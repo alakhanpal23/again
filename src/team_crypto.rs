@@ -10,13 +10,12 @@ use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
 
 use crate::team::{
-    RemoteCacheManifest, SIGNATURE_ENVELOPE_SCHEMA_VERSION, SignatureAlgorithm, SignatureEnvelope,
-    SignatureVerifier, VerificationError,
+    ED25519_SIGNATURE_SIZE, RemoteCacheManifest, SIGNATURE_ENVELOPE_SCHEMA_VERSION,
+    SignatureAlgorithm, SignatureEnvelope, SignatureVerifier, VerificationError,
 };
 
 const ED25519_SECRET_KEY_BYTES: usize = 32;
 const ED25519_PUBLIC_KEY_BYTES: usize = 32;
-const ED25519_SIGNATURE_BYTES: usize = 64;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum CryptoError {
@@ -90,23 +89,25 @@ impl Ed25519Signer {
         {
             return Err(CryptoError::KeyMismatch);
         }
-        manifest.signature = Some(SignatureEnvelope {
+        let mut candidate = manifest.clone();
+        candidate.signature = Some(SignatureEnvelope {
             schema_version: SIGNATURE_ENVELOPE_SCHEMA_VERSION,
             algorithm: SignatureAlgorithm::Ed25519,
             key_id: self.key_id.clone(),
             // A fixed-size placeholder keeps signing independent of whether a
             // caller previously supplied a signature. It is not authenticated.
-            signature: vec![0; ED25519_SIGNATURE_BYTES],
+            signature: vec![0; ED25519_SIGNATURE_SIZE],
         });
-        manifest
+        candidate
             .validate_for_signing()
             .map_err(CryptoError::InvalidManifest)?;
-        let signature = self.signing_key.sign(&manifest.canonical_signing_bytes());
-        manifest
+        let signature = self.signing_key.sign(&candidate.canonical_signing_bytes());
+        candidate
             .signature
             .as_mut()
             .expect("signature just installed")
             .signature = signature.to_bytes().to_vec();
+        manifest.signature = candidate.signature;
         Ok(())
     }
 }
@@ -172,7 +173,7 @@ impl SignatureVerifier for Ed25519Verifier {
         signing_bytes: &[u8],
         signature: &[u8],
     ) -> bool {
-        if algorithm != SignatureAlgorithm::Ed25519 || signature.len() != ED25519_SIGNATURE_BYTES {
+        if algorithm != SignatureAlgorithm::Ed25519 || signature.len() != ED25519_SIGNATURE_SIZE {
             return false;
         }
         let Some((owner, key)) = self.keys.get(key_id) else {
@@ -181,7 +182,7 @@ impl SignatureVerifier for Ed25519Verifier {
         if owner != producer_id {
             return false;
         }
-        let signature_bytes: [u8; ED25519_SIGNATURE_BYTES] = match signature.try_into() {
+        let signature_bytes: [u8; ED25519_SIGNATURE_SIZE] = match signature.try_into() {
             Ok(bytes) => bytes,
             Err(_) => return false,
         };
@@ -293,7 +294,7 @@ mod tests {
         );
         assert_eq!(
             value.signature.as_ref().unwrap().signature.len(),
-            ED25519_SIGNATURE_BYTES
+            ED25519_SIGNATURE_SIZE
         );
     }
 
@@ -322,7 +323,7 @@ mod tests {
             &signer.public_key_bytes(),
         )
         .unwrap();
-        value.signature.as_mut().unwrap().signature = vec![0; ED25519_SIGNATURE_BYTES - 1];
+        value.signature.as_mut().unwrap().signature = vec![0; ED25519_SIGNATURE_SIZE - 1];
         assert_eq!(
             verify_candidate(
                 &value,
@@ -330,7 +331,7 @@ mod tests {
                 &verifier
             )
             .unwrap_err(),
-            VerificationError::InvalidSignature
+            VerificationError::InvalidSignatureSize
         );
         signer.sign_manifest(&mut value).unwrap();
         value.signature.as_mut().unwrap().signature[0] ^= 1;
@@ -343,6 +344,24 @@ mod tests {
             .unwrap_err(),
             VerificationError::InvalidSignature
         );
+    }
+
+    #[test]
+    fn failed_signing_does_not_mutate_an_existing_manifest() {
+        let signer =
+            Ed25519Signer::from_secret_key("key-crypto", "producer-crypto", &[8; 32]).unwrap();
+        let mut value = manifest();
+        signer.sign_manifest(&mut value).unwrap();
+        value.expires_at_unix_seconds = value.created_at_unix_seconds;
+        let before = value.clone();
+
+        assert_eq!(
+            signer.sign_manifest(&mut value),
+            Err(CryptoError::InvalidManifest(
+                VerificationError::InvalidLifetime
+            ))
+        );
+        assert_eq!(value, before);
     }
 
     #[test]

@@ -1,70 +1,83 @@
-# Product benchmark
+# Benchmarks
 
-This is a reproducible local product benchmark, not a published performance
-claim. It measures the whole Codex-facing path: hook classification, opaque
-handoff, execution/validation, cache replay, compact response, and exact output
-recovery.
+## Direct product benchmark
 
-Build a binary and write a new, retained result file:
+[`direct_benchmark.py`](direct_benchmark.py) is the current product harness. It
+invokes explicit `again run -- <argv...>` with stdin, stdout, and stderr all
+non-TTY. It does not install or exercise Codex hooks, and it requires every warm
+hit to return the complete byte-for-byte streams. Warm measurements include the
+real fixed-argument exact-executable capability-probe child; they are not
+zero-process-spawn measurements and do not rerun the requested work.
+
+Build a release binary and write evidence to a new path:
 
 ```bash
 cargo build --release
+python3 -B bench/direct_benchmark.py \
+  --binary target/release/again \
+  --size-mib 2048 \
+  --json-out bench/results/YYYY-MM-DD-direct.json
+```
+
+Add `--enforce-speed-gate` when the run must exit non-zero unless the speed gate
+passes. An existing JSON path is never overwritten. Without `--json-out`, the
+result is printed to stdout.
+
+The default fixture splits 2 GiB of logical sparse-file input across four files,
+runs five native baselines and fifteen warm Again calls, and allows 120 seconds
+per process. Each captured stream has a 16 MiB harness limit. The optional
+`--memory-limit-mib` applies an inherited address-space limit on supported
+platforms; it is unavailable on Darwin, where the harness records observed child
+peak RSS instead.
+
+The harness uses a fresh temporary Git workspace and external Again state, fixes
+`LC_ALL=C` and `PATH=/usr/bin:/bin`, unsets `GREP_OPTIONS`, and removes every
+inherited `DYLD_*`, `LD_*`, `Malloc*`, `MALLOC_*`, sanitizer-option, locale,
+terminal, and timezone override that the v0 ambient-input policy rejects. The
+retained result records the exact removed names under
+`unmodeled_loader_locale_terminal_inputs_removed`. It runs native `grep` against
+the same explicit files as Again and verifies:
+
+- the cold result exactly matches native exit status, stdout, and stderr;
+- every warm event is `replayed_full` and returns the complete exact streams;
+- every warm timing includes current identity/context validation and the
+  exact-executable capability probe;
+- a controlled input mutation that leaves native output unchanged still misses;
+- stats report only full replays, with no compact replays or omitted bytes;
+- retained evidence includes source, harness and binary provenance, raw timing
+  distributions, exact stream hashes, and bounded resource observations.
+
+The correctness gate must pass. The speed gate is applicable only when native
+p50 is at least 500 ms; it then requires native p50 divided by warm Again p95 to
+be at least 3x. Below that baseline the speed gate is `not_applicable`, because
+trivial commands can be slower after process and fingerprint overhead. A script
+result is evidence only for its recorded commit, binary, host, and fixture.
+
+## Experimental hook regression harnesses
+
+[`benchmark.py`](benchmark.py) and [`slow_gate.py`](slow_gate.py) explicitly use
+`again hook --experimental-unsafe-rewrite`. They exercise dormant exact-envelope,
+opaque-handoff, runtime-check, and replay plumbing. Production hooks emit no
+automatic allow/rewrite decision, so these scripts are experimental regressions,
+not product benchmarks and not release evidence.
+
+```bash
 python3 bench/benchmark.py \
   --binary target/release/again \
   --iterations 15 \
-  --json-out bench/results/local-$(date +%Y%m%d-%H%M%S).json
-```
+  --json-out bench/results/YYYY-MM-DD-experimental-hook.json
 
-`--json-out` is optional; without it JSON is written to stdout. When present it
-uses exclusive creation and refuses to overwrite an existing result. Retain the
-raw JSON with the change being evaluated. It records:
-
-- source commit and dirty state;
-- binary path, `--version`, and SHA-256 digest;
-- machine and Python metadata;
-- raw samples plus p50/p95 for baseline, warm hook, warm execution, and full
-  warm end-to-end latency;
-- a cold result, `again show <id>` byte-for-byte recovery check, unsafe and
-  unhandled no-rewrite matrix, and input-mutation invalidation check.
-
-The fixture is a fresh temporary workspace containing a deterministic payload.
-It uses a temporary Again state directory, so it neither reuses nor changes a
-developer's normal cache.
-
-## Gates
-
-The output evaluates these explicit, observed gates:
-
-| Gate | Pass condition |
-| --- | --- |
-| Hook | warm hook p95 `< 10 ms` |
-| Hit | warm execution p95 `< 100 ms` |
-| Context reduction | median duplicate output reduction `>= 50%` |
-| Speed | evaluated only if baseline p50 is at least `500 ms`; then baseline p50 / warm hit p95 must be at least `3x` |
-
-The speed gate is `not_applicable` below the 500 ms baseline threshold. Gate
-status is a measurement outcome for the recorded environment, not a general
-claim. The benchmark intentionally reports cold cost, distributions, raw
-samples, safety checks, and failed gates rather than hiding them.
-
-The no-rewrite matrix includes network, mutation, Git, unknown, shell-composed,
-absolute-path, and stdin-dependent commands. It fails the run if the hook
-rewrites any of them; it never executes those commands.
-
-## Slow speed gate
-
-Use a separate low-output scan fixture for the roadmap's speed gate:
-
-```bash
 python3 -B bench/slow_gate.py \
   --binary target/release/again \
   --size-mib 2048 \
-  --json-out bench/results/YYYY-MM-DD-slow-gate.json
+  --json-out bench/results/YYYY-MM-DD-experimental-slow-gate.json
 ```
 
-It creates a sparse file with one match at the end, measures native `grep`, the
-full cold double-validation path, and warm hook-to-result latency. It then
-changes an input byte while deliberately leaving grep's output unchanged; a
-compact response at that point is a correctness failure. Speed passes only when
-native p50 is at least 500 ms and native p50 divided by Again warm end-to-end
-p95 is at least 3x.
+These scripts require exact full streams if run against current code. Their hook
+and opaque-execution thresholds are script-local regression signals only. They
+must never be used to justify automatic-hook, product-latency, or release claims.
+
+Every existing JSON under `bench/results/` predates the current explicit-CLI
+product contract and/or exercises the unsafe experimental hook. Those files are
+retained unchanged as historical, superseded evidence; see
+[`docs/EVIDENCE.md`](../docs/EVIDENCE.md).

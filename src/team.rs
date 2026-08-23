@@ -14,7 +14,9 @@ use thiserror::Error;
 pub const REMOTE_CACHE_SCHEMA_VERSION: u16 = 1;
 pub const SIGNATURE_ENVELOPE_SCHEMA_VERSION: u16 = 1;
 pub const MAX_BLOB_SIZE: u64 = 16 * 1024 * 1024;
-pub const MAX_SIGNATURE_SIZE: usize = 4096;
+pub const MAX_MANIFEST_LIFETIME_SECONDS: u64 = 30 * 24 * 60 * 60;
+pub const MAX_JSON_SAFE_INTEGER: u64 = (1 << 53) - 1;
+pub const ED25519_SIGNATURE_SIZE: usize = 64;
 
 const SIGNING_DOMAIN: &[u8] = b"again.remote-cache.manifest.v1";
 
@@ -29,13 +31,16 @@ impl Digest {
         if value.len() != 64 {
             return Err(DigestError::Length);
         }
-        let mut bytes = [0u8; 32];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let pair = &value[index * 2..index * 2 + 2];
-            *byte = u8::from_str_radix(pair, 16).map_err(|_| DigestError::Hex)?;
+        if !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(DigestError::Hex);
         }
         if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
             return Err(DigestError::Uppercase);
+        }
+        let mut bytes = [0u8; 32];
+        let encoded = value.as_bytes();
+        for (index, output) in bytes.iter_mut().enumerate() {
+            *output = (hex_nibble(encoded[index * 2]) << 4) | hex_nibble(encoded[index * 2 + 1]);
         }
         Ok(Self(bytes))
     }
@@ -93,8 +98,16 @@ pub enum DigestError {
     Uppercase,
 }
 
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => unreachable!("digest syntax was validated before decoding"),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct BlobRef {
     pub digest: Digest,
     pub size_bytes: u64,
@@ -122,7 +135,7 @@ pub enum Shareability {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct PrivacyMetadata {
     pub classification: PrivacyClass,
     pub shareability: Shareability,
@@ -136,7 +149,7 @@ pub enum SignatureAlgorithm {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct SignatureEnvelope {
     pub schema_version: u16,
     pub algorithm: SignatureAlgorithm,
@@ -147,7 +160,7 @@ pub struct SignatureEnvelope {
 /// A signed, content-addressed result description. Blob bytes are transferred
 /// separately; this record binds their digests and exact sizes to the request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct RemoteCacheManifest {
     pub schema_version: u16,
     pub record_id: String,
@@ -218,7 +231,15 @@ impl RemoteCacheManifest {
         }
         validate_blob(&self.stdout)?;
         validate_blob(&self.stderr)?;
-        if self.expires_at_unix_seconds <= self.created_at_unix_seconds {
+        if self.created_at_unix_seconds > MAX_JSON_SAFE_INTEGER
+            || self.expires_at_unix_seconds > MAX_JSON_SAFE_INTEGER
+        {
+            return Err(VerificationError::TimestampOutOfRange);
+        }
+        if self.expires_at_unix_seconds <= self.created_at_unix_seconds
+            || self.expires_at_unix_seconds - self.created_at_unix_seconds
+                > MAX_MANIFEST_LIFETIME_SECONDS
+        {
             return Err(VerificationError::InvalidLifetime);
         }
         if self.privacy.secret_tainted || self.privacy.classification == PrivacyClass::Secret {
@@ -239,7 +260,7 @@ impl RemoteCacheManifest {
     fn validate_wire(&self) -> Result<(), VerificationError> {
         self.validate_for_signing()?;
         let signature = self.signature.as_ref().ok_or(VerificationError::Unsigned)?;
-        if signature.signature.is_empty() || signature.signature.len() > MAX_SIGNATURE_SIZE {
+        if signature.signature.len() != ED25519_SIGNATURE_SIZE {
             return Err(VerificationError::InvalidSignatureSize);
         }
         Ok(())
@@ -265,6 +286,11 @@ fn validate_identifier(value: &str) -> Result<(), ()> {
 }
 
 /// The client's complete binding for which a remote result was requested.
+///
+/// This is a verification input, not an authenticated trust object: callers
+/// must recompute the expected digests locally and populate key authorization,
+/// revocation, and time from fresh trusted sources. The v1 type carries no
+/// source, freshness epoch, tenant-policy version, or authenticated envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerificationContext {
     pub tenant_id: String,
@@ -317,6 +343,8 @@ pub enum VerificationError {
     InvalidBlobSize,
     #[error("invalid signature size")]
     InvalidSignatureSize,
+    #[error("manifest timestamp exceeds the shared JSON safe-integer range")]
+    TimestampOutOfRange,
     #[error("invalid creation/expiry interval")]
     InvalidLifetime,
     #[error("candidate has expired")]
@@ -539,7 +567,7 @@ mod tests {
                 schema_version: SIGNATURE_ENVELOPE_SCHEMA_VERSION,
                 algorithm: SignatureAlgorithm::Ed25519,
                 key_id: "key-1".into(),
-                signature: b"fake-valid-signature".to_vec(),
+                signature: vec![0; ED25519_SIGNATURE_SIZE],
             }),
         }
     }
@@ -564,7 +592,7 @@ mod tests {
         FakeVerifier {
             expected_bytes: manifest.canonical_signing_bytes(),
             expected_key: "key-1".into(),
-            valid_signature: b"fake-valid-signature".to_vec(),
+            valid_signature: vec![0; ED25519_SIGNATURE_SIZE],
         }
     }
 
@@ -698,7 +726,7 @@ mod tests {
         );
 
         let mut bad_signature = base.clone();
-        bad_signature.signature.as_mut().unwrap().signature = b"wrong".to_vec();
+        bad_signature.signature.as_mut().unwrap().signature[0] = 1;
         assert_eq!(
             verify_candidate(&bad_signature, &expected(&bad_signature), &verifier),
             Err(VerificationError::InvalidSignature)
@@ -732,11 +760,24 @@ mod tests {
         );
 
         let mut oversized_signature = base.clone();
-        oversized_signature.signature.as_mut().unwrap().signature = vec![0; MAX_SIGNATURE_SIZE + 1];
+        oversized_signature.signature.as_mut().unwrap().signature =
+            vec![0; ED25519_SIGNATURE_SIZE + 1];
         assert_eq!(
             verify_candidate(
                 &oversized_signature,
                 &expected(&oversized_signature),
+                &verifier
+            ),
+            Err(VerificationError::InvalidSignatureSize)
+        );
+
+        let mut undersized_signature = base.clone();
+        undersized_signature.signature.as_mut().unwrap().signature =
+            vec![0; ED25519_SIGNATURE_SIZE - 1];
+        assert_eq!(
+            verify_candidate(
+                &undersized_signature,
+                &expected(&undersized_signature),
                 &verifier
             ),
             Err(VerificationError::InvalidSignatureSize)
@@ -753,6 +794,67 @@ mod tests {
         let mut unknown_algorithm = serde_json::to_value(&base).unwrap();
         unknown_algorithm["signature"]["algorithm"] = json!("rsa_pss");
         assert!(serde_json::from_value::<RemoteCacheManifest>(unknown_algorithm).is_err());
+    }
+
+    #[test]
+    fn wire_parser_rejects_unknown_fields_without_panicking_on_unicode_digests() {
+        let base = fixture();
+
+        let mut unknown_top_level = serde_json::to_value(&base).unwrap();
+        unknown_top_level["requires_attestation"] = json!(true);
+        assert!(serde_json::from_value::<RemoteCacheManifest>(unknown_top_level).is_err());
+
+        let mut unknown_nested = serde_json::to_value(&base).unwrap();
+        unknown_nested["stdout"]["compression"] = json!("zstd");
+        assert!(serde_json::from_value::<RemoteCacheManifest>(unknown_nested).is_err());
+
+        let mut unicode_digest = serde_json::to_value(&base).unwrap();
+        unicode_digest["request_key"] = json!(format!("€{}", "0".repeat(61)));
+        let parsed = std::panic::catch_unwind(|| {
+            serde_json::from_value::<RemoteCacheManifest>(unicode_digest)
+        });
+        assert!(parsed.is_ok(), "malformed remote JSON must not panic");
+        assert!(parsed.unwrap().is_err());
+    }
+
+    #[test]
+    fn lifetime_timestamp_and_identifier_rules_match_the_service_wire_contract() {
+        let mut long_lived = fixture();
+        long_lived.expires_at_unix_seconds =
+            long_lived.created_at_unix_seconds + MAX_MANIFEST_LIFETIME_SECONDS + 1;
+        let long_lived_verifier = verifier(&long_lived);
+        assert_eq!(
+            verify_candidate(&long_lived, &expected(&long_lived), &long_lived_verifier),
+            Err(VerificationError::InvalidLifetime)
+        );
+
+        let mut unsafe_timestamp = fixture();
+        unsafe_timestamp.created_at_unix_seconds = MAX_JSON_SAFE_INTEGER + 1;
+        unsafe_timestamp.expires_at_unix_seconds = MAX_JSON_SAFE_INTEGER + 2;
+        let unsafe_timestamp_verifier = verifier(&unsafe_timestamp);
+        assert_eq!(
+            verify_candidate(
+                &unsafe_timestamp,
+                &expected(&unsafe_timestamp),
+                &unsafe_timestamp_verifier
+            ),
+            Err(VerificationError::TimestampOutOfRange)
+        );
+
+        let mut c1_control = fixture();
+        c1_control.record_id = "record\u{80}".into();
+        let c1_verifier = verifier(&c1_control);
+        assert_eq!(
+            verify_candidate(&c1_control, &expected(&c1_control), &c1_verifier),
+            Err(VerificationError::InvalidIdentifier("record_id"))
+        );
+
+        let mut byte_order_mark = fixture();
+        byte_order_mark.record_id = "record\u{feff}".into();
+        let bom_verifier = verifier(&byte_order_mark);
+        assert!(
+            verify_candidate(&byte_order_mark, &expected(&byte_order_mark), &bom_verifier).is_ok()
+        );
     }
 
     #[test]

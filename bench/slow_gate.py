@@ -4,8 +4,9 @@
 The fixture is a sparse file with one match at the end. Apple's grep must scan
 the logical bytes but emits only a short result. Again's cold path hashes and
 validates the file; its warm path can use the ctime/inode-validated digest memo
-and the result cache. This is intentionally separate from the output-compaction
-benchmark so neither benefit hides the other's cost.
+and the result cache. Warm hits must still return the exact full output because
+Codex currently hides effective output caps from hooks, so delivery compaction
+is deliberately disabled.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ def main() -> int:
         env = inherited_env.copy()
         env["AGAIN_HOME"] = str(state)
         env["LC_ALL"] = "C"
-        command = "grep needle payload.bin"
+        command = "/usr/bin/grep needle payload.bin"
         session = "again-slow-benchmark-session"
 
         baseline_samples: list[float] = []
@@ -91,7 +92,7 @@ def main() -> int:
         hook_samples: list[float] = []
         exec_samples: list[float] = []
         end_to_end_samples: list[float] = []
-        compact = []
+        exact_full_replays = []
         for _ in range(arguments.warm_iterations):
             call_id, hook_ms, _ = common.hook_call(binary, workspace, env, command, session)
             if call_id is None:
@@ -99,12 +100,12 @@ def main() -> int:
             completed, exec_ms = common.execute_call(binary, call_id, workspace, env)
             if completed.returncode != 0:
                 raise RuntimeError(completed.stderr.decode(errors="replace"))
+            if completed.stdout != baseline_stdout or completed.stderr:
+                raise RuntimeError("warm slow replay changed the exact streams")
             hook_samples.append(hook_ms)
             exec_samples.append(exec_ms)
             end_to_end_samples.append(hook_ms + exec_ms)
-            compact.append(b"exact repeat" in completed.stdout)
-        if not all(compact):
-            raise RuntimeError("warm slow results were not compact references")
+            exact_full_replays.append(True)
 
         # Change one sparse byte while leaving the final grep output unchanged.
         # A correct cache must still miss, execute, and return the full output.
@@ -119,10 +120,13 @@ def main() -> int:
         if changed_id is None:
             raise RuntimeError("mutated slow fixture was not rewritten")
         changed, mutation_exec_ms = common.execute_call(binary, changed_id, workspace, env)
+        mutation_event = common.last_event(binary, workspace, env)
         mutation_invalidated = (
             changed.returncode == 0
             and changed.stdout == baseline_stdout
-            and b"exact repeat" not in changed.stdout
+            and changed.stderr == b""
+            and mutation_event.get("disposition") == "executed"
+            and mutation_event.get("reason") == "DOUBLE_EXECUTION_VALIDATED"
         )
         if not mutation_invalidated:
             raise RuntimeError("same-output input mutation produced a false cache hit")
@@ -146,7 +150,7 @@ def main() -> int:
             speed_gate["reason"] = "baseline_p50_ms_below_500"
 
         result = {
-            "schema": "again.slow-gate.v1",
+            "schema": "again.slow-gate.v2",
             "provenance": {
                 "repository": common.repository_metadata(source_root, inherited_env),
                 "binary": common.binary_metadata(binary, inherited_env),
@@ -167,9 +171,14 @@ def main() -> int:
                 "warm_hook": hook,
                 "warm_exec": execution,
                 "warm_end_to_end": end_to_end,
-                "all_warm_results_compact": all(compact),
+                "all_warm_results_exact_full_streams": all(exact_full_replays),
+                "delivery_compaction": {
+                    "enabled": False,
+                    "reason": "codex_hook_hides_effective_output_cap",
+                },
                 "same_output_mutation_invalidation": {
                     "passed": mutation_invalidated,
+                    "event": mutation_event,
                     "hook_ms": mutation_hook_ms,
                     "exec_ms": mutation_exec_ms,
                 },

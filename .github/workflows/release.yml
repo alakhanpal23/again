@@ -1,0 +1,203 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: verify release source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the tagged source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind the tag to Cargo version and main history
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+          if [[ ! "$TAG" =~ $semver_re ]]; then
+            echo "release tag is not supported SemVer: $TAG" >&2
+            exit 1
+          fi
+          crate_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+          test "$TAG" = "v${crate_version}"
+          git merge-base --is-ancestor HEAD origin/main
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+      - name: Run locked source gates
+        run: |
+          set -euo pipefail
+          cargo +1.88.0 fmt --check
+          cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+          cargo +1.88.0 test --locked --all-features
+          cargo +1.88.0 test --locked --test generated_differential generated_differential_100k -- --ignored --exact --nocapture
+          sh -n scripts/install.sh scripts/uninstall.sh scripts/test_packaging.sh
+          python3 -m py_compile scripts/package_release.py
+          sh scripts/test_packaging.sh
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native GitHub-hosted runners avoid an unreviewed cross-linker or
+          # emulator in the release path.
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out the tagged source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Add the native release target
+        run: rustup +1.88.0 target add ${{ matrix.target }}
+      - name: Test the tagged source natively
+        run: cargo +1.88.0 test --locked --all-features --target ${{ matrix.target }}
+      - name: Build with the lockfile
+        run: cargo +1.88.0 build --release --locked --target ${{ matrix.target }}
+      - name: Package normalized archive and smoke-test it
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          source_date_epoch=$(git show -s --format=%ct HEAD)
+          archive="dist/again-${TAG}-${TARGET}.tar.gz"
+          python3 scripts/package_release.py \
+            --binary "target/${TARGET}/release/again" \
+            --output "$archive" \
+            --source-date-epoch "$source_date_epoch"
+          test "$(tar -tzf "$archive")" = "again"
+          smoke_dir=$(mktemp -d)
+          trap 'rm -rf "$smoke_dir"' EXIT
+          tar -xzf "$archive" -C "$smoke_dir"
+          test "$("$smoke_dir/again" --version)" = "again ${TAG#v}"
+      - name: Upload the platform archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/again-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  sbom:
+    name: build source dependency SBOM
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the tagged source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Generate the pinned source dependency SBOM
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cargo +1.88.0 install cargo-cyclonedx --version 0.5.9 --locked
+          mkdir -p dist
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          sbom="again-${TAG}-source.cdx.json"
+          cargo +1.88.0 cyclonedx --quiet --all-features --format json --spec-version 1.5 \
+            --override-filename "$sbom"
+          test -s "$sbom"
+          mv "$sbom" "dist/$sbom"
+      - name: Upload the source dependency SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-source-sbom
+          path: dist/again-${{ github.ref_name }}-source.cdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish checksummed release
+    needs: [build, sbom]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download verified build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Revalidate the tag and create SHA-256 manifest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          current_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${TAG}" --jq .sha)
+          test "$current_sha" = "$GITHUB_SHA"
+          cd dist
+          archives=(
+            "again-${TAG}-aarch64-apple-darwin.tar.gz"
+            "again-${TAG}-x86_64-apple-darwin.tar.gz"
+            "again-${TAG}-aarch64-unknown-linux-gnu.tar.gz"
+            "again-${TAG}-x86_64-unknown-linux-gnu.tar.gz"
+          )
+          for archive in "${archives[@]}"; do
+            test -s "$archive"
+          done
+          sbom="again-${TAG}-source.cdx.json"
+          test -s "$sbom"
+          sha256sum "${archives[@]}" "$sbom" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Publish release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          current_sha=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)
+          test "$current_sha" = "$GITHUB_SHA"
+          release_kind=()
+          case "$GITHUB_REF_NAME" in
+            *-*) release_kind=(--prerelease) ;;
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            --verify-tag \
+            --generate-notes \
+            "${release_kind[@]}" \
+            "dist/again-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-source.cdx.json" \
+            dist/SHA256SUMS

@@ -4,9 +4,39 @@
 //! pass its canonical path here before it can be treated as an eligible tool.
 
 use std::fmt;
+#[cfg(target_os = "macos")]
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_PROFILE_PATH: &str = "/System/Library/CoreServices/SystemVersion.plist";
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_PROFILE_BLAKE3: &str =
+    "5adbd08043e220188b91445787a518ddaa060a56057191707da49b3e91aba10a";
+#[cfg(target_os = "macos")]
+const MACOS_SYSTEM_PROFILE_ID: &str = "macos-15.6.1-24G90-read-v0";
+#[cfg(target_os = "macos")]
+const CODEX_RG_BLAKE3: &str = "0dc9090877943cb7bcc35fab4dd2bf501f53c4555a919bf2476fef702f1e5af2";
+#[cfg(target_os = "macos")]
+const CODEX_RG_PROFILE_ID: &str = "codex-rg-15.2.0-e89fff89ac-arm64-read-v0";
+#[cfg(target_os = "macos")]
+const MAX_AUDITED_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[cfg(target_os = "macos")]
+fn audited_apple_tool_digest(tool: ToolKind) -> Option<&'static str> {
+    match tool {
+        ToolKind::Cat => Some("30fdc8a74ef975c1d61a6110083490ac43fe0c0c28228a5abd2cd5f88187cf1c"),
+        ToolKind::Head => Some("5ce13107571eecfaf6fb128e0f9697f98bade39df715adfd83afd66bbff77f66"),
+        ToolKind::Tail => Some("fd4c9cffd139ee86e199c464f71554157ae11eae2809f513aaacade1ab5f2caa"),
+        ToolKind::Wc => Some("f34527e367649c6ca0434e0f4a3a083f69cb06325526edd00e418fbdbb73e12b"),
+        ToolKind::Grep => Some("46dee6a2c4f69fcaf38aecbc32003bc93ff57903c682b3271e53920e2658a62f"),
+        ToolKind::Ls => Some("73d13c2d68c0b93c8cbd18502900d8bd3d8d3472d683c84a06780d0a2b240c77"),
+        ToolKind::Pwd => Some("354299ce70bdeafe5a1a74b8063fcad17d785f42db8c0c3d8ebdb157eca572fd"),
+        ToolKind::Rg => None,
+    }
+}
 
 /// A command whose executable has a v0 audit profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,6 +111,8 @@ pub struct ExecutableIdentity {
     pub tool: ToolKind,
     pub canonical_path: PathBuf,
     pub provenance: ExecutableProvenance,
+    /// Exact parser/semantics profile reviewed for this executable.
+    pub semantic_profile: String,
 }
 
 /// Stable error codes. Deliberately omit host paths and command output so the
@@ -100,6 +132,8 @@ pub enum VerifyError {
     ScriptFile,
     SignatureInvalid,
     SignatureIdentityMismatch,
+    SystemProfileMismatch,
+    ContentDigestMismatch,
     InspectionFailed,
 }
 
@@ -118,6 +152,8 @@ impl VerifyError {
             Self::ScriptFile => "SCRIPT_FILE",
             Self::SignatureInvalid => "SIGNATURE_INVALID",
             Self::SignatureIdentityMismatch => "SIGNATURE_IDENTITY_MISMATCH",
+            Self::SystemProfileMismatch => "SYSTEM_PROFILE_MISMATCH",
+            Self::ContentDigestMismatch => "CONTENT_DIGEST_MISMATCH",
             Self::InspectionFailed => "INSPECTION_FAILED",
         }
     }
@@ -151,15 +187,66 @@ pub fn verify_executable(
     verify_macos(requested_argv0, canonical_path)
 }
 
+/// Return the exact complete Apple tool profile available on this host.
+///
+/// Tests and diagnostics use this to distinguish an intentionally unsupported
+/// macOS update from a regression on the one reviewed profile. Individual
+/// command admission still verifies its own exact bytes independently.
+pub fn host_audited_apple_profile() -> Result<&'static str, VerifyError> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err(VerifyError::UnsupportedPlatform)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let profile = verify_macos_system_profile()?;
+        for tool in [
+            ToolKind::Cat,
+            ToolKind::Head,
+            ToolKind::Tail,
+            ToolKind::Wc,
+            ToolKind::Grep,
+            ToolKind::Ls,
+            ToolKind::Pwd,
+        ] {
+            let path = tool
+                .apple_system_path()
+                .ok_or(VerifyError::SystemPathMismatch)?;
+            inspect_regular_non_privileged_binary(path)?;
+            let expected =
+                audited_apple_tool_digest(tool).ok_or(VerifyError::ContentDigestMismatch)?;
+            if hash_file_bounded(path)? != expected {
+                return Err(VerifyError::ContentDigestMismatch);
+            }
+        }
+        Ok(profile)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn verify_macos(
     requested_argv0: &str,
     canonical_path: &Path,
 ) -> Result<ExecutableIdentity, VerifyError> {
-    if requested_argv0.contains('/') || requested_argv0.is_empty() {
-        return Err(VerifyError::RequestedNameMismatch);
-    }
-    let tool = ToolKind::parse(requested_argv0).ok_or(VerifyError::UnsupportedTool)?;
+    let requested = Path::new(requested_argv0);
+    let requested_name = if requested.is_absolute() {
+        // Reject aliases, symlinks and merely equivalent spellings. The raw
+        // shell command and the wrapper must name the exact audited binary.
+        if requested != canonical_path {
+            return Err(VerifyError::RequestedNameMismatch);
+        }
+        requested
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(VerifyError::RequestedNameMismatch)?
+    } else {
+        if requested_argv0.contains('/') || requested_argv0.is_empty() {
+            return Err(VerifyError::RequestedNameMismatch);
+        }
+        requested_argv0
+    };
+    let tool = ToolKind::parse(requested_name).ok_or(VerifyError::UnsupportedTool)?;
     if canonical_path.file_name().and_then(|name| name.to_str()) != Some(tool.executable_name()) {
         return Err(VerifyError::BasenameMismatch);
     }
@@ -174,22 +261,73 @@ fn verify_macos(
         if canonical_path != system_path {
             return Err(VerifyError::SystemPathMismatch);
         }
+        let semantic_profile = verify_macos_system_profile()?;
+        let expected_digest =
+            audited_apple_tool_digest(tool).ok_or(VerifyError::ContentDigestMismatch)?;
+        if hash_file_bounded(canonical_path)? != expected_digest {
+            return Err(VerifyError::ContentDigestMismatch);
+        }
         return Ok(ExecutableIdentity {
             tool,
             canonical_path: canonical_path.to_path_buf(),
             provenance: ExecutableProvenance::AppleSystem,
+            semantic_profile: semantic_profile.to_owned(),
         });
     }
 
     if !is_codex_bundled_rg(canonical_path) {
         return Err(VerifyError::CodexBundlePathMismatch);
     }
-    verify_codex_rg_signature(canonical_path)?;
+    let system_profile = verify_macos_system_profile()?;
+    verify_codex_rg_signature_identity(canonical_path)?;
+    let digest = hash_file_bounded(canonical_path)?;
+    if digest != CODEX_RG_BLAKE3 {
+        return Err(VerifyError::ContentDigestMismatch);
+    }
     Ok(ExecutableIdentity {
         tool,
         canonical_path: canonical_path.to_path_buf(),
         provenance: ExecutableProvenance::OpenAiCodexBundle,
+        semantic_profile: format!("{system_profile}+{CODEX_RG_PROFILE_ID}"),
     })
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_system_profile() -> Result<&'static str, VerifyError> {
+    let bytes =
+        std::fs::read(MACOS_SYSTEM_PROFILE_PATH).map_err(|_| VerifyError::InspectionFailed)?;
+    if bytes.len() > 1024 * 1024
+        || blake3::hash(&bytes).to_hex().as_str() != MACOS_SYSTEM_PROFILE_BLAKE3
+    {
+        return Err(VerifyError::SystemProfileMismatch);
+    }
+    Ok(MACOS_SYSTEM_PROFILE_ID)
+}
+
+#[cfg(target_os = "macos")]
+fn hash_file_bounded(path: &Path) -> Result<String, VerifyError> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| VerifyError::InspectionFailed)?;
+    if metadata.len() > MAX_AUDITED_EXECUTABLE_BYTES {
+        return Err(VerifyError::ContentDigestMismatch);
+    }
+    let mut file = std::fs::File::open(path).map_err(|_| VerifyError::InspectionFailed)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| VerifyError::InspectionFailed)?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        if total > MAX_AUDITED_EXECUTABLE_BYTES {
+            return Err(VerifyError::ContentDigestMismatch);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 #[cfg(target_os = "macos")]
@@ -241,17 +379,14 @@ fn is_codex_bundled_rg(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn verify_codex_rg_signature(path: &Path) -> Result<(), VerifyError> {
+fn verify_codex_rg_signature_identity(path: &Path) -> Result<(), VerifyError> {
     use std::process::Command;
 
-    let verification = Command::new("/usr/bin/codesign")
-        .args(["--verify", "--strict", "--verbose=0"])
-        .arg(path)
-        .status()
-        .map_err(|_| VerifyError::InspectionFailed)?;
-    if !verification.success() {
-        return Err(VerifyError::SignatureInvalid);
-    }
+    // Some official npm-distributed Codex bundles retain identifier/team
+    // metadata while macOS reports that the extracted nested signature is not
+    // strictly verifiable. Runtime integrity and semantics are therefore bound
+    // by the exact BLAKE3 allowlist below; these fields are an additional
+    // publisher-identity check, not the content trust boundary.
     let details = Command::new("/usr/bin/codesign")
         .args(["-dvv"])
         .arg(path)
@@ -285,6 +420,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn accepts_exact_apple_system_tools() {
+        if host_audited_apple_profile().is_err() {
+            return;
+        }
         let cases = [
             ("cat", "/bin/cat", ToolKind::Cat),
             ("head", "/usr/bin/head", ToolKind::Head),
@@ -302,9 +440,58 @@ mod tests {
                     tool,
                     canonical_path: path,
                     provenance: ExecutableProvenance::AppleSystem,
+                    semantic_profile: MACOS_SYSTEM_PROFILE_ID.to_owned(),
                 })
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_exact_absolute_apple_system_tools() {
+        if host_audited_apple_profile().is_err() {
+            return;
+        }
+        for requested in [
+            "/bin/cat",
+            "/usr/bin/head",
+            "/usr/bin/tail",
+            "/usr/bin/wc",
+            "/usr/bin/grep",
+            "/bin/ls",
+            "/bin/pwd",
+        ] {
+            let canonical = std::fs::canonicalize(requested).expect("system tool exists");
+            let exact = canonical.to_str().expect("system path is UTF-8");
+            assert!(
+                verify_executable(exact, &canonical).is_ok(),
+                "absolute audited path should be accepted: {exact}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accepts_exact_audited_codex_rg_when_present() {
+        if host_audited_apple_profile().is_err() {
+            return;
+        }
+        let Some(path) = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
+            .map(|directory| directory.join("rg"))
+            .find(|path| path.is_file() && is_codex_bundled_rg(path))
+        else {
+            return;
+        };
+        let path = std::fs::canonicalize(path).unwrap();
+        let identity = verify_executable("rg", &path).unwrap();
+        assert_eq!(identity.tool, ToolKind::Rg);
+        assert_eq!(identity.provenance, ExecutableProvenance::OpenAiCodexBundle);
+        assert_eq!(
+            identity.semantic_profile,
+            format!("{MACOS_SYSTEM_PROFILE_ID}+{CODEX_RG_PROFILE_ID}")
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -320,6 +507,38 @@ mod tests {
             let path = std::fs::canonicalize(path).unwrap();
             assert!(verify_executable(name, &path).is_err(), "{name}");
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unknown_host_profile_fails_closed_instead_of_becoming_a_success_fixture() {
+        if host_audited_apple_profile().is_ok() {
+            return;
+        }
+        let rejected = [
+            ("cat", "/bin/cat"),
+            ("head", "/usr/bin/head"),
+            ("tail", "/usr/bin/tail"),
+            ("wc", "/usr/bin/wc"),
+            ("grep", "/usr/bin/grep"),
+            ("ls", "/bin/ls"),
+            ("pwd", "/bin/pwd"),
+        ]
+        .into_iter()
+        .filter_map(|(requested, path)| {
+            let canonical = std::fs::canonicalize(path).ok()?;
+            verify_executable(requested, &canonical).err()
+        })
+        .any(|error| {
+            matches!(
+                error,
+                VerifyError::SystemProfileMismatch | VerifyError::ContentDigestMismatch
+            )
+        });
+        assert!(
+            rejected,
+            "unknown host must reject at least one audited tool"
+        );
     }
 
     #[cfg(not(target_os = "macos"))]

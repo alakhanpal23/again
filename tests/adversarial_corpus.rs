@@ -16,10 +16,13 @@ use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
+fn audited_host_profile_available() -> bool {
+    again::executable::host_audited_apple_profile().is_ok()
+}
+
 fn again_binary() -> PathBuf {
-    env::var_os("CARGO_BIN_EXE_again")
-        .expect("Cargo must provide the compiled Again binary")
-        .into()
+    PathBuf::from(env!("CARGO_BIN_EXE_again"))
 }
 
 fn hook_event(event_name: &str, tool_name: &str, cwd: &Path, command: Option<&str>) -> String {
@@ -42,14 +45,24 @@ fn hook_event(event_name: &str, tool_name: &str, cwd: &Path, command: Option<&st
 }
 
 fn invoke_hook(root: &Path, input: &str, path: Option<&Path>) -> Output {
-    let state = root.join("again-state");
+    let name = root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("workspace");
+    let state = root
+        .parent()
+        .unwrap_or(root)
+        .join(format!(".{name}-again-state"));
     let home = root.join("home");
     fs::create_dir_all(&state).unwrap();
     fs::create_dir_all(&home).unwrap();
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
 
     let mut command = Command::new(again_binary());
+    remove_unmodeled_ambient_inputs(&mut command);
     command
         .arg("hook")
+        .arg("--experimental-unsafe-rewrite")
         .current_dir(root)
         .env("AGAIN_HOME", state)
         .env("HOME", home)
@@ -70,6 +83,38 @@ fn invoke_hook(root: &Path, input: &str, path: Option<&Path>) -> Output {
         .write_all(input.as_bytes())
         .expect("write hook input");
     child.wait_with_output().expect("wait for Again hook")
+}
+
+fn remove_unmodeled_ambient_inputs(command: &mut Command) {
+    for (name, _) in env::vars_os() {
+        let Some(name_text) = name.to_str() else {
+            command.env_remove(name);
+            continue;
+        };
+        if name_text.starts_with("DYLD_")
+            || name_text.starts_with("LD_")
+            || name_text.starts_with("Malloc")
+            || name_text.starts_with("MALLOC_")
+            || matches!(
+                name_text,
+                "ASAN_OPTIONS"
+                    | "LSAN_OPTIONS"
+                    | "MSAN_OPTIONS"
+                    | "TSAN_OPTIONS"
+                    | "UBSAN_OPTIONS"
+                    | "GCONV_PATH"
+                    | "LOCPATH"
+                    | "NLSPATH"
+                    | "PATH_LOCALE"
+                    | "TERMCAP"
+                    | "TERMINFO"
+                    | "TERMINFO_DIRS"
+                    | "TZDIR"
+            )
+        {
+            command.env_remove(name);
+        }
+    }
 }
 
 fn assert_no_rewrite(root: &Path, command: &str, path: Option<&Path>) {
@@ -175,6 +220,10 @@ fn deterministic_adversarial_corpus_is_fail_closed() {
         "git push origin main",
         "rm -f input.txt",
         "cat --bad-flag input.txt",
+        "rg needle -n",
+        "rg needle --no-ignore",
+        "rg -E utf-8 needle",
+        "grep needle -n input.txt",
         "definitely-not-an-audited-command input.txt",
     ] {
         assert_no_rewrite(&workspace, command, None);
@@ -194,18 +243,31 @@ fn deterministic_adversarial_corpus_is_fail_closed() {
 
     #[cfg(target_os = "macos")]
     let eligible = [
-        "cat input.txt",
-        "head -n 1 input.txt",
-        "wc -l input.txt",
-        "ls input.txt",
-        "pwd",
+        "/bin/cat input.txt",
+        "/usr/bin/head -n 1 input.txt",
+        "/usr/bin/wc -l input.txt",
+        "/bin/ls --color=never input.txt",
+        "/bin/pwd -P",
     ];
     #[cfg(target_os = "macos")]
+    let eligible_profile_available = audited_host_profile_available();
+    #[cfg(target_os = "macos")]
     for command in eligible {
-        assert_rewrite(&workspace, command);
+        if eligible_profile_available {
+            assert_rewrite(&workspace, command);
+        } else {
+            assert_no_rewrite(&workspace, command, None);
+        }
     }
+    // Even the controlled experimental path never rewrites a bare command:
+    // shell aliases/functions and startup files are outside the hook envelope.
+    assert_no_rewrite(&workspace, "cat input.txt", None);
     #[cfg(not(target_os = "macos"))]
-    for command in ["cat input.txt", "head -n 1 input.txt", "wc -l input.txt"] {
+    for command in [
+        "/bin/cat input.txt",
+        "/usr/bin/head -n 1 input.txt",
+        "/usr/bin/wc -l input.txt",
+    ] {
         assert_no_rewrite(&workspace, command, None);
     }
 
@@ -216,10 +278,18 @@ fn deterministic_adversarial_corpus_is_fail_closed() {
     let fake_cat = fake_bin.join("cat");
     fs::write(&fake_cat, b"#!/bin/sh\nexit 0\n").unwrap();
     fs::set_permissions(&fake_cat, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_no_rewrite(&workspace, "cat input.txt", Some(&fake_bin));
+    assert_no_rewrite(
+        &workspace,
+        &format!("{} input.txt", fake_cat.display()),
+        Some(&fake_bin),
+    );
 
     #[cfg(target_os = "macos")]
-    let eligible_count = eligible.len();
+    let eligible_count = if eligible_profile_available {
+        eligible.len()
+    } else {
+        0
+    };
     #[cfg(not(target_os = "macos"))]
     let eligible_count = 0;
     eprintln!(

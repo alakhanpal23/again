@@ -7,19 +7,25 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
-
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy
+      - run: cargo +1.88.0 fmt --check
+      - run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo +1.88.0 test --locked --all-features
+      - name: Run the deterministic 100,000-case gate
+        run: cargo +1.88.0 test --locked --test generated_differential generated_differential_100k -- --ignored --exact --nocapture

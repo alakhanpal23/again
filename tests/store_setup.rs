@@ -22,13 +22,10 @@ fn executable_with_shell_sensitive_path(temp: &TempDir) -> std::path::PathBuf {
 #[test]
 fn cas_detects_corruption_after_storage() {
     let temp = TempDir::new().unwrap();
-    let store = Store::open(temp.path()).unwrap();
+    let state = temp.path().join("state");
+    let store = Store::open(&state).unwrap();
     let digest = store.put_blob(b"immutable bytes").unwrap();
-    let blob_path = temp
-        .path()
-        .join("blobs")
-        .join(&digest[..2])
-        .join(&digest[2..]);
+    let blob_path = state.join("blobs").join(&digest[..2]).join(&digest[2..]);
 
     fs::write(&blob_path, b"tampered bytes").unwrap();
     let error = store.get_blob(&digest).unwrap_err().to_string();
@@ -41,7 +38,7 @@ fn cas_detects_corruption_after_storage() {
 #[test]
 fn same_key_divergence_is_quarantined_and_hidden() {
     let temp = TempDir::new().unwrap();
-    let mut store = Store::open(temp.path()).unwrap();
+    let mut store = Store::open(temp.path().join("state")).unwrap();
     let first = store
         .insert_result("same-key", b"first", b"", 0, 7, "v0", "{}")
         .unwrap();
@@ -65,25 +62,67 @@ fn same_key_divergence_is_quarantined_and_hidden() {
 }
 
 #[test]
-fn delivery_state_is_separate_per_session() {
+fn delivery_state_is_separate_per_session_and_context() {
     let temp = TempDir::new().unwrap();
-    let mut store = Store::open(temp.path()).unwrap();
+    let mut store = Store::open(temp.path().join("state")).unwrap();
     let result = store
         .insert_result("key", b"stdout", b"stderr", 0, 20, "v0", "{}")
         .unwrap();
 
-    assert!(!store.was_delivered("session-a", &result.id).unwrap());
-    assert!(!store.was_delivered("session-b", &result.id).unwrap());
-    store.mark_delivered("session-a", &result.id).unwrap();
-    store.mark_delivered("session-a", &result.id).unwrap();
-    assert!(store.was_delivered("session-a", &result.id).unwrap());
-    assert!(!store.was_delivered("session-b", &result.id).unwrap());
+    assert!(
+        !store
+            .was_delivered("session-a", "root-turn-a", &result.id)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .was_delivered("session-b", "root-turn-a", &result.id)
+            .unwrap()
+    );
+    store
+        .mark_delivered("session-a", "root-turn-a", &result.id)
+        .unwrap();
+    store
+        .mark_delivered("session-a", "root-turn-a", &result.id)
+        .unwrap();
+    assert!(
+        store
+            .was_delivered("session-a", "root-turn-a", &result.id)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .was_delivered("session-a", "agent-turn-a", &result.id)
+            .unwrap()
+    );
+    assert!(
+        !store
+            .was_delivered("session-b", "root-turn-a", &result.id)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .clear_deliveries_for_context("session-a", "root-turn-a")
+            .unwrap(),
+        1
+    );
+    assert!(
+        !store
+            .was_delivered("session-a", "root-turn-a", &result.id)
+            .unwrap()
+    );
+    assert_eq!(
+        store
+            .clear_deliveries_for_context("session-a", "root-turn-a")
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
 fn stats_aggregate_execution_replay_bypass_and_quarantine_events() {
     let temp = TempDir::new().unwrap();
-    let mut store = Store::open(temp.path()).unwrap();
+    let mut store = Store::open(temp.path().join("state")).unwrap();
     let result = store
         .insert_result("key", b"stdout", b"", 0, 20, "v0", "{}")
         .unwrap();
@@ -193,7 +232,10 @@ fn install_is_idempotent_and_preserves_unrelated_hooks() {
     assert_eq!(document["description"], "keep me");
     assert_eq!(document["other"]["value"], 42);
     assert!(second.rendered.contains("other-hook"));
-    assert_eq!(second.rendered.matches(AGAIN_SENTINEL).count(), 1);
+    assert_eq!(second.rendered.matches(AGAIN_SENTINEL).count(), 3);
+    assert!(document["hooks"]["PreToolUse"].is_array());
+    assert!(document["hooks"]["PreCompact"].is_array());
+    assert!(document["hooks"]["PostCompact"].is_array());
 }
 
 #[test]

@@ -1,37 +1,43 @@
 # Delivery roadmap and gates
 
-Dates are phase labels, not excuses to weaken the safety invariant. A feature ships only when its gate passes.
+Dates are phase labels, not excuses to widen the documented reuse boundary. A feature ships only when its gate passes.
 
 ## Overnight vertical slice
 
 Sequence:
 
-1. Freeze product promise, first user, v0 allowlist, bypass rules, and EffectIR v1.
-2. Build native CLI, Codex PreToolUse adapter, opaque call handoff, idempotent dry-run setup, and doctor.
+1. Freeze product promise, first user, v0 allowlist, refusal/no-store rules, and EffectIR v1.
+2. Build native explicit `again run`, an ownership-checked instruction-only Codex skill, doctor scope reporting, and a true no-op production hook while effective workdir/TTY/shell/remote semantics are hidden. Retain exact-envelope, explicit-absolute-executable and opaque-handoff plumbing for experimental tests only.
 3. Build deterministic workspace/request fingerprint, SQLite index, immutable blob store, exact result replay, and full-output retrieval.
-4. Add same-session exact-output references, stats, and human/machine-readable explanations.
-5. Run policy tables, hook-contract fixtures, mutation invalidation, symlink/path escape, corruption, concurrency, crash, and non-zero-result tests.
-6. Benchmark cold overhead, warm latency, wall time, output bytes, and context-byte reduction on controlled fixtures.
-7. Test an isolated Codex install/config, record limitations, commit and push only a green checkpoint.
+4. Return exact full streams on every hit; add stats and human/machine-readable explanations. Keep delivery-ledger compaction disabled until Codex supplies a stable delivery receipt.
+5. Run policy tables, no-op hook/envelope fixtures, explicit-run TTY behavior, mutation invalidation, state/path symlink, ownership, mode and hard-link checks, output-limit/nonempty-stderr admission, corruption, concurrency, crash, and non-zero-result tests.
+6. Run `bench/direct_benchmark.py` for cold overhead, warm latency including the exact-executable probe child, wall time, mutation invalidation, resource observations, and full-stream equality with non-TTY streams.
+7. Test personal-only and project-only Codex skill installs, record limitations, and commit only a green checkpoint.
 
 Success gates:
 
 - zero false hits in the adversarial fixture suite;
-- all unsafe fixtures pass through without hook auto-allow;
-- byte-perfect first delivery and reliable `show` recovery;
-- compact references only after full same-session delivery;
-- p95 hook classification under 10 ms and local hit under 100 ms on the development machine;
+- every production hook fixture emits no automatic allow/rewrite decision;
+- byte-perfect full stdout/stderr on every miss and hit, plus reliable `show` retrieval;
+- explicit `again run` resolves only audited executables from the actual local tool-shell context;
+- exact tool BLAKE3 and exact OS semantic profile match `strict-read-v0.5`; unknown updates fail closed;
+- every unmodeled loader, sanitizer, locale, terminal, or timezone environment override in the documented denylist refuses admission;
+- keys/proofs partition real/effective credentials, supplementary groups, supported macOS rlimits, and signal mask/dispositions;
+- every served hit passes a fixed-argument exact-executable capability probe without rerunning requested argv;
+- explicit TTY calls execute once uncached with inherited streams;
+- explicit policy refusals never execute the command; callers rerun original argv unchanged;
+- reusable results require exit zero, empty stderr, bounded complete captures, stable observations and shadow equality;
+- p95 explicit-CLI warm hit under 100 ms on the development machine;
 - warm speedup at least 3x on fixtures whose original duration is at least 500 ms;
-- at least 50% duplicate output bytes removed in repeated-session fixtures;
-- install/setup under one minute excluding the explicit Codex trust review.
+- install and first explicit cached call under one minute, with no hook trust review.
 
-Kill or narrow immediately if any stale/incorrect result is served, a rewrite changes an unsafe call’s approval behavior, exact output cannot be recovered, or median eligible warm speedup is below 2x.
+Kill or narrow immediately if any known stale/incorrect result is served, the production hook emits an automatic allow/rewrite decision, a cache hit changes either output stream, or median eligible warm speedup is below 2x.
 
 ## Days 1–7: trusted local alpha
 
-### Day 1 — correctness corpus
+### Day 1 — reuse corpus
 
-Expand to at least 1,000 deterministic/adversarial executions across Rust, Python, Go, TypeScript and shell repositories. Add model-based/property tests for parser and filesystem invalidation. Publish every failure class as a regression fixture.
+Expand to at least 1,000 deterministic/adversarial executions across Rust, Python, Go, TypeScript and shell repositories. Add property tests for parser and filesystem invalidation, `pwd -P`, `ls --color=never`, explicit `grep`/`rg` paths, `rg --no-ignore --sort=path`, recursive `.git` aliases, no-op hook envelopes, exact executable/OS profiles and unknown-profile refusal, ambient-input denylist coverage, runtime-context partitions, capability-probe failures, state-root placement and ownership/link/mode checks, configured ancestor owner/sticky rules, same-user/root state-parent races, bounded output, and empty-stderr admission. Publish every failure class as a regression fixture. Treat concurrent path mutation and transient global-resource changes as unresolved until stronger execution/snapshot boundaries exist.
 
 ### Day 2 — Linux trace boundary
 
@@ -47,11 +53,11 @@ Shadow 100% of newly eligible hits; compare exact streams/status, canonical Effe
 
 ### Day 5 — real agent sessions
 
-Capture opt-in local metrics on representative Codex tasks without collecting command text or output. Measure total task latency, miss overhead, reuse rate, repeated output bytes, explicit full-output fetches, and behavioral failures.
+Capture opt-in local metrics on representative Codex tasks without collecting command text or output. Measure total task latency, explicit-prefix adoption, miss overhead, reuse rate, full-stream byte cost, uncached TTY executions, and behavioral failures.
 
 ### Day 6 — packaging and distribution
 
-Reproducible macOS/Linux releases, checksums/SBOM, Homebrew tap, install script with signature verification, uninstall, upgrade, schema migration, bounded storage and GC.
+Normalized macOS/Linux releases, checksums/source SBOM, Homebrew tap, install script with signature verification, uninstall, upgrade, schema migration, bounded storage and GC. An installable artifact must still report unsupported and disable reuse unless its backend/profile is audited. Claim bit reproducibility only after an independent rebuild comparison.
 
 ### Day 7 — outside alpha
 
@@ -67,7 +73,7 @@ Define content-addressed manifest/blob APIs with policy/profile identity, signed
 
 ### Security and tenancy
 
-End-to-end TLS, encrypted storage, tenant/repository namespaces, least-privilege tokens, ACLs, audit events, retention, deletion, quotas, rate limiting, secret-taint local-only policy, threat model, dependency/SBOM scanning and incident runbook.
+End-to-end TLS, encrypted storage, tenant/repository namespaces, least-privilege credentials, ACLs, audit events, retention, deletion, quotas, rate limiting, secret-taint local-only policy, threat model, dependency/SBOM scanning and incident runbook.
 
 ### CI and remote execution
 
@@ -75,7 +81,7 @@ GitHub Action and generic CI client; equivalent immutable images; staged output 
 
 ### Policy and analytics
 
-Organization policy packs, signed versions, “why run/reuse” audit, compute/time/token savings receipts, regression health, cache poisoning alerts, GC/storage reports. No surveillance telemetry by default.
+Organization policy packs, signed versions, “why run/reuse” audit, compute/time savings receipts, regression health, cache poisoning alerts, GC/storage reports. No surveillance telemetry by default.
 
 ### Design partners and pricing evidence
 
@@ -87,21 +93,20 @@ Day-30 gates:
 - no validation mismatch served after discovery;
 - cross-machine equality for 100 hermetic workloads;
 - p95 local hit below 100 ms and shared hit faster than original execution;
-- at least 30% median end-to-end wall-time reduction and 30% duplicate tool-output reduction on consenting team sessions;
+- at least 30% median end-to-end wall-time reduction on consenting team sessions while preserving exact full streams;
 - at least 20% useful cross-user hit rate for the chosen ICP;
 - three design partners willing to pay for shared reuse or verified compute savings.
 
-If cross-user hits remain below 10%, correctness data can still support local optimization, but the remote-cache business thesis must be reconsidered.
+If cross-user hits remain below 10%, reuse evidence can still support local optimization, but the remote-cache business thesis must be reconsidered.
 
 ## How each stage compounds the moat
 
 | Stage | Product asset | Compounding asset |
 |---|---|---|
-| v0 strict reads | instant setup and trustworthy fallback | labeled safe/unsafe command shapes, invalidation fixtures, output-repeat patterns |
-| traced local alpha | broader useful work | real EffectIR traces, minimized divergences, tool/runtime compatibility, proof history |
+| v0 strict reads | explicit one-command wrapper, instruction skill, and clear refusal/rerun behavior | labeled admitted/refused command shapes, invalidation fixtures, output-repeat patterns |
+| traced local alpha | broader useful work | real EffectIR traces, minimized divergences, tool/runtime compatibility, validation history |
 | outside alpha | reproducible value | repository/language workload coverage and accepted policy generalizations |
 | team cache | shared saved work | cross-machine equivalence graph, artifact provenance, organization-specific effect graph |
 | remote execution | high-value acceleration | calibrated compute profiles, failure/poisoning corpus, verified savings history |
 
-The moat is correctness and compatibility data that improves safe coverage. A blob store or opaque classifier alone is copyable.
-
+The moat is reuse-safety and compatibility evidence that improves conservative coverage. A blob store or opaque classifier alone is copyable.

@@ -1,7 +1,7 @@
 //! Local SQLite index and content-addressed output store.
 
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -21,6 +21,7 @@ const ORPHAN_ARTIFACT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
 const CLEANUP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 const CLEANUP_ROW_LIMIT: i64 = 512;
 const CLEANUP_ARTIFACT_LIMIT: i64 = 256;
+const MAX_LOCAL_BLOB_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
@@ -34,6 +35,7 @@ pub struct PendingCall {
     pub id: String,
     pub session_id: String,
     pub turn_id: Option<String>,
+    pub context_id: Option<String>,
     pub cwd: PathBuf,
     pub raw_command: String,
     pub argv: Vec<String>,
@@ -98,15 +100,14 @@ pub struct Store {
 impl Store {
     /// Resolve state for a repository-scoped execution.
     ///
-    /// Codex normally grants tool calls write access to the active workspace,
-    /// not to arbitrary locations under the user's home directory. Keeping the
-    /// default store in `<workspace>/.again` therefore makes the hook usable
-    /// without broadening Codex's sandbox. Tests and advanced users can still
-    /// provide `AGAIN_HOME` to select an isolated location explicitly.
+    /// The default is a private, per-user, per-workspace directory below the
+    /// operating system temporary directory. State must never live inside the
+    /// observed workspace: creating or updating it could otherwise change the
+    /// output of commands such as `ls -A .` and recursive `rg`.
+    ///
+    /// `AGAIN_HOME` selects one exact persistent store. It must be absolute and
+    /// external to the workspace.
     pub fn root_for_workspace(workspace: &Path) -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("AGAIN_HOME") {
-            return Ok(PathBuf::from(path));
-        }
         let workspace = fs::canonicalize(workspace)
             .with_context(|| format!("resolve Again workspace {}", workspace.display()))?;
         if !workspace.is_dir() {
@@ -115,37 +116,37 @@ impl Store {
                 workspace.display()
             );
         }
-        Ok(workspace.join(".again"))
+        if let Some(path) = std::env::var_os("AGAIN_HOME") {
+            let requested = PathBuf::from(path);
+            if !requested.is_absolute() {
+                bail!("AGAIN_HOME must be an absolute path outside the active workspace");
+            }
+            let root = prospective_store_root(&requested)?;
+            validate_external_state_root(&workspace, &root)?;
+            validate_trusted_state_ancestors(&root)?;
+            return Ok(root);
+        }
+        default_workspace_state_root(&workspace, &std::env::temp_dir())
     }
 
     pub fn open_for_workspace(workspace: &Path) -> Result<Self> {
-        Self::open(Self::root_for_workspace(workspace)?)
-    }
-
-    pub fn default_root() -> Result<PathBuf> {
-        if let Some(path) = std::env::var_os("AGAIN_HOME") {
-            return Ok(PathBuf::from(path));
-        }
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| anyhow!("HOME is unavailable; set AGAIN_HOME to a private directory"))?;
-        Ok(home.join(".again"))
-    }
-
-    pub fn open_default() -> Result<Self> {
-        Self::open(Self::default_root()?)
+        Self::open_with_policy(Self::root_for_workspace(workspace)?)
     }
 
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref().to_path_buf();
-        let blobs = root.join("blobs");
-        fs::create_dir_all(&blobs)
-            .with_context(|| format!("create Again state directory {}", blobs.display()))?;
-        set_private_dir(&root)?;
-        set_private_dir(&blobs)?;
+        Self::open_with_policy(root)
+    }
+
+    fn open_with_policy(root: impl AsRef<Path>) -> Result<Self> {
+        let root = prepare_store_root(root.as_ref())?;
+        let blobs = prepare_private_child_dir(&root, "blobs")?;
         create_self_ignoring_gitignore(&root)?;
 
         let database = root.join("again.sqlite");
+        reject_unsafe_existing_file(&database, "Again database")?;
+        reject_unsafe_existing_file(&root.join("again.sqlite-wal"), "Again WAL")?;
+        reject_unsafe_existing_file(&root.join("again.sqlite-shm"), "Again SHM")?;
+        ensure_private_database_file(&database)?;
         let conn = Connection::open(&database)
             .with_context(|| format!("open Again database {}", database.display()))?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -162,6 +163,8 @@ impl Store {
         store.migrate()?;
         store.maybe_cleanup()?;
         set_private_file(&database)?;
+        set_private_file(&store.root.join("again.sqlite-wal"))?;
+        set_private_file(&store.root.join("again.sqlite-shm"))?;
         Ok(store)
     }
 
@@ -276,6 +279,26 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 4 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE pending_calls ADD COLUMN context_id TEXT;
+                DELETE FROM pending_calls;
+                DROP TABLE IF EXISTS deliveries;
+                CREATE TABLE deliveries (
+                    session_id TEXT NOT NULL,
+                    context_id TEXT NOT NULL,
+                    result_id TEXT NOT NULL,
+                    delivered_ms INTEGER NOT NULL,
+                    PRIMARY KEY (session_id, context_id, result_id),
+                    FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE
+                );
+                PRAGMA user_version = 4;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -283,6 +306,7 @@ impl Store {
         &self,
         session_id: &str,
         turn_id: Option<&str>,
+        context_id: Option<&str>,
         cwd: &Path,
         raw_command: &str,
         argv: &[String],
@@ -292,16 +316,18 @@ impl Store {
             id,
             session_id: session_id.to_owned(),
             turn_id: turn_id.map(ToOwned::to_owned),
+            context_id: context_id.map(ToOwned::to_owned),
             cwd: cwd.to_path_buf(),
             raw_command: raw_command.to_owned(),
             argv: argv.to_vec(),
         };
         self.conn.execute(
-            "INSERT INTO pending_calls (id, session_id, turn_id, cwd, raw_command, argv_json, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO pending_calls (id, session_id, turn_id, context_id, cwd, raw_command, argv_json, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 call.id,
                 call.session_id,
                 call.turn_id,
+                call.context_id,
                 call.cwd.to_string_lossy(),
                 call.raw_command,
                 serde_json::to_string(&call.argv)?,
@@ -314,13 +340,13 @@ impl Store {
     pub fn get_call(&self, id: &str) -> Result<Option<PendingCall>> {
         self.conn
             .query_row(
-                "SELECT id, session_id, turn_id, cwd, raw_command, argv_json FROM pending_calls WHERE id = ?1",
+                "SELECT id, session_id, turn_id, context_id, cwd, raw_command, argv_json FROM pending_calls WHERE id = ?1",
                 [id],
                 |row| {
-                    let argv_json: String = row.get(5)?;
+                    let argv_json: String = row.get(6)?;
                     let argv = serde_json::from_str(&argv_json).map_err(|error| {
                         rusqlite::Error::FromSqlConversionFailure(
-                            5,
+                            6,
                             rusqlite::types::Type::Text,
                             Box::new(error),
                         )
@@ -329,8 +355,9 @@ impl Store {
                         id: row.get(0)?,
                         session_id: row.get(1)?,
                         turn_id: row.get(2)?,
-                        cwd: PathBuf::from(row.get::<_, String>(3)?),
-                        raw_command: row.get(4)?,
+                        context_id: row.get(3)?,
+                        cwd: PathBuf::from(row.get::<_, String>(4)?),
+                        raw_command: row.get(5)?,
                         argv,
                     })
                 },
@@ -346,6 +373,9 @@ impl Store {
     }
 
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
+        if bytes.len() > MAX_LOCAL_BLOB_BYTES {
+            bail!("Again blob exceeds the local 16 MiB limit");
+        }
         let digest = blake3::hash(bytes).to_hex().to_string();
         let target = self.blob_path(&digest)?;
         // File publication and lifecycle cleanup share the SQLite write lock. This
@@ -363,7 +393,10 @@ impl Store {
 
     pub fn get_blob(&self, digest: &str) -> Result<Vec<u8>> {
         let path = self.blob_path(digest)?;
-        let bytes = fs::read(&path).with_context(|| format!("read blob {digest}"))?;
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("inspect blob {digest}"))?;
+        validate_owned_regular_file(&path, &metadata, "Again blob")?;
+        let bytes = read_blob_bounded(&path, digest)?;
         let actual = blake3::hash(&bytes).to_hex().to_string();
         if actual != digest {
             bail!("CAS corruption: blob {digest} hashes to {actual}");
@@ -420,7 +453,11 @@ impl Store {
             }
             if existing.stdout_digest != result.stdout_digest
                 || existing.stderr_digest != result.stderr_digest
+                || existing.stdout_bytes != result.stdout_bytes
+                || existing.stderr_bytes != result.stderr_bytes
                 || existing.exit_code != result.exit_code
+                || existing.policy_version != result.policy_version
+                || existing.proof_json != result.proof_json
             {
                 transaction.execute(
                     "UPDATE results SET quarantined = 1, quarantine_reason = ?2 WHERE id = ?1",
@@ -491,22 +528,45 @@ impl Store {
         Ok(())
     }
 
-    /// Returns true only when the exact result was already delivered in full to this session.
-    pub fn was_delivered(&self, session_id: &str, result_id: &str) -> Result<bool> {
+    /// Returns true only when the exact result was already delivered in full to
+    /// this Codex session, turn and root/subagent context.
+    pub fn was_delivered(
+        &self,
+        session_id: &str,
+        context_id: &str,
+        result_id: &str,
+    ) -> Result<bool> {
         let exists: bool = self.conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE session_id = ?1 AND result_id = ?2)",
-            params![session_id, result_id],
+            "SELECT EXISTS(SELECT 1 FROM deliveries WHERE session_id = ?1 AND context_id = ?2 AND result_id = ?3)",
+            params![session_id, context_id, result_id],
             |row| row.get(0),
         )?;
         Ok(exists)
     }
 
-    pub fn mark_delivered(&self, session_id: &str, result_id: &str) -> Result<()> {
+    pub fn mark_delivered(
+        &self,
+        session_id: &str,
+        context_id: &str,
+        result_id: &str,
+    ) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO deliveries (session_id, result_id, delivered_ms) VALUES (?1, ?2, ?3)",
-            params![session_id, result_id, now_ms()],
+            "INSERT OR IGNORE INTO deliveries (session_id, context_id, result_id, delivered_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![session_id, context_id, result_id, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Invalidate full-output visibility evidence for the exact active Codex
+    /// turn and root/subagent context. Both compaction events call this
+    /// idempotently. Turn scoping also prevents stale evidence from surviving a
+    /// workspace change where another repository-local store received compact.
+    pub fn clear_deliveries_for_context(&self, session_id: &str, context_id: &str) -> Result<u64> {
+        let removed = self.conn.execute(
+            "DELETE FROM deliveries WHERE session_id = ?1 AND context_id = ?2",
+            params![session_id, context_id],
+        )?;
+        Ok(removed as u64)
     }
 
     pub fn quarantine(&self, result_id: &str, reason: &str) -> Result<()> {
@@ -856,6 +916,328 @@ fn file_digest_row_checksum(identity: &FileIdentity, digest: &[u8; 32]) -> [u8; 
     *hasher.finalize().as_bytes()
 }
 
+fn default_workspace_state_root(workspace: &Path, temporary_directory: &Path) -> Result<PathBuf> {
+    let temporary_directory = fs::canonicalize(temporary_directory).with_context(|| {
+        format!(
+            "resolve operating-system temporary directory {}",
+            temporary_directory.display()
+        )
+    })?;
+    let base = temporary_directory.join(format!("again-{}", user_namespace()));
+    validate_external_state_root(workspace, &base)?;
+    let base = prepare_store_root(&base)?;
+    let workspaces = prepare_private_child_dir(&base, "workspaces")?;
+    let root = workspaces.join(workspace_state_id(workspace));
+    validate_external_state_root(workspace, &root)?;
+    Ok(root)
+}
+
+fn workspace_state_id(workspace: &Path) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("again.workspace-state-path.v1");
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        hasher.update(workspace.as_os_str().as_bytes());
+    }
+    #[cfg(not(unix))]
+    hasher.update(workspace.to_string_lossy().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+#[cfg(unix)]
+fn user_namespace() -> String {
+    // SAFETY: `geteuid` has no preconditions and does not dereference pointers.
+    unsafe { libc::geteuid() }.to_string()
+}
+
+#[cfg(not(unix))]
+fn user_namespace() -> String {
+    let identity = std::env::var_os("USERNAME")
+        .or_else(|| std::env::var_os("USER"))
+        .unwrap_or_else(|| std::ffi::OsString::from("unknown"));
+    blake3::hash(identity.to_string_lossy().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
+fn prepare_store_root(requested: &Path) -> Result<PathBuf> {
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(requested)
+    };
+    match fs::symlink_metadata(&requested) {
+        Ok(metadata) => {
+            // Never chmod an arbitrary existing AGAIN_HOME or caller-supplied
+            // path: a typo such as AGAIN_HOME=$HOME must fail without changing
+            // broad directory permissions. Existing roots opt in with 0700.
+            validate_private_directory(&requested, &metadata, "Again state root")?;
+            fs::canonicalize(&requested)
+                .with_context(|| format!("canonicalize Again state root {}", requested.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = requested.parent().ok_or_else(|| {
+                anyhow!("Again state root has no parent: {}", requested.display())
+            })?;
+            let name = requested
+                .file_name()
+                .ok_or_else(|| anyhow!("Again state root has no final component"))?;
+            let parent = fs::canonicalize(parent).with_context(|| {
+                format!(
+                    "resolve parent of Again state root {}; create its parent directories first",
+                    requested.display()
+                )
+            })?;
+            let root = parent.join(name);
+            match create_private_directory(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("create Again state root {}", root.display()));
+                }
+            }
+            let metadata = fs::symlink_metadata(&root)
+                .with_context(|| format!("inspect Again state root {}", root.display()))?;
+            validate_private_directory(&root, &metadata, "Again state root")?;
+            fs::canonicalize(&root)
+                .with_context(|| format!("canonicalize Again state root {}", root.display()))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect Again state root {}", requested.display()))
+        }
+    }
+}
+
+fn prospective_store_root(requested: &Path) -> Result<PathBuf> {
+    let requested = requested.to_path_buf();
+    match fs::symlink_metadata(&requested) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("AGAIN_HOME must not be a symlink: {}", requested.display());
+            }
+            fs::canonicalize(&requested).with_context(|| {
+                format!(
+                    "resolve configured Again state root {}",
+                    requested.display()
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let parent = requested.parent().ok_or_else(|| {
+                anyhow!("Again state root has no parent: {}", requested.display())
+            })?;
+            let name = requested
+                .file_name()
+                .ok_or_else(|| anyhow!("Again state root has no final component"))?;
+            Ok(fs::canonicalize(parent)
+                .with_context(|| {
+                    format!(
+                        "resolve parent of Again state root {}; create its parent directories first",
+                        requested.display()
+                    )
+                })?
+                .join(name))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("inspect Again state root {}", requested.display()))
+        }
+    }
+}
+
+fn validate_external_state_root(workspace: &Path, root: &Path) -> Result<()> {
+    if root.starts_with(workspace) {
+        bail!(
+            "Again state must be outside the active workspace {}; set AGAIN_HOME to an absolute external directory",
+            workspace.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_trusted_state_ancestors(root: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let effective_uid = unsafe { libc::geteuid() };
+    let parent = root
+        .parent()
+        .ok_or_else(|| anyhow!("configured Again state root has no parent"))?;
+    for ancestor in parent.ancestors() {
+        let metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            format!(
+                "inspect configured Again state ancestor {}",
+                ancestor.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            bail!(
+                "configured Again state ancestor must be a real directory: {}",
+                ancestor.display()
+            );
+        }
+        if metadata.uid() != effective_uid && metadata.uid() != 0 {
+            bail!(
+                "configured Again state ancestor has an untrusted owner: {}",
+                ancestor.display()
+            );
+        }
+        let mode = metadata.permissions().mode();
+        if mode & 0o022 != 0 && mode & 0o1000 == 0 {
+            bail!(
+                "configured Again state ancestor is writable by other users without sticky protection: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_trusted_state_ancestors(_root: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn prepare_private_child_dir(parent: &Path, name: &str) -> Result<PathBuf> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || matches!(name, "." | "..") {
+        bail!("invalid Again state directory component");
+    }
+    let path = parent.join(name);
+    let created = match create_private_directory(&path) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("create Again state directory {}", path.display()));
+        }
+    };
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect Again state directory {}", path.display()))?;
+    let label = if created {
+        "new Again state directory"
+    } else {
+        "Again state directory"
+    };
+    validate_private_directory(&path, &metadata, label)?;
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+fn validate_owned_directory(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!(
+            "{label} must be a real directory, not a symlink: {}",
+            path.display()
+        );
+    }
+    validate_current_owner(path, metadata, label)
+}
+
+fn validate_private_directory(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    validate_owned_directory(path, metadata, label)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o700 {
+            bail!("{label} must already have mode 0700: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn reject_unsafe_existing_file(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_owned_regular_file(path, &metadata, label),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspect {label} {}", path.display())),
+    }
+}
+
+fn ensure_private_database_file(path: &Path) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(file) => {
+            file.sync_all()?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_unsafe_existing_file(path, "Again database")?;
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("create Again database {}", path.display()));
+        }
+    }
+    set_private_file(path)
+}
+
+fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    validate_owned_regular_file_identity(path, metadata, label)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            bail!("{label} must already have mode 0600: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn validate_owned_regular_file_identity(
+    path: &Path,
+    metadata: &fs::Metadata,
+    label: &str,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "{label} must be a regular file, not a symlink: {}",
+            path.display()
+        );
+    }
+    validate_current_owner(path, metadata, label)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 {
+            bail!("{label} must not be hard-linked: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_current_owner(path: &Path, metadata: &fs::Metadata, label: &str) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let effective_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != effective_uid {
+        bail!(
+            "{label} is not owned by the current user: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_current_owner(_path: &Path, _metadata: &fs::Metadata, _label: &str) -> Result<()> {
+    Ok(())
+}
+
 fn blob_path_under(blobs: &Path, digest: &str) -> Result<PathBuf> {
     if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         bail!("invalid BLAKE3 digest");
@@ -864,13 +1246,24 @@ fn blob_path_under(blobs: &Path, digest: &str) -> Result<PathBuf> {
 }
 
 fn ensure_blob_file(target: &Path, digest: &str, expected: &[u8]) -> Result<()> {
-    if target.exists() {
-        return verify_blob_file(target, digest, expected);
+    match fs::symlink_metadata(target) {
+        Ok(metadata) => {
+            validate_owned_regular_file(target, &metadata, "Again blob")?;
+            return verify_blob_file(target, digest, expected);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect Again blob {digest}"));
+        }
     }
 
     let parent = target.parent().context("blob target has no parent")?;
-    fs::create_dir_all(parent)?;
-    set_private_dir(parent)?;
+    let blobs = parent.parent().context("blob shard has no CAS parent")?;
+    let shard = parent
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| anyhow!("blob shard is not valid UTF-8"))?;
+    let parent = prepare_private_child_dir(blobs, shard)?;
     let staged = parent.join(format!(".{digest}.{}.tmp", Uuid::new_v4().simple()));
     let write_result = (|| -> Result<()> {
         let mut file = OpenOptions::new()
@@ -888,8 +1281,11 @@ fn ensure_blob_file(target: &Path, digest: &str, expected: &[u8]) -> Result<()> 
     }
     match fs::rename(&staged, target) {
         Ok(()) => Ok(()),
-        Err(error) if target.exists() => {
+        Err(error) if fs::symlink_metadata(target).is_ok() => {
             let _ = fs::remove_file(&staged);
+            let metadata = fs::symlink_metadata(target)
+                .with_context(|| format!("inspect raced Again blob {digest}"))?;
+            validate_owned_regular_file(target, &metadata, "Again blob")?;
             verify_blob_file(target, digest, expected).context(error)
         }
         Err(error) => {
@@ -900,7 +1296,7 @@ fn ensure_blob_file(target: &Path, digest: &str, expected: &[u8]) -> Result<()> 
 }
 
 fn verify_blob_file(path: &Path, digest: &str, expected: &[u8]) -> Result<()> {
-    let existing = fs::read(path).with_context(|| format!("read blob {digest}"))?;
+    let existing = read_blob_bounded(path, digest)?;
     let actual = blake3::hash(&existing).to_hex().to_string();
     if actual != digest {
         bail!("CAS corruption: blob {digest} hashes to {actual}");
@@ -909,6 +1305,23 @@ fn verify_blob_file(path: &Path, digest: &str, expected: &[u8]) -> Result<()> {
         bail!("CAS collision or corruption for blob {digest}");
     }
     Ok(())
+}
+
+fn read_blob_bounded(path: &Path, digest: &str) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("inspect blob {digest} before bounded read"))?;
+    if metadata.len() > MAX_LOCAL_BLOB_BYTES as u64 {
+        bail!("Again blob {digest} exceeds the local 16 MiB limit");
+    }
+    let file = File::open(path).with_context(|| format!("open blob {digest}"))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_LOCAL_BLOB_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read blob {digest}"))?;
+    if bytes.len() > MAX_LOCAL_BLOB_BYTES {
+        bail!("Again blob {digest} grew beyond the local 16 MiB limit");
+    }
+    Ok(bytes)
 }
 
 fn system_time_ms(time: SystemTime) -> Option<i64> {
@@ -929,7 +1342,9 @@ fn create_self_ignoring_gitignore(root: &Path) -> Result<()> {
             set_private_file(&path)?;
             Ok(())
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            reject_unsafe_existing_file(&path, "Again .gitignore")
+        }
         Err(error) => Err(error).with_context(|| format!("create {}", path.display())),
     }
 }
@@ -957,14 +1372,16 @@ fn now_ms() -> i64 {
         .min(i64::MAX as u128) as i64
 }
 
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 fn set_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
+    let metadata = fs::symlink_metadata(path)?;
+    validate_owned_directory(path, &metadata, "Again private directory")?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(test, not(unix)))]
 fn set_private_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -972,8 +1389,13 @@ fn set_private_dir(_path: &Path) -> Result<()> {
 #[cfg(unix)]
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    if path.exists() {
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            validate_owned_regular_file_identity(path, &metadata, "Again private file")?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
     Ok(())
 }
@@ -986,11 +1408,148 @@ fn set_private_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs::{File, FileTimes};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn state_root_and_fixed_children_reject_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+
+        let untrusted_root = temp.path().join("untrusted-root");
+        fs::create_dir(&untrusted_root).unwrap();
+        fs::set_permissions(&untrusted_root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Store::open_with_policy(&untrusted_root).is_err());
+        assert_eq!(
+            fs::symlink_metadata(&untrusted_root)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+
+        let root_link = temp.path().join("root-link");
+        symlink(&outside, &root_link).unwrap();
+        assert!(Store::open(&root_link).is_err());
+        assert!(!outside.join("blobs").exists());
+
+        let blobs_root = temp.path().join("blobs-root");
+        fs::create_dir(&blobs_root).unwrap();
+        set_private_dir(&blobs_root).unwrap();
+        symlink(&outside, blobs_root.join("blobs")).unwrap();
+        assert!(Store::open(&blobs_root).is_err());
+
+        let database_root = temp.path().join("database-root");
+        fs::create_dir(&database_root).unwrap();
+        set_private_dir(&database_root).unwrap();
+        let outside_file = outside.join("victim");
+        fs::write(&outside_file, b"unchanged").unwrap();
+        symlink(&outside_file, database_root.join("again.sqlite")).unwrap();
+        assert!(Store::open(&database_root).is_err());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"unchanged");
+
+        let ignore_root = temp.path().join(".again");
+        fs::create_dir(&ignore_root).unwrap();
+        set_private_dir(&ignore_root).unwrap();
+        symlink(&outside_file, ignore_root.join(".gitignore")).unwrap();
+        assert!(Store::open(&ignore_root).is_err());
+        assert_eq!(fs::read(&outside_file).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    fn default_state_is_external_stable_and_workspace_scoped() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let other_workspace = temp.path().join("other-workspace");
+        let temporary_directory = temp.path().join("system-temp");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&other_workspace).unwrap();
+        fs::create_dir(&temporary_directory).unwrap();
+
+        let root = default_workspace_state_root(&workspace, &temporary_directory).unwrap();
+        let repeated = default_workspace_state_root(&workspace, &temporary_directory).unwrap();
+        let other = default_workspace_state_root(&other_workspace, &temporary_directory).unwrap();
+
+        assert_eq!(root, repeated);
+        assert_ne!(root, other);
+        assert!(root.starts_with(temporary_directory.canonicalize().unwrap()));
+        assert!(!root.starts_with(workspace.canonicalize().unwrap()));
+        assert!(!workspace.join(".again").exists());
+        let store = Store::open(&root).unwrap();
+        assert_eq!(store.root(), root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn configured_state_must_be_external_and_final_symlinks_are_rejected() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir(&outside).unwrap();
+
+        assert!(validate_external_state_root(&workspace, &workspace.join(".again")).is_err());
+        assert!(validate_external_state_root(&workspace, &outside).is_ok());
+
+        let link = temp.path().join("configured-link");
+        symlink(&outside, &link).unwrap();
+        assert!(prospective_store_root(&link).is_err());
+    }
+
+    #[test]
+    fn configured_state_rejects_an_unprotected_writable_parent_namespace() {
+        let temp = TempDir::new().unwrap();
+        let parent = temp.path().join("shared-parent");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
+        let root = prospective_store_root(&parent.join("state")).unwrap();
+        assert!(validate_trusted_state_ancestors(&root).is_err());
+
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(validate_trusted_state_ancestors(&root).is_ok());
+    }
+
+    #[test]
+    fn blob_shards_and_reads_reject_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let bytes = b"immutable blob";
+        let digest = blake3::hash(bytes).to_hex().to_string();
+        symlink(&outside, store.blobs.join(&digest[..2])).unwrap();
+        assert!(store.put_blob(bytes).is_err());
+
+        fs::remove_file(store.blobs.join(&digest[..2])).unwrap();
+        let stored = store.put_blob(bytes).unwrap();
+        let path = store.blob_path(&stored).unwrap();
+        fs::remove_file(&path).unwrap();
+        let outside_file = outside.join("blob-victim");
+        fs::write(&outside_file, bytes).unwrap();
+        symlink(&outside_file, &path).unwrap();
+        assert!(store.get_blob(&stored).is_err());
+        assert_eq!(fs::read(&outside_file).unwrap(), bytes);
+    }
+
+    #[test]
+    fn blob_reads_are_bounded_even_if_state_is_tampered() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let digest = store.put_blob(b"small").unwrap();
+        let path = store.blob_path(&digest).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_LOCAL_BLOB_BYTES as u64 + 1)
+            .unwrap();
+        assert!(store.get_blob(&digest).is_err());
+    }
 
     fn test_file_identity() -> FileIdentity {
         FileIdentity {
@@ -1010,6 +1569,7 @@ mod tests {
     #[test]
     fn blobs_round_trip_and_detect_invalid_digest() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let store = Store::open(temp.path()).unwrap();
         let digest = store.put_blob(b"hello").unwrap();
         assert_eq!(store.get_blob(&digest).unwrap(), b"hello");
@@ -1019,6 +1579,7 @@ mod tests {
     #[test]
     fn file_digest_memo_survives_reopen_without_persisting_paths() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let identity = test_file_identity();
         let digest = [0x5a; 32];
         {
@@ -1043,6 +1604,7 @@ mod tests {
     #[test]
     fn corrupted_file_digest_row_is_a_miss_and_can_be_recomputed() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let identity = test_file_identity();
         let digest = [0x71; 32];
         let mut store = Store::open(temp.path()).unwrap();
@@ -1066,7 +1628,7 @@ mod tests {
     #[test]
     fn version_one_database_migrates_file_digest_table() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir_all(temp.path().join("blobs")).unwrap();
+        set_private_dir(temp.path()).unwrap();
         let database = temp.path().join("again.sqlite");
         Connection::open(&database)
             .unwrap()
@@ -1083,6 +1645,7 @@ mod tests {
                 "#,
             )
             .unwrap();
+        set_private_file(&database).unwrap();
 
         let store = Store::open(temp.path()).unwrap();
         let version: i64 = store
@@ -1120,11 +1683,13 @@ mod tests {
     #[test]
     fn pending_calls_round_trip_without_shell_interpolation() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let store = Store::open(temp.path()).unwrap();
         let call = store
             .create_call(
                 "session",
                 Some("turn"),
+                Some("root-turn"),
                 temp.path(),
                 "rg needle src",
                 &["rg".into(), "needle".into(), "src".into()],
@@ -1138,6 +1703,7 @@ mod tests {
     #[test]
     fn cleanup_expires_only_stale_unreferenced_state() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let mut store = Store::open(temp.path()).unwrap();
         let current = now_ms();
         let stale_pending = current - PENDING_CALL_TTL_MS - 1;
@@ -1152,7 +1718,7 @@ mod tests {
             )
             .unwrap();
         let recent = store
-            .create_call("session", None, temp.path(), "cat x", &["cat".into()])
+            .create_call("session", None, None, temp.path(), "cat x", &["cat".into()])
             .unwrap();
         store
             .conn
@@ -1222,6 +1788,7 @@ mod tests {
     #[test]
     fn cleanup_batches_are_strictly_bounded() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let mut store = Store::open(temp.path()).unwrap();
         let current = now_ms();
         let stale = current - PENDING_CALL_TTL_MS - 1;
@@ -1251,19 +1818,21 @@ mod tests {
     #[test]
     fn results_and_delivery_state_round_trip() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let mut store = Store::open(temp.path()).unwrap();
         let result = store
             .insert_result("key", b"out", b"", 0, 50, "v0", "{}")
             .unwrap();
         assert_eq!(store.get_result("key").unwrap(), Some(result.clone()));
-        assert!(!store.was_delivered("s", &result.id).unwrap());
-        store.mark_delivered("s", &result.id).unwrap();
-        assert!(store.was_delivered("s", &result.id).unwrap());
+        assert!(!store.was_delivered("s", "root-turn", &result.id).unwrap());
+        store.mark_delivered("s", "root-turn", &result.id).unwrap();
+        assert!(store.was_delivered("s", "root-turn", &result.id).unwrap());
     }
 
     #[test]
     fn same_key_with_different_output_is_quarantined() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         let mut store = Store::open(temp.path()).unwrap();
         store
             .insert_result("key", b"first", b"", 0, 1, "v0", "{}")
@@ -1279,6 +1848,7 @@ mod tests {
     #[test]
     fn concurrent_identical_writes_converge_on_one_result() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         drop(Store::open(temp.path()).unwrap());
         let root = temp.path().to_path_buf();
         let barrier = Arc::new(Barrier::new(8));
@@ -1313,6 +1883,7 @@ mod tests {
     #[test]
     fn concurrent_same_key_divergence_is_atomically_quarantined() {
         let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
         drop(Store::open(temp.path()).unwrap());
         let root = temp.path().to_path_buf();
         let barrier = Arc::new(Barrier::new(2));

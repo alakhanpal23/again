@@ -1,4 +1,4 @@
-//! Idempotent Codex hook installation and removal.
+//! Idempotent Codex integration installation and removal.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -11,6 +11,28 @@ use uuid::Uuid;
 
 const HOOK_SENTINEL: &str = "AGAIN_CODEX_HOOK_V1=1";
 const SNAPSHOT_SCHEMA: &str = "again.codex-hook-snapshot.v1";
+const SKILL_SNAPSHOT_SCHEMA: &str = "again.codex-skill-snapshot.v1";
+const CODEX_SKILL_NAME: &str = "again";
+const CODEX_SKILL_MANIFEST: &str = ".again-install-v1.json";
+const CODEX_SKILL: &str = r#"---
+name: again
+description: "Accelerate repeated supported local read-only shell calls with `again run --`; use for repository inspection commands, but not for mutating, networked, interactive, piped, redirected, or environment-sensitive work."
+---
+
+# Again
+
+For a supported, standalone, non-interactive, local read-only command, invoke the command through:
+
+```sh
+again run -- <command> <arguments...>
+```
+
+Use this only for `cat`, `head`, `tail`, `wc`, `ls --color=never`, `pwd -P`, `grep`, and `rg`. Every `rg` invocation must already include `--no-ignore --sort=path` and at least one explicit path operand. Keep the same working directory and argv the unwrapped command would have used.
+
+Again admits commands through a fail-closed policy. If it reports that a command is not eligible, rerun the original command normally and unchanged. Do not weaken or reshape the command merely to make it cacheable.
+
+Never wrap shell composition or expansion, including pipes, redirects, `&&`, substitutions, globs, or environment assignments. Never wrap a command that mutates state, uses the network, consumes stdin, needs a TTY, or reads outside the current repository. Never invoke Again's hidden `hook` or `exec` subcommands.
+"#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetupScope {
@@ -24,6 +46,30 @@ pub struct HookChange {
     pub changed: bool,
     pub backup: Option<PathBuf>,
     pub rendered: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillChange {
+    /// The `SKILL.md` file managed by this operation.
+    pub path: PathBuf,
+    pub changed: bool,
+    /// The skill text that would remain after the operation. Empty on removal.
+    pub rendered: String,
+}
+
+/// Installation state across the personal and repository Codex skill scopes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CodexSkillScopeStatus {
+    pub personal_dir: PathBuf,
+    pub project_dir: PathBuf,
+    pub personal_installed: bool,
+    pub project_installed: bool,
+}
+
+impl CodexSkillScopeStatus {
+    pub fn duplicate_again_skills(&self) -> bool {
+        self.personal_dir != self.project_dir && self.personal_installed && self.project_installed
+    }
 }
 
 /// Installation state across the two Codex hook scopes. Consumers such as
@@ -47,6 +93,353 @@ struct HookSnapshot {
     schema: String,
     original: Vec<u8>,
     installed: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SkillSnapshot {
+    schema: String,
+    skill_name: String,
+    installed: String,
+}
+
+/// Return the documented Codex skill directory for one setup scope.
+///
+/// `SetupScope::Global` means the current user's personal skill scope. Project
+/// callers should pass the repository root rather than an arbitrary child
+/// working directory.
+pub fn codex_skill_dir(scope: SetupScope, project: Option<&Path>) -> Result<PathBuf> {
+    match scope {
+        SetupScope::Global => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("HOME is unavailable"))?;
+            Ok(codex_personal_skill_dir(&home))
+        }
+        SetupScope::Project => {
+            let project =
+                project.ok_or_else(|| anyhow!("project scope requires a repository path"))?;
+            Ok(project
+                .join(".agents")
+                .join("skills")
+                .join(CODEX_SKILL_NAME))
+        }
+    }
+}
+
+/// Pure path helper used by callers that already resolved a user's home.
+pub fn codex_personal_skill_dir(home: &Path) -> PathBuf {
+    home.join(".agents").join("skills").join(CODEX_SKILL_NAME)
+}
+
+pub fn codex_skill_scope_status(
+    personal_dir: &Path,
+    project_dir: &Path,
+) -> Result<CodexSkillScopeStatus> {
+    Ok(CodexSkillScopeStatus {
+        personal_dir: personal_dir.to_path_buf(),
+        project_dir: project_dir.to_path_buf(),
+        personal_installed: is_codex_skill_installed(personal_dir)?,
+        project_installed: is_codex_skill_installed(project_dir)?,
+    })
+}
+
+/// Install the instruction-only Again skill without changing Codex hooks or
+/// configuration. Existing unowned `SKILL.md` files are never overwritten.
+pub fn install_codex_skill(skill_dir: &Path, dry_run: bool) -> Result<SkillChange> {
+    validate_skill_location(skill_dir)?;
+    let skill_path = skill_dir.join("SKILL.md");
+    let manifest_path = skill_dir.join(CODEX_SKILL_MANIFEST);
+    let current = read_optional_regular_file(&skill_path, "Codex skill")?;
+    let manifest_bytes = read_optional_regular_file(&manifest_path, "Again skill snapshot")?;
+    let snapshot = manifest_bytes
+        .as_deref()
+        .map(|bytes| parse_skill_snapshot(&manifest_path, bytes))
+        .transpose()?;
+
+    match (&current, &snapshot) {
+        (Some(_), None) => bail!(
+            "{} is not owned by Again; refusing to overwrite it",
+            skill_path.display()
+        ),
+        (None, Some(_)) => bail!(
+            "{} is missing while its Again ownership snapshot remains; refusing to guess which state is authoritative",
+            skill_path.display()
+        ),
+        (Some(current), Some(snapshot)) if current.as_slice() != snapshot.installed.as_bytes() => {
+            bail!(
+                "{} changed since Again installed it; refusing to overwrite user-owned changes",
+                skill_path.display()
+            )
+        }
+        _ => {}
+    }
+
+    let rendered = CODEX_SKILL.to_owned();
+    let changed = current.as_deref() != Some(rendered.as_bytes());
+    if !changed || dry_run {
+        return Ok(SkillChange {
+            path: skill_path,
+            changed,
+            rendered,
+        });
+    }
+
+    let directory_existed = skill_dir.exists();
+    fs::create_dir_all(skill_dir)
+        .with_context(|| format!("create Codex skill directory {}", skill_dir.display()))?;
+    validate_skill_location(skill_dir)?;
+
+    let previous_skill = current;
+    let previous_manifest = manifest_bytes;
+    let new_snapshot = SkillSnapshot {
+        schema: SKILL_SNAPSHOT_SCHEMA.to_owned(),
+        skill_name: CODEX_SKILL_NAME.to_owned(),
+        installed: rendered.clone(),
+    };
+    let new_manifest = serde_json::to_vec_pretty(&new_snapshot)?;
+
+    atomic_write_skill_file(&skill_path, rendered.as_bytes())?;
+    if let Err(error) = atomic_write_skill_file(&manifest_path, &new_manifest) {
+        rollback_skill_install(
+            &skill_path,
+            &manifest_path,
+            previous_skill.as_deref(),
+            previous_manifest.as_deref(),
+        );
+        if !directory_existed {
+            let _ = fs::remove_dir(skill_dir);
+        }
+        return Err(error).context("write Again skill ownership snapshot");
+    }
+
+    Ok(SkillChange {
+        path: skill_path,
+        changed: true,
+        rendered,
+    })
+}
+
+/// Remove only a byte-identical skill previously installed by Again.
+/// Unrelated files in the skill directory are preserved.
+pub fn remove_codex_skill(skill_dir: &Path, dry_run: bool) -> Result<SkillChange> {
+    validate_skill_location(skill_dir)?;
+    let skill_path = skill_dir.join("SKILL.md");
+    let manifest_path = skill_dir.join(CODEX_SKILL_MANIFEST);
+    let current = read_optional_regular_file(&skill_path, "Codex skill")?;
+    let manifest_bytes = read_optional_regular_file(&manifest_path, "Again skill snapshot")?;
+
+    match (current.as_ref(), manifest_bytes.as_ref()) {
+        (None, None) => {
+            return Ok(SkillChange {
+                path: skill_path,
+                changed: false,
+                rendered: String::new(),
+            });
+        }
+        (Some(_), None) => bail!(
+            "{} is not owned by Again; refusing to remove it",
+            skill_path.display()
+        ),
+        (None, Some(_)) => bail!(
+            "{} is missing while its Again ownership snapshot remains; refusing to remove partial state",
+            skill_path.display()
+        ),
+        (Some(_), Some(_)) => {}
+    }
+
+    let current = current.expect("checked above");
+    let manifest_bytes = manifest_bytes.expect("checked above");
+    let snapshot = parse_skill_snapshot(&manifest_path, &manifest_bytes)?;
+    if current.as_slice() != snapshot.installed.as_bytes() {
+        bail!(
+            "{} changed since Again installed it; refusing to remove user-owned changes",
+            skill_path.display()
+        );
+    }
+    let rendered = String::new();
+    if dry_run {
+        return Ok(SkillChange {
+            path: skill_path,
+            changed: true,
+            rendered,
+        });
+    }
+
+    transactional_remove_skill(&skill_path, &manifest_path)?;
+    let _ = fs::remove_dir(skill_dir);
+
+    Ok(SkillChange {
+        path: skill_path,
+        changed: true,
+        rendered,
+    })
+}
+
+pub fn is_codex_skill_installed(skill_dir: &Path) -> Result<bool> {
+    validate_skill_location(skill_dir)?;
+    let skill_path = skill_dir.join("SKILL.md");
+    let manifest_path = skill_dir.join(CODEX_SKILL_MANIFEST);
+    let current = read_optional_regular_file(&skill_path, "Codex skill")?;
+    let manifest = read_optional_regular_file(&manifest_path, "Again skill snapshot")?;
+    match (current, manifest) {
+        (None, None) | (Some(_), None) => Ok(false),
+        (None, Some(_)) => bail!(
+            "{} is missing while its Again ownership snapshot remains",
+            skill_path.display()
+        ),
+        (Some(current), Some(manifest)) => {
+            let snapshot = parse_skill_snapshot(&manifest_path, &manifest)?;
+            if current.as_slice() != snapshot.installed.as_bytes() {
+                bail!("{} differs from its Again snapshot", skill_path.display());
+            }
+            Ok(true)
+        }
+    }
+}
+
+fn validate_skill_location(skill_dir: &Path) -> Result<()> {
+    // The managed layout is `<scope-root>/.agents/skills/again`. Refuse
+    // symlinks or non-directories in its three installer-owned components so
+    // a repository cannot redirect setup outside its selected scope.
+    for component in skill_dir.ancestors().take(3) {
+        match fs::symlink_metadata(component) {
+            Ok(metadata) if metadata.file_type().is_symlink() => bail!(
+                "{} is a symlink; refusing to manage an indirect Codex skill directory",
+                component.display()
+            ),
+            Ok(metadata) if !metadata.is_dir() => {
+                bail!("{} is not a directory", component.display())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", component.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn read_optional_regular_file(path: &Path, description: &str) -> Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{} {} is a symlink", description, path.display())
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("{} {} is not a regular file", description, path.display())
+        }
+        Ok(_) => fs::read(path)
+            .with_context(|| format!("read {}", path.display()))
+            .map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn parse_skill_snapshot(path: &Path, bytes: &[u8]) -> Result<SkillSnapshot> {
+    let snapshot: SkillSnapshot =
+        serde_json::from_slice(bytes).with_context(|| format!("parse {}", path.display()))?;
+    if snapshot.schema != SKILL_SNAPSHOT_SCHEMA || snapshot.skill_name != CODEX_SKILL_NAME {
+        bail!(
+            "{} is not an Again skill ownership snapshot",
+            path.display()
+        );
+    }
+    Ok(snapshot)
+}
+
+fn rollback_skill_install(
+    skill_path: &Path,
+    manifest_path: &Path,
+    previous_skill: Option<&[u8]>,
+    previous_manifest: Option<&[u8]>,
+) {
+    match previous_skill {
+        Some(bytes) => {
+            let _ = atomic_write_skill_file(skill_path, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(skill_path);
+        }
+    }
+    match previous_manifest {
+        Some(bytes) => {
+            let _ = atomic_write_skill_file(manifest_path, bytes);
+        }
+        None => {
+            let _ = fs::remove_file(manifest_path);
+        }
+    }
+}
+
+fn transactional_remove_skill(skill_path: &Path, manifest_path: &Path) -> Result<()> {
+    let parent = skill_path
+        .parent()
+        .ok_or_else(|| anyhow!("Codex skill path has no parent"))?;
+    let nonce = Uuid::new_v4().simple();
+    let staged_skill = parent.join(format!(".again-remove-skill-{nonce}"));
+    let staged_manifest = parent.join(format!(".again-remove-manifest-{nonce}"));
+
+    fs::rename(skill_path, &staged_skill).with_context(|| {
+        format!(
+            "stage {} for ownership-checked removal",
+            skill_path.display()
+        )
+    })?;
+    if let Err(error) = fs::rename(manifest_path, &staged_manifest) {
+        fs::rename(&staged_skill, skill_path).with_context(|| {
+            format!(
+                "restore {} after removal staging failed: {error}",
+                skill_path.display()
+            )
+        })?;
+        return Err(error).with_context(|| format!("stage {}", manifest_path.display()));
+    }
+
+    fs::remove_file(&staged_manifest)
+        .with_context(|| format!("remove {}", staged_manifest.display()))?;
+    fs::remove_file(&staged_skill).with_context(|| format!("remove {}", staged_skill.display()))?;
+    Ok(())
+}
+
+fn atomic_write_skill_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("Codex skill path has no parent"))?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("create Codex skill directory {}", parent.display()))?;
+    let staged = parent.join(format!(".again-skill-{}.tmp", Uuid::new_v4().simple()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)
+            .with_context(|| format!("create {}", staged.display()))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        set_skill_file_permissions(&staged)?;
+        fs::rename(&staged, path)
+            .with_context(|| format!("install Codex skill file {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
+#[cfg(unix)]
+fn set_skill_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_skill_file_permissions(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn hook_path(scope: SetupScope, project: Option<&Path>) -> Result<PathBuf> {
@@ -92,7 +485,7 @@ pub fn install_codex_hook(path: &Path, executable: &Path, dry_run: bool) -> Resu
         );
     }
     let mut document = read_document(path)?;
-    let already_installed = document_contains_again_handler(&document);
+    let already_installed = document_contains_any_again_handler(&document);
     let original = serde_json::to_string_pretty(&document)? + "\n";
     remove_again_handlers(&mut document)?;
     add_again_handler(&mut document, executable)?;
@@ -201,9 +594,9 @@ pub fn remove_codex_hook(path: &Path, dry_run: bool) -> Result<HookChange> {
     })
 }
 
-fn document_contains_again_handler(document: &Value) -> bool {
+fn event_contains_again_handler(document: &Value, event: &str) -> bool {
     document
-        .pointer("/hooks/PreToolUse")
+        .pointer(&format!("/hooks/{event}"))
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -213,11 +606,23 @@ fn document_contains_again_handler(document: &Value) -> bool {
         .any(|command| command.contains(HOOK_SENTINEL))
 }
 
+fn document_contains_any_again_handler(document: &Value) -> bool {
+    ["PreToolUse", "PreCompact", "PostCompact"]
+        .iter()
+        .any(|event| event_contains_again_handler(document, event))
+}
+
+fn document_contains_complete_again_hook(document: &Value) -> bool {
+    ["PreToolUse", "PreCompact", "PostCompact"]
+        .iter()
+        .all(|event| event_contains_again_handler(document, event))
+}
+
 fn is_empty_again_scaffold(document: &Value) -> bool {
     document
         == &json!({
             "description": "Local Codex lifecycle hooks. Unrelated entries are preserved by Again.",
-            "hooks": { "PreToolUse": [] }
+            "hooks": {}
         })
 }
 
@@ -226,7 +631,7 @@ pub fn is_codex_hook_installed(path: &Path) -> Result<bool> {
         return Ok(false);
     }
     let document = read_document(path)?;
-    Ok(document_contains_again_handler(&document))
+    Ok(document_contains_complete_again_hook(&document))
 }
 
 fn read_document(path: &Path) -> Result<Value> {
@@ -261,17 +666,43 @@ fn add_again_handler(document: &mut Value, executable: &Path) -> Result<()> {
         .with_context(|| format!("resolve Again executable {}", executable.display()))?;
     let command = format!("{HOOK_SENTINEL} {} hook", shell_quote_path(&executable)?);
     let hooks = hooks_object(document)?;
-    let entries = hooks.entry("PreToolUse").or_insert_with(|| json!([]));
+    add_again_event_handler(
+        hooks,
+        "PreToolUse",
+        "^Bash$",
+        &command,
+        "Again: checking exact reuse",
+    )?;
+    for event in ["PreCompact", "PostCompact"] {
+        add_again_event_handler(
+            hooks,
+            event,
+            "^(manual|auto)$",
+            &command,
+            "Again: inactive lifecycle compatibility no-op",
+        )?;
+    }
+    Ok(())
+}
+
+fn add_again_event_handler(
+    hooks: &mut Map<String, Value>,
+    event: &str,
+    matcher: &str,
+    command: &str,
+    status_message: &str,
+) -> Result<()> {
+    let entries = hooks.entry(event).or_insert_with(|| json!([]));
     let entries = entries
         .as_array_mut()
-        .ok_or_else(|| anyhow!("hooks.PreToolUse must be an array"))?;
+        .ok_or_else(|| anyhow!("hooks.{event} must be an array"))?;
     entries.push(json!({
-        "matcher": "^Bash$",
+        "matcher": matcher,
         "hooks": [{
             "type": "command",
             "command": command,
             "timeout": 5,
-            "statusMessage": "Again: checking exact reuse"
+            "statusMessage": status_message
         }]
     }));
     Ok(())
@@ -279,27 +710,34 @@ fn add_again_handler(document: &mut Value, executable: &Path) -> Result<()> {
 
 fn remove_again_handlers(document: &mut Value) -> Result<usize> {
     let hooks = hooks_object(document)?;
-    let Some(entries) = hooks.get_mut("PreToolUse") else {
-        return Ok(0);
-    };
-    let entries = entries
-        .as_array_mut()
-        .ok_or_else(|| anyhow!("hooks.PreToolUse must be an array"))?;
     let mut removed = 0;
-    entries.retain_mut(|group| {
-        let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
-            return true;
+    for event in ["PreToolUse", "PreCompact", "PostCompact"] {
+        let remove_event = if let Some(entries) = hooks.get_mut(event) {
+            let entries = entries
+                .as_array_mut()
+                .ok_or_else(|| anyhow!("hooks.{event} must be an array"))?;
+            entries.retain_mut(|group| {
+                let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                    return true;
+                };
+                let before = handlers.len();
+                handlers.retain(|handler| {
+                    !handler
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .is_some_and(|command| command.contains(HOOK_SENTINEL))
+                });
+                removed += before - handlers.len();
+                !handlers.is_empty()
+            });
+            entries.is_empty()
+        } else {
+            false
         };
-        let before = handlers.len();
-        handlers.retain(|handler| {
-            !handler
-                .get("command")
-                .and_then(Value::as_str)
-                .is_some_and(|command| command.contains(HOOK_SENTINEL))
-        });
-        removed += before - handlers.len();
-        !handlers.is_empty()
-    });
+        if remove_event {
+            hooks.remove(event);
+        }
+    }
     Ok(removed)
 }
 
@@ -423,7 +861,9 @@ mod tests {
         let second = install_codex_hook(&path, &executable, false).unwrap();
         assert!(!second.changed);
         assert!(second.rendered.contains("other"));
-        assert_eq!(second.rendered.matches(HOOK_SENTINEL).count(), 1);
+        assert_eq!(second.rendered.matches(HOOK_SENTINEL).count(), 3);
+        assert!(second.rendered.contains("PreCompact"));
+        assert!(second.rendered.contains("PostCompact"));
     }
 
     #[test]

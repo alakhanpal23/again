@@ -1,7 +1,8 @@
 //! Content-derived request fingerprints for the conservative macOS v0.
 //!
-//! The fingerprint deliberately ignores access, creation, and modification times. It
-//! is derived from content, names, symlink targets, and Unix mode/type information.
+//! The legacy whole-workspace fingerprint ignores access, creation, and modification
+//! times. The scoped execution proof additionally binds Unix identity/change epochs
+//! so a byte-for-byte ABA mutation between validation runs cannot look unchanged.
 //! Callers must provide the complete environment visible to the child process; the
 //! returned value contains only digests of environment names and values.
 
@@ -16,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use blake3::{Hash, Hasher};
 use thiserror::Error;
 
-const FORMAT_VERSION: &[u8] = b"again-fingerprint-v1";
+const FORMAT_VERSION: &[u8] = b"again-fingerprint-v2";
 
 /// All execution inputs needed to construct a cache request fingerprint.
 ///
@@ -154,6 +155,9 @@ pub enum FingerprintError {
     #[error("symlink cycle encountered while hashing scoped content: {0}")]
     SymlinkCycle(PathBuf),
 
+    #[error("directory-listing symlink operands require option-aware semantics: {0}")]
+    SymlinkListingOperand(PathBuf),
+
     #[error("workspace is not a directory: {0}")]
     WorkspaceNotDirectory(PathBuf),
 
@@ -275,8 +279,10 @@ pub fn fingerprint(input: &FingerprintInput<'_>) -> Result<FingerprintResult, Fi
 /// This preserves the command, cwd, environment, executable, and request component
 /// encodings used by [`fingerprint`], while replacing its expensive generic tree
 /// with an explicit scope Merkle root. Unlike the legacy whole-workspace walker,
-/// scoped filesystem metadata includes size, uid, gid, and nanosecond mtime because
-/// commands such as `ls -l` and `ls -t` expose those values. A missing path is a
+/// scoped filesystem metadata includes device, inode, size, ownership, and
+/// nanosecond mtime/ctime because commands such as `ls -l` and `ls -t` expose
+/// metadata while the identity/ctime epoch prevents byte-for-byte ABA mutations
+/// from reusing an observation made against a different filesystem object. A missing path is a
 /// valid, deterministic observation tied to its nearest existing in-workspace
 /// ancestor, allowing the wrapped command to produce its normal nonzero result.
 pub fn fingerprint_scoped(
@@ -363,7 +369,7 @@ pub fn fingerprint_scoped_with_cache(
                     hash_fields("again.scope.identity-only.v1", std::iter::empty()),
                     0,
                 ),
-                ScopeEntry::ContentPath(relative) | ScopeEntry::RecursiveContentTree(relative) => {
+                ScopeEntry::ContentPath(relative) => {
                     let resolved = resolve_scope_operand(&canonical_workspace, relative)?;
                     let mut active = HashSet::new();
                     let tree =
@@ -376,6 +382,21 @@ pub fn fingerprint_scoped_with_cache(
                         ],
                     );
                     (scope_key(1, &resolved.relative), component, tree.entries)
+                }
+                ScopeEntry::RecursiveContentTree(relative) => {
+                    let resolved = resolve_scope_operand(&canonical_workspace, relative)?;
+                    reject_recursive_git_directory(&canonical_workspace, &resolved)?;
+                    let mut active = HashSet::new();
+                    let tree =
+                        walker.walk_content(&resolved.path, &resolved.relative, &mut active)?;
+                    let component = hash_fields(
+                        "again.scope.recursive-content-tree.v1",
+                        [
+                            resolved.relative.as_os_str().as_bytes(),
+                            tree.digest.as_bytes(),
+                        ],
+                    );
+                    (scope_key(4, &resolved.relative), component, tree.entries)
                 }
                 ScopeEntry::DirectoryListing(relative) => {
                     let resolved = resolve_scope_operand(&canonical_workspace, relative)?;
@@ -448,6 +469,35 @@ pub fn fingerprint_scoped_with_cache(
 struct ResolvedScopePath {
     path: PathBuf,
     relative: PathBuf,
+}
+
+fn reject_recursive_git_directory(
+    workspace: &Path,
+    resolved: &ResolvedScopePath,
+) -> Result<(), FingerprintError> {
+    let metadata = match fs::metadata(&resolved.path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(io_error(
+                "inspect recursive scope operand",
+                &resolved.path,
+                source,
+            ));
+        }
+    };
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    let canonical = canonicalize(&resolved.path, "canonicalize recursive scope operand")?;
+    ensure_within(&canonical, workspace, "recursive scope operand")?;
+    let relative = canonical
+        .strip_prefix(workspace)
+        .expect("ensure_within established recursive scope prefix");
+    if is_git_namespace(relative) {
+        return Err(FingerprintError::ExcludedScopePath(canonical));
+    }
+    Ok(())
 }
 
 fn resolve_scope_operand(
@@ -572,7 +622,11 @@ fn fingerprint_executable_with_cache(
     }
     let mut hasher = domain_hasher("again.executable.v1");
     put_bytes(&mut hasher, path.as_os_str().as_bytes());
+    put_u64(&mut hasher, initial_metadata.dev());
+    put_u64(&mut hasher, initial_metadata.ino());
     put_u32(&mut hasher, relevant_mode(&initial_metadata));
+    put_i64(&mut hasher, initial_metadata.ctime());
+    put_i64(&mut hasher, initial_metadata.ctime_nsec());
     hasher.update(content.as_bytes());
     Ok(hasher.finalize())
 }
@@ -737,20 +791,12 @@ impl ScopedWalker<'_, '_> {
         let kind = scoped_file_kind(path, &metadata)?;
 
         if metadata.file_type().is_symlink() {
-            let resolved = resolve_scoped_symlink(path, self.root)?;
-            if !same_metadata(&metadata, &resolved.metadata) {
-                return Err(FingerprintError::ConcurrentMutation {
-                    path: path.to_path_buf(),
-                });
-            }
-            let mut hasher = domain_hasher("again.directory-listing.symlink-operand.v1");
-            put_rich_metadata(&mut hasher, &metadata, kind);
-            put_bytes(&mut hasher, resolved.raw_target.as_os_str().as_bytes());
-            put_bytes(&mut hasher, resolved.relative.as_os_str().as_bytes());
-            return Ok(WalkResult {
-                digest: hasher.finalize(),
-                entries: 1,
-            });
+            // `ls link` follows a command-line directory symlink, whereas
+            // `ls -d link` observes the link entry. DirectoryListing does not
+            // encode that argv distinction, so accepting either here would be
+            // an incomplete proof. This guard also closes a race after policy
+            // classification but before fingerprinting.
+            return Err(FingerprintError::SymlinkListingOperand(path.to_path_buf()));
         }
 
         let canonical = canonicalize(path, "canonicalize listing operand")?;
@@ -790,11 +836,11 @@ impl ScopedWalker<'_, '_> {
         let mut members = Vec::new();
         for name in names {
             let child_path = path.join(&name);
-            let child_relative = relative.join(&name);
             let child_metadata = symlink_metadata(&child_path, "inspect listing member")?;
-            if is_excluded(&child_relative, &child_metadata) {
-                continue;
-            }
+            // A one-level `ls` can print excluded runtime names and can sort or
+            // classify them from metadata. Include the entry metadata without
+            // recursing into or opening its contents. Content/tree scopes still
+            // exclude these volatile namespaces.
             let child_kind = scoped_file_kind(&child_path, &child_metadata)?;
             let mut child_hasher = domain_hasher("again.directory-listing.member.v1");
             put_rich_metadata(&mut child_hasher, &child_metadata, child_kind);
@@ -979,12 +1025,16 @@ fn scoped_file_kind(path: &Path, metadata: &Metadata) -> Result<u8, FingerprintE
 
 fn put_rich_metadata(hasher: &mut Hasher, metadata: &Metadata, kind: u8) {
     hasher.update(&[kind]);
+    put_u64(hasher, metadata.dev());
+    put_u64(hasher, metadata.ino());
     put_u32(hasher, relevant_mode(metadata));
     put_u64(hasher, metadata.len());
     put_u32(hasher, metadata.uid());
     put_u32(hasher, metadata.gid());
     put_i64(hasher, metadata.mtime());
     put_i64(hasher, metadata.mtime_nsec());
+    put_i64(hasher, metadata.ctime());
+    put_i64(hasher, metadata.ctime_nsec());
 }
 
 fn same_metadata(left: &Metadata, right: &Metadata) -> bool {
@@ -1215,6 +1265,12 @@ fn is_git_log_path(relative: &Path) -> bool {
     components.len() >= 2 && components[0] == b".git" && components[1] == b"logs"
 }
 
+fn is_git_namespace(relative: &Path) -> bool {
+    normal_components(relative)
+        .first()
+        .is_some_and(|component| *component == b".git")
+}
+
 fn is_git_lock_path(relative: &Path) -> bool {
     let components = normal_components(relative);
     components
@@ -1286,8 +1342,21 @@ fn hash_file_with_cache(
     if identity.is_valid()
         && let Some(bytes) = cache.lookup(&identity)
     {
+        // A persistent digest proves prior content, not current authority to
+        // read it. Re-open and fstat on every hit so credential/sandbox changes
+        // cannot turn an unreadable native input into a cached success.
+        let file = File::open(path).map_err(|source| io_error(operation, path, source))?;
+        let opened_metadata = file
+            .metadata()
+            .map_err(|source| io_error("inspect opened cached file", path, source))?;
+        if !opened_metadata.is_file() {
+            return Err(FingerprintError::SpecialFile(path.to_path_buf()));
+        }
         let path_after = symlink_metadata(path, operation)?;
-        if !same_metadata(&path_before, &path_after) {
+        if !same_metadata(&path_before, &opened_metadata)
+            || !same_metadata(&path_before, &path_after)
+            || !same_metadata(&opened_metadata, &path_after)
+        {
             return Err(FingerprintError::ConcurrentMutation {
                 path: path.to_path_buf(),
             });
@@ -1534,6 +1603,22 @@ mod tests {
     }
 
     #[test]
+    fn memoized_digest_still_requires_current_read_authority() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("input");
+        fs::write(&path, b"previously readable").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        let identity = FileIdentity::from_metadata(&metadata);
+        let mut cache = CountingCache::default();
+        cache
+            .digests
+            .insert(identity, *blake3::hash(b"previously readable").as_bytes());
+
+        assert!(hash_file_with_cache(&path, "test read", &mut cache).is_err());
+    }
+
+    #[test]
     fn restored_mtime_cannot_hide_content_mutation_from_cache() {
         let fixture = Fixture::new();
         let selected = fixture.workspace.join("selected");
@@ -1565,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn inode_replacement_cannot_reuse_old_digest() {
+    fn inode_replacement_with_identical_bytes_changes_the_request_epoch() {
         let fixture = Fixture::new();
         let selected = fixture.workspace.join("selected");
         let replacement = fixture.workspace.join("replacement");
@@ -1588,8 +1673,39 @@ mod tests {
         assert_ne!(original.ino(), changed.ino());
 
         let second = fixture.fingerprint_scoped_cached(&scope, &mut cache);
-        assert_eq!(first.request_digest, second.request_digest);
+        assert_ne!(first.request_digest, second.request_digest);
         assert_eq!(cache.records, 3, "changed inode must force a byte read");
+    }
+
+    #[test]
+    fn byte_for_byte_restore_cannot_hide_an_aba_mutation() {
+        let fixture = Fixture::new();
+        let selected = fixture.workspace.join("selected");
+        fs::write(&selected, b"stable").expect("selected file");
+        let scope = [ScopeEntry::ContentPath(PathBuf::from("selected"))];
+        let mut cache = CountingCache::default();
+        let original = fs::metadata(&selected).expect("original metadata");
+        let first = fixture.fingerprint_scoped_cached(&scope, &mut cache);
+
+        fs::write(&selected, b"changed").expect("transient mutation");
+        fs::write(&selected, b"stable").expect("restore original bytes");
+        OpenOptions::new()
+            .write(true)
+            .open(&selected)
+            .expect("open selected")
+            .set_times(FileTimes::new().set_modified(original.modified().expect("original mtime")))
+            .expect("restore mtime");
+        let restored = fs::metadata(&selected).expect("restored metadata");
+        assert_eq!(original.len(), restored.len());
+        assert_eq!(original.mtime(), restored.mtime());
+        assert_eq!(original.mtime_nsec(), restored.mtime_nsec());
+        assert_ne!(
+            (original.ctime(), original.ctime_nsec()),
+            (restored.ctime(), restored.ctime_nsec())
+        );
+
+        let second = fixture.fingerprint_scoped_cached(&scope, &mut cache);
+        assert_ne!(first.request_digest, second.request_digest);
     }
 
     #[test]
@@ -1875,7 +1991,7 @@ mod tests {
     }
 
     #[test]
-    fn directory_listing_hashes_membership_and_metadata_but_not_file_content() {
+    fn directory_listing_conservatively_changes_after_a_member_content_mutation() {
         let fixture = Fixture::new();
         let source = fixture.workspace.join("src/main.rs");
         let original_mtime = fs::metadata(&source)
@@ -1885,7 +2001,10 @@ mod tests {
         let scope = [ScopeEntry::DirectoryListing(PathBuf::from("src"))];
         let before = fixture.fingerprint_scoped(&scope);
 
-        // Same-size content with restored metadata must not affect a listing scope.
+        // Although a plain listing does not expose member contents, changing a
+        // member advances its ctime. Binding the listing observation to that
+        // epoch is intentionally conservative: it closes same-size/restored-
+        // mtime ABA holes at the cost of a safe miss.
         fs::write(&source, b"fn nope() {}\n").expect("same-size content change");
         OpenOptions::new()
             .write(true)
@@ -1894,7 +2013,7 @@ mod tests {
             .set_times(FileTimes::new().set_modified(original_mtime))
             .expect("restore mtime");
         let content_changed = fixture.fingerprint_scoped(&scope);
-        assert_eq!(before.request_digest, content_changed.request_digest);
+        assert_ne!(before.request_digest, content_changed.request_digest);
 
         fs::write(fixture.workspace.join("src/member.rs"), b"").expect("new member");
         let member_added = fixture.fingerprint_scoped(&scope);
@@ -1954,24 +2073,113 @@ mod tests {
     #[test]
     fn scoped_directory_listing_rejects_special_members() {
         let fixture = Fixture::new();
-        let socket = fixture.workspace.join("src/socket");
+        let workspace_alias = fixture.workspace.with_file_name("workspace-alias");
+        symlink(&fixture.workspace, &workspace_alias).expect("workspace alias");
+        let socket = workspace_alias.join("src/socket");
         let _listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
             Err(error) => panic!("create unix socket: {error}"),
         };
+        // Scoped operands are walked below the canonical workspace. On macOS,
+        // temporary directories are commonly spelled below `/var` while
+        // canonicalization returns the `/private/var` alias. Compare the error
+        // against the same canonical identity used by the walker.
+        let canonical_socket = fs::canonicalize(&socket).expect("canonical socket path");
         let result = super::fingerprint_scoped(
             &FingerprintInput {
                 argv: &[OsString::from("tool")],
-                cwd: &fixture.workspace,
-                workspace: &fixture.workspace,
+                cwd: &workspace_alias,
+                workspace: &workspace_alias,
                 environment: &environment(),
                 executable: &fixture.executable,
             },
             &[ScopeEntry::DirectoryListing(PathBuf::from("src"))],
         );
 
-        assert!(matches!(result, Err(FingerprintError::SpecialFile(path)) if path == socket));
+        assert!(
+            matches!(result, Err(FingerprintError::SpecialFile(ref path)) if path == &canonical_socket),
+            "directory listing must fail closed on Unix socket member: {result:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_directory_listing_rejects_a_symlink_operand() {
+        let fixture = Fixture::new();
+        symlink("src", fixture.workspace.join("linked-src")).expect("directory symlink");
+        let result = super::fingerprint_scoped(
+            &FingerprintInput {
+                argv: &[OsString::from("ls"), OsString::from("linked-src")],
+                cwd: &fixture.workspace,
+                workspace: &fixture.workspace,
+                environment: &environment(),
+                executable: &fixture.executable,
+            },
+            &[ScopeEntry::DirectoryListing(PathBuf::from("linked-src"))],
+        );
+
+        assert!(
+            matches!(result, Err(FingerprintError::SymlinkListingOperand(ref path)) if path.ends_with("linked-src")),
+            "listing symlink operand must fail closed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn directory_listing_includes_excluded_member_metadata() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.workspace.join(".git")).expect("git directory");
+        let lock = fixture.workspace.join(".git/index.lock");
+        fs::write(&lock, b"one").expect("git lock");
+        let scope = [ScopeEntry::DirectoryListing(PathBuf::from(".git"))];
+        let before = fixture.fingerprint_scoped(&scope);
+
+        fs::write(&lock, b"a larger lock file").expect("change excluded member metadata");
+        let after = fixture.fingerprint_scoped(&scope);
+
+        assert_ne!(before.request_digest, after.request_digest);
+    }
+
+    #[test]
+    fn recursive_scope_rejects_git_directory_and_symlink_alias() {
+        let fixture = Fixture::new();
+        fs::create_dir(fixture.workspace.join(".git")).expect("git directory");
+        fs::create_dir_all(fixture.workspace.join(".git/refs")).expect("git refs");
+        symlink(".git", fixture.workspace.join("git-alias")).expect("git alias");
+        let input = FingerprintInput {
+            argv: &[OsString::from("rg")],
+            cwd: &fixture.workspace,
+            workspace: &fixture.workspace,
+            environment: &environment(),
+            executable: &fixture.executable,
+        };
+
+        for scope in [
+            ScopeEntry::RecursiveContentTree(PathBuf::from(".git")),
+            ScopeEntry::RecursiveContentTree(PathBuf::from(".git/refs")),
+            ScopeEntry::RecursiveContentTree(PathBuf::from("git-alias")),
+        ] {
+            let result = super::fingerprint_scoped(&input, &[scope]);
+            assert!(
+                matches!(result, Err(FingerprintError::ExcludedScopePath(_))),
+                "recursive Git scope must fail closed: {result:?}"
+            );
+        }
+
+        // A direct regular file remains a complete content observation even
+        // when it lives under `.git`; only recursive directory traversal has
+        // excluded descendants that make a narrow proof incomplete.
+        fs::write(
+            fixture.workspace.join(".git/HEAD"),
+            b"ref: refs/heads/main\n",
+        )
+        .expect("git HEAD");
+        assert!(
+            super::fingerprint_scoped(
+                &input,
+                &[ScopeEntry::RecursiveContentTree(PathBuf::from(".git/HEAD"))]
+            )
+            .is_ok()
+        );
     }
 
     #[test]

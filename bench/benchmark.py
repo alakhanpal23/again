@@ -131,7 +131,7 @@ def hook_call(
         "tool_input": {"command": command},
     }
     hook, hook_ms = run(
-        [str(binary), "hook"],
+        [str(binary), "hook", "--experimental-unsafe-rewrite"],
         cwd=workspace,
         env=env,
         stdin=json.dumps(event, separators=(",", ":")).encode(),
@@ -166,6 +166,18 @@ def result_id_from_last_event(
     if not isinstance(result_id, str) or not result_id:
         raise RuntimeError("last Again event did not expose a result id")
     return result_id
+
+
+def last_event(
+    binary: pathlib.Path, workspace: pathlib.Path, env: dict[str, str]
+) -> dict[str, Any]:
+    completed, _ = run([str(binary), "explain", "--json"], cwd=workspace, env=env)
+    if completed.returncode:
+        raise RuntimeError(completed.stderr.decode(errors="replace"))
+    value = json.loads(completed.stdout)
+    if not isinstance(value, dict):
+        raise RuntimeError("last Again event was not an object")
+    return value
 
 
 def exact_show_recovery_check(
@@ -224,20 +236,15 @@ def gate(name: str, observed: float, threshold: float) -> dict[str, Any]:
         "name": name,
         "observed": observed,
         "threshold": threshold,
-        "comparison": "<" if name != "output_reduction" else ">=",
-        "status": "pass"
-        if (observed >= threshold if name == "output_reduction" else observed < threshold)
-        else "fail",
+        "comparison": "<",
+        "status": "pass" if observed < threshold else "fail",
     }
 
 
-def gates(
-    *, hook_p95: float, hit_p95: float, output_reduction: float, baseline_p50: float
-) -> dict[str, Any]:
+def gates(*, hook_p95: float, hit_p95: float, baseline_p50: float) -> dict[str, Any]:
     evaluated: dict[str, Any] = {
         "hook_p95_ms": gate("hook_p95_ms", hook_p95, 10.0),
         "hit_p95_ms": gate("hit_p95_ms", hit_p95, 100.0),
-        "output_reduction": gate("output_reduction", output_reduction, 0.50),
     }
     # A sub-500ms baseline is too short for this harness to make a product-speed
     # claim. When it is long enough, require at least a 3x warm speedup.
@@ -304,13 +311,13 @@ def main() -> int:
         env = inherited_env.copy()
         env["AGAIN_HOME"] = str(state)
         env["LC_ALL"] = "C"
-        command = "cat payload.txt"
+        command = "/bin/cat payload.txt"
         session = "again-benchmark-session"
 
         baseline_samples = []
         baseline_bytes = None
         for _ in range(arguments.iterations):
-            baseline, elapsed_ms = run(["cat", "payload.txt"], cwd=workspace, env=env)
+            baseline, elapsed_ms = run(["/bin/cat", "payload.txt"], cwd=workspace, env=env)
             if baseline.returncode:
                 raise RuntimeError(baseline.stderr.decode(errors="replace"))
             baseline_samples.append(elapsed_ms)
@@ -329,7 +336,7 @@ def main() -> int:
         exec_samples = []
         end_to_end_samples = []
         warm_output_bytes = []
-        compact_markers = []
+        exact_warm_outputs = []
         for _ in range(arguments.iterations):
             call_id, hook_ms, _ = hook_call(binary, workspace, env, command, session)
             if call_id is None:
@@ -337,11 +344,13 @@ def main() -> int:
             completed, exec_ms = execute_call(binary, call_id, workspace, env)
             if completed.returncode:
                 raise RuntimeError(completed.stderr.decode(errors="replace"))
+            if completed.stdout != payload or completed.stderr:
+                raise RuntimeError("warm cache replay did not return exact full streams")
             hook_samples.append(hook_ms)
             exec_samples.append(exec_ms)
             end_to_end_samples.append(hook_ms + exec_ms)
             warm_output_bytes.append(len(completed.stdout) + len(completed.stderr))
-            compact_markers.append(b"exact repeat" in completed.stdout)
+            exact_warm_outputs.append(True)
 
         unsafe_matrix = no_rewrite_matrix(binary, workspace, env, session)
 
@@ -364,7 +373,7 @@ def main() -> int:
         end_to_end_distribution = distribution(end_to_end_samples)
         output_reduction = 1 - statistics.median(warm_output_bytes) / baseline_bytes
         result = {
-            "schema": "again.benchmark.v2",
+            "schema": "again.benchmark.v3",
             "provenance": provenance,
             "fixture": {
                 "command": command,
@@ -381,7 +390,11 @@ def main() -> int:
                 "warm_exec": exec_distribution,
                 "warm_end_to_end": end_to_end_distribution,
                 "warm_output_bytes": warm_output_bytes,
-                "all_warm_results_compact": all(compact_markers),
+                "all_warm_results_exact_full_streams": all(exact_warm_outputs),
+                "delivery_compaction": {
+                    "enabled": False,
+                    "reason": "codex_hook_hides_effective_output_cap",
+                },
                 "show_recovery": recovery,
                 "unsafe_unhandled_matrix": unsafe_matrix,
                 "mutation_invalidation": {
@@ -398,7 +411,6 @@ def main() -> int:
             "gates": gates(
                 hook_p95=hook_distribution["p95_ms"],
                 hit_p95=exec_distribution["p95_ms"],
-                output_reduction=output_reduction,
                 baseline_p50=baseline_distribution["p50_ms"],
             ),
         }

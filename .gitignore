@@ -6,3 +6,8 @@ __pycache__/
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
+/service/node_modules
+/service/.wrangler
+/service/coverage
+/service/dist
+/service/*.cpuprofile

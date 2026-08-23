@@ -18,6 +18,11 @@ pub struct PolicyContext<'a> {
     /// tools, so their presence is an explicit cache-admission input.
     pub stdin_is_tty: bool,
     pub stdout_is_tty: bool,
+    /// Automatic shell-hook rewriting must not change how argv[0] resolves.
+    /// When set, only an explicit absolute executable path is admissible;
+    /// bare names could resolve through aliases, functions, or shell startup
+    /// files that a direct wrapper execution cannot observe.
+    pub require_explicit_executable: bool,
 }
 
 impl<'a> PolicyContext<'a> {
@@ -27,6 +32,7 @@ impl<'a> PolicyContext<'a> {
             cwd,
             stdin_is_tty: false,
             stdout_is_tty: false,
+            require_explicit_executable: false,
         }
     }
 }
@@ -42,11 +48,13 @@ pub enum ReasonCode {
     GlobExpansion,
     ParseError,
     AlreadyWrapped,
+    ShellResolutionAmbiguous,
     TtyDependent,
     StdinDependent,
     AbsolutePath,
     OutsideWorkspace,
     ExcludedRuntimePath,
+    UnsupportedPath,
     MissingOperand,
     UnsafeFlag,
     UnsafeGitSubcommand,
@@ -65,11 +73,13 @@ impl ReasonCode {
             Self::GlobExpansion => "GLOB_EXPANSION",
             Self::ParseError => "PARSE_ERROR",
             Self::AlreadyWrapped => "ALREADY_WRAPPED",
+            Self::ShellResolutionAmbiguous => "SHELL_RESOLUTION_AMBIGUOUS",
             Self::TtyDependent => "TTY_DEPENDENT",
             Self::StdinDependent => "STDIN_DEPENDENT",
             Self::AbsolutePath => "ABSOLUTE_PATH",
             Self::OutsideWorkspace => "OUTSIDE_WORKSPACE",
             Self::ExcludedRuntimePath => "EXCLUDED_RUNTIME_PATH",
+            Self::UnsupportedPath => "UNSUPPORTED_PATH",
             Self::MissingOperand => "MISSING_OPERAND",
             Self::UnsafeFlag => "UNSAFE_FLAG",
             Self::UnsafeGitSubcommand => "UNSAFE_GIT_SUBCOMMAND",
@@ -161,20 +171,32 @@ pub fn classify(raw: &str, context: PolicyContext<'_>) -> Decision {
     if argv[0] == "again" || argv[0].ends_with("/again") {
         return bypass(ReasonCode::AlreadyWrapped);
     }
-    if Path::new(&argv[0]).is_absolute() {
-        return bypass(ReasonCode::AbsolutePath);
-    }
+    let program_path = Path::new(&argv[0]);
+    let program = if context.require_explicit_executable {
+        if !program_path.is_absolute() {
+            return bypass(ReasonCode::ShellResolutionAmbiguous);
+        }
+        match program_path.file_name().and_then(|name| name.to_str()) {
+            Some(name) if !name.is_empty() => name,
+            _ => return bypass(ReasonCode::ShellResolutionAmbiguous),
+        }
+    } else {
+        if program_path.is_absolute() {
+            return bypass(ReasonCode::AbsolutePath);
+        }
+        argv[0].as_str()
+    };
     if !cwd_is_in_workspace(context) {
         return bypass(ReasonCode::OutsideWorkspace);
     }
-    if is_network_command(&argv[0]) {
+    if is_network_command(program) {
         return bypass(ReasonCode::NetworkCommand);
     }
-    if is_mutating_command(&argv[0]) {
+    if is_mutating_command(program) {
         return bypass(ReasonCode::MutatingCommand);
     }
 
-    let result = match argv[0].as_str() {
+    let result = match program {
         "cat" => classify_files(&argv, FileOptions::None, true, context),
         "head" | "tail" => classify_files(&argv, FileOptions::HeadTail, true, context),
         "wc" => classify_files(&argv, FileOptions::Wc, true, context),
@@ -224,14 +246,14 @@ fn normalize_existing_or_absolute(path: &Path) -> Option<PathBuf> {
 }
 
 fn classify_pwd(argv: &[String]) -> Result<AccessPlan, ReasonCode> {
-    if argv.len() == 1 || (argv.len() == 2 && matches!(argv[1].as_str(), "-L" | "-P")) {
+    if argv.len() == 2 && argv[1] == "-P" {
         Ok(AccessPlan {
             scopes: vec![AccessScope::IdentityOnly],
         })
-    } else if argv.get(1).is_some_and(|arg| arg.starts_with('-')) {
-        Err(ReasonCode::UnsafeFlag)
     } else {
-        Err(ReasonCode::MissingOperand)
+        // Default pwd and -L consult logical PWD resolution. V0 does not bind
+        // the filesystem identity of every component in that environment path.
+        Err(ReasonCode::UnsafeFlag)
     }
 }
 
@@ -249,6 +271,11 @@ fn classify_files(
     require_file: bool,
     context: PolicyContext<'_>,
 ) -> Result<AccessPlan, ReasonCode> {
+    if matches!(options, FileOptions::Ls)
+        && (!ls_explicitly_disables_color(argv) || !ls_option_mix_supported(argv))
+    {
+        return Err(ReasonCode::UnsafeFlag);
+    }
     let mut index = 1;
     let mut operands = 0;
     let mut options_done = false;
@@ -263,12 +290,36 @@ fn classify_files(
         if item == "-" {
             return Err(ReasonCode::StdinDependent);
         }
+        if matches!(options, FileOptions::HeadTail)
+            && argv
+                .first()
+                .is_some_and(|program| program.ends_with("tail"))
+            && !options_done
+            && operands == 0
+            && item.starts_with('+')
+        {
+            // BSD tail's legacy +N/+Nc forms are options that read stdin, not
+            // filenames. An explicit preceding `--` remains an unambiguous
+            // filename escape.
+            return Err(ReasonCode::UnsafeFlag);
+        }
         if !options_done && item.starts_with('-') {
             index = consume_safe_file_option(argv, index, options)?;
             continue;
         }
         operands += 1;
         validate_path(item, context)?;
+        if matches!(options, FileOptions::Ls)
+            && std::fs::symlink_metadata(context.cwd.join(item))
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            // Default ls follows a command-line symlink to a directory, while
+            // -d observes the link itself. V0 deliberately models neither
+            // branch until its access plan carries that option-dependent
+            // distinction. The fingerprinter independently rejects this case
+            // to close the classify/fingerprint race.
+            return Err(ReasonCode::UnsupportedPath);
+        }
         let path = workspace_relative_path(item, context)?;
         scopes.push(match options {
             FileOptions::Ls => AccessScope::DirectoryListing(path),
@@ -276,6 +327,10 @@ fn classify_files(
                 AccessScope::ContentPath(path)
             }
         });
+        // The audited macOS file utilities stop option parsing at the first
+        // operand. Every later token, including `--` or a leading dash, is a
+        // filename and must therefore be represented in the access plan.
+        options_done = true;
         index += 1;
     }
     if require_file && operands == 0 {
@@ -342,7 +397,6 @@ fn safe_ls_flag(flag: &str) -> bool {
             | "-r"
             | "-S"
             | "-t"
-            | "-U"
             | "-1"
             | "--all"
             | "--almost-all"
@@ -358,7 +412,42 @@ fn safe_ls_flag(flag: &str) -> bool {
         && flag.len() > 2
         && flag[1..]
             .chars()
-            .all(|c| matches!(c, 'a' | 'A' | 'd' | 'F' | 'r' | 'S' | 't' | 'U' | '1')))
+            .all(|c| matches!(c, 'a' | 'A' | 'd' | 'F' | 'r' | 'S' | 't' | '1')))
+}
+
+fn ls_explicitly_disables_color(argv: &[String]) -> bool {
+    for value in argv.iter().skip(1) {
+        if value == "--" || !value.starts_with('-') || value == "-" {
+            break;
+        }
+        if value == "--color=never" {
+            return true;
+        }
+    }
+    false
+}
+
+/// `ls -a` includes the synthetic `.` and `..` entries. Sorting those entries by
+/// time or size observes parent-directory metadata outside a narrow listing
+/// scope, so that option combination must pass through until it is modeled.
+fn ls_option_mix_supported(argv: &[String]) -> bool {
+    let mut includes_dot_and_dotdot = false;
+    let mut metadata_sort = false;
+
+    for flag in argv.iter().skip(1) {
+        if flag == "--" || !flag.starts_with('-') || flag == "-" {
+            break;
+        }
+        includes_dot_and_dotdot |= flag == "-a"
+            || flag == "--all"
+            || (flag.starts_with('-') && !flag.starts_with("--") && flag[1..].contains('a'));
+        metadata_sort |= matches!(flag.as_str(), "-t" | "-S" | "--sort=time" | "--sort=size")
+            || (flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag[1..].chars().any(|value| matches!(value, 't' | 'S')));
+    }
+
+    !(includes_dot_and_dotdot && metadata_sort)
 }
 
 fn short_count(flag: &str) -> bool {
@@ -376,15 +465,19 @@ fn classify_search(
 ) -> Result<AccessPlan, ReasonCode> {
     let mut index = 1;
     let mut no_ignore = false;
+    let mut sort_path = false;
+    let mut options_done = false;
     while index < argv.len() {
         let item = &argv[index];
         if item == "--" {
+            options_done = true;
             index += 1;
             break;
         }
         if item.starts_with('-') {
             if safe_search_flag(item, is_rg) {
                 no_ignore |= item == "--no-ignore";
+                sort_path |= item == "--sort=path";
                 index += 1;
                 continue;
             }
@@ -399,11 +492,24 @@ fn classify_search(
     index += 1;
     let first_path = index;
     let mut scopes = Vec::new();
-    let mut recursive_input = false;
     while index < argv.len() {
+        // GNU grep and ripgrep accept options after the pattern. Treating such
+        // a token as a path can omit the command's real recursive input from
+        // the access plan (for example `rg needle -n`). An explicit pre-pattern
+        // `--` is the only case in which a dash-prefixed token is unambiguously
+        // positional in this deliberately small parser.
+        if !options_done && argv[index].starts_with('-') {
+            return Err(ReasonCode::UnsafeFlag);
+        }
         validate_path(&argv[index], context)?;
-        recursive_input |= context.cwd.join(&argv[index]).is_dir();
+        let operand_is_directory = context.cwd.join(&argv[index]).is_dir();
         let path = workspace_relative_path(&argv[index], context)?;
+        if is_rg
+            && operand_is_directory
+            && recursive_rg_directory_targets_git(&argv[index], &path, context)
+        {
+            return Err(ReasonCode::UnsupportedPath);
+        }
         scopes.push(if is_rg {
             AccessScope::RecursiveContentTree(path)
         } else {
@@ -411,20 +517,17 @@ fn classify_search(
         });
         index += 1;
     }
-    if !is_rg && first_path == argv.len() {
+    if first_path == argv.len() {
+        // Both grep and rg can switch to stdin when it is readable. V0 does
+        // not model stdin source/content, so require at least one explicit
+        // path even though interactive rg often defaults to the current tree.
         Err(ReasonCode::StdinDependent)
     } else {
-        if is_rg && first_path == argv.len() {
-            recursive_input = true;
-            scopes.push(AccessScope::RecursiveContentTree(workspace_relative_path(
-                ".", context,
-            )?));
-        }
-        // Recursive ripgrep normally consults parent, repository and global ignore
-        // files that are not represented by a narrow content scope. Requiring
-        // `--no-ignore` removes those ambient filesystem inputs. Explicit regular
-        // file operands remain eligible without it.
-        if is_rg && recursive_input && !no_ignore {
+        // Every ripgrep request must disable ambient ignore files and select
+        // deterministic path ordering. Requiring both even for a currently
+        // regular-file operand closes the race where it becomes a directory
+        // between classification and fingerprinting.
+        if is_rg && (!no_ignore || !sort_path) {
             return Err(ReasonCode::UnsafeFlag);
         }
         Ok(AccessPlan { scopes })
@@ -436,12 +539,10 @@ fn safe_search_flag(flag: &str, is_rg: bool) -> bool {
         flag,
         "-i" | "-n"
             | "-H"
-            | "-h"
             | "-v"
             | "-w"
             | "-x"
             | "-F"
-            | "-E"
             | "--fixed-strings"
             | "--ignore-case"
             | "--line-number"
@@ -451,10 +552,46 @@ fn safe_search_flag(flag: &str, is_rg: bool) -> bool {
             | "--word-regexp"
             | "--line-regexp"
     );
-    common || (is_rg && matches!(flag, "--no-ignore" | "--no-messages" | "--count" | "-c"))
+    common
+        || (!is_rg && matches!(flag, "-E" | "-h"))
+        || (is_rg
+            && matches!(
+                flag,
+                "--no-ignore" | "--no-messages" | "--count" | "-c" | "--sort=path"
+            ))
+}
+
+fn recursive_rg_directory_targets_git(
+    spelling: &str,
+    relative: &Path,
+    context: PolicyContext<'_>,
+) -> bool {
+    if first_normal_component_is_git(relative) {
+        return true;
+    }
+    let Ok(workspace) = std::fs::canonicalize(context.workspace) else {
+        return true;
+    };
+    let Ok(canonical) = std::fs::canonicalize(context.cwd.join(spelling)) else {
+        return false;
+    };
+    canonical
+        .strip_prefix(workspace)
+        .is_ok_and(first_normal_component_is_git)
+}
+
+fn first_normal_component_is_git(path: &Path) -> bool {
+    path.components().find_map(|component| match component {
+        Component::Normal(value) => Some(value == ".git"),
+        Component::CurDir => None,
+        Component::ParentDir | Component::RootDir | Component::Prefix(_) => Some(false),
+    }) == Some(true)
 }
 
 fn validate_path(value: &str, context: PolicyContext<'_>) -> Result<(), ReasonCode> {
+    if value.is_empty() {
+        return Err(ReasonCode::UnsupportedPath);
+    }
     if value == "-" {
         return Err(ReasonCode::StdinDependent);
     }
@@ -623,20 +760,61 @@ mod tests {
                 &["tail", "--lines=1", "readme.txt"],
             ),
             ("wc -l readme.txt", &["wc", "-l", "readme.txt"]),
-            ("ls -a src", &["ls", "-a", "src"]),
+            (
+                "ls --color=never -a src",
+                &["ls", "--color=never", "-a", "src"],
+            ),
             ("pwd -P", &["pwd", "-P"]),
             (
-                "rg --no-ignore needle .",
-                &["rg", "--no-ignore", "needle", "."],
+                "rg --no-ignore --sort=path needle .",
+                &["rg", "--no-ignore", "--sort=path", "needle", "."],
             ),
             (
                 "grep -n needle readme.txt",
                 &["grep", "-n", "needle", "readme.txt"],
             ),
+            ("grep '' readme.txt", &["grep", "", "readme.txt"]),
         ];
         for (command, argv) in cases {
             assert_exact(command, &temp, argv);
         }
+    }
+
+    #[test]
+    fn hook_mode_requires_an_explicit_absolute_executable() {
+        let temp = TempDir::new().unwrap();
+        std::fs::write(temp.path().join("readme.txt"), "hello\n").unwrap();
+        let mut hook_context = context(&temp);
+        hook_context.require_explicit_executable = true;
+
+        assert_eq!(
+            classify("cat readme.txt", hook_context),
+            Decision::BypassNoStore {
+                reason: ReasonCode::ShellResolutionAmbiguous
+            }
+        );
+        assert_eq!(
+            classify("bin/cat readme.txt", hook_context),
+            Decision::BypassNoStore {
+                reason: ReasonCode::ShellResolutionAmbiguous
+            }
+        );
+        assert_eq!(
+            classify("/bin/cat readme.txt", hook_context).argv(),
+            Some(&["/bin/cat".to_owned(), "readme.txt".to_owned()][..])
+        );
+        assert_eq!(
+            classify("/usr/bin/curl https://example.invalid", hook_context),
+            Decision::BypassNoStore {
+                reason: ReasonCode::NetworkCommand
+            }
+        );
+        assert_eq!(
+            classify("/bin/rm readme.txt", hook_context),
+            Decision::BypassNoStore {
+                reason: ReasonCode::MutatingCommand
+            }
+        );
     }
 
     #[test]
@@ -646,7 +824,7 @@ mod tests {
         std::fs::write(temp.path().join("a.txt"), "a").unwrap();
         std::fs::write(temp.path().join("b.txt"), "b").unwrap();
         let cases: &[(&str, Vec<AccessScope>)] = &[
-            ("pwd", vec![AccessScope::IdentityOnly]),
+            ("pwd -P", vec![AccessScope::IdentityOnly]),
             (
                 "cat a.txt b.txt",
                 vec![
@@ -659,19 +837,15 @@ mod tests {
                 vec![AccessScope::ContentPath(PathBuf::from("a.txt"))],
             ),
             (
-                "rg --no-ignore needle src",
+                "rg --no-ignore --sort=path needle src",
                 vec![AccessScope::RecursiveContentTree(PathBuf::from("src"))],
             ),
             (
-                "rg --no-ignore needle",
-                vec![AccessScope::RecursiveContentTree(PathBuf::from("."))],
-            ),
-            (
-                "ls src",
+                "ls --color=never src",
                 vec![AccessScope::DirectoryListing(PathBuf::from("src"))],
             ),
             (
-                "ls",
+                "ls --color=never",
                 vec![AccessScope::DirectoryListing(PathBuf::from("."))],
             ),
         ];
@@ -737,14 +911,27 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let cases = [
             ("cat /etc/passwd", ReasonCode::AbsolutePath),
+            ("cat '' readme.txt", ReasonCode::UnsupportedPath),
             ("cat ../secret", ReasonCode::OutsideWorkspace),
             ("cat -", ReasonCode::StdinDependent),
             ("head", ReasonCode::StdinDependent),
+            ("tail +1", ReasonCode::UnsafeFlag),
+            ("tail +1c", ReasonCode::UnsafeFlag),
             ("grep needle", ReasonCode::StdinDependent),
             ("cat --help", ReasonCode::UnsafeFlag),
             ("ls -l", ReasonCode::UnsafeFlag),
             ("rg needle .", ReasonCode::UnsafeFlag),
+            (
+                "rg --no-ignore --sort=path needle",
+                ReasonCode::StdinDependent,
+            ),
             ("rg --hidden --no-ignore needle .", ReasonCode::UnsafeFlag),
+            ("rg --no-ignore needle .", ReasonCode::UnsafeFlag),
+            ("rg needle -n", ReasonCode::UnsafeFlag),
+            ("rg needle --no-ignore", ReasonCode::UnsafeFlag),
+            ("rg -E utf-8 needle", ReasonCode::UnsafeFlag),
+            ("rg -h needle readme.txt", ReasonCode::UnsafeFlag),
+            ("grep needle -n readme.txt", ReasonCode::UnsafeFlag),
             ("cat .again/cache", ReasonCode::ExcludedRuntimePath),
             ("cat .git/logs/HEAD", ReasonCode::ExcludedRuntimePath),
             ("cat .git/index.lock", ReasonCode::ExcludedRuntimePath),
@@ -759,6 +946,122 @@ mod tests {
         std::os::unix::fs::symlink(outside.path().join("secret"), temp.path().join("escape"))
             .unwrap();
         assert_bypass("cat escape", &temp, ReasonCode::OutsideWorkspace);
+    }
+
+    #[test]
+    fn rejects_ls_symlink_operands_until_follow_semantics_are_modeled() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join("target")).unwrap();
+        std::os::unix::fs::symlink("target", temp.path().join("linked")).unwrap();
+
+        assert_bypass(
+            "ls --color=never linked",
+            &temp,
+            ReasonCode::UnsupportedPath,
+        );
+        assert_bypass(
+            "ls --color=never -d linked",
+            &temp,
+            ReasonCode::UnsupportedPath,
+        );
+    }
+
+    #[test]
+    fn rejects_ls_all_with_parent_metadata_sorting() {
+        let temp = TempDir::new().unwrap();
+        for command in [
+            "ls --color=never -at",
+            "ls --color=never -aS",
+            "ls --color=never --all --sort=time",
+            "ls --color=never --all --sort=size",
+        ] {
+            assert_bypass(command, &temp, ReasonCode::UnsafeFlag);
+        }
+        assert_exact(
+            "ls --color=never -ar",
+            &temp,
+            &["ls", "--color=never", "-ar"],
+        );
+        assert_exact(
+            "ls --color=never -At",
+            &temp,
+            &["ls", "--color=never", "-At"],
+        );
+    }
+
+    #[test]
+    fn recursive_rg_rejects_git_directories_and_requires_path_sorting() {
+        let temp = TempDir::new().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::create_dir_all(temp.path().join(".git/refs")).unwrap();
+        std::fs::create_dir(temp.path().join("tree")).unwrap();
+        std::os::unix::fs::symlink(".git", temp.path().join("git-alias")).unwrap();
+
+        assert_bypass(
+            "rg --no-ignore --sort=path needle .git",
+            &temp,
+            ReasonCode::UnsupportedPath,
+        );
+        assert_bypass(
+            "rg --no-ignore --sort=path needle .git/refs",
+            &temp,
+            ReasonCode::UnsupportedPath,
+        );
+        assert_bypass(
+            "rg --no-ignore --sort=path needle git-alias",
+            &temp,
+            ReasonCode::UnsupportedPath,
+        );
+        assert_bypass("rg --no-ignore needle tree", &temp, ReasonCode::UnsafeFlag);
+        assert_exact(
+            "rg --no-ignore --sort=path needle tree",
+            &temp,
+            &["rg", "--no-ignore", "--sort=path", "needle", "tree"],
+        );
+    }
+
+    #[test]
+    fn macos_file_options_stop_at_the_first_operand() {
+        let temp = TempDir::new().unwrap();
+        let cases = [
+            (
+                "cat readme.txt --",
+                vec![
+                    AccessScope::ContentPath(PathBuf::from("readme.txt")),
+                    AccessScope::ContentPath(PathBuf::from("--")),
+                ],
+            ),
+            (
+                "head readme.txt -n 1",
+                vec![
+                    AccessScope::ContentPath(PathBuf::from("readme.txt")),
+                    AccessScope::ContentPath(PathBuf::from("-n")),
+                    AccessScope::ContentPath(PathBuf::from("1")),
+                ],
+            ),
+            (
+                "wc readme.txt -l",
+                vec![
+                    AccessScope::ContentPath(PathBuf::from("readme.txt")),
+                    AccessScope::ContentPath(PathBuf::from("-l")),
+                ],
+            ),
+            (
+                "ls --color=never src -1",
+                vec![
+                    AccessScope::DirectoryListing(PathBuf::from("src")),
+                    AccessScope::DirectoryListing(PathBuf::from("-1")),
+                ],
+            ),
+        ];
+
+        for (command, scopes) in cases {
+            assert_eq!(
+                classify(command, context(&temp)).access_plan(),
+                Some(&AccessPlan { scopes }),
+                "{command}"
+            );
+        }
     }
 
     #[test]

@@ -1,61 +1,78 @@
 # Again
 
-Again is an open-source execution layer for coding-agent tool calls. It reuses a result only when it can prove the supported inputs are unchanged, and it replaces output that the same agent session has already seen with a short, reversible reference.
+Again is an open-source execution layer for coding-agent tool calls. For a deliberately narrow set of explicit local read-only commands, it can reuse an exact successful result when its versioned, scoped observations still match. An ineligible explicit call exits with an error without running the command; the caller then reruns the original command unchanged outside Again.
 
-```text
-$ again setup --codex
-Codex hook installed. Review it once with /hooks.
-
-$ again run -- rg --no-ignore -n "EffectIR" src
-...full output...
-
-$ again run -- rg --no-ignore -n "EffectIR" src
-[again: exact repeat of result 01J...; 18,421 duplicate bytes omitted]
+```bash
+# Redirect all three standard streams so this terminal demonstration is non-TTY.
+again run -- rg --no-ignore --sort=path -n "EffectIR" src \
+  </dev/null > /tmp/again-first.out 2> /tmp/again-first.err
+again run -- rg --no-ignore --sort=path -n "EffectIR" src \
+  </dev/null > /tmp/again-second.out 2> /tmp/again-second.err
+cmp /tmp/again-first.out /tmp/again-second.out
+cmp /tmp/again-first.err /tmp/again-second.err
 ```
 
-The current repository is an early correctness-first implementation. The example above is the target alpha experience, not a claim that arbitrary commands are safe to cache today.
+The second eligible invocation can be a cache hit and still returns the same complete streams. If any standard stream is a TTY, as in a normal interactive terminal invocation, Again instead executes the audited command once uncached with inherited streams. The current repository is an early conservative implementation; arbitrary commands are not safe to cache.
 
 ## Product promise
 
-For an eligible Codex shell call, Again returns the same successful result without re-executing it. This is faster for sufficiently expensive calls; trivial utilities can still be slower because proof and process startup have a real cost. Within one Codex session, byte-identical output already delivered in full may be represented by a compact result reference. If Again cannot prove its narrow safety conditions, the original call runs normally.
+On a validated cache hit for an eligible explicit `again run -- <argv...>` call, Again returns the stored successful stdout, stderr, and status without rerunning the requested argv. Every served hit first launches the exact audited executable once with fixed cheap capability-probe arguments; it therefore is not a zero-process-spawn path. Every hit currently returns the complete streams. A miss streams the first execution's output live; only a result that passes the initial admission checks is executed a second time before storage. Reusable admission requires exit status zero, empty stderr, identical validation runs, stable post-execution fingerprints, and stdout/stderr within the 16 MiB per-stream capture limit. Any local blob is also capped at 16 MiB. Once the child's output has been successfully presented, later validation, admission, or accounting failures preserve the child's status. This is faster for sufficiently expensive repeats; trivial utilities can still be slower because fingerprinting, the capability probe, and process startup have real costs. An ineligible explicit call errors without executing the command and tells the caller to rerun the original command unchanged.
 
-Again never treats a matching command string or basename as sufficient proof. The current macOS profile admits exact Apple system identities for narrowly parsed `cat`, `head`, `tail`, `wc`, `grep`, `ls`, and `pwd`, plus OpenAI-signed Codex-bundled `rg`. Recursive `rg` requires `--no-ignore` so parent/global ignore files are not hidden inputs. Git, network access, writes, shell composition, time, randomness, interactive input, credentials, unsupported paths, unknown flags, incomplete observation, and non-zero results bypass storage.
+Again never treats a matching command string or basename as sufficient. `again run -- cat ...` resolves and validates the executable from the wrapper's actual local context. Active policy `strict-read-v0.5` admits only the exact reviewed BLAKE3 of each Apple tool at its fixed system path plus the exact BLAKE3 of `/System/Library/CoreServices/SystemVersion.plist`. The Codex-bundled `rg` requires its exact canonical bundle path shape, reviewed binary BLAKE3, and the same OS profile. Codesign-reported identifier/team fields are checked only as descriptive publisher metadata; strict signature validity is not claimed, and the exact BLAKE3 is the byte-integrity boundary. The current semantic profiles are `macos-15.6.1-24G90-read-v0` and, for ripgrep, `codex-rg-15.2.0-e89fff89ac-arm64-read-v0`; any unreviewed OS or binary update fails closed. Packages may install on Linux or an unknown macOS profile, but reuse remains disabled until that platform/backend is audited; `again doctor` reports either the audited Apple profile or an unsupported code. The narrow command surface includes `cat`, `head`, `tail`, `wc`, `grep`, `ls --color=never`, only `pwd -P`, and `rg`. Every `grep` and `rg` invocation requires an explicit path operand. Every `rg` invocation, including an explicit regular-file search, also requires both `--no-ignore` and `--sort=path`; `RIPGREP_CONFIG_PATH` disables admission, and explicit recursive `.git` directories or aliases to them are rejected. Git commands, network access, writes, shell composition, time, randomness, unsupported paths, unknown flags, incomplete observation, and non-zero results are not cached as reusable results.
+
+Cache keys and stored proofs also bind a macOS runtime-context digest: real/effective uid and gid, supplementary groups, supported soft/hard resource limits, and the current signal mask, dispositions, and flags. A changed context produces a miss rather than reusing a result from different inherited process semantics.
+
+V0 refuses admission when the environment contains any `DYLD_*`, `LD_*`, `Malloc*`, `MALLOC_*`, `{ASAN,LSAN,MSAN,TSAN,UBSAN}_OPTIONS`, `GCONV_PATH`, `LOCPATH`, `NLSPATH`, `PATH_LOCALE`, `TERMCAP`, `TERMINFO`, `TERMINFO_DIRS`, or `TZDIR` variable. Those variables can redirect loaders, instrumentation, locale, terminal, or timezone lookups to external bytes outside the scoped fingerprint; hashing only their text would not bind those bytes.
+
+Automatic Codex `PreToolUse` rewriting is disabled: the production hook returns before reading or parsing stdin and emits no allow decision. The hook contract exposes only `tool_input.command`, not effective workdir, TTY, shell/login, sandbox, remote `environment_id`, output ceiling, or delivery receipt, so transparent substitution cannot preserve all hidden semantics. The repository retains strict envelope parsing, an explicit-absolute-executable guard, opaque handoff, defensive runtime checks, `PreCompact`/`PostCompact` handlers, and a delivery ledger as dormant/test plumbing behind the explicit unsafe test flag. If that dormant wrapper is exercised directly, a hidden TTY or same-repository cwd difference executes the revalidated command once uncached with inherited streams; a different repository/non-Git cwd or remote executable/state mismatch can fail. None is an active acceleration or output-compaction path. Explicit `again run` is local/default-environment only and starts inside the tool shell's actual cwd, streams, and environment; if any stream is a TTY, the audited command executes once uncached with inherited streams.
+
+Local v0 does not classify credentials or secret-tainted output. Admitted path operands and validation metadata may be persisted, and successful stdout/stderr may remain in the local CAS; the experimental opaque-hook path also persists raw command text and argv while a call is pending. Do not place credentials in eligible command arguments or use Again on secret-bearing output until secret classification ships. The undeployed remote service rejects records already marked secret-tainted, but it cannot infer that label for the local engine.
 
 ## First user
 
-The beachhead is an individual Codex user working in a medium or large repository whose agent repeatedly reads and searches after small edits. The first release compacts and, where the avoided work exceeds proof overhead, accelerates provably read-only calls. Test/build reuse is a later trace-backed profile and does not ship until differential correctness gates pass.
+The beachhead is an individual Codex user working in a medium or large local repository whose agent can prefix repeated reads and searches with `again run --`. Where avoided work exceeds fingerprint overhead, the first release accelerates a deliberately narrow set of policy-admitted read-only calls while returning exact full streams. Test/build reuse and transparent hooks are later profiles and do not ship until their semantics are observable and their isolation/differential gates pass.
 
 ## Install during development
 
 ```bash
 cargo install --path .
 again setup --codex
+# Start a new Codex session, then Codex can use:
+again run -- cat path/to/file
 ```
 
-No Again account, OAuth flow, API key, daemon, Docker, root permission, task graph, or telemetry is required for local mode. Local state is private and repository-scoped under `.again` unless `AGAIN_HOME` is set. Codex requires one explicit review of a newly installed non-managed hook and trusts its exact hash; Again cannot safely bypass that platform control.
+`again setup --codex` installs a reversible instruction-only skill at `$HOME/.agents/skills/again` by default. Use `again setup --codex --project` for `<repo>/.agents/skills/again`, and use the same scope with `--remove` to remove files still matching Again's ownership record. Setup does not install or modify hooks. `again doctor` reports both skill scopes and warns when both are installed.
+
+No Again account, OAuth flow, API key, daemon, Docker, root permission, task graph, hook installation, or telemetry is required for local mode. On Unix, disposable state defaults to `${TMPDIR}/again-<euid>/workspaces/<BLAKE3(canonical-workspace-path)>`, with app-owned directory levels at mode `0700`; the first run never mutates the workspace. `AGAIN_HOME` selects one exact persistent root and must be absolute and outside the active workspace. Its final component cannot be a symlink, and an existing root must already be an owned real directory with mode `0700`. Every canonical ancestor must be a real directory owned by the current uid or root; a group/world-writable ancestor must have the sticky bit. Fixed state files, directories, blobs, and the state-root `.gitignore` must satisfy the documented ownership, type, link-count, symlink, and private-mode checks; unsafe state causes an error. Resolution and creation remain pathname-based and can still be raced by the same user or root. This repository's checked-in `/.again` ignore is root-scoped legacy housekeeping; it neither places current state in the workspace nor ignores nested user directories.
 
 ## Commands
 
 ```text
-again setup --codex       Install or print the Codex PreToolUse hook
 again run -- <argv...>    Run through the conservative local engine
-again hook                Handle Codex PreToolUse JSON on stdin
-again exec --call <id>    Execute an opaque call created by the hook
-again explain [id]        Explain reuse or bypass in plain language
+again setup --codex       Install the instruction-only personal Codex skill
+again setup --codex --project
+                          Install the skill in the current repository
+again hook                Production no-op; unsafe parser requires a test flag
+again exec --call <id>    Experimental opaque-call plumbing for hook tests
+again explain [id]        Show a stored result or the latest recorded event
 again show <result-id>    Retrieve exact stored stdout/stderr
-again stats               Show local time and duplicate bytes saved
-again doctor              Verify the install and safety capabilities
+again stats               Show local execution and replay counters
+again doctor              Verify state, skill scopes, and safety capabilities
 ```
+
+`again hook --experimental-unsafe-rewrite` exists only for controlled differential tests. It can change hidden Codex invocation semantics and must not be installed or used as a production integration.
+
+`again explain <id>` reads a stored, non-quarantined result; without an id it reports only the latest event that was actually recorded. It does not reconstruct or invent an explanation for a refusal or failure that occurred before event persistence.
 
 See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md), [architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md), [roadmap](docs/ROADMAP.md), and [security model](SECURITY.md).
 
 ## Open source and business
 
-The local policy engine, tracer, EffectIR, cache, validation, explainability, and Codex integration stay open source. A future paid team product may provide encrypted shared cache, equivalent remote execution, policy and audit controls, provenance, analytics, support, and verified compute-savings reporting. Clients must still validate remote records locally.
+The current local policy engine, EffectIR schema, cache, validation, explainability, and Codex integration stay open source; the planned local tracer and effect-replay machinery will as well. The repository also contains an undeployed, locally tested shared-cache service and an async Rust transport/verification module; neither is wired into the CLI or presented as production-ready. The module enforces HTTPS, redirect, deadline, body, wire, blob, and concrete Ed25519 checks, but its expected bindings and trust/revocation snapshot still come from the caller; no authenticated control plane supplies that state. A future paid team product may provide managed shared cache, equivalent remote execution, policy and audit controls, application-layer confidentiality where required, provenance, analytics, support, and verified compute-savings reporting. Clients must still validate remote records locally.
 
 ## Status
 
-Pre-alpha. Do not depend on Again for correctness-sensitive workloads until the documented gates are green. Unknown always means execute.
+Pre-alpha. Scoped validation is sampled and path-based; concurrent mutation after validation, transient global-resource changes around the capability probe, same-user/root pathname races, and unauthenticated same-user metadata-store writes remain outside the current boundary. Do not depend on Again for correctness-sensitive workloads until those limits are closed and the documented gates are green. Unknown means Again refuses the call; the caller must rerun the original unchanged.
 
 ## License
 
