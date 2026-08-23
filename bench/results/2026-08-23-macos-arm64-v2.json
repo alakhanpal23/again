@@ -1,0 +1,254 @@
+{
+  "again": {
+    "all_warm_results_compact": true,
+    "cold": {
+      "exec_ms": 33.584042,
+      "hook_ms": 8.058208
+    },
+    "mutation_invalidation": {
+      "exec_ms": 18.35075,
+      "hook_ms": 5.164416,
+      "passed": true
+    },
+    "show_recovery": {
+      "elapsed_ms": 7.177958,
+      "exact": true,
+      "result_id": "r_74908e3a30a54234acb47ec704187cf6"
+    },
+    "unsafe_unhandled_matrix": [
+      {
+        "command": "curl https://example.com",
+        "hook_ms": 3.981542,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "touch should-not-be-created",
+        "hook_ms": 3.47025,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "git status --short",
+        "hook_ms": 3.526791,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "echo unhandled",
+        "hook_ms": 4.234584,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat payload.txt | wc -c",
+        "hook_ms": 3.991041,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat /etc/passwd",
+        "hook_ms": 4.959541,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat -",
+        "hook_ms": 4.344083,
+        "returncode": 0,
+        "rewritten": false
+      }
+    ],
+    "warm_end_to_end": {
+      "mean_ms": 12.591569466666666,
+      "p50_ms": 12.131917000000001,
+      "p95_ms": 17.780874999999998,
+      "samples_ms": [
+        11.739792,
+        12.131917000000001,
+        10.719625,
+        11.260375,
+        15.701749,
+        11.573375,
+        11.397584,
+        12.318459,
+        12.601041,
+        12.406917,
+        12.556208999999999,
+        11.8825,
+        17.780874999999998,
+        12.79525,
+        12.007874000000001
+      ]
+    },
+    "warm_exec": {
+      "mean_ms": 7.531508266666666,
+      "p50_ms": 7.068666,
+      "p95_ms": 12.344833,
+      "samples_ms": [
+        6.612333,
+        6.860292,
+        6.135375,
+        6.523125,
+        10.568541,
+        6.797125,
+        6.6535,
+        7.269459,
+        7.265333,
+        7.151125,
+        7.710792,
+        6.722375,
+        12.344833,
+        7.28975,
+        7.068666
+      ]
+    },
+    "warm_hook": {
+      "mean_ms": 5.060061200000001,
+      "p50_ms": 5.127459,
+      "p95_ms": 5.5055,
+      "samples_ms": [
+        5.127459,
+        5.271625,
+        4.58425,
+        4.73725,
+        5.133208,
+        4.77625,
+        4.744084,
+        5.049,
+        5.335708,
+        5.255792,
+        4.845417,
+        5.160125,
+        5.436042,
+        5.5055,
+        4.939208
+      ]
+    },
+    "warm_output_bytes": [
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169
+    ]
+  },
+  "baseline": {
+    "mean_ms": 4.1416612,
+    "output_bytes": 2097120,
+    "p50_ms": 3.995334,
+    "p95_ms": 4.824959,
+    "samples_ms": [
+      4.05925,
+      4.824959,
+      4.654833,
+      3.944584,
+      4.463917,
+      4.154583,
+      3.937916,
+      3.967709,
+      4.017875,
+      3.995334,
+      3.982041,
+      3.809542,
+      3.920166,
+      3.84825,
+      4.543959
+    ]
+  },
+  "derived": {
+    "duplicate_output_reduction_fraction": 0.9999194132906081,
+    "warm_exec_speedup_vs_baseline_p50": 0.5652175389246005
+  },
+  "fixture": {
+    "command": "cat payload.txt",
+    "iterations": 15,
+    "payload_bytes": 2097120
+  },
+  "gates": {
+    "hit_p95_ms": {
+      "comparison": "<",
+      "name": "hit_p95_ms",
+      "observed": 12.344833,
+      "status": "pass",
+      "threshold": 100.0
+    },
+    "hook_p95_ms": {
+      "comparison": "<",
+      "name": "hook_p95_ms",
+      "observed": 5.5055,
+      "status": "pass",
+      "threshold": 10.0
+    },
+    "output_reduction": {
+      "comparison": ">=",
+      "name": "output_reduction",
+      "observed": 0.9999194132906081,
+      "status": "pass",
+      "threshold": 0.5
+    },
+    "speed": {
+      "baseline_p50_ms": 3.995334,
+      "reason": "baseline_p50_ms_below_500",
+      "status": "not_applicable"
+    }
+  },
+  "provenance": {
+    "binary": {
+      "digest": {
+        "algorithm": "sha256",
+        "hex": "8db9b3d61fffd8344802fd7cfcd2ac7c946f6d160f92f020712bcc8fbface6e6"
+      },
+      "path": "/Users/arjun/again/target/release/again",
+      "version": "again 0.1.0"
+    },
+    "host": {
+      "machine": {
+        "machine": "arm64",
+        "processor": "arm",
+        "release": "24.6.0",
+        "system": "Darwin",
+        "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+      },
+      "python": {
+        "build": [
+          "v3.9.13:6de2ca5339",
+          "May 17 2022 11:37:23"
+        ],
+        "executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+        "implementation": "CPython",
+        "version": "3.9.13"
+      }
+    },
+    "repository": {
+      "commit": null,
+      "dirty": true,
+      "dirty_entries": [
+        "?? .github/",
+        "?? .gitignore",
+        "?? Cargo.lock",
+        "?? Cargo.toml",
+        "?? LICENSE",
+        "?? README.md",
+        "?? SECURITY.md",
+        "?? bench/",
+        "?? docs/",
+        "?? rust-toolchain.toml",
+        "?? src/",
+        "?? tests/"
+      ],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.benchmark.v2"
+}

@@ -1,0 +1,8 @@
+/target
+/.again
+__pycache__/
+*.py[cod]
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
