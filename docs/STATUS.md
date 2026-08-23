@@ -22,12 +22,12 @@ Current local verification: 89 library tests, 1 generated-corpus integration tes
 
 ## Measured gates
 
-The retained clean-commit benchmark passes hook p95 (6.359 ms), local exec p95 (8.088 ms), exact recovery, mutation invalidation, unsafe no-rewrite, and duplicate-output reduction (99.992%). It does **not** demonstrate a speedup: the native 3.860 ms `cat` fixture is faster than Again. A workload with at least a 500 ms baseline is still required for the speed gate.
+The retained trivial-command benchmark passes safety, recovery and context gates but correctly shows Again slower than native `cat`. The separate clean-commit 2 GiB low-output scan passes the useful-work gate conservatively: native p50 962.473 ms versus warm end-to-end p95 23.675 ms (40.653x), with hook p95 9.797 ms and exec p95 7.096 ms. Its same-output input mutation forced a miss; cold double validation cost 3,416.835 ms.
 
 ## Day 1–7 remaining
 
 - Repeat the real Codex hook flow across clean global-only and project-only installs, subdirectories, and interrupted/long-running calls.
-- Add a slow, low-output workload and multi-language repository corpus.
+- Add the multi-language repository corpus; the slow low-output speed gate is implemented and passing.
 - Reach 100,000 differential shadow validations with zero unexplained mismatch.
 - Implement an enforceable Linux trace/COW profile before test/build effect replay.
 - Add reproducible signed releases, SBOM, packaged install/uninstall, and outside alpha evidence. Bounded local lifecycle cleanup is implemented.

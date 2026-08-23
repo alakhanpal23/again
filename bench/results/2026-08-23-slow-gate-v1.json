@@ -1,0 +1,185 @@
+{
+  "again": {
+    "all_warm_results_compact": true,
+    "cold_exec_and_double_validation_ms": 3416.834916,
+    "cold_hook_ms": 206.86625,
+    "same_output_mutation_invalidation": {
+      "exec_ms": 3089.796583,
+      "hook_ms": 4.979042,
+      "passed": true
+    },
+    "warm_end_to_end": {
+      "mean_ms": 11.88196344,
+      "p50_ms": 9.745166000000001,
+      "p95_ms": 23.675166,
+      "samples_ms": [
+        13.222583,
+        9.600916999999999,
+        9.396958999999999,
+        10.319917,
+        9.263707,
+        9.0075,
+        9.457626,
+        9.510833,
+        8.854708,
+        9.627834,
+        11.416958000000001,
+        10.008666,
+        9.258334,
+        9.853583,
+        9.215209,
+        46.257917000000006,
+        23.675166,
+        11.020875,
+        10.208167,
+        9.745166000000001,
+        9.803376,
+        9.791875000000001,
+        10.030417,
+        9.344584000000001,
+        9.156209
+      ]
+    },
+    "warm_exec": {
+      "mean_ms": 6.4458500800000005,
+      "p50_ms": 5.005459,
+      "p95_ms": 7.096291,
+      "samples_ms": [
+        5.337375,
+        4.867125,
+        4.911459,
+        5.251125,
+        4.806166,
+        4.731125,
+        4.986584,
+        4.944125,
+        4.640333,
+        5.466042,
+        6.443208,
+        4.9495,
+        4.829959,
+        5.101875,
+        4.717417,
+        36.461083,
+        7.096291,
+        5.281292,
+        5.382458,
+        4.976666,
+        5.236584,
+        5.423625,
+        5.303542,
+        4.995834,
+        5.005459
+      ]
+    },
+    "warm_hook": {
+      "mean_ms": 5.43611336,
+      "p50_ms": 4.566792,
+      "p95_ms": 9.796834,
+      "samples_ms": [
+        7.885208,
+        4.733792,
+        4.4855,
+        5.068792,
+        4.457541,
+        4.276375,
+        4.471042,
+        4.566708,
+        4.214375,
+        4.161792,
+        4.97375,
+        5.059166,
+        4.428375,
+        4.751708,
+        4.497792,
+        9.796834,
+        16.578875,
+        5.739583,
+        4.825709,
+        4.7685,
+        4.566792,
+        4.36825,
+        4.726875,
+        4.34875,
+        4.15075
+      ]
+    }
+  },
+  "baseline": {
+    "mean_ms": 1103.3103999999998,
+    "p50_ms": 962.47275,
+    "p95_ms": 1600.667583,
+    "samples_ms": [
+      1600.667583,
+      1061.329542,
+      953.183375,
+      962.47275,
+      938.89875
+    ]
+  },
+  "fixture": {
+    "allocated_size_bytes": 32768,
+    "baseline_iterations": 5,
+    "command": "grep needle payload.bin",
+    "logical_size_bytes": 2147483648,
+    "output_bytes": 32,
+    "warm_iterations": 25
+  },
+  "gates": {
+    "hit_p95_ms": {
+      "comparison": "<",
+      "name": "hit_p95_ms",
+      "observed": 7.096291,
+      "status": "pass",
+      "threshold": 100.0
+    },
+    "hook_p95_ms": {
+      "comparison": "<",
+      "name": "hook_p95_ms",
+      "observed": 9.796834,
+      "status": "pass",
+      "threshold": 10.0
+    },
+    "speed": {
+      "comparison": ">=",
+      "observed_speedup": 40.65326300140831,
+      "status": "pass",
+      "threshold": 3.0
+    }
+  },
+  "provenance": {
+    "binary": {
+      "digest": {
+        "algorithm": "sha256",
+        "hex": "20eaf293e71a0c49c7040ae03d5d9c9daaa57e74d91691671a724bc082f7b08b"
+      },
+      "path": "/Users/arjun/again/target/release/again",
+      "version": "again 0.1.0"
+    },
+    "host": {
+      "machine": {
+        "machine": "arm64",
+        "processor": "arm",
+        "release": "24.6.0",
+        "system": "Darwin",
+        "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+      },
+      "python": {
+        "build": [
+          "v3.9.13:6de2ca5339",
+          "May 17 2022 11:37:23"
+        ],
+        "executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+        "implementation": "CPython",
+        "version": "3.9.13"
+      }
+    },
+    "repository": {
+      "commit": "58188d5258f333d13efa2aa305a4de5a85a61b7d",
+      "dirty": false,
+      "dirty_entries": [],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.slow-gate.v1"
+}
