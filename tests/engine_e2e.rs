@@ -1,5 +1,7 @@
 use std::fs;
-use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -12,6 +14,7 @@ use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
 
+#[cfg(target_os = "macos")]
 const AGAIN_SENTINEL: &str = "AGAIN_CODEX_HOOK_V1=1";
 
 #[cfg(target_os = "macos")]
