@@ -1,0 +1,273 @@
+{
+  "configuration": {
+    "baseline_iterations": 5,
+    "child_address_space_limit_bytes": null,
+    "environment_overrides": {
+      "AGAIN_HOME": "fresh temporary directory",
+      "GREP_OPTIONS": "unset",
+      "LC_ALL": "C",
+      "PATH": "/usr/bin:/bin",
+      "unmodeled_loader_locale_terminal_inputs_removed": []
+    },
+    "filesystem_page_cache_dropped": false,
+    "fixture_files": 4,
+    "fixture_size_mib": 2048,
+    "memory_limit_note": "no portable hard limit; child peak RSS is recorded",
+    "per_stream_hard_file_and_capture_limit_bytes": 16777216,
+    "speed_gate_enforced_by_exit_code": true,
+    "timeout_seconds_per_process": 120.0,
+    "warm_iterations": 15
+  },
+  "correctness": {
+    "all_warm_events_are_full_hits": true,
+    "all_warm_exact": true,
+    "cold_exact": true,
+    "mutation_event_is_miss": true,
+    "mutation_exact": true,
+    "stats": {
+      "bypasses": 0,
+      "compact_replays": 0,
+      "duplicate_bytes_omitted": 0,
+      "estimated_execution_ms_saved": 9705,
+      "executions": 2,
+      "full_replays": 15,
+      "quarantines": 0
+    }
+  },
+  "fixture": {
+    "again_argv": [
+      "/Users/arjun/again/target/release/again",
+      "run",
+      "--",
+      "grep",
+      "needle",
+      "payload-000.bin",
+      "payload-001.bin",
+      "payload-002.bin",
+      "payload-003.bin"
+    ],
+    "aggregate_logical_size_bytes": 2147483648,
+    "allocated_size_bytes_after_mutation": 81920,
+    "construction": "aggregate bytes split across sparse zero-filled files, each ending in ASCII needle\\n",
+    "logical_size_bytes_by_file": [
+      536870912,
+      536870912,
+      536870912,
+      536870912
+    ],
+    "mutation": {
+      "file": "payload-000.bin",
+      "native_streams_unchanged": true,
+      "offset_bytes": 268435456,
+      "replacement_hex": "78"
+    },
+    "native_argv": [
+      "/usr/bin/grep",
+      "needle",
+      "payload-000.bin",
+      "payload-001.bin",
+      "payload-002.bin",
+      "payload-003.bin"
+    ],
+    "stream_evidence": {
+      "exit_code": 0,
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_bytes": 144,
+      "stdout_sha256": "24c6f65304db6197ae816df511d79bf9bc30c5126d6de53d953c1379b04a8887"
+    }
+  },
+  "gates": {
+    "correctness": {
+      "status": "pass"
+    },
+    "speed": {
+      "baseline_p50_ms": 721.466583,
+      "comparison": ">=",
+      "observed_speedup": 68.4728047399232,
+      "required_speedup": 3.0,
+      "status": "pass",
+      "warm_again_p95_ms": 10.536542
+    }
+  },
+  "generated_at_utc": "2026-08-23T20:23:36.076761+00:00",
+  "harness_version": "1.0.0",
+  "measurements": {
+    "again_cold": {
+      "elapsed_ms": 2713.628708,
+      "event": {
+        "disposition": "executed",
+        "reason": "DOUBLE_EXECUTION_VALIDATED",
+        "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+      },
+      "exact_stream_match": true
+    },
+    "again_warm": {
+      "all_exact_full_stream_matches": true,
+      "events": [
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_7d50e416fae94d53afdacc402a10eedc"
+        }
+      ],
+      "maximum_ms": 10.536542,
+      "mean_ms": 10.229210933333333,
+      "minimum_ms": 9.205625,
+      "p50_ms": 10.255875,
+      "p95_ms": 10.536542,
+      "samples_ms": [
+        10.536542,
+        10.197916,
+        10.410792,
+        9.205625,
+        10.221666,
+        10.155458,
+        10.364375,
+        10.145125,
+        10.508083,
+        10.52675,
+        10.305875,
+        10.128041,
+        10.090208,
+        10.255875,
+        10.385833
+      ]
+    },
+    "mutation_miss": {
+      "again_elapsed_ms": 1652.162791,
+      "event": {
+        "disposition": "executed",
+        "reason": "DOUBLE_EXECUTION_VALIDATED",
+        "result_id": "r_29901b20e4474fd8875ecbe7705c86f8"
+      },
+      "exact_stream_match": true,
+      "native_elapsed_ms": 628.156667
+    },
+    "native": {
+      "maximum_ms": 1126.994125,
+      "mean_ms": 782.515075,
+      "minimum_ms": 659.478209,
+      "p50_ms": 721.466583,
+      "p95_ms": 1126.994125,
+      "samples_ms": [
+        1126.994125,
+        675.81875,
+        659.478209,
+        728.817708,
+        721.466583
+      ]
+    },
+    "resource_observation": {
+      "initial_child_rss_high_water_bytes": 0,
+      "peak_child_rss_bytes": 773177344,
+      "platform_interpretation": "ru_maxrss is bytes on Darwin",
+      "scope": "high-water mark from the first native run through Again stats; provenance subprocesses were launched afterward"
+    }
+  },
+  "provenance": {
+    "binary": {
+      "path": "/Users/arjun/again/target/release/again",
+      "sha256": "d11d43d023bfa52084818710c0c2c20c56f70bdb2acb648ac45b9cca619d6dd1",
+      "version": "again 0.1.0"
+    },
+    "harness": {
+      "path": "/Users/arjun/again/bench/direct_benchmark.py",
+      "sha256": "619c625a090c93abd92267e4e47dc904db23530836d851f9841796f7c802db50"
+    },
+    "host": {
+      "machine": "arm64",
+      "processor": "arm",
+      "python_executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+      "python_implementation": "CPython",
+      "python_version": "3.9.13",
+      "release": "24.6.0",
+      "system": "Darwin",
+      "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+    },
+    "repository": {
+      "commit": "7a238d5364efaa37addc6a51e398f57a91d1c439",
+      "dirty": false,
+      "dirty_entries": [],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.direct-benchmark.v1",
+  "scope": {
+    "automatic_hooks_exercised": false,
+    "codex_models_exercised": false,
+    "output_compaction_exercised": false,
+    "product_path": "explicit again run -- argv",
+    "token_reduction_measured": false
+  }
+}

@@ -77,7 +77,12 @@ These scripts require exact full streams if run against current code. Their hook
 and opaque-execution thresholds are script-local regression signals only. They
 must never be used to justify automatic-hook, product-latency, or release claims.
 
-Every existing JSON under `bench/results/` predates the current explicit-CLI
-product contract and/or exercises the unsafe experimental hook. Those files are
-retained unchanged as historical, superseded evidence; see
+[`results/2026-08-23-direct-v1.json`](results/2026-08-23-direct-v1.json) is the
+current explicit-CLI/full-stream result for clean source commit `7a238d5`. It
+passed correctness and the conditional 3x gate on its recorded 2 GiB sparse
+`grep` fixture: native p50 721.467 ms, warm Again p95 10.537 ms, or 68.473x.
+Cold double validation took 2,713.629 ms, so the result is evidence for repeated
+work on that exact commit/host/fixture, not a claim about first runs or arbitrary
+commands. The other JSON files exercise superseded automatic-hook and/or
+compact-reference paths and remain only for provenance; see
 [`docs/EVIDENCE.md`](../docs/EVIDENCE.md).
