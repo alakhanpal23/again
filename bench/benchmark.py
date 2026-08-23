@@ -240,7 +240,7 @@ def gates(
         "output_reduction": gate("output_reduction", output_reduction, 0.50),
     }
     # A sub-500ms baseline is too short for this harness to make a product-speed
-    # claim. When it is long enough, require warm p95 to beat baseline p50.
+    # claim. When it is long enough, require at least a 3x warm speedup.
     if baseline_p50 < 500.0:
         evaluated["speed"] = {
             "status": "not_applicable",
@@ -248,7 +248,15 @@ def gates(
             "baseline_p50_ms": baseline_p50,
         }
     else:
-        evaluated["speed"] = gate("speed", hit_p95, baseline_p50)
+        speedup = baseline_p50 / hit_p95
+        evaluated["speed"] = {
+            "status": "pass" if speedup >= 3.0 else "fail",
+            "observed_speedup": speedup,
+            "threshold": 3.0,
+            "comparison": ">=",
+            "baseline_p50_ms": baseline_p50,
+            "warm_hit_p95_ms": hit_p95,
+        }
     return evaluated
 
 

@@ -23,6 +23,7 @@ pub enum ToolKind {
 }
 
 impl ToolKind {
+    #[cfg(target_os = "macos")]
     fn parse(requested: &str) -> Option<Self> {
         match requested {
             "cat" => Some(Self::Cat),
@@ -37,6 +38,7 @@ impl ToolKind {
         }
     }
 
+    #[cfg(target_os = "macos")]
     fn executable_name(self) -> &'static str {
         match self {
             Self::Cat => "cat",
@@ -142,7 +144,7 @@ pub fn verify_executable(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (requested_argv0, canonical_path);
-        return Err(VerifyError::UnsupportedPlatform);
+        Err(VerifyError::UnsupportedPlatform)
     }
 
     #[cfg(target_os = "macos")]

@@ -19,7 +19,7 @@ use crate::fingerprint::{
 use crate::hook::{parse_input, rewrite_output};
 use crate::policy::{AccessPlan, AccessScope, Decision, PolicyContext, classify};
 use crate::setup::{
-    SetupScope, hook_path, install_codex_hook, is_codex_hook_installed, remove_codex_hook,
+    SetupScope, codex_hook_scope_status, hook_path, install_codex_hook, remove_codex_hook,
 };
 use crate::store::{EventDisposition, PendingCall, Store};
 
@@ -147,9 +147,17 @@ struct DoctorReport {
     executable: String,
     state_dir: String,
     state_writable: bool,
-    codex_hook_path: String,
-    codex_hook_installed: bool,
+    policy_version: &'static str,
+    global_codex_hook_path: String,
+    project_codex_hook_path: String,
+    global_codex_hook_installed: bool,
+    project_codex_hook_installed: bool,
+    duplicate_codex_hook_scopes: bool,
     profile: &'static str,
+    execution_boundary: &'static str,
+    seatbelt_preflight: String,
+    seatbelt_runtime_probe: String,
+    seatbelt_used_for_profile: bool,
     trace_backed_replay: bool,
 }
 
@@ -218,6 +226,18 @@ fn setup(args: SetupArgs) -> Result<i32> {
             "Again's Codex hook is already current at {}.",
             change.path.display()
         );
+    }
+    if !args.dry_run {
+        let workspace = discover_workspace(&cwd)?;
+        let global = hook_path(SetupScope::Global, None)?;
+        let project = hook_path(SetupScope::Project, Some(&workspace))?;
+        if let Ok(status) = codex_hook_scope_status(&global, &project)
+            && status.duplicate_again_hooks()
+        {
+            eprintln!(
+                "Warning: Again is installed in both global and project Codex hook scopes; remove one to avoid duplicate handlers."
+            );
+        }
     }
     Ok(0)
 }
@@ -455,7 +475,7 @@ fn run_admitted(
     }
 
     // A candidate is admitted only after an immediate independent execution agrees.
-    // This is validation evidence, not a substitute for the v0 whole-workspace proof.
+    // This is validation evidence, not a substitute for the scoped v0 proof.
     let shadow = execute_once(&executable, &argv[1..], &call.cwd, &environment)?;
     let after_shadow = fingerprint_scoped_with_cache(
         &FingerprintInput {
@@ -793,15 +813,32 @@ fn stats(json: bool) -> Result<i32> {
 fn doctor(json: bool) -> Result<i32> {
     let executable = std::env::current_exe()?.canonicalize()?;
     let store = open_store_for_current_workspace()?;
-    let hook = hook_path(SetupScope::Global, None)?;
+    let cwd = std::env::current_dir()?;
+    let workspace = discover_workspace(&cwd)?;
+    let global_hook = hook_path(SetupScope::Global, None)?;
+    let project_hook = hook_path(SetupScope::Project, Some(&workspace))?;
+    let hooks = codex_hook_scope_status(&global_hook, &project_hook)?;
+    let seatbelt_preflight = crate::sandbox::preflight().to_string();
+    let seatbelt_runtime_probe = match crate::sandbox::probe_apply() {
+        Ok(()) => "available".to_owned(),
+        Err(error) => format!("unavailable: {error}"),
+    };
     let report = DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
         executable: executable.display().to_string(),
         state_dir: store.root().display().to_string(),
         state_writable: store.root().is_dir(),
-        codex_hook_path: hook.display().to_string(),
-        codex_hook_installed: is_codex_hook_installed(&hook)?,
-        profile: "whole_workspace_read_v0",
+        policy_version: POLICY_VERSION,
+        global_codex_hook_path: hooks.global_path.display().to_string(),
+        project_codex_hook_path: hooks.project_path.display().to_string(),
+        global_codex_hook_installed: hooks.global_installed,
+        project_codex_hook_installed: hooks.project_installed,
+        duplicate_codex_hook_scopes: hooks.duplicate_again_hooks(),
+        profile: "scoped_audited_read_only_v0",
+        execution_boundary: "audited_native_read_only_v0",
+        seatbelt_preflight,
+        seatbelt_runtime_probe,
+        seatbelt_used_for_profile: false,
         trace_backed_replay: false,
     };
     if json {
@@ -810,15 +847,19 @@ fn doctor(json: bool) -> Result<i32> {
         println!("Again {}", report.version);
         println!("executable: {}", report.executable);
         println!("state: {}", report.state_dir);
+        println!("policy: {}", report.policy_version);
         println!(
-            "Codex hook: {}",
-            if report.codex_hook_installed {
-                "installed"
-            } else {
-                "not installed"
-            }
+            "Codex hooks: global={}, project={}",
+            report.global_codex_hook_installed, report.project_codex_hook_installed
         );
+        if report.duplicate_codex_hook_scopes {
+            println!("warning: duplicate Again handlers are active in both hook scopes");
+        }
         println!("active profile: {}", report.profile);
+        println!("execution boundary: {}", report.execution_boundary);
+        println!("Seatbelt preflight: {}", report.seatbelt_preflight);
+        println!("Seatbelt runtime probe: {}", report.seatbelt_runtime_probe);
+        println!("Seatbelt used by active profile: no");
         println!("trace-backed replay: not yet available; unsafe/unknown calls pass through");
     }
     Ok(0)

@@ -782,22 +782,30 @@ fn is_regular_executable(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use std::ffi::OsStr;
+    #[cfg(target_os = "macos")]
     use std::fs;
+    #[cfg(target_os = "macos")]
     use std::os::unix::ffi::OsStrExt;
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::{PermissionsExt, symlink};
+    #[cfg(target_os = "macos")]
     use std::path::PathBuf;
 
+    #[cfg(target_os = "macos")]
     use tempfile::TempDir;
 
     use super::*;
 
+    #[cfg(target_os = "macos")]
     struct Fixture {
         _temp: TempDir,
         workspace: PathBuf,
         executable: PathBuf,
     }
 
+    #[cfg(target_os = "macos")]
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("tempdir");

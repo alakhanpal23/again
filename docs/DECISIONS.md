@@ -38,3 +38,14 @@ Again can compile a deterministic macOS Seatbelt profile with exact executable a
 
 Benchmarks measure hook, opaque handoff, fingerprint, lookup, and presentation. Trivial commands may be slower. The 3x speed gate is evaluated only where the native baseline is at least 500 ms; duplicate-output reduction remains valuable independently. Failing measurements stay in the evidence ledger.
 
+## D-010 — Hook setup is reversible or fails closed
+
+When Again installs into an existing Codex hook file, it keeps a private versioned snapshot and restores the original bytes exactly. Reinstall updates the expected installed bytes only when the file still matches Again's prior write. If a user or another tool changes it, setup/removal refuses to overwrite; both global and project installations are diagnosed as a duplicate-handler risk.
+
+## D-011 — Concurrent results converge or quarantine atomically
+
+Local result compare/insert runs under an immediate SQLite transaction. Identical writers converge on one result; a same-key output/status disagreement quarantines the record and emits evidence in the same transaction. Cleanup is bounded and may delete only old unreferenced tracked blobs, stale opaque calls, and expired telemetry—not results, deliveries, quarantine evidence, or referenced blobs.
+
+## D-012 — Shared records use signed, producer-bound manifests
+
+Remote manifests sign a manual length-prefixed canonical encoding with Ed25519. Tenant, repository, request, policy, execution profile, platform/image, blob, lifetime, privacy, key-id, and producer bindings are verified before acceptance. A key id cannot be silently rebound to different key material or a different producer. This secures the protocol object; it does not imply that the remote service or transport exists yet.

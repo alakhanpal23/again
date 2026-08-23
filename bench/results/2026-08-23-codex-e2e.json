@@ -1,0 +1,36 @@
+{
+  "schema": "again.codex-integration.v1",
+  "date": "2026-08-23",
+  "source_commit": "0421bad397b6e7d3b1b646dcca29b352a2f6d143",
+  "again_version": "0.1.0",
+  "codex_version": "0.149.0",
+  "platform": "Darwin arm64",
+  "sandbox": "workspace-write",
+  "hook_scope_under_test": "global",
+  "fixture": {
+    "workspace": "isolated temporary Git repository",
+    "command": "cat input.txt",
+    "separate_tool_calls": 2,
+    "expected_stdout": "alpha from real codex integration\n"
+  },
+  "assertions": {
+    "pre_tool_use_hook_ran": true,
+    "opaque_again_exec_rewrite_ran": true,
+    "first_delivery_exact": true,
+    "second_delivery_compact": true,
+    "full_output_reference_present": true,
+    "repository_local_state_writable_inside_codex_sandbox": true
+  },
+  "store_stats_after_run": {
+    "executions": 1,
+    "full_replays": 0,
+    "compact_replays": 1,
+    "bypasses": 0,
+    "quarantines": 0,
+    "duplicate_bytes_omitted": 34
+  },
+  "limitations": [
+    "The fixture also still had a project-local copy of the same hook, so Codex reported two matching PreToolUse handlers per tool call. Both produced the same rewrite; the temporary project hook and global hook were removed after the run. Normal setup should select one scope.",
+    "This is one real session, not the multi-repository outside-alpha gate."
+  ]
+}

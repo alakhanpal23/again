@@ -1,7 +1,6 @@
 //! Versioned wire types and fail-closed verification for the day-30 shared cache.
 //!
-//! This module intentionally does not implement cryptography. A deployment
-//! supplies a [`SignatureVerifier`] backed by its chosen, reviewed crypto
+//! The [`crate::team_crypto`] adapter supplies the reviewed Ed25519
 //! implementation. The bytes authenticated by that verifier are a manual,
 //! length-prefixed encoding; JSON field order is never part of the protocol.
 
@@ -204,7 +203,7 @@ impl RemoteCacheManifest {
         bytes
     }
 
-    fn validate_wire(&self) -> Result<(), VerificationError> {
+    pub(crate) fn validate_for_signing(&self) -> Result<(), VerificationError> {
         if self.schema_version != REMOTE_CACHE_SCHEMA_VERSION {
             return Err(VerificationError::UnknownSchemaVersion);
         }
@@ -234,6 +233,12 @@ impl RemoteCacheManifest {
         }
         validate_identifier(&signature.key_id)
             .map_err(|_| VerificationError::InvalidIdentifier("signature.key_id"))?;
+        Ok(())
+    }
+
+    fn validate_wire(&self) -> Result<(), VerificationError> {
+        self.validate_for_signing()?;
+        let signature = self.signature.as_ref().ok_or(VerificationError::Unsigned)?;
         if signature.signature.is_empty() || signature.signature.len() > MAX_SIGNATURE_SIZE {
             return Err(VerificationError::InvalidSignatureSize);
         }
@@ -290,6 +295,7 @@ pub trait SignatureVerifier {
         &self,
         algorithm: SignatureAlgorithm,
         key_id: &str,
+        producer_id: &str,
         signing_bytes: &[u8],
         signature: &[u8],
     ) -> bool;
@@ -402,6 +408,7 @@ pub fn verify_candidate<'a, V: SignatureVerifier>(
     if !verifier.verify(
         signature.algorithm,
         &signature.key_id,
+        &manifest.producer_id,
         &manifest.canonical_signing_bytes(),
         &signature.signature,
     ) {
@@ -486,6 +493,7 @@ mod tests {
             &self,
             algorithm: SignatureAlgorithm,
             key_id: &str,
+            _producer_id: &str,
             signing_bytes: &[u8],
             signature: &[u8],
         ) -> bool {

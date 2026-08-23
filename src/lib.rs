@@ -8,5 +8,6 @@ pub mod sandbox;
 pub mod setup;
 pub mod store;
 pub mod team;
+pub mod team_crypto;
 
 pub use engine::run_cli;

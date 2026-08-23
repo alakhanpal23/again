@@ -6,15 +6,28 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
+const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const EVENT_TTL_MS: i64 = 90 * 24 * 60 * 60 * 1_000;
+const ORPHAN_ARTIFACT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+const CLEANUP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
+const CLEANUP_ROW_LIMIT: i64 = 512;
+const CLEANUP_ARTIFACT_LIMIT: i64 = 256;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CleanupReport {
+    pub pending_calls: u64,
+    pub events: u64,
+    pub artifacts: u64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingCall {
@@ -140,13 +153,14 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
 
-        let store = Self {
+        let mut store = Self {
             root,
             blobs,
             conn,
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
         };
         store.migrate()?;
+        store.maybe_cleanup()?;
         set_private_file(&database)?;
         Ok(store)
     }
@@ -243,6 +257,25 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 3 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE artifacts (
+                    digest TEXT PRIMARY KEY CHECK(length(digest) = 64),
+                    created_ms INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                CREATE INDEX artifacts_created_idx ON artifacts(created_ms);
+                CREATE INDEX pending_calls_created_idx ON pending_calls(created_ms);
+                CREATE TABLE maintenance (
+                    name TEXT PRIMARY KEY,
+                    completed_ms INTEGER NOT NULL
+                ) WITHOUT ROWID;
+                PRAGMA user_version = 3;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -315,35 +348,16 @@ impl Store {
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
         let digest = blake3::hash(bytes).to_hex().to_string();
         let target = self.blob_path(&digest)?;
-        if target.exists() {
-            self.verify_blob(&digest, bytes)?;
-            return Ok(digest);
-        }
-
-        let parent = target.parent().context("blob target has no parent")?;
-        fs::create_dir_all(parent)?;
-        set_private_dir(parent)?;
-        let staged = parent.join(format!(".{}.{}.tmp", digest, Uuid::new_v4().simple()));
-        {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&staged)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-        }
-        set_private_file(&staged)?;
-        match fs::rename(&staged, &target) {
-            Ok(()) => {}
-            Err(error) if target.exists() => {
-                let _ = fs::remove_file(&staged);
-                self.verify_blob(&digest, bytes).context(error)?;
-            }
-            Err(error) => {
-                let _ = fs::remove_file(&staged);
-                return Err(error).context("commit CAS blob");
-            }
-        }
+        // File publication and lifecycle cleanup share the SQLite write lock. This
+        // prevents a cleaner from deleting an old orphan between verification and
+        // publication in the artifact inventory.
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_blob_file(&target, &digest, bytes)?;
+        transaction.execute(
+            "INSERT INTO artifacts (digest, created_ms) VALUES (?1, ?2) ON CONFLICT(digest) DO UPDATE SET created_ms = excluded.created_ms",
+            params![digest, now_ms()],
+        )?;
+        transaction.commit()?;
         Ok(digest)
     }
 
@@ -358,18 +372,7 @@ impl Store {
     }
 
     fn blob_path(&self, digest: &str) -> Result<PathBuf> {
-        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("invalid BLAKE3 digest");
-        }
-        Ok(self.blobs.join(&digest[..2]).join(&digest[2..]))
-    }
-
-    fn verify_blob(&self, digest: &str, expected: &[u8]) -> Result<()> {
-        let existing = self.get_blob(digest)?;
-        if existing != expected {
-            bail!("CAS collision or corruption for blob {digest}");
-        }
-        Ok(())
+        blob_path_under(&self.blobs, digest)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -385,18 +388,6 @@ impl Store {
     ) -> Result<StoredResult> {
         let stdout_digest = self.put_blob(stdout)?;
         let stderr_digest = self.put_blob(stderr)?;
-        let existing = self.get_result(request_key)?;
-        if let Some(existing) = existing {
-            if existing.stdout_digest != stdout_digest
-                || existing.stderr_digest != stderr_digest
-                || existing.exit_code != exit_code
-            {
-                self.quarantine(&existing.id, "same_key_different_result")?;
-                bail!("differential mismatch for request key {request_key}; entry quarantined");
-            }
-            return Ok(existing);
-        }
-
         let result = StoredResult {
             id: format!("r_{}", Uuid::new_v4().simple()),
             request_key: request_key.to_owned(),
@@ -410,7 +401,46 @@ impl Store {
             proof_json: proof_json.to_owned(),
         };
         let now = now_ms();
-        let transaction = self.conn.transaction()?;
+        // Serialize the read/compare/insert decision. A deferred transaction lets
+        // two writers both observe absence and turns divergence into a bare UNIQUE
+        // error instead of quarantine.
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = transaction
+            .query_row(
+                "SELECT id, request_key, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, policy_version, proof_json, quarantined FROM results WHERE request_key = ?1",
+                [request_key],
+                |row| Ok((row_to_result(row)?, row.get::<_, bool>(10)?)),
+            )
+            .optional()?;
+        if let Some((existing, quarantined)) = existing {
+            if quarantined {
+                bail!("request key {request_key} is quarantined");
+            }
+            if existing.stdout_digest != result.stdout_digest
+                || existing.stderr_digest != result.stderr_digest
+                || existing.exit_code != result.exit_code
+            {
+                transaction.execute(
+                    "UPDATE results SET quarantined = 1, quarantine_reason = ?2 WHERE id = ?1",
+                    params![existing.id, "same_key_different_result"],
+                )?;
+                transaction.execute(
+                    "INSERT INTO events (call_id, result_id, disposition, reason_code, elapsed_ms, bytes_omitted, created_ms) VALUES (NULL, ?1, ?2, ?3, 0, 0, ?4)",
+                    params![
+                        existing.id,
+                        EventDisposition::Quarantined.as_str(),
+                        "same_key_different_result",
+                        now,
+                    ],
+                )?;
+                transaction.commit()?;
+                bail!("differential mismatch for request key {request_key}; entry quarantined");
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
         transaction.execute(
             "INSERT INTO results (id, request_key, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, policy_version, proof_json, created_ms, last_used_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
@@ -529,6 +559,109 @@ impl Store {
             )
             .optional()
             .context("read last event")
+    }
+
+    /// Run one bounded lifecycle-maintenance pass immediately.
+    ///
+    /// Results, deliveries, quarantined evidence, and referenced CAS blobs are
+    /// deliberately retained. Only expired pending calls, expired telemetry, and
+    /// old tracked blobs with no result reference are eligible.
+    pub fn cleanup(&mut self) -> Result<CleanupReport> {
+        self.cleanup_at(now_ms(), true)
+    }
+
+    fn maybe_cleanup(&mut self) -> Result<()> {
+        self.cleanup_at(now_ms(), false).map(|_| ())
+    }
+
+    fn cleanup_at(&mut self, now: i64, force: bool) -> Result<CleanupReport> {
+        let blobs = self.blobs.clone();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !force {
+            let last: Option<i64> = transaction
+                .query_row(
+                    "SELECT completed_ms FROM maintenance WHERE name = 'lifecycle_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if last.is_some_and(|last| now.saturating_sub(last) < CLEANUP_INTERVAL_MS) {
+                transaction.commit()?;
+                return Ok(CleanupReport::default());
+            }
+        }
+
+        let pending_cutoff = now.saturating_sub(PENDING_CALL_TTL_MS);
+        let event_cutoff = now.saturating_sub(EVENT_TTL_MS);
+        let artifact_cutoff = now.saturating_sub(ORPHAN_ARTIFACT_TTL_MS);
+        let pending_calls = transaction.execute(
+            "DELETE FROM pending_calls WHERE id IN (SELECT id FROM pending_calls WHERE created_ms < ?1 ORDER BY created_ms ASC LIMIT ?2)",
+            params![pending_cutoff, CLEANUP_ROW_LIMIT],
+        )? as u64;
+        let events = transaction.execute(
+            "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE created_ms < ?1 ORDER BY created_ms ASC, id ASC LIMIT ?2)",
+            params![event_cutoff, CLEANUP_ROW_LIMIT],
+        )? as u64;
+
+        let candidates: Vec<String> = {
+            let mut statement = transaction.prepare(
+                r#"
+                SELECT digest FROM artifacts
+                WHERE created_ms < ?1
+                  AND NOT EXISTS (
+                    SELECT 1 FROM results
+                    WHERE stdout_digest = artifacts.digest OR stderr_digest = artifacts.digest
+                  )
+                ORDER BY created_ms ASC, digest ASC LIMIT ?2
+                "#,
+            )?;
+            statement
+                .query_map(params![artifact_cutoff, CLEANUP_ARTIFACT_LIMIT], |row| {
+                    row.get(0)
+                })?
+                .collect::<rusqlite::Result<_>>()?
+        };
+        let mut artifacts = 0_u64;
+        for digest in candidates {
+            let Ok(path) = blob_path_under(&blobs, &digest) else {
+                // A malformed inventory row cannot name a filesystem target.
+                transaction.execute("DELETE FROM artifacts WHERE digest = ?1", [&digest])?;
+                artifacts += 1;
+                continue;
+            };
+            let removable = match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => metadata
+                    .modified()
+                    .ok()
+                    .and_then(system_time_ms)
+                    .is_some_and(|modified| modified < artifact_cutoff),
+                Ok(_) => false,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            };
+            if !removable {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => continue,
+            }
+            transaction.execute("DELETE FROM artifacts WHERE digest = ?1", [&digest])?;
+            artifacts += 1;
+        }
+        transaction.execute(
+            "INSERT INTO maintenance (name, completed_ms) VALUES ('lifecycle_cleanup', ?1) ON CONFLICT(name) DO UPDATE SET completed_ms = excluded.completed_ms",
+            [now],
+        )?;
+        transaction.commit()?;
+        Ok(CleanupReport {
+            pending_calls,
+            events,
+            artifacts,
+        })
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
@@ -723,6 +856,67 @@ fn file_digest_row_checksum(identity: &FileIdentity, digest: &[u8; 32]) -> [u8; 
     *hasher.finalize().as_bytes()
 }
 
+fn blob_path_under(blobs: &Path, digest: &str) -> Result<PathBuf> {
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("invalid BLAKE3 digest");
+    }
+    Ok(blobs.join(&digest[..2]).join(&digest[2..]))
+}
+
+fn ensure_blob_file(target: &Path, digest: &str, expected: &[u8]) -> Result<()> {
+    if target.exists() {
+        return verify_blob_file(target, digest, expected);
+    }
+
+    let parent = target.parent().context("blob target has no parent")?;
+    fs::create_dir_all(parent)?;
+    set_private_dir(parent)?;
+    let staged = parent.join(format!(".{digest}.{}.tmp", Uuid::new_v4().simple()));
+    let write_result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staged)?;
+        file.write_all(expected)?;
+        file.sync_all()?;
+        set_private_file(&staged)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    match fs::rename(&staged, target) {
+        Ok(()) => Ok(()),
+        Err(error) if target.exists() => {
+            let _ = fs::remove_file(&staged);
+            verify_blob_file(target, digest, expected).context(error)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&staged);
+            Err(error).context("commit CAS blob")
+        }
+    }
+}
+
+fn verify_blob_file(path: &Path, digest: &str, expected: &[u8]) -> Result<()> {
+    let existing = fs::read(path).with_context(|| format!("read blob {digest}"))?;
+    let actual = blake3::hash(&existing).to_hex().to_string();
+    if actual != digest {
+        bail!("CAS corruption: blob {digest} hashes to {actual}");
+    }
+    if existing != expected {
+        bail!("CAS collision or corruption for blob {digest}");
+    }
+    Ok(())
+}
+
+fn system_time_ms(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+}
+
 fn create_self_ignoring_gitignore(root: &Path) -> Result<()> {
     if root.file_name().and_then(|name| name.to_str()) != Some(".again") {
         return Ok(());
@@ -791,6 +985,10 @@ fn set_private_file(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::{File, FileTimes};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
     use tempfile::TempDir;
 
@@ -872,7 +1070,18 @@ mod tests {
         let database = temp.path().join("again.sqlite");
         Connection::open(&database)
             .unwrap()
-            .execute_batch("PRAGMA user_version = 1;")
+            .execute_batch(
+                r#"
+                CREATE TABLE pending_calls (id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL);
+                CREATE TABLE results (
+                    id TEXT PRIMARY KEY,
+                    stdout_digest TEXT NOT NULL,
+                    stderr_digest TEXT NOT NULL
+                );
+                CREATE TABLE events (id INTEGER PRIMARY KEY, created_ms INTEGER NOT NULL);
+                PRAGMA user_version = 1;
+                "#,
+            )
             .unwrap();
 
         let store = Store::open(temp.path()).unwrap();
@@ -927,6 +1136,119 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_expires_only_stale_unreferenced_state() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let current = now_ms();
+        let stale_pending = current - PENDING_CALL_TTL_MS - 1;
+        let stale_event = current - EVENT_TTL_MS - 1;
+        let stale_artifact = current - ORPHAN_ARTIFACT_TTL_MS - 1;
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO pending_calls (id, session_id, cwd, raw_command, argv_json, created_ms) VALUES ('stale', 's', '/tmp', 'cat x', '[]', ?1)",
+                [stale_pending],
+            )
+            .unwrap();
+        let recent = store
+            .create_call("session", None, temp.path(), "cat x", &["cat".into()])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (disposition, reason_code, elapsed_ms, bytes_omitted, created_ms) VALUES ('passed_through', 'old', 0, 0, ?1)",
+                [stale_event],
+            )
+            .unwrap();
+        store
+            .record_event(None, None, EventDisposition::Executed, "recent", 0, 0)
+            .unwrap();
+
+        let orphan_digest = store.put_blob(b"orphan").unwrap();
+        let retained = store
+            .insert_result("retained", b"referenced", b"", 0, 1, "v0", "{}")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE artifacts SET created_ms = ?1 WHERE digest = ?2",
+                params![stale_artifact, orphan_digest],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE artifacts SET created_ms = ?1 WHERE digest = ?2 OR digest = ?3",
+                params![
+                    stale_artifact,
+                    retained.stdout_digest,
+                    retained.stderr_digest
+                ],
+            )
+            .unwrap();
+        let old_time = UNIX_EPOCH + Duration::from_millis(stale_artifact as u64);
+        for digest in [
+            orphan_digest.as_str(),
+            retained.stdout_digest.as_str(),
+            retained.stderr_digest.as_str(),
+        ] {
+            File::open(store.blob_path(digest).unwrap())
+                .unwrap()
+                .set_times(FileTimes::new().set_modified(old_time))
+                .unwrap();
+        }
+
+        let report = store.cleanup_at(current, true).unwrap();
+        assert_eq!(
+            report,
+            CleanupReport {
+                pending_calls: 1,
+                events: 1,
+                artifacts: 1,
+            }
+        );
+        assert!(store.get_call("stale").unwrap().is_none());
+        assert_eq!(store.get_call(&recent.id).unwrap(), Some(recent));
+        assert!(store.get_blob(&orphan_digest).is_err());
+        assert_eq!(
+            store.get_blob(&retained.stdout_digest).unwrap(),
+            b"referenced"
+        );
+        assert_eq!(store.get_result("retained").unwrap(), Some(retained));
+        assert_eq!(store.stats().unwrap().executions, 1);
+    }
+
+    #[test]
+    fn cleanup_batches_are_strictly_bounded() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let current = now_ms();
+        let stale = current - PENDING_CALL_TTL_MS - 1;
+        let transaction = store.conn.transaction().unwrap();
+        for index in 0..(CLEANUP_ROW_LIMIT + 1) {
+            transaction
+                .execute(
+                    "INSERT INTO pending_calls (id, session_id, cwd, raw_command, argv_json, created_ms) VALUES (?1, 's', '/tmp', 'cat', '[]', ?2)",
+                    params![format!("stale-{index}"), stale],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        assert_eq!(
+            store.cleanup_at(current, true).unwrap().pending_calls,
+            CLEANUP_ROW_LIMIT as u64
+        );
+        let remaining: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_calls", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1);
+        assert_eq!(store.cleanup_at(current, true).unwrap().pending_calls, 1);
+    }
+
+    #[test]
     fn results_and_delivery_state_round_trip() {
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path()).unwrap();
@@ -952,5 +1274,86 @@ mod tests {
                 .is_err()
         );
         assert!(store.get_result("key").unwrap().is_none());
+    }
+
+    #[test]
+    fn concurrent_identical_writes_converge_on_one_result() {
+        let temp = TempDir::new().unwrap();
+        drop(Store::open(temp.path()).unwrap());
+        let root = temp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut store = Store::open(root).unwrap();
+                    barrier.wait();
+                    store
+                        .insert_result("shared", b"same", b"", 0, 1, "v0", "{}")
+                        .unwrap()
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+
+        assert!(results.iter().all(|result| result.id == results[0].id));
+        let store = Store::open(temp.path()).unwrap();
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM results", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(store.get_blob(&results[0].stdout_digest).unwrap(), b"same");
+    }
+
+    #[test]
+    fn concurrent_same_key_divergence_is_atomically_quarantined() {
+        let temp = TempDir::new().unwrap();
+        drop(Store::open(temp.path()).unwrap());
+        let root = temp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = [b"first".as_slice(), b"second".as_slice()]
+            .into_iter()
+            .map(|output| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let mut store = Store::open(root).unwrap();
+                    barrier.wait();
+                    store.insert_result("shared", output, b"", 0, 1, "v0", "{}")
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|result| result.is_err()).count(), 1);
+
+        let store = Store::open(temp.path()).unwrap();
+        assert!(store.get_result("shared").unwrap().is_none());
+        let quarantined: i64 = store
+            .conn
+            .query_row(
+                "SELECT quarantined FROM results WHERE request_key = 'shared'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 1);
+        let quarantine_events: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE reason_code = 'same_key_different_result'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantine_events, 1);
     }
 }

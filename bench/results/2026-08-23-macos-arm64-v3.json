@@ -1,0 +1,291 @@
+{
+  "again": {
+    "all_warm_results_compact": true,
+    "cold": {
+      "exec_ms": 32.74475,
+      "hook_ms": 7.946333
+    },
+    "mutation_invalidation": {
+      "exec_ms": 24.287334,
+      "hook_ms": 4.597708,
+      "passed": true
+    },
+    "show_recovery": {
+      "elapsed_ms": 7.641042,
+      "exact": true,
+      "result_id": "r_a9aa2b0cd5584e78b5e2715a6c3bcc03"
+    },
+    "unsafe_unhandled_matrix": [
+      {
+        "command": "curl https://example.com",
+        "hook_ms": 3.584666,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "touch should-not-be-created",
+        "hook_ms": 3.322083,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "git status --short",
+        "hook_ms": 3.25325,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "echo unhandled",
+        "hook_ms": 3.234042,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat payload.txt | wc -c",
+        "hook_ms": 3.659667,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat /etc/passwd",
+        "hook_ms": 3.725792,
+        "returncode": 0,
+        "rewritten": false
+      },
+      {
+        "command": "cat -",
+        "hook_ms": 3.549292,
+        "returncode": 0,
+        "rewritten": false
+      }
+    ],
+    "warm_end_to_end": {
+      "mean_ms": 12.28434832,
+      "p50_ms": 11.905332999999999,
+      "p95_ms": 14.109957999999999,
+      "samples_ms": [
+        12.461875,
+        11.905332999999999,
+        13.140208000000001,
+        11.617542,
+        12.365584,
+        15.6915,
+        12.6445,
+        12.893334,
+        11.655459,
+        12.23125,
+        11.828291,
+        11.526959000000002,
+        12.56575,
+        12.595208,
+        11.756583,
+        13.443916999999999,
+        11.514125,
+        10.974208,
+        14.109957999999999,
+        11.790792,
+        11.477875000000001,
+        13.135124000000001,
+        11.26875,
+        11.388290999999999,
+        11.126292
+      ]
+    },
+    "warm_exec": {
+      "mean_ms": 7.017161720000001,
+      "p50_ms": 6.798208,
+      "p95_ms": 8.087916,
+      "samples_ms": [
+        7.261375,
+        7.037583,
+        7.867,
+        6.656167,
+        7.177709,
+        9.836333,
+        7.158375,
+        7.365042,
+        6.728125,
+        7.142625,
+        6.712125,
+        6.500917,
+        6.833917,
+        7.2315,
+        6.798208,
+        7.085042,
+        6.417292,
+        6.361625,
+        6.500833,
+        6.597042,
+        6.671,
+        8.087916,
+        6.43475,
+        6.55525,
+        6.411292
+      ]
+    },
+    "warm_hook": {
+      "mean_ms": 5.2671866,
+      "p50_ms": 5.096833,
+      "p95_ms": 6.358875,
+      "samples_ms": [
+        5.2005,
+        4.86775,
+        5.273208,
+        4.961375,
+        5.187875,
+        5.855167,
+        5.486125,
+        5.528292,
+        4.927334,
+        5.088625,
+        5.116166,
+        5.026042,
+        5.731833,
+        5.363708,
+        4.958375,
+        6.358875,
+        5.096833,
+        4.612583,
+        7.609125,
+        5.19375,
+        4.806875,
+        5.047208,
+        4.834,
+        4.833041,
+        4.715
+      ]
+    },
+    "warm_output_bytes": [
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169,
+      169
+    ]
+  },
+  "baseline": {
+    "mean_ms": 3.93273324,
+    "output_bytes": 2097120,
+    "p50_ms": 3.860166,
+    "p95_ms": 4.529125,
+    "samples_ms": [
+      4.6865,
+      3.607834,
+      3.863791,
+      3.572416,
+      3.683417,
+      3.78725,
+      3.852833,
+      3.759875,
+      4.529125,
+      4.238167,
+      4.0915,
+      3.865083,
+      4.464416,
+      3.844166,
+      3.956958,
+      3.875084,
+      3.861375,
+      3.999083,
+      3.8125,
+      3.841375,
+      3.754417,
+      3.898708,
+      3.860166,
+      3.815667,
+      3.796625
+    ]
+  },
+  "derived": {
+    "duplicate_output_reduction_fraction": 0.9999194132906081,
+    "warm_exec_speedup_vs_baseline_p50": 0.5678211081508538
+  },
+  "fixture": {
+    "command": "cat payload.txt",
+    "iterations": 25,
+    "payload_bytes": 2097120
+  },
+  "gates": {
+    "hit_p95_ms": {
+      "comparison": "<",
+      "name": "hit_p95_ms",
+      "observed": 8.087916,
+      "status": "pass",
+      "threshold": 100.0
+    },
+    "hook_p95_ms": {
+      "comparison": "<",
+      "name": "hook_p95_ms",
+      "observed": 6.358875,
+      "status": "pass",
+      "threshold": 10.0
+    },
+    "output_reduction": {
+      "comparison": ">=",
+      "name": "output_reduction",
+      "observed": 0.9999194132906081,
+      "status": "pass",
+      "threshold": 0.5
+    },
+    "speed": {
+      "baseline_p50_ms": 3.860166,
+      "reason": "baseline_p50_ms_below_500",
+      "status": "not_applicable"
+    }
+  },
+  "provenance": {
+    "binary": {
+      "digest": {
+        "algorithm": "sha256",
+        "hex": "8db9b3d61fffd8344802fd7cfcd2ac7c946f6d160f92f020712bcc8fbface6e6"
+      },
+      "path": "/Users/arjun/again/target/release/again",
+      "version": "again 0.1.0"
+    },
+    "host": {
+      "machine": {
+        "machine": "arm64",
+        "processor": "arm",
+        "release": "24.6.0",
+        "system": "Darwin",
+        "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+      },
+      "python": {
+        "build": [
+          "v3.9.13:6de2ca5339",
+          "May 17 2022 11:37:23"
+        ],
+        "executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+        "implementation": "CPython",
+        "version": "3.9.13"
+      }
+    },
+    "repository": {
+      "commit": "0421bad397b6e7d3b1b646dcca29b352a2f6d143",
+      "dirty": false,
+      "dirty_entries": [],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.benchmark.v2"
+}
