@@ -64,6 +64,18 @@ Linux library lane passed 615 tests with 7 ignored and zero failures. This is
 positive evidence for the fixed negative-lane classifier and control framing,
 not for a private root, command execution, profile qualification, or reuse.
 
+The subsequent fixed child now contains the next no-command implementation
+slice: after the namespace, identity, UTS, and parent-death checks, it makes
+mount propagation recursively private; mounts a fixed 16 MiB/4096-inode
+`nodev,nosuid,noswap` tmpfs over descriptor-checked `/tmp`; pivots into it;
+detaches the old-root pathname; reopens absolute `/`; and binds the final
+tmpfs identity, flags, limits, ownership, mode, and reserved-path absence into
+an exact new success bit. Dedicated canonical OS and invariant failures map to
+`mount_root_failed` and are never expected-unavailable. This source compiles
+for pinned x86_64 GNU production and test targets, but stock hosted Ubuntu
+refuses earlier at UTS configuration. A provisioned qualifying runner must
+exercise the branch before it becomes positive root-runtime evidence.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the

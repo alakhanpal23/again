@@ -3,9 +3,12 @@
 //! This module does not accept a program, arguments, caller-supplied
 //! environment parameter, path, callback, descriptor, or output sink. Its
 //! Linux leaf creates only one fixed child running a raw-syscall protocol; it
-//! never executes caller code. The leaf verifies the namespace bootstrap. A
-//! completed marker is returned only after that direct child has exited and
-//! been reaped; a cleanup-uncertain failure remains possible.
+//! never executes caller code. The leaf verifies the namespace bootstrap and
+//! a fixed, path-disconnected private tmpfs root. It does not yet prove
+//! inherited-FD hygiene, descriptor-selected mounts, scratch, procfs, or an
+//! executable workload. A completed marker is returned only after that direct
+//! child has exited and been reaped. A cleanup-uncertain failure remains
+//! possible.
 //! The result is not an execution, snapshot, isolation-session, or reuse
 //! authority.
 
@@ -55,6 +58,7 @@ enum IsolationQualificationStageV1 {
     ReceiveChildProof,
     VerifyChildProof,
     ChildUtsConfiguration,
+    ChildMountRoot,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -91,6 +95,7 @@ impl IsolationQualificationStageV1 {
             Self::ReceiveChildProof => "receive_child_proof",
             Self::VerifyChildProof => "verify_child_proof",
             Self::ChildUtsConfiguration => "child_uts_configuration",
+            Self::ChildMountRoot => "child_mount_root",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -474,7 +479,9 @@ mod platform {
     const PROOF_STATUS_INVARIANT_V1: u8 = 2;
     const PROOF_STATUS_PROTOCOL_V1: u8 = 3;
     const PROOF_STATUS_UTS_CONFIGURATION_V1: u8 = 4;
-    const PROOF_FLAGS_V1: u8 = 0b0000_0111;
+    const PROOF_STATUS_MOUNT_ROOT_OS_V1: u8 = 5;
+    const PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1: u8 = 6;
+    const PROOF_FLAGS_V1: u8 = 0b0000_1111;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -500,6 +507,25 @@ mod platform {
     const CLONE_CLEAR_SIGHAND_V1: u64 = 0x1_0000_0000;
     const CAP_SYS_ADMIN_MASK_V1: u64 = 1_u64 << 21;
     const HOSTNAME_V1: &[u8] = b"again";
+    const TMPFS_SUPER_MAGIC_V1: libc::c_long = 0x0102_1994;
+    const ROOT_TMPFS_BYTES_V1: u64 = 16 * 1024 * 1024;
+    const ROOT_TMPFS_INODES_V1: u64 = 4_096;
+    const ROOT_TMPFS_TYPE_V1: &CStr = c"tmpfs";
+    const ROOT_TMPFS_OPTIONS_V1: &CStr = c"size=16777216,nr_inodes=4096,mode=0755,noswap";
+    const ROOT_PATH_V1: &CStr = c"/";
+    const ROOT_TARGET_PATH_V1: &CStr = c"/tmp";
+    const ROOT_TARGET_NAME_V1: &CStr = c"tmp";
+    const CURRENT_DIRECTORY_V1: &CStr = c".";
+    const OLD_ROOT_NAME_V1: &CStr = c".oldroot";
+    const OLD_ROOT_PATH_V1: &CStr = c"/.oldroot";
+    const ABSENT_ROOT_NAMES_V1: [&CStr; 4] = [OLD_ROOT_NAME_V1, c"proc", c"dev", c"sys"];
+    const REQUIRED_ROOT_STATX_MASK_V1: u32 = libc::STATX_TYPE
+        | libc::STATX_MODE
+        | libc::STATX_UID
+        | libc::STATX_GID
+        | libc::STATX_INO
+        | libc::STATX_MNT_ID;
+    const MAX_LINUX_ERRNO_V1: i32 = 4_095;
 
     #[repr(C)]
     #[derive(Default)]
@@ -522,6 +548,20 @@ mod platform {
         flags: u64,
         mode: u64,
         resolve: u64,
+    }
+
+    #[derive(PartialEq)]
+    struct ChildRootIdentityV1 {
+        mount_id: u64,
+        inode: u64,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    }
+
+    enum ChildMountRootFailureV1 {
+        Os(i32),
+        Invariant,
     }
 
     #[derive(Clone, Copy)]
@@ -2576,6 +2616,33 @@ mod platform {
                 Some(errno),
             ));
         }
+        if matches!(
+            status,
+            PROOF_STATUS_MOUNT_ROOT_OS_V1 | PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1
+        ) {
+            let canonical_errno = match status {
+                PROOF_STATUS_MOUNT_ROOT_OS_V1 => (1..=MAX_LINUX_ERRNO_V1).contains(&errno),
+                PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1 => errno == 0,
+                _ => false,
+            };
+            if frame[FRAME_FLAGS_OFFSET_V1] != 0 || !canonical_errno || !identity_is_exact {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                RefusalCode::MountRootFailed,
+                IsolationQualificationStageV1::ChildMountRoot,
+                if status == PROOF_STATUS_MOUNT_ROOT_OS_V1 {
+                    IsolationQualificationReasonV1::Io
+                } else {
+                    IsolationQualificationReasonV1::ChildInvariantFailed
+                },
+                (errno != 0).then_some(errno),
+            ));
+        }
         if status != PROOF_STATUS_SUCCESS_V1 {
             let reason = match status {
                 PROOF_STATUS_OS_ERROR_V1 | PROOF_STATUS_INVARIANT_V1 => {
@@ -3148,12 +3215,305 @@ mod platform {
             child_fail(report_write, &nonce, PROOF_STATUS_INVARIANT_V1, 0, deadline);
         }
 
+        if let Err(error) = child_enter_private_tmpfs_root_v1() {
+            match error {
+                ChildMountRootFailureV1::Os(errno) => child_fail(
+                    report_write,
+                    &nonce,
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    errno,
+                    deadline,
+                ),
+                ChildMountRootFailureV1::Invariant => child_fail(
+                    report_write,
+                    &nonce,
+                    PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
+                    0,
+                    deadline,
+                ),
+            }
+        }
+
         let proof = child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
         if !child_write_frame(report_write, &proof, deadline) {
             child_exit(CHILD_EXIT_PROOF_FAILED_V1);
         }
         let _ = child_close(report_write);
         child_exit(0)
+    }
+
+    /// Enter the fixed diagnostic root without accepting a caller path or FD.
+    ///
+    /// This proves path disconnection only. Inherited descriptors and old
+    /// executable mappings are deliberately outside this slice and therefore
+    /// this result can never authorize execution.
+    fn child_enter_private_tmpfs_root_v1() -> Result<(), ChildMountRootFailureV1> {
+        let old_root = child_open_absolute_root_v1()?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_mount,
+                std::ptr::null::<u8>(),
+                ROOT_PATH_V1.as_ptr(),
+                std::ptr::null::<u8>(),
+                (libc::MS_REC | libc::MS_PRIVATE) as libc::c_ulong,
+                std::ptr::null::<u8>(),
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+
+        let old_target = child_open_root_target_at_v1(old_root)?;
+        let old_target_identity = child_root_identity_v1(old_target)?;
+
+        if unsafe {
+            libc::syscall(
+                libc::SYS_mount,
+                ROOT_TMPFS_TYPE_V1.as_ptr(),
+                ROOT_TARGET_PATH_V1.as_ptr(),
+                ROOT_TMPFS_TYPE_V1.as_ptr(),
+                (libc::MS_NODEV | libc::MS_NOSUID) as libc::c_ulong,
+                ROOT_TMPFS_OPTIONS_V1.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+
+        let new_root = child_open_root_target_at_v1(old_root)?;
+        let mounted_identity = child_root_identity_v1(new_root)?;
+        if mounted_identity.mount_id == old_target_identity.mount_id {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+
+        if unsafe { libc::syscall(libc::SYS_fchdir, new_root) } != 0 {
+            return Err(child_mount_os_failure_v1());
+        }
+        let old_target_closed = child_close_mount_fd_v1(old_target);
+        let old_root_closed = child_close_mount_fd_v1(old_root);
+        old_target_closed?;
+        old_root_closed?;
+
+        if unsafe {
+            libc::syscall(
+                libc::SYS_mkdirat,
+                new_root,
+                OLD_ROOT_NAME_V1.as_ptr(),
+                0o700_u32,
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_pivot_root,
+                CURRENT_DIRECTORY_V1.as_ptr(),
+                OLD_ROOT_NAME_V1.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+        if unsafe { libc::syscall(libc::SYS_chdir, ROOT_PATH_V1.as_ptr()) } != 0 {
+            return Err(child_mount_os_failure_v1());
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_umount2,
+                OLD_ROOT_PATH_V1.as_ptr(),
+                libc::MNT_DETACH,
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+        if unsafe {
+            libc::syscall(
+                libc::SYS_unlinkat,
+                new_root,
+                OLD_ROOT_NAME_V1.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+
+        let pivoted_root = child_open_absolute_root_v1()?;
+        let pivoted_identity = child_root_identity_v1(pivoted_root)?;
+        if pivoted_identity != mounted_identity
+            || !child_root_matches_policy_v1(pivoted_root, &pivoted_identity)?
+        {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        for name in ABSENT_ROOT_NAMES_V1 {
+            child_require_absent_at_v1(pivoted_root, name)?;
+        }
+        let retained_root_closed = child_close_mount_fd_v1(new_root);
+        let pivoted_root_closed = child_close_mount_fd_v1(pivoted_root);
+        retained_root_closed?;
+        pivoted_root_closed?;
+        Ok(())
+    }
+
+    fn child_open_absolute_root_v1() -> Result<RawFd, ChildMountRootFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                ROOT_PATH_V1.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0_u32,
+            )
+        };
+        child_checked_fd_v1(result)
+    }
+
+    fn child_open_root_target_at_v1(directory: RawFd) -> Result<RawFd, ChildMountRootFailureV1> {
+        let how = OpenHowV1 {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH_V1 | RESOLVE_NO_MAGICLINKS_V1,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                directory,
+                ROOT_TARGET_NAME_V1.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHowV1>(),
+            )
+        };
+        child_checked_fd_v1(result)
+    }
+
+    fn child_checked_fd_v1(result: libc::c_long) -> Result<RawFd, ChildMountRootFailureV1> {
+        if result < 0 {
+            return Err(child_mount_os_failure_v1());
+        }
+        match i32::try_from(result) {
+            Ok(fd) if fd >= 0 => Ok(fd),
+            _ => Err(ChildMountRootFailureV1::Invariant),
+        }
+    }
+
+    fn child_root_identity_v1(
+        descriptor: RawFd,
+    ) -> Result<ChildRootIdentityV1, ChildMountRootFailureV1> {
+        let mut raw = MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                descriptor,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_NO_AUTOMOUNT | libc::AT_SYMLINK_NOFOLLOW,
+                REQUIRED_ROOT_STATX_MASK_V1,
+                raw.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_mount_os_failure_v1());
+        }
+        let raw = unsafe { raw.assume_init() };
+        if raw.stx_mask & REQUIRED_ROOT_STATX_MASK_V1 != REQUIRED_ROOT_STATX_MASK_V1
+            || raw.stx_mnt_id == 0
+            || raw.stx_ino == 0
+        {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        Ok(ChildRootIdentityV1 {
+            mount_id: raw.stx_mnt_id,
+            inode: raw.stx_ino,
+            mode: raw.stx_mode,
+            uid: raw.stx_uid,
+            gid: raw.stx_gid,
+        })
+    }
+
+    fn child_root_matches_policy_v1(
+        descriptor: RawFd,
+        identity: &ChildRootIdentityV1,
+    ) -> Result<bool, ChildMountRootFailureV1> {
+        if u32::from(identity.mode) & libc::S_IFMT != libc::S_IFDIR
+            || u32::from(identity.mode) & 0o7777 != 0o755
+            || identity.uid != 0
+            || identity.gid != 0
+        {
+            return Ok(false);
+        }
+        let mut filesystem = MaybeUninit::<libc::statfs64>::zeroed();
+        if unsafe { libc::syscall(libc::SYS_fstatfs, descriptor, filesystem.as_mut_ptr()) } != 0 {
+            return Err(child_mount_os_failure_v1());
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        Ok(child_statfs_matches_policy_v1(&filesystem))
+    }
+
+    fn child_statfs_matches_policy_v1(filesystem: &libc::statfs64) -> bool {
+        if filesystem.f_bsize <= 0 || filesystem.f_flags < 0 {
+            return false;
+        }
+        let required_flags = libc::ST_NODEV | libc::ST_NOSUID;
+        let flags = filesystem.f_flags as u64;
+        let bytes = (filesystem.f_bsize as u64).checked_mul(filesystem.f_blocks);
+        filesystem.f_type == TMPFS_SUPER_MAGIC_V1
+            && flags & required_flags == required_flags
+            && bytes.is_some_and(|bytes| bytes > 0 && bytes <= ROOT_TMPFS_BYTES_V1)
+            && filesystem.f_files > 0
+            && filesystem.f_files <= ROOT_TMPFS_INODES_V1
+    }
+
+    fn child_require_absent_at_v1(
+        directory: RawFd,
+        path: &CStr,
+    ) -> Result<(), ChildMountRootFailureV1> {
+        let how = OpenHowV1 {
+            flags: (libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH_V1 | RESOLVE_NO_MAGICLINKS_V1,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                directory,
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHowV1>(),
+            )
+        };
+        if result >= 0 {
+            if let Ok(fd) = i32::try_from(result) {
+                let _ = child_close(fd);
+            }
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        if child_errno() == libc::ENOENT {
+            Ok(())
+        } else {
+            Err(child_mount_os_failure_v1())
+        }
+    }
+
+    fn child_mount_os_failure_v1() -> ChildMountRootFailureV1 {
+        let errno = child_errno();
+        if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+            ChildMountRootFailureV1::Os(errno)
+        } else {
+            ChildMountRootFailureV1::Invariant
+        }
+    }
+
+    fn child_close_mount_fd_v1(descriptor: RawFd) -> Result<(), ChildMountRootFailureV1> {
+        if descriptor < 0 {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        let result = unsafe { libc::syscall(libc::SYS_close, descriptor) };
+        if result == 0 || (result < 0 && child_errno() == libc::EINTR) {
+            Ok(())
+        } else {
+            Err(child_mount_os_failure_v1())
+        }
     }
 
     fn child_fail(
@@ -3456,6 +3816,16 @@ mod platform {
                 .unwrap_or_else(|_| panic!("monotonic deadline fixture failed"))
         }
 
+        fn policy_statfs() -> libc::statfs64 {
+            let mut filesystem = unsafe { MaybeUninit::<libc::statfs64>::zeroed().assume_init() };
+            filesystem.f_type = TMPFS_SUPER_MAGIC_V1;
+            filesystem.f_bsize = 4_096;
+            filesystem.f_blocks = ROOT_TMPFS_BYTES_V1 / 4_096;
+            filesystem.f_files = ROOT_TMPFS_INODES_V1;
+            filesystem.f_flags = (libc::ST_NODEV | libc::ST_NOSUID) as libc::c_long;
+            filesystem
+        }
+
         #[test]
         fn map_encoder_covers_zero_and_u32_max() {
             assert_eq!(encode_id_map_line(0).as_slice(), b"0 0 1\n");
@@ -3542,6 +3912,35 @@ mod platform {
                     error.reason,
                     IsolationQualificationReasonV1::MalformedKernelResponse
                 );
+            }
+        }
+
+        #[test]
+        fn fixed_tmpfs_policy_is_bounded_and_exact() {
+            assert_eq!(
+                ROOT_TMPFS_OPTIONS_V1.to_bytes_with_nul(),
+                b"size=16777216,nr_inodes=4096,mode=0755,noswap\0"
+            );
+            assert!(child_statfs_matches_policy_v1(&policy_statfs()));
+
+            let mut wrong_type = policy_statfs();
+            wrong_type.f_type = 0;
+            let mut missing_flag = policy_statfs();
+            missing_flag.f_flags &= !(libc::ST_NODEV as libc::c_long);
+            let mut too_many_blocks = policy_statfs();
+            too_many_blocks.f_blocks += 1;
+            let mut too_many_inodes = policy_statfs();
+            too_many_inodes.f_files += 1;
+            let mut zero_blocks = policy_statfs();
+            zero_blocks.f_blocks = 0;
+            for filesystem in [
+                wrong_type,
+                missing_flag,
+                too_many_blocks,
+                too_many_inodes,
+                zero_blocks,
+            ] {
+                assert!(!child_statfs_matches_policy_v1(&filesystem));
             }
         }
 
@@ -3644,6 +4043,9 @@ mod platform {
             let frame =
                 child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
             assert!(verify_proof_frame(&frame, &nonce).is_ok());
+            let stale_pre_root =
+                child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, 0b0000_0111, 0);
+            assert!(verify_proof_frame(&stale_pre_root, &nonce).is_err());
 
             for offset in [
                 FRAME_STATUS_OFFSET_V1,
@@ -3712,6 +4114,72 @@ mod platform {
                     Ok(()) => panic!("noncanonical UTS proof was accepted"),
                     Err(error) => error,
                 };
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+        }
+
+        #[test]
+        fn mount_root_failure_proofs_are_closed_and_never_expected() {
+            let nonce = [0x42_u8; NONCE_BYTES_V1];
+            for (status, errno, reason) in [
+                (
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    libc::EPERM,
+                    IsolationQualificationReasonV1::Io,
+                ),
+                (
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    MAX_LINUX_ERRNO_V1,
+                    IsolationQualificationReasonV1::Io,
+                ),
+                (
+                    PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
+                    0,
+                    IsolationQualificationReasonV1::ChildInvariantFailed,
+                ),
+            ] {
+                let frame = child_encode_proof_frame(&nonce, status, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("mount-root failure proof was accepted as success");
+                assert_eq!(error.code, RefusalCode::MountRootFailed);
+                assert_eq!(error.stage, IsolationQualificationStageV1::ChildMountRoot);
+                assert_eq!(error.reason, reason);
+                assert_eq!(error.errno, (errno != 0).then_some(errno));
+                assert!(!error.is_expected_unavailable());
+            }
+
+            let mut wrong_identity =
+                child_encode_proof_frame(&nonce, PROOF_STATUS_MOUNT_ROOT_OS_V1, 0, libc::EPERM);
+            wrong_identity[FRAME_PID_OFFSET_V1] = 2;
+            for frame in [
+                child_encode_proof_frame(&nonce, PROOF_STATUS_MOUNT_ROOT_OS_V1, 0, 0),
+                child_encode_proof_frame(&nonce, PROOF_STATUS_MOUNT_ROOT_OS_V1, 0, -1),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    0,
+                    MAX_LINUX_ERRNO_V1 + 1,
+                ),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
+                    0,
+                    libc::EPERM,
+                ),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    PROOF_FLAGS_V1,
+                    libc::EPERM,
+                ),
+                wrong_identity,
+            ] {
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("noncanonical mount-root proof was accepted");
                 assert_eq!(
                     error.reason,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch

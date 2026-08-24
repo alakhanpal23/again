@@ -471,6 +471,19 @@ descriptor disposal; failures expose whether cleanup completed. Either result
 is narrow bootstrap evidence only: it neither qualifies the profile nor grants
 execution authority.
 
+After the verified child configures its fixed UTS state, the diagnostic's
+next fixed no-command slice makes the mount tree recursively private and uses
+the pre-existing `/tmp` only as a descriptor-checked mountpoint. It mounts a
+new 16 MiB/4096-inode `nodev,nosuid,noswap` tmpfs there, enters it by pinned
+descriptor, pivots, detaches and removes the old-root pathname, reopens
+absolute `/`, and verifies the exact mount identity, tmpfs type, mode,
+ownership, flags, limits, and absence of `.oldroot`, `/proc`, `/dev`, and
+`/sys`. The exact success proof adds a distinct root bit; stale namespace-only
+success frames and malformed root failures are rejected. This proves pathname
+detachment only. Inherited descriptors and executable mappings remain outside
+the slice, and stock hosted Ubuntu currently refuses before reaching it, so it
+still grants no workload or profile authority.
+
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
 the launcher captures a bounded canonical host-KGID vector; while PID 1 is
