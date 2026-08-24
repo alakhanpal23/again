@@ -27,6 +27,7 @@ use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
 const HARD_MAX_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 const HARD_MAX_DATA_EXTENTS: u32 = 1024 * 1024;
 const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
+const HARD_MAX_SYSCALL_ATTEMPTS: u8 = 32;
 
 /// Bounded inputs that must eventually be committed by the snapshot-policy
 /// digest.  Keeping them explicit prevents this leaf from inventing ambient
@@ -36,6 +37,7 @@ pub(super) struct RegularCopyPolicyV1 {
     max_logical_bytes: NonZeroU64,
     max_data_extents: NonZeroU32,
     openat2_attempts: NonZeroU8,
+    syscall_attempts: NonZeroU8,
 }
 
 impl RegularCopyPolicyV1 {
@@ -45,10 +47,12 @@ impl RegularCopyPolicyV1 {
         max_logical_bytes: NonZeroU64,
         max_data_extents: NonZeroU32,
         openat2_attempts: NonZeroU8,
+        syscall_attempts: NonZeroU8,
     ) -> Option<Self> {
         if max_logical_bytes.get() > HARD_MAX_LOGICAL_BYTES
             || max_data_extents.get() > HARD_MAX_DATA_EXTENTS
             || openat2_attempts.get() > HARD_MAX_OPENAT2_ATTEMPTS
+            || syscall_attempts.get() > HARD_MAX_SYSCALL_ATTEMPTS
         {
             return None;
         }
@@ -56,6 +60,7 @@ impl RegularCopyPolicyV1 {
             max_logical_bytes,
             max_data_extents,
             openat2_attempts,
+            syscall_attempts,
         })
     }
 
@@ -69,6 +74,10 @@ impl RegularCopyPolicyV1 {
 
     pub(super) const fn openat2_attempts(self) -> u8 {
         self.openat2_attempts.get()
+    }
+
+    pub(super) const fn syscall_attempts(self) -> u8 {
+        self.syscall_attempts.get()
     }
 }
 
@@ -334,6 +343,14 @@ mod platform {
         fn clone_file(&self, destination: RawFd, source: RawFd) -> io::Result<()>;
 
         #[cfg(test)]
+        fn test_source_read_open_flags(&self) -> i32 {
+            // Unit hooks model a qualified no-atime source view with a real
+            // no-atime descriptor. `KernelHooks` overrides this so the
+            // production path remains an ordinary read even under `cfg(test)`.
+            source_read_open_flags() | libc::O_NOATIME
+        }
+
+        #[cfg(test)]
         fn after_source_handle_opened(&self) -> io::Result<()> {
             Ok(())
         }
@@ -376,6 +393,11 @@ mod platform {
             } else {
                 Err(io::Error::last_os_error())
             }
+        }
+
+        #[cfg(test)]
+        fn test_source_read_open_flags(&self) -> i32 {
+            source_read_open_flags()
         }
     }
 
@@ -444,10 +466,14 @@ mod platform {
             .after_source_handle_opened()
             .map_err(|error| construction_io(SnapshotRegularStageV1::OpenSourceRead, error))?;
 
+        #[cfg(not(test))]
+        let source_open_flags = source_read_open_flags();
+        #[cfg(test)]
+        let source_open_flags = hooks.test_source_read_open_flags();
         let source_read = openat2_owned(
             source_parent,
             source_name,
-            source_read_open_flags(),
+            source_open_flags,
             0,
             SOURCE_RESOLVE,
             policy.openat2_attempts(),
@@ -491,10 +517,15 @@ mod platform {
                 truncate_to(destination.as_fd(), source_identity.size).map_err(|error| {
                     map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
                 })?;
-                copy_data_extents(source_read.as_fd(), destination.as_fd(), &initial_extents)
-                    .map_err(|error| {
-                        map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
-                    })?;
+                copy_data_extents(
+                    source_read.as_fd(),
+                    destination.as_fd(),
+                    &initial_extents,
+                    policy.syscall_attempts(),
+                )
+                .map_err(|error| {
+                    map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
+                })?;
             }
             Err(error) => {
                 return Err(map_destination_error(
@@ -569,10 +600,12 @@ mod platform {
             ));
         }
 
-        let content_digest = hash_logical_bytes(destination.as_fd(), destination_identity.size)
-            .map_err(|error| {
-                map_destination_error(SnapshotRegularStageV1::HashDestination, error)
-            })?;
+        let content_digest = hash_logical_bytes(
+            destination.as_fd(),
+            destination_identity.size,
+            policy.syscall_attempts(),
+        )
+        .map_err(|error| map_destination_error(SnapshotRegularStageV1::HashDestination, error))?;
 
         revalidate_source(
             source_parent,
@@ -932,6 +965,7 @@ mod platform {
         source: BorrowedFd<'_>,
         destination: BorrowedFd<'_>,
         extents: &[ExtentV1],
+        syscall_attempts: u8,
     ) -> io::Result<()> {
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
         for extent in extents {
@@ -943,16 +977,21 @@ mod platform {
             while offset < end {
                 let length = usize::try_from((end - offset).min(buffer.len() as u64))
                     .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-                pread_exact(source, &mut buffer[..length], offset)?;
-                pwrite_all(destination, &buffer[..length], offset)?;
+                pread_exact(source, &mut buffer[..length], offset, syscall_attempts)?;
+                pwrite_all(destination, &buffer[..length], offset, syscall_attempts)?;
                 offset += length as u64;
             }
         }
         Ok(())
     }
 
-    fn pread_exact(fd: BorrowedFd<'_>, mut output: &mut [u8], mut offset: u64) -> io::Result<()> {
-        while !output.is_empty() {
+    fn pread_exact(
+        fd: BorrowedFd<'_>,
+        output: &mut [u8],
+        offset: u64,
+        syscall_attempts: u8,
+    ) -> io::Result<()> {
+        pread_exact_with(output, offset, syscall_attempts, |output, offset| {
             let result = unsafe {
                 libc::pread(
                     fd.as_raw_fd(),
@@ -962,24 +1001,53 @@ mod platform {
                 )
             };
             if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
+                Err(io::Error::last_os_error())
+            } else {
+                usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
             }
-            if result == 0 {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            let read = result as usize;
-            offset += read as u64;
-            output = &mut output[read..];
-        }
-        Ok(())
+        })
     }
 
-    fn pwrite_all(fd: BorrowedFd<'_>, mut input: &[u8], mut offset: u64) -> io::Result<()> {
-        while !input.is_empty() {
+    fn pread_exact_with(
+        mut output: &mut [u8],
+        mut offset: u64,
+        syscall_attempts: u8,
+        mut operation: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let mut exhaustion_errno = libc::EINTR;
+        for _ in 0..syscall_attempts {
+            let read = match operation(output, offset) {
+                Ok(0) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                Ok(read) if read <= output.len() => read,
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    exhaustion_errno = libc::EINTR;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            exhaustion_errno = libc::EIO;
+            offset = offset
+                .checked_add(read as u64)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            output = &mut output[read..];
+            if output.is_empty() {
+                return Ok(());
+            }
+        }
+        Err(io::Error::from_raw_os_error(exhaustion_errno))
+    }
+
+    fn pwrite_all(
+        fd: BorrowedFd<'_>,
+        input: &[u8],
+        offset: u64,
+        syscall_attempts: u8,
+    ) -> io::Result<()> {
+        pwrite_all_with(input, offset, syscall_attempts, |input, offset| {
             let result = unsafe {
                 libc::pwrite(
                     fd.as_raw_fd(),
@@ -989,23 +1057,51 @@ mod platform {
                 )
             };
             if result < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
+                Err(io::Error::last_os_error())
+            } else {
+                usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
             }
-            if result == 0 {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
-            }
-            let written = result as usize;
-            offset += written as u64;
-            input = &input[written..];
-        }
-        Ok(())
+        })
     }
 
-    fn hash_logical_bytes(fd: BorrowedFd<'_>, size: u64) -> io::Result<FileContentDigest> {
+    fn pwrite_all_with(
+        mut input: &[u8],
+        mut offset: u64,
+        syscall_attempts: u8,
+        mut operation: impl FnMut(&[u8], u64) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        if input.is_empty() {
+            return Ok(());
+        }
+        let mut exhaustion_errno = libc::EINTR;
+        for _ in 0..syscall_attempts {
+            let written = match operation(input, offset) {
+                Ok(0) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                Ok(written) if written <= input.len() => written,
+                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    exhaustion_errno = libc::EINTR;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            exhaustion_errno = libc::EIO;
+            offset = offset
+                .checked_add(written as u64)
+                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+            input = &input[written..];
+            if input.is_empty() {
+                return Ok(());
+            }
+        }
+        Err(io::Error::from_raw_os_error(exhaustion_errno))
+    }
+
+    fn hash_logical_bytes(
+        fd: BorrowedFd<'_>,
+        size: u64,
+        syscall_attempts: u8,
+    ) -> io::Result<FileContentDigest> {
         let mut hasher = FileContentHasherV1::new(size);
 
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
@@ -1013,7 +1109,7 @@ mod platform {
         while offset < size {
             let length = usize::try_from((size - offset).min(buffer.len() as u64))
                 .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-            pread_exact(fd, &mut buffer[..length], offset)?;
+            pread_exact(fd, &mut buffer[..length], offset, syscall_attempts)?;
             if !hasher.update(&buffer[..length]) {
                 return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
             }
@@ -1128,6 +1224,7 @@ mod platform {
             RegularCopyPolicyV1::checked(
                 NonZeroU64::new(16 * 1024 * 1024).unwrap(),
                 NonZeroU32::new(4096).unwrap(),
+                NonZeroU8::new(4).unwrap(),
                 NonZeroU8::new(4).unwrap(),
             )
             .unwrap()
@@ -1402,6 +1499,93 @@ mod platform {
         }
 
         #[test]
+        fn pread_budget_accepts_exact_n_and_refuses_n_plus_one() {
+            let mut output = [0u8; 4];
+            let mut success_calls = 0;
+            pread_exact_with(&mut output, 11, 3, |remaining, offset| {
+                success_calls += 1;
+                match success_calls {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => {
+                        assert_eq!(offset, 11);
+                        remaining[..2].copy_from_slice(b"ab");
+                        Ok(2)
+                    }
+                    3 => {
+                        assert_eq!(offset, 13);
+                        remaining.copy_from_slice(b"cd");
+                        Ok(remaining.len())
+                    }
+                    _ => panic!("pread exceeded its committed attempt budget"),
+                }
+            })
+            .unwrap();
+            assert_eq!(output, *b"abcd");
+            assert_eq!(success_calls, 3);
+
+            let mut interrupted_calls = 0;
+            let error = pread_exact_with(&mut [0u8; 1], 0, 3, |_, _| {
+                interrupted_calls += 1;
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EINTR));
+            assert_eq!(interrupted_calls, 3);
+
+            let mut partial_calls = 0;
+            let error = pread_exact_with(&mut [0u8; 3], 0, 2, |remaining, _| {
+                partial_calls += 1;
+                remaining[0] = b'x';
+                Ok(1)
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(partial_calls, 2);
+        }
+
+        #[test]
+        fn pwrite_budget_accepts_exact_n_and_refuses_n_plus_one() {
+            let mut success_calls = 0;
+            pwrite_all_with(b"abcd", 17, 3, |remaining, offset| {
+                success_calls += 1;
+                match success_calls {
+                    1 => Err(io::Error::from_raw_os_error(libc::EINTR)),
+                    2 => {
+                        assert_eq!(offset, 17);
+                        assert_eq!(remaining, b"abcd");
+                        Ok(2)
+                    }
+                    3 => {
+                        assert_eq!(offset, 19);
+                        assert_eq!(remaining, b"cd");
+                        Ok(2)
+                    }
+                    _ => panic!("pwrite exceeded its committed attempt budget"),
+                }
+            })
+            .unwrap();
+            assert_eq!(success_calls, 3);
+
+            let mut interrupted_calls = 0;
+            let error = pwrite_all_with(b"x", 0, 3, |_, _| {
+                interrupted_calls += 1;
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EINTR));
+            assert_eq!(interrupted_calls, 3);
+
+            let mut partial_calls = 0;
+            let error = pwrite_all_with(b"abc", 0, 2, |_, _| {
+                partial_calls += 1;
+                Ok(1)
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            assert_eq!(partial_calls, 2);
+        }
+
+        #[test]
         fn source_authority_uses_ordinary_reads_but_destination_keeps_noatime() {
             assert_eq!(source_read_open_flags() & libc::O_NOATIME, 0);
             assert_ne!(destination_open_flags() & libc::O_NOATIME, 0);
@@ -1434,6 +1618,39 @@ mod platform {
                 sparse_copy_io.code(),
                 RefusalCode::SnapshotConstructionFailed
             );
+        }
+
+        #[test]
+        fn test_source_view_preserves_a_stale_atime_without_forging_future_time() {
+            use std::os::unix::fs::MetadataExt;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            let fixture = Fixture::with_input(b"qualified fixture read");
+            let source_path = fixture.source("input");
+            let stale_atime = UNIX_EPOCH + Duration::from_secs(946_684_800);
+            OpenOptions::new()
+                .read(true)
+                .open(&source_path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(stale_atime))
+                .unwrap();
+            let before = fs::metadata(&source_path).unwrap();
+            let before_atime = (before.atime(), before.atime_nsec());
+            assert!(before.atime() <= before.mtime());
+
+            let copied = fixture
+                .copy_input(
+                    policy(),
+                    &ForcedCloneError {
+                        errno: libc::EOPNOTSUPP,
+                        calls: Cell::new(0),
+                    },
+                )
+                .unwrap();
+            let _ = finish(copied);
+
+            let after = fs::metadata(source_path).unwrap();
+            assert_eq!((after.atime(), after.atime_nsec()), before_atime);
         }
 
         #[test]
@@ -1831,6 +2048,7 @@ mod platform {
                 NonZeroU64::new(16 * 1024 * 1024).unwrap(),
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU8::new(4).unwrap(),
+                NonZeroU8::new(4).unwrap(),
             )
             .unwrap();
             let hooks = ForcedCloneError {
@@ -1904,6 +2122,7 @@ mod platform {
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU8::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
             )
             .unwrap();
             let limit = fixture.copy_input(tiny_policy, &hooks).unwrap_err();
@@ -1958,11 +2177,13 @@ mod portable_tests {
             NonZeroU64::new(1024).unwrap(),
             NonZeroU32::new(32).unwrap(),
             NonZeroU8::new(4).unwrap(),
+            NonZeroU8::new(3).unwrap(),
         )
         .unwrap();
         assert_eq!(policy.max_logical_bytes(), 1024);
         assert_eq!(policy.max_data_extents(), 32);
         assert_eq!(policy.openat2_attempts(), 4);
+        assert_eq!(policy.syscall_attempts(), 3);
     }
 
     #[test]
@@ -1971,16 +2192,19 @@ mod portable_tests {
             NonZeroU64::new(HARD_MAX_LOGICAL_BYTES).unwrap(),
             NonZeroU32::new(HARD_MAX_DATA_EXTENTS).unwrap(),
             NonZeroU8::new(HARD_MAX_OPENAT2_ATTEMPTS).unwrap(),
+            NonZeroU8::new(HARD_MAX_SYSCALL_ATTEMPTS).unwrap(),
         )
         .unwrap();
         assert_eq!(at_ceiling.max_logical_bytes(), HARD_MAX_LOGICAL_BYTES);
         assert_eq!(at_ceiling.max_data_extents(), HARD_MAX_DATA_EXTENTS);
         assert_eq!(at_ceiling.openat2_attempts(), HARD_MAX_OPENAT2_ATTEMPTS);
+        assert_eq!(at_ceiling.syscall_attempts(), HARD_MAX_SYSCALL_ATTEMPTS);
 
         assert!(
             RegularCopyPolicyV1::checked(
                 NonZeroU64::new(HARD_MAX_LOGICAL_BYTES + 1).unwrap(),
                 NonZeroU32::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
                 NonZeroU8::new(1).unwrap(),
             )
             .is_none()
@@ -1990,6 +2214,7 @@ mod portable_tests {
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU32::new(HARD_MAX_DATA_EXTENTS + 1).unwrap(),
                 NonZeroU8::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
             )
             .is_none()
         );
@@ -1998,6 +2223,16 @@ mod portable_tests {
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU8::new(HARD_MAX_OPENAT2_ATTEMPTS + 1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
+            )
+            .is_none()
+        );
+        assert!(
+            RegularCopyPolicyV1::checked(
+                NonZeroU64::new(1).unwrap(),
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
+                NonZeroU8::new(HARD_MAX_SYSCALL_ATTEMPTS + 1).unwrap(),
             )
             .is_none()
         );

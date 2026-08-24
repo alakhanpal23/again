@@ -165,6 +165,7 @@ impl SourceEnumerationPolicyV1 {
             traversal.max_file_bytes,
             max_data_extents,
             openat2_attempts,
+            syscall_attempts,
         ) {
             Some(policy) => policy,
             None => return None,
@@ -1142,12 +1143,25 @@ mod platform {
         fn get_xattr(&self, fd: RawFd, name: &CStr, output: Option<&mut [u8]>)
         -> io::Result<usize>;
 
+        fn read_symlink(
+            &self,
+            fd: RawFd,
+            _relative_path: &[u8],
+            output: &mut [u8],
+        ) -> io::Result<usize> {
+            readlinkat_empty_path(fd, output)
+        }
+
         fn after_directory_children(&self, _relative_path: &[u8]) -> io::Result<()> {
             Ok(())
         }
 
         fn after_leaf_visitor(&self, _relative_path: &[u8]) -> io::Result<()> {
             Ok(())
+        }
+
+        fn directory_open_flags(&self) -> i32 {
+            source_directory_open_flags()
         }
 
         fn observe_live_source_fds(&self, _depth: u16, _upper_bound: u32) {}
@@ -1440,7 +1454,7 @@ mod platform {
                     let directory = openat2_owned(
                         parent_fd,
                         name,
-                        source_directory_open_flags(),
+                        self.hooks.directory_open_flags(),
                         SOURCE_RESOLVE,
                         self.policy.openat2_attempts.get(),
                     )
@@ -1564,14 +1578,15 @@ mod platform {
                         membership_bytes
                             .checked_add(membership_fixed)
                             .ok_or_else(|| limit(&relative_path, SourceTreeLimitV1::PlanBytes))?;
-                    if membership_storage_bytes > self.remaining_plan_bytes() {
+                    let revalidation_storage_bytes = self.remaining_plan_bytes();
+                    if membership_storage_bytes > revalidation_storage_bytes {
                         return Err(limit(&relative_path, SourceTreeLimitV1::PlanBytes).into());
                     }
                     let membership_after = read_directory_names(
                         directory.as_fd(),
                         &relative_path,
                         self.policy.traversal,
-                        membership_storage_bytes,
+                        revalidation_storage_bytes,
                         self.policy.syscall_attempts.get(),
                     )?;
                     let statx_after = statx_identity(directory.as_fd()).map_err(|error| {
@@ -1695,6 +1710,7 @@ mod platform {
                         .get()
                         .min(u32::try_from(self.remaining_plan_bytes()).unwrap_or(u32::MAX));
                     let target = read_stable_symlink_target(
+                        self.hooks,
                         &handle,
                         &relative_path,
                         target_cap,
@@ -2287,12 +2303,6 @@ mod platform {
                 SourceTreeLimitV1::XattrListBytes,
             )));
         }
-        if list_size as u64 > max_xattr_bytes {
-            return Err(XattrPassError::Fatal(limit(
-                relative_path,
-                SourceTreeLimitV1::TotalXattrBytes,
-            )));
-        }
         if list_size as u64 > max_plan_bytes {
             return Err(XattrPassError::Fatal(limit(
                 relative_path,
@@ -2513,14 +2523,15 @@ mod platform {
         Ok((dynamic, plan))
     }
 
-    fn read_stable_symlink_target(
+    fn read_stable_symlink_target<H: EnumerationHooks>(
+        hooks: &H,
         handle: &OwnedFd,
         relative_path: &[u8],
         max_bytes: u32,
         max_plan_bytes: u64,
     ) -> Result<Vec<u8>, SourceTreeFailureV1> {
-        let first = read_symlink_target_once(handle.as_fd(), relative_path, max_bytes)?;
-        let second = read_symlink_target_once(handle.as_fd(), relative_path, max_bytes)?;
+        let first = read_symlink_target_once(hooks, handle.as_fd(), relative_path, max_bytes)?;
+        let second = read_symlink_target_once(hooks, handle.as_fd(), relative_path, max_bytes)?;
         if (first.capacity() as u64)
             .checked_add(second.capacity() as u64)
             .is_none_or(|bytes| bytes > max_plan_bytes)
@@ -2536,7 +2547,8 @@ mod platform {
         Ok(first)
     }
 
-    fn read_symlink_target_once(
+    fn read_symlink_target_once<H: EnumerationHooks>(
+        hooks: &H,
         fd: BorrowedFd<'_>,
         relative_path: &[u8],
         max_bytes: u32,
@@ -2552,22 +2564,14 @@ mod platform {
                 .try_reserve_exact(capacity)
                 .map_err(|_| limit(relative_path, SourceTreeLimitV1::PlanBytes))?;
             output.resize(capacity, 0);
-            let result = unsafe {
-                libc::readlinkat(
-                    fd.as_raw_fd(),
-                    c"".as_ptr(),
-                    output.as_mut_ptr().cast(),
-                    output.len(),
-                )
-            };
-            if result < 0 {
-                return Err(io_failure(
-                    SourceTreeStageV1::CaptureSymlink,
-                    relative_path,
-                    io::Error::last_os_error(),
-                ));
+            let used = hooks
+                .read_symlink(fd.as_raw_fd(), relative_path, &mut output)
+                .map_err(|error| {
+                    io_failure(SourceTreeStageV1::CaptureSymlink, relative_path, error)
+                })?;
+            if used > output.len() {
+                return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path));
             }
-            let used = result as usize;
             if used < capacity {
                 if used == 0 || output[..used].contains(&0) {
                     return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path));
@@ -2582,6 +2586,16 @@ mod platform {
                 .checked_mul(2)
                 .unwrap_or(maximum_capacity)
                 .min(maximum_capacity);
+        }
+    }
+
+    fn readlinkat_empty_path(fd: RawFd, output: &mut [u8]) -> io::Result<usize> {
+        let result =
+            unsafe { libc::readlinkat(fd, c"".as_ptr(), output.as_mut_ptr().cast(), output.len()) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
         }
     }
 
@@ -2898,6 +2912,7 @@ mod platform {
         struct TestHooks {
             directory_action: RefCell<Option<(Vec<u8>, BarrierAction)>>,
             leaf_action: RefCell<Option<(Vec<u8>, BarrierAction)>>,
+            symlink_targets: BTreeMap<Vec<u8>, Vec<u8>>,
             fd_observations: RefCell<Vec<(u16, u32)>>,
         }
 
@@ -2924,6 +2939,13 @@ mod platform {
                     ..Self::default()
                 }
             }
+
+            fn with_symlink_target(relative_path: &[u8], target: &[u8]) -> Self {
+                Self {
+                    symlink_targets: BTreeMap::from([(relative_path.to_vec(), target.to_vec())]),
+                    ..Self::default()
+                }
+            }
         }
 
         impl EnumerationHooks for TestHooks {
@@ -2941,6 +2963,21 @@ mod platform {
                 _output: Option<&mut [u8]>,
             ) -> io::Result<usize> {
                 Err(io::Error::from_raw_os_error(libc::ENODATA))
+            }
+
+            fn read_symlink(
+                &self,
+                _fd: RawFd,
+                relative_path: &[u8],
+                output: &mut [u8],
+            ) -> io::Result<usize> {
+                let target = self
+                    .symlink_targets
+                    .get(relative_path)
+                    .expect("test symlink target must be explicit");
+                let used = output.len().min(target.len());
+                output[..used].copy_from_slice(&target[..used]);
+                Ok(used)
             }
 
             fn after_directory_children(&self, relative_path: &[u8]) -> io::Result<()> {
@@ -2971,6 +3008,15 @@ mod platform {
                     action()?;
                 }
                 Ok(())
+            }
+
+            fn directory_open_flags(&self) -> i32 {
+                // These unit fixtures are owned by the current user but do
+                // not represent a real `QualifiedNoAtimeSourceViewV1`.
+                // `O_NOATIME` makes their directory reads deterministic
+                // without forging timestamps or weakening the production
+                // capability boundary.
+                source_directory_open_flags() | libc::O_NOATIME
             }
 
             fn observe_live_source_fds(&self, depth: u16, live: u32) {
@@ -3217,7 +3263,11 @@ mod platform {
             let raw_name = OsString::from_vec(vec![0xff]);
             fs::write(tree.root.join(&raw_name), b"raw").unwrap();
 
-            let hooks = TestHooks::default();
+            // The actual symlink supplies kernel identity and file type. The
+            // explicit target hook avoids mutating its atime on this
+            // unqualified disposable fixture; production still uses
+            // `readlinkat` only after source-view qualification.
+            let hooks = TestHooks::with_symlink_target(b"s", b"target");
             let mut visitor = RecordingVisitor::default();
             let plan = enumerate(&tree, policy(16, 64), &hooks, &mut visitor).unwrap();
 
@@ -3743,6 +3793,7 @@ mod portable_tests {
         assert_eq!(committed.regular_copy.max_logical_bytes(), 16 * 1024 * 1024);
         assert_eq!(committed.regular_copy.max_data_extents(), 64);
         assert_eq!(committed.regular_copy.openat2_attempts(), 4);
+        assert_eq!(committed.regular_copy.syscall_attempts(), 3);
         assert_eq!(committed.syscall_attempts(), 3);
         assert_eq!(committed.max_basename_bytes(), 255);
         assert!(valid_basename(b"raw-\xff", 255));
