@@ -1498,6 +1498,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    #[ignore = "requires a provisioned ST_NOATIME source view that passes functional qualification"]
     fn charged_materialization_copies_exact_bytes_preserves_atime_and_cleans_on_drop() {
         let source_parent = tempfile::tempdir().unwrap();
         let source_tree = source_parent.path().join("tree");
@@ -1559,6 +1560,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    #[ignore = "requires a provisioned ST_NOATIME source view that passes functional qualification"]
     fn post_staging_symlink_refusal_cleans_stage_leases_and_keeps_publication_consumed() {
         let source_parent = tempfile::tempdir().unwrap();
         let source_tree = source_parent.path().join("tree");
@@ -1635,6 +1637,74 @@ mod tests {
         assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
         assert!(connector.publication_started.get());
         assert!(connector.begin_publication().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn post_staging_source_refusal_cleans_stage_leases_and_keeps_publication_consumed() {
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let invalid_source = File::open("/dev/null").unwrap();
+        let staging_name = c".again-snapshot-stage-33333333333333333333333333333333";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        // SAFETY: the non-directory descriptor makes traversal refuse at its
+        // first path-resolution operation. No source data, directory stream,
+        // regular bytes, symlink target, or xattrs can be read through it.
+        let source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+
+        let error = match connector.materialize_source_tree_at(
+            publication_parent_fd.as_fd(),
+            staging_name,
+            source_view,
+            c"root",
+        ) {
+            Err(error) => error,
+            Ok(staged) => {
+                drop(staged);
+                panic!("a non-directory source parent must fail closed");
+            }
+        };
+
+        assert!(matches!(
+            &error,
+            SnapshotPipelineMaterializationErrorV1::Materialization(
+                SnapshotTreeMaterializeErrorV1::Source(_)
+            )
+        ));
+        assert_eq!(format!("{error:?}"), "Materialization(Source(<redacted>))");
+        assert!(!staging_path.exists());
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+
+        let forward_before = connector.resources.forward_attempts_remaining_for_test();
+        // SAFETY: publication refusal occurs after structural lease
+        // reservation but before traversal, so this descriptor is not read.
+        let second_source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+        assert!(matches!(
+            connector.materialize_source_tree_at(
+                publication_parent_fd.as_fd(),
+                staging_name,
+                second_source_view,
+                c"root",
+            ),
+            Err(SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted)
+        ));
+        assert_eq!(
+            connector.resources.forward_attempts_remaining_for_test(),
+            forward_before
+        );
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert!(!staging_path.exists());
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
