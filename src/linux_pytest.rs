@@ -1,9 +1,10 @@
-//! Frozen shared contract for the future `linux-pytest-v1` execution profile.
+//! Frozen shared contract and in-progress backend for the future
+//! `linux-pytest-v1` execution profile.
 //!
 //! This module is intentionally unreachable from the public CLI.  It defines
 //! the privacy, completeness, snapshot-capability, trace-record, and promotion
-//! boundaries that the isolated Linux implementations build against.  The
-//! contract-only implementations fail closed and never execute Python.
+//! boundaries that the isolated Linux implementations build against. No
+//! concrete execution profile exists yet, so this module cannot execute Python.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -3744,59 +3745,6 @@ pub trait PromotionStore: Send {
     ) -> Result<PromotionGcReportV2, ProfileFailure>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ContractOnlyProfile;
-
-impl ProfileAdmission for ContractOnlyProfile {
-    fn parse_lexical(
-        &self,
-        _input: AdmissionInput<'_>,
-    ) -> Result<PytestAdmissionDraft, ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-
-    fn finalize_against_snapshot(
-        &self,
-        _draft: PytestAdmissionDraft,
-        _snapshot: SealedSnapshot,
-    ) -> Result<PreparedPytest, ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-}
-
-impl SnapshotProvider for ContractOnlyProfile {
-    fn seal_full(&self, _draft: &PytestAdmissionDraft) -> Result<SealedSnapshot, ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-
-    fn seal_validation_snapshot(
-        &self,
-        _draft: &PytestAdmissionDraft,
-        _expected_shape: &ShapeV1,
-        _expected_closure: &ObservationClosureV1,
-    ) -> Result<RevalidatedObservationClosureV1, ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-}
-
-impl SandboxTracer for ContractOnlyProfile {
-    fn execute(
-        &self,
-        _prepared: &PreparedPytest,
-        _mode: TraceExecutionMode,
-    ) -> Result<VerifiedExecutionRecordV2, ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-
-    fn capability_probe(
-        &self,
-        _snapshot: &ValidationSnapshot,
-        _probe: PythonCapabilityProbeV1,
-    ) -> Result<(), ProfileFailure> {
-        Err(ProfileFailure::refused(RefusalCode::ProfileDisabled))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4528,32 +4476,6 @@ mod tests {
         let json = serde_json::to_string(&record()).unwrap();
         assert!(!json.contains("environment_value"));
         assert!(!json.contains("SUPER_SECRET"));
-        assert!(format!("{ContractOnlyProfile:?}").contains("ContractOnlyProfile"));
-    }
-
-    #[test]
-    fn contract_only_admission_refuses_without_execution() {
-        let argv = vec![OsString::from(".venv/bin/python")];
-        let profile = ContractOnlyProfile;
-        let error = profile
-            .parse_lexical(AdmissionInput {
-                argv: &argv,
-                cwd: Path::new("/workspace"),
-                workspace_root: Path::new("/workspace"),
-                stdio: StdioFacts {
-                    stdin: StdinKind::Closed,
-                    stdout_is_tty: false,
-                    stderr_is_tty: false,
-                },
-                environment: &[],
-            })
-            .unwrap_err();
-        assert_eq!(
-            error,
-            ProfileFailure::Refused {
-                code: RefusalCode::ProfileDisabled
-            }
-        );
     }
 
     #[test]
