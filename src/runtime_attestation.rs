@@ -37,6 +37,7 @@
     reason = "the sealed team runtime is intentionally not wired to the CLI or uploader yet"
 )]
 
+#[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fmt;
 use std::fs::{File, Metadata, OpenOptions};
@@ -44,23 +45,29 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::{Command, Stdio};
 #[cfg(test)]
 use std::sync::Arc;
+#[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(target_os = "macos")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use blake3::Hasher;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[cfg(target_os = "macos")]
+use crate::executable::host_audited_apple_profile;
 use crate::executable::{
-    ExecutableIdentity, ExecutableProvenance, ToolKind, VerifyError, host_audited_apple_profile,
-    verify_executable,
+    ExecutableIdentity, ExecutableProvenance, ToolKind, VerifyError, verify_executable,
 };
 use crate::team::Digest;
 use crate::team_request_key::TeamRequestKeyV1;
