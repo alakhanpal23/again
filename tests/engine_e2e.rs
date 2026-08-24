@@ -9,7 +9,6 @@ use std::process::{Command, Output, Stdio};
 
 #[cfg(target_os = "macos")]
 use rusqlite::Connection;
-#[cfg(target_os = "macos")]
 use serde_json::Value;
 use serde_json::json;
 use tempfile::TempDir;
@@ -120,6 +119,83 @@ fn remove_unmodeled_ambient_inputs(command: &mut Command) {
 fn run_again(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     run_process(root, &again_binary(), &args, stdin)
+}
+
+#[test]
+fn rootless_namespace_probe_is_closed_and_non_qualifying() {
+    let temp = TempDir::new().unwrap();
+    let output = run_again(temp.path(), &["__linux-pytest-namespace-probe-v1"], None);
+    assert!(
+        output.stderr.is_empty(),
+        "probe wrote unexpected stderr: {:?}",
+        output.stderr
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["schema"], "again.linux-pytest-namespace-probe.v1");
+    assert_eq!(report["profile_id"], "linux-pytest-v1");
+    assert_eq!(
+        report["scope"],
+        json!({
+            "kind": "fixed_no_command_namespace_bootstrap",
+            "profile_qualification": false,
+            "accepts_command": false,
+            "execution_authority": false,
+        })
+    );
+    match output.status.code() {
+        Some(0) => {
+            assert_eq!(report["status"], "completed");
+            assert!(report["refusal"].is_null());
+        }
+        Some(77) => {
+            assert_eq!(report["status"], "unavailable");
+            assert_eq!(report["refusal"]["cleanup_complete"], true);
+            assert!(report["refusal"]["code"].is_string());
+            assert!(report["refusal"]["stage"].is_string());
+            assert!(report["refusal"]["reason"].is_string());
+        }
+        status => panic!("probe returned broken status {status:?}: {report}"),
+    }
+    assert!(!state_dir(temp.path()).exists());
+
+    let rejected = run_again(
+        temp.path(),
+        &["__linux-pytest-namespace-probe-v1", "unexpected-command"],
+        None,
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unexpected argument"),
+        "unexpected rejection: {:?}",
+        rejected.stderr
+    );
+    assert!(!state_dir(temp.path()).exists());
+}
+
+#[test]
+#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+fn rootless_namespace_probe_rejects_loader_injection_before_clone() {
+    let temp = TempDir::new().unwrap();
+    let output = run_process_with_env(
+        temp.path(),
+        &again_binary(),
+        &["__linux-pytest-namespace-probe-v1".to_owned()],
+        None,
+        &[("LD_LIBRARY_PATH", "/dev/null/again-loader-path")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "probe wrote unexpected stderr: {:?}",
+        output.stderr
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["status"], "broken");
+    assert_eq!(report["refusal"]["reason"], "loader_injection_environment");
+    assert_eq!(report["refusal"]["stage"], "dedicated_helper");
+    assert_eq!(report["refusal"]["cleanup_complete"], true);
+    assert!(!state_dir(temp.path()).exists());
 }
 
 fn run_experimental_hook(root: &Path, stdin: &str) -> Output {

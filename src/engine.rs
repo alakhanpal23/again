@@ -64,6 +64,9 @@ enum CommandName {
     Stats(StatsArgs),
     /// Check the local runtime and Codex integration.
     Doctor(DoctorArgs),
+    /// Run the fixed no-command Linux namespace diagnostic.
+    #[command(name = "__linux-pytest-namespace-probe-v1", hide = true)]
+    LinuxPytestNamespaceProbeV1,
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +281,32 @@ struct DoctorReport {
     trace_backed_replay: bool,
 }
 
+#[derive(Serialize)]
+struct RootlessNamespaceProbeReport {
+    schema: &'static str,
+    profile_id: &'static str,
+    scope: RootlessNamespaceProbeScope,
+    status: &'static str,
+    refusal: Option<RootlessNamespaceProbeRefusal>,
+}
+
+#[derive(Serialize)]
+struct RootlessNamespaceProbeScope {
+    kind: &'static str,
+    profile_qualification: bool,
+    accepts_command: bool,
+    execution_authority: bool,
+}
+
+#[derive(Serialize)]
+struct RootlessNamespaceProbeRefusal {
+    code: &'static str,
+    stage: &'static str,
+    reason: &'static str,
+    errno: Option<i32>,
+    cleanup_complete: bool,
+}
+
 pub fn run_cli() -> Result<i32> {
     let cli = Cli::parse_from(normalized_args());
     match cli.command {
@@ -296,7 +325,64 @@ pub fn run_cli() -> Result<i32> {
         CommandName::Show(args) => show(&args.id),
         CommandName::Stats(args) => stats(args.json),
         CommandName::Doctor(args) => doctor(args.json),
+        CommandName::LinuxPytestNamespaceProbeV1 => linux_pytest_namespace_probe_v1(),
     }
+}
+
+fn linux_pytest_namespace_probe_v1() -> Result<i32> {
+    use crate::linux_pytest::{LINUX_PYTEST_PROFILE_ID, RootlessNamespaceProbeDiagnosticV1};
+
+    let scope = RootlessNamespaceProbeScope {
+        kind: "fixed_no_command_namespace_bootstrap",
+        profile_qualification: false,
+        accepts_command: false,
+        execution_authority: false,
+    };
+    let (report, exit_code) = match crate::linux_pytest::diagnose_rootless_namespace_tuple_v1() {
+        RootlessNamespaceProbeDiagnosticV1::Completed => (
+            RootlessNamespaceProbeReport {
+                schema: "again.linux-pytest-namespace-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: "completed",
+                refusal: None,
+            },
+            0,
+        ),
+        RootlessNamespaceProbeDiagnosticV1::Refused {
+            code,
+            stage,
+            reason,
+            errno,
+            cleanup_complete,
+            expected_unavailable,
+        } => (
+            RootlessNamespaceProbeReport {
+                schema: "again.linux-pytest-namespace-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: if expected_unavailable {
+                    "unavailable"
+                } else {
+                    "broken"
+                },
+                refusal: Some(RootlessNamespaceProbeRefusal {
+                    code: code.as_str(),
+                    stage,
+                    reason,
+                    errno,
+                    cleanup_complete,
+                }),
+            },
+            if expected_unavailable { 77 } else { 1 },
+        ),
+    };
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &report)?;
+    output.write_all(b"\n")?;
+    Ok(exit_code)
 }
 
 /// Let the README-friendly `again -- rg ...` spelling behave like `again run -- rg ...`.

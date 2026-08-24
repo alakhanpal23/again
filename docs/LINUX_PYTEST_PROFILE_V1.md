@@ -7,9 +7,11 @@ exists or has passed its gates. The profile identifier is
 `linux-pytest-v1`. Its exact binary object registry, field tags, hash frame,
 environment normalization, comparison exclusions, and manifest commitments
 are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
-The current crate-private module is unreachable from the CLI and all concrete
-profile traits still fail closed; pytest execution and reuse are not
-implemented. Descriptor-stable source enumeration, regular-file copying,
+The crate-private execution profile remains unreachable from the CLI and no
+concrete profile implementation exists; pytest execution and reuse are not
+implemented. A hidden, fixed, no-command namespace-bootstrap diagnostic is
+non-qualifying and grants no execution authority. Descriptor-stable source
+enumeration, regular-file copying,
 connector-owned charged materialization, identity-checked atomic publication,
 and one shared resource contract exist as internal leaves. A no-atime
 source-view qualification path is also implemented as a crate-private leaf,
@@ -451,6 +453,19 @@ corresponding gid map. No host capability is requested or retained. The parent
 pins all six namespace descriptors, verifies each namespace type and
 device/inode identity, and proves through `NS_GET_USERNS` that every non-user
 namespace is owned by the new user namespace.
+
+The fixed bootstrap diagnostic first pins `/proc`, verifies `PROC_SUPER_MAGIC`,
+requires the mount's exact `self` link to equal the caller's canonical decimal
+`getpid()`, and then opens the numeric self and direct-child task directories
+beneath that descriptor with `openat2`
+`RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`. Its procfs
+observations are descriptor-relative; only the authenticated `ns/*` magic-link
+opens may cross into nsfs. The direct child remains unreaped and pidfd-bound
+through validation, while the default `SIGCHLD` disposition preserves the
+direct-child wait contract. `Completed` is minted only after terminal reap and
+descriptor disposal; failures expose whether cleanup completed. Either result
+is narrow bootstrap evidence only: it neither qualifies the profile nor grants
+execution authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,

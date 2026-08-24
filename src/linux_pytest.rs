@@ -1,10 +1,13 @@
 //! Frozen shared contract and in-progress backend for the future
 //! `linux-pytest-v1` execution profile.
 //!
-//! This module is intentionally unreachable from the public CLI.  It defines
-//! the privacy, completeness, snapshot-capability, trace-record, and promotion
-//! boundaries that the isolated Linux implementations build against. No
-//! concrete execution profile exists yet, so this module cannot execute Python.
+//! The execution profile is intentionally unreachable from the public CLI. A
+//! hidden, fixed diagnostic can exercise its no-command namespace bootstrap,
+//! but explicitly grants neither profile qualification nor execution authority.
+//! This module defines the privacy, completeness, snapshot-capability,
+//! trace-record, and promotion boundaries that the isolated Linux
+//! implementations build against. No concrete execution profile exists yet,
+//! so this module cannot execute Python.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -65,6 +68,7 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 
 mod canonical;
 mod identity;
+mod isolation_qualification;
 mod snapshot_connector;
 mod snapshot_manifest;
 mod snapshot_materialize;
@@ -73,6 +77,38 @@ mod snapshot_publish;
 mod snapshot_regular;
 mod snapshot_tree;
 mod snapshot_verify;
+
+/// Diagnostic-only result for the fixed rootless namespace probe.
+///
+/// This projection deliberately cannot expose a PID, descriptor, namespace,
+/// path, callback, command, or execution authority. `Completed` implies exact
+/// terminal reap; a refusal reports whether cleanup could be proven.
+pub(crate) enum RootlessNamespaceProbeDiagnosticV1 {
+    Completed,
+    Refused {
+        code: RefusalCode,
+        stage: &'static str,
+        reason: &'static str,
+        errno: Option<i32>,
+        cleanup_complete: bool,
+        expected_unavailable: bool,
+    },
+}
+
+/// Run the closed no-command diagnostic and erase its private evidence type.
+pub(crate) fn diagnose_rootless_namespace_tuple_v1() -> RootlessNamespaceProbeDiagnosticV1 {
+    match isolation_qualification::qualify_rootless_namespace_tuple_v1() {
+        Ok(_) => RootlessNamespaceProbeDiagnosticV1::Completed,
+        Err(failure) => RootlessNamespaceProbeDiagnosticV1::Refused {
+            code: failure.code(),
+            stage: failure.stage(),
+            reason: failure.reason(),
+            errno: failure.errno(),
+            cleanup_complete: failure.cleanup_complete(),
+            expected_unavailable: failure.is_expected_unavailable(),
+        },
+    }
+}
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Blake3Digest([u8; 32]);

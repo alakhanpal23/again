@@ -13,9 +13,9 @@ concurrency:
 
 jobs:
   linux-capability-evidence:
-    name: Linux capability inventory (non-qualifying; 77 accepted)
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    name: Linux bootstrap evidence (stock user-namespace refusal required)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,6 +24,8 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Build the independent read-only capability probe
         run: rustc +1.88.0 --edition 2024 -D warnings ci/linux_capability_probe.rs -o linux-capability-probe
+      - name: Build the fixed Again namespace diagnostic
+        run: cargo +1.88.0 build --locked --bin again
       - name: Collect typed hosted Linux capability evidence
         id: capability-probe
         shell: bash
@@ -117,12 +119,57 @@ jobs:
               exit "${probe_exit}"
               ;;
           esac
+      - name: Require the stock-runner namespace refusal
+        shell: bash
+        run: |
+          set +e
+          target/debug/again __linux-pytest-namespace-probe-v1 \
+            > linux-namespace-bootstrap-report.json \
+            2> linux-namespace-bootstrap.stderr
+          probe_exit=$?
+          set -e
+          test "${probe_exit}" -eq 77
+          test ! -s linux-namespace-bootstrap.stderr
+          jq -e '
+            (keys == ["profile_id", "refusal", "schema", "scope", "status"])
+            and .schema == "again.linux-pytest-namespace-probe.v1"
+            and .profile_id == "linux-pytest-v1"
+            and .status == "unavailable"
+            and (.scope | keys == [
+              "accepts_command", "execution_authority", "kind", "profile_qualification"
+            ])
+            and .scope.kind == "fixed_no_command_namespace_bootstrap"
+            and .scope.profile_qualification == false
+            and .scope.accepts_command == false
+            and .scope.execution_authority == false
+            and (.refusal | keys == ["cleanup_complete", "code", "errno", "reason", "stage"])
+            and .refusal.code == "user_namespace_unavailable"
+            and .refusal.stage == "clone_namespaces"
+            and .refusal.reason == "administrative_policy"
+            and .refusal.errno == 13
+            and .refusal.cleanup_complete == true
+          ' linux-namespace-bootstrap-report.json > /dev/null
+          jq -e '
+            .results.user_namespace.status == "unavailable"
+            and .results.user_namespace.reason == "user_namespace_unavailable"
+            and .results.user_namespace.stage == "unshare_user"
+            and .results.user_namespace.errno == 13
+          ' \
+            linux-capability-report.json > /dev/null
+          {
+            echo "### Fixed namespace bootstrap"
+            echo "✅ The stock Ubuntu 24.04 runner refused before any workload surface."
+            echo "The diagnostic remains non-qualifying and grants no execution authority."
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the hosted Linux capability report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux-capability-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
-          path: linux-capability-report.json
+          path: |
+            linux-capability-report.json
+            linux-namespace-bootstrap-report.json
+            linux-namespace-bootstrap.stderr
           if-no-files-found: error
           retention-days: 30
 
