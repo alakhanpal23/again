@@ -5,36 +5,62 @@
 //! retained-view leases, charges every new outer container to the
 //! persistent-manifest ledger, hashes nodes through allocation-free canonical
 //! projections, and retains exact canonical tree bytes plus the 102-byte D2
-//! `SourceStatxV1` commitment. It is not yet wired into connector publication.
+//! `SourceStatxV1` commitment.
 //!
-//! The result is still data, not authority: it owns no descriptor, binds no
-//! published directory, and cannot grant isolation, execution, or reuse. A
-//! later publisher must bind its D2 root commitment and canonical evidence to
-//! the reopened immutable child. The old allocation-heavy owning compiler is
-//! retained only under `cfg(test)` as an independent parity oracle.
+//! The FD-free compiler result is still data, not authority. The integrated
+//! connector keeps it live while binding the exact published child, then
+//! returns `PublishedCanonicalTreeV1`: paired physical and canonical evidence
+//! that still cannot grant isolation, execution, or reuse. The old
+//! allocation-heavy owning compiler is retained only under `cfg(test)` as an
+//! independent parity oracle.
 //! Per-field hard ceilings are refusal bounds, not a promise that every
 //! Cartesian-maximum plan fits the persistent envelope; exact precharge may
 //! reject such a plan before result construction.
 
 use super::canonical;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_connector::{
+    SnapshotChargedErrorV1, SnapshotConnectorV1, SnapshotPipelineFourViewErrorV1,
+};
 use super::snapshot_connector::{
     SnapshotManifestCompilationSessionV1, consume_stable_manifest_projection,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_policy::SnapshotPublishedChildBindReservationV1;
 use super::snapshot_policy::{
     SnapshotManifestCompilationVecV1, SnapshotPipelineResourceErrorV1, SnapshotRetainedViewLeaseV1,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::{
+    BoundPublishedSnapshotChildV1, SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1,
+    SnapshotPublishedChildBindErrorV1, seal_publish_and_bind_snapshot_child_at,
+    validate_snapshot_final_name,
+};
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::{
+    bound_published_snapshot_directory_fd, bound_published_snapshot_root_fd,
+};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::QualifiedNoAtimeSourceViewV1;
 use super::snapshot_tree::{
     CapturedXattrValueV1, SourcePlanPayloadV1, SourceTreeEntryV1, SourceTreePlanV1,
 };
 use super::snapshot_verify::StableManifestProjectionV1;
 use super::{
     ChildCommitmentV1, HardlinkGroupDigest, LinuxPytestContractError, ManifestEntryKindV1,
-    NodeDigest, SandboxPath, TimespecV1, TreeRoleV1, XattrV1,
+    NodeDigest, TimespecV1, TreeRoleV1, XattrV1,
 };
 #[cfg(test)]
 use super::{
-    HARDLINK_GROUP_DOMAIN, ManifestEntryV1, ManifestPayloadV1, MetadataV1, TreeManifestV1,
+    HARDLINK_GROUP_DOMAIN, ManifestEntryV1, ManifestPayloadV1, MetadataV1, SandboxPath,
+    TreeManifestV1,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::ffi::CStr;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::fmt;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::os::fd::BorrowedFd;
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum SnapshotManifestCompileErrorV1 {
@@ -60,6 +86,106 @@ impl From<SnapshotPipelineResourceErrorV1> for SnapshotManifestCompileErrorV1 {
     }
 }
 
+/// Linear handoff from one verified D2 manifest and the exact publication
+/// ledger to the descriptor-binding leaf. Private fields make raw commitment
+/// bytes and caller-created reservations insufficient to construct it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[must_use = "a prepared published-child bind must be consumed or its escrow is refunded"]
+pub(super) struct SnapshotPreparedPublishedChildBindV1<'resources, 'evidence> {
+    reservation: SnapshotPublishedChildBindReservationV1<'resources>,
+    root_name: &'evidence CStr,
+    manifest: &'evidence ChargedTreeManifestV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<'resources, 'evidence> SnapshotPreparedPublishedChildBindV1<'resources, 'evidence> {
+    pub(super) fn into_leaf_parts(
+        self,
+    ) -> (
+        &'evidence CStr,
+        [u8; 102],
+        SnapshotPublishedChildBindReservationV1<'resources>,
+    ) {
+        (
+            self.root_name,
+            *self.manifest.destination_root_statx_commitment_v1(),
+            self.reservation,
+        )
+    }
+}
+
+/// Physical published-tree descriptors paired with the exact charged
+/// canonical manifest that proved their D2 root identity. Physical fields are
+/// dropped first. This remains snapshot evidence, not execution/reuse
+/// authority; later isolation must address the same-UID mutation boundary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct PublishedCanonicalTreeV1<'resources> {
+    physical: BoundPublishedSnapshotChildV1,
+    manifest: ChargedTreeManifestV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl PublishedCanonicalTreeV1<'_> {
+    pub(super) const fn manifest(&self) -> &ChargedTreeManifestV1<'_> {
+        &self.manifest
+    }
+
+    /// Test-only physical inspection. Production intentionally exposes no
+    /// clonable descriptor borrow from the canonical composite.
+    #[cfg(test)]
+    pub(super) fn published_directory(&self) -> BorrowedFd<'_> {
+        bound_published_snapshot_directory_fd(&self.physical)
+    }
+
+    /// Test-only physical inspection. A future isolation transition must
+    /// consume the opaque composite rather than detach this child descriptor.
+    #[cfg(test)]
+    pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
+        bound_published_snapshot_root_fd(&self.physical)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for PublishedCanonicalTreeV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PublishedCanonicalTreeV1")
+            .field("physical", &self.physical)
+            .field("manifest", &"<charged-canonical-manifest>")
+            .finish()
+    }
+}
+
+/// Failures before publication retain their original typed cause. A bind
+/// failure is distinct because its final name is already durable and must
+/// never be treated as removable or safely retried.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) enum SnapshotPublishedCanonicalTreeErrorV1 {
+    RootNameMismatch,
+    FourView(SnapshotPipelineFourViewErrorV1),
+    Manifest(SnapshotManifestCompileErrorV1),
+    Finalization(SnapshotChargedErrorV1<SnapshotPublishErrorV1>),
+    PublishedChildBind(SnapshotPublishedChildBindErrorV1),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for SnapshotPublishedCanonicalTreeErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootNameMismatch => formatter.write_str("RootNameMismatch"),
+            Self::FourView(error) => formatter.debug_tuple("FourView").field(error).finish(),
+            Self::Manifest(error) => formatter.debug_tuple("Manifest").field(error).finish(),
+            Self::Finalization(error) => {
+                formatter.debug_tuple("Finalization").field(error).finish()
+            }
+            Self::PublishedChildBind(error) => formatter
+                .debug_tuple("PublishedChildBind")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
 /// One charged, FD-free projection of a stable S1/D2 pair.
 ///
 /// This value is deliberately not a `TreeManifestV1` and grants no snapshot,
@@ -68,9 +194,8 @@ impl From<SnapshotPipelineResourceErrorV1> for SnapshotManifestCompileErrorV1 {
 /// while all moved plan-owned buffers remain covered by the two retained-view
 /// leases. Field order is part of the safety argument: charged entries and
 /// every nested moved buffer are destroyed before either lease is released.
-pub(super) struct ChargedTreeManifestV1<'resources, 'profile> {
-    mount_path: &'profile SandboxPath,
-    tree_role: TreeRoleV1,
+pub(super) struct ChargedTreeManifestV1<'resources> {
+    root_name: Box<[u8]>,
     entries: SnapshotManifestCompilationVecV1<'resources, ChargedManifestEntryV1<'resources>>,
     root_digest: NodeDigest,
     destination_root_statx_commitment: [u8; 102],
@@ -79,13 +204,9 @@ pub(super) struct ChargedTreeManifestV1<'resources, 'profile> {
     _destination_lease: SnapshotRetainedViewLeaseV1<'resources>,
 }
 
-impl ChargedTreeManifestV1<'_, '_> {
-    pub(super) const fn mount_path(&self) -> &SandboxPath {
-        self.mount_path
-    }
-
-    pub(super) const fn tree_role(&self) -> TreeRoleV1 {
-        self.tree_role
+impl ChargedTreeManifestV1<'_> {
+    fn root_name(&self) -> &[u8] {
+        &self.root_name
     }
 
     #[cfg(test)]
@@ -97,7 +218,7 @@ impl ChargedTreeManifestV1<'_, '_> {
         self.root_digest
     }
 
-    pub(super) const fn destination_root_statx_commitment_v1(&self) -> &[u8; 102] {
+    const fn destination_root_statx_commitment_v1(&self) -> &[u8; 102] {
         &self.destination_root_statx_commitment
     }
 
@@ -240,23 +361,21 @@ impl canonical::ManifestCanonicalByteSinkV1 for SnapshotManifestCompilationVecV1
     }
 }
 
-/// Production-shaped compilation of one connector-verified S1/D2 pair without
-/// creating an uncharged owning-manifest container. Connector publication does
-/// not call this function yet.
+/// Production compilation of one connector-verified S1/D2 pair without
+/// creating an uncharged owning-manifest container.
 ///
 /// The only plan input is the verifier's non-forgeable stable projection. Its
 /// connector-owned bridge keeps each plan ahead of its retained-view lease in
 /// drop order. The session/lease identity check runs before semantic
 /// validation or allocation, preventing proof from one pipeline resource
 /// authority from being spliced into another authority's ledger. This remains
-/// a data-only projection: the 102-byte D2 `SourceStatxV1` commitment is retained for a
-/// later publisher binding, but no FD or publication proof is created here.
-pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
+/// a data-only projection: the 102-byte D2 `SourceStatxV1` commitment is
+/// retained for the integrated publisher binding, but this function alone
+/// creates no FD or publication proof.
+pub(super) fn compile_tree_manifest_charged<'resources>(
     session: &SnapshotManifestCompilationSessionV1<'resources>,
     stable: StableManifestProjectionV1<'resources, 'resources>,
-    mount_path: &'profile SandboxPath,
-    tree_role: TreeRoleV1,
-) -> Result<ChargedTreeManifestV1<'resources, 'profile>, SnapshotManifestCompileErrorV1> {
+) -> Result<ChargedTreeManifestV1<'resources>, SnapshotManifestCompileErrorV1> {
     let mut inputs = consume_stable_manifest_projection(stable);
     let (source_lease, destination_lease) = inputs.leases();
     if !session.owns_lease(source_lease) || !session.owns_lease(destination_lease) {
@@ -273,8 +392,9 @@ pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
         .commitment_bytes_v1();
 
     let (source, destination) = inputs.take_plans();
-    let (_, source_entries, source_groups, _) = source.into_parts();
-    let (_, destination_entries, _, _) = destination.into_parts();
+    let (source_root_name, source_entries, source_groups, _) = source.into_parts();
+    let (destination_root_name, destination_entries, _, _) = destination.into_parts();
+    drop(source_root_name);
     let group_digests =
         compile_hardlink_group_digests_charged(session, &source_entries, &source_groups)?;
 
@@ -416,15 +536,15 @@ pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
         entry_views.try_push(entry.projection())?;
     }
     let canonical_length = canonical::checked_tree_manifest_projection_canonical_length_v1(
-        mount_path.as_bytes(),
-        tree_role,
+        b"/workspace",
+        TreeRoleV1::Workspace,
         entry_views.as_slice(),
         root_digest,
     )?;
     let mut canonical_bytes = session.charged_vec::<u8>(canonical_length)?;
     let written = match canonical::write_tree_manifest_projection_canonical_v1(
-        mount_path.as_bytes(),
-        tree_role,
+        b"/workspace",
+        TreeRoleV1::Workspace,
         entry_views.as_slice(),
         root_digest,
         &mut canonical_bytes,
@@ -447,8 +567,7 @@ pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
     let (source_lease, destination_lease) = inputs.into_leases();
 
     Ok(ChargedTreeManifestV1 {
-        mount_path,
-        tree_role,
+        root_name: destination_root_name,
         entries: entries_reversed,
         root_digest,
         destination_root_statx_commitment,
@@ -456,6 +575,67 @@ pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
         _source_lease: source_lease,
         _destination_lease: destination_lease,
     })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SnapshotConnectorV1 {
+    /// Materializes and verifies four independent views, compiles the exact D2
+    /// manifest, escrows post-publication binding before sealing, publishes,
+    /// and binds the reopened child without exposing any intermediate token.
+    /// Success is still evidence only; it cannot authorize execution or reuse.
+    pub(super) fn materialize_workspace_tree_and_publish_at<'resources>(
+        &'resources self,
+        publication_parent: BorrowedFd<'resources>,
+        staging_name: &CStr,
+        final_name: &CStr,
+        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
+        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<PublishedCanonicalTreeV1<'resources>, SnapshotPublishedCanonicalTreeErrorV1> {
+        validate_snapshot_final_name(staging_name, final_name).map_err(|error| {
+            SnapshotPublishedCanonicalTreeErrorV1::Finalization(SnapshotChargedErrorV1::Leaf(error))
+        })?;
+
+        let (staged, stable) = self
+            .materialize_source_tree_four_view_at(
+                publication_parent,
+                staging_name,
+                source_s1_view,
+                source_s2_view,
+                root_name,
+            )
+            .map_err(SnapshotPublishedCanonicalTreeErrorV1::FourView)?;
+        let compilation = self.manifest_compilation_session();
+        let manifest = compile_tree_manifest_charged(&compilation, stable)
+            .map_err(SnapshotPublishedCanonicalTreeErrorV1::Manifest)?;
+        if manifest.root_name() != root_name.to_bytes() {
+            return Err(SnapshotPublishedCanonicalTreeErrorV1::RootNameMismatch);
+        }
+
+        let reservation = staged
+            .reserve_published_child_bind_attempts()
+            .map_err(|error| {
+                SnapshotPublishedCanonicalTreeErrorV1::Finalization(
+                    SnapshotChargedErrorV1::Resource(error),
+                )
+            })?;
+        let prepared = SnapshotPreparedPublishedChildBindV1 {
+            reservation,
+            root_name,
+            manifest: &manifest,
+        };
+        let physical = seal_publish_and_bind_snapshot_child_at(staged, final_name, prepared)
+            .map_err(|error| match error {
+                SnapshotPublishAndBindErrorV1::Finalization(error) => {
+                    SnapshotPublishedCanonicalTreeErrorV1::Finalization(error)
+                }
+                SnapshotPublishAndBindErrorV1::PublishedChildBind(error) => {
+                    SnapshotPublishedCanonicalTreeErrorV1::PublishedChildBind(error)
+                }
+            })?;
+
+        Ok(PublishedCanonicalTreeV1 { physical, manifest })
+    }
 }
 
 fn compile_hardlink_group_digests_charged<'resources>(
@@ -1209,17 +1389,11 @@ mod tests {
         awaiting_d2.compare_destination_d2(destination_d2).unwrap()
     }
 
-    fn compile_charged<'resources, 'profile>(
+    fn compile_charged<'resources>(
         resources: &'resources SnapshotPipelineResourcesV1,
         stable: StableManifestProjectionV1<'resources, 'resources>,
-        mount_path: &'profile SandboxPath,
-    ) -> Result<ChargedTreeManifestV1<'resources, 'profile>, SnapshotManifestCompileErrorV1> {
-        compile_tree_manifest_charged(
-            &manifest_compilation_session_for_test(resources),
-            stable,
-            mount_path,
-            TreeRoleV1::Workspace,
-        )
+    ) -> Result<ChargedTreeManifestV1<'resources>, SnapshotManifestCompileErrorV1> {
+        compile_tree_manifest_charged(&manifest_compilation_session_for_test(resources), stable)
     }
 
     #[derive(Default)]
@@ -1323,8 +1497,7 @@ mod tests {
             destination_d1,
             destination_d2,
         );
-        let mount = workspace_path();
-        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        let charged = compile_charged(&resources, stable).unwrap();
         assert_eq!(charged.canonical_bytes(), canonical);
         drop(charged);
         assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
@@ -1340,7 +1513,7 @@ mod tests {
             destination_d1,
             destination_d2,
         );
-        let error = match compile_charged(&resources, stable, &mount) {
+        let error = match compile_charged(&resources, stable) {
             Ok(_) => panic!("one-byte-short manifest budget must refuse"),
             Err(error) => error,
         };
@@ -1785,11 +1958,9 @@ mod tests {
             destination_d1,
             destination_d2,
         );
-        let mount = workspace_path();
-        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        let charged = compile_charged(&resources, stable).unwrap();
 
-        assert_eq!(charged.mount_path(), &mount);
-        assert_eq!(charged.tree_role(), TreeRoleV1::Workspace);
+        assert_eq!(charged.root_name(), b"source-root");
         assert_eq!(charged.canonical_bytes(), expected_canonical);
         assert_eq!(
             charged.destination_root_statx_commitment_v1(),
@@ -1861,8 +2032,7 @@ mod tests {
                 destination_d1,
                 destination_d2,
             );
-            let mount = workspace_path();
-            let charged = compile_charged(&resources, stable, &mount).unwrap();
+            let charged = compile_charged(&resources, stable).unwrap();
             assert_eq!(charged.canonical_bytes(), expected_canonical);
             assert_eq!(charged.root_digest(), legacy.root_digest);
             assert_eq!(charged.entries().len(), legacy.entries.len());
@@ -1967,7 +2137,6 @@ mod tests {
     #[test]
     fn charged_compiler_preserves_raw_names_end_to_end() {
         let resources = manifest_resources(4 * 1024 * 1024);
-        let mount = workspace_path();
         let (source_s1, destination_d1) = fixture(0x63, b"\xff");
         let (source_s2, destination_d2) = fixture(0x63, b"\xff");
         let stable = stable_projection(
@@ -1977,7 +2146,7 @@ mod tests {
             destination_d1,
             destination_d2,
         );
-        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        let charged = compile_charged(&resources, stable).unwrap();
         assert_eq!(charged.entries()[1].relative_path(), b"\xff");
         let ChargedManifestPayloadV1::Directory { children } = charged.entries()[0].payload()
         else {
@@ -2041,12 +2210,9 @@ mod tests {
         let (source_s2, destination_d2) = fixture(0x61, b"file");
         let stable =
             stable_projection(&owner, source_s1, source_s2, destination_d1, destination_d2);
-        let mount = workspace_path();
         let error = match compile_tree_manifest_charged(
             &manifest_compilation_session_for_test(&foreign),
             stable,
-            &mount,
-            TreeRoleV1::Workspace,
         ) {
             Ok(_) => panic!("foreign session must refuse stable proof"),
             Err(error) => error,
@@ -2212,8 +2378,7 @@ mod tests {
             malformed(false),
             malformed(false),
         );
-        let mount = workspace_path();
-        let error = match compile_charged(&resources, stable, &mount) {
+        let error = match compile_charged(&resources, stable) {
             Ok(_) => panic!("malformed parent backlink must refuse"),
             Err(error) => error,
         };
@@ -2260,8 +2425,7 @@ mod tests {
             malformed_destination(),
             malformed_destination(),
         );
-        let mount = workspace_path();
-        let error = match compile_charged(&resources, stable, &mount) {
+        let error = match compile_charged(&resources, stable) {
             Ok(_) => panic!("malformed D2 semantics must refuse"),
             Err(error) => error,
         };
@@ -2283,11 +2447,21 @@ mod tests {
         impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
         impl<T: Copy> AmbiguousIfCopy<u8> for T {}
 
-        <ChargedTreeManifestV1<'static, 'static> as AmbiguousIfClone<_>>::probe();
-        <ChargedTreeManifestV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
-        assert!(std::mem::needs_drop::<
-            ChargedTreeManifestV1<'static, 'static>,
-        >());
+        <ChargedTreeManifestV1<'static> as AmbiguousIfClone<_>>::probe();
+        <ChargedTreeManifestV1<'static> as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<ChargedTreeManifestV1<'static>>());
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            <SnapshotPreparedPublishedChildBindV1<'static, 'static> as AmbiguousIfClone<_>>::probe(
+            );
+            <SnapshotPreparedPublishedChildBindV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
+            <PublishedCanonicalTreeV1<'static> as AmbiguousIfClone<_>>::probe();
+            <PublishedCanonicalTreeV1<'static> as AmbiguousIfCopy<_>>::probe();
+            assert!(std::mem::needs_drop::<
+                SnapshotPreparedPublishedChildBindV1<'static, 'static>,
+            >());
+            assert!(std::mem::needs_drop::<PublishedCanonicalTreeV1<'static>>());
+        }
 
         let resources = manifest_resources(4 * 1024 * 1024);
         let (source_s1, destination_d1) = fixture(0x91, b"file");
@@ -2299,8 +2473,7 @@ mod tests {
             destination_d1,
             destination_d2,
         );
-        let mount = workspace_path();
-        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        let charged = compile_charged(&resources, stable).unwrap();
         assert!(resources.persistent_manifest_heap_live_for_test() > 0);
         assert_eq!(
             resources.retained_view_heap_live_for_test(),

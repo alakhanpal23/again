@@ -28,6 +28,8 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_manifest::SnapshotPreparedPublishedChildBindV1;
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::{
@@ -502,10 +504,31 @@ pub(super) type ChargedStagedSnapshotDirectoryV1<'resources> =
     platform::ChargedStagedSnapshotDirectoryV1<'resources>;
 pub(super) type VerifiedReadySnapshotDirectoryV1<'parent> =
     platform::VerifiedReadySnapshotDirectoryV1<'parent>;
+#[cfg(test)]
 pub(super) type PublishedSnapshotDirectoryV1 = platform::PublishedSnapshotDirectoryV1;
 /// Point-in-time physical descriptor binding only. It neither makes the path
 /// or descendants immutable nor grants isolation, execution, or reuse.
 pub(super) type BoundPublishedSnapshotChildV1 = platform::BoundPublishedSnapshotChildV1;
+
+/// Test-only inspection of the pinned published-container descriptor. This is
+/// deliberately absent from production because `BorrowedFd` can be cloned to
+/// an owned descriptor in safe Rust.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn bound_published_snapshot_directory_fd(
+    bound: &BoundPublishedSnapshotChildV1,
+) -> BorrowedFd<'_> {
+    bound.published_directory()
+}
+
+/// Test-only inspection of the exact child selected at bind time. Production
+/// consumers must use a future operation-specific isolation transition rather
+/// than receiving a clonable descriptor borrow.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn bound_published_snapshot_root_fd(
+    bound: &BoundPublishedSnapshotChildV1,
+) -> BorrowedFd<'_> {
+    bound.root_directory()
+}
 
 pub(super) fn create_charged_staged_snapshot_directory_at<'scope>(
     parent: BorrowedFd<'scope>,
@@ -516,16 +539,47 @@ pub(super) fn create_charged_staged_snapshot_directory_at<'scope>(
     platform::create_charged_staged_snapshot_directory_at(parent, staging_name, session)
 }
 
-/// Consumes the connector's populated, four-view-checked staging guard and
-/// performs the only production readiness/publication transition. The result
-/// is an opaque physical-directory capability only; it carries no manifest,
-/// content identity, execution authority, or reuse authority.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Test-only access to physical publication without canonical binding.
+/// Production has no irreversible publication operation that omits the
+/// verifier/compiler handoff.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn seal_and_publish_charged_at(
     staged: ChargedStagedSnapshotDirectoryV1<'_>,
     final_name: &CStr,
 ) -> Result<PublishedSnapshotDirectoryV1, SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
     platform::seal_and_publish_charged_at(staged, final_name)
+}
+
+/// Distinguishes failure before durable publication from failure while
+/// binding a final name that is already durable.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) enum SnapshotPublishAndBindErrorV1 {
+    Finalization(SnapshotChargedErrorV1<SnapshotPublishErrorV1>),
+    PublishedChildBind(SnapshotPublishedChildBindErrorV1),
+}
+
+/// The sole production irreversible transition. It requires the manifest
+/// compiler's non-forgeable linear handoff before sealing, then publishes and
+/// pins the exact child selected beneath the durable final name. Raw
+/// commitment bytes and separately minted reservations are not accepted at
+/// this boundary. Success remains point-in-time evidence only; it neither
+/// prevents same-UID mutation nor grants isolation, execution, or reuse.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn seal_publish_and_bind_snapshot_child_at(
+    staged: ChargedStagedSnapshotDirectoryV1<'_>,
+    final_name: &CStr,
+    prepared: SnapshotPreparedPublishedChildBindV1<'_, '_>,
+) -> Result<BoundPublishedSnapshotChildV1, SnapshotPublishAndBindErrorV1> {
+    let (child_name, expected_statx_commitment, reservation) = prepared.into_leaf_parts();
+    let published = platform::seal_and_publish_charged_at(staged, final_name)
+        .map_err(SnapshotPublishAndBindErrorV1::Finalization)?;
+    platform::bind_published_snapshot_child_at(
+        published,
+        child_name,
+        expected_statx_commitment,
+        reservation,
+    )
+    .map_err(SnapshotPublishAndBindErrorV1::PublishedChildBind)
 }
 
 #[cfg(test)]
@@ -710,6 +764,25 @@ mod platform {
         > {
             match self {
                 Self::Charged { session } => session.reserve_finalization_attempts(),
+                #[cfg(test)]
+                Self::Unmetered { .. } => {
+                    unreachable!("the legacy test authority does not reserve shared attempts")
+                }
+            }
+        }
+
+        /// Reserves the exact post-publication child-bind ceiling derived by
+        /// the publication policy carried inside this charged authority.
+        /// Callers cannot select a count or recover the broader resource
+        /// ledger from the narrowed reservation.
+        fn reserve_published_child_bind_attempts(
+            &self,
+        ) -> Result<
+            SnapshotPublishedChildBindReservationV1<'resources>,
+            SnapshotPipelineResourceErrorV1,
+        > {
+            match self {
+                Self::Charged { session } => session.reserve_published_child_bind_attempts(),
                 #[cfg(test)]
                 Self::Unmetered { .. } => {
                     unreachable!("the legacy test authority does not reserve shared attempts")
@@ -926,7 +999,6 @@ mod platform {
 
     pub(in crate::linux_pytest) struct PublishedSnapshotDirectoryV1 {
         directory: OwnedFd,
-        identity: SnapshotDirectoryIdentityV1,
         openat2_attempts: u8,
     }
 
@@ -935,7 +1007,7 @@ mod platform {
     /// The pair does not stop same-UID mutation after binding and grants no
     /// execution authority.
     pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
-        published: PublishedSnapshotDirectoryV1,
+        published: OwnedFd,
         root: OwnedFd,
     }
 
@@ -985,7 +1057,7 @@ mod platform {
         }
     }
 
-    impl ChargedStagedSnapshotDirectoryV1<'_> {
+    impl<'resources> ChargedStagedSnapshotDirectoryV1<'resources> {
         pub(in crate::linux_pytest) fn directory(&self) -> BorrowedFd<'_> {
             self.cleanup.directory()
         }
@@ -1000,6 +1072,22 @@ mod platform {
 
         pub(in crate::linux_pytest) fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1 {
             self.cleanup.policy().cleanup_envelope()
+        }
+
+        /// Escrows the leaf's complete child-binding work before sealing can
+        /// make publication irreversible. The count comes only from the
+        /// embedded charged publication policy. This is operation authority,
+        /// not evidence that any child is stable, immutable, isolated, or
+        /// eligible for execution or reuse.
+        pub(in crate::linux_pytest) fn reserve_published_child_bind_attempts(
+            &self,
+        ) -> Result<
+            SnapshotPublishedChildBindReservationV1<'resources>,
+            SnapshotPipelineResourceErrorV1,
+        > {
+            self.cleanup
+                .authority
+                .reserve_published_child_bind_attempts()
         }
     }
 
@@ -1017,17 +1105,15 @@ mod platform {
         pub(super) fn directory(&self) -> BorrowedFd<'_> {
             self.directory.as_fd()
         }
-
-        pub(super) const fn identity(&self) -> SnapshotDirectoryIdentityV1 {
-            self.identity
-        }
     }
 
     impl BoundPublishedSnapshotChildV1 {
+        #[cfg(test)]
         pub(super) fn published_directory(&self) -> BorrowedFd<'_> {
-            self.published.directory()
+            self.published.as_fd()
         }
 
+        #[cfg(test)]
         pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
             self.root.as_fd()
         }
@@ -1047,10 +1133,14 @@ mod platform {
             ));
         }
 
+        let PublishedSnapshotDirectoryV1 {
+            directory,
+            openat2_attempts,
+        } = published;
         let root = open_path_at_with_gate(
-            published.directory(),
+            directory.as_fd(),
             child_name,
-            published.openat2_attempts,
+            openat2_attempts,
             &reservation,
         )
         .map_err(|error| {
@@ -1093,7 +1183,10 @@ mod platform {
             ));
         }
 
-        Ok(BoundPublishedSnapshotChildV1 { published, root })
+        Ok(BoundPublishedSnapshotChildV1 {
+            published: directory,
+            root,
+        })
     }
 
     impl<'parent> StagedSnapshotDirectoryV1<'parent> {
@@ -1247,7 +1340,6 @@ mod platform {
 
             Ok(PublishedSnapshotDirectoryV1 {
                 directory: reopened,
-                identity: reopened_identity,
                 openat2_attempts: cleanup.policy().openat2_attempts(),
             })
         }
@@ -1431,7 +1523,6 @@ mod platform {
 
         Ok(PublishedSnapshotDirectoryV1 {
             directory: reopened,
-            identity: reopened_identity,
             openat2_attempts: cleanup.policy().openat2_attempts(),
         })
     }
@@ -3161,6 +3252,51 @@ mod platform {
         }
 
         #[test]
+        fn charged_stage_reserves_the_exact_child_bind_ceiling_before_sealing() {
+            let fixture = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
+                .unwrap();
+            let authority = &staged.cleanup.authority;
+            let before = authority
+                .remaining_attempts(PublisherAttemptBucketV1::Forward)
+                .unwrap();
+            let exact = u64::from(staged.cleanup.policy().openat2_attempts()) + 1;
+            let fstats_before = DIRECTORY_FSTAT_CALLS.with(|calls| calls.get());
+            PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.set(0));
+
+            let reservation = staged.reserve_published_child_bind_attempts().unwrap();
+
+            assert_eq!(
+                authority.remaining_attempts(PublisherAttemptBucketV1::Forward),
+                Some(before - exact)
+            );
+            assert_eq!(
+                DIRECTORY_FSTAT_CALLS.with(|calls| calls.get()),
+                fstats_before
+            );
+            assert_eq!(PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.get()), 0);
+            assert_eq!(
+                fs::metadata(fixture.staging_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                PRIVATE_DIRECTORY_MODE
+            );
+            assert!(!fixture.final_path().exists());
+
+            drop(reservation);
+            assert_eq!(
+                authority.remaining_attempts(PublisherAttemptBucketV1::Forward),
+                Some(before)
+            );
+            drop(staged);
+            assert!(!fixture.staging_path().exists());
+        }
+
+        #[test]
         fn zero_forward_budget_refuses_before_the_first_kernel_attempt() {
             // Four entries reserve exactly 272 publisher-cleanup attempts plus
             // the disjoint leaf-local reserve and leave no forward attempt.
@@ -3618,10 +3754,9 @@ mod platform {
                 SEALED_DIRECTORY_MODE
             );
             assert_eq!(
-                directory_identity(published.directory()).unwrap(),
-                published.identity()
+                directory_identity(published.directory()).unwrap().mode & 0o7777,
+                SEALED_DIRECTORY_MODE
             );
-            assert_eq!(published.identity().mode & 0o7777, SEALED_DIRECTORY_MODE);
         }
 
         #[test]
@@ -4209,7 +4344,6 @@ mod platform {
             let ready_identity = ready.cleanup.expected_identity();
             let published = ready.publish_at(FINAL).unwrap();
             assert!(callback_ran);
-            assert_eq!(published.identity(), ready_identity);
             assert_eq!(
                 directory_identity(published.directory()).unwrap(),
                 ready_identity
@@ -4243,11 +4377,17 @@ mod platform {
             // has already returned to the shared ledger.
             assert_eq!(resources.forward_attempts_remaining_for_test(), before - 2);
             assert_eq!(
-                fstat_raw(bound.root_directory()).unwrap().st_mode & libc::S_IFMT,
+                fstat_raw(bound_published_snapshot_root_fd(&bound))
+                    .unwrap()
+                    .st_mode
+                    & libc::S_IFMT,
                 libc::S_IFDIR
             );
             assert_eq!(
-                fstat_raw(bound.published_directory()).unwrap().st_mode & libc::S_IFMT,
+                fstat_raw(bound_published_snapshot_directory_fd(&bound))
+                    .unwrap()
+                    .st_mode
+                    & libc::S_IFMT,
                 libc::S_IFDIR
             );
             assert_eq!(
@@ -4595,12 +4735,11 @@ mod platform {
 
     pub(in crate::linux_pytest) struct PublishedSnapshotDirectoryV1 {
         directory: OwnedFd,
-        identity: SnapshotDirectoryIdentityV1,
         openat2_attempts: u8,
     }
 
     pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
-        published: PublishedSnapshotDirectoryV1,
+        published: OwnedFd,
         root: OwnedFd,
     }
 
@@ -4647,17 +4786,15 @@ mod platform {
         pub(super) fn directory(&self) -> BorrowedFd<'_> {
             self.directory.as_fd()
         }
-
-        pub(super) const fn identity(&self) -> SnapshotDirectoryIdentityV1 {
-            self.identity
-        }
     }
 
     impl BoundPublishedSnapshotChildV1 {
+        #[cfg(test)]
         pub(super) fn published_directory(&self) -> BorrowedFd<'_> {
-            self.published.directory()
+            self.published.as_fd()
         }
 
+        #[cfg(test)]
         pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
             self.root.as_fd()
         }

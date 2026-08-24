@@ -6,11 +6,12 @@
 //! widened. The connector then owns the mutable resource ledger and keeps leaf
 //! policies private. On Linux x86_64, connector-owned source observation,
 //! charged source-to-stage materialization, independent destination
-//! observation, the ordered S1/S2, S1/D1, D1/D2 comparisons, and an integrated
-//! charged filesystem-publication checkpoint are wired. The unready RAII
-//! cleanup guard never escapes the connector between D2 and finalization.
-//! Publication still grants no manifest, execution, or reuse authority. Every
-//! explicitly modeled fallible or retryable kernel attempt, apart from
+//! observation, and the ordered S1/S2, S1/D1, D1/D2 comparisons are wired.
+//! Production retains the unready RAII cleanup guard beside the verifier-minted
+//! stable projection only inside the integrated manifest/publication flow and
+//! returns paired physical/canonical evidence. Neither intermediate nor that
+//! evidence grants execution or reuse authority. Every explicitly modeled
+//! fallible or retryable kernel attempt, apart from
 //! release-only descriptor close, charges the same ledger.
 //! Source-observation logical counts and payloads are bounded by leaf policy.
 //! Source plans and materializer workspace use conservative full-ceiling
@@ -30,15 +31,14 @@ use super::snapshot_materialize::{
 use super::snapshot_policy::{
     SnapshotChargedBytesV1, SnapshotFinalizationAttemptReservationV1,
     SnapshotPipelineForwardStageV1, SnapshotPipelineResourceErrorV1, SnapshotPipelineResourcesV1,
-    SnapshotResourcePolicyFieldV1, SnapshotResourcePolicyV1, SnapshotRetainedViewLeaseV1,
+    SnapshotPublishedChildBindReservationV1, SnapshotResourcePolicyFieldV1,
+    SnapshotResourcePolicyV1, SnapshotRetainedViewLeaseV1,
 };
 use super::snapshot_publish::SnapshotPublishPolicyV1;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::seal_and_publish_charged_at;
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::snapshot_publish::{ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1};
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_publish::{
-    PublishedSnapshotDirectoryV1, seal_and_publish_charged_at, validate_snapshot_final_name,
-};
 use super::snapshot_regular::{RegularCopyPolicyV1, SnapshotRegularFailureV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::enumerate_destination_tree_view_charged_at;
@@ -134,11 +134,11 @@ pub(super) enum SnapshotChargedErrorV1<E> {
     Leaf(E),
 }
 
-/// Flat connector-owned failure for materialization, all three semantic
-/// comparisons, and the integrated physical publication checkpoint. Resource
-/// exhaustion remains top-level regardless of the leaf that encountered it;
-/// potentially path-bearing leaf payloads stay redacted. The type carries no
-/// staged directory or transition authority.
+/// Flat connector-owned failure for materialization and all three semantic
+/// comparisons before canonical compilation/publication. Resource exhaustion
+/// remains top-level regardless of the leaf that encountered it; potentially
+/// path-bearing leaf payloads stay redacted. The type carries no staged
+/// directory or transition authority.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) enum SnapshotPipelineFourViewErrorV1 {
     PublicationAlreadyStarted,
@@ -640,6 +640,21 @@ impl<'resources> SnapshotPublicationSessionV1<'resources> {
             .reserve_finalization_attempts(self.policy.finalization_operation_attempt_bound())
     }
 
+    /// Reserves the exact post-publication child-bind ceiling from this
+    /// session's publication policy and sole resource ledger.
+    ///
+    /// The caller cannot substitute an attempt count: the leaf policy fixes
+    /// the bound at `openat2_attempts + 1` for the terminal descriptor-based
+    /// `statx`. The reservation must be acquired before sealing begins.
+    pub(super) fn reserve_published_child_bind_attempts(
+        &self,
+    ) -> Result<SnapshotPublishedChildBindReservationV1<'resources>, SnapshotPipelineResourceErrorV1>
+    {
+        self.resources.reserve_published_child_bind_attempts(
+            self.policy.published_child_bind_operation_attempt_bound(),
+        )
+    }
+
     pub(super) fn run_publisher_cleanup_attempt<T>(
         &self,
         attempt: impl FnOnce() -> T,
@@ -712,6 +727,14 @@ impl SnapshotConnectorV1 {
         }
     }
 
+    /// Mints the allocator used by production manifest compilation from this
+    /// connector's sole preflighted resource ledger.
+    pub(super) fn manifest_compilation_session(&self) -> SnapshotManifestCompilationSessionV1<'_> {
+        SnapshotManifestCompilationSessionV1 {
+            resources: &self.resources,
+        }
+    }
+
     fn begin_publication(&self) -> Option<SnapshotPublicationSessionV1<'_>> {
         if self.publication_started.replace(true) {
             return None;
@@ -774,54 +797,29 @@ impl SnapshotConnectorV1 {
         })
     }
 
-    /// Materialize, compare, seal, and atomically publish one private tree
-    /// without exposing the mutable staging guard after D2. The returned
-    /// directory is only an opaque filesystem publication checkpoint; it is
-    /// not manifest, execution, or reuse authority.
+    /// Returns the still-owned private stage paired with the non-forgeable
+    /// stable S1/D2 projection that completed all three comparisons.
+    ///
+    /// Neither value grants publication, execution, or reuse authority. Only
+    /// `materialize_workspace_tree_and_publish_at` carries both through the
+    /// final linear flow, reserves post-publication binding before sealing,
+    /// and consumes the stable projection through manifest compilation rather
+    /// than extracting raw commitment bytes.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    pub(super) fn materialize_source_tree_four_view_and_publish_at<'scope>(
-        &'scope self,
-        publication_parent: BorrowedFd<'scope>,
-        staging_name: &CStr,
-        final_name: &CStr,
-        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
-        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
-        root_name: &CStr,
-    ) -> Result<PublishedSnapshotDirectoryV1, SnapshotPipelineFourViewErrorV1> {
-        validate_snapshot_final_name(staging_name, final_name)
-            .map_err(SnapshotPipelineFourViewErrorV1::Publication)?;
-        let staging = self.materialize_source_tree_four_view_at(
-            publication_parent,
-            staging_name,
-            source_s1_view,
-            source_s2_view,
-            root_name,
-        )?;
-        seal_and_publish_charged_at(staging, final_name).map_err(|error| match error {
-            SnapshotChargedErrorV1::PublicationAlreadyStarted => {
-                SnapshotPipelineFourViewErrorV1::PublicationAlreadyStarted
-            }
-            SnapshotChargedErrorV1::Resource(error) => {
-                SnapshotPipelineFourViewErrorV1::Resource(error)
-            }
-            SnapshotChargedErrorV1::Leaf(error) => {
-                SnapshotPipelineFourViewErrorV1::Publication(error)
-            }
-        })
-    }
-
-    /// Internal comparison checkpoint used by the integrated operation and
-    /// same-module tests. Keeping this private prevents a production caller
-    /// from mutating staged children after D2 and before sealing.
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn materialize_source_tree_four_view_at<'scope>(
+    pub(super) fn materialize_source_tree_four_view_at<'scope>(
         &'scope self,
         publication_parent: BorrowedFd<'scope>,
         staging_name: &CStr,
         source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
         source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
-    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotPipelineFourViewErrorV1> {
+    ) -> Result<
+        (
+            ChargedStagedSnapshotDirectoryV1<'scope>,
+            StableManifestProjectionV1<'scope, 'scope>,
+        ),
+        SnapshotPipelineFourViewErrorV1,
+    > {
         let (staging, source_s1) = self.materialize_source_tree_at(
             publication_parent,
             staging_name,
@@ -876,9 +874,8 @@ impl SnapshotConnectorV1 {
         let stable_projection = destination_stable
             .compare_destination_d2(destination_d2)
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
-        drop(stable_projection);
 
-        Ok(staging)
+        Ok((staging, stable_projection))
     }
 
     /// In one connector-owned operation, selects this connector's policies and
@@ -886,9 +883,9 @@ impl SnapshotConnectorV1 {
     /// stage through one charged source traversal. No independently spliceable
     /// session or policy escapes. Success returns the populated guard beside
     /// the exact copy-time source plan under its retained-view lease; the
-    /// materializer-workspace lease has already been released. The guard stays
-    /// inside this connector's private comparison/finalization chain and is
-    /// never returned by its production operation. Capacity refusal before
+    /// materializer-workspace lease has already been released. The caller is
+    /// the private four-view checkpoint, which returns the guard only beside
+    /// the verifier-minted stable projection. Capacity refusal before
     /// publication leaves the one-shot unused; any failure after publication
     /// begins consumes it.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -958,9 +955,8 @@ impl SnapshotConnectorV1 {
         ))
     }
 
-    /// Test-only access to the charged staging checkpoint. Production code
-    /// must use `materialize_source_tree_four_view_and_publish_at` so a stage
-    /// cannot escape before population, comparison, sealing, and publication.
+    /// Test-only access to an unpopulated charged staging guard. Production
+    /// reaches stage creation only inside the canonical integrated flow.
     #[cfg(test)]
     pub(super) fn create_staged_snapshot_directory_at<'scope>(
         &'scope self,
@@ -1387,9 +1383,11 @@ mod tests {
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
     use std::os::fd::AsFd;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::fd::AsRawFd;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use std::os::unix::ffi::OsStrExt;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     use super::*;
 
@@ -1935,7 +1933,8 @@ mod tests {
             c"root",
         ) {
             Err(error) => error,
-            Ok(staging) => {
+            Ok((staging, stable_projection)) => {
+                drop(stable_projection);
                 drop(staging);
                 panic!("an invalid staging basename must fail closed");
             }
@@ -2058,7 +2057,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[ignore = "requires qualified no-atime source and destination staging filesystems"]
-    fn four_view_materialization_copies_exact_bytes_preserves_atime_and_publishes() {
+    fn workspace_manifest_binding_preserves_bytes_atime_and_releases_resources() {
         let source_parent = tempfile::tempdir().unwrap();
         let source_tree = source_parent.path().join("tree");
         let source_file = source_tree.join("file");
@@ -2088,7 +2087,9 @@ mod tests {
             .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
         let final_name = c"snapshot-final";
         let final_path = publication_parent.path().join(final_name.to_str().unwrap());
-        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let mut inputs = Inputs::exact();
+        inputs.persistent_manifest_heap_bytes = 1024 * 1024;
+        let connector = connect_snapshot_pipeline(resources(inputs)).unwrap();
         // SAFETY: this mechanics-only fixture is owned by the test, has no
         // concurrent writer, and the repeated probes above proved that the
         // exact objects retain atime. This does not claim that the host passed
@@ -2106,7 +2107,7 @@ mod tests {
             )
         };
         let published = connector
-            .materialize_source_tree_four_view_and_publish_at(
+            .materialize_workspace_tree_and_publish_at(
                 publication_parent_fd.as_fd(),
                 staging_name,
                 final_name,
@@ -2120,9 +2121,49 @@ mod tests {
         assert_eq!(fs::read(final_path.join("tree/file")).unwrap(), expected);
         assert_eq!(source_atime(&source_tree), tree_atime);
         assert_eq!(source_atime(&source_file), file_atime);
-        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+
+        let manifest = published.manifest();
+        assert!(!manifest.canonical_bytes().is_empty());
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            connector.resources.policy().max_retained_view_bytes().get() * 2
+        );
+        assert!(connector.resources.persistent_manifest_heap_live_for_test() > 0);
+
+        for (directory, expected_metadata) in [
+            (
+                published.published_directory(),
+                fs::metadata(&final_path).unwrap(),
+            ),
+            (
+                published.root_directory(),
+                fs::metadata(final_path.join("tree")).unwrap(),
+            ),
+        ] {
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            let result = unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) };
+            assert_eq!(result, 0);
+            let stat = unsafe { stat.assume_init() };
+            assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFDIR);
+            assert_eq!(stat.st_dev, expected_metadata.dev());
+            assert_eq!(stat.st_ino, expected_metadata.ino());
+        }
+
         drop(published);
-        assert!(final_path.exists());
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert_eq!(
+            connector.resources.persistent_manifest_heap_live_for_test(),
+            0
+        );
+        assert!(final_path.is_dir());
+        assert_eq!(fs::read(final_path.join("tree/file")).unwrap(), expected);
+        assert_eq!(fs::metadata(&final_path).unwrap().mode() & 0o7777, 0o500);
+
+        // Publication deliberately seals the container at 0500. Restore owner
+        // write permission only after the composite has released both pinned
+        // descriptors so TempDir can recursively clean this successful case.
+        fs::set_permissions(final_path.join("tree"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&final_path, fs::Permissions::from_mode(0o700)).unwrap();
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -2180,7 +2221,8 @@ mod tests {
             c"tree",
         ) {
             Err(error) => error,
-            Ok(staging) => {
+            Ok((staging, stable_projection)) => {
+                drop(stable_projection);
                 drop(staging);
                 panic!("distinct source views must fail S1/S2 comparison");
             }
@@ -2283,6 +2325,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn invalid_final_name_refuses_before_qualification_resources_or_one_shot() {
+        use super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1;
         use super::super::snapshot_publish::{
             SnapshotPublicationStateV1, SnapshotPublishErrorKindV1, SnapshotPublishStageV1,
         };
@@ -2311,7 +2354,7 @@ mod tests {
         };
 
         let error = connector
-            .materialize_source_tree_four_view_and_publish_at(
+            .materialize_workspace_tree_and_publish_at(
                 unreachable.as_fd(),
                 c".again-snapshot-stage-dddddddddddddddddddddddddddddddd",
                 c"nested/final",
@@ -2321,7 +2364,10 @@ mod tests {
             )
             .err()
             .expect("invalid final name must refuse before qualification");
-        let SnapshotPipelineFourViewErrorV1::Publication(error) = error else {
+        let SnapshotPublishedCanonicalTreeErrorV1::Finalization(SnapshotChargedErrorV1::Leaf(
+            error,
+        )) = error
+        else {
             panic!("invalid final name must remain a publication-leaf refusal");
         };
         assert_eq!(error.kind(), SnapshotPublishErrorKindV1::InvalidFinalName);
@@ -2386,7 +2432,8 @@ mod tests {
             c"root",
         ) {
             Err(error) => error,
-            Ok(staged) => {
+            Ok((staged, stable_projection)) => {
+                drop(stable_projection);
                 drop(staged);
                 panic!("a non-directory source parent must fail closed");
             }
@@ -2551,22 +2598,26 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn finalization_escrow_admits_exact_bound_and_n_minus_one_refuses_before_sealing() {
+    fn simultaneous_finalization_and_bind_escrows_admit_exact_f_plus_b_only() {
         use super::super::snapshot_policy::{
             SnapshotPipelineAttemptBucketV1, SnapshotPipelineStageV1,
         };
 
-        // This tests atomic escrow admission and refusal. The successful kernel
-        // path refunds unused worst-case authority; it need not consume the
-        // entire bound.
-        for (suffix, exact) in [('a', true), ('b', false)] {
+        // Binding must be escrowed before the irreversible seal. Together the
+        // two exact reservations therefore require F+B live authority at once.
+        // The successful kernel path may refund unused finalization authority.
+        for (staging_name, exact) in [
+            (
+                c".again-snapshot-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                true,
+            ),
+            (
+                c".again-snapshot-stage-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                false,
+            ),
+        ] {
             let publication_parent = tempfile::tempdir().unwrap();
             let publication_parent_fd = File::open(publication_parent.path()).unwrap();
-            let staging_name = if suffix == 'a' {
-                c".again-snapshot-stage-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            } else {
-                c".again-snapshot-stage-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-            };
             let staging_path = publication_parent
                 .path()
                 .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
@@ -2575,14 +2626,23 @@ mod tests {
             let mut inputs = Inputs::exact();
             inputs.operation_attempts = 512;
             let connector = connect_snapshot_pipeline(resources(inputs)).unwrap();
-            let bound = connector
+            let finalization_bound = connector
                 .publication
                 .finalization_operation_attempt_bound()
                 .get();
+            let bind_bound = connector
+                .publication
+                .published_child_bind_operation_attempt_bound()
+                .get();
+            let combined_bound = finalization_bound.checked_add(bind_bound).unwrap();
             let staged = connector
                 .create_staged_snapshot_directory_at(publication_parent_fd.as_fd(), staging_name)
                 .unwrap();
-            let target = if exact { bound } else { bound - 1 };
+            let target = if exact {
+                combined_bound
+            } else {
+                combined_bound - 1
+            };
             let remaining = connector.resources.forward_attempts_remaining_for_test();
             assert!(remaining >= target);
             for _ in target..remaining {
@@ -2596,6 +2656,15 @@ mod tests {
                 target
             );
 
+            let bind_reservation = staged.reserve_published_child_bind_attempts().unwrap();
+            assert_eq!(
+                connector.resources.forward_attempts_remaining_for_test(),
+                if exact {
+                    finalization_bound
+                } else {
+                    finalization_bound - 1
+                }
+            );
             let result = seal_and_publish_charged_at(staged, final_name);
             if exact {
                 let published = result.unwrap();
@@ -2603,6 +2672,13 @@ mod tests {
                 assert!(final_path.is_dir());
                 assert_eq!(fs::metadata(&final_path).unwrap().mode() & 0o7777, 0o500);
                 drop(published);
+                let before_bind_refund = connector.resources.forward_attempts_remaining_for_test();
+                drop(bind_reservation);
+                assert_eq!(
+                    connector.resources.forward_attempts_remaining_for_test(),
+                    before_bind_refund.checked_add(bind_bound).unwrap()
+                );
+                fs::set_permissions(&final_path, fs::Permissions::from_mode(0o700)).unwrap();
             } else {
                 assert!(matches!(
                     result,
@@ -2617,10 +2693,15 @@ mod tests {
                 ));
                 assert_eq!(
                     connector.resources.forward_attempts_remaining_for_test(),
-                    bound - 1
+                    finalization_bound - 1
                 );
                 assert!(!staging_path.exists());
                 assert!(!final_path.exists());
+                drop(bind_reservation);
+                assert_eq!(
+                    connector.resources.forward_attempts_remaining_for_test(),
+                    combined_bound - 1
+                );
             }
         }
     }

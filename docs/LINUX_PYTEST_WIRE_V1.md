@@ -8,21 +8,23 @@ This is the frozen Stage 0 binary and identity contract for the future
 `src/linux_pytest/identity.rs`. The module remains unreachable from the public
 CLI, and its concrete admission, canonical sealed-snapshot provider, sandbox,
 tracer, storage, and worker implementations do not exist. A narrow
-crate-private physical-publication checkpoint is implemented; its mechanics
-and limits are specified by the
+crate-private manifest-bound publication checkpoint is implemented; its
+mechanics and limits are specified by the
 [profile contract](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint).
-A pure crate-private compiler can project already-equal logical-source and
-destination plans into the frozen `TreeManifestV1` data model, but it is not
-wired into the connector or publication path because its nested allocation
-envelope and tree-root descriptor binding are not complete.
+A charged compiler consumes only the verifier-minted stable S1/D2 projection,
+builds the canonical workspace-tree bytes and root digest, and retains the D2
+root `SourceStatxV1` commitment. Before sealing, the connector escrows the
+exact post-publication bind bound. After durable publication it reopens the
+exact child, verifies that commitment, and returns opaque physical descriptors
+paired with the still-charged canonical evidence.
 
-For this wire contract, its `PublishedSnapshotDirectoryV1` result is opaque
-and creates no canonical object, manifest, digest, or content-addressed name.
-It grants no execution, Python, isolation, or reuse authority and makes no
-claim against a malicious same-UID process or host root. The positive
-full-flow test remains ignored until both source and destination filesystems
-are functionally qualified for no-atime access; hosted CI supplies no positive
-evidence for the qualified full flow.
+The paired result is not yet a canonical `SnapshotManifestV1`, sealed-snapshot
+identity, snapshot digest, or content-addressed publication. It grants no
+execution, Python, isolation, or reuse authority and makes no claim against a
+malicious same-UID process or host root. The positive full-flow test remains
+ignored until both source and destination filesystems are functionally
+qualified for no-atime access; hosted CI supplies no positive evidence for the
+qualified full flow.
 
 Runtime qualification and retained evidence are tracked in
 [STATUS.md](STATUS.md). Nothing in this document is evidence that a canonical

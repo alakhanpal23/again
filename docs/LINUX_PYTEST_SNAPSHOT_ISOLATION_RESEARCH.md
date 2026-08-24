@@ -211,10 +211,13 @@ Runtime qualification and retained evidence are tracked in
 source and destination filesystems are functionally qualified for no-atime
 access, so hosted CI is not positive evidence for the qualified full flow.
 The production-shaped charged compiler can now construct exact canonical tree
-data from a verifier-minted S1/D2 projection, but the connector does not yet
-carry that data through publication. Published-child binding, canonical
-manifest authority, and every later isolation step in this note remain
-research requirements.
+data from a verifier-minted S1/D2 projection. The connector keeps that charged
+evidence live, escrows the exact child-bind work before sealing, durably
+publishes, verifies the D2 root commitment against the reopened exact child,
+and returns paired canonical evidence and opaque physical descriptors. Full
+snapshot-manifest identity, content-addressed publication, the same-UID
+boundary, and every later isolation step in this note remain research
+requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`
@@ -250,17 +253,20 @@ transitive rather than retaining a third plan for another direct comparison.
 The final physical sealed-mode projection and post-chmod xattr verification of
 every manifest entry are already part of both destination views. The current
 materializer fsyncs each supported file and directory before destination
-observation. After D2, charged publication separately changes the non-manifest
-staging container to mode `0500`; the connector does not expose the staging
-descriptor and follows the
+observation. After D2, the connector compiles the charged canonical
+workspace-tree evidence. Charged publication separately changes the
+non-manifest staging container to mode `0500`; the connector does not expose
+the staging descriptor and follows the
 [normative charged-publication sequence](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint).
-Only the opaque published directory capability leaves that operation. It
-grants no canonical manifest or digest, content-addressed name, execution,
-Python, isolation, or reuse authority.
+Before that irreversible transition it reserves the exact post-publication
+binding work. It then reopens the durable publication, pins the exact child,
+and verifies the D2 root commitment. The returned composite pairs those opaque
+physical descriptors with the still-charged canonical tree bytes and root
+digest. It grants no full snapshot manifest or digest, content-addressed name,
+execution, Python, isolation, or reuse authority.
 
-A complete backend must still carry the compiler's canonical tree evidence
-through publication, bind and authenticate it against the reopened immutable
-child, construct the full snapshot manifest and digest, choose a
+A complete backend must still combine this workspace tree with the runtime
+forest, construct the full snapshot manifest and digest, choose a
 content-addressed name, and mint the later isolation/execution authorities.
 The malicious same-UID and host-root threat boundary also remains open. The
 logical source mode remains in the future manifest and is restored only on the

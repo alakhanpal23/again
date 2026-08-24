@@ -23,10 +23,14 @@ read from the actual staged publisher to dominate its source depth, entry
 count, basename, and retry limits. Mismatch refuses before materializer
 population and delegates bounded, best-effort cleanup to the staged publisher.
 The connector now joins the supported materialization and observation leaves
-into an internal four-view comparison followed by a narrow physical
-publication checkpoint. That checkpoint does not produce the canonical
-manifest or digest required by this profile and is not wired to
-`SnapshotProvider`.
+into an internal four-view comparison, charged canonical workspace-tree
+compilation, atomic publication, and exact published-child binding. Its
+`PublishedCanonicalTreeV1` result keeps the charged canonical bytes and root
+digest live beside opaque descriptors for the durable publication and the
+exact D2-committed child. This remains an internal evidence checkpoint: it
+does not construct the full snapshot manifest or snapshot digest, choose a
+content-addressed name, protect private state from the same host UID, or wire
+the result to `SnapshotProvider`.
 
 A static, allocation-free projection now returns a non-`Clone`, non-`Copy`
 connector that owns the preflighted policy and one shared operation/heap
@@ -62,30 +66,29 @@ is charged to the destination-observation transient heap through that exact
 connector session; it is not a hash or a retained-view lease. D1 is then
 dropped before D2. The D1/D2 comparator reconstructs the prior full-plan
 field order from S1 plus the raw witness, preserving exact mismatch locations
-while S1 remains available for future logical-manifest projection. It drops
-D2, S1, and the witness before finalization, so at most two retained-view
-leases coexist. The
-D2-complete cleanup guard remains private to the connector and flows
-immediately into a no-argument reservation bound to its embedded publication
-session. That reservation takes the leaf policy's exact worst-case raw-attempt
-ceiling from the same forward ledger. Reservation refusal occurs before any
-finalization syscall. The charged leaf then changes the top-level staging
-container to physical mode `0500`, revalidates and fsyncs it, performs an
-adjacent pre-rename identity check,
-uses state-aware `renameat2(..., RENAME_NOREPLACE)` reconciliation, fsyncs the
-parent, reopens the final name, and binds the original and reopened identities.
-Success returns only an opaque `PublishedSnapshotDirectoryV1`.
+while S1 remains available for logical-manifest projection. The witness is
+dropped after D2. The verifier's stable S1/D2 projection then flows directly
+into the charged compiler. It computes node and hard-link digests bottom-up,
+uses source logical metadata, moves destination payload and xattr evidence
+under the two retained-view leases, charges each new outer allocation to the
+persistent-manifest ledger, and retains the exact canonical workspace-tree
+bytes, root digest, and 102-byte D2 `SourceStatxV1` root commitment.
 
-A separate production-shaped compiler can consume only the verifier-minted
-stable S1/D2 projection. It computes real node and hard-link digests
-bottom-up, uses source logical metadata, moves destination payload and xattr
-evidence under the retained-view leases, charges each new outer allocation to
-the persistent-manifest ledger, and retains exact canonical tree bytes plus
-the 102-byte D2 `SourceStatxV1` commitment. It creates data, not authority. The current
-connector intentionally does not call it: publication still returns the outer
-container rather than a canonical-evidence-bound tree-root descriptor.
+The D2-complete cleanup guard remains private. Before any irreversible
+transition it escrows the exact published-child bind ceiling from its embedded
+publication session. A non-forgeable prepared handoff borrows the live charged
+manifest and owns that reservation. The sole production publication function
+requires the stage and this handoff together. It then reserves finalization,
+changes the top-level staging container to physical mode `0500`, revalidates
+and fsyncs it, performs an adjacent pre-rename identity check, uses state-aware
+`renameat2(..., RENAME_NOREPLACE)` reconciliation, fsyncs the parent, and
+reopens the final name. Finally it opens the exact manifest root beneath that
+durable publication and requires its `statx` commitment to equal D2. Success
+returns an opaque physical binding paired with the still-charged canonical
+tree evidence. Production exposes no raw physical-only seal and no clonable FD
+borrow from that composite.
 
-This physical publication checkpoint does not construct or authenticate the
+This manifest-bound publication checkpoint does not construct the full
 canonical snapshot manifest, compute a snapshot digest, choose a
 content-addressed name, or grant execution, Python, isolation, or reuse
 authority. It makes no claim against a malicious same-UID process or host
@@ -100,9 +103,10 @@ Within the wired source-observation, materialization, and staged-publication
 slices, every explicitly modeled raw kernel operation attempt, including every
 retry, is charged before invocation. Non-retryable RAII descriptor close is
 the explicit release-only exception.
-Before finalization, the session subtracts the complete leaf-derived attempt
-ceiling in one checked reservation; every charged attempt consumes that
-reservation before invocation, and dropping it refunds only unused attempts.
+Before finalization, the session holds the exact child-bind reservation and
+subtracts the complete finalization leaf ceiling in a second checked
+reservation. Every charged attempt consumes its reservation before invocation,
+and dropping either reservation refunds only unused attempts.
 Forward and publisher-cleanup attempts use disjoint buckets, so forward
 exhaustion cannot spend the cleanup reserve. The policy also pre-reserves a
 separate leaf-local cleanup bucket consumed by the charged regular-copy leaf.
