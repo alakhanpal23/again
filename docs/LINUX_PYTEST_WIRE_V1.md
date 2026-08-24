@@ -14,13 +14,16 @@ coexisting full views to two. This is a structural ceiling, not exact
 allocator-capacity accounting inside the plan. A no-atime source-view
 qualification path exists but is not connector-wired; its fixed local probe
 retries are outside the shared resource ledger, so callers cannot yet obtain
-that authority through the charged pipeline. The connector separately permits
-one charged private staged-directory creation and RAII-cleanup session on Linux
-x86_64. Its guard exposes the pinned directory and cleanup envelope but no
-ready, publish, execution, or reuse transition. Charged destination regular
-copying exists as a connector-bound leaf but has no pipeline caller; complete
-four-view orchestration also remains unwired. Nothing in this document is
-evidence that pytest execution or reuse is available.
+that authority through the charged pipeline. On Linux x86_64, one
+connector-owned operation now reserves two full-plan ceilings, creates the
+charged private stage, traverses the already-qualified source, invokes charged
+regular copying, finalizes supported metadata and durability, and returns the
+populated RAII-cleanup guard. Source-enumeration, materialization, and
+regular-copy policies are bound into the same connector-minted session. The
+populated guard exposes no ready, publish, execution, or reuse transition;
+destination observation and complete four-view orchestration remain unwired.
+Nothing in this document is evidence that pytest execution or reuse is
+available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR

@@ -176,29 +176,20 @@ nonforgeable, allocation-free cleanup envelope from the actual staged
 publisher. Its cleanup depth, entry count, basename limit, `openat2` attempts,
 and generic syscall attempts must each dominate the source-derived
 materialization policy. An independently configured or smaller cleanup guard
-is a typed future pre-population refusal. The current connector stops before
-population: it can issue one unsplittable shared-ledger session to create a
-private staged directory, and the returned charged guard exposes only its
-pinned directory, cleanup envelope, and RAII cleanup. Forward and cleanup raw
+is a typed pre-population refusal. The current connector reserves both
+simultaneously live plan ceilings before filesystem work, creates one private
+charged stage, traverses the already-qualified source, populates supported
+entries through the connector-bound regular-copy leaf, and returns the
+populated guard. Forward and cleanup raw
 attempts, including retries, use disjoint buckets; the retained 55-byte staging
 basename is forward-charged and retained cleanup names are cleanup-charged. For
 cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
 live retained-name heap is `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each
 active cleanup frame retains a fixed two-slot name batch on the stack; those
 stack bytes are outside the transient-heap ledger. The guard exposes no ready,
-publish, or execution transition. A charged iterative cleanup traversal and
-every later snapshot and isolation step in this note remain research
-requirements.
-
-**Current implementation note (2026-08-24):** The paragraph above records the
-earlier staged-publication checkpoint. The connector now also wires charged
-source observation and reserves the full committed per-view ceiling before
-each traversal through a linear lease, limiting full retained plans to two.
-That structural precharge does not make allocator-observed capacities inside a
-plan exact. The no-atime source-view qualification path is implemented but
-unwired, and its fixed local probe retries are outside the shared resource
-ledger. A connector-bound charged regular-copy leaf exists but has no pipeline
-caller, and connector-owned four-view orchestration remains unwired.
+publish, or execution transition. Destination observation, four-view
+orchestration, publication, and every later isolation step in this note remain
+research requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`

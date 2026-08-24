@@ -14,13 +14,17 @@ use std::fmt;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::BorrowedFd;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_connector::SnapshotMaterializationSessionV1;
 use super::snapshot_connector::{
     SnapshotSourceObservationErrorV1, SnapshotSourceObservationSessionV1,
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
-#[cfg(test)]
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::snapshot_regular::CopiedRegularV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_regular::SnapshotRegularMaterializationErrorV1;
 use super::snapshot_regular::{
     RegularCopyEvidenceV1, RegularCopyPolicyV1, SnapshotRegularFailureV1,
 };
@@ -1033,6 +1037,46 @@ impl<'a> SourceRegularVisitV1<'a> {
     }
 }
 
+/// A callback-scoped regular-file capability for charged source
+/// materialization.
+///
+/// The qualified source descriptors and exact connector-minted session remain
+/// inseparable for this visit. A callback can inspect only the descriptor-free
+/// common metadata surface and can copy the pinned leaf only through the
+/// charged regular-copy entrypoint.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct SourceMaterializedRegularVisitV1<'visit, 'resources> {
+    common: SourceVisitCommonV1<'visit>,
+    session: &'visit SnapshotMaterializationSessionV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<'visit, 'resources> SourceMaterializedRegularVisitV1<'visit, 'resources> {
+    pub(super) const fn common(&self) -> SourceVisitCommonV1<'visit> {
+        self.common
+    }
+
+    pub(super) fn copy_to(
+        self,
+        destination_parent: BorrowedFd<'_>,
+        destination_name: &CStr,
+    ) -> Result<CopiedRegularV1, SnapshotRegularMaterializationErrorV1> {
+        // SAFETY: only the qualified charged walker can construct this value.
+        // Its source capabilities and exact connector-minted session remain
+        // borrowed for this callback-scoped copy.
+        unsafe {
+            super::snapshot_regular::copy_regular_from_qualified_pinned_charged_at(
+                self.common.parent,
+                self.common.name,
+                self.common.handle,
+                destination_parent,
+                destination_name,
+                self.session,
+            )
+        }
+    }
+}
+
 /// A regular-file callback capability for connector-owned source observation.
 ///
 /// Unlike the test-only legacy materialization visit, this value exposes no
@@ -1113,6 +1157,44 @@ pub(super) trait SourceObservationTreeVisitorV1 {
     ) -> Result<SourceRegularEvidenceV1, Self::Error>;
 }
 
+/// Charged source-materialization visitor. Event order is directory-enter,
+/// raw-name-sorted children, directory-leave; regular and symlink leaves each
+/// emit once while their qualified source capabilities remain live.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) trait SourceMaterializationTreeVisitorV1 {
+    type Error;
+
+    fn directory_enter(&mut self, visit: SourceDirectoryVisitV1<'_>) -> Result<(), Self::Error>;
+
+    fn regular(
+        &mut self,
+        visit: SourceMaterializedRegularVisitV1<'_, '_>,
+    ) -> Result<SourceRegularEvidenceV1, Self::Error>;
+
+    fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error>;
+
+    fn directory_leave(&mut self, visit: SourceDirectoryVisitV1<'_>) -> Result<(), Self::Error>;
+}
+
+/// A charged source-materialization failure. Resource exhaustion from the
+/// connector's shared forward ledger remains distinct from traversal or
+/// visitor failure, whose potentially path-bearing payload stays redacted.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) enum SourceTreeMaterializationErrorV1<E> {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(E),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<E> fmt::Debug for SourceTreeMaterializationErrorV1<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resource(error) => formatter.debug_tuple("Resource").field(error).finish(),
+            Self::Leaf(_) => formatter.write_str("Leaf(<redacted>)"),
+        }
+    }
+}
+
 pub(super) enum SourceTreeAcquireFailureV1<E> {
     Source(SourceTreeFailureV1),
     Visitor {
@@ -1150,6 +1232,17 @@ pub(super) fn enumerate_source_tree_view_charged_at<V: SourceObservationTreeVisi
 ) -> Result<SourceTreePlanV1, SnapshotSourceObservationErrorV1<SourceTreeAcquireFailureV1<V::Error>>>
 {
     platform::enumerate_source_tree_view_charged_at(source_view, root_name, session, visitor)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn enumerate_source_tree_view_materializing_at<V: SourceMaterializationTreeVisitorV1>(
+    source_view: QualifiedNoAtimeSourceViewV1<'_>,
+    root_name: &CStr,
+    session: &SnapshotMaterializationSessionV1<'_>,
+    visitor: &mut V,
+) -> Result<SourceTreePlanV1, SourceTreeMaterializationErrorV1<SourceTreeAcquireFailureV1<V::Error>>>
+{
+    platform::enumerate_source_tree_view_materializing_at(source_view, root_name, session, visitor)
 }
 
 #[cfg(test)]
@@ -1236,6 +1329,13 @@ mod platform {
                 Self::Leaf(error) => SnapshotSourceObservationErrorV1::Leaf(error),
             }
         }
+
+        fn into_source_materialization(self) -> SourceTreeMaterializationErrorV1<E> {
+            match self {
+                Self::Resource(error) => SourceTreeMaterializationErrorV1::Resource(error),
+                Self::Leaf(error) => SourceTreeMaterializationErrorV1::Leaf(error),
+            }
+        }
     }
 
     impl From<SourceTreeFailureV1> for TraversalFailureV1<SourceTreeFailureV1> {
@@ -1277,6 +1377,15 @@ mod platform {
             attempt: impl FnOnce() -> T,
         ) -> Result<T, SnapshotPipelineResourceErrorV1> {
             SnapshotSourceObservationSessionV1::run_attempt(self, attempt)
+        }
+    }
+
+    impl AttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            SnapshotMaterializationSessionV1::run_materialization_attempt(self, attempt)
         }
     }
 
@@ -1391,6 +1500,46 @@ mod platform {
             _visit: SourceDirectoryVisitV1<'_>,
         ) -> Result<(), Self::Error> {
             Ok(())
+        }
+    }
+
+    struct ChargedMaterializationVisitorAdapterV1<'visitor, 'session, 'resources, V> {
+        visitor: &'visitor mut V,
+        session: &'session SnapshotMaterializationSessionV1<'resources>,
+    }
+
+    impl<V: SourceMaterializationTreeVisitorV1> WalkVisitorV1
+        for ChargedMaterializationVisitorAdapterV1<'_, '_, '_, V>
+    {
+        type Error = V::Error;
+
+        fn directory_enter(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.visitor.directory_enter(visit)
+        }
+
+        fn regular(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            _copy_policy: RegularCopyPolicyV1,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+            self.visitor.regular(SourceMaterializedRegularVisitV1 {
+                common,
+                session: self.session,
+            })
+        }
+
+        fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
+            self.visitor.symlink(visit)
+        }
+
+        fn directory_leave(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.visitor.directory_leave(visit)
         }
     }
 
@@ -1683,6 +1832,29 @@ mod platform {
             &mut visitor,
         )
         .map_err(TraversalFailureV1::into_source_observation)
+    }
+
+    pub(super) fn enumerate_source_tree_view_materializing_at<
+        V: SourceMaterializationTreeVisitorV1,
+    >(
+        source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+        session: &SnapshotMaterializationSessionV1<'_>,
+        visitor: &mut V,
+    ) -> Result<
+        SourceTreePlanV1,
+        SourceTreeMaterializationErrorV1<SourceTreeAcquireFailureV1<V::Error>>,
+    > {
+        let mut visitor = ChargedMaterializationVisitorAdapterV1 { visitor, session };
+        enumerate_source_tree_view_at_with(
+            source_view.trusted_parent(),
+            root_name,
+            *session.source_policy(),
+            session,
+            &KernelHooks,
+            &mut visitor,
+        )
+        .map_err(TraversalFailureV1::into_source_materialization)
     }
 
     #[cfg(test)]

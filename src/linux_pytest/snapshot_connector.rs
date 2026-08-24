@@ -4,26 +4,33 @@
 //! preflighted policy. Optional zero-valued classes and aggregate budgets that
 //! current nonzero leaf shapes cannot enforce exactly are refused rather than
 //! widened. The connector then owns the mutable resource ledger and keeps leaf
-//! policies private. Connector-owned source observation and staged-directory
-//! creation with RAII cleanup are wired so far; the charged guard cannot enter
-//! the still-unmetered ready or publish transitions. Every wired kernel attempt
-//! charges the same ledger. Source-observation logical counts and payloads are
-//! bounded by leaf policy, but allocator-observed capacity is not yet
-//! structurally charged to the transient-heap ledger.
+//! policies private. Connector-owned source observation and charged
+//! source-to-stage materialization with RAII cleanup are wired so far; the
+//! populated guard cannot enter the still-unmetered ready or publish
+//! transitions. Every wired kernel attempt charges the same ledger.
+//! Source-observation logical counts and payloads are bounded by leaf policy.
+//! Source plans and materializer workspace use conservative full-ceiling
+//! leases; allocator-observed capacity inside them is not yet reconciled to
+//! those structural reservations.
 
 use std::ffi::CStr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use std::os::fd::BorrowedFd;
 
 use super::snapshot_materialize::SnapshotMaterializePolicyV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_materialize::{
+    SnapshotTreeMaterializeErrorV1, materialize_source_tree_charged_at,
+};
 use super::snapshot_policy::{
     SnapshotChargedBytesV1, SnapshotPipelineForwardStageV1, SnapshotPipelineResourceErrorV1,
     SnapshotPipelineResourcesV1, SnapshotResourcePolicyFieldV1, SnapshotResourcePolicyV1,
     SnapshotRetainedViewLeaseV1,
 };
-use super::snapshot_publish::{
-    ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1, SnapshotPublishPolicyV1,
-};
+use super::snapshot_publish::SnapshotPublishPolicyV1;
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+use super::snapshot_publish::{ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1};
 use super::snapshot_regular::{RegularCopyPolicyV1, SnapshotRegularFailureV1};
 use super::snapshot_tree::{
     QualifiedNoAtimeSourceViewV1, SourceEnumerationPolicyV1, SourceObservationTreeVisitorV1,
@@ -113,6 +120,49 @@ pub(super) enum SnapshotChargedErrorV1<E> {
     Leaf(E),
 }
 
+/// One connector-owned staging-and-population failure.
+///
+/// Staging and traversal share the connector's sole resource ledger, but
+/// their correctness failures remain typed and redacted. This type carries no
+/// staging, publication, readiness, or execution authority.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) enum SnapshotPipelineMaterializationErrorV1 {
+    PublicationAlreadyStarted,
+    Resource(SnapshotPipelineResourceErrorV1),
+    Publication(SnapshotPublishErrorV1),
+    Materialization(SnapshotTreeMaterializeErrorV1),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl std::fmt::Debug for SnapshotPipelineMaterializationErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublicationAlreadyStarted => formatter.write_str("PublicationAlreadyStarted"),
+            Self::Resource(error) => formatter.debug_tuple("Resource").field(error).finish(),
+            Self::Publication(_) => formatter.write_str("Publication(<redacted>)"),
+            Self::Materialization(error) => formatter
+                .debug_tuple("Materialization")
+                .field(error)
+                .finish(),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn flatten_pipeline_materialization_error(
+    error: SnapshotTreeMaterializeErrorV1,
+) -> SnapshotPipelineMaterializationErrorV1 {
+    match error {
+        SnapshotTreeMaterializeErrorV1::Resource(error) => {
+            SnapshotPipelineMaterializationErrorV1::Resource(error)
+        }
+        error @ (SnapshotTreeMaterializeErrorV1::Source(_)
+        | SnapshotTreeMaterializeErrorV1::Materializer(_)) => {
+            SnapshotPipelineMaterializationErrorV1::Materialization(error)
+        }
+    }
+}
+
 impl<E> std::fmt::Debug for SnapshotChargedErrorV1<E> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -187,14 +237,16 @@ pub(super) struct SnapshotSourceObservationSessionV1<'resources> {
 /// Connector-minted authority for materializer-local and regular-copy attempts
 /// in one sequential, connector-owned traversal.
 ///
-/// The exact regular-copy policy and both non-fungible attempt buckets come
-/// from the same preflighted pipeline ledger. No caller can substitute retry
-/// limits or spend publisher cleanup authority on leaf-local failure cleanup.
-/// The traversal must abort on its first fatal leaf, which keeps at most one
-/// failed local destination active against the fixed reserve.
+/// The exact source-enumeration, destination-materialization, and regular-copy
+/// policies plus both non-fungible attempt buckets come from the same
+/// preflighted pipeline ledger. No caller can substitute retry limits or spend
+/// publisher cleanup authority on leaf-local failure cleanup. The traversal
+/// must abort on its first fatal leaf, which keeps at most one failed local
+/// destination active against the fixed reserve.
 pub(super) struct SnapshotMaterializationSessionV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
-    regular_copy_policy: RegularCopyPolicyV1,
+    source_policy: &'resources SourceEnumerationPolicyV1,
+    materialization_policy: &'resources SnapshotMaterializePolicyV1,
 }
 
 /// One FD-free tree view paired with the connector's linear retained-heap
@@ -226,8 +278,16 @@ impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
 }
 
 impl SnapshotMaterializationSessionV1<'_> {
+    pub(super) const fn source_policy(&self) -> &SourceEnumerationPolicyV1 {
+        self.source_policy
+    }
+
+    pub(super) const fn materialization_policy(&self) -> &SnapshotMaterializePolicyV1 {
+        self.materialization_policy
+    }
+
     pub(super) const fn regular_copy_policy(&self) -> RegularCopyPolicyV1 {
-        self.regular_copy_policy
+        self.source_policy.regular_copy_policy()
     }
 
     pub(super) fn run_materialization_attempt<T>(
@@ -397,7 +457,8 @@ impl SnapshotConnectorV1 {
     fn materialization_session(&self) -> SnapshotMaterializationSessionV1<'_> {
         SnapshotMaterializationSessionV1 {
             resources: &self.resources,
-            regular_copy_policy: self.source.regular_copy_policy(),
+            source_policy: &self.source,
+            materialization_policy: &self.materialization,
         }
     }
 
@@ -437,9 +498,62 @@ impl SnapshotConnectorV1 {
         })
     }
 
-    /// Consumes the sole publication attempt, even when staging refuses or
-    /// fails. A returned guard can expose its pinned directory and clean it up,
-    /// but cannot enter the still-unmetered ready or publish transitions.
+    /// In one connector-owned operation, selects this connector's policies and
+    /// resource ledger, creates its sole private stage, and populates that
+    /// stage through one charged source traversal. No independently spliceable
+    /// session or policy escapes. The returned guard can expose its pinned
+    /// directory and clean it up, but cannot enter readiness or publication
+    /// transitions. Capacity refusal before publication leaves the one-shot
+    /// unused; any failure after publication begins consumes it.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn materialize_source_tree_at<'scope>(
+        &'scope self,
+        publication_parent: BorrowedFd<'scope>,
+        staging_name: &CStr,
+        source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotPipelineMaterializationErrorV1>
+    {
+        // The traversal's source plan and the materializer's event workspace
+        // can each reach one full-plan ceiling. Reserve both before publication
+        // or filesystem work. If the second reservation fails, ordinary drop
+        // rollback releases the first before this method returns.
+        let _source_plan_lease = self
+            .resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
+            .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
+        let _materializer_plan_lease = self
+            .resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
+            .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
+        let publication = self
+            .begin_publication()
+            .ok_or(SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted)?;
+        let staging = super::snapshot_publish::create_charged_staged_snapshot_directory_at(
+            publication_parent,
+            staging_name,
+            publication,
+        )
+        .map_err(|error| match error {
+            SnapshotChargedErrorV1::PublicationAlreadyStarted => {
+                SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted
+            }
+            SnapshotChargedErrorV1::Resource(error) => {
+                SnapshotPipelineMaterializationErrorV1::Resource(error)
+            }
+            SnapshotChargedErrorV1::Leaf(error) => {
+                SnapshotPipelineMaterializationErrorV1::Publication(error)
+            }
+        })?;
+        let materialization = self.materialization_session();
+        materialize_source_tree_charged_at(staging, source_view, root_name, &materialization)
+            .map_err(flatten_pipeline_materialization_error)
+    }
+
+    /// Test-only access to the charged staging checkpoint. Production code
+    /// must use `materialize_source_tree_at` so a stage cannot escape before
+    /// its connector-owned population attempt.
+    #[cfg(test)]
     pub(super) fn create_staged_snapshot_directory_at<'scope>(
         &'scope self,
         parent: BorrowedFd<'scope>,
@@ -858,9 +972,15 @@ fn nonzero_u64(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::fs;
     use std::fs::File;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
     use std::os::fd::AsFd;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::unix::fs::MetadataExt;
 
     use super::*;
 
@@ -964,6 +1084,12 @@ mod tests {
     fn projection_error(inputs: Inputs) -> SnapshotPolicyProjectionErrorV1 {
         let resources = resources(inputs);
         connect_snapshot_pipeline(resources).unwrap_err()
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn source_atime(path: &std::path::Path) -> (i64, i64) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        (metadata.atime(), metadata.atime_nsec())
     }
 
     #[test]
@@ -1250,6 +1376,16 @@ mod tests {
             first.regular_copy_policy(),
             connector.source.regular_copy_policy()
         );
+        assert!(std::ptr::eq(first.source_policy(), &connector.source));
+        assert!(std::ptr::eq(first.source_policy(), second.source_policy()));
+        assert!(std::ptr::eq(
+            first.materialization_policy(),
+            &connector.materialization
+        ));
+        assert!(std::ptr::eq(
+            first.materialization_policy(),
+            second.materialization_policy()
+        ));
         assert_eq!(first.regular_copy_policy(), second.regular_copy_policy());
         let forward_before = first.forward_attempts_remaining();
         let local_before = first.local_cleanup_attempts_remaining();
@@ -1301,6 +1437,224 @@ mod tests {
                 .publisher_cleanup_attempts_remaining_for_test(),
             publisher_cleanup_before
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn materialization_plan_reservations_roll_back_before_staging() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let per_view = connector.resources.policy().max_retained_view_bytes().get();
+        let retained = connector
+            .resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::SourceObservation)
+            .unwrap();
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let invalid_source = File::open("/dev/null").unwrap();
+        // SAFETY: the capacity refusal below precedes all source filesystem
+        // access. The deliberately invalid descriptor makes accidental access
+        // fail rather than touching an unqualified source tree.
+        let source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+        let staging_name = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let forward_before = connector.resources.forward_attempts_remaining_for_test();
+
+        assert!(matches!(
+            connector.materialize_source_tree_at(
+                publication_parent_fd.as_fd(),
+                staging_name,
+                source_view,
+                c"root",
+            ),
+            Err(SnapshotPipelineMaterializationErrorV1::Resource(
+                SnapshotPipelineResourceErrorV1::RetainedViewHeapCapacityExceeded {
+                    stage: SnapshotPipelineForwardStageV1::Materialization,
+                    live,
+                    requested,
+                    limit,
+                }
+            )) if live == per_view * 2 && requested == per_view && limit == per_view * 2
+        ));
+        assert_eq!(
+            connector.resources.forward_attempts_remaining_for_test(),
+            forward_before
+        );
+        assert!(!connector.publication_started.get());
+        assert!(!staging_path.exists());
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            per_view
+        );
+
+        drop(retained);
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn charged_materialization_copies_exact_bytes_preserves_atime_and_cleans_on_drop() {
+        let source_parent = tempfile::tempdir().unwrap();
+        let source_tree = source_parent.path().join("tree");
+        let source_file = source_tree.join("file");
+        let expected = b"again charged materialization mechanics\n";
+        fs::create_dir(&source_tree).unwrap();
+        fs::write(&source_file, expected).unwrap();
+
+        let primed_names = fs::read_dir(&source_tree)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(primed_names, vec![std::ffi::OsString::from("file")]);
+        assert_eq!(fs::read(&source_file).unwrap(), expected);
+        let tree_atime = source_atime(&source_tree);
+        let file_atime = source_atime(&source_file);
+        assert_eq!(fs::read_dir(&source_tree).unwrap().count(), 1);
+        assert_eq!(fs::read(&source_file).unwrap(), expected);
+        assert_eq!(source_atime(&source_tree), tree_atime);
+        assert_eq!(source_atime(&source_file), file_atime);
+
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let source_parent_fd = File::open(source_parent.path()).unwrap();
+        let staging_name = c".again-snapshot-stage-11111111111111111111111111111111";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        // SAFETY: this mechanics-only fixture is owned by the test, has no
+        // concurrent writer, and an immediate second directory/regular probe
+        // above proved that the exact objects used here retain atime. The
+        // assertions below recheck that condition; this does not claim that
+        // the host passed production functional qualification.
+        let source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_parent_fd.as_fd(),
+            )
+        };
+
+        let staged = connector
+            .materialize_source_tree_at(
+                publication_parent_fd.as_fd(),
+                staging_name,
+                source_view,
+                c"tree",
+            )
+            .unwrap();
+
+        assert_eq!(fs::read(staging_path.join("tree/file")).unwrap(), expected);
+        assert_eq!(source_atime(&source_tree), tree_atime);
+        assert_eq!(source_atime(&source_file), file_atime);
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert!(staging_path.exists());
+
+        drop(staged);
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn post_staging_symlink_refusal_cleans_stage_leases_and_keeps_publication_consumed() {
+        let source_parent = tempfile::tempdir().unwrap();
+        let source_tree = source_parent.path().join("tree");
+        let source_link = source_tree.join("secret-symlink-path-sentinel");
+        fs::create_dir(&source_tree).unwrap();
+        std::os::unix::fs::symlink("missing-target", &source_link).unwrap();
+
+        let primed_names = fs::read_dir(&source_tree)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            primed_names,
+            vec![std::ffi::OsString::from("secret-symlink-path-sentinel")]
+        );
+        assert_eq!(
+            fs::read_link(&source_link).unwrap(),
+            std::path::PathBuf::from("missing-target")
+        );
+        let tree_atime = source_atime(&source_tree);
+        let link_atime = source_atime(&source_link);
+        assert_eq!(fs::read_dir(&source_tree).unwrap().count(), 1);
+        assert_eq!(
+            fs::read_link(&source_link).unwrap(),
+            std::path::PathBuf::from("missing-target")
+        );
+        assert_eq!(source_atime(&source_tree), tree_atime);
+        assert_eq!(source_atime(&source_link), link_atime);
+
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let source_parent_fd = File::open(source_parent.path()).unwrap();
+        let staging_name = c".again-snapshot-stage-22222222222222222222222222222222";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        // SAFETY: this mechanics-only fixture is owned by the test, has no
+        // concurrent writer, and an immediate second directory/symlink probe
+        // above proved that the exact objects used here retain atime. The
+        // assertions below recheck that condition; this does not claim
+        // production functional qualification.
+        let source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_parent_fd.as_fd(),
+            )
+        };
+
+        let error = match connector.materialize_source_tree_at(
+            publication_parent_fd.as_fd(),
+            staging_name,
+            source_view,
+            c"tree",
+        ) {
+            Err(error) => error,
+            Ok(staged) => {
+                drop(staged);
+                panic!("an unqualified symlink must fail closed");
+            }
+        };
+
+        assert!(matches!(
+            &error,
+            SnapshotPipelineMaterializationErrorV1::Materialization(
+                SnapshotTreeMaterializeErrorV1::Materializer(_)
+            )
+        ));
+        let rendered = format!("{error:?}");
+        assert_eq!(rendered, "Materialization(Materializer(<redacted>))");
+        assert!(!rendered.contains("secret-symlink-path-sentinel"));
+        assert_eq!(source_atime(&source_tree), tree_atime);
+        assert_eq!(source_atime(&source_link), link_atime);
+        assert!(!staging_path.exists());
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert!(connector.publication_started.get());
+        assert!(connector.begin_publication().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn pipeline_materialization_flattens_resource_to_outer_resource() {
+        let resource = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+            stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                SnapshotPipelineForwardStageV1::Materialization,
+            ),
+            bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+        };
+
+        match flatten_pipeline_materialization_error(SnapshotTreeMaterializeErrorV1::Resource(
+            resource,
+        )) {
+            SnapshotPipelineMaterializationErrorV1::Resource(actual) => {
+                assert_eq!(actual, resource);
+            }
+            other => panic!("resource error was nested instead of flattened: {other:?}"),
+        }
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //!
 //! The materializer owns the publisher's private staging container while it
 //! is active. It always creates the source root as a child of that container,
-//! keeps only the active destination-directory stack open, and returns an
-//! opaque publisher-ready authority only after hardlinks, metadata, xattrs,
-//! timestamps, and recursive durability are complete. Dropping the
+//! keeps only the active destination-directory stack open, and returns the
+//! still-unready charged staging guard only after hardlinks, metadata, xattrs,
+//! timestamps, and recursive durability are complete. The legacy test seam
+//! separately exercises the publisher-ready transition. Dropping the
 //! materializer delegates bounded, best-effort recursive cleanup to the
 //! publisher's inode-bound RAII guard. Cleanup is not immediate while a
 //! caller retains the materializer, and an uncleanable owner-private stage is
@@ -12,6 +13,8 @@
 //! Symlinks fail closed until staging is bound to a qualified dedicated
 //! filesystem whose filesystem-wide durability operation is safe to invoke.
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use std::ffi::CStr;
 use std::fmt;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
@@ -19,23 +22,32 @@ use super::RefusalCode;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_connector::SnapshotMaterializationSessionV1;
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::ChargedStagedSnapshotDirectoryV1;
 use super::snapshot_publish::SnapshotCleanupEnvelopeV1;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::SnapshotPublishErrorV1;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::StagedSnapshotDirectoryV1;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::VerifiedReadySnapshotDirectoryV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_regular::SnapshotRegularMaterializationErrorV1;
 use super::snapshot_regular::SnapshotRegularStageV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_regular::{CopiedRegularV1, SnapshotRegularFailureV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::SourceRegularEvidenceV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_tree::SourceTreePlanV1;
-#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::{
-    SourceDirectoryVisitV1, SourceRegularVisitV1, SourceSymlinkVisitV1, SourceTreeVisitorV1,
+    QualifiedNoAtimeSourceViewV1, SourceDirectoryVisitV1, SourceMaterializationTreeVisitorV1,
+    SourceMaterializedRegularVisitV1, SourceSymlinkVisitV1, SourceTreeAcquireFailureV1,
+    SourceTreeFailureV1, SourceTreeMaterializationErrorV1, SourceTreePlanV1,
+    enumerate_source_tree_view_materializing_at,
 };
 use super::snapshot_tree::{SourceEnumerationPolicyV1, SourceNodeKindV1};
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::{SourceRegularVisitV1, SourceTreeVisitorV1};
 
 const HARD_MAX_DEPTH: u16 = 256;
 const HARD_MAX_BASENAME_BYTES: u16 = 255;
@@ -419,8 +431,8 @@ impl From<SnapshotPublishErrorV1> for SnapshotMaterializeFinishErrorV1 {
 
 /// Private attempt authority used by the destination materializer.
 ///
-/// A later specialized adapter in this module will delegate to the
-/// connector's non-forgeable materialization session. Keeping the trait and
+/// A specialized adapter in this module delegates to the connector's
+/// non-forgeable materialization session. Keeping the trait and
 /// generic constructor private prevents sibling modules from substituting an
 /// unmetered production gate. Every explicit materializer-local filesystem or
 /// identity operation governed here is reached only from a closure passed to
@@ -434,7 +446,7 @@ trait SnapshotMaterializeAttemptGateV1 {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl SnapshotMaterializeAttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
+impl SnapshotMaterializeAttemptGateV1 for &SnapshotMaterializationSessionV1<'_> {
     fn run_materialization_attempt<T>(
         &self,
         attempt: impl FnOnce() -> T,
@@ -461,6 +473,38 @@ impl From<SnapshotMaterializeFailureV1> for SnapshotChargedMaterializeErrorV1 {
     fn from(error: SnapshotMaterializeFailureV1) -> Self {
         Self::Leaf(error)
     }
+}
+
+/// One charged source-tree materialization failure. Shared-ledger exhaustion,
+/// source acquisition, and destination construction remain structurally
+/// distinct. Debug output deliberately omits both walker callback paths and
+/// the materializer's diagnostic path.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) enum SnapshotTreeMaterializeErrorV1 {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Source(SourceTreeFailureV1),
+    Materializer(SnapshotMaterializeFailureV1),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for SnapshotTreeMaterializeErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Resource(error) => formatter.debug_tuple("Resource").field(error).finish(),
+            Self::Source(_) => formatter.write_str("Source(<redacted>)"),
+            Self::Materializer(_) => formatter.write_str("Materializer(<redacted>)"),
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn materialize_source_tree_charged_at<'scope>(
+    staging: ChargedStagedSnapshotDirectoryV1<'scope>,
+    source_view: QualifiedNoAtimeSourceViewV1<'_>,
+    root_name: &CStr,
+    session: &SnapshotMaterializationSessionV1<'_>,
+) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotTreeMaterializeErrorV1> {
+    platform::materialize_source_tree_charged_at(staging, source_view, root_name, session)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -770,8 +814,33 @@ mod platform {
         }
     }
 
-    struct SnapshotMaterializerWithGateV1<'parent, H, G> {
-        staging: StagedSnapshotDirectoryV1<'parent>,
+    trait MaterializeStagingV1 {
+        fn directory(&self) -> BorrowedFd<'_>;
+        fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1;
+    }
+
+    #[cfg(test)]
+    impl MaterializeStagingV1 for StagedSnapshotDirectoryV1<'_> {
+        fn directory(&self) -> BorrowedFd<'_> {
+            StagedSnapshotDirectoryV1::directory(self)
+        }
+
+        fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1 {
+            StagedSnapshotDirectoryV1::cleanup_envelope(self)
+        }
+    }
+
+    impl MaterializeStagingV1 for ChargedStagedSnapshotDirectoryV1<'_> {
+        fn directory(&self) -> BorrowedFd<'_> {
+            ChargedStagedSnapshotDirectoryV1::directory(self)
+        }
+
+        fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1 {
+            ChargedStagedSnapshotDirectoryV1::cleanup_envelope(self)
+        }
+    }
+
+    struct SnapshotMaterializerWithGateV1<S, H, G> {
         policy: SnapshotMaterializePolicyV1,
         hooks: H,
         attempt_gate: G,
@@ -781,17 +850,31 @@ mod platform {
         root_name: Option<Vec<u8>>,
         total_xattr_bytes: u64,
         total_xattrs: u64,
+        /// Field order is a resource invariant: every active destination FD in
+        /// `stack` must close before dropping staging can start publisher
+        /// cleanup. Preflight budgets the build and cleanup FD peaks with
+        /// `max`, not their sum.
+        staging: S,
     }
 
     #[cfg(test)]
-    type SnapshotMaterializerWithHooksV1<'parent, H> =
-        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>;
+    type SnapshotMaterializerWithHooksV1<'parent, H> = SnapshotMaterializerWithGateV1<
+        StagedSnapshotDirectoryV1<'parent>,
+        H,
+        DirectMaterializeAttemptGateV1,
+    >;
 
     #[cfg(test)]
     type SnapshotMaterializerV1<'parent> = SnapshotMaterializerWithHooksV1<'parent, KernelHooks>;
 
     #[cfg(test)]
-    impl<'parent> SnapshotMaterializerWithGateV1<'parent, KernelHooks, DirectMaterializeAttemptGateV1> {
+    impl<'parent>
+        SnapshotMaterializerWithGateV1<
+            StagedSnapshotDirectoryV1<'parent>,
+            KernelHooks,
+            DirectMaterializeAttemptGateV1,
+        >
+    {
         pub(super) fn new(
             staging: StagedSnapshotDirectoryV1<'parent>,
             policy: SnapshotMaterializePolicyV1,
@@ -802,7 +885,11 @@ mod platform {
 
     #[cfg(test)]
     impl<'parent, H: MaterializeHooks>
-        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<
+            StagedSnapshotDirectoryV1<'parent>,
+            H,
+            DirectMaterializeAttemptGateV1,
+        >
     {
         fn new_with_hooks(
             staging: StagedSnapshotDirectoryV1<'parent>,
@@ -813,11 +900,11 @@ mod platform {
         }
     }
 
-    impl<'parent, H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
-        SnapshotMaterializerWithGateV1<'parent, H, G>
+    impl<S: MaterializeStagingV1, H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<S, H, G>
     {
         fn new_with_gate(
-            staging: StagedSnapshotDirectoryV1<'parent>,
+            staging: S,
             policy: SnapshotMaterializePolicyV1,
             hooks: H,
             attempt_gate: G,
@@ -826,7 +913,6 @@ mod platform {
                 return Err(cleanup_authority_failure());
             }
             Ok(Self {
-                staging,
                 policy,
                 hooks,
                 attempt_gate,
@@ -836,6 +922,7 @@ mod platform {
                 root_name: None,
                 total_xattr_bytes: 0,
                 total_xattrs: 0,
+                staging,
             })
         }
 
@@ -942,6 +1029,143 @@ mod platform {
                 return Err(event_failure(relative_path));
             }
             Ok(parent.directory.as_fd())
+        }
+
+        fn directory_enter_charged(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            membership: &[Box<[u8]>],
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+            self.validate_event(common, SourceNodeKindV1::Directory)?;
+            let event_commitment = commit_directory_event(common, membership)?;
+            reserve_plan_vector_slot(
+                &mut self.stack,
+                usize::from(self.policy.max_depth) + 1,
+                common.relative_path(),
+            )?;
+            let retained_basename =
+                fallible_plan_bytes(common.name().to_bytes(), common.relative_path())?;
+            let stage = if common.relative_path().is_empty() {
+                SnapshotMaterializeStageV1::CreateRoot
+            } else {
+                SnapshotMaterializeStageV1::CreateDirectory
+            };
+            checkpoint(&self.hooks, stage, common.relative_path())?;
+            let parent = if common.relative_path().is_empty() {
+                if !self.stack.is_empty() || self.root_name.is_some() {
+                    return Err(event_failure(common.relative_path()).into());
+                }
+                self.staging_directory()
+            } else {
+                self.active_parent(common.relative_path(), common.name())?
+            };
+            mkdir_private_at(
+                parent,
+                common.name(),
+                self.policy.syscall_attempts.get(),
+                &self.attempt_gate,
+            )
+            .map_err(|error| {
+                map_attempt_leaf(error, |error| {
+                    mutation_io(stage, common.relative_path(), error)
+                })
+            })?;
+            let directory = open_directory_at(
+                parent,
+                common.name(),
+                self.policy.openat2_attempts.get(),
+                &self.attempt_gate,
+            )
+            .map_err(|error| {
+                map_attempt_leaf(error, |error| {
+                    mutation_io(stage, common.relative_path(), error)
+                })
+            })?;
+            validate_new_directory(
+                directory.as_fd(),
+                common.relative_path(),
+                &self.attempt_gate,
+            )?;
+            let event_index = self.event_commitments.len();
+            let basename = if common.relative_path().is_empty() {
+                self.root_name = Some(retained_basename);
+                None
+            } else {
+                Some(retained_basename)
+            };
+            self.stack.push(ActiveDirectoryV1 {
+                basename,
+                directory,
+                event_index,
+            });
+            self.event_commitments.push(event_commitment);
+            Ok(())
+        }
+
+        fn regular_charged(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            copy: impl FnOnce(
+                BorrowedFd<'_>,
+                &CStr,
+            ) -> Result<CopiedRegularV1, SnapshotChargedMaterializeErrorV1>,
+        ) -> Result<SourceRegularEvidenceV1, SnapshotChargedMaterializeErrorV1> {
+            self.validate_event(common, SourceNodeKindV1::Regular)?;
+            checkpoint(
+                &self.hooks,
+                SnapshotMaterializeStageV1::CopyRegular,
+                common.relative_path(),
+            )?;
+            let parent = self.active_parent(common.relative_path(), common.name())?;
+            let copied = copy(parent, common.name())?;
+            let (_, evidence) = copied.finalize_with(|destination| {
+                self.finalize_regular(
+                    destination,
+                    common.statx(),
+                    common.xattrs(),
+                    common.relative_path(),
+                )
+            })?;
+            let (digest, extents) = evidence.into_parts();
+            let evidence = SourceRegularEvidenceV1::checked(digest, extents, common.statx().size())
+                .ok_or_else(|| metadata_mismatch(common.relative_path()))?;
+            self.event_commitments
+                .push(commit_regular_event(common, &evidence)?);
+            Ok(evidence)
+        }
+
+        fn symlink_charged(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+            self.validate_event(common, SourceNodeKindV1::Symlink)?;
+            refuse_unqualified_symlink_event(common.relative_path()).map_err(Into::into)
+        }
+
+        fn directory_leave_charged(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            membership: &[Box<[u8]>],
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+            let Some(active) = self.stack.last() else {
+                return Err(event_failure(common.relative_path()).into());
+            };
+            let expected_name = active.basename.as_deref().or(self.root_name.as_deref());
+            if kind_from_mode(common.statx().mode()) != Some(SourceNodeKindV1::Directory)
+                || expected_name != Some(common.name().to_bytes())
+                || !path_matches_stack(&self.stack, None, common.relative_path())
+                || self.event_commitments.get(active.event_index)
+                    != Some(&commit_directory_event(common, membership)?)
+            {
+                return Err(event_failure(common.relative_path()).into());
+            }
+            let Some(_active) = self.stack.pop() else {
+                return Err(event_failure(common.relative_path()).into());
+            };
+            if common.relative_path().is_empty() && !self.stack.is_empty() {
+                return Err(event_failure(common.relative_path()).into());
+            }
+            Ok(())
         }
 
         fn validate_finished_plan(
@@ -1323,24 +1547,36 @@ mod platform {
             }
             Ok(())
         }
+
+        fn finish_populated(
+            mut self,
+            plan: &SourceTreePlanV1,
+        ) -> Result<S, SnapshotChargedMaterializeErrorV1> {
+            begin_plan_validation(&self.hooks, self.policy, plan)?;
+            refuse_unqualified_plan_symlinks(plan)?;
+            self.validate_finished_plan(plan)?;
+            self.consolidate_hardlinks(plan)?;
+            self.refinalize_hardlink_anchors(plan)?;
+            self.finalize_directories(plan)?;
+            let Self { staging, .. } = self;
+            Ok(staging)
+        }
     }
 
     #[cfg(test)]
     impl<'parent, H: MaterializeHooks>
-        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<
+            StagedSnapshotDirectoryV1<'parent>,
+            H,
+            DirectMaterializeAttemptGateV1,
+        >
     {
         pub(super) fn finish(
-            mut self,
+            self,
             plan: &SourceTreePlanV1,
         ) -> Result<VerifiedReadySnapshotDirectoryV1<'parent>, SnapshotMaterializeFinishErrorV1>
         {
-            begin_plan_validation(&self.hooks, self.policy, plan)?;
-            refuse_unqualified_plan_symlinks(plan)?;
-            self.validate_finished_plan(plan)?;
-            direct_leaf(self.consolidate_hardlinks(plan))?;
-            direct_leaf(self.refinalize_hardlink_anchors(plan))?;
-            direct_leaf(self.finalize_directories(plan))?;
-            let Self { staging, .. } = self;
+            let staging = direct_leaf(self.finish_populated(plan))?;
             Ok(staging.verify_ready_with(|_| Ok(()))?)
         }
     }
@@ -1353,150 +1589,147 @@ mod platform {
             &mut self,
             visit: SourceDirectoryVisitV1<'_>,
         ) -> Result<(), Self::Error> {
-            self.validate_event(visit.common(), SourceNodeKindV1::Directory)?;
-            let common = visit.common();
-            let event_commitment = commit_directory_event(common, visit.membership())?;
-            reserve_plan_vector_slot(
-                &mut self.stack,
-                usize::from(self.policy.max_depth) + 1,
-                common.relative_path(),
-            )?;
-            let retained_basename =
-                fallible_plan_bytes(common.name().to_bytes(), common.relative_path())?;
-            let stage = if common.relative_path().is_empty() {
-                SnapshotMaterializeStageV1::CreateRoot
-            } else {
-                SnapshotMaterializeStageV1::CreateDirectory
-            };
-            checkpoint(&self.hooks, stage, common.relative_path())?;
-            let parent = if common.relative_path().is_empty() {
-                if !self.stack.is_empty() || self.root_name.is_some() {
-                    return Err(event_failure(common.relative_path()));
-                }
-                self.staging_directory()
-            } else {
-                self.active_parent(common.relative_path(), common.name())?
-            };
-            direct_leaf(
-                mkdir_private_at(
-                    parent,
-                    common.name(),
-                    self.policy.syscall_attempts.get(),
-                    &self.attempt_gate,
-                )
-                .map_err(|error| {
-                    map_attempt_leaf(error, |error| {
-                        mutation_io(stage, common.relative_path(), error)
-                    })
-                }),
-            )?;
-            let directory = direct_leaf(
-                open_directory_at(
-                    parent,
-                    common.name(),
-                    self.policy.openat2_attempts.get(),
-                    &self.attempt_gate,
-                )
-                .map_err(|error| {
-                    map_attempt_leaf(error, |error| {
-                        mutation_io(stage, common.relative_path(), error)
-                    })
-                }),
-            )?;
-            direct_leaf(validate_new_directory(
-                directory.as_fd(),
-                common.relative_path(),
-                &self.attempt_gate,
-            ))?;
-            if common.relative_path().is_empty() {
-                self.root_name = Some(retained_basename);
-                let event_index = self.event_commitments.len();
-                self.stack.push(ActiveDirectoryV1 {
-                    basename: None,
-                    directory,
-                    event_index,
-                });
-            } else {
-                let event_index = self.event_commitments.len();
-                self.stack.push(ActiveDirectoryV1 {
-                    basename: Some(retained_basename),
-                    directory,
-                    event_index,
-                });
-            }
-            self.event_commitments.push(event_commitment);
-            Ok(())
+            direct_leaf(self.directory_enter_charged(visit.common(), visit.membership()))
         }
 
         fn regular(
             &mut self,
             visit: SourceRegularVisitV1<'_>,
         ) -> Result<SourceRegularEvidenceV1, Self::Error> {
-            self.validate_event(visit.common(), SourceNodeKindV1::Regular)?;
             let common = visit.common();
-            checkpoint(
-                &self.hooks,
-                SnapshotMaterializeStageV1::CopyRegular,
-                common.relative_path(),
-            )?;
-            let parent = self.active_parent(common.relative_path(), common.name())?;
-            let copied = visit.copy_to(parent, common.name()).map_err(|error| {
-                SnapshotMaterializeFailureV1::new(
-                    error.code(),
-                    SnapshotMaterializeStageV1::CopyRegular,
-                    SnapshotMaterializeFailureKindV1::RegularCopy,
-                    Some(error.stage()),
-                    error.errno(),
-                    common.relative_path(),
-                )
-            })?;
-            let (_, evidence) = copied.finalize_with(|destination| {
-                direct_leaf(self.finalize_regular(
-                    destination,
-                    common.statx(),
-                    common.xattrs(),
-                    common.relative_path(),
-                ))
-            })?;
-            let (digest, extents) = evidence.into_parts();
-            let evidence = SourceRegularEvidenceV1::checked(digest, extents, common.statx().size())
-                .ok_or_else(|| metadata_mismatch(common.relative_path()))?;
-            self.event_commitments
-                .push(commit_regular_event(common, &evidence)?);
-            Ok(evidence)
+            direct_leaf(self.regular_charged(common, |parent, name| {
+                visit
+                    .copy_to(parent, name)
+                    .map_err(|error| regular_copy_failure(error, common.relative_path()).into())
+            }))
         }
 
         fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
-            self.validate_event(visit.common(), SourceNodeKindV1::Symlink)?;
-            let common = visit.common();
-            refuse_unqualified_symlink_event(common.relative_path())
+            direct_leaf(self.symlink_charged(visit.common()))
         }
 
         fn directory_leave(
             &mut self,
             visit: SourceDirectoryVisitV1<'_>,
         ) -> Result<(), Self::Error> {
-            let common = visit.common();
-            let Some(active) = self.stack.last() else {
-                return Err(event_failure(common.relative_path()));
-            };
-            let expected_name = active.basename.as_deref().or(self.root_name.as_deref());
-            if kind_from_mode(common.statx().mode()) != Some(SourceNodeKindV1::Directory)
-                || expected_name != Some(common.name().to_bytes())
-                || !path_matches_stack(&self.stack, None, common.relative_path())
-                || self.event_commitments.get(active.event_index)
-                    != Some(&commit_directory_event(common, visit.membership())?)
-            {
-                return Err(event_failure(common.relative_path()));
-            }
-            let Some(_active) = self.stack.pop() else {
-                return Err(event_failure(common.relative_path()));
-            };
-            if common.relative_path().is_empty() && !self.stack.is_empty() {
-                return Err(event_failure(common.relative_path()));
-            }
-            Ok(())
+            direct_leaf(self.directory_leave_charged(visit.common(), visit.membership()))
         }
+    }
+
+    impl SourceMaterializationTreeVisitorV1
+        for SnapshotMaterializerWithGateV1<
+            ChargedStagedSnapshotDirectoryV1<'_>,
+            KernelHooks,
+            &SnapshotMaterializationSessionV1<'_>,
+        >
+    {
+        type Error = SnapshotChargedMaterializeErrorV1;
+
+        fn directory_enter(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.directory_enter_charged(visit.common(), visit.membership())
+        }
+
+        fn regular(
+            &mut self,
+            visit: SourceMaterializedRegularVisitV1<'_, '_>,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+            let common = visit.common();
+            self.regular_charged(common, |parent, name| {
+                visit.copy_to(parent, name).map_err(|error| match error {
+                    SnapshotRegularMaterializationErrorV1::Resource(error) => {
+                        SnapshotChargedMaterializeErrorV1::Resource(error)
+                    }
+                    SnapshotRegularMaterializationErrorV1::Leaf(error) => {
+                        regular_copy_failure(error, common.relative_path()).into()
+                    }
+                })
+            })
+        }
+
+        fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
+            self.symlink_charged(visit.common())
+        }
+
+        fn directory_leave(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.directory_leave_charged(visit.common(), visit.membership())
+        }
+    }
+
+    fn regular_copy_failure(
+        error: SnapshotRegularFailureV1,
+        relative_path: &[u8],
+    ) -> SnapshotMaterializeFailureV1 {
+        SnapshotMaterializeFailureV1::new(
+            error.code(),
+            SnapshotMaterializeStageV1::CopyRegular,
+            SnapshotMaterializeFailureKindV1::RegularCopy,
+            Some(error.stage()),
+            error.errno(),
+            relative_path,
+        )
+    }
+
+    fn flatten_charged_materialize_error(
+        error: SnapshotChargedMaterializeErrorV1,
+    ) -> SnapshotTreeMaterializeErrorV1 {
+        match error {
+            SnapshotChargedMaterializeErrorV1::Resource(error) => {
+                SnapshotTreeMaterializeErrorV1::Resource(error)
+            }
+            SnapshotChargedMaterializeErrorV1::Leaf(error) => {
+                SnapshotTreeMaterializeErrorV1::Materializer(error)
+            }
+        }
+    }
+
+    fn flatten_tree_materialize_error(
+        error: SourceTreeMaterializationErrorV1<
+            SourceTreeAcquireFailureV1<SnapshotChargedMaterializeErrorV1>,
+        >,
+    ) -> SnapshotTreeMaterializeErrorV1 {
+        match error {
+            SourceTreeMaterializationErrorV1::Resource(error) => {
+                SnapshotTreeMaterializeErrorV1::Resource(error)
+            }
+            SourceTreeMaterializationErrorV1::Leaf(SourceTreeAcquireFailureV1::Source(error)) => {
+                SnapshotTreeMaterializeErrorV1::Source(error)
+            }
+            SourceTreeMaterializationErrorV1::Leaf(SourceTreeAcquireFailureV1::Visitor {
+                source,
+                ..
+            }) => flatten_charged_materialize_error(source),
+        }
+    }
+
+    pub(super) fn materialize_source_tree_charged_at<'scope>(
+        staging: ChargedStagedSnapshotDirectoryV1<'scope>,
+        source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+        session: &SnapshotMaterializationSessionV1<'_>,
+    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotTreeMaterializeErrorV1> {
+        let mut materializer = SnapshotMaterializerWithGateV1::new_with_gate(
+            staging,
+            *session.materialization_policy(),
+            KernelHooks,
+            session,
+        )
+        .map_err(SnapshotTreeMaterializeErrorV1::Materializer)?;
+        let plan = enumerate_source_tree_view_materializing_at(
+            source_view,
+            root_name,
+            session,
+            &mut materializer,
+        )
+        .map_err(flatten_tree_materialize_error)?;
+        materializer
+            .finish_populated(&plan)
+            .map_err(flatten_charged_materialize_error)
     }
 
     struct DestinationIdentityV1 {
@@ -2246,8 +2479,8 @@ mod platform {
         Ok(())
     }
 
-    impl<H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
-        SnapshotMaterializerWithGateV1<'_, H, G>
+    impl<S: MaterializeStagingV1, H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<S, H, G>
     {
         fn finalize_regular(
             &self,
@@ -3292,9 +3525,11 @@ mod platform {
         use std::collections::BTreeMap;
         use std::ffi::{CString, OsStr};
         use std::fs::{self, File};
+        use std::io::Read;
         use std::num::{NonZeroU16, NonZeroU32};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+        use std::os::unix::net::UnixStream;
         use std::path::Path;
         use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3308,7 +3543,7 @@ mod platform {
         };
         use crate::linux_pytest::snapshot_tree::{
             QualifiedNoAtimeSourceViewV1, SourceEnumerationPolicyV1, SourceTraversalLimitsV1,
-            SourceTreeAcquireFailureV1, SourceTreeEntryV1, SourceXattrLimitsV1,
+            SourceTreeAcquireFailureV1, SourceTreeEntryV1, SourceTreeStageV1, SourceXattrLimitsV1,
             enumerate_source_tree_view_at,
         };
 
@@ -3358,6 +3593,66 @@ mod platform {
                 self.charged.set(self.charged.get() + 1);
                 Ok(attempt())
             }
+        }
+
+        fn exhausted_materialization_resource() -> SnapshotPipelineResourceErrorV1 {
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::Materialization,
+                ),
+                bucket: SnapshotPipelineAttemptBucketV1::Forward,
+            }
+        }
+
+        #[test]
+        fn tree_boundary_flattens_outer_and_callback_resource_exhaustion() {
+            let outer = flatten_tree_materialize_error(SourceTreeMaterializationErrorV1::Resource(
+                exhausted_materialization_resource(),
+            ));
+            assert!(matches!(
+                outer,
+                SnapshotTreeMaterializeErrorV1::Resource(
+                    SnapshotPipelineResourceErrorV1::OperationBudgetExhausted { .. }
+                )
+            ));
+
+            let nested = flatten_tree_materialize_error(SourceTreeMaterializationErrorV1::Leaf(
+                SourceTreeAcquireFailureV1::Visitor {
+                    stage: SourceTreeStageV1::VisitRegular,
+                    relative_path: b"private/callback/path".to_vec(),
+                    source: SnapshotChargedMaterializeErrorV1::Resource(
+                        exhausted_materialization_resource(),
+                    ),
+                },
+            ));
+            assert!(matches!(
+                nested,
+                SnapshotTreeMaterializeErrorV1::Resource(
+                    SnapshotPipelineResourceErrorV1::OperationBudgetExhausted { .. }
+                )
+            ));
+            assert!(!format!("{nested:?}").contains("private/callback/path"));
+        }
+
+        #[test]
+        fn materializer_leaf_debug_redacts_both_diagnostic_paths() {
+            let nested = flatten_tree_materialize_error(SourceTreeMaterializationErrorV1::Leaf(
+                SourceTreeAcquireFailureV1::Visitor {
+                    stage: SourceTreeStageV1::VisitRegular,
+                    relative_path: b"walker/secret".to_vec(),
+                    source: SnapshotChargedMaterializeErrorV1::Leaf(event_failure(
+                        b"materializer/secret",
+                    )),
+                },
+            ));
+            assert!(matches!(
+                nested,
+                SnapshotTreeMaterializeErrorV1::Materializer(_)
+            ));
+            let debug = format!("{nested:?}");
+            assert_eq!(debug, "Materializer(<redacted>)");
+            assert!(!debug.contains("walker/secret"));
+            assert!(!debug.contains("materializer/secret"));
         }
 
         impl StatefulXattrHooks {
@@ -3528,6 +3823,73 @@ mod platform {
                 NonZeroU64::new(256 * 1024).unwrap(),
             )
             .unwrap()
+        }
+
+        struct DropOrderStaging<'parent, 'signal> {
+            staging: StagedSnapshotDirectoryV1<'parent>,
+            active_directory_peer: UnixStream,
+            active_directory_was_closed: &'signal Cell<bool>,
+        }
+
+        impl MaterializeStagingV1 for DropOrderStaging<'_, '_> {
+            fn directory(&self) -> BorrowedFd<'_> {
+                self.staging.directory()
+            }
+
+            fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1 {
+                self.staging.cleanup_envelope()
+            }
+        }
+
+        impl Drop for DropOrderStaging<'_, '_> {
+            fn drop(&mut self) {
+                let mut byte = [0u8; 1];
+                self.active_directory_was_closed
+                    .set(matches!(self.active_directory_peer.read(&mut byte), Ok(0)));
+            }
+        }
+
+        #[test]
+        fn active_destination_fds_close_before_staging_cleanup_can_start() {
+            let publication_parent = tempfile::tempdir().unwrap();
+            let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+            let staging_name = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
+            let staging_path = publication_parent
+                .path()
+                .join(OsStr::from_bytes(staging_name.to_bytes()));
+            let staged = create_staged_snapshot_directory_at(
+                publication_parent_fd.as_fd(),
+                staging_name,
+                test_publish_policy(),
+            )
+            .unwrap();
+            let (active_directory, active_directory_peer) = UnixStream::pair().unwrap();
+            active_directory_peer.set_nonblocking(true).unwrap();
+            let active_directory_was_closed = Cell::new(false);
+            let staging = DropOrderStaging {
+                staging: staged,
+                active_directory_peer,
+                active_directory_was_closed: &active_directory_was_closed,
+            };
+            let mut materializer = SnapshotMaterializerWithGateV1::new_with_gate(
+                staging,
+                test_policy(),
+                KernelHooks,
+                DirectMaterializeAttemptGateV1,
+            )
+            .unwrap();
+            materializer.stack.push(ActiveDirectoryV1 {
+                basename: None,
+                directory: active_directory.into(),
+                event_index: 0,
+            });
+
+            drop(materializer);
+
+            // The staging Drop hook runs only after the active-directory stack
+            // has released the exact descriptor it recorded.
+            assert!(active_directory_was_closed.get());
+            assert!(!staging_path.exists());
         }
 
         fn test_fd() -> File {
