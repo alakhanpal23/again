@@ -23,8 +23,10 @@ read from the actual staged publisher to dominate its source depth, entry
 count, basename, and retry limits. Mismatch refuses before materializer
 population and delegates bounded, best-effort cleanup to the staged publisher.
 The connector now joins the supported materialization and observation leaves
-into internal four-view comparison mechanics, but it does not produce a ready
-or sealed snapshot and is not wired to `SnapshotProvider`.
+into an internal four-view comparison followed by a narrow physical
+publication checkpoint. That checkpoint does not produce the canonical
+manifest or digest required by this profile and is not wired to
+`SnapshotProvider`.
 
 A static, allocation-free projection now returns a non-`Clone`, non-`Copy`
 connector that owns the preflighted policy and one shared operation/heap
@@ -43,6 +45,8 @@ plan, S1. The materializer-workspace lease is released while the source-plan
 lease remains attached to that plan. The session binds the exact source,
 destination, and copy policies to the shared ledger.
 
+### Charged publication checkpoint
+
 On Linux x86_64, the connector's atomic comparison path next observes an
 independent source plan S2 and then two independent destination plans D1 and
 D2. Destination observation uses a distinct connector-minted charged session;
@@ -51,15 +55,36 @@ symlink is refused after descriptor-selected type identification but before
 xattr or target acquisition, including before `readlinkat`. The connector
 compares S1/S2, S1/D1 with the stage's expected physical owner, and D1/D2, in
 that order. It drops S2 before D1, S1 before D2, and every remaining plan
-before returning, so at most two retained-view leases coexist. Success returns
-only the still-unready RAII cleanup guard. Comparison success is not an
-authority, and no ready, publish, Python-execution, or reuse transition exists.
+before finalization, so at most two retained-view leases coexist. The
+D2-complete cleanup guard remains private to the connector and flows
+immediately into a no-argument reservation bound to its embedded publication
+session. That reservation takes the leaf policy's exact worst-case raw-attempt
+ceiling from the same forward ledger. Reservation refusal occurs before any
+finalization syscall. The charged leaf then changes the top-level staging
+container to physical mode `0500`, revalidates and fsyncs it, performs an
+adjacent pre-rename identity check,
+uses state-aware `renameat2(..., RENAME_NOREPLACE)` reconciliation, fsyncs the
+parent, reopens the final name, and binds the original and reopened identities.
+Success returns only an opaque `PublishedSnapshotDirectoryV1`.
+
+This physical publication checkpoint does not construct or authenticate the
+canonical snapshot manifest, compute a snapshot digest, choose a
+content-addressed name, or grant execution, Python, isolation, or reuse
+authority. It makes no claim against a malicious same-UID process or host
+root. The positive full-flow test remains ignored until both source and
+destination filesystems are functionally qualified for no-atime access, so
+stock hosted CI provides no positive qualified full-flow publication evidence.
 
 Runtime qualification and retained evidence are tracked in
 [STATUS.md](STATUS.md).
 
 Within the wired source-observation, materialization, and staged-publication
-slices, every raw attempt, including every retry, is charged before invocation.
+slices, every explicitly modeled raw kernel operation attempt, including every
+retry, is charged before invocation. Non-retryable RAII descriptor close is
+the explicit release-only exception.
+Before finalization, the session subtracts the complete leaf-derived attempt
+ceiling in one checked reservation; every charged attempt consumes that
+reservation before invocation, and dropping it refunds only unused attempts.
 Forward and publisher-cleanup attempts use disjoint buckets, so forward
 exhaustion cannot spend the cleanup reserve. The policy also pre-reserves a
 separate leaf-local cleanup bucket consumed by the charged regular-copy leaf.
@@ -71,9 +96,9 @@ retained-name heap is
 one fixed two-slot name batch on the stack; those stack bytes and
 allocator-private metadata are outside the transient-heap ledger. Maximum-depth
 cleanup is retained as a required test on each supported build/target. Positive
-qualified runtime evidence and every readiness, sealing, publication,
-isolation, Python-execution, and reuse transition remain required before this
-checkpoint can become a release-qualified snapshot backend.
+qualified runtime evidence, canonical manifest/digest construction, isolation,
+Python execution, and reuse remain required before this checkpoint can become
+a release-qualified snapshot backend.
 
 Each charged `Vec<u8>` precharges its requested capacity, observes capacity
 after `try_reserve_exact`, and accepts only exact equality. Allocator
@@ -347,8 +372,10 @@ and only if any logical execute-class bit was set. Full logical mode, special
 bits, uid, and gid remain in the manifest. Physical uid and gid are
 creation-context metadata behind the private container and are excluded from
 the logical projection. Final mode and xattrs are reverified; ACL/xattr sets
-changed by that chmod refuse. No chmod follows the verified destination views.
-Directory `st_size` is not an exact projection.
+changed by that chmod refuse. No chmod of a manifest entry follows the verified
+destination views. Charged publication separately changes the non-manifest
+staging container to mode `0500`. Directory `st_size` is not an exact
+projection.
 
 The canonical manifest has one workspace tree at `/workspace` and a nonempty,
 strictly mount-path-sorted forest of read-only runtime trees. Entries use raw

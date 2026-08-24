@@ -1,16 +1,20 @@
 //! Crash-safe publication of one already-built snapshot directory.
 //!
 //! This leaf owns only the publication protocol. It creates an owner-private
-//! staging directory beneath a trusted directory descriptor, keeps the inode
-//! pinned by an owned descriptor, requires a trusted callback to attest that
-//! every descendant has been made durable, fsyncs the staging root, publishes
-//! with `renameat2(RENAME_NOREPLACE)`, fsyncs the parent, and reopens the final
-//! name with constrained `openat2` resolution before returning it.
+//! staging directory beneath a trusted directory descriptor and keeps the
+//! inode pinned by an owned descriptor. The production path consumes a
+//! charged guard after connector-owned recursive durability and four-view
+//! verification, seals and fsyncs the staging container, publishes with
+//! `renameat2(RENAME_NOREPLACE)`, fsyncs the parent, and reopens the final name
+//! with constrained `openat2` resolution before returning it. A legacy
+//! test-only seam retains the trusted durability callback used by leaf tests.
 //!
 //! It does not enumerate, copy, hash, validate, or make a tree immutable, and
-//! it is not a sandbox. The caller must finish all tree construction and
-//! recursive file/directory fsync work before its readiness callback returns.
-//! No mutation is permitted after that callback succeeds.
+//! it is not a sandbox. The connector must finish all tree construction,
+//! recursive durability, and mandatory comparisons before charged
+//! finalization. No materialized manifest entry may mutate after those
+//! comparisons succeed; this leaf changes only the non-manifest staging
+//! container to its sealed mode.
 //! Physical staging directories must remain owned by the current effective
 //! user; source uid/gid are logical manifest metadata, never applied by chown.
 //! RAII cleanup is bounded and best-effort: limit exhaustion or uncertain
@@ -25,7 +29,10 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_policy::{SnapshotChargedBytesV1, SnapshotPipelineResourceErrorV1};
+use super::snapshot_policy::{
+    SnapshotChargedBytesV1, SnapshotFinalizationAttemptReservationV1,
+    SnapshotPipelineResourceErrorV1,
+};
 
 const STAGING_NAME_PREFIX: &[u8] = b".again-snapshot-stage-";
 const STAGING_NONCE_HEX_BYTES: usize = 32;
@@ -43,6 +50,7 @@ const HARD_MAX_SYSCALL_ATTEMPTS: u8 = 32;
 const HARD_MAX_SOURCE_TREE_DEPTH: u16 = 256;
 const HARD_MAX_CLEANUP_ENTRIES: u32 = 1024 * 1024;
 const HARD_MAX_CLEANUP_RETAINED_NAME_BYTES: u64 = 512 * 1024 * 1024;
+const SEALED_DIRECTORY_MODE: u32 = 0o500;
 // The private staging container and the materialized tree root sit outside
 // the source walker's descendant-depth budget.
 const PUBLICATION_CONTAINER_LEVELS: u16 = 2;
@@ -107,6 +115,7 @@ pub(super) struct SnapshotPublishPolicyV1 {
     max_cleanup_name_bytes: NonZeroU16,
     max_cleanup_retained_name_bytes: NonZeroU64,
     max_cleanup_getdents_attempts: u64,
+    finalization_operation_attempt_bound: NonZeroU64,
 }
 
 impl SnapshotPublishPolicyV1 {
@@ -148,6 +157,22 @@ impl SnapshotPublishPolicyV1 {
             .checked_mul(5)?
             .checked_add(3)?
             .checked_mul(syscall_attempts.get() as u64)?;
+        let open_attempts = u64::from(openat2_attempts.get());
+        let generic_attempts = u64::from(syscall_attempts.get());
+        // Integrated charged finalization performs three staging
+        // revalidations and one final reopen (four openat2 retry groups and
+        // sixteen fixed fstat/statx calls). Each retryable rename iteration
+        // performs the rename plus one expected and one missing name binding,
+        // for `2O + 2` attempts. Container sealing and the two fsyncs add the
+        // remaining three generic retry groups. The terminal both-present
+        // reconciliation branch costs one more attempt but cannot execute the
+        // post-rename tail, so it is not the whole-path maximum.
+        let finalization_operation_attempt_bound =
+            open_attempts.checked_mul(4)?.checked_add(16)?.checked_add(
+                generic_attempts.checked_mul(open_attempts.checked_mul(2)?.checked_add(5)?)?,
+            )?;
+        let finalization_operation_attempt_bound =
+            NonZeroU64::new(finalization_operation_attempt_bound)?;
         Some(Self {
             openat2_attempts,
             syscall_attempts,
@@ -156,6 +181,7 @@ impl SnapshotPublishPolicyV1 {
             max_cleanup_name_bytes,
             max_cleanup_retained_name_bytes,
             max_cleanup_getdents_attempts,
+            finalization_operation_attempt_bound,
         })
     }
 
@@ -185,6 +211,12 @@ impl SnapshotPublishPolicyV1 {
 
     pub(super) const fn max_cleanup_getdents_attempts(self) -> u64 {
         self.max_cleanup_getdents_attempts
+    }
+
+    /// Exact worst-case raw-attempt escrow for the integrated charged
+    /// seal-and-publish state machine.
+    pub(super) const fn finalization_operation_attempt_bound(self) -> NonZeroU64 {
+        self.finalization_operation_attempt_bound
     }
 
     /// Descriptor retained while the caller builds and seals the stage.
@@ -235,6 +267,7 @@ pub(super) enum SnapshotPublishStageV1 {
     BindStagingIdentity,
     VerifyRecursiveDurability,
     RevalidateStaging,
+    SealStaging,
     SyncStaging,
     ValidateFinalName,
     PublishRename,
@@ -245,7 +278,7 @@ pub(super) enum SnapshotPublishStageV1 {
 
 impl SnapshotPublishStageV1 {
     #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
-    const ALL_TRANSITIONS: [Self; 12] = [
+    const LEGACY_TRANSITIONS: [Self; 12] = [
         Self::ValidateStagingName,
         Self::InspectParent,
         Self::CreateAndOpenStaging,
@@ -371,6 +404,23 @@ fn valid_staging_basename(name: &CStr) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
 }
 
+/// Pure validation shared by the connector and both publication paths. It
+/// performs no allocation, resource charge, or filesystem operation.
+pub(super) fn validate_snapshot_final_name(
+    staging_name: &CStr,
+    final_name: &CStr,
+) -> Result<(), SnapshotPublishErrorV1> {
+    if valid_raw_basename(final_name) && final_name != staging_name {
+        return Ok(());
+    }
+    Err(SnapshotPublishErrorV1::new(
+        SnapshotPublishErrorKindV1::InvalidFinalName,
+        SnapshotPublishStageV1::ValidateFinalName,
+        SnapshotPublicationStateV1::Unpublished,
+        None,
+    ))
+}
+
 pub(super) type StagedSnapshotDirectoryV1<'parent> = platform::StagedSnapshotDirectoryV1<'parent>;
 pub(super) type ChargedStagedSnapshotDirectoryV1<'resources> =
     platform::ChargedStagedSnapshotDirectoryV1<'resources>;
@@ -385,6 +435,18 @@ pub(super) fn create_charged_staged_snapshot_directory_at<'scope>(
 ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotChargedErrorV1<SnapshotPublishErrorV1>>
 {
     platform::create_charged_staged_snapshot_directory_at(parent, staging_name, session)
+}
+
+/// Consumes the connector's populated, four-view-checked staging guard and
+/// performs the only production readiness/publication transition. The result
+/// is an opaque physical-directory capability only; it carries no manifest,
+/// content identity, execution authority, or reuse authority.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn seal_and_publish_charged_at(
+    staged: ChargedStagedSnapshotDirectoryV1<'_>,
+    final_name: &CStr,
+) -> Result<PublishedSnapshotDirectoryV1, SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
+    platform::seal_and_publish_charged_at(staged, final_name)
 }
 
 #[cfg(test)]
@@ -405,7 +467,10 @@ mod platform {
 
     #[cfg(test)]
     std::thread_local! {
-        static CHARGED_DIRECTORY_FSTAT_CALLS: std::cell::Cell<u64> = const {
+        static DIRECTORY_FSTAT_CALLS: std::cell::Cell<u64> = const {
+            std::cell::Cell::new(0)
+        };
+        static FINALIZATION_ATTEMPT_CHARGES: std::cell::Cell<u64> = const {
             std::cell::Cell::new(0)
         };
     }
@@ -447,11 +512,64 @@ mod platform {
         ) -> io::Result<()> {
             rename_noreplace_at(old_parent, old_name, new_parent, new_name)
         }
+
+        fn seal_directory(&mut self, directory: BorrowedFd<'_>) -> io::Result<()> {
+            let result = unsafe {
+                libc::fchmod(directory.as_raw_fd(), SEALED_DIRECTORY_MODE as libc::mode_t)
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        }
     }
 
     struct KernelTransitions;
 
     impl TransitionHookV1 for KernelTransitions {}
+
+    trait PublisherAttemptGateV1 {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1>;
+    }
+
+    impl PublisherAttemptGateV1 for SnapshotFinalizationAttemptReservationV1<'_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            self.run_attempt(|| {
+                #[cfg(test)]
+                FINALIZATION_ATTEMPT_CHARGES.with(|calls| calls.set(calls.get() + 1));
+                attempt()
+            })
+        }
+    }
+
+    struct UnmeteredPublisherAttemptGateV1;
+
+    impl PublisherAttemptGateV1 for UnmeteredPublisherAttemptGateV1 {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            Ok(attempt())
+        }
+    }
+
+    fn unmetered_leaf<T, E>(result: Result<T, SnapshotChargedErrorV1<E>>) -> Result<T, E> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(SnapshotChargedErrorV1::Leaf(error)) => Err(error),
+            Err(
+                SnapshotChargedErrorV1::Resource(_)
+                | SnapshotChargedErrorV1::PublicationAlreadyStarted,
+            ) => unreachable!("an unmetered publisher gate cannot refuse"),
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum PublisherAttemptBucketV1 {
@@ -493,6 +611,21 @@ mod platform {
             }
         }
 
+        fn reserve_finalization_attempts(
+            &self,
+        ) -> Result<
+            SnapshotFinalizationAttemptReservationV1<'resources>,
+            SnapshotPipelineResourceErrorV1,
+        > {
+            match self {
+                Self::Charged { session } => session.reserve_finalization_attempts(),
+                #[cfg(test)]
+                Self::Unmetered { .. } => {
+                    unreachable!("the legacy test authority does not reserve shared attempts")
+                }
+            }
+        }
+
         #[cfg(test)]
         fn remaining_attempts(&self, bucket: PublisherAttemptBucketV1) -> Option<u64> {
             match (self, bucket) {
@@ -504,6 +637,20 @@ mod platform {
                 }
                 (Self::Unmetered { .. }, _) => None,
             }
+        }
+    }
+
+    struct PublisherBucketAttemptGateV1<'authority, 'resources> {
+        authority: &'authority PublisherAuthorityV1<'resources>,
+        bucket: PublisherAttemptBucketV1,
+    }
+
+    impl PublisherAttemptGateV1 for PublisherBucketAttemptGateV1<'_, '_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            self.authority.run_attempt(self.bucket, attempt)
         }
     }
 
@@ -675,9 +822,9 @@ mod platform {
         cleanup: StagingCleanupV1<'parent>,
     }
 
-    /// A resource-charged staging guard. This narrow checkpoint deliberately
-    /// exposes no ready/publish transition: those transitions are still
-    /// unmetered and must not be reachable from a charged construction path.
+    /// A resource-charged staging guard. It exposes no public ready token or
+    /// publication method and can only be consumed by integrated charged
+    /// finalization after the connector completes its mandatory comparisons.
     pub(in crate::linux_pytest) struct ChargedStagedSnapshotDirectoryV1<'resources> {
         cleanup: StagingCleanupV1<'resources>,
     }
@@ -839,14 +986,7 @@ mod platform {
                 SnapshotPublishStageV1::ValidateFinalName,
                 SnapshotPublicationStateV1::Unpublished,
             )?;
-            if !valid_raw_basename(final_name) || final_name == cleanup.staging_name.as_c_str() {
-                return Err(SnapshotPublishErrorV1::new(
-                    SnapshotPublishErrorKindV1::InvalidFinalName,
-                    SnapshotPublishStageV1::ValidateFinalName,
-                    SnapshotPublicationStateV1::Unpublished,
-                    None,
-                ));
-            }
+            validate_snapshot_final_name(cleanup.staging_name.as_c_str(), final_name)?;
 
             let before_rename = revalidate_staging(&cleanup)?;
             if before_rename != cleanup.expected_identity() {
@@ -928,6 +1068,188 @@ mod platform {
         }
     }
 
+    fn seal_and_publish_charged_with_transitions<H>(
+        staged: ChargedStagedSnapshotDirectoryV1<'_>,
+        final_name: &CStr,
+        transitions: &mut H,
+    ) -> Result<PublishedSnapshotDirectoryV1, SnapshotChargedErrorV1<SnapshotPublishErrorV1>>
+    where
+        H: TransitionHookV1,
+    {
+        let mut cleanup = staged.cleanup;
+
+        // This validation is allocation- and filesystem-free. Keep it before
+        // reservation and even before the first test hook or sealing mutation
+        // so an invalid caller-controlled name cannot consume authority.
+        validate_snapshot_final_name(cleanup.staging_name.as_c_str(), final_name)
+            .map_err(SnapshotChargedErrorV1::Leaf)?;
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::ValidateFinalName,
+            SnapshotPublicationStateV1::Unpublished,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+
+        let reservation = cleanup
+            .authority
+            .reserve_finalization_attempts()
+            .map_err(SnapshotChargedErrorV1::Resource)?;
+
+        // Materialization legitimately changed the private container's link
+        // count by creating its root directory. This is the sole refresh that
+        // admits metadata drift: the pinned object, its current name, owner,
+        // and exact builder mode must still agree.
+        let builder_identity = revalidate_staging_refresh_with_gate(
+            &cleanup,
+            PRIVATE_DIRECTORY_MODE,
+            &reservation,
+            SnapshotPublishStageV1::RevalidateStaging,
+        )?;
+        cleanup.expected_identity = Some(builder_identity);
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::SealStaging,
+            SnapshotPublicationStateV1::Unpublished,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        retry_eintr_result_with_gate(&reservation, cleanup.policy().syscall_attempts(), || {
+            transitions.seal_directory(cleanup.directory())
+        })
+        .map_err(|error| {
+            map_charged_io(
+                error,
+                SnapshotPublishStageV1::SealStaging,
+                SnapshotPublicationStateV1::Unpublished,
+            )
+        })?;
+
+        let sealed_identity = identity_with_mode(builder_identity, SEALED_DIRECTORY_MODE);
+        revalidate_staging_exact_with_gate(
+            &cleanup,
+            sealed_identity,
+            &reservation,
+            SnapshotPublishStageV1::SealStaging,
+        )?;
+        cleanup.expected_identity = Some(sealed_identity);
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::SyncStaging,
+            SnapshotPublicationStateV1::Unpublished,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        fsync_fd_with_gate(
+            cleanup.directory(),
+            cleanup.policy().syscall_attempts(),
+            &reservation,
+        )
+        .map_err(|error| {
+            map_charged_io(
+                error,
+                SnapshotPublishStageV1::SyncStaging,
+                SnapshotPublicationStateV1::Unpublished,
+            )
+        })?;
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::PublishRename,
+            SnapshotPublicationStateV1::Unpublished,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        // This post-fsync check is immediately adjacent to rename and serves
+        // as the pre-rename check as well. All checkpoints precede it, and no
+        // caller callback or intermediate token can re-enter afterward;
+        // production `KernelTransitions` immediately issues the charged
+        // rename.
+        revalidate_staging_exact_with_gate(
+            &cleanup,
+            sealed_identity,
+            &reservation,
+            SnapshotPublishStageV1::RevalidateStaging,
+        )?;
+        rename_staging_with_reconciliation_and_gate(
+            &mut cleanup,
+            final_name,
+            transitions,
+            &reservation,
+        )?;
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::SyncParent,
+            SnapshotPublicationStateV1::PublishedDurabilityUnknown,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        fsync_fd_with_gate(
+            cleanup.parent,
+            cleanup.policy().syscall_attempts(),
+            &reservation,
+        )
+        .map_err(|error| {
+            map_charged_io(
+                error,
+                SnapshotPublishStageV1::SyncParent,
+                SnapshotPublicationStateV1::PublishedDurabilityUnknown,
+            )
+        })?;
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::ReopenPublished,
+            SnapshotPublicationStateV1::PublishedDurable,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        let reopened = open_directory_at_with_gate(
+            cleanup.parent,
+            final_name,
+            cleanup.policy().openat2_attempts(),
+            &reservation,
+        )
+        .map_err(|error| {
+            map_charged_io(
+                error,
+                SnapshotPublishStageV1::ReopenPublished,
+                SnapshotPublicationStateV1::PublishedDurable,
+            )
+        })?;
+
+        checkpoint(
+            transitions,
+            SnapshotPublishStageV1::BindPublishedIdentity,
+            SnapshotPublicationStateV1::PublishedDurable,
+        )
+        .map_err(SnapshotChargedErrorV1::Leaf)?;
+        let original_identity = directory_identity_with_gate(cleanup.directory(), &reservation)
+            .map_err(|error| {
+                map_charged_identity_io(
+                    error,
+                    SnapshotPublishStageV1::BindPublishedIdentity,
+                    SnapshotPublicationStateV1::PublishedDurable,
+                )
+            })?;
+        let reopened_identity = directory_identity_with_gate(reopened.as_fd(), &reservation)
+            .map_err(|error| {
+                map_charged_identity_io(
+                    error,
+                    SnapshotPublishStageV1::BindPublishedIdentity,
+                    SnapshotPublicationStateV1::PublishedDurable,
+                )
+            })?;
+        if original_identity != sealed_identity || reopened_identity != sealed_identity {
+            return Err(SnapshotChargedErrorV1::Leaf(identity_failure(
+                SnapshotPublishStageV1::BindPublishedIdentity,
+                SnapshotPublicationStateV1::PublishedDurable,
+            )));
+        }
+
+        Ok(PublishedSnapshotDirectoryV1 {
+            directory: reopened,
+            identity: reopened_identity,
+        })
+    }
+
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum NameBindingV1 {
         Missing,
@@ -940,29 +1262,53 @@ mod platform {
         final_name: &CStr,
         transitions: &mut H,
     ) -> Result<(), SnapshotPublishErrorV1> {
+        unmetered_leaf(rename_staging_with_reconciliation_and_gate(
+            cleanup,
+            final_name,
+            transitions,
+            &UnmeteredPublisherAttemptGateV1,
+        ))
+    }
+
+    fn rename_staging_with_reconciliation_and_gate<
+        H: TransitionHookV1,
+        G: PublisherAttemptGateV1,
+    >(
+        cleanup: &mut StagingCleanupV1<'_>,
+        final_name: &CStr,
+        transitions: &mut H,
+        gate: &G,
+    ) -> Result<(), SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
         for _ in 0..cleanup.policy().syscall_attempts() {
-            match transitions.rename_noreplace(
-                cleanup.parent,
-                cleanup.staging_name.as_c_str(),
-                cleanup.parent,
-                final_name,
-            ) {
+            let rename = gate
+                .run_attempt(|| {
+                    transitions.rename_noreplace(
+                        cleanup.parent,
+                        cleanup.staging_name.as_c_str(),
+                        cleanup.parent,
+                        final_name,
+                    )
+                })
+                .map_err(SnapshotChargedErrorV1::Resource)?;
+            match rename {
                 Ok(()) => {
                     cleanup.disarm();
                     return Ok(());
                 }
                 Err(error) => {
-                    let old_binding = name_binding(
+                    let old_binding = name_binding_with_gate(
                         cleanup.parent,
                         cleanup.staging_name.as_c_str(),
                         cleanup.expected_identity(),
                         cleanup.policy().openat2_attempts(),
+                        gate,
                     );
-                    let final_binding = name_binding(
+                    let final_binding = name_binding_with_gate(
                         cleanup.parent,
                         final_name,
                         cleanup.expected_identity(),
                         cleanup.policy().openat2_attempts(),
+                        gate,
                     );
                     match (old_binding, final_binding) {
                         (Ok(NameBindingV1::Missing), Ok(NameBindingV1::Expected)) => {
@@ -978,34 +1324,34 @@ mod platform {
                         | (Ok(NameBindingV1::Expected), Ok(NameBindingV1::Other))
                             if error.raw_os_error() == Some(libc::EEXIST) =>
                         {
-                            return Err(rename_error(
+                            return Err(SnapshotChargedErrorV1::Leaf(rename_error(
                                 error,
                                 SnapshotPublicationStateV1::Unpublished,
-                            ));
+                            )));
                         }
                         (Ok(NameBindingV1::Expected), Ok(NameBindingV1::Missing)) => {
-                            return Err(rename_error(
+                            return Err(SnapshotChargedErrorV1::Leaf(rename_error(
                                 error,
                                 SnapshotPublicationStateV1::Unpublished,
-                            ));
+                            )));
                         }
                         _ => {
                             cleanup.disarm();
-                            return Err(rename_error(
+                            return Err(SnapshotChargedErrorV1::Leaf(rename_error(
                                 error,
                                 SnapshotPublicationStateV1::PublishedDurabilityUnknown,
-                            ));
+                            )));
                         }
                     }
                 }
             }
         }
-        Err(SnapshotPublishErrorV1::new(
+        Err(SnapshotChargedErrorV1::Leaf(SnapshotPublishErrorV1::new(
             SnapshotPublishErrorKindV1::Io,
             SnapshotPublishStageV1::PublishRename,
             SnapshotPublicationStateV1::Unpublished,
             Some(libc::EINTR),
-        ))
+        )))
     }
 
     fn rename_error(
@@ -1027,20 +1373,27 @@ mod platform {
         )
     }
 
-    fn name_binding(
+    fn name_binding_with_gate<G: PublisherAttemptGateV1>(
         parent: BorrowedFd<'_>,
         name: &CStr,
         expected: SnapshotDirectoryIdentityV1,
         attempts: u8,
-    ) -> io::Result<NameBindingV1> {
-        let current = match open_path_at(parent, name, attempts) {
+        gate: &G,
+    ) -> Result<NameBindingV1, SnapshotChargedErrorV1<io::Error>> {
+        let current = match open_path_at_with_gate(parent, name, attempts, gate) {
             Ok(current) => current,
-            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+            Err(SnapshotChargedErrorV1::Leaf(error))
+                if error.raw_os_error() == Some(libc::ENOENT) =>
+            {
                 return Ok(NameBindingV1::Missing);
             }
             Err(error) => return Err(error),
         };
-        let current = cleanup_identity(current.as_fd())?;
+        // Reconciliation needs only physical name binding, not a second full
+        // manifest identity. One charged fstat preserves the frozen `2O + 2`
+        // per-iteration bound: one expected name has a fstat and one missing
+        // name does not.
+        let current = cleanup_identity_with_gate(current.as_fd(), gate)?;
         if current.mode_type == libc::S_IFDIR
             && linux_device_major(current.device) == expected.device_major
             && linux_device_minor(current.device) == expected.device_minor
@@ -1121,7 +1474,7 @@ mod platform {
                 current_identity
             };
             if !same_directory_object(current_identity, pinned_identity)
-                || !owner_private_directory(current_identity, self.effective_uid)
+                || !owner_staging_directory(current_identity, self.effective_uid)
             {
                 return Err(SnapshotChargedErrorV1::Leaf(io::Error::from_raw_os_error(
                     libc::ESTALE,
@@ -1191,6 +1544,14 @@ mod platform {
             &mut transitions,
         )
         .map(|cleanup| ChargedStagedSnapshotDirectoryV1 { cleanup })
+    }
+
+    pub(super) fn seal_and_publish_charged_at(
+        staged: ChargedStagedSnapshotDirectoryV1<'_>,
+        final_name: &CStr,
+    ) -> Result<PublishedSnapshotDirectoryV1, SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
+        let mut transitions = KernelTransitions;
+        seal_and_publish_charged_with_transitions(staged, final_name, &mut transitions)
     }
 
     #[cfg(test)]
@@ -1399,48 +1760,117 @@ mod platform {
     fn revalidate_staging(
         cleanup: &StagingCleanupV1<'_>,
     ) -> Result<SnapshotDirectoryIdentityV1, SnapshotPublishErrorV1> {
-        let fd_identity = directory_identity(cleanup.directory()).map_err(|error| {
-            identity_io_failure(
-                SnapshotPublishStageV1::RevalidateStaging,
-                SnapshotPublicationStateV1::Unpublished,
-                error,
-            )
-        })?;
-        let reopened = open_directory_at(
+        unmetered_leaf(revalidate_staging_refresh_with_gate(
+            cleanup,
+            PRIVATE_DIRECTORY_MODE,
+            &UnmeteredPublisherAttemptGateV1,
+            SnapshotPublishStageV1::RevalidateStaging,
+        ))
+    }
+
+    fn revalidate_staging_refresh_with_gate<G: PublisherAttemptGateV1>(
+        cleanup: &StagingCleanupV1<'_>,
+        required_mode: u32,
+        gate: &G,
+        stage: SnapshotPublishStageV1,
+    ) -> Result<SnapshotDirectoryIdentityV1, SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
+        let fd_identity =
+            directory_identity_with_gate(cleanup.directory(), gate).map_err(|error| {
+                map_charged_identity_io(error, stage, SnapshotPublicationStateV1::Unpublished)
+            })?;
+        let reopened = open_directory_at_with_gate(
             cleanup.parent,
             cleanup.staging_name.as_c_str(),
             cleanup.policy().openat2_attempts(),
+            gate,
         )
-        .map_err(|error| {
-            io_failure(
-                SnapshotPublishStageV1::RevalidateStaging,
-                SnapshotPublicationStateV1::Unpublished,
-                error,
-            )
-        })?;
-        let reopened_identity = directory_identity(reopened.as_fd()).map_err(|error| {
-            identity_io_failure(
-                SnapshotPublishStageV1::RevalidateStaging,
-                SnapshotPublicationStateV1::Unpublished,
-                error,
-            )
-        })?;
-        if !same_directory_object(fd_identity, cleanup.expected_identity())
+        .map_err(|error| map_charged_io(error, stage, SnapshotPublicationStateV1::Unpublished))?;
+        let reopened_identity =
+            directory_identity_with_gate(reopened.as_fd(), gate).map_err(|error| {
+                map_charged_identity_io(error, stage, SnapshotPublicationStateV1::Unpublished)
+            })?;
+        if !same_staging_identity_except_link_count(fd_identity, cleanup.expected_identity())
             || reopened_identity != fd_identity
-            || !owner_private_directory(fd_identity, cleanup.effective_uid)
+            || !owned_directory_with_exact_mode(fd_identity, cleanup.effective_uid, required_mode)
         {
-            return Err(identity_failure(
-                SnapshotPublishStageV1::RevalidateStaging,
+            return Err(SnapshotChargedErrorV1::Leaf(identity_failure(
+                stage,
                 SnapshotPublicationStateV1::Unpublished,
-            ));
+            )));
         }
         Ok(fd_identity)
     }
 
-    fn owner_private_directory(identity: SnapshotDirectoryIdentityV1, effective_uid: u32) -> bool {
+    fn revalidate_staging_exact_with_gate<G: PublisherAttemptGateV1>(
+        cleanup: &StagingCleanupV1<'_>,
+        expected: SnapshotDirectoryIdentityV1,
+        gate: &G,
+        stage: SnapshotPublishStageV1,
+    ) -> Result<(), SnapshotChargedErrorV1<SnapshotPublishErrorV1>> {
+        let fd_identity =
+            directory_identity_with_gate(cleanup.directory(), gate).map_err(|error| {
+                map_charged_identity_io(error, stage, SnapshotPublicationStateV1::Unpublished)
+            })?;
+        let reopened = open_directory_at_with_gate(
+            cleanup.parent,
+            cleanup.staging_name.as_c_str(),
+            cleanup.policy().openat2_attempts(),
+            gate,
+        )
+        .map_err(|error| map_charged_io(error, stage, SnapshotPublicationStateV1::Unpublished))?;
+        let reopened_identity =
+            directory_identity_with_gate(reopened.as_fd(), gate).map_err(|error| {
+                map_charged_identity_io(error, stage, SnapshotPublicationStateV1::Unpublished)
+            })?;
+        if fd_identity != expected || reopened_identity != expected {
+            return Err(SnapshotChargedErrorV1::Leaf(identity_failure(
+                stage,
+                SnapshotPublicationStateV1::Unpublished,
+            )));
+        }
+        Ok(())
+    }
+
+    fn identity_with_mode(
+        identity: SnapshotDirectoryIdentityV1,
+        permissions: u32,
+    ) -> SnapshotDirectoryIdentityV1 {
+        SnapshotDirectoryIdentityV1 {
+            mode: (identity.mode & !0o7777) | permissions,
+            ..identity
+        }
+    }
+
+    fn same_staging_identity_except_link_count(
+        current: SnapshotDirectoryIdentityV1,
+        expected: SnapshotDirectoryIdentityV1,
+    ) -> bool {
+        current.mount_id == expected.mount_id
+            && current.device_major == expected.device_major
+            && current.device_minor == expected.device_minor
+            && current.inode == expected.inode
+            && current.mode == expected.mode
+            && current.uid == expected.uid
+            && current.gid == expected.gid
+    }
+
+    fn owned_directory_with_exact_mode(
+        identity: SnapshotDirectoryIdentityV1,
+        effective_uid: u32,
+        permissions: u32,
+    ) -> bool {
         identity.mode & libc::S_IFMT == libc::S_IFDIR
-            && identity.mode & 0o7777 == PRIVATE_DIRECTORY_MODE
+            && identity.mode & 0o7777 == permissions
             && identity.uid == effective_uid
+    }
+
+    fn owner_private_directory(identity: SnapshotDirectoryIdentityV1, effective_uid: u32) -> bool {
+        owned_directory_with_exact_mode(identity, effective_uid, PRIVATE_DIRECTORY_MODE)
+    }
+
+    fn owner_staging_directory(identity: SnapshotDirectoryIdentityV1, effective_uid: u32) -> bool {
+        owner_private_directory(identity, effective_uid)
+            || owned_directory_with_exact_mode(identity, effective_uid, SEALED_DIRECTORY_MODE)
     }
 
     fn same_directory_object(
@@ -1482,6 +1912,21 @@ mod platform {
         )
     }
 
+    fn open_directory_at_with_gate<G: PublisherAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, SnapshotChargedErrorV1<io::Error>> {
+        openat2_owned_with_gate(
+            parent,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            attempts,
+            gate,
+        )
+    }
+
     fn open_directory_at_charged(
         authority: &PublisherAuthorityV1<'_>,
         bucket: PublisherAttemptBucketV1,
@@ -1500,61 +1945,21 @@ mod platform {
     }
 
     fn directory_identity(directory: BorrowedFd<'_>) -> io::Result<SnapshotDirectoryIdentityV1> {
-        let mut stat = MaybeUninit::<libc::stat>::zeroed();
-        if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let stat = unsafe { stat.assume_init() };
-
-        let mut statx = MaybeUninit::<libc::statx>::zeroed();
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                directory.as_raw_fd(),
-                c"".as_ptr(),
-                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                REQUIRED_STATX_MASK,
-                statx.as_mut_ptr(),
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let statx = unsafe { statx.assume_init() };
-        if statx.stx_mask & REQUIRED_STATX_MASK != REQUIRED_STATX_MASK
-            || statx.stx_ino != stat.st_ino
-            || statx.stx_dev_major != linux_device_major(stat.st_dev)
-            || statx.stx_dev_minor != linux_device_minor(stat.st_dev)
-            || u32::from(statx.stx_mode) != stat.st_mode
-            || statx.stx_uid != stat.st_uid
-            || statx.stx_gid != stat.st_gid
-            || u64::from(statx.stx_nlink) != stat.st_nlink
-            || stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        {
-            return Err(io::Error::from_raw_os_error(libc::ESTALE));
-        }
-        Ok(SnapshotDirectoryIdentityV1 {
-            mount_id: statx.stx_mnt_id,
-            device_major: statx.stx_dev_major,
-            device_minor: statx.stx_dev_minor,
-            inode: statx.stx_ino,
-            mode: u32::from(statx.stx_mode),
-            uid: statx.stx_uid,
-            gid: statx.stx_gid,
-            link_count: u64::from(statx.stx_nlink),
-        })
+        unmetered_leaf(directory_identity_with_gate(
+            directory,
+            &UnmeteredPublisherAttemptGateV1,
+        ))
     }
 
-    fn directory_identity_charged(
-        authority: &PublisherAuthorityV1<'_>,
-        bucket: PublisherAttemptBucketV1,
+    fn directory_identity_with_gate<G: PublisherAttemptGateV1>(
         directory: BorrowedFd<'_>,
+        gate: &G,
     ) -> Result<SnapshotDirectoryIdentityV1, SnapshotChargedErrorV1<io::Error>> {
         let mut stat = MaybeUninit::<libc::stat>::zeroed();
-        let fstat_result = authority
-            .run_attempt(bucket, || unsafe {
+        let fstat_result = gate
+            .run_attempt(|| unsafe {
                 #[cfg(test)]
-                CHARGED_DIRECTORY_FSTAT_CALLS.with(|calls| calls.set(calls.get() + 1));
+                DIRECTORY_FSTAT_CALLS.with(|calls| calls.set(calls.get() + 1));
                 libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr())
             })
             .map_err(SnapshotChargedErrorV1::Resource)?;
@@ -1564,8 +1969,8 @@ mod platform {
         let stat = unsafe { stat.assume_init() };
 
         let mut statx = MaybeUninit::<libc::statx>::zeroed();
-        let statx_result = authority
-            .run_attempt(bucket, || unsafe {
+        let statx_result = gate
+            .run_attempt(|| unsafe {
                 libc::syscall(
                     libc::SYS_statx,
                     directory.as_raw_fd(),
@@ -1606,6 +2011,17 @@ mod platform {
         })
     }
 
+    fn directory_identity_charged(
+        authority: &PublisherAuthorityV1<'_>,
+        bucket: PublisherAttemptBucketV1,
+        directory: BorrowedFd<'_>,
+    ) -> Result<SnapshotDirectoryIdentityV1, SnapshotChargedErrorV1<io::Error>> {
+        directory_identity_with_gate(
+            directory,
+            &PublisherBucketAttemptGateV1 { authority, bucket },
+        )
+    }
+
     const fn linux_device_major(device: libc::dev_t) -> u32 {
         (((device & 0x0000_0000_000f_ff00) >> 8) | ((device & 0xffff_f000_0000_0000) >> 32)) as u32
     }
@@ -1615,7 +2031,26 @@ mod platform {
     }
 
     fn fsync_fd(fd: BorrowedFd<'_>, attempts: u8) -> io::Result<()> {
-        retry_eintr_zero(attempts, || unsafe { libc::fsync(fd.as_raw_fd()) })
+        unmetered_leaf(fsync_fd_with_gate(
+            fd,
+            attempts,
+            &UnmeteredPublisherAttemptGateV1,
+        ))
+    }
+
+    fn fsync_fd_with_gate<G: PublisherAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<(), SnapshotChargedErrorV1<io::Error>> {
+        retry_eintr_result_with_gate(gate, attempts, || {
+            let result = unsafe { libc::fsync(fd.as_raw_fd()) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
     }
 
     fn rename_noreplace_at(
@@ -1664,18 +2099,43 @@ mod platform {
     where
         F: FnMut() -> libc::c_int,
     {
+        let result =
+            retry_eintr_result_with_gate(&UnmeteredPublisherAttemptGateV1, attempts, || {
+                let result = operation();
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        unmetered_leaf(result)
+    }
+
+    fn retry_eintr_result_with_gate<G, F>(
+        gate: &G,
+        attempts: u8,
+        mut operation: F,
+    ) -> Result<(), SnapshotChargedErrorV1<io::Error>>
+    where
+        G: PublisherAttemptGateV1,
+        F: FnMut() -> io::Result<()>,
+    {
         let mut last = io::Error::from_raw_os_error(libc::EINTR);
         for _ in 0..attempts {
-            let result = operation();
-            if result == 0 {
-                return Ok(());
-            }
-            last = io::Error::last_os_error();
-            if last.kind() != io::ErrorKind::Interrupted {
-                return Err(last);
+            match gate
+                .run_attempt(&mut operation)
+                .map_err(SnapshotChargedErrorV1::Resource)?
+            {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    last = error;
+                    if last.kind() != io::ErrorKind::Interrupted {
+                        return Err(SnapshotChargedErrorV1::Leaf(last));
+                    }
+                }
             }
         }
-        Err(last)
+        Err(SnapshotChargedErrorV1::Leaf(last))
     }
 
     fn retry_eintr_zero_charged<F>(
@@ -1687,20 +2147,18 @@ mod platform {
     where
         F: FnMut() -> libc::c_int,
     {
-        let mut last = io::Error::from_raw_os_error(libc::EINTR);
-        for _ in 0..attempts {
-            let result = authority
-                .run_attempt(bucket, &mut operation)
-                .map_err(SnapshotChargedErrorV1::Resource)?;
-            if result == 0 {
-                return Ok(());
-            }
-            last = io::Error::last_os_error();
-            if last.kind() != io::ErrorKind::Interrupted {
-                return Err(SnapshotChargedErrorV1::Leaf(last));
-            }
-        }
-        Err(SnapshotChargedErrorV1::Leaf(last))
+        retry_eintr_result_with_gate(
+            &PublisherBucketAttemptGateV1 { authority, bucket },
+            attempts,
+            || {
+                let result = operation();
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            },
+        )
     }
 
     fn remove_directory_contents<'resources>(
@@ -1906,22 +2364,16 @@ mod platform {
     }
 
     fn fstat_raw(fd: BorrowedFd<'_>) -> io::Result<libc::stat> {
-        let mut stat = MaybeUninit::<libc::stat>::zeroed();
-        if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(unsafe { stat.assume_init() })
+        unmetered_leaf(fstat_raw_with_gate(fd, &UnmeteredPublisherAttemptGateV1))
     }
 
-    fn fstat_raw_charged(
-        authority: &PublisherAuthorityV1<'_>,
+    fn fstat_raw_with_gate<G: PublisherAttemptGateV1>(
         fd: BorrowedFd<'_>,
+        gate: &G,
     ) -> Result<libc::stat, SnapshotChargedErrorV1<io::Error>> {
         let mut stat = MaybeUninit::<libc::stat>::zeroed();
-        let result = authority
-            .run_attempt(PublisherAttemptBucketV1::Cleanup, || unsafe {
-                libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr())
-            })
+        let result = gate
+            .run_attempt(|| unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) })
             .map_err(SnapshotChargedErrorV1::Resource)?;
         if result != 0 {
             return Err(SnapshotChargedErrorV1::Leaf(io::Error::last_os_error()));
@@ -1933,7 +2385,20 @@ mod platform {
         authority: &PublisherAuthorityV1<'_>,
         fd: BorrowedFd<'_>,
     ) -> Result<CleanupIdentityV1, SnapshotChargedErrorV1<io::Error>> {
-        let stat = fstat_raw_charged(authority, fd)?;
+        cleanup_identity_with_gate(
+            fd,
+            &PublisherBucketAttemptGateV1 {
+                authority,
+                bucket: PublisherAttemptBucketV1::Cleanup,
+            },
+        )
+    }
+
+    fn cleanup_identity_with_gate<G: PublisherAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        gate: &G,
+    ) -> Result<CleanupIdentityV1, SnapshotChargedErrorV1<io::Error>> {
+        let stat = fstat_raw_with_gate(fd, gate)?;
         Ok(CleanupIdentityV1 {
             device: stat.st_dev,
             inode: stat.st_ino,
@@ -1943,12 +2408,18 @@ mod platform {
         })
     }
 
-    fn open_path_at(parent: BorrowedFd<'_>, name: &CStr, attempts: u8) -> io::Result<OwnedFd> {
-        openat2_owned(
+    fn open_path_at_with_gate<G: PublisherAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, SnapshotChargedErrorV1<io::Error>> {
+        openat2_owned_with_gate(
             parent,
             name,
             libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             attempts,
+            gate,
         )
     }
 
@@ -1974,40 +2445,21 @@ mod platform {
         flags: i32,
         attempts: u8,
     ) -> io::Result<OwnedFd> {
-        let how = OpenHow {
-            flags: flags as u64,
-            mode: 0,
-            resolve: SNAPSHOT_RESOLVE,
-        };
-        let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
-        for _ in 0..attempts {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    &how,
-                    mem::size_of::<OpenHow>(),
-                )
-            };
-            if result >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
-            }
-            last = io::Error::last_os_error();
-            if last.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(last);
-            }
-        }
-        Err(last)
+        unmetered_leaf(openat2_owned_with_gate(
+            parent,
+            name,
+            flags,
+            attempts,
+            &UnmeteredPublisherAttemptGateV1,
+        ))
     }
 
-    fn openat2_owned_charged(
-        authority: &PublisherAuthorityV1<'_>,
-        bucket: PublisherAttemptBucketV1,
+    fn openat2_owned_with_gate<G: PublisherAttemptGateV1>(
         parent: BorrowedFd<'_>,
         name: &CStr,
         flags: i32,
         attempts: u8,
+        gate: &G,
     ) -> Result<OwnedFd, SnapshotChargedErrorV1<io::Error>> {
         let how = OpenHow {
             flags: flags as u64,
@@ -2016,8 +2468,8 @@ mod platform {
         };
         let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
         for _ in 0..attempts {
-            let result = authority
-                .run_attempt(bucket, || unsafe {
+            let result = gate
+                .run_attempt(|| unsafe {
                     libc::syscall(
                         libc::SYS_openat2,
                         parent.as_raw_fd(),
@@ -2039,6 +2491,23 @@ mod platform {
             }
         }
         Err(SnapshotChargedErrorV1::Leaf(last))
+    }
+
+    fn openat2_owned_charged(
+        authority: &PublisherAuthorityV1<'_>,
+        bucket: PublisherAttemptBucketV1,
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        flags: i32,
+        attempts: u8,
+    ) -> Result<OwnedFd, SnapshotChargedErrorV1<io::Error>> {
+        openat2_owned_with_gate(
+            parent,
+            name,
+            flags,
+            attempts,
+            &PublisherBucketAttemptGateV1 { authority, bucket },
+        )
     }
 
     struct CleanupNameBatchV1<'resources> {
@@ -2437,7 +2906,7 @@ mod platform {
             // the disjoint leaf-local reserve and leave no forward attempt.
             let fixture = Fixture::new();
             let connector = charged_connector(272 + LOCAL_REGULAR_CLEANUP_RESERVE, 1024 * 1024);
-            CHARGED_DIRECTORY_FSTAT_CALLS.with(|calls| calls.set(0));
+            DIRECTORY_FSTAT_CALLS.with(|calls| calls.set(0));
             let error = connector
                 .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
                 .err()
@@ -2453,7 +2922,7 @@ mod platform {
                     },
                 )
             );
-            assert_eq!(CHARGED_DIRECTORY_FSTAT_CALLS.with(|calls| calls.get()), 0);
+            assert_eq!(DIRECTORY_FSTAT_CALLS.with(|calls| calls.get()), 0);
             assert!(!fixture.staging_path().exists());
         }
 
@@ -2743,9 +3212,235 @@ mod platform {
             }
         }
 
+        struct SealEffectThenInterrupt {
+            calls: u8,
+        }
+
+        impl TransitionHookV1 for SealEffectThenInterrupt {
+            fn seal_directory(&mut self, directory: BorrowedFd<'_>) -> io::Result<()> {
+                self.calls += 1;
+                if self.calls == 1 {
+                    let result = unsafe {
+                        libc::fchmod(directory.as_raw_fd(), SEALED_DIRECTORY_MODE as libc::mode_t)
+                    };
+                    if result != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Err(io::Error::from_raw_os_error(libc::EINTR))
+            }
+        }
+
+        struct ReplaceAtPublishCheckpoint {
+            parent_path: PathBuf,
+        }
+
+        impl TransitionHookV1 for ReplaceAtPublishCheckpoint {
+            fn checkpoint(&mut self, stage: SnapshotPublishStageV1) -> io::Result<()> {
+                if stage != SnapshotPublishStageV1::PublishRename {
+                    return Ok(());
+                }
+                let staging = self.parent_path.join(OsStr::from_bytes(STAGING.to_bytes()));
+                fs::rename(&staging, self.parent_path.join("moved-original"))?;
+                fs::create_dir(&staging)?;
+                fs::write(staging.join("replacement"), b"preserved")?;
+                fs::set_permissions(&staging, fs::Permissions::from_mode(SEALED_DIRECTORY_MODE))
+            }
+        }
+
         #[test]
-        fn every_state_transition_has_a_deterministic_fail_closed_checkpoint() {
-            for (index, stage) in SnapshotPublishStageV1::ALL_TRANSITIONS
+        fn charged_finalization_seals_exactly_and_reconciles_effected_rename() {
+            let fixture = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
+                .unwrap();
+            fs::create_dir(fixture.staging_path().join("root")).unwrap();
+            let mut interrupt = InterruptRename {
+                behavior: InterruptedRenameV1::EffectThenInterrupt,
+                calls: 0,
+            };
+            FINALIZATION_ATTEMPT_CHARGES.with(|calls| calls.set(0));
+
+            let published =
+                seal_and_publish_charged_with_transitions(staged, FINAL, &mut interrupt).unwrap();
+
+            assert_eq!(interrupt.calls, 1);
+            // Three one-open revalidations cost five charges each. Seal and
+            // staging fsync cost two; effected-rename reconciliation costs
+            // four; parent fsync, final reopen, and two identities cost six.
+            assert_eq!(
+                FINALIZATION_ATTEMPT_CHARGES.with(|calls| calls.get()),
+                3 * 5 + 2 + 4 + 6
+            );
+            assert!(!fixture.staging_path().exists());
+            assert!(fixture.final_path().is_dir());
+            assert!(fixture.final_path().join("root").is_dir());
+            assert_eq!(
+                fs::metadata(fixture.final_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                SEALED_DIRECTORY_MODE
+            );
+            assert_eq!(
+                directory_identity(published.directory()).unwrap(),
+                published.identity()
+            );
+            assert_eq!(published.identity().mode & 0o7777, SEALED_DIRECTORY_MODE);
+        }
+
+        #[test]
+        fn charged_seal_effect_then_eintr_cleans_the_same_sealed_stage() {
+            let fixture = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
+                .unwrap();
+            let mut interrupt = SealEffectThenInterrupt { calls: 0 };
+
+            let error = seal_and_publish_charged_with_transitions(staged, FINAL, &mut interrupt)
+                .err()
+                .unwrap();
+            let SnapshotChargedErrorV1::Leaf(error) = error else {
+                panic!("seal failure must remain a publication-leaf error");
+            };
+            assert_eq!(interrupt.calls, 3);
+            assert_eq!(error.stage(), SnapshotPublishStageV1::SealStaging);
+            assert_eq!(error.errno(), Some(libc::EINTR));
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::Unpublished
+            );
+            assert!(!fixture.staging_path().exists());
+            assert!(!fixture.final_path().exists());
+        }
+
+        #[test]
+        fn charged_post_fsync_revalidation_never_publishes_or_deletes_a_replacement() {
+            let fixture = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
+                .unwrap();
+            let moved_original = fixture.temp.path().join("moved-original");
+            let mut replacement = ReplaceAtPublishCheckpoint {
+                parent_path: fixture.temp.path().to_owned(),
+            };
+
+            let error = seal_and_publish_charged_with_transitions(staged, FINAL, &mut replacement)
+                .err()
+                .unwrap();
+            let SnapshotChargedErrorV1::Leaf(error) = error else {
+                panic!("post-fsync identity drift must remain a publication-leaf error");
+            };
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::IdentityMismatch);
+            assert_eq!(error.stage(), SnapshotPublishStageV1::RevalidateStaging);
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::Unpublished
+            );
+            assert!(moved_original.is_dir());
+            assert_eq!(
+                fs::metadata(&moved_original).unwrap().permissions().mode() & 0o7777,
+                SEALED_DIRECTORY_MODE
+            );
+            assert_eq!(
+                fs::read(fixture.staging_path().join("replacement")).unwrap(),
+                b"preserved"
+            );
+            assert_eq!(
+                fs::metadata(fixture.staging_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                SEALED_DIRECTORY_MODE
+            );
+            assert!(!fixture.final_path().exists());
+        }
+
+        #[test]
+        fn charged_seal_checkpoint_and_post_rename_failure_report_exact_states() {
+            let before_seal = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(before_seal.parent.as_fd(), STAGING)
+                .unwrap();
+            let mut fault = FailAt {
+                stage: SnapshotPublishStageV1::SealStaging,
+            };
+            let error = seal_and_publish_charged_with_transitions(staged, FINAL, &mut fault)
+                .err()
+                .unwrap();
+            let SnapshotChargedErrorV1::Leaf(error) = error else {
+                panic!("checkpoint failure must remain a publication-leaf error");
+            };
+            assert_eq!(error.stage(), SnapshotPublishStageV1::SealStaging);
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::Unpublished
+            );
+            assert!(!before_seal.staging_path().exists());
+            assert!(!before_seal.final_path().exists());
+
+            let after_rename = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(after_rename.parent.as_fd(), STAGING)
+                .unwrap();
+            let mut fault = FailAt {
+                stage: SnapshotPublishStageV1::SyncParent,
+            };
+            let error = seal_and_publish_charged_with_transitions(staged, FINAL, &mut fault)
+                .err()
+                .unwrap();
+            let SnapshotChargedErrorV1::Leaf(error) = error else {
+                panic!("post-rename failure must remain a publication-leaf error");
+            };
+            assert_eq!(error.stage(), SnapshotPublishStageV1::SyncParent);
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::PublishedDurabilityUnknown
+            );
+            assert!(!after_rename.staging_path().exists());
+            assert!(after_rename.final_path().is_dir());
+            assert_eq!(
+                fs::metadata(after_rename.final_path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                SEALED_DIRECTORY_MODE
+            );
+
+            let after_parent_sync = Fixture::new();
+            let connector = charged_connector(1_000_000, 1024 * 1024);
+            let staged = connector
+                .create_staged_snapshot_directory_at(after_parent_sync.parent.as_fd(), STAGING)
+                .unwrap();
+            let mut fault = FailAt {
+                stage: SnapshotPublishStageV1::ReopenPublished,
+            };
+            let error = seal_and_publish_charged_with_transitions(staged, FINAL, &mut fault)
+                .err()
+                .unwrap();
+            let SnapshotChargedErrorV1::Leaf(error) = error else {
+                panic!("durable publication failure must remain a publication-leaf error");
+            };
+            assert_eq!(error.stage(), SnapshotPublishStageV1::ReopenPublished);
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::PublishedDurable
+            );
+            assert!(!after_parent_sync.staging_path().exists());
+            assert!(after_parent_sync.final_path().is_dir());
+        }
+
+        #[test]
+        fn every_legacy_transition_has_a_deterministic_fail_closed_checkpoint() {
+            for (index, stage) in SnapshotPublishStageV1::LEGACY_TRANSITIONS
                 .into_iter()
                 .enumerate()
             {
@@ -3421,13 +4116,23 @@ mod portable_tests {
     }
 
     #[test]
-    fn final_basename_validation_is_raw_and_strict() {
-        assert!(valid_raw_basename(c"snapshot-01"));
-        assert!(valid_raw_basename(c"snapshot-\xFF"));
-        assert!(!valid_raw_basename(c""));
-        assert!(!valid_raw_basename(c"."));
-        assert!(!valid_raw_basename(c".."));
-        assert!(!valid_raw_basename(c"nested/name"));
+    fn pure_final_name_validation_returns_one_typed_failure() {
+        let staging = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            validate_snapshot_final_name(staging, c"snapshot-\xFF"),
+            Ok(())
+        );
+
+        for invalid in [c"", c".", c"..", c"nested/name", staging] {
+            let error = validate_snapshot_final_name(staging, invalid).unwrap_err();
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::InvalidFinalName);
+            assert_eq!(error.stage(), SnapshotPublishStageV1::ValidateFinalName);
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::Unpublished
+            );
+            assert_eq!(error.errno(), None);
+        }
     }
 
     #[test]
@@ -3503,5 +4208,39 @@ mod portable_tests {
         assert_eq!(policy.max_live_staged_fds(), 1);
         assert_eq!(policy.max_live_cleanup_fds(), 2 * 9 + 4);
         assert_eq!(policy.max_live_publication_fds(), 2);
+    }
+
+    #[test]
+    fn policy_reports_the_exact_integrated_finalization_attempt_ceiling() {
+        let open_retries = 4_u64;
+        let generic_retries = 3_u64;
+        let policy = checked_policy(
+            open_retries as u8,
+            generic_retries as u8,
+            7,
+            11,
+            13,
+            64 * 1024,
+        )
+        .unwrap();
+        let staging_revalidations = 3 * (open_retries + 4);
+        let seal_and_staging_sync = 2 * generic_retries;
+        let rename_reconciliation = generic_retries * (2 * open_retries + 2);
+        let parent_sync = generic_retries;
+        let final_reopen_and_identity = open_retries + 4;
+        let decomposed = staging_revalidations
+            + seal_and_staging_sync
+            + rename_reconciliation
+            + parent_sync
+            + final_reopen_and_identity;
+
+        assert_eq!(
+            policy.finalization_operation_attempt_bound().get(),
+            decomposed
+        );
+        assert_eq!(
+            decomposed,
+            4 * open_retries + 16 + generic_retries * (2 * open_retries + 5)
+        );
     }
 }

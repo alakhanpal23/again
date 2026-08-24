@@ -6,38 +6,23 @@ This is the frozen Stage 0 binary and identity contract for the future
 `linux-pytest-v1` profile. It documents the crate-private contract in
 `src/linux_pytest.rs`, `src/linux_pytest/canonical.rs`, and
 `src/linux_pytest/identity.rs`. The module remains unreachable from the public
-CLI, and its concrete admission, sealed-snapshot, sandbox, tracer, storage, and
-worker implementations do not exist. The connector now wires source
-observation through its shared ledger and precharges one full retained-view
-ceiling before each walk; a linear lease held beside the resulting plan limits
-coexisting full views to two. This is a structural ceiling, not exact
-allocator-capacity accounting inside the plan. A no-atime source-view
-qualification path exists but is not connector-wired; its fixed local probe
-retries are outside the shared resource ledger, so callers cannot yet obtain
-that authority through the charged pipeline. On Linux x86_64, one
-connector-owned operation now reserves two full-plan ceilings, creates the
-charged private stage, traverses the already-qualified source, invokes charged
-regular copying, finalizes supported metadata and durability, and returns the
-populated RAII-cleanup guard beside the retained copy-time source plan. Its
-source-plan lease remains live after the materializer-workspace lease is
-released. Source-enumeration, materialization, and regular-copy policies are
-bound into the same connector-minted session.
+CLI, and its concrete admission, canonical sealed-snapshot provider, sandbox,
+tracer, storage, and worker implementations do not exist. A narrow
+crate-private physical-publication checkpoint is implemented; its mechanics
+and limits are specified by the
+[profile contract](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint).
 
-The Linux x86_64 connector now consumes that copy-time plan as S1, observes an
-independent S2, then observes D1 and D2 from the private stage under distinct
-connector-minted `DestinationObservation`-charged sessions. Destination
-directory and regular-file reads use `O_NOATIME`; destination symlinks are
-refused after descriptor-selected type identification and before xattr or
-target acquisition, including before `readlinkat`. Comparisons run in the
-fixed order S1/S2, S1/D1, and D1/D2. Plans are released between steps so at
-most two retained-view leases coexist, and all plans are gone on success.
-Success returns only the still-unready cleanup guard; comparison success mints
-no authority, and there is no ready, publish, Python-execution, or reuse
-transition.
+For this wire contract, its `PublishedSnapshotDirectoryV1` result is opaque
+and creates no canonical object, manifest, digest, or content-addressed name.
+It grants no execution, Python, isolation, or reuse authority and makes no
+claim against a malicious same-UID process or host root. The positive
+full-flow test remains ignored until both source and destination filesystems
+are functionally qualified for no-atime access; hosted CI supplies no positive
+evidence for the qualified full flow.
 
 Runtime qualification and retained evidence are tracked in
-[STATUS.md](STATUS.md). Nothing in this document is evidence that a sealed
-snapshot, pytest execution, or reuse is available.
+[STATUS.md](STATUS.md). Nothing in this document is evidence that a canonical
+sealed snapshot, pytest execution, or reuse is available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR
@@ -604,11 +589,11 @@ runtime material part of identity without pretending it is a child of the
 writable workspace tree.
 
 The strict manifest encoder, decoder, canonical round-trip check, and
-validators are contract code. The regular-file leaf now performs
-descriptor-selected reflink or sparse-copy materialization, destination-byte
-hashing, extent comparison, and source/destination reopen validation on Linux
-x86_64. Full traversal, xattrs, hardlinks, metadata application, publication,
-CAS persistence, and runtime mounting remain to be implemented and gated.
+validators are contract code. The physical checkpoint linked above does not
+encode this manifest or bind its digests to the published directory. Canonical
+manifest construction from published bytes, content-addressed naming, CAS
+persistence, runtime mounting, isolation, and execution remain to be
+implemented and gated.
 
 ## Promotion lookup and V2 storage boundary
 

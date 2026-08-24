@@ -188,8 +188,9 @@ basename is forward-charged and retained cleanup names are cleanup-charged. For
 cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
 live retained-name heap is `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each
 active cleanup frame retains a fixed two-slot name batch on the stack; those
-stack bytes are outside the transient-heap ledger. The guard exposes no ready,
-publish, or execution transition.
+stack bytes are outside the transient-heap ledger. The materializer alone
+returns a connector-private cleanup guard; production code does not expose
+that guard after the subsequent D2 comparison.
 
 The current Linux x86_64 connector continues from the copy-time source plan S1
 with an independent source observation S2, followed by destination observations
@@ -200,13 +201,17 @@ identification and before xattr or target acquisition, including before
 `readlinkat`. The connector compares S1/S2, S1/D1 with the stage's expected
 physical owner, and D1/D2, in that order. It drops retained plans between steps
 so no more than two retained-view leases coexist. On success all plans and
-leases are gone and only the still-unready cleanup guard returns; the
-comparison result does not mint readiness, publication, execution, or reuse
-authority, and no Python process can run through this checkpoint.
+leases are gone, and the D2-complete guard remains inside the connector. The
+subsequent charged publication mechanics and authority limits are normative in
+the [profile contract](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint);
+the isolation consequences are summarized in section 5 below.
 
 Runtime qualification and retained evidence are tracked in
-[STATUS.md](STATUS.md). Readiness, immutable publication, and every later
-isolation step in this note remain research requirements.
+[STATUS.md](STATUS.md). The positive full-flow test remains ignored until both
+source and destination filesystems are functionally qualified for no-atime
+access, so hosted CI is not positive evidence for the qualified full flow.
+Canonical manifest/digest authority and every later isolation step in this
+note remain research requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`
@@ -239,17 +244,22 @@ The current connector constructs and consumes the four views in this order:
 
 It compares S1/S2, S1/D1, and D1/D2. Exact comparison makes the D2 match to S1
 transitive rather than retaining a third plan for another direct comparison.
-The final physical sealed-mode projection and its post-chmod xattr verification
-are already part of both destination views. The current materializer fsyncs
-each supported file and directory before destination observation, but the
-success value remains only an unready cleanup guard whose staged-directory
-descriptor is still visible inside the crate. A complete backend must hide
-that mutation surface or perform another exact revalidation before turning the
-state into nonforgeable readiness. It must also preserve or reprove the
-durability boundary for every compared semantic field, atomically publish with
-`renameat2(..., RENAME_NOREPLACE)`, and fsync the state parent directory. The
-logical source mode remains in the manifest and is restored only on the private
-execution branch.
+The final physical sealed-mode projection and post-chmod xattr verification of
+every manifest entry are already part of both destination views. The current
+materializer fsyncs each supported file and directory before destination
+observation. After D2, charged publication separately changes the non-manifest
+staging container to mode `0500`; the connector does not expose the staging
+descriptor and follows the
+[normative charged-publication sequence](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint).
+Only the opaque published directory capability leaves that operation. It
+grants no canonical manifest or digest, content-addressed name, execution,
+Python, isolation, or reuse authority.
+
+A complete backend must still construct and authenticate the canonical
+manifest and digest, bind them to a content-addressed immutable name, and mint
+the later isolation/execution authorities. The malicious same-UID and
+host-root threat boundary also remains open. The logical source mode remains
+in the future manifest and is restored only on the private execution branch.
 
 The per-run branch uses the same verified reflink/sparse-copy algorithm from
 sealed input. Branch writes must not change either sealed input or the host
