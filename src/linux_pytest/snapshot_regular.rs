@@ -445,6 +445,26 @@ mod platform {
             .map_err(MeteredIoV1::Io)
     }
 
+    /// Run one bounded retry class while charging immediately before every raw
+    /// operation.
+    fn run_retryable_io_attempts<G: KernelAttemptGateV1, T>(
+        gate: &G,
+        attempts: u8,
+        exhausted_errno: i32,
+        retryable: impl Fn(&io::Error) -> bool,
+        mut attempt: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, MeteredIoV1<G::ChargeError>> {
+        let mut last = io::Error::from_raw_os_error(exhausted_errno);
+        for _ in 0..attempts {
+            match run_io_attempt(gate, &mut attempt) {
+                Ok(value) => return Ok(value),
+                Err(MeteredIoV1::Io(error)) if retryable(&error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(MeteredIoV1::Io(last))
+    }
+
     #[cfg(test)]
     fn into_direct_io<T>(result: Result<T, MeteredIoV1<Infallible>>) -> io::Result<T> {
         match result {
@@ -1344,9 +1364,12 @@ mod platform {
             mode: mode as u64,
             resolve,
         };
-        let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
-        for _ in 0..attempts {
-            match run_io_attempt(gate, || {
+        run_retryable_io_attempts(
+            gate,
+            attempts,
+            libc::EAGAIN,
+            |error| error.raw_os_error() == Some(libc::EAGAIN),
+            || {
                 let result = unsafe {
                     libc::syscall(
                         libc::SYS_openat2,
@@ -1361,15 +1384,8 @@ mod platform {
                 } else {
                     Err(io::Error::last_os_error())
                 }
-            }) {
-                Ok(descriptor) => return Ok(descriptor),
-                Err(MeteredIoV1::Io(error)) if error.raw_os_error() == Some(libc::EAGAIN) => {
-                    last = error;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(MeteredIoV1::Io(last))
+            },
+        )
     }
 
     fn statx_identity_with_gate<G: KernelAttemptGateV1>(
@@ -1432,9 +1448,12 @@ mod platform {
         syscall_attempts: u8,
         gate: &G,
     ) -> Result<CleanupIdentity, MeteredIoV1<G::ChargeError>> {
-        let mut last = io::Error::from_raw_os_error(libc::EINTR);
-        for _ in 0..syscall_attempts {
-            match run_io_attempt(gate, || {
+        run_retryable_io_attempts(
+            gate,
+            syscall_attempts,
+            libc::EINTR,
+            |error| error.kind() == io::ErrorKind::Interrupted,
+            || {
                 let mut raw = MaybeUninit::<libc::stat>::zeroed();
                 if unsafe { libc::fstat(fd.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
                     return Err(io::Error::last_os_error());
@@ -1444,15 +1463,8 @@ mod platform {
                     device: raw.st_dev,
                     inode: raw.st_ino,
                 })
-            }) {
-                Ok(identity) => return Ok(identity),
-                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
-                    last = error;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(MeteredIoV1::Io(last))
+            },
+        )
     }
 
     fn unlinkat_with_gate<G: KernelAttemptGateV1>(
@@ -1461,24 +1473,20 @@ mod platform {
         syscall_attempts: u8,
         gate: &G,
     ) -> Result<(), MeteredIoV1<G::ChargeError>> {
-        let mut last = io::Error::from_raw_os_error(libc::EINTR);
-        for _ in 0..syscall_attempts {
-            match run_io_attempt(gate, || {
+        run_retryable_io_attempts(
+            gate,
+            syscall_attempts,
+            libc::EINTR,
+            |error| error.kind() == io::ErrorKind::Interrupted,
+            || {
                 let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
                 if result == 0 {
                     Ok(())
                 } else {
                     Err(io::Error::last_os_error())
                 }
-            }) {
-                Ok(()) => return Ok(()),
-                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
-                    last = error;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(MeteredIoV1::Io(last))
+            },
+        )
     }
 
     #[cfg(test)]
@@ -2606,6 +2614,50 @@ mod platform {
                 "the N+1 unlink must not run after cleanup authority is exhausted"
             );
             fs::remove_file(short_fixture.destination("output")).unwrap();
+        }
+
+        #[test]
+        fn every_forward_budget_cutpoint_in_reflink_fallback_refuses_before_next_gated_closure() {
+            let bytes = b"deterministic-fallback-prefix-matrix";
+            let policy = policy();
+            let discovery_fixture = Fixture::with_input(bytes);
+            let discovery_hooks = ForcedCloneError {
+                errno: libc::EOPNOTSUPP,
+                calls: Cell::new(0),
+            };
+            let discovery = TestGate::bounded_with_cleanup(u64::MAX, u64::MAX);
+            finish(
+                discovery_fixture
+                    .copy_input_with_gate(policy, &discovery_hooks, &discovery)
+                    .unwrap(),
+            );
+            let required = discovery.raw_calls.get();
+            assert_eq!(discovery_hooks.calls.get(), 1);
+            assert!(required > 10, "the matrix must span the fallback path");
+
+            for budget in 0..required {
+                let fixture = Fixture::with_input(bytes);
+                let hooks = ForcedCloneError {
+                    errno: libc::EOPNOTSUPP,
+                    calls: Cell::new(0),
+                };
+                let gate =
+                    TestGate::bounded_with_cleanup(budget, policy.local_cleanup_attempt_bound());
+                assert!(matches!(
+                    fixture.copy_input_with_gate(policy, &hooks, &gate),
+                    Err(GatedRegularFailureV1::Charge(GateExhausted))
+                ));
+                assert_eq!(
+                    gate.raw_calls.get(),
+                    budget,
+                    "budget {budget} invoked the N+1 gated closure"
+                );
+                assert_eq!(gate.remaining.get(), 0);
+                assert!(
+                    !fixture.destination("output").exists(),
+                    "budget {budget} left a partial fallback destination"
+                );
+            }
         }
 
         #[test]

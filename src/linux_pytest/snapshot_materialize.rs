@@ -16,18 +16,24 @@ use std::fmt;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
 use super::RefusalCode;
-use super::snapshot_publish::{
-    SnapshotCleanupEnvelopeV1, SnapshotPublishErrorV1, StagedSnapshotDirectoryV1,
-    VerifiedReadySnapshotDirectoryV1,
-};
+use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
+use super::snapshot_publish::SnapshotCleanupEnvelopeV1;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::SnapshotPublishErrorV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::StagedSnapshotDirectoryV1;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::VerifiedReadySnapshotDirectoryV1;
 use super::snapshot_regular::SnapshotRegularStageV1;
-#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::SourceRegularEvidenceV1;
-#[cfg(test)]
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::SourceTreePlanV1;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::{
     SourceDirectoryVisitV1, SourceRegularVisitV1, SourceSymlinkVisitV1, SourceTreeVisitorV1,
 };
-use super::snapshot_tree::{SourceEnumerationPolicyV1, SourceNodeKindV1, SourceTreePlanV1};
+use super::snapshot_tree::{SourceEnumerationPolicyV1, SourceNodeKindV1};
 
 const HARD_MAX_DEPTH: u16 = 256;
 const HARD_MAX_BASENAME_BYTES: u16 = 255;
@@ -388,36 +394,62 @@ fn cleanup_authority_failure() -> SnapshotMaterializeFailureV1 {
     )
 }
 
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 #[derive(Debug)]
-pub(super) enum SnapshotMaterializeFinishErrorV1 {
+enum SnapshotMaterializeFinishErrorV1 {
     Materialize(SnapshotMaterializeFailureV1),
     Publisher(SnapshotPublishErrorV1),
 }
 
-impl fmt::Display for SnapshotMaterializeFinishErrorV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Materialize(error) => write!(formatter, "materializer readiness failed: {error}"),
-            Self::Publisher(error) => write!(formatter, "publisher readiness failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotMaterializeFinishErrorV1 {}
-
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 impl From<SnapshotMaterializeFailureV1> for SnapshotMaterializeFinishErrorV1 {
     fn from(error: SnapshotMaterializeFailureV1) -> Self {
         Self::Materialize(error)
     }
 }
 
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 impl From<SnapshotPublishErrorV1> for SnapshotMaterializeFinishErrorV1 {
     fn from(error: SnapshotPublishErrorV1) -> Self {
         Self::Publisher(error)
     }
 }
 
-pub(super) type SnapshotMaterializerV1<'parent> = platform::SnapshotMaterializerV1<'parent>;
+/// Private attempt authority used by the destination materializer.
+///
+/// A later specialized adapter in this module will delegate to the
+/// connector's non-forgeable materialization session. Keeping the trait and
+/// generic constructor private prevents sibling modules from substituting an
+/// unmetered production gate. Every explicit materializer-local filesystem or
+/// identity operation governed here is reached only from a closure passed to
+/// the gate, each closure contains at most one such operation, and retry loops
+/// re-enter the gate before each retry.
+trait SnapshotMaterializeAttemptGateV1 {
+    fn run_materialization_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1>;
+}
+
+/// A charged materializer failure keeps shared-ledger exhaustion distinct
+/// from a leaf correctness refusal.
+#[derive(Debug)]
+enum SnapshotChargedMaterializeErrorV1 {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(SnapshotMaterializeFailureV1),
+}
+
+impl From<SnapshotPipelineResourceErrorV1> for SnapshotChargedMaterializeErrorV1 {
+    fn from(error: SnapshotPipelineResourceErrorV1) -> Self {
+        Self::Resource(error)
+    }
+}
+
+impl From<SnapshotMaterializeFailureV1> for SnapshotChargedMaterializeErrorV1 {
+    fn from(error: SnapshotMaterializeFailureV1) -> Self {
+        Self::Leaf(error)
+    }
+}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
@@ -455,6 +487,64 @@ mod platform {
         | libc::STATX_INO
         | libc::STATX_SIZE
         | STATX_MNT_ID;
+
+    /// Unit tests exercise the exact production plumbing without drawing from
+    /// the connector ledger. Production construction must supply the
+    /// connector-owned gate instead.
+    #[cfg(test)]
+    struct DirectMaterializeAttemptGateV1;
+
+    #[cfg(test)]
+    impl SnapshotMaterializeAttemptGateV1 for DirectMaterializeAttemptGateV1 {
+        fn run_materialization_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            Ok(attempt())
+        }
+    }
+
+    #[derive(Debug)]
+    enum MaterializeAttemptErrorV1 {
+        Resource(SnapshotPipelineResourceErrorV1),
+        Io(io::Error),
+    }
+
+    fn run_io_attempt<G: SnapshotMaterializeAttemptGateV1, T>(
+        gate: &G,
+        attempt: impl FnOnce() -> io::Result<T>,
+    ) -> Result<T, MaterializeAttemptErrorV1> {
+        gate.run_materialization_attempt(attempt)
+            .map_err(MaterializeAttemptErrorV1::Resource)?
+            .map_err(MaterializeAttemptErrorV1::Io)
+    }
+
+    fn map_attempt_leaf(
+        error: MaterializeAttemptErrorV1,
+        map_io: impl FnOnce(io::Error) -> SnapshotMaterializeFailureV1,
+    ) -> SnapshotChargedMaterializeErrorV1 {
+        match error {
+            MaterializeAttemptErrorV1::Resource(error) => {
+                SnapshotChargedMaterializeErrorV1::Resource(error)
+            }
+            MaterializeAttemptErrorV1::Io(error) => {
+                SnapshotChargedMaterializeErrorV1::Leaf(map_io(error))
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn direct_leaf<T>(
+        result: Result<T, SnapshotChargedMaterializeErrorV1>,
+    ) -> Result<T, SnapshotMaterializeFailureV1> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(SnapshotChargedMaterializeErrorV1::Leaf(error)) => Err(error),
+            Err(SnapshotChargedMaterializeErrorV1::Resource(_)) => {
+                unreachable!("the test-only direct materialization gate cannot exhaust")
+            }
+        }
+    }
 
     #[repr(C)]
     struct OpenHow {
@@ -504,7 +594,7 @@ mod platform {
         }
     }
 
-    pub(in crate::linux_pytest) trait MaterializeHooks {
+    trait MaterializeHooks {
         fn checkpoint(
             &self,
             _stage: SnapshotMaterializeStageV1,
@@ -523,16 +613,14 @@ mod platform {
         fn remove_xattr(&self, fd: RawFd, name: &CStr) -> io::Result<()>;
     }
 
-    pub(in crate::linux_pytest) struct KernelHooks {
-        syscall_attempts: u8,
-    }
+    struct KernelHooks;
 
     impl MaterializeHooks for KernelHooks {
         fn list_xattrs(&self, fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
             let (pointer, length) = output
                 .map(|buffer| (buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()))
                 .unwrap_or((std::ptr::null_mut(), 0));
-            retry_eintr_size(self.syscall_attempts, || unsafe {
+            let result = unsafe {
                 libc::syscall(
                     SYS_LISTXATTRAT_X86_64,
                     fd,
@@ -541,7 +629,12 @@ mod platform {
                     pointer,
                     length,
                 )
-            })
+            };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+            }
         }
 
         fn get_xattr(
@@ -559,7 +652,7 @@ mod platform {
                     .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
                 flags: 0,
             };
-            retry_eintr_size(self.syscall_attempts, || unsafe {
+            let result = unsafe {
                 libc::syscall(
                     SYS_GETXATTRAT_X86_64,
                     fd,
@@ -569,7 +662,12 @@ mod platform {
                     &mut args,
                     mem::size_of::<XattrArgs>(),
                 )
-            })
+            };
+            if result < 0 {
+                Err(io::Error::last_os_error())
+            } else {
+                usize::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+            }
         }
 
         fn set_xattr(&self, fd: RawFd, name: &CStr, value: &[u8]) -> io::Result<()> {
@@ -579,7 +677,7 @@ mod platform {
                     .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
                 flags: 0,
             };
-            retry_eintr_zero(self.syscall_attempts, || unsafe {
+            let result = unsafe {
                 libc::syscall(
                     SYS_SETXATTRAT_X86_64,
                     fd,
@@ -589,11 +687,16 @@ mod platform {
                     &mut args,
                     mem::size_of::<XattrArgs>(),
                 ) as libc::c_int
-            })
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
         }
 
         fn remove_xattr(&self, fd: RawFd, name: &CStr) -> io::Result<()> {
-            retry_eintr_zero(self.syscall_attempts, || unsafe {
+            let result = unsafe {
                 libc::syscall(
                     SYS_REMOVEXATTRAT_X86_64,
                     fd,
@@ -601,7 +704,12 @@ mod platform {
                     AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
                     name.as_ptr(),
                 ) as libc::c_int
-            })
+            };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
         }
     }
 
@@ -650,10 +758,11 @@ mod platform {
         }
     }
 
-    pub(in crate::linux_pytest) struct SnapshotMaterializerWithHooksV1<'parent, H> {
+    struct SnapshotMaterializerWithGateV1<'parent, H, G> {
         staging: StagedSnapshotDirectoryV1<'parent>,
         policy: SnapshotMaterializePolicyV1,
         hooks: H,
+        attempt_gate: G,
         xattr_operations: XattrOperationBudgetV1,
         stack: Vec<ActiveDirectoryV1>,
         event_commitments: Vec<[u8; 32]>,
@@ -662,29 +771,44 @@ mod platform {
         total_xattrs: u64,
     }
 
-    pub(in crate::linux_pytest) type SnapshotMaterializerV1<'parent> =
-        SnapshotMaterializerWithHooksV1<'parent, KernelHooks>;
+    #[cfg(test)]
+    type SnapshotMaterializerWithHooksV1<'parent, H> =
+        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>;
 
-    impl<'parent> SnapshotMaterializerWithHooksV1<'parent, KernelHooks> {
+    #[cfg(test)]
+    type SnapshotMaterializerV1<'parent> = SnapshotMaterializerWithHooksV1<'parent, KernelHooks>;
+
+    #[cfg(test)]
+    impl<'parent> SnapshotMaterializerWithGateV1<'parent, KernelHooks, DirectMaterializeAttemptGateV1> {
         pub(super) fn new(
             staging: StagedSnapshotDirectoryV1<'parent>,
             policy: SnapshotMaterializePolicyV1,
         ) -> Result<Self, SnapshotMaterializeFailureV1> {
-            Self::new_with_hooks(
-                staging,
-                policy,
-                KernelHooks {
-                    syscall_attempts: policy.syscall_attempts.get(),
-                },
-            )
+            Self::new_with_hooks(staging, policy, KernelHooks)
         }
     }
 
-    impl<'parent, H: MaterializeHooks> SnapshotMaterializerWithHooksV1<'parent, H> {
+    #[cfg(test)]
+    impl<'parent, H: MaterializeHooks>
+        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>
+    {
         fn new_with_hooks(
             staging: StagedSnapshotDirectoryV1<'parent>,
             policy: SnapshotMaterializePolicyV1,
             hooks: H,
+        ) -> Result<Self, SnapshotMaterializeFailureV1> {
+            Self::new_with_gate(staging, policy, hooks, DirectMaterializeAttemptGateV1)
+        }
+    }
+
+    impl<'parent, H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<'parent, H, G>
+    {
+        fn new_with_gate(
+            staging: StagedSnapshotDirectoryV1<'parent>,
+            policy: SnapshotMaterializePolicyV1,
+            hooks: H,
+            attempt_gate: G,
         ) -> Result<Self, SnapshotMaterializeFailureV1> {
             if !cleanup_envelope_covers(staging.cleanup_envelope(), policy) {
                 return Err(cleanup_authority_failure());
@@ -693,6 +817,7 @@ mod platform {
                 staging,
                 policy,
                 hooks,
+                attempt_gate,
                 xattr_operations: XattrOperationBudgetV1::new(policy.max_xattr_operations.get()),
                 stack: Vec::new(),
                 event_commitments: Vec::new(),
@@ -700,21 +825,6 @@ mod platform {
                 total_xattr_bytes: 0,
                 total_xattrs: 0,
             })
-        }
-
-        pub(super) fn finish(
-            mut self,
-            plan: &SourceTreePlanV1,
-        ) -> Result<VerifiedReadySnapshotDirectoryV1<'parent>, SnapshotMaterializeFinishErrorV1>
-        {
-            begin_plan_validation(&self.hooks, self.policy, plan)?;
-            refuse_unqualified_plan_symlinks(plan)?;
-            self.validate_finished_plan(plan)?;
-            self.consolidate_hardlinks(plan)?;
-            self.refinalize_hardlink_anchors(plan)?;
-            self.finalize_directories(plan)?;
-            let Self { staging, .. } = self;
-            Ok(staging.verify_ready_with(|_| Ok(()))?)
         }
 
         fn staging_directory(&self) -> BorrowedFd<'_> {
@@ -902,10 +1012,10 @@ mod platform {
         fn consolidate_hardlinks(
             &self,
             plan: &SourceTreePlanV1,
-        ) -> Result<(), SnapshotMaterializeFailureV1> {
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
             for group in plan.hardlink_groups() {
                 let Some((&first, remaining)) = group.member_indices().split_first() else {
-                    return Err(plan_failure(b""));
+                    return Err(plan_failure(b"").into());
                 };
                 let first_index = first as usize;
                 let first_entry = plan
@@ -924,15 +1034,23 @@ mod platform {
                     first_index,
                     self.policy.max_depth,
                     self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
                 )?;
                 let first_handle = open_path_at(
                     first_parent.as_fd(),
                     &first_name,
                     self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
                 )
-                .map_err(|error| open_io(first_entry.relative_path(), error))?;
-                let first_identity = destination_identity(first_handle.as_fd())
-                    .map_err(|error| map_identity_error(first_entry.relative_path(), error))?;
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| open_io(first_entry.relative_path(), error))
+                })?;
+                let first_identity = destination_identity(first_handle.as_fd(), &self.attempt_gate)
+                    .map_err(|error| {
+                        map_attempt_leaf(error, |error| {
+                            map_identity_error(first_entry.relative_path(), error)
+                        })
+                    })?;
                 for member in remaining {
                     let member_index = *member as usize;
                     let entry = plan
@@ -946,63 +1064,109 @@ mod platform {
                         member_index,
                         self.policy.max_depth,
                         self.policy.openat2_attempts.get(),
+                        &self.attempt_gate,
                     )?;
-                    let replaced =
-                        open_path_at(parent.as_fd(), &name, self.policy.openat2_attempts.get())
-                            .map_err(|error| open_io(entry.relative_path(), error))?;
-                    let replaced_identity = destination_identity(replaced.as_fd())
-                        .map_err(|error| map_identity_error(entry.relative_path(), error))?;
+                    let replaced = open_path_at(
+                        parent.as_fd(),
+                        &name,
+                        self.policy.openat2_attempts.get(),
+                        &self.attempt_gate,
+                    )
+                    .map_err(|error| {
+                        map_attempt_leaf(error, |error| open_io(entry.relative_path(), error))
+                    })?;
+                    let replaced_identity =
+                        destination_identity(replaced.as_fd(), &self.attempt_gate).map_err(
+                            |error| {
+                                map_attempt_leaf(error, |error| {
+                                    map_identity_error(entry.relative_path(), error)
+                                })
+                            },
+                        )?;
                     if replaced_identity.same_object(&first_identity) {
-                        return Err(metadata_mismatch(entry.relative_path()));
+                        return Err(metadata_mismatch(entry.relative_path()).into());
                     }
                     drop(replaced);
-                    retry_eintr_zero(self.policy.syscall_attempts.get(), || unsafe {
-                        libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0)
-                    })
+                    retry_eintr_io(
+                        &self.attempt_gate,
+                        self.policy.syscall_attempts.get(),
+                        || {
+                            raw_zero(unsafe {
+                                libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0)
+                            })
+                        },
+                    )
                     .map_err(|error| {
-                        mutation_io(
-                            SnapshotMaterializeStageV1::ConsolidateHardlinks,
-                            entry.relative_path(),
-                            error,
-                        )
+                        map_attempt_leaf(error, |error| {
+                            mutation_io(
+                                SnapshotMaterializeStageV1::ConsolidateHardlinks,
+                                entry.relative_path(),
+                                error,
+                            )
+                        })
                     })?;
-                    retry_eintr_zero(self.policy.syscall_attempts.get(), || unsafe {
-                        libc::linkat(
-                            first_parent.as_raw_fd(),
-                            first_name.as_ptr(),
-                            parent.as_raw_fd(),
-                            name.as_ptr(),
-                            0,
-                        )
-                    })
+                    retry_eintr_io(
+                        &self.attempt_gate,
+                        self.policy.syscall_attempts.get(),
+                        || {
+                            raw_zero(unsafe {
+                                libc::linkat(
+                                    first_parent.as_raw_fd(),
+                                    first_name.as_ptr(),
+                                    parent.as_raw_fd(),
+                                    name.as_ptr(),
+                                    0,
+                                )
+                            })
+                        },
+                    )
                     .map_err(|error| {
-                        mutation_io(
-                            SnapshotMaterializeStageV1::ConsolidateHardlinks,
-                            entry.relative_path(),
-                            error,
-                        )
+                        map_attempt_leaf(error, |error| {
+                            mutation_io(
+                                SnapshotMaterializeStageV1::ConsolidateHardlinks,
+                                entry.relative_path(),
+                                error,
+                            )
+                        })
                     })?;
-                    let linked =
-                        open_path_at(parent.as_fd(), &name, self.policy.openat2_attempts.get())
-                            .map_err(|error| open_io(entry.relative_path(), error))?;
-                    let linked_identity = destination_identity(linked.as_fd())
-                        .map_err(|error| map_identity_error(entry.relative_path(), error))?;
+                    let linked = open_path_at(
+                        parent.as_fd(),
+                        &name,
+                        self.policy.openat2_attempts.get(),
+                        &self.attempt_gate,
+                    )
+                    .map_err(|error| {
+                        map_attempt_leaf(error, |error| open_io(entry.relative_path(), error))
+                    })?;
+                    let linked_identity = destination_identity(linked.as_fd(), &self.attempt_gate)
+                        .map_err(|error| {
+                            map_attempt_leaf(error, |error| {
+                                map_identity_error(entry.relative_path(), error)
+                            })
+                        })?;
                     if !linked_identity.same_object(&first_identity) {
-                        return Err(metadata_mismatch(entry.relative_path()));
+                        return Err(metadata_mismatch(entry.relative_path()).into());
                     }
                 }
                 let rebound = open_path_at(
                     first_parent.as_fd(),
                     &first_name,
                     self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
                 )
-                .map_err(|error| open_io(first_entry.relative_path(), error))?;
-                let rebound_identity = destination_identity(rebound.as_fd())
-                    .map_err(|error| map_identity_error(first_entry.relative_path(), error))?;
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| open_io(first_entry.relative_path(), error))
+                })?;
+                let rebound_identity = destination_identity(rebound.as_fd(), &self.attempt_gate)
+                    .map_err(|error| {
+                        map_attempt_leaf(error, |error| {
+                            map_identity_error(first_entry.relative_path(), error)
+                        })
+                    })?;
                 if !rebound_identity.same_object(&first_identity)
                     || rebound_identity.nlink != first_entry.statx().nlink()
                 {
-                    return Err(metadata_mismatch(first_entry.relative_path()));
+                    return Err(metadata_mismatch(first_entry.relative_path()).into());
                 }
             }
             Ok(())
@@ -1011,10 +1175,10 @@ mod platform {
         fn refinalize_hardlink_anchors(
             &self,
             plan: &SourceTreePlanV1,
-        ) -> Result<(), SnapshotMaterializeFailureV1> {
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
             for group in plan.hardlink_groups() {
                 let Some(first) = group.member_indices().first() else {
-                    return Err(plan_failure(b""));
+                    return Err(plan_failure(b"").into());
                 };
                 let index = *first as usize;
                 let entry = plan.entries().get(index).ok_or_else(|| plan_failure(b""))?;
@@ -1025,27 +1189,56 @@ mod platform {
                     index,
                     self.policy.max_depth,
                     self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
                 )?;
-                let handle =
-                    open_path_at(parent.as_fd(), &name, self.policy.openat2_attempts.get())
-                        .map_err(|error| open_io(entry.relative_path(), error))?;
-                let pinned = destination_identity(handle.as_fd())
-                    .map_err(|error| map_identity_error(entry.relative_path(), error))?;
-                chmod_empty_path(handle.as_fd(), 0o600, self.policy.syscall_attempts.get())
-                    .map_err(|error| {
+                let handle = open_path_at(
+                    parent.as_fd(),
+                    &name,
+                    self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
+                )
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| open_io(entry.relative_path(), error))
+                })?;
+                let pinned =
+                    destination_identity(handle.as_fd(), &self.attempt_gate).map_err(|error| {
+                        map_attempt_leaf(error, |error| {
+                            map_identity_error(entry.relative_path(), error)
+                        })
+                    })?;
+                chmod_empty_path(
+                    handle.as_fd(),
+                    0o600,
+                    self.policy.syscall_attempts.get(),
+                    &self.attempt_gate,
+                )
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| {
                         metadata_io(
                             SnapshotMaterializeStageV1::ApplyMode,
                             entry.relative_path(),
                             error,
                         )
-                    })?;
-                let writable =
-                    open_regular_at(parent.as_fd(), &name, self.policy.openat2_attempts.get())
-                        .map_err(|error| open_io(entry.relative_path(), error))?;
-                let rebound = destination_identity(writable.as_fd())
-                    .map_err(|error| map_identity_error(entry.relative_path(), error))?;
+                    })
+                })?;
+                let writable = open_regular_at(
+                    parent.as_fd(),
+                    &name,
+                    self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
+                )
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| open_io(entry.relative_path(), error))
+                })?;
+                let rebound = destination_identity(writable.as_fd(), &self.attempt_gate).map_err(
+                    |error| {
+                        map_attempt_leaf(error, |error| {
+                            map_identity_error(entry.relative_path(), error)
+                        })
+                    },
+                )?;
                 if !rebound.same_object(&pinned) {
-                    return Err(metadata_mismatch(entry.relative_path()));
+                    return Err(metadata_mismatch(entry.relative_path()).into());
                 }
                 self.finalize_regular(
                     writable.as_fd(),
@@ -1053,10 +1246,14 @@ mod platform {
                     entry.xattrs(),
                     entry.relative_path(),
                 )?;
-                let rebound = destination_identity(handle.as_fd())
-                    .map_err(|error| map_identity_error(entry.relative_path(), error))?;
+                let rebound =
+                    destination_identity(handle.as_fd(), &self.attempt_gate).map_err(|error| {
+                        map_attempt_leaf(error, |error| {
+                            map_identity_error(entry.relative_path(), error)
+                        })
+                    })?;
                 if !rebound.same_object(&pinned) || rebound.nlink != entry.statx().nlink() {
-                    return Err(metadata_mismatch(entry.relative_path()));
+                    return Err(metadata_mismatch(entry.relative_path()).into());
                 }
             }
             Ok(())
@@ -1065,7 +1262,7 @@ mod platform {
         fn finalize_directories(
             &self,
             plan: &SourceTreePlanV1,
-        ) -> Result<(), SnapshotMaterializeFailureV1> {
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
             for (index, entry) in plan.entries().iter().enumerate().rev() {
                 if entry.payload().kind() != SourceNodeKindV1::Directory {
                     continue;
@@ -1081,6 +1278,7 @@ mod platform {
                     index,
                     self.policy.max_depth,
                     self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
                 )?;
                 let projected_nlink = match entry.payload() {
                     SourcePlanPayloadV1::Directory { children } => {
@@ -1101,7 +1299,7 @@ mod platform {
                             }
                         })?
                     }
-                    _ => return Err(plan_failure(entry.relative_path())),
+                    _ => return Err(plan_failure(entry.relative_path()).into()),
                 };
                 self.finalize_directory(
                     directory.as_fd(),
@@ -1112,6 +1310,26 @@ mod platform {
                 )?;
             }
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    impl<'parent, H: MaterializeHooks>
+        SnapshotMaterializerWithGateV1<'parent, H, DirectMaterializeAttemptGateV1>
+    {
+        pub(super) fn finish(
+            mut self,
+            plan: &SourceTreePlanV1,
+        ) -> Result<VerifiedReadySnapshotDirectoryV1<'parent>, SnapshotMaterializeFinishErrorV1>
+        {
+            begin_plan_validation(&self.hooks, self.policy, plan)?;
+            refuse_unqualified_plan_symlinks(plan)?;
+            self.validate_finished_plan(plan)?;
+            direct_leaf(self.consolidate_hardlinks(plan))?;
+            direct_leaf(self.refinalize_hardlink_anchors(plan))?;
+            direct_leaf(self.finalize_directories(plan))?;
+            let Self { staging, .. } = self;
+            Ok(staging.verify_ready_with(|_| Ok(()))?)
         }
     }
 
@@ -1147,12 +1365,37 @@ mod platform {
             } else {
                 self.active_parent(common.relative_path(), common.name())?
             };
-            mkdir_private_at(parent, common.name(), self.policy.syscall_attempts.get())
-                .map_err(|error| mutation_io(stage, common.relative_path(), error))?;
-            let directory =
-                open_directory_at(parent, common.name(), self.policy.openat2_attempts.get())
-                    .map_err(|error| mutation_io(stage, common.relative_path(), error))?;
-            validate_new_directory(directory.as_fd(), common.relative_path())?;
+            direct_leaf(
+                mkdir_private_at(
+                    parent,
+                    common.name(),
+                    self.policy.syscall_attempts.get(),
+                    &self.attempt_gate,
+                )
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| {
+                        mutation_io(stage, common.relative_path(), error)
+                    })
+                }),
+            )?;
+            let directory = direct_leaf(
+                open_directory_at(
+                    parent,
+                    common.name(),
+                    self.policy.openat2_attempts.get(),
+                    &self.attempt_gate,
+                )
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| {
+                        mutation_io(stage, common.relative_path(), error)
+                    })
+                }),
+            )?;
+            direct_leaf(validate_new_directory(
+                directory.as_fd(),
+                common.relative_path(),
+                &self.attempt_gate,
+            ))?;
             if common.relative_path().is_empty() {
                 self.root_name = Some(retained_basename);
                 let event_index = self.event_commitments.len();
@@ -1196,12 +1439,12 @@ mod platform {
                 )
             })?;
             let (_, evidence) = copied.finalize_with(|destination| {
-                self.finalize_regular(
+                direct_leaf(self.finalize_regular(
                     destination,
                     common.statx(),
                     common.xattrs(),
                     common.relative_path(),
-                )
+                ))
             })?;
             let (digest, extents) = evidence.into_parts();
             let evidence = SourceRegularEvidenceV1::checked(digest, extents, common.statx().size())
@@ -1751,30 +1994,33 @@ mod platform {
         Ok(())
     }
 
-    fn open_plan_parent(
+    fn open_plan_parent<G: SnapshotMaterializeAttemptGateV1>(
         container: BorrowedFd<'_>,
         plan: &SourceTreePlanV1,
         index: usize,
         max_depth: u16,
         attempts: u8,
-    ) -> Result<(OwnedFd, RetainedCStringV1), SnapshotMaterializeFailureV1> {
+        gate: &G,
+    ) -> Result<(OwnedFd, RetainedCStringV1), SnapshotChargedMaterializeErrorV1> {
         let entry = plan.entries().get(index).ok_or_else(|| plan_failure(b""))?;
         let parent_index = entry
             .parent_index()
             .map(|value| value as usize)
             .ok_or_else(|| plan_failure(entry.relative_path()))?;
         let name = fallible_plan_basename(entry.basename(), entry.relative_path())?;
-        let parent = open_plan_entry_directory(container, plan, parent_index, max_depth, attempts)?;
+        let parent =
+            open_plan_entry_directory(container, plan, parent_index, max_depth, attempts, gate)?;
         Ok((parent, name))
     }
 
-    fn open_plan_entry_directory(
+    fn open_plan_entry_directory<G: SnapshotMaterializeAttemptGateV1>(
         container: BorrowedFd<'_>,
         plan: &SourceTreePlanV1,
         index: usize,
         max_depth: u16,
         attempts: u8,
-    ) -> Result<OwnedFd, SnapshotMaterializeFailureV1> {
+        gate: &G,
+    ) -> Result<OwnedFd, SnapshotChargedMaterializeErrorV1> {
         let mut chain = [0usize; HARD_MAX_DEPTH as usize + 1];
         let mut chain_len = 0usize;
         let mut cursor = index;
@@ -1784,7 +2030,8 @@ mod platform {
                     plan.entries()
                         .get(index)
                         .map_or(b"".as_slice(), |entry| entry.relative_path()),
-                ));
+                )
+                .into());
             }
             chain[chain_len] = cursor;
             chain_len += 1;
@@ -1793,12 +2040,12 @@ mod platform {
                 .get(cursor)
                 .ok_or_else(|| plan_failure(b""))?;
             if entry.payload().kind() != SourceNodeKindV1::Directory {
-                return Err(plan_failure(entry.relative_path()));
+                return Err(plan_failure(entry.relative_path()).into());
             }
             match entry.parent_index() {
                 Some(parent) => cursor = parent as usize,
                 None if cursor == 0 => break,
-                None => return Err(plan_failure(entry.relative_path())),
+                None => return Err(plan_failure(entry.relative_path()).into()),
             }
         }
         let mut current: Option<OwnedFd> = None;
@@ -1808,23 +2055,38 @@ mod platform {
             let parent = current
                 .as_ref()
                 .map_or(container, |directory| directory.as_fd());
-            let next = open_directory_at(parent, &name, attempts)
-                .map_err(|error| open_io(entry.relative_path(), error))?;
+            let next = open_directory_at(parent, &name, attempts, gate).map_err(|error| {
+                map_attempt_leaf(error, |error| open_io(entry.relative_path(), error))
+            })?;
             current = Some(next);
         }
-        current.ok_or_else(|| plan_failure(b""))
+        current.ok_or_else(|| plan_failure(b"").into())
     }
 
-    fn mkdir_private_at(parent: BorrowedFd<'_>, name: &CStr, attempts: u8) -> io::Result<()> {
+    fn mkdir_private_at<G: SnapshotMaterializeAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<(), MaterializeAttemptErrorV1> {
         if !valid_raw_basename(name) {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            return Err(MaterializeAttemptErrorV1::Io(io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
         }
-        retry_eintr_zero(attempts, || unsafe {
-            libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), PRIVATE_DIRECTORY_MODE)
+        retry_eintr_io(gate, attempts, || {
+            raw_zero(unsafe {
+                libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), PRIVATE_DIRECTORY_MODE)
+            })
         })
     }
 
-    fn open_directory_at(parent: BorrowedFd<'_>, name: &CStr, attempts: u8) -> io::Result<OwnedFd> {
+    fn open_directory_at<G: SnapshotMaterializeAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, MaterializeAttemptErrorV1> {
         openat2_owned(
             parent,
             name,
@@ -1836,10 +2098,16 @@ mod platform {
             0,
             DESTINATION_RESOLVE,
             attempts,
+            gate,
         )
     }
 
-    fn open_path_at(parent: BorrowedFd<'_>, name: &CStr, attempts: u8) -> io::Result<OwnedFd> {
+    fn open_path_at<G: SnapshotMaterializeAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, MaterializeAttemptErrorV1> {
         openat2_owned(
             parent,
             name,
@@ -1847,10 +2115,16 @@ mod platform {
             0,
             DESTINATION_RESOLVE,
             attempts,
+            gate,
         )
     }
 
-    fn open_regular_at(parent: BorrowedFd<'_>, name: &CStr, attempts: u8) -> io::Result<OwnedFd> {
+    fn open_regular_at<G: SnapshotMaterializeAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, MaterializeAttemptErrorV1> {
         openat2_owned(
             parent,
             name,
@@ -1858,24 +2132,25 @@ mod platform {
             0,
             DESTINATION_RESOLVE,
             attempts,
+            gate,
         )
     }
 
-    fn openat2_owned(
+    fn openat2_owned<G: SnapshotMaterializeAttemptGateV1>(
         parent: BorrowedFd<'_>,
         name: &CStr,
         flags: i32,
         mode: u32,
         resolve: u64,
         attempts: u8,
-    ) -> io::Result<OwnedFd> {
+        gate: &G,
+    ) -> Result<OwnedFd, MaterializeAttemptErrorV1> {
         let how = OpenHow {
             flags: flags as u64,
             mode: mode as u64,
             resolve,
         };
-        let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
-        for _ in 0..attempts {
+        retry_openat2_io(gate, attempts, || {
             let result = unsafe {
                 libc::syscall(
                     libc::SYS_openat2,
@@ -1886,79 +2161,94 @@ mod platform {
                 )
             };
             if result >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
+                Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) })
+            } else {
+                Err(io::Error::last_os_error())
             }
-            last = io::Error::last_os_error();
-            if last.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(last);
-            }
-        }
-        Err(last)
-    }
-
-    fn destination_identity(fd: BorrowedFd<'_>) -> io::Result<DestinationIdentityV1> {
-        let mut raw = MaybeUninit::<libc::statx>::zeroed();
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                libc::STATX_BASIC_STATS | STATX_MNT_ID,
-                raw.as_mut_ptr(),
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let raw = unsafe { raw.assume_init() };
-        if raw.stx_mask & REQUIRED_STATX_MASK != REQUIRED_STATX_MASK {
-            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        }
-        Ok(DestinationIdentityV1 {
-            mount_id: raw.stx_mnt_id,
-            device_major: raw.stx_dev_major,
-            device_minor: raw.stx_dev_minor,
-            inode: raw.stx_ino,
-            mode: u32::from(raw.stx_mode),
-            uid: raw.stx_uid,
-            nlink: u64::from(raw.stx_nlink),
-            size: raw.stx_size,
-            atime_seconds: raw.stx_atime.tv_sec,
-            atime_nanoseconds: raw.stx_atime.tv_nsec,
-            mtime_seconds: raw.stx_mtime.tv_sec,
-            mtime_nanoseconds: raw.stx_mtime.tv_nsec,
         })
     }
 
-    fn validate_new_directory(
+    fn destination_identity<G: SnapshotMaterializeAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        gate: &G,
+    ) -> Result<DestinationIdentityV1, MaterializeAttemptErrorV1> {
+        run_io_attempt(gate, || {
+            let mut raw = MaybeUninit::<libc::statx>::zeroed();
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    libc::STATX_BASIC_STATS | STATX_MNT_ID,
+                    raw.as_mut_ptr(),
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let raw = unsafe { raw.assume_init() };
+            if raw.stx_mask & REQUIRED_STATX_MASK != REQUIRED_STATX_MASK {
+                return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            }
+            Ok(DestinationIdentityV1 {
+                mount_id: raw.stx_mnt_id,
+                device_major: raw.stx_dev_major,
+                device_minor: raw.stx_dev_minor,
+                inode: raw.stx_ino,
+                mode: u32::from(raw.stx_mode),
+                uid: raw.stx_uid,
+                nlink: u64::from(raw.stx_nlink),
+                size: raw.stx_size,
+                atime_seconds: raw.stx_atime.tv_sec,
+                atime_nanoseconds: raw.stx_atime.tv_nsec,
+                mtime_seconds: raw.stx_mtime.tv_sec,
+                mtime_nanoseconds: raw.stx_mtime.tv_nsec,
+            })
+        })
+    }
+
+    fn effective_uid<G: SnapshotMaterializeAttemptGateV1>(
+        gate: &G,
+    ) -> Result<u32, SnapshotPipelineResourceErrorV1> {
+        gate.run_materialization_attempt(|| unsafe { libc::geteuid() })
+    }
+
+    fn validate_new_directory<G: SnapshotMaterializeAttemptGateV1>(
         fd: BorrowedFd<'_>,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
-        let identity =
-            destination_identity(fd).map_err(|error| map_identity_error(relative_path, error))?;
+        gate: &G,
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+        let identity = destination_identity(fd, gate).map_err(|error| {
+            map_attempt_leaf(error, |error| map_identity_error(relative_path, error))
+        })?;
         if identity.mode & libc::S_IFMT != libc::S_IFDIR
             || identity.mode & 0o7777 != PRIVATE_DIRECTORY_MODE
-            || identity.uid != unsafe { libc::geteuid() }
-            || identity.nlink < 2
         {
-            return Err(metadata_mismatch(relative_path));
+            return Err(metadata_mismatch(relative_path).into());
+        }
+        let effective_uid = effective_uid(gate)?;
+        if identity.uid != effective_uid || identity.nlink < 2 {
+            return Err(metadata_mismatch(relative_path).into());
         }
         Ok(())
     }
 
-    impl<H: MaterializeHooks> SnapshotMaterializerWithHooksV1<'_, H> {
+    impl<H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>
+        SnapshotMaterializerWithGateV1<'_, H, G>
+    {
         fn finalize_regular(
             &self,
             fd: BorrowedFd<'_>,
             expected: &SourceStatxV1,
             xattrs: &[CapturedXattrV1],
             relative_path: &[u8],
-        ) -> Result<(), SnapshotMaterializeFailureV1> {
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
             let kind = SourceNodeKindV1::Regular;
-            validate_builder_mode(fd, kind, relative_path)?;
+            validate_builder_mode(fd, kind, relative_path, &self.attempt_gate)?;
             let xattr_names = apply_xattrs(
                 &self.hooks,
+                &self.attempt_gate,
                 &self.xattr_operations,
                 fd,
                 xattrs,
@@ -1971,16 +2261,27 @@ mod platform {
                     .expect("regular projection is defined"),
                 self.policy.syscall_attempts.get(),
                 relative_path,
+                &self.attempt_gate,
             )?;
             apply_times(
                 fd,
                 expected,
                 self.policy.syscall_attempts.get(),
                 relative_path,
+                &self.attempt_gate,
             )?;
-            verify_metadata(fd, expected, xattrs, kind, None, relative_path)?;
+            verify_metadata(
+                fd,
+                expected,
+                xattrs,
+                kind,
+                None,
+                relative_path,
+                &self.attempt_gate,
+            )?;
             verify_xattrs(
                 &self.hooks,
+                &self.attempt_gate,
                 &self.xattr_operations,
                 fd,
                 xattrs,
@@ -1993,15 +2294,19 @@ mod platform {
                 SnapshotMaterializeStageV1::SyncRegular,
                 relative_path,
             )?;
-            retry_eintr_zero(self.policy.syscall_attempts.get(), || unsafe {
-                libc::fsync(fd.as_raw_fd())
-            })
+            retry_eintr_io(
+                &self.attempt_gate,
+                self.policy.syscall_attempts.get(),
+                || raw_zero(unsafe { libc::fsync(fd.as_raw_fd()) }),
+            )
             .map_err(|error| {
-                metadata_io(
-                    SnapshotMaterializeStageV1::SyncRegular,
-                    relative_path,
-                    error,
-                )
+                map_attempt_leaf(error, |error| {
+                    metadata_io(
+                        SnapshotMaterializeStageV1::SyncRegular,
+                        relative_path,
+                        error,
+                    )
+                })
             })?;
             Ok(())
         }
@@ -2013,10 +2318,16 @@ mod platform {
             xattrs: &[CapturedXattrV1],
             projected_nlink: u64,
             relative_path: &[u8],
-        ) -> Result<(), SnapshotMaterializeFailureV1> {
-            validate_builder_mode(fd, SourceNodeKindV1::Directory, relative_path)?;
+        ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+            validate_builder_mode(
+                fd,
+                SourceNodeKindV1::Directory,
+                relative_path,
+                &self.attempt_gate,
+            )?;
             let xattr_names = apply_xattrs(
                 &self.hooks,
+                &self.attempt_gate,
                 &self.xattr_operations,
                 fd,
                 xattrs,
@@ -2029,12 +2340,14 @@ mod platform {
                     .expect("directory projection is defined"),
                 self.policy.syscall_attempts.get(),
                 relative_path,
+                &self.attempt_gate,
             )?;
             apply_times(
                 fd,
                 expected,
                 self.policy.syscall_attempts.get(),
                 relative_path,
+                &self.attempt_gate,
             )?;
             verify_metadata(
                 fd,
@@ -2043,9 +2356,11 @@ mod platform {
                 SourceNodeKindV1::Directory,
                 Some(projected_nlink),
                 relative_path,
+                &self.attempt_gate,
             )?;
             verify_xattrs(
                 &self.hooks,
+                &self.attempt_gate,
                 &self.xattr_operations,
                 fd,
                 xattrs,
@@ -2053,72 +2368,92 @@ mod platform {
                 self.policy,
                 relative_path,
             )?;
-            retry_eintr_zero(self.policy.syscall_attempts.get(), || unsafe {
-                libc::fsync(fd.as_raw_fd())
-            })
+            retry_eintr_io(
+                &self.attempt_gate,
+                self.policy.syscall_attempts.get(),
+                || raw_zero(unsafe { libc::fsync(fd.as_raw_fd()) }),
+            )
             .map_err(|error| {
-                metadata_io(
-                    SnapshotMaterializeStageV1::FinalizeDirectory,
-                    relative_path,
-                    error,
-                )
+                map_attempt_leaf(error, |error| {
+                    metadata_io(
+                        SnapshotMaterializeStageV1::FinalizeDirectory,
+                        relative_path,
+                        error,
+                    )
+                })
             })
         }
     }
 
-    fn apply_mode(
+    fn apply_mode<G: SnapshotMaterializeAttemptGateV1>(
         fd: BorrowedFd<'_>,
         physical_mode: u32,
         attempts: u8,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
-        retry_eintr_zero(attempts, || unsafe {
-            libc::fchmod(fd.as_raw_fd(), physical_mode & 0o7777)
+        gate: &G,
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+        retry_eintr_io(gate, attempts, || {
+            raw_zero(unsafe { libc::fchmod(fd.as_raw_fd(), physical_mode & 0o7777) })
         })
-        .map_err(|error| metadata_io(SnapshotMaterializeStageV1::ApplyMode, relative_path, error))
+        .map_err(|error| {
+            map_attempt_leaf(error, |error| {
+                metadata_io(SnapshotMaterializeStageV1::ApplyMode, relative_path, error)
+            })
+        })
     }
 
-    fn validate_builder_mode(
+    fn validate_builder_mode<G: SnapshotMaterializeAttemptGateV1>(
         fd: BorrowedFd<'_>,
         kind: SourceNodeKindV1,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
-        let observed =
-            destination_identity(fd).map_err(|error| map_identity_error(relative_path, error))?;
+        gate: &G,
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
+        let observed = destination_identity(fd, gate).map_err(|error| {
+            map_attempt_leaf(error, |error| map_identity_error(relative_path, error))
+        })?;
         let expected_mode = match kind {
             SourceNodeKindV1::Directory => PRIVATE_DIRECTORY_MODE,
             SourceNodeKindV1::Regular => 0o600,
             SourceNodeKindV1::Symlink => {
-                return Err(unqualified_symlink_durability(relative_path));
+                return Err(unqualified_symlink_durability(relative_path).into());
             }
         };
-        if kind_from_mode(observed.mode) != Some(kind)
-            || observed.mode & 0o7777 != expected_mode
-            || observed.uid != unsafe { libc::geteuid() }
-        {
-            return Err(metadata_mismatch(relative_path));
+        if kind_from_mode(observed.mode) != Some(kind) || observed.mode & 0o7777 != expected_mode {
+            return Err(metadata_mismatch(relative_path).into());
+        }
+        let effective_uid = effective_uid(gate)?;
+        if observed.uid != effective_uid {
+            return Err(metadata_mismatch(relative_path).into());
         }
         Ok(())
     }
 
-    fn chmod_empty_path(fd: BorrowedFd<'_>, mode: u32, attempts: u8) -> io::Result<()> {
-        retry_eintr_zero(attempts, || unsafe {
-            libc::syscall(
-                SYS_FCHMODAT2_X86_64,
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                mode,
-                AT_EMPTY_PATH,
-            ) as libc::c_int
+    fn chmod_empty_path<G: SnapshotMaterializeAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        mode: u32,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<(), MaterializeAttemptErrorV1> {
+        retry_eintr_io(gate, attempts, || {
+            raw_zero(unsafe {
+                libc::syscall(
+                    SYS_FCHMODAT2_X86_64,
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    mode,
+                    AT_EMPTY_PATH,
+                ) as libc::c_int
+            })
         })
     }
 
-    fn apply_times(
+    fn apply_times<G: SnapshotMaterializeAttemptGateV1>(
         fd: BorrowedFd<'_>,
         expected: &SourceStatxV1,
         attempts: u8,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
+        gate: &G,
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
         if expected.atime().nanoseconds >= 1_000_000_000
             || expected.mtime().nanoseconds >= 1_000_000_000
         {
@@ -2129,7 +2464,8 @@ mod platform {
                 None,
                 None,
                 relative_path,
-            ));
+            )
+            .into());
         }
         let times = [
             libc::timespec {
@@ -2141,46 +2477,57 @@ mod platform {
                 tv_nsec: libc::c_long::from(expected.mtime().nanoseconds),
             },
         ];
-        retry_eintr_zero(attempts, || unsafe {
-            libc::utimensat(
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                times.as_ptr(),
-                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-            )
+        retry_eintr_io(gate, attempts, || {
+            raw_zero(unsafe {
+                libc::utimensat(
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    times.as_ptr(),
+                    AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                )
+            })
         })
-        .map_err(|error| metadata_io(SnapshotMaterializeStageV1::ApplyTimes, relative_path, error))
+        .map_err(|error| {
+            map_attempt_leaf(error, |error| {
+                metadata_io(SnapshotMaterializeStageV1::ApplyTimes, relative_path, error)
+            })
+        })
     }
 
-    fn verify_metadata(
+    fn verify_metadata<G: SnapshotMaterializeAttemptGateV1>(
         fd: BorrowedFd<'_>,
         expected: &SourceStatxV1,
         xattrs: &[CapturedXattrV1],
         kind: SourceNodeKindV1,
         projected_directory_nlink: Option<u64>,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
+        gate: &G,
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
         let expected_physical_mode = match kind {
             SourceNodeKindV1::Directory | SourceNodeKindV1::Regular => {
                 projected_materialized_permissions(expected.mode(), kind)
                     .expect("directory and regular projections are defined")
             }
-            SourceNodeKindV1::Symlink => return Err(unqualified_symlink_durability(relative_path)),
+            SourceNodeKindV1::Symlink => {
+                return Err(unqualified_symlink_durability(relative_path).into());
+            }
         };
-        let observed =
-            destination_identity(fd).map_err(|error| map_identity_error(relative_path, error))?;
-        let euid = unsafe { libc::geteuid() };
+        let observed = destination_identity(fd, gate).map_err(|error| {
+            map_attempt_leaf(error, |error| map_identity_error(relative_path, error))
+        })?;
+        let euid = effective_uid(gate)?;
         let mode_mismatch = observed.mode & 0o7777 != expected_physical_mode;
         if mode_mismatch && contains_access_acl(xattrs) {
             return Err(unsupported_metadata(
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 relative_path,
                 None,
-            ));
+            )
+            .into());
         }
         if !metadata_projection_matches(&observed, expected, kind, projected_directory_nlink, euid)
         {
-            return Err(metadata_mismatch(relative_path));
+            return Err(metadata_mismatch(relative_path).into());
         }
         Ok(())
     }
@@ -2218,14 +2565,15 @@ mod platform {
             && object_metadata_matches
     }
 
-    fn apply_xattrs<H: MaterializeHooks>(
+    fn apply_xattrs<H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>(
         hooks: &H,
+        gate: &G,
         xattr_operations: &XattrOperationBudgetV1,
         fd: BorrowedFd<'_>,
         expected: &[CapturedXattrV1],
         policy: SnapshotMaterializePolicyV1,
         relative_path: &[u8],
-    ) -> Result<Vec<RetainedCStringV1>, SnapshotMaterializeFailureV1> {
+    ) -> Result<Vec<RetainedCStringV1>, SnapshotChargedMaterializeErrorV1> {
         checkpoint(
             hooks,
             SnapshotMaterializeStageV1::ApplyXattrs,
@@ -2239,6 +2587,7 @@ mod platform {
         )?;
         let existing = list_xattr_names(
             hooks,
+            gate,
             xattr_operations,
             fd,
             policy,
@@ -2255,12 +2604,17 @@ mod platform {
                     SnapshotMaterializeStageV1::ApplyXattrs,
                     relative_path,
                 )?;
-                hooks.remove_xattr(fd.as_raw_fd(), name).map_err(|error| {
-                    xattr_io(
-                        SnapshotMaterializeStageV1::ApplyXattrs,
-                        relative_path,
-                        error,
-                    )
+                retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+                    hooks.remove_xattr(fd.as_raw_fd(), name)
+                })
+                .map_err(|error| {
+                    map_attempt_leaf(error, |error| {
+                        xattr_io(
+                            SnapshotMaterializeStageV1::ApplyXattrs,
+                            relative_path,
+                            error,
+                        )
+                    })
                 })?;
             }
         }
@@ -2273,33 +2627,40 @@ mod platform {
                     None,
                     None,
                     relative_path,
-                ));
+                )
+                .into());
             };
             xattr_operations.charge(1, SnapshotMaterializeStageV1::ApplyXattrs, relative_path)?;
-            hooks
-                .set_xattr(fd.as_raw_fd(), name, value)
-                .map_err(|error| {
+            retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+                hooks.set_xattr(fd.as_raw_fd(), name, value)
+            })
+            .map_err(|error| {
+                map_attempt_leaf(error, |error| {
                     xattr_io(
                         SnapshotMaterializeStageV1::ApplyXattrs,
                         relative_path,
                         error,
                     )
-                })?;
+                })
+            })?;
         }
         Ok(expected_names)
     }
 
-    fn verify_xattrs<H: MaterializeHooks>(
+    #[allow(clippy::too_many_arguments)]
+    fn verify_xattrs<H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>(
         hooks: &H,
+        gate: &G,
         xattr_operations: &XattrOperationBudgetV1,
         fd: BorrowedFd<'_>,
         expected: &[CapturedXattrV1],
         expected_names: &[RetainedCStringV1],
         policy: SnapshotMaterializePolicyV1,
         relative_path: &[u8],
-    ) -> Result<(), SnapshotMaterializeFailureV1> {
+    ) -> Result<(), SnapshotChargedMaterializeErrorV1> {
         let observed = list_xattr_names(
             hooks,
+            gate,
             xattr_operations,
             fd,
             policy,
@@ -2312,28 +2673,31 @@ mod platform {
                 .zip(expected_names)
                 .any(|(left, right)| left.as_bytes() != right.as_bytes())
         {
-            return Err(xattr_mismatch(expected, relative_path));
+            return Err(xattr_mismatch(expected, relative_path).into());
         }
         for (xattr, name) in expected.iter().zip(expected_names) {
             let CapturedXattrValueV1::Bytes(value) = xattr.value() else {
-                return Err(xattr_mismatch(expected, relative_path));
+                return Err(xattr_mismatch(expected, relative_path).into());
             };
             xattr_operations.charge(
                 1,
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 relative_path,
             )?;
-            let length = hooks
-                .get_xattr(fd.as_raw_fd(), name, None)
-                .map_err(|error| {
+            let length = retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+                hooks.get_xattr(fd.as_raw_fd(), name, None)
+            })
+            .map_err(|error| {
+                map_attempt_leaf(error, |error| {
                     xattr_io(
                         SnapshotMaterializeStageV1::VerifyMetadata,
                         relative_path,
                         error,
                     )
-                })?;
+                })
+            })?;
             if length != value.len() || length as u64 > policy.max_total_xattr_bytes.get() {
-                return Err(xattr_mismatch(expected, relative_path));
+                return Err(xattr_mismatch(expected, relative_path).into());
             }
             let mut observed_value = allocate_zeroed_at(
                 length,
@@ -2346,17 +2710,20 @@ mod platform {
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 relative_path,
             )?;
-            let returned = hooks
-                .get_xattr(fd.as_raw_fd(), name, Some(&mut observed_value))
-                .map_err(|error| {
+            let returned = retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+                hooks.get_xattr(fd.as_raw_fd(), name, Some(&mut observed_value))
+            })
+            .map_err(|error| {
+                map_attempt_leaf(error, |error| {
                     xattr_io(
                         SnapshotMaterializeStageV1::VerifyMetadata,
                         relative_path,
                         error,
                     )
-                })?;
+                })
+            })?;
             if returned != length || observed_value.as_slice() != value.as_ref() {
-                return Err(xattr_mismatch(expected, relative_path));
+                return Err(xattr_mismatch(expected, relative_path).into());
             }
         }
         Ok(())
@@ -2381,24 +2748,27 @@ mod platform {
         Ok(names)
     }
 
-    fn list_xattr_names<H: MaterializeHooks>(
+    fn list_xattr_names<H: MaterializeHooks, G: SnapshotMaterializeAttemptGateV1>(
         hooks: &H,
+        gate: &G,
         xattr_operations: &XattrOperationBudgetV1,
         fd: BorrowedFd<'_>,
         policy: SnapshotMaterializePolicyV1,
         stage: SnapshotMaterializeStageV1,
         relative_path: &[u8],
-    ) -> Result<Vec<RetainedCStringV1>, SnapshotMaterializeFailureV1> {
+    ) -> Result<Vec<RetainedCStringV1>, SnapshotChargedMaterializeErrorV1> {
         xattr_operations.charge(1, stage, relative_path)?;
-        let length = hooks
-            .list_xattrs(fd.as_raw_fd(), None)
-            .map_err(|error| xattr_io(stage, relative_path, error))?;
+        let length = retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+            hooks.list_xattrs(fd.as_raw_fd(), None)
+        })
+        .map_err(|error| map_attempt_leaf(error, |error| xattr_io(stage, relative_path, error)))?;
         if length > MAX_XATTR_LIST_BYTES || length as u64 > policy.max_total_xattr_bytes.get() {
             return Err(resource_failure_at(
                 stage,
                 SnapshotMaterializeLimitV1::XattrListBytes,
                 relative_path,
-            ));
+            )
+            .into());
         }
         if length == 0 {
             return Ok(Vec::new());
@@ -2410,11 +2780,12 @@ mod platform {
             relative_path,
         )?;
         xattr_operations.charge(1, stage, relative_path)?;
-        let returned = hooks
-            .list_xattrs(fd.as_raw_fd(), Some(&mut bytes))
-            .map_err(|error| xattr_io(stage, relative_path, error))?;
+        let returned = retry_eintr_io(gate, policy.syscall_attempts.get(), || {
+            hooks.list_xattrs(fd.as_raw_fd(), Some(&mut bytes))
+        })
+        .map_err(|error| map_attempt_leaf(error, |error| xattr_io(stage, relative_path, error)))?;
         if returned != length {
-            return Err(metadata_mismatch_at(stage, relative_path));
+            return Err(metadata_mismatch_at(stage, relative_path).into());
         }
         let name_count = bytes.iter().filter(|byte| **byte == 0).count();
         let mut names = Vec::new();
@@ -2431,7 +2802,7 @@ mod platform {
                 continue;
             }
             if index == start {
-                return Err(metadata_mismatch_at(stage, relative_path));
+                return Err(metadata_mismatch_at(stage, relative_path).into());
             }
             names.push(fallible_cstring(
                 &bytes[start..index],
@@ -2441,14 +2812,14 @@ mod platform {
             start = index + 1;
         }
         if start != bytes.len() {
-            return Err(metadata_mismatch_at(stage, relative_path));
+            return Err(metadata_mismatch_at(stage, relative_path).into());
         }
         names.sort_unstable_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
         if names
             .windows(2)
             .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
         {
-            return Err(metadata_mismatch_at(stage, relative_path));
+            return Err(metadata_mismatch_at(stage, relative_path).into());
         }
         Ok(names)
     }
@@ -2557,38 +2928,63 @@ mod platform {
             .map_err(|_| resource_failure(SnapshotMaterializeLimitV1::PlanBytes, relative_path))
     }
 
-    fn retry_eintr_zero(
+    fn retry_io_with<G: SnapshotMaterializeAttemptGateV1, T>(
+        gate: &G,
         attempts: u8,
-        mut operation: impl FnMut() -> libc::c_int,
-    ) -> io::Result<()> {
+        mut retry: impl FnMut(&io::Error) -> bool,
+        mut operation: impl FnMut() -> io::Result<T>,
+        exhausted_errno: i32,
+    ) -> Result<T, MaterializeAttemptErrorV1> {
+        let mut last = io::Error::from_raw_os_error(exhausted_errno);
         for _ in 0..attempts {
-            if operation() == 0 {
-                return Ok(());
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
+            match run_io_attempt(gate, &mut operation) {
+                Ok(value) => return Ok(value),
+                Err(MaterializeAttemptErrorV1::Resource(error)) => {
+                    return Err(MaterializeAttemptErrorV1::Resource(error));
+                }
+                Err(MaterializeAttemptErrorV1::Io(error)) if retry(&error) => last = error,
+                Err(MaterializeAttemptErrorV1::Io(error)) => {
+                    return Err(MaterializeAttemptErrorV1::Io(error));
+                }
             }
         }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
+        Err(MaterializeAttemptErrorV1::Io(last))
     }
 
-    fn retry_eintr_size(
+    fn retry_eintr_io<G: SnapshotMaterializeAttemptGateV1, T>(
+        gate: &G,
         attempts: u8,
-        mut operation: impl FnMut() -> libc::c_long,
-    ) -> io::Result<usize> {
-        for _ in 0..attempts {
-            let result = operation();
-            if result >= 0 {
-                return usize::try_from(result)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
+        operation: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, MaterializeAttemptErrorV1> {
+        retry_io_with(
+            gate,
+            attempts,
+            |error| error.kind() == io::ErrorKind::Interrupted,
+            operation,
+            libc::EINTR,
+        )
+    }
+
+    fn retry_openat2_io<G: SnapshotMaterializeAttemptGateV1, T>(
+        gate: &G,
+        attempts: u8,
+        operation: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, MaterializeAttemptErrorV1> {
+        retry_io_with(
+            gate,
+            attempts,
+            |error| error.raw_os_error() == Some(libc::EAGAIN),
+            operation,
+            libc::EAGAIN,
+        )
+    }
+
+    fn raw_zero(result: libc::c_int) -> io::Result<()> {
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
         }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
     }
 
     fn begin_event_validation<H: MaterializeHooks>(
@@ -2880,7 +3276,7 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use std::cell::RefCell;
+        use std::cell::{Cell, RefCell};
         use std::collections::BTreeMap;
         use std::ffi::{CString, OsStr};
         use std::fs::{self, File};
@@ -2891,6 +3287,10 @@ mod platform {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         use super::*;
+        use crate::linux_pytest::snapshot_policy::{
+            SnapshotPipelineAttemptBucketV1, SnapshotPipelineForwardStageV1,
+            SnapshotPipelineStageV1,
+        };
         use crate::linux_pytest::snapshot_publish::{
             SnapshotPublishPolicyV1, create_staged_snapshot_directory_at,
         };
@@ -2912,6 +3312,40 @@ mod platform {
         struct StatefulXattrHooks {
             values: RefCell<BTreeMap<Vec<u8>, Vec<u8>>>,
             operations: RefCell<Vec<&'static str>>,
+        }
+
+        struct BoundedAttemptGateV1 {
+            remaining: Cell<u64>,
+            charged: Cell<u64>,
+        }
+
+        impl BoundedAttemptGateV1 {
+            const fn new(remaining: u64) -> Self {
+                Self {
+                    remaining: Cell::new(remaining),
+                    charged: Cell::new(0),
+                }
+            }
+        }
+
+        impl SnapshotMaterializeAttemptGateV1 for BoundedAttemptGateV1 {
+            fn run_materialization_attempt<T>(
+                &self,
+                attempt: impl FnOnce() -> T,
+            ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+                let remaining = self.remaining.get();
+                if remaining == 0 {
+                    return Err(SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                        stage: SnapshotPipelineStageV1::Forward(
+                            SnapshotPipelineForwardStageV1::Materialization,
+                        ),
+                        bucket: SnapshotPipelineAttemptBucketV1::Forward,
+                    });
+                }
+                self.remaining.set(remaining - 1);
+                self.charged.set(self.charged.get() + 1);
+                Ok(attempt())
+            }
         }
 
         impl StatefulXattrHooks {
@@ -3151,57 +3585,186 @@ mod platform {
             plan_with_children(name, &[])
         }
 
-        #[test]
-        fn bounded_eintr_retry_accepts_n_and_never_attempts_n_plus_one() {
-            let mut calls = 0;
-            retry_eintr_zero(3, || {
-                calls += 1;
-                if calls == 3 {
-                    0
-                } else {
-                    unsafe { *libc::__errno_location() = libc::EINTR };
-                    -1
+        fn assert_materialization_resource(error: MaterializeAttemptErrorV1) {
+            assert_eq!(
+                match error {
+                    MaterializeAttemptErrorV1::Resource(error) => error,
+                    MaterializeAttemptErrorV1::Io(error) => {
+                        panic!("expected resource exhaustion, got {error}")
+                    }
+                },
+                SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                    stage: SnapshotPipelineStageV1::Forward(
+                        SnapshotPipelineForwardStageV1::Materialization,
+                    ),
+                    bucket: SnapshotPipelineAttemptBucketV1::Forward,
                 }
-            })
-            .unwrap();
-            assert_eq!(calls, 3);
+            );
+        }
 
-            let mut exhausted_calls = 0;
-            let error = retry_eintr_zero(3, || {
-                exhausted_calls += 1;
-                unsafe { *libc::__errno_location() = libc::EINTR };
-                -1
-            })
-            .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::EINTR));
-            assert_eq!(exhausted_calls, 3);
+        fn assert_charged_materialization_resource(error: SnapshotChargedMaterializeErrorV1) {
+            let SnapshotChargedMaterializeErrorV1::Resource(error) = error else {
+                panic!("expected materialization resource exhaustion")
+            };
+            assert_eq!(
+                error,
+                SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                    stage: SnapshotPipelineStageV1::Forward(
+                        SnapshotPipelineForwardStageV1::Materialization,
+                    ),
+                    bucket: SnapshotPipelineAttemptBucketV1::Forward,
+                }
+            );
         }
 
         #[test]
-        fn bounded_size_retry_accepts_n_and_never_attempts_n_plus_one() {
-            let mut calls = 0;
-            let size = retry_eintr_size(3, || {
-                calls += 1;
-                if calls == 3 {
-                    17
+        fn effective_uid_cutpoint_preserves_pre_uid_failure_precedence() {
+            let mismatch = test_fd();
+            let mismatch_gate = BoundedAttemptGateV1::new(1);
+            let mismatch_error = validate_builder_mode(
+                mismatch.as_fd(),
+                SourceNodeKindV1::Regular,
+                b"kind-mismatch",
+                &mismatch_gate,
+            )
+            .unwrap_err();
+            let SnapshotChargedMaterializeErrorV1::Leaf(mismatch_error) = mismatch_error else {
+                panic!("a pre-uid metadata mismatch must precede uid exhaustion")
+            };
+            assert_eq!(
+                mismatch_error.kind(),
+                SnapshotMaterializeFailureKindV1::DestinationIdentityMismatch
+            );
+            assert_eq!(mismatch_gate.charged.get(), 1);
+
+            let regular = tempfile::tempfile().unwrap();
+            regular
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let exhausted_gate = BoundedAttemptGateV1::new(1);
+            let exhausted_error = validate_builder_mode(
+                regular.as_fd(),
+                SourceNodeKindV1::Regular,
+                b"uid-cutpoint",
+                &exhausted_gate,
+            )
+            .unwrap_err();
+            assert_charged_materialization_resource(exhausted_error);
+            assert_eq!(exhausted_gate.charged.get(), 1);
+
+            let exact_gate = BoundedAttemptGateV1::new(2);
+            validate_builder_mode(
+                regular.as_fd(),
+                SourceNodeKindV1::Regular,
+                b"uid-cutpoint",
+                &exact_gate,
+            )
+            .unwrap();
+            assert_eq!(exact_gate.charged.get(), 2);
+        }
+
+        #[test]
+        fn charged_openat2_retry_accepts_exact_n_and_n_minus_one_stops_before_raw_n() {
+            let exact_gate = BoundedAttemptGateV1::new(3);
+            let exact_raw_calls = Cell::new(0);
+            retry_openat2_io(&exact_gate, 3, || {
+                let call = exact_raw_calls.get() + 1;
+                exact_raw_calls.set(call);
+                if call == 3 {
+                    Ok(())
                 } else {
-                    unsafe { *libc::__errno_location() = libc::EINTR };
-                    -1
+                    Err(io::Error::from_raw_os_error(libc::EAGAIN))
                 }
             })
             .unwrap();
-            assert_eq!(size, 17);
-            assert_eq!(calls, 3);
+            assert_eq!(exact_gate.charged.get(), 3);
+            assert_eq!(exact_raw_calls.get(), 3);
 
-            let mut exhausted_calls = 0;
-            let error = retry_eintr_size(3, || {
-                exhausted_calls += 1;
-                unsafe { *libc::__errno_location() = libc::EINTR };
-                -1
+            let short_gate = BoundedAttemptGateV1::new(2);
+            let short_raw_calls = Cell::new(0);
+            let error = retry_openat2_io(&short_gate, 3, || {
+                short_raw_calls.set(short_raw_calls.get() + 1);
+                Err::<(), _>(io::Error::from_raw_os_error(libc::EAGAIN))
             })
             .unwrap_err();
-            assert_eq!(error.raw_os_error(), Some(libc::EINTR));
-            assert_eq!(exhausted_calls, 3);
+            assert_materialization_resource(error);
+            assert_eq!(short_gate.charged.get(), 2);
+            assert_eq!(short_raw_calls.get(), 2);
+        }
+
+        #[test]
+        fn charged_eintr_retry_accepts_exact_n_and_exhaustion_precedes_attempt() {
+            let exact_gate = BoundedAttemptGateV1::new(3);
+            let exact_raw_calls = Cell::new(0);
+            retry_eintr_io(&exact_gate, 3, || {
+                let call = exact_raw_calls.get() + 1;
+                exact_raw_calls.set(call);
+                if call == 3 {
+                    Ok(())
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                }
+            })
+            .unwrap();
+            assert_eq!(exact_raw_calls.get(), 3);
+
+            let short_gate = BoundedAttemptGateV1::new(2);
+            let short_raw_calls = Cell::new(0);
+            let later_mutation = Cell::new(false);
+            let error = retry_eintr_io(&short_gate, 3, || {
+                short_raw_calls.set(short_raw_calls.get() + 1);
+                if short_raw_calls.get() > 2 {
+                    later_mutation.set(true);
+                }
+                Err::<(), _>(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap_err();
+            assert_materialization_resource(error);
+            assert_eq!(short_raw_calls.get(), 2);
+            assert!(!later_mutation.get());
+        }
+
+        #[test]
+        fn charged_xattr_size_and_fetch_require_two_distinct_attempts() {
+            let hooks = StatefulXattrHooks {
+                values: RefCell::new(BTreeMap::from([(b"user.a".to_vec(), b"value".to_vec())])),
+                ..StatefulXattrHooks::default()
+            };
+            let file = test_fd();
+            let exact_gate = BoundedAttemptGateV1::new(2);
+            let exact_budget = test_xattr_budget();
+            let names = list_xattr_names(
+                &hooks,
+                &exact_gate,
+                &exact_budget,
+                file.as_fd(),
+                test_policy(),
+                SnapshotMaterializeStageV1::VerifyMetadata,
+                b"xattr",
+            )
+            .unwrap();
+            assert_eq!(names.len(), 1);
+            assert_eq!(exact_gate.charged.get(), 2);
+            assert_eq!(hooks.operations.borrow().as_slice(), &["list", "list"]);
+
+            let short_hooks = StatefulXattrHooks {
+                values: RefCell::new(BTreeMap::from([(b"user.a".to_vec(), b"value".to_vec())])),
+                ..StatefulXattrHooks::default()
+            };
+            let short_gate = BoundedAttemptGateV1::new(1);
+            let short_budget = test_xattr_budget();
+            let error = list_xattr_names(
+                &short_hooks,
+                &short_gate,
+                &short_budget,
+                file.as_fd(),
+                test_policy(),
+                SnapshotMaterializeStageV1::VerifyMetadata,
+                b"xattr",
+            )
+            .unwrap_err();
+            assert_charged_materialization_resource(error);
+            assert_eq!(short_hooks.operations.borrow().as_slice(), &["list"]);
         }
 
         #[test]
@@ -3302,6 +3865,7 @@ mod platform {
                 materializer.staging_directory(),
                 c"tree",
                 test_policy().syscall_attempts.get(),
+                &DirectMaterializeAttemptGateV1,
             )
             .unwrap();
             let private_root = staging_path.join("tree");
@@ -3666,14 +4230,15 @@ mod platform {
             };
             let file = test_fd();
             let budget = test_xattr_budget();
-            let names = list_xattr_names(
+            let names = direct_leaf(list_xattr_names(
                 &hooks,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 test_policy(),
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 b"raw",
-            )
+            ))
             .unwrap();
             assert_eq!(
                 names.iter().map(|name| name.as_bytes()).collect::<Vec<_>>(),
@@ -3690,24 +4255,26 @@ mod platform {
             let expected = [CapturedXattrV1::bytes_for_test(b"user.a", b"value")];
             let file = test_fd();
             let budget = test_xattr_budget();
-            let names = apply_xattrs(
+            let names = direct_leaf(apply_xattrs(
                 &hooks,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 &expected,
                 test_policy(),
                 b"file",
-            )
+            ))
             .unwrap();
-            verify_xattrs(
+            direct_leaf(verify_xattrs(
                 &hooks,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 &expected,
                 &names,
                 test_policy(),
                 b"file",
-            )
+            ))
             .unwrap();
             assert_eq!(
                 &*hooks.values.borrow(),
@@ -3727,14 +4294,15 @@ mod platform {
             )];
             let file = test_fd();
             let budget = test_xattr_budget();
-            let failure = apply_xattrs(
+            let failure = direct_leaf(apply_xattrs(
                 &hooks,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 &expected,
                 test_policy(),
                 b"file",
-            )
+            ))
             .unwrap_err();
             assert_eq!(
                 failure.kind(),
@@ -3757,14 +4325,15 @@ mod platform {
                     ..FakeHooks::default()
                 };
                 let budget = test_xattr_budget();
-                let failure = list_xattr_names(
+                let failure = direct_leaf(list_xattr_names(
                     &hooks,
+                    &DirectMaterializeAttemptGateV1,
                     &budget,
                     file.as_fd(),
                     test_policy(),
                     SnapshotMaterializeStageV1::VerifyMetadata,
                     b"bad",
-                )
+                ))
                 .unwrap_err();
                 assert_eq!(
                     failure.kind(),
@@ -3781,14 +4350,15 @@ mod platform {
                 ..FakeHooks::default()
             };
             let budget = test_xattr_budget();
-            let failure = list_xattr_names(
+            let failure = direct_leaf(list_xattr_names(
                 &oversized,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 test_policy(),
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 b"large",
-            )
+            ))
             .unwrap_err();
             assert_eq!(
                 failure.kind(),
@@ -3802,14 +4372,15 @@ mod platform {
                 ..FakeHooks::default()
             };
             let budget = test_xattr_budget();
-            let failure = list_xattr_names(
+            let failure = direct_leaf(list_xattr_names(
                 &missing,
+                &DirectMaterializeAttemptGateV1,
                 &budget,
                 file.as_fd(),
                 test_policy(),
                 SnapshotMaterializeStageV1::VerifyMetadata,
                 b"missing",
-            )
+            ))
             .unwrap_err();
             assert_eq!(failure.code(), RefusalCode::RequiredKernelCapabilityMissing);
         }
@@ -4287,63 +4858,9 @@ mod platform {
     }
 }
 
-#[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
+#[cfg(all(test, not(all(target_os = "linux", target_arch = "x86_64"))))]
 mod platform {
     use super::*;
-
-    pub(in crate::linux_pytest) struct SnapshotMaterializerV1<'parent> {
-        staging: StagedSnapshotDirectoryV1<'parent>,
-    }
-
-    impl<'parent> SnapshotMaterializerV1<'parent> {
-        pub(super) fn new(
-            staging: StagedSnapshotDirectoryV1<'parent>,
-            policy: SnapshotMaterializePolicyV1,
-        ) -> Result<Self, SnapshotMaterializeFailureV1> {
-            if !cleanup_envelope_covers(staging.cleanup_envelope(), policy) {
-                return Err(cleanup_authority_failure());
-            }
-            Ok(Self { staging })
-        }
-
-        pub(super) fn finish(
-            self,
-            _plan: &SourceTreePlanV1,
-        ) -> Result<VerifiedReadySnapshotDirectoryV1<'parent>, SnapshotMaterializeFinishErrorV1>
-        {
-            Err(SnapshotMaterializeFinishErrorV1::Materialize(unsupported()))
-        }
-    }
-
-    #[cfg(test)]
-    impl SourceTreeVisitorV1 for SnapshotMaterializerV1<'_> {
-        type Error = SnapshotMaterializeFailureV1;
-
-        fn directory_enter(
-            &mut self,
-            _visit: SourceDirectoryVisitV1<'_>,
-        ) -> Result<(), Self::Error> {
-            Err(unsupported())
-        }
-
-        fn regular(
-            &mut self,
-            _visit: SourceRegularVisitV1<'_>,
-        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
-            Err(unsupported())
-        }
-
-        fn symlink(&mut self, _visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
-            Err(unsupported())
-        }
-
-        fn directory_leave(
-            &mut self,
-            _visit: SourceDirectoryVisitV1<'_>,
-        ) -> Result<(), Self::Error> {
-            Err(unsupported())
-        }
-    }
 
     fn unsupported() -> SnapshotMaterializeFailureV1 {
         SnapshotMaterializeFailureV1::new(
@@ -4360,7 +4877,6 @@ mod platform {
         )
     }
 
-    #[cfg(test)]
     pub(super) fn unsupported_for_test() -> SnapshotMaterializeFailureV1 {
         unsupported()
     }
