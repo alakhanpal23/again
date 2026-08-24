@@ -342,6 +342,25 @@ pub(super) struct SnapshotRetainedTreeViewV1<'resources> {
     _lease: SnapshotRetainedViewLeaseV1<'resources>,
 }
 
+impl SnapshotRetainedTreeViewV1<'_> {
+    pub(super) const fn plan(&self) -> &SourceTreePlanV1 {
+        &self.plan
+    }
+}
+
+#[cfg(test)]
+pub(super) fn retain_tree_plan_for_test<'resources>(
+    resources: &'resources SnapshotPipelineResourcesV1,
+    stage: SnapshotPipelineForwardStageV1,
+    plan: SourceTreePlanV1,
+) -> Result<SnapshotRetainedTreeViewV1<'resources>, SnapshotPipelineResourceErrorV1> {
+    let lease = resources.reserve_retained_view(stage)?;
+    Ok(SnapshotRetainedTreeViewV1 {
+        plan,
+        _lease: lease,
+    })
+}
+
 impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
     pub(super) const fn source_policy(&self) -> &'resources SourceEnumerationPolicyV1 {
         self.policy
@@ -707,8 +726,8 @@ impl SnapshotConnectorV1 {
                     SnapshotPipelineFourViewErrorV1::SourceObservation,
                 )
             })?;
-        let source_stable = begin_four_view_comparison(&source_s1.plan)
-            .compare_source_s2(&source_s2.plan)
+        let source_stable = begin_four_view_comparison(source_s1)
+            .compare_source_s2(&source_s2)
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
         drop(source_s2);
 
@@ -723,7 +742,7 @@ impl SnapshotConnectorV1 {
         let (uid, gid) = staging.expected_owner();
         let destination_stable = source_stable
             .compare_destination_d1(
-                &destination_d1.plan,
+                &destination_d1,
                 DestinationPhysicalIdentityV1::new(uid, gid),
             )
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
@@ -743,11 +762,10 @@ impl SnapshotConnectorV1 {
                     SnapshotPipelineFourViewErrorV1::DestinationObservation,
                 )
             })?;
-        destination_stable
-            .compare_destination_d2(&destination_d2.plan)
+        let stable_projection = destination_stable
+            .compare_destination_d2(destination_d2)
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
-        drop(destination_d2);
-        drop(source_s1);
+        drop(stable_projection);
 
         Ok(staging)
     }
@@ -1033,6 +1051,7 @@ fn validate_derived_resources(
     let projected_four_view_heap = source
         .max_plan_bytes()
         .checked_add(materialization.max_plan_bytes())
+        .and_then(|value| value.checked_add(policy.max_persistent_manifest_heap_bytes()))
         .and_then(|value| value.checked_add(publication.max_cleanup_retained_name_bytes()))
         .ok_or(SnapshotPolicyProjectionErrorV1::DerivedResourceOverflow(
             Resource::FourViewHeapBytes,
@@ -1281,6 +1300,7 @@ mod tests {
         xattr_list_bytes: u32,
         total_xattr_payload_bytes: u64,
         retained_view_bytes: u64,
+        persistent_manifest_heap_bytes: u64,
         transient_heap_bytes: u64,
         operation_attempts: u64,
         openat2_attempts: u8,
@@ -1307,6 +1327,7 @@ mod tests {
                 xattr_list_bytes: 4096,
                 total_xattr_payload_bytes: 64 * 1024,
                 retained_view_bytes: 8 * 1024 * 1024,
+                persistent_manifest_heap_bytes: 0,
                 transient_heap_bytes: 1024 * 1024,
                 operation_attempts: 1_000_000,
                 openat2_attempts: 4,
@@ -1350,6 +1371,7 @@ mod tests {
             inputs.xattr_list_bytes,
             inputs.total_xattr_payload_bytes,
             nz64(inputs.retained_view_bytes),
+            inputs.persistent_manifest_heap_bytes,
             inputs.transient_heap_bytes,
             nz64(inputs.operation_attempts),
             nz8(inputs.openat2_attempts),
@@ -1373,7 +1395,8 @@ mod tests {
 
     #[test]
     fn exact_projection_preserves_every_leaf_input() {
-        let inputs = Inputs::exact();
+        let mut inputs = Inputs::exact();
+        inputs.persistent_manifest_heap_bytes = 512 * 1024;
         let resources = resources(inputs);
         let projected = connect_snapshot_pipeline(resources).unwrap();
         let traversal = SourceTraversalLimitsV1::checked(
@@ -1423,10 +1446,28 @@ mod tests {
             .max_plan_bytes()
             .checked_add(projected.materialization.max_plan_bytes())
             .and_then(|value| {
+                value.checked_add(
+                    projected
+                        .resources
+                        .policy()
+                        .max_persistent_manifest_heap_bytes(),
+                )
+            })
+            .and_then(|value| {
                 value.checked_add(projected.publication.max_cleanup_retained_name_bytes())
             })
             .unwrap();
-        assert_eq!(projected_four_view_heap, 17 * 1024 * 1024);
+        assert_eq!(
+            projected_four_view_heap,
+            17 * 1024 * 1024 + inputs.persistent_manifest_heap_bytes
+        );
+        assert_eq!(
+            projected
+                .resources
+                .policy()
+                .max_persistent_manifest_heap_bytes(),
+            inputs.persistent_manifest_heap_bytes
+        );
         assert_eq!(
             projected_four_view_heap,
             projected.resources.policy().max_four_view_heap_bytes()

@@ -2861,6 +2861,7 @@ mod platform {
                 4096,
                 64 * 1024,
                 NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+                0,
                 transient_heap_bytes,
                 NonZeroU64::new(operation_attempts).unwrap(),
                 NonZeroU8::new(4).unwrap(),

@@ -33,7 +33,11 @@ const HARD_MAX_XATTR_VALUE_BYTES: u32 = 64 * 1024;
 const HARD_MAX_XATTR_LIST_BYTES: u32 = 64 * 1024;
 const HARD_MAX_TOTAL_XATTR_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_MAX_RETAINED_VIEW_BYTES: u64 = 512 * 1024 * 1024;
+const HARD_MAX_PERSISTENT_MANIFEST_HEAP_BYTES: u64 = 512 * 1024 * 1024;
 const HARD_MAX_TRANSIENT_HEAP_BYTES: u64 = 512 * 1024 * 1024;
+// Preserve the original aggregate hard cap. The per-class ceilings are not a
+// Cartesian promise: adding persistent manifest evidence reduces the retained
+// view/transient combinations that can be admitted by `checked`.
 const HARD_MAX_FOUR_VIEW_HEAP_BYTES: u64 =
     2 * HARD_MAX_RETAINED_VIEW_BYTES + HARD_MAX_TRANSIENT_HEAP_BYTES;
 const HARD_MAX_OPERATION_ATTEMPTS: u64 = 1 << 40;
@@ -75,6 +79,7 @@ pub(super) enum SnapshotResourcePolicyFieldV1 {
     XattrListBytes,
     TotalXattrPayloadBytes,
     RetainedViewBytes,
+    PersistentManifestHeapBytes,
     TransientHeapBytes,
     FourViewHeapBytes,
     OperationAttempts,
@@ -100,6 +105,7 @@ pub(super) enum SnapshotResourcePolicyErrorV1 {
 pub(super) enum SnapshotPipelineForwardStageV1 {
     RegularCopy,
     Materialization,
+    ManifestCompilation,
     Publication,
     SourceObservation,
     DestinationObservation,
@@ -155,6 +161,17 @@ pub(super) enum SnapshotPipelineResourceErrorV1 {
         requested: u64,
         limit: u64,
     },
+    PersistentManifestHeapArithmeticOverflow {
+        stage: SnapshotPipelineStageV1,
+        live: u64,
+        requested: u64,
+    },
+    PersistentManifestHeapCapacityExceeded {
+        stage: SnapshotPipelineStageV1,
+        live: u64,
+        requested: u64,
+        limit: u64,
+    },
     ContainerCapacityArithmeticOverflow {
         stage: SnapshotPipelineStageV1,
     },
@@ -176,9 +193,10 @@ pub(super) enum SnapshotPipelineResourceErrorV1 {
 /// Validated limits shared by every phase and every stability view.
 ///
 /// Byte limits are inclusive. Zero is meaningful for optional resource
-/// classes: it disables nonempty extents, xattrs, symlinks, or transient heap
-/// rather than being silently replaced with a default. The root entry itself
-/// is mandatory, so `max_entries` remains nonzero.
+/// classes: it disables nonempty extents, xattrs, symlinks, persistent
+/// manifest heap, or transient heap rather than being silently replaced with
+/// a default. The root entry itself is mandatory, so `max_entries` remains
+/// nonzero.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SnapshotResourcePolicyV1 {
     max_depth: u16,
@@ -197,6 +215,7 @@ pub(super) struct SnapshotResourcePolicyV1 {
     max_xattr_list_bytes: u32,
     max_total_xattr_payload_bytes: u64,
     max_retained_view_bytes: NonZeroU64,
+    max_persistent_manifest_heap_bytes: u64,
     max_transient_heap_bytes: u64,
     max_operation_attempts: NonZeroU64,
     openat2_attempts: NonZeroU8,
@@ -217,9 +236,9 @@ pub(super) struct SnapshotResourcePolicyV1 {
 ///
 /// This type intentionally implements neither `Clone` nor `Copy`. Its private
 /// cells are the only mutable authorities for forward work, publisher cleanup,
-/// leaf-local cleanup, retained-view leases, and concurrently live transient
-/// heap. A connector must create one instance and lend it to every phase
-/// through the end of publication or RAII cleanup.
+/// leaf-local cleanup, retained-view leases, persistent manifest heap, and
+/// concurrently live transient heap. A connector must create one instance and
+/// lend it to every phase through the end of publication or RAII cleanup.
 #[derive(Debug)]
 pub(super) struct SnapshotPipelineResourcesV1 {
     policy: SnapshotResourcePolicyV1,
@@ -227,6 +246,7 @@ pub(super) struct SnapshotPipelineResourcesV1 {
     publisher_cleanup_attempts_remaining: Cell<u64>,
     local_cleanup_attempts_remaining: Cell<u64>,
     retained_view_heap_live: Cell<u64>,
+    persistent_manifest_heap_live: Cell<u64>,
     transient_heap_live: Cell<u64>,
 }
 
@@ -265,6 +285,14 @@ struct SnapshotTransientChargeV1<'resources> {
     bytes: u64,
 }
 
+/// Temporary RAII precharge held while a persistent manifest allocation is
+/// attempted.
+#[must_use = "dropping the charge releases its persistent-manifest bytes"]
+struct SnapshotPersistentManifestChargeV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    bytes: u64,
+}
+
 /// A byte vector structurally bound to its exact container-observed capacity.
 ///
 /// Requested capacity is precharged before allocation. A supported allocator
@@ -280,6 +308,43 @@ pub(super) struct SnapshotChargedBytesV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
     stage: SnapshotPipelineStageV1,
     charged_bytes: u64,
+}
+
+/// A linear owner for one actual `Vec<T>` backing allocation created while
+/// compiling persistent manifest evidence.
+///
+/// The requested logical `Vec` slot capacity multiplied by `size_of::<T>()` is
+/// precharged to the dedicated persistent-manifest heap envelope. Construction
+/// then requires the `Vec` to report that exact logical capacity; allocator
+/// rounding is a typed refusal, and allocator-private metadata is outside this
+/// contract. The charge remains live for as long as this owner and its actual
+/// `Vec` remain live, so a later prepared-evidence type can retain this owner
+/// without consuming the publication leaf's separate transient budget. The
+/// aggregate preflight equation includes both envelopes simultaneously. The
+/// stage name describes where the allocation originated; it does not imply
+/// that the allocation is short-lived.
+///
+/// This type accounts only for the `Vec<T>` backing slots it owns. Any heap
+/// allocations owned by individual `T` values must be moved under an already
+/// live plan lease or represented by their own charged owners. The raw `Vec`
+/// is never exposed or detachable from this charge.
+#[must_use = "dropping the owner destroys its manifest slots and releases their heap charge"]
+pub(super) struct SnapshotManifestCompilationVecV1<'resources, T> {
+    values: Vec<T>,
+    resources: &'resources SnapshotPipelineResourcesV1,
+    charged_bytes: u64,
+}
+
+impl<T> std::fmt::Debug for SnapshotManifestCompilationVecV1<'_, T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotManifestCompilationVecV1")
+            .field("values", &"<redacted>")
+            .field("len", &self.values.len())
+            .field("capacity", &self.values.capacity())
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for SnapshotChargedBytesV1<'_> {
@@ -318,6 +383,7 @@ impl SnapshotResourcePolicyV1 {
         max_xattr_list_bytes: u32,
         max_total_xattr_payload_bytes: u64,
         max_retained_view_bytes: NonZeroU64,
+        max_persistent_manifest_heap_bytes: u64,
         max_transient_heap_bytes: u64,
         max_operation_attempts: NonZeroU64,
         openat2_attempts: NonZeroU8,
@@ -374,6 +440,9 @@ impl SnapshotResourcePolicyV1 {
         }
         if max_retained_view_bytes.get() > HARD_MAX_RETAINED_VIEW_BYTES {
             return Err(AboveHardCeiling(Field::RetainedViewBytes));
+        }
+        if max_persistent_manifest_heap_bytes > HARD_MAX_PERSISTENT_MANIFEST_HEAP_BYTES {
+            return Err(AboveHardCeiling(Field::PersistentManifestHeapBytes));
         }
         if max_transient_heap_bytes > HARD_MAX_TRANSIENT_HEAP_BYTES {
             return Err(AboveHardCeiling(Field::TransientHeapBytes));
@@ -477,9 +546,14 @@ impl SnapshotResourcePolicyV1 {
 
         // Four-view verification compares retained plans pairwise: S1/S2,
         // S1/D1, then D1/D2. The prior pair is released before the next is
-        // admitted, so at most two full views coexist.
-        let max_four_view_heap_bytes =
-            checked_four_view_heap_bytes(max_retained_view_bytes.get(), max_transient_heap_bytes)?;
+        // admitted, so at most two full views coexist. Manifest compilation
+        // can allocate persistent evidence while the final pair remains live,
+        // and that evidence can remain live beside publication scratch.
+        let max_four_view_heap_bytes = checked_four_view_heap_bytes(
+            max_retained_view_bytes.get(),
+            max_persistent_manifest_heap_bytes,
+            max_transient_heap_bytes,
+        )?;
 
         let open_attempts = u64::from(openat2_attempts.get());
         let generic_attempts = u64::from(syscall_attempts.get());
@@ -542,6 +616,7 @@ impl SnapshotResourcePolicyV1 {
             max_xattr_list_bytes,
             max_total_xattr_payload_bytes,
             max_retained_view_bytes,
+            max_persistent_manifest_heap_bytes,
             max_transient_heap_bytes,
             max_operation_attempts,
             openat2_attempts,
@@ -621,6 +696,10 @@ impl SnapshotResourcePolicyV1 {
 
     pub(super) const fn max_retained_view_bytes(self) -> NonZeroU64 {
         self.max_retained_view_bytes
+    }
+
+    pub(super) const fn max_persistent_manifest_heap_bytes(self) -> u64 {
+        self.max_persistent_manifest_heap_bytes
     }
 
     pub(super) const fn max_transient_heap_bytes(self) -> u64 {
@@ -739,6 +818,7 @@ impl SnapshotPipelineResourcesV1 {
             ),
             local_cleanup_attempts_remaining: Cell::new(policy.local_cleanup_operation_reserve()),
             retained_view_heap_live: Cell::new(0),
+            persistent_manifest_heap_live: Cell::new(0),
             transient_heap_live: Cell::new(0),
         })
     }
@@ -846,6 +926,17 @@ impl SnapshotPipelineResourcesV1 {
         SnapshotChargedBytesV1::with_capacity(self, SnapshotPipelineStageV1::Cleanup, max_capacity)
     }
 
+    /// Allocate one exact-capacity typed slot vector for persistent manifest
+    /// compilation evidence. A connector-owned manifest session can lend this
+    /// narrow allocator without exposing the underlying resource cells or a
+    /// caller-selected stage.
+    pub(super) fn charged_manifest_compilation_vec<T>(
+        &self,
+        max_capacity: usize,
+    ) -> Result<SnapshotManifestCompilationVecV1<'_, T>, SnapshotPipelineResourceErrorV1> {
+        SnapshotManifestCompilationVecV1::with_capacity(self, max_capacity)
+    }
+
     /// Reserves one complete retained-view ceiling before a view-producing
     /// traversal starts. The returned lease must remain owned beside the view.
     pub(super) fn reserve_retained_view(
@@ -891,6 +982,11 @@ impl SnapshotPipelineResourcesV1 {
     #[cfg(test)]
     pub(super) fn retained_view_heap_live_for_test(&self) -> u64 {
         self.retained_view_heap_live.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn persistent_manifest_heap_live_for_test(&self) -> u64 {
+        self.persistent_manifest_heap_live.get()
     }
 
     fn charge_attempt(
@@ -942,12 +1038,53 @@ impl SnapshotPipelineResourcesV1 {
         })
     }
 
+    fn reserve_persistent_manifest(
+        &self,
+        stage: SnapshotPipelineStageV1,
+        bytes: u64,
+    ) -> Result<SnapshotPersistentManifestChargeV1<'_>, SnapshotPipelineResourceErrorV1> {
+        let live = self.persistent_manifest_heap_live.get();
+        let Some(next) = live.checked_add(bytes) else {
+            return Err(
+                SnapshotPipelineResourceErrorV1::PersistentManifestHeapArithmeticOverflow {
+                    stage,
+                    live,
+                    requested: bytes,
+                },
+            );
+        };
+        let limit = self.policy.max_persistent_manifest_heap_bytes();
+        if next > limit {
+            return Err(
+                SnapshotPipelineResourceErrorV1::PersistentManifestHeapCapacityExceeded {
+                    stage,
+                    live,
+                    requested: bytes,
+                    limit,
+                },
+            );
+        }
+        self.persistent_manifest_heap_live.set(next);
+        Ok(SnapshotPersistentManifestChargeV1 {
+            resources: self,
+            bytes,
+        })
+    }
+
     fn release_transient(&self, bytes: u64) {
         let live = self.transient_heap_live.get();
         let restored = live
             .checked_sub(bytes)
             .expect("a private transient charge cannot release uncharged bytes");
         self.transient_heap_live.set(restored);
+    }
+
+    fn release_persistent_manifest(&self, bytes: u64) {
+        let live = self.persistent_manifest_heap_live.get();
+        let restored = live
+            .checked_sub(bytes)
+            .expect("a private persistent-manifest charge cannot release uncharged bytes");
+        self.persistent_manifest_heap_live.set(restored);
     }
 
     fn release_retained_view(&self) {
@@ -1000,6 +1137,12 @@ impl Drop for SnapshotFinalizationAttemptReservationV1<'_> {
 impl Drop for SnapshotTransientChargeV1<'_> {
     fn drop(&mut self) {
         self.resources.release_transient(self.bytes);
+    }
+}
+
+impl Drop for SnapshotPersistentManifestChargeV1<'_> {
+    fn drop(&mut self) {
+        self.resources.release_persistent_manifest(self.bytes);
     }
 }
 
@@ -1098,6 +1241,140 @@ impl Drop for SnapshotChargedBytesV1<'_> {
     }
 }
 
+impl<'resources, T> SnapshotManifestCompilationVecV1<'resources, T> {
+    fn with_capacity(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        max_capacity: usize,
+    ) -> Result<Self, SnapshotPipelineResourceErrorV1> {
+        Self::with_capacity_using(resources, max_capacity, |values, capacity| {
+            values.try_reserve_exact(capacity).map_err(|_| ())
+        })
+    }
+
+    fn with_capacity_using(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        max_capacity: usize,
+        reserve: impl FnOnce(&mut Vec<T>, usize) -> Result<(), ()>,
+    ) -> Result<Self, SnapshotPipelineResourceErrorV1> {
+        let stage = manifest_compilation_stage();
+        let precharged = manifest_compilation_capacity_bytes::<T>(max_capacity)?;
+        let mut charge = resources.reserve_persistent_manifest(stage, precharged)?;
+        let mut values = Vec::new();
+        if reserve(&mut values, max_capacity).is_err() {
+            return Err(SnapshotPipelineResourceErrorV1::ContainerAllocationFailed { stage });
+        }
+        let observed = manifest_compilation_capacity_bytes::<T>(values.capacity())?;
+        if observed > precharged {
+            drop(values);
+            return Err(
+                SnapshotPipelineResourceErrorV1::AllocatorCapacityExceededPrecharge {
+                    stage,
+                    observed,
+                    precharged,
+                },
+            );
+        }
+        // The production allocator contract guarantees at least the requested
+        // capacity. Refuse an injected or incompatible allocator that reports
+        // less rather than allowing a later push to grow outside the charge.
+        if observed != precharged || !values.is_empty() {
+            drop(values);
+            return Err(SnapshotPipelineResourceErrorV1::ContainerAllocationFailed { stage });
+        }
+        charge.bytes = 0;
+        Ok(Self {
+            values,
+            resources,
+            charged_bytes: observed,
+        })
+    }
+
+    pub(super) fn try_push(&mut self, value: T) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        let required = self.values.len().checked_add(1).ok_or(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            },
+        )?;
+        self.require_capacity(required)?;
+        self.values.push(value);
+        Ok(())
+    }
+
+    fn require_capacity(&self, required: usize) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        if required > self.values.capacity() {
+            return Err(
+                SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                    stage: manifest_compilation_stage(),
+                    required: manifest_compilation_capacity_bytes::<T>(required)
+                        .unwrap_or(u64::MAX),
+                    limit: self.charged_bytes,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn as_slice(&self) -> &[T] {
+        &self.values
+    }
+}
+
+impl SnapshotManifestCompilationVecV1<'_, u8> {
+    pub(super) fn try_extend_from_slice(
+        &mut self,
+        values: &[u8],
+    ) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        let required = self.values.len().checked_add(values.len()).ok_or(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            },
+        )?;
+        self.require_capacity(required)?;
+        self.values.extend_from_slice(values);
+        Ok(())
+    }
+}
+
+impl<T> Drop for SnapshotManifestCompilationVecV1<'_, T> {
+    fn drop(&mut self) {
+        // Keep the charge live while element destructors and the actual backing
+        // allocation are destroyed. The guard also releases it if an element
+        // destructor unwinds.
+        let release = SnapshotPersistentManifestChargeV1 {
+            resources: self.resources,
+            bytes: self.charged_bytes,
+        };
+        self.charged_bytes = 0;
+        drop(std::mem::take(&mut self.values));
+        drop(release);
+    }
+}
+
+const fn manifest_compilation_stage() -> SnapshotPipelineStageV1 {
+    SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::ManifestCompilation)
+}
+
+fn manifest_compilation_capacity_bytes<T>(
+    capacity: usize,
+) -> Result<u64, SnapshotPipelineResourceErrorV1> {
+    let element_size = std::mem::size_of::<T>();
+    if element_size == 0 {
+        return Err(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            },
+        );
+    }
+    capacity
+        .checked_mul(element_size)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .ok_or(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            },
+        )
+}
+
 fn observed_capacity_bytes(
     capacity: usize,
     stage: SnapshotPipelineStageV1,
@@ -1108,10 +1385,12 @@ fn observed_capacity_bytes(
 
 fn checked_four_view_heap_bytes(
     retained_view_bytes: u64,
+    persistent_manifest_heap_bytes: u64,
     transient_heap_bytes: u64,
 ) -> Result<u64, SnapshotResourcePolicyErrorV1> {
     let total = retained_view_bytes
         .checked_mul(2)
+        .and_then(|value| value.checked_add(persistent_manifest_heap_bytes))
         .and_then(|value| value.checked_add(transient_heap_bytes))
         .ok_or(SnapshotResourcePolicyErrorV1::ArithmeticOverflow)?;
     if total > HARD_MAX_FOUR_VIEW_HEAP_BYTES {
@@ -1125,6 +1404,23 @@ fn checked_four_view_heap_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ManifestSlotDropProbe<'resources> {
+        resources: &'resources SnapshotPipelineResourcesV1,
+        expected_live_bytes: u64,
+        dropped: &'resources Cell<bool>,
+    }
+
+    impl Drop for ManifestSlotDropProbe<'_> {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.resources.persistent_manifest_heap_live.get(),
+                self.expected_live_bytes,
+                "the manifest allocation charge must remain live during element destruction"
+            );
+            self.dropped.set(true);
+        }
+    }
 
     fn nz8(value: u8) -> NonZeroU8 {
         NonZeroU8::new(value).unwrap()
@@ -1152,6 +1448,29 @@ mod tests {
         open_attempts: u8,
         syscall_attempts: u8,
     ) -> Result<SnapshotResourcePolicyV1, SnapshotResourcePolicyErrorV1> {
+        policy_with_manifest(
+            depth,
+            entries,
+            retained,
+            0,
+            transient,
+            operations,
+            open_attempts,
+            syscall_attempts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn policy_with_manifest(
+        depth: u16,
+        entries: u32,
+        retained: u64,
+        persistent_manifest: u64,
+        transient: u64,
+        operations: u64,
+        open_attempts: u8,
+        syscall_attempts: u8,
+    ) -> Result<SnapshotResourcePolicyV1, SnapshotResourcePolicyErrorV1> {
         let aggregate_items = u64::from(entries) * 64;
         SnapshotResourcePolicyV1::checked(
             depth,
@@ -1170,6 +1489,7 @@ mod tests {
             64 * 1024,
             1024 * 1024,
             nz64(retained),
+            persistent_manifest,
             transient,
             nz64(operations),
             nz8(open_attempts),
@@ -1180,10 +1500,11 @@ mod tests {
 
     #[test]
     fn exact_current_fd_and_four_view_heap_equations_are_frozen() {
-        let policy = policy(
+        let policy = policy_with_manifest(
             16,
             4096,
             128 * 1024 * 1024,
+            16 * 1024 * 1024,
             32 * 1024 * 1024,
             1_000_000,
             4,
@@ -1200,8 +1521,12 @@ mod tests {
         assert_eq!(policy.max_live_publisher_cleanup_fds(), 2 * 18 + 4);
         assert_eq!(policy.max_live_snapshot_fds(), 2 * 16 + 9 + 17);
         assert_eq!(
+            policy.max_persistent_manifest_heap_bytes(),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
             policy.max_four_view_heap_bytes(),
-            2 * 128 * 1024 * 1024 + 32 * 1024 * 1024
+            2 * 128 * 1024 * 1024 + 16 * 1024 * 1024 + 32 * 1024 * 1024
         );
     }
 
@@ -1247,6 +1572,7 @@ mod tests {
         assert_eq!(
             checked_four_view_heap_bytes(
                 HARD_MAX_RETAINED_VIEW_BYTES,
+                0,
                 HARD_MAX_TRANSIENT_HEAP_BYTES
             ),
             Ok(HARD_MAX_FOUR_VIEW_HEAP_BYTES)
@@ -1254,6 +1580,17 @@ mod tests {
         assert_eq!(
             checked_four_view_heap_bytes(
                 HARD_MAX_RETAINED_VIEW_BYTES,
+                1,
+                HARD_MAX_TRANSIENT_HEAP_BYTES
+            ),
+            Err(SnapshotResourcePolicyErrorV1::AboveHardCeiling(
+                SnapshotResourcePolicyFieldV1::FourViewHeapBytes
+            ))
+        );
+        assert_eq!(
+            checked_four_view_heap_bytes(
+                HARD_MAX_RETAINED_VIEW_BYTES,
+                0,
                 HARD_MAX_TRANSIENT_HEAP_BYTES + 1
             ),
             Err(SnapshotResourcePolicyErrorV1::AboveHardCeiling(
@@ -1282,6 +1619,7 @@ mod tests {
             0,
             nz64(1),
             0,
+            0,
             nz64(32),
             nz8(1),
             nz8(1),
@@ -1301,6 +1639,7 @@ mod tests {
         assert_eq!(policy.max_xattr_value_bytes(), 0);
         assert_eq!(policy.max_xattr_list_bytes(), 0);
         assert_eq!(policy.max_total_xattr_payload_bytes(), 0);
+        assert_eq!(policy.max_persistent_manifest_heap_bytes(), 0);
         assert_eq!(policy.max_transient_heap_bytes(), 0);
     }
 
@@ -1324,6 +1663,7 @@ mod tests {
                 9,
                 16,
                 nz64(1024),
+                0,
                 1024,
                 nz64(1000),
                 nz8(1),
@@ -1353,7 +1693,7 @@ mod tests {
     }
 
     #[test]
-    fn hard_ceiling_values_are_accepted_without_cartesian_heap_preflight() {
+    fn legacy_hard_ceiling_combination_remains_valid_with_zero_manifest_heap() {
         let cleanup = (CLEANUP_FIXED_OPEN_CALLS * u64::from(HARD_MAX_ATTEMPTS_PER_CALL)
             + CLEANUP_FIXED_SYSCALL_CALLS * u64::from(HARD_MAX_ATTEMPTS_PER_CALL))
             + u64::from(HARD_MAX_ENTRIES)
@@ -1377,6 +1717,7 @@ mod tests {
             HARD_MAX_XATTR_LIST_BYTES,
             HARD_MAX_TOTAL_XATTR_PAYLOAD_BYTES,
             nz64(HARD_MAX_RETAINED_VIEW_BYTES),
+            0,
             HARD_MAX_TRANSIENT_HEAP_BYTES,
             nz64(cleanup + local_cleanup),
             nz8(HARD_MAX_ATTEMPTS_PER_CALL),
@@ -1390,6 +1731,22 @@ mod tests {
         assert_eq!(
             policy.max_four_view_heap_bytes(),
             2 * HARD_MAX_RETAINED_VIEW_BYTES + HARD_MAX_TRANSIENT_HEAP_BYTES
+        );
+
+        let manifest_max = policy_with_manifest(
+            0,
+            1,
+            1,
+            HARD_MAX_PERSISTENT_MANIFEST_HEAP_BYTES,
+            0,
+            100,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            manifest_max.max_persistent_manifest_heap_bytes(),
+            HARD_MAX_PERSISTENT_MANIFEST_HEAP_BYTES
         );
     }
 
@@ -1424,6 +1781,7 @@ mod tests {
                 2,
                 2,
                 nz64(retained),
+                0,
                 transient,
                 nz64(operations),
                 nz8(open),
@@ -1454,6 +1812,21 @@ mod tests {
                 1
             )
             .is_err()
+        );
+        assert_eq!(
+            policy_with_manifest(
+                0,
+                1,
+                1,
+                HARD_MAX_PERSISTENT_MANIFEST_HEAP_BYTES + 1,
+                0,
+                100,
+                1,
+                1,
+            ),
+            Err(SnapshotResourcePolicyErrorV1::AboveHardCeiling(
+                SnapshotResourcePolicyFieldV1::PersistentManifestHeapBytes
+            ))
         );
         assert!(above(0, 1, HARD_MAX_NAME_BYTES + 1, 0, 0, 0, 1, 0, 100, 1, 1, 1).is_err());
         assert!(
@@ -1632,6 +2005,14 @@ mod tests {
         forward_attempts: u64,
         transient_heap_bytes: u64,
     ) -> SnapshotResourcePolicyV1 {
+        pipeline_policy_with_manifest(forward_attempts, 0, transient_heap_bytes)
+    }
+
+    fn pipeline_policy_with_manifest(
+        forward_attempts: u64,
+        persistent_manifest_heap_bytes: u64,
+        transient_heap_bytes: u64,
+    ) -> SnapshotResourcePolicyV1 {
         let entries = 2u64;
         let open_attempts = 2u64;
         let syscall_attempts = 2u64;
@@ -1641,10 +2022,11 @@ mod tests {
                 * (CLEANUP_OPEN_CALLS_PER_ENTRY * open_attempts
                     + CLEANUP_SYSCALL_CALLS_PER_ENTRY * syscall_attempts);
         let local_cleanup = open_attempts + 2 * syscall_attempts;
-        policy(
+        policy_with_manifest(
             2,
             entries as u32,
             4096,
+            persistent_manifest_heap_bytes,
             transient_heap_bytes,
             cleanup + local_cleanup + forward_attempts,
             open_attempts as u8,
@@ -1658,6 +2040,25 @@ mod tests {
         transient_heap_bytes: u64,
     ) -> SnapshotPipelineResourcesV1 {
         let policy = pipeline_policy(forward_attempts, transient_heap_bytes);
+        pipeline_resources_for_policy(policy)
+    }
+
+    fn pipeline_resources_with_manifest(
+        forward_attempts: u64,
+        persistent_manifest_heap_bytes: u64,
+        transient_heap_bytes: u64,
+    ) -> SnapshotPipelineResourcesV1 {
+        let policy = pipeline_policy_with_manifest(
+            forward_attempts,
+            persistent_manifest_heap_bytes,
+            transient_heap_bytes,
+        );
+        pipeline_resources_for_policy(policy)
+    }
+
+    fn pipeline_resources_for_policy(
+        policy: SnapshotResourcePolicyV1,
+    ) -> SnapshotPipelineResourcesV1 {
         let baseline = 7;
         let file_descriptor_limit = baseline + u64::from(policy.max_live_snapshot_fds());
         SnapshotPipelineResourcesV1::preflight(
@@ -1692,6 +2093,26 @@ mod tests {
         );
         assert_eq!(
             SnapshotPipelineResourcesV1::preflight(policy, baseline, exact_fds, exact_heap - 1)
+                .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::PreflightCapacityExceeded {
+                resource: SnapshotPipelinePreflightResourceV1::FourViewHeapBytes,
+                required: exact_heap,
+                available: exact_heap - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn pipeline_preflight_includes_persistent_manifest_and_transient_envelopes() {
+        let policy = pipeline_policy_with_manifest(8, 1024, 512);
+        let exact_heap = 2 * policy.max_retained_view_bytes().get()
+            + policy.max_persistent_manifest_heap_bytes()
+            + policy.max_transient_heap_bytes();
+        assert_eq!(policy.max_four_view_heap_bytes(), exact_heap);
+
+        SnapshotPipelineResourcesV1::preflight(policy, 0, u64::MAX, exact_heap).unwrap();
+        assert_eq!(
+            SnapshotPipelineResourcesV1::preflight(policy, 0, u64::MAX, exact_heap - 1)
                 .unwrap_err(),
             SnapshotPipelineResourceErrorV1::PreflightCapacityExceeded {
                 resource: SnapshotPipelinePreflightResourceV1::FourViewHeapBytes,
@@ -1738,6 +2159,24 @@ mod tests {
         assert_eq!(resources.transient_heap_live.get(), 1);
         drop(one);
         assert_eq!(resources.transient_heap_live.get(), 0);
+
+        let resources = pipeline_resources_with_manifest(1, 8, 0);
+        let stage = manifest_compilation_stage();
+        let one = resources.reserve_persistent_manifest(stage, 1).unwrap();
+        assert_eq!(
+            resources
+                .reserve_persistent_manifest(stage, u64::MAX)
+                .err()
+                .unwrap(),
+            SnapshotPipelineResourceErrorV1::PersistentManifestHeapArithmeticOverflow {
+                stage,
+                live: 1,
+                requested: u64::MAX,
+            }
+        );
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 1);
+        drop(one);
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
     }
 
     #[test]
@@ -2065,6 +2504,208 @@ mod tests {
     }
 
     #[test]
+    fn manifest_compilation_vec_owns_exact_slots_and_canonical_bytes() {
+        let slot_bytes = u64::try_from(std::mem::size_of::<u64>()).unwrap();
+        let resources = pipeline_resources_with_manifest(1, slot_bytes * 2, 4);
+        let mut slots = resources
+            .charged_manifest_compilation_vec::<u64>(2)
+            .unwrap();
+        assert_eq!(
+            resources.persistent_manifest_heap_live.get(),
+            slot_bytes * 2
+        );
+        assert_eq!(resources.transient_heap_live.get(), 0);
+        let scratch = resources.charged_cleanup_bytes(4).unwrap();
+        assert_eq!(resources.transient_heap_live.get(), 4);
+        slots.try_push(11).unwrap();
+        slots.try_push(22).unwrap();
+        assert_eq!(slots.as_slice(), &[11, 22]);
+        assert_eq!(
+            slots.try_push(33).unwrap_err(),
+            SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                stage: manifest_compilation_stage(),
+                required: slot_bytes * 3,
+                limit: slot_bytes * 2,
+            }
+        );
+        assert_eq!(slots.as_slice(), &[11, 22]);
+        drop(scratch);
+        assert_eq!(resources.transient_heap_live.get(), 0);
+        drop(slots);
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+
+        let resources = pipeline_resources_with_manifest(1, 4, 0);
+        let mut canonical = resources.charged_manifest_compilation_vec::<u8>(4).unwrap();
+        canonical.try_extend_from_slice(b"wire").unwrap();
+        assert_eq!(canonical.as_slice(), b"wire");
+        assert_eq!(
+            canonical.try_extend_from_slice(b"!").unwrap_err(),
+            SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                stage: manifest_compilation_stage(),
+                required: 5,
+                limit: 4,
+            }
+        );
+        drop(canonical);
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn manifest_compilation_vec_requires_exact_precharge_before_allocation() {
+        let slot_bytes = u64::try_from(std::mem::size_of::<u64>()).unwrap();
+        let exact = slot_bytes * 2;
+        let resources = pipeline_resources_with_manifest(1, exact - 1, 0);
+        let allocator_ran = Cell::new(false);
+        assert_eq!(
+            SnapshotManifestCompilationVecV1::<u64>::with_capacity_using(&resources, 2, |_, _| {
+                allocator_ran.set(true);
+                Ok(())
+            },)
+            .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::PersistentManifestHeapCapacityExceeded {
+                stage: manifest_compilation_stage(),
+                live: 0,
+                requested: exact,
+                limit: exact - 1,
+            }
+        );
+        assert!(!allocator_ran.get());
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn manifest_compilation_vec_refuses_arithmetic_and_zero_sized_capacity_fiction() {
+        let resources = pipeline_resources_with_manifest(1, 64, 0);
+        let allocator_ran = Cell::new(false);
+        assert_eq!(
+            SnapshotManifestCompilationVecV1::<u64>::with_capacity_using(
+                &resources,
+                usize::MAX,
+                |_, _| {
+                    allocator_ran.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            }
+        );
+        assert!(!allocator_ran.get());
+
+        assert_eq!(
+            SnapshotManifestCompilationVecV1::<()>::with_capacity_using(&resources, 1, |_, _| {
+                allocator_ran.set(true);
+                Ok(())
+            },)
+            .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: manifest_compilation_stage(),
+            }
+        );
+        assert!(!allocator_ran.get());
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn manifest_compilation_allocation_failures_release_precharge() {
+        let resources = pipeline_resources_with_manifest(1, 64, 0);
+        let stage = manifest_compilation_stage();
+        let slot_bytes = u64::try_from(std::mem::size_of::<u64>()).unwrap();
+
+        let error =
+            SnapshotManifestCompilationVecV1::<u64>::with_capacity_using(&resources, 2, |_, _| {
+                assert_eq!(
+                    resources.persistent_manifest_heap_live.get(),
+                    slot_bytes * 2
+                );
+                Err(())
+            })
+            .unwrap_err();
+        assert_eq!(
+            error,
+            SnapshotPipelineResourceErrorV1::ContainerAllocationFailed { stage }
+        );
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+
+        let error = SnapshotManifestCompilationVecV1::<u64>::with_capacity_using(
+            &resources,
+            1,
+            |values, _| values.try_reserve_exact(2).map_err(|_| ()),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotPipelineResourceErrorV1::AllocatorCapacityExceededPrecharge {
+                stage: error_stage,
+                observed,
+                precharged,
+            } if error_stage == stage && observed >= slot_bytes * 2 && precharged == slot_bytes
+        ));
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = SnapshotManifestCompilationVecV1::<u64>::with_capacity_using(
+                &resources,
+                2,
+                |_, _| panic!("injected manifest allocator unwind"),
+            );
+        }));
+        assert!(panic.is_err());
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn manifest_compilation_charge_is_exclusive_and_reusable_after_drop() {
+        let slot_bytes = u64::try_from(std::mem::size_of::<u64>()).unwrap();
+        let resources = pipeline_resources_with_manifest(1, slot_bytes, 0);
+        let slots = resources
+            .charged_manifest_compilation_vec::<u64>(1)
+            .unwrap();
+        assert_eq!(resources.persistent_manifest_heap_live.get(), slot_bytes);
+        assert_eq!(
+            resources
+                .charged_manifest_compilation_vec::<u64>(1)
+                .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::PersistentManifestHeapCapacityExceeded {
+                stage: manifest_compilation_stage(),
+                live: slot_bytes,
+                requested: slot_bytes,
+                limit: slot_bytes,
+            }
+        );
+        drop(slots);
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+        let replacement = resources
+            .charged_manifest_compilation_vec::<u64>(1)
+            .unwrap();
+        assert_eq!(resources.persistent_manifest_heap_live.get(), slot_bytes);
+        drop(replacement);
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn manifest_compilation_charge_remains_live_through_element_drop() {
+        let slot_bytes =
+            u64::try_from(std::mem::size_of::<ManifestSlotDropProbe<'static>>()).unwrap();
+        let resources = pipeline_resources_with_manifest(1, slot_bytes, 0);
+        let dropped = Cell::new(false);
+        let mut slots = resources
+            .charged_manifest_compilation_vec::<ManifestSlotDropProbe<'_>>(1)
+            .unwrap();
+        slots
+            .try_push(ManifestSlotDropProbe {
+                resources: &resources,
+                expected_live_bytes: slot_bytes,
+                dropped: &dropped,
+            })
+            .unwrap();
+        drop(slots);
+        assert!(dropped.get());
+        assert_eq!(resources.persistent_manifest_heap_live.get(), 0);
+    }
+
+    #[test]
     fn pipeline_capability_and_reservations_cannot_gain_clone_copy_or_default() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
@@ -2090,9 +2731,21 @@ mod tests {
         <SnapshotChargedBytesV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotChargedBytesV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotChargedBytesV1<'static> as AmbiguousIfDefault<_>>::probe();
+        <SnapshotPersistentManifestChargeV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotPersistentManifestChargeV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotPersistentManifestChargeV1<'static> as AmbiguousIfDefault<_>>::probe();
+        <SnapshotManifestCompilationVecV1<'static, u64> as AmbiguousIfClone<_>>::probe();
+        <SnapshotManifestCompilationVecV1<'static, u64> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotManifestCompilationVecV1<'static, u64> as AmbiguousIfDefault<_>>::probe();
         <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<SnapshotChargedBytesV1<'static>>());
+        assert!(std::mem::needs_drop::<
+            SnapshotPersistentManifestChargeV1<'static>,
+        >());
+        assert!(std::mem::needs_drop::<
+            SnapshotManifestCompilationVecV1<'static, u64>,
+        >());
         assert!(std::mem::needs_drop::<
             SnapshotFinalizationAttemptReservationV1<'static>,
         >());

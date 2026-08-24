@@ -9,7 +9,7 @@
 //! Successful comparison grants no manifest or publication authority and is
 //! not a substitute for canonical verification.
 
-use super::snapshot_connector::SnapshotDestinationWitnessBytesV1;
+use super::snapshot_connector::{SnapshotDestinationWitnessBytesV1, SnapshotRetainedTreeViewV1};
 use super::snapshot_materialize::projected_materialized_permissions;
 use super::snapshot_policy::{
     SnapshotPipelineForwardStageV1, SnapshotPipelineResourceErrorV1, SnapshotPipelineStageV1,
@@ -94,47 +94,55 @@ pub(super) struct SnapshotVerifyErrorV1 {
     pub(super) location: SnapshotVerifyLocationV1,
 }
 
-/// S1 is retained until an independently produced S2 has compared equal.
-pub(super) struct AwaitingSourceViewS2V1<'source> {
-    source_s1: &'source SourceTreePlanV1,
+/// S1 is owned until an independently produced S2 has compared equal.
+pub(super) struct AwaitingSourceViewS2V1<'resources> {
+    source_s1: SnapshotRetainedTreeViewV1<'resources>,
 }
 
 pub(super) const fn begin_four_view_comparison(
-    source_s1: &SourceTreePlanV1,
+    source_s1: SnapshotRetainedTreeViewV1<'_>,
 ) -> AwaitingSourceViewS2V1<'_> {
     AwaitingSourceViewS2V1 { source_s1 }
 }
 
-impl<'source> AwaitingSourceViewS2V1<'source> {
+impl<'resources> AwaitingSourceViewS2V1<'resources> {
     /// The returned state no longer borrows S2, allowing its retained-plan
     /// lease to be dropped before D1 is acquired.
     pub(super) fn compare_source_s2(
         self,
-        source_s2: &SourceTreePlanV1,
-    ) -> Result<SourceViewsStableV1<'source>, SnapshotVerifyErrorV1> {
-        compare_same_plan(self.source_s1, source_s2, SnapshotViewPairV1::S1S2)?;
+        source_s2: &SnapshotRetainedTreeViewV1<'_>,
+    ) -> Result<SourceViewsStableV1<'resources>, SnapshotVerifyErrorV1> {
+        compare_same_plan(
+            self.source_s1.plan(),
+            source_s2.plan(),
+            SnapshotViewPairV1::S1S2,
+        )?;
         Ok(SourceViewsStableV1 {
             source_s1: self.source_s1,
         })
     }
 }
 
-/// S1/S2 equality is proven; S1 remains borrowed through both destination
+/// S1/S2 equality is proven; S1 remains owned through both destination
 /// comparisons so it can later be projected into logical manifest metadata.
-pub(super) struct SourceViewsStableV1<'source> {
-    source_s1: &'source SourceTreePlanV1,
+pub(super) struct SourceViewsStableV1<'resources> {
+    source_s1: SnapshotRetainedTreeViewV1<'resources>,
 }
 
-impl<'source> SourceViewsStableV1<'source> {
+impl<'resources> SourceViewsStableV1<'resources> {
     /// Equality under the source-to-destination materialization projection is
     /// proven here. The returned short-lived state still borrows D1 so its
     /// exact destination-only fields can be copied into a charged raw witness.
     pub(super) fn compare_destination_d1<'destination>(
         self,
-        destination_d1: &'destination SourceTreePlanV1,
+        destination_d1: &'destination SnapshotRetainedTreeViewV1<'resources>,
         physical_identity: DestinationPhysicalIdentityV1,
-    ) -> Result<DestinationViewD1MatchedV1<'source, 'destination>, SnapshotVerifyErrorV1> {
-        compare_source_destination(self.source_s1, destination_d1, physical_identity)?;
+    ) -> Result<DestinationViewD1MatchedV1<'resources, 'destination>, SnapshotVerifyErrorV1> {
+        compare_source_destination(
+            self.source_s1.plan(),
+            destination_d1.plan(),
+            physical_identity,
+        )?;
         Ok(DestinationViewD1MatchedV1 {
             source_s1: self.source_s1,
             destination_d1,
@@ -145,20 +153,20 @@ impl<'source> SourceViewsStableV1<'source> {
 
 /// A short-lived state proving S1/D1 projection equality while borrowing the
 /// exact D1 plan. It intentionally cannot be cloned or used for publication.
-pub(super) struct DestinationViewD1MatchedV1<'source, 'destination> {
-    source_s1: &'source SourceTreePlanV1,
-    destination_d1: &'destination SourceTreePlanV1,
+pub(super) struct DestinationViewD1MatchedV1<'resources, 'destination> {
+    source_s1: SnapshotRetainedTreeViewV1<'resources>,
+    destination_d1: &'destination SnapshotRetainedTreeViewV1<'resources>,
     exact_physical_identity: DestinationPhysicalIdentityV1,
 }
 
-impl<'source, 'destination> DestinationViewD1MatchedV1<'source, 'destination> {
+impl<'resources, 'destination> DestinationViewD1MatchedV1<'resources, 'destination> {
     /// Captures the exact D1-only equality fields into one charged raw buffer.
-    /// Consuming this state ends its D1 borrow; the returned state owns no
-    /// retained-view lease and keeps only its transient charge plus S1. The
+    /// Consuming this state ends its D1 borrow; the returned state owns S1's
+    /// retained-view lease plus its transient charge, but no D1 lease. The
     /// allocator is intentionally narrow: connector orchestration must lend a
     /// destination-observation-session allocator rather than exposing or
     /// substituting the pipeline's raw resource authority here.
-    pub(super) fn capture_stability_witness<'resources>(
+    pub(super) fn capture_stability_witness(
         self,
         allocate_destination_observation_bytes: impl FnOnce(
             usize,
@@ -166,10 +174,9 @@ impl<'source, 'destination> DestinationViewD1MatchedV1<'source, 'destination> {
             SnapshotDestinationWitnessBytesV1<'resources>,
             SnapshotPipelineResourceErrorV1,
         >,
-    ) -> Result<AwaitingDestinationViewD2V1<'source, 'resources>, SnapshotPipelineResourceErrorV1>
-    {
+    ) -> Result<AwaitingDestinationViewD2V1<'resources>, SnapshotPipelineResourceErrorV1> {
         let witness = DestinationStabilityWitnessV1::capture(
-            self.destination_d1,
+            self.destination_d1.plan(),
             allocate_destination_observation_bytes,
         )?;
         Ok(AwaitingDestinationViewD2V1 {
@@ -182,24 +189,48 @@ impl<'source, 'destination> DestinationViewD1MatchedV1<'source, 'destination> {
 
 /// S1 plus a compact exact D1 witness are retained until an independently
 /// produced D2 has compared equal. This state owns no D1 borrow.
-pub(super) struct AwaitingDestinationViewD2V1<'source, 'resources> {
-    source_s1: &'source SourceTreePlanV1,
+pub(super) struct AwaitingDestinationViewD2V1<'resources> {
+    source_s1: SnapshotRetainedTreeViewV1<'resources>,
     witness: DestinationStabilityWitnessV1<'resources>,
     exact_physical_identity: DestinationPhysicalIdentityV1,
 }
 
-impl AwaitingDestinationViewD2V1<'_, '_> {
-    /// Success completes comparison only; it grants no publication authority.
-    pub(super) fn compare_destination_d2(
+impl<'resources> AwaitingDestinationViewD2V1<'resources> {
+    /// Success returns the exact owned S1 and D2 plans that completed all
+    /// three comparisons. The private result cannot be forged or swapped and
+    /// grants only manifest-projection input, not publication authority.
+    pub(super) fn compare_destination_d2<'destination>(
         self,
-        destination_d2: &SourceTreePlanV1,
-    ) -> Result<(), SnapshotVerifyErrorV1> {
+        destination_d2: SnapshotRetainedTreeViewV1<'destination>,
+    ) -> Result<StableManifestProjectionV1<'resources, 'destination>, SnapshotVerifyErrorV1> {
         compare_destination_from_witness(
-            self.source_s1,
+            self.source_s1.plan(),
             &self.witness,
-            destination_d2,
+            destination_d2.plan(),
             self.exact_physical_identity,
-        )
+        )?;
+        Ok(StableManifestProjectionV1 {
+            source_s1: self.source_s1,
+            destination_d2,
+        })
+    }
+}
+
+/// The only owned plan pair admitted to charged manifest compilation. Private
+/// fields make successful four-view comparison the sole production mint.
+pub(super) struct StableManifestProjectionV1<'source, 'destination> {
+    source_s1: SnapshotRetainedTreeViewV1<'source>,
+    destination_d2: SnapshotRetainedTreeViewV1<'destination>,
+}
+
+impl<'source, 'destination> StableManifestProjectionV1<'source, 'destination> {
+    pub(super) fn into_views(
+        self,
+    ) -> (
+        SnapshotRetainedTreeViewV1<'source>,
+        SnapshotRetainedTreeViewV1<'destination>,
+    ) {
+        (self.source_s1, self.destination_d2)
     }
 }
 
@@ -711,7 +742,9 @@ fn plan_index(index: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux_pytest::snapshot_connector::mint_destination_witness_bytes_for_test;
+    use crate::linux_pytest::snapshot_connector::{
+        mint_destination_witness_bytes_for_test, retain_tree_plan_for_test,
+    };
     use crate::linux_pytest::snapshot_policy::{
         SnapshotPipelineResourcesV1, SnapshotResourcePolicyV1,
     };
@@ -956,6 +989,7 @@ mod tests {
             64 * 1024,
             1024 * 1024,
             NonZeroU64::new(1024 * 1024).unwrap(),
+            0,
             transient_heap_bytes,
             NonZeroU64::new(1_000_000).unwrap(),
             NonZeroU8::new(4).unwrap(),
@@ -977,22 +1011,88 @@ mod tests {
         move |capacity| mint_destination_witness_bytes_for_test(resources, capacity)
     }
 
-    fn awaiting_d2<'source, 'resources>(
-        source_s1: &'source SourceTreePlanV1,
-        source_s2: &SourceTreePlanV1,
-        destination_d1: &SourceTreePlanV1,
+    fn retained_view<'resources>(
+        plan: SourceTreePlanV1,
         resources: &'resources SnapshotPipelineResourcesV1,
-    ) -> AwaitingDestinationViewD2V1<'source, 'resources> {
-        begin_four_view_comparison(source_s1)
-            .compare_source_s2(source_s2)
-            .unwrap()
+        stage: SnapshotPipelineForwardStageV1,
+    ) -> SnapshotRetainedTreeViewV1<'resources> {
+        retain_tree_plan_for_test(resources, stage, plan).unwrap()
+    }
+
+    fn compare_source_views<'resources>(
+        source_s1: SourceTreePlanV1,
+        source_s2: SourceTreePlanV1,
+        resources: &'resources SnapshotPipelineResourcesV1,
+    ) -> Result<SourceViewsStableV1<'resources>, SnapshotVerifyErrorV1> {
+        let source_s1 = retained_view(
+            source_s1,
+            resources,
+            SnapshotPipelineForwardStageV1::SourceObservation,
+        );
+        let source_s2 = retained_view(
+            source_s2,
+            resources,
+            SnapshotPipelineForwardStageV1::SourceObservation,
+        );
+        let result = begin_four_view_comparison(source_s1).compare_source_s2(&source_s2);
+        drop(source_s2);
+        result
+    }
+
+    fn compare_source_destination_views(
+        source_s1: SourceTreePlanV1,
+        source_s2: SourceTreePlanV1,
+        destination_d1: SourceTreePlanV1,
+        physical_identity: DestinationPhysicalIdentityV1,
+        resources: &SnapshotPipelineResourcesV1,
+    ) -> Result<(), SnapshotVerifyErrorV1> {
+        let source_stable = compare_source_views(source_s1, source_s2, resources)?;
+        let destination_d1 = retained_view(
+            destination_d1,
+            resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+        );
+        source_stable
+            .compare_destination_d1(&destination_d1, physical_identity)
+            .map(|_| ())
+    }
+
+    fn awaiting_d2<'resources>(
+        source_s1: SourceTreePlanV1,
+        source_s2: SourceTreePlanV1,
+        destination_d1: SourceTreePlanV1,
+        resources: &'resources SnapshotPipelineResourcesV1,
+    ) -> AwaitingDestinationViewD2V1<'resources> {
+        let source_stable = compare_source_views(source_s1, source_s2, resources).unwrap();
+        let destination_d1 = retained_view(
+            destination_d1,
+            resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+        );
+        let destination_stable = source_stable
             .compare_destination_d1(
-                destination_d1,
+                &destination_d1,
                 DestinationPhysicalIdentityV1::new(1_000, 2_000),
             )
-            .unwrap()
+            .unwrap();
+        let awaiting = destination_stable
             .capture_stability_witness(witness_allocator(resources))
-            .unwrap()
+            .unwrap();
+        drop(destination_d1);
+        awaiting
+    }
+
+    fn compare_d2<'resources>(
+        awaiting: AwaitingDestinationViewD2V1<'resources>,
+        destination_d2: SourceTreePlanV1,
+        resources: &'resources SnapshotPipelineResourcesV1,
+    ) -> Result<StableManifestProjectionV1<'resources, 'resources>, SnapshotVerifyErrorV1> {
+        let destination_d2 = retained_view(
+            destination_d2,
+            resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+        );
+        awaiting.compare_destination_d2(destination_d2)
     }
 
     fn error<T>(result: Result<T, SnapshotVerifyErrorV1>) -> SnapshotVerifyErrorV1 {
@@ -1036,16 +1136,15 @@ mod tests {
         assert_ne!(source_root.btime(), destination_root.btime());
         assert_ne!(source_root.size(), destination_root.size());
 
-        awaiting_d2(&s1, &s2, &d1, &resources)
-            .compare_destination_d2(&d2)
-            .unwrap();
+        compare_d2(awaiting_d2(s1, s2, d1, &resources), d2, &resources).unwrap();
     }
 
     #[test]
     fn every_required_pair_has_distinct_mismatch_evidence() {
-        let s1 = source(1);
+        let resources =
+            witness_resources(checked_destination_witness_capacity(3, 0).unwrap() as u64);
         let s2_wrong = source(2);
-        let mismatch = error(begin_four_view_comparison(&s1).compare_source_s2(&s2_wrong));
+        let mismatch = error(compare_source_views(source(1), s2_wrong, &resources));
         assert_eq!(mismatch.pair, SnapshotViewPairV1::S1S2);
         assert_eq!(
             mismatch.field,
@@ -1053,17 +1152,14 @@ mod tests {
         );
         assert_eq!(mismatch.location, SnapshotVerifyLocationV1::Entry(1));
 
-        let s2 = source(1);
         let d1_wrong = destination(2, 0);
-        let mismatch = error(
-            begin_four_view_comparison(&s1)
-                .compare_source_s2(&s2)
-                .unwrap()
-                .compare_destination_d1(
-                    &d1_wrong,
-                    DestinationPhysicalIdentityV1::new(1_000, 2_000),
-                ),
-        );
+        let mismatch = error(compare_source_destination_views(
+            source(1),
+            source(1),
+            d1_wrong,
+            DestinationPhysicalIdentityV1::new(1_000, 2_000),
+            &resources,
+        ));
         assert_eq!(mismatch.pair, SnapshotViewPairV1::S1D1);
         assert_eq!(
             mismatch.field,
@@ -1073,10 +1169,11 @@ mod tests {
 
         let d1 = destination(1, 0);
         let d2_wrong = destination(1, 1);
-        let resources =
-            witness_resources(checked_destination_witness_capacity(3, 0).unwrap() as u64);
-        let mismatch =
-            error(awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong));
+        let mismatch = error(compare_d2(
+            awaiting_d2(source(1), source(1), d1, &resources),
+            d2_wrong,
+            &resources,
+        ));
         assert_eq!(mismatch.pair, SnapshotViewPairV1::D1D2);
         assert_eq!(mismatch.field, SnapshotMismatchFieldV1::Ctime);
         assert_eq!(mismatch.location, SnapshotVerifyLocationV1::Entry(0));
@@ -1084,17 +1181,16 @@ mod tests {
 
     #[test]
     fn destination_projection_uses_writer_mode_and_explicit_owner() {
-        let s1 = source(1);
-        let s2 = source(1);
-        let d1 = destination(1, 0);
+        let resources = witness_resources(0);
 
         let wrong_mode = source(1);
-        let mismatch = error(
-            begin_four_view_comparison(&s1)
-                .compare_source_s2(&s2)
-                .unwrap()
-                .compare_destination_d1(&wrong_mode, DestinationPhysicalIdentityV1::new(10, 20)),
-        );
+        let mismatch = error(compare_source_destination_views(
+            source(1),
+            source(1),
+            wrong_mode,
+            DestinationPhysicalIdentityV1::new(10, 20),
+            &resources,
+        ));
         assert_eq!(mismatch.pair, SnapshotViewPairV1::S1D1);
         assert_eq!(
             mismatch.field,
@@ -1102,12 +1198,13 @@ mod tests {
         );
         assert_eq!(mismatch.location, SnapshotVerifyLocationV1::Entry(0));
 
-        let mismatch = error(
-            begin_four_view_comparison(&s1)
-                .compare_source_s2(&s2)
-                .unwrap()
-                .compare_destination_d1(&d1, DestinationPhysicalIdentityV1::new(7, 8)),
-        );
+        let mismatch = error(compare_source_destination_views(
+            source(1),
+            source(1),
+            destination(1, 0),
+            DestinationPhysicalIdentityV1::new(7, 8),
+            &resources,
+        ));
         assert_eq!(mismatch.pair, SnapshotViewPairV1::S1D1);
         assert_eq!(
             mismatch.field,
@@ -1118,11 +1215,10 @@ mod tests {
 
     #[test]
     fn mismatch_precedence_is_header_then_entry_then_field() {
-        let s1 = source(1);
-
+        let resources = witness_resources(0);
         let wrong_header = fixture_with(Role::Source, 2, 1, b"wrong", 2);
         assert_mismatch(
-            begin_four_view_comparison(&s1).compare_source_s2(&wrong_header),
+            compare_source_views(source(1), wrong_header, &resources),
             SnapshotViewPairV1::S1S2,
             SnapshotMismatchFieldV1::RootName,
             SnapshotVerifyLocationV1::Header,
@@ -1131,7 +1227,7 @@ mod tests {
         // Entry zero's ctime precedes entry one's digest and extent failures.
         let wrong_entries = fixture_with(Role::Source, 2, 1, b"tree", 2);
         assert_mismatch(
-            begin_four_view_comparison(&s1).compare_source_s2(&wrong_entries),
+            compare_source_views(source(1), wrong_entries, &resources),
             SnapshotViewPairV1::S1S2,
             SnapshotMismatchFieldV1::Ctime,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1141,7 +1237,7 @@ mod tests {
         // ctime, and birth-time differences.
         let wrong_fields = destination(2, 1);
         assert_mismatch(
-            begin_four_view_comparison(&s1).compare_source_s2(&wrong_fields),
+            compare_source_views(source(1), wrong_fields, &resources),
             SnapshotViewPairV1::S1S2,
             SnapshotMismatchFieldV1::InodeIdentity,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1157,8 +1253,11 @@ mod tests {
         let resources =
             witness_resources(checked_destination_witness_capacity(3, 0).unwrap() as u64);
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources)
-                .compare_destination_d2(&d2_with_different_extents),
+            compare_d2(
+                awaiting_d2(s1, s2, d1, &resources),
+                d2_with_different_extents,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::RegularExtents,
             SnapshotVerifyLocationV1::Entry(1),
@@ -1174,30 +1273,36 @@ mod tests {
         let capacity = checked_destination_witness_capacity(3, 1).unwrap();
         assert_eq!(capacity, 195);
         let resources = witness_resources(capacity as u64);
+        let expected_entry_bytes = d1
+            .entries()
+            .iter()
+            .map(SourceTreeEntryV1::destination_stability_bytes_v1)
+            .collect::<Vec<_>>();
+        let expected_group_bytes = d1.hardlink_groups()[0].destination_stability_bytes_v1();
 
-        let awaiting_d2 = awaiting_d2(&s1, &s2, &d1, &resources);
+        let awaiting_d2 = awaiting_d2(s1, s2, d1, &resources);
 
         let bytes = awaiting_d2.witness.bytes.as_slice();
         assert_eq!(bytes.len(), capacity);
         assert_eq!(awaiting_d2.witness.entry_count(), 3);
         assert_eq!(awaiting_d2.witness.hardlink_group_count(), 1);
-        for (index, entry) in d1.entries().iter().enumerate() {
+        for (index, expected) in expected_entry_bytes.iter().enumerate() {
             let start = index * DESTINATION_WITNESS_ENTRY_BYTES_V1;
             assert_eq!(
                 &bytes[start..start + DESTINATION_WITNESS_ENTRY_BYTES_V1],
-                &entry.destination_stability_bytes_v1()
+                expected
             );
         }
         let group_start = 3 * DESTINATION_WITNESS_ENTRY_BYTES_V1;
         assert_eq!(
             &bytes[group_start..group_start + DESTINATION_WITNESS_HARDLINK_BYTES_V1],
-            &d1.hardlink_groups()[0].destination_stability_bytes_v1()
+            &expected_group_bytes
         );
         assert_eq!(
             awaiting_d2.exact_physical_identity,
             DestinationPhysicalIdentityV1::new(1_000, 2_000)
         );
-        awaiting_d2.compare_destination_d2(&d2).unwrap();
+        compare_d2(awaiting_d2, d2, &resources).unwrap();
     }
 
     #[test]
@@ -1232,24 +1337,16 @@ mod tests {
         let capacity = checked_destination_witness_capacity(3, 0).unwrap();
         let resources = witness_resources(capacity as u64);
 
-        let s1_a = source(1);
-        let s2_a = source(1);
         let d1_a = destination(1, 0);
-        let first = awaiting_d2(&s1_a, &s2_a, &d1_a, &resources);
+        let first =
+            DestinationStabilityWitnessV1::capture(&d1_a, witness_allocator(&resources)).unwrap();
 
-        let s1_b = source(1);
-        let s2_b = source(1);
         let d1_b = destination(1, 0);
-        let error = match begin_four_view_comparison(&s1_b)
-            .compare_source_s2(&s2_b)
-            .unwrap()
-            .compare_destination_d1(&d1_b, DestinationPhysicalIdentityV1::new(1_000, 2_000))
-            .unwrap()
-            .capture_stability_witness(witness_allocator(&resources))
-        {
-            Ok(_) => panic!("a second concurrent witness must exceed the exact charge"),
-            Err(error) => error,
-        };
+        let error =
+            match DestinationStabilityWitnessV1::capture(&d1_b, witness_allocator(&resources)) {
+                Ok(_) => panic!("a second concurrent witness must exceed the exact charge"),
+                Err(error) => error,
+            };
         assert_eq!(
             error,
             SnapshotPipelineResourceErrorV1::TransientHeapCapacityExceeded {
@@ -1263,23 +1360,28 @@ mod tests {
         );
 
         drop(first);
-        let s1_c = source(1);
-        let s2_c = source(1);
         let d1_c = destination(1, 0);
-        let replacement = awaiting_d2(&s1_c, &s2_c, &d1_c, &resources);
+        let replacement =
+            DestinationStabilityWitnessV1::capture(&d1_c, witness_allocator(&resources)).unwrap();
         drop(replacement);
     }
 
     #[test]
     fn d1_d2_keeps_entry_then_group_and_group_field_precedence() {
-        let s1 = with_hardlink_group(source(1));
-        let s2 = with_hardlink_group(source(1));
-        let d1 = with_hardlink_group(destination(1, 0));
         let d2_wrong_entry = with_hardlink_group(destination(1, 1));
         let capacity = checked_destination_witness_capacity(3, 1).unwrap();
         let resources = witness_resources(capacity as u64);
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong_entry),
+            compare_d2(
+                awaiting_d2(
+                    with_hardlink_group(source(1)),
+                    with_hardlink_group(source(1)),
+                    with_hardlink_group(destination(1, 0)),
+                    &resources,
+                ),
+                d2_wrong_entry,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::Ctime,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1287,7 +1389,16 @@ mod tests {
 
         let d2_wrong_group = with_hardlink_group_at(destination(1, 0), 0, vec![2]);
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong_group),
+            compare_d2(
+                awaiting_d2(
+                    with_hardlink_group(source(1)),
+                    with_hardlink_group(source(1)),
+                    with_hardlink_group(destination(1, 0)),
+                    &resources,
+                ),
+                d2_wrong_group,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::HardlinkInodeIdentity,
             SnapshotVerifyLocationV1::HardlinkGroup(0),
@@ -1296,9 +1407,6 @@ mod tests {
 
     #[test]
     fn d1_d2_reconstructs_each_raw_field_and_same_inode_group_members() {
-        let s1 = source(1);
-        let s2 = source(1);
-        let d1 = destination(1, 0);
         let resources =
             witness_resources(checked_destination_witness_capacity(3, 1).unwrap() as u64);
 
@@ -1316,7 +1424,11 @@ mod tests {
             ),
         );
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong_inode),
+            compare_d2(
+                awaiting_d2(source(1), source(1), destination(1, 0), &resources),
+                d2_wrong_inode,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::InodeIdentity,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1336,7 +1448,11 @@ mod tests {
             ),
         );
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong_directory_size),
+            compare_d2(
+                awaiting_d2(source(1), source(1), destination(1, 0), &resources),
+                d2_wrong_directory_size,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::Size,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1361,7 +1477,11 @@ mod tests {
             ),
         );
         assert_mismatch(
-            awaiting_d2(&s1, &s2, &d1, &resources).compare_destination_d2(&d2_wrong_btime),
+            compare_d2(
+                awaiting_d2(source(1), source(1), destination(1, 0), &resources),
+                d2_wrong_btime,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::Btime,
             SnapshotVerifyLocationV1::Entry(0),
@@ -1372,8 +1492,11 @@ mod tests {
         let d1_grouped = with_hardlink_group(destination(1, 0));
         let d2_wrong_members = with_hardlink_group_at(destination(1, 0), 1, vec![2]);
         assert_mismatch(
-            awaiting_d2(&s1_grouped, &s2_grouped, &d1_grouped, &resources)
-                .compare_destination_d2(&d2_wrong_members),
+            compare_d2(
+                awaiting_d2(s1_grouped, s2_grouped, d1_grouped, &resources),
+                d2_wrong_members,
+                &resources,
+            ),
             SnapshotViewPairV1::D1D2,
             SnapshotMismatchFieldV1::HardlinkMembers,
             SnapshotVerifyLocationV1::HardlinkGroup(0),
@@ -1389,10 +1512,17 @@ mod tests {
         assert_eq!(required, 195);
         let resources = witness_resources((required - 1) as u64);
 
-        let error = match begin_four_view_comparison(&s1)
-            .compare_source_s2(&s2)
-            .unwrap()
-            .compare_destination_d1(&d1, DestinationPhysicalIdentityV1::new(1_000, 2_000))
+        let source_stable = compare_source_views(s1, s2, &resources).unwrap();
+        let destination_d1 = retained_view(
+            d1,
+            &resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+        );
+        let error = match source_stable
+            .compare_destination_d1(
+                &destination_d1,
+                DestinationPhysicalIdentityV1::new(1_000, 2_000),
+            )
             .unwrap()
             .capture_stability_witness(witness_allocator(&resources))
         {
@@ -1413,6 +1543,30 @@ mod tests {
     }
 
     #[test]
+    fn stable_projection_owns_both_exact_retained_views_until_consumed() {
+        let capacity = checked_destination_witness_capacity(3, 0).unwrap();
+        let resources = witness_resources(capacity as u64);
+        let awaiting = awaiting_d2(source(1), source(1), destination(1, 0), &resources);
+
+        assert_eq!(resources.retained_view_heap_live_for_test(), 1024 * 1024);
+        let stable = compare_d2(awaiting, destination(1, 0), &resources).unwrap();
+        assert_eq!(
+            resources.retained_view_heap_live_for_test(),
+            2 * 1024 * 1024
+        );
+
+        let (source_s1, destination_d2) = stable.into_views();
+        assert_eq!(
+            resources.retained_view_heap_live_for_test(),
+            2 * 1024 * 1024
+        );
+        drop(destination_d2);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 1024 * 1024);
+        drop(source_s1);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[test]
     fn witness_owning_typestates_cannot_gain_clone_or_copy() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
@@ -1430,10 +1584,17 @@ mod tests {
         <DestinationViewD1MatchedV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
         <DestinationStabilityWitnessV1<'static> as AmbiguousIfClone<_>>::probe();
         <DestinationStabilityWitnessV1<'static> as AmbiguousIfCopy<_>>::probe();
-        <AwaitingDestinationViewD2V1<'static, 'static> as AmbiguousIfClone<_>>::probe();
-        <AwaitingDestinationViewD2V1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
+        <AwaitingSourceViewS2V1<'static> as AmbiguousIfClone<_>>::probe();
+        <AwaitingSourceViewS2V1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SourceViewsStableV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SourceViewsStableV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <AwaitingDestinationViewD2V1<'static> as AmbiguousIfClone<_>>::probe();
+        <AwaitingDestinationViewD2V1<'static> as AmbiguousIfCopy<_>>::probe();
+        <StableManifestProjectionV1<'static, 'static> as AmbiguousIfClone<_>>::probe();
+        <StableManifestProjectionV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<AwaitingDestinationViewD2V1<'static>>());
         assert!(std::mem::needs_drop::<
-            AwaitingDestinationViewD2V1<'static, 'static>,
+            StableManifestProjectionV1<'static, 'static>,
         >());
     }
 }

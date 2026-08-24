@@ -94,6 +94,178 @@ impl WireType {
     }
 }
 
+/// Minimal allocation-free output boundary for canonical manifest bytes.
+///
+/// The snapshot resource layer can implement this trait for its private
+/// charged byte container without lending allocator or ledger authority to
+/// this module. Implementations must either append the complete slice or
+/// return an error; partial-success semantics are forbidden.
+pub(super) trait ManifestCanonicalByteSinkV1 {
+    type Error;
+
+    fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum ManifestCanonicalWriteErrorV1<E> {
+    Canonical(LinuxPytestContractError),
+    Sink(E),
+}
+
+impl<E> From<LinuxPytestContractError> for ManifestCanonicalWriteErrorV1<E> {
+    fn from(error: LinuxPytestContractError) -> Self {
+        Self::Canonical(error)
+    }
+}
+
+struct ManifestCanonicalWriterV1<'sink, S> {
+    sink: &'sink mut S,
+    written: usize,
+}
+
+impl<'sink, S> ManifestCanonicalWriterV1<'sink, S>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    fn new(sink: &'sink mut S) -> Self {
+        Self { sink, written: 0 }
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        let next = self
+            .written
+            .checked_add(bytes.len())
+            .ok_or(LinuxPytestContractError::CanonicalEncoding)?;
+        self.sink
+            .try_extend_canonical(bytes)
+            .map_err(ManifestCanonicalWriteErrorV1::Sink)?;
+        self.written = next;
+        Ok(())
+    }
+
+    const fn written(&self) -> usize {
+        self.written
+    }
+
+    fn object_header(
+        &mut self,
+        type_id: u16,
+        field_count: u16,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        self.bytes(&type_id.to_be_bytes())?;
+        self.bytes(&EFFECT_IR_V2_WIRE_VERSION.to_be_bytes())?;
+        self.bytes(&field_count.to_be_bytes())
+    }
+
+    fn enum_header(
+        &mut self,
+        variant: u16,
+        field_count: u16,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        if variant == 0 {
+            return Err(LinuxPytestContractError::CanonicalEncoding.into());
+        }
+        self.bytes(&variant.to_be_bytes())?;
+        self.bytes(&field_count.to_be_bytes())
+    }
+
+    fn field_header(
+        &mut self,
+        tag: u16,
+        wire_type: WireType,
+        payload_length: usize,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        if tag == 0 {
+            return Err(LinuxPytestContractError::CanonicalEncoding.into());
+        }
+        let payload_length = u64::try_from(payload_length)
+            .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+        self.bytes(&tag.to_be_bytes())?;
+        self.bytes(&[wire_type as u8])?;
+        self.bytes(&payload_length.to_be_bytes())
+    }
+
+    fn list_header(
+        &mut self,
+        item_count: usize,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        let item_count = canonical_collection_count(item_count)?;
+        self.bytes(&item_count.to_be_bytes())
+    }
+
+    fn list_item_header(
+        &mut self,
+        item_length: usize,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>> {
+        let item_length =
+            u64::try_from(item_length).map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+        self.bytes(&item_length.to_be_bytes())
+    }
+}
+
+struct ManifestCanonicalVecSinkV1 {
+    bytes: Vec<u8>,
+    exact_length: usize,
+}
+
+impl ManifestCanonicalVecSinkV1 {
+    fn new(exact_length: usize) -> Result<Self, LinuxPytestContractError> {
+        checked_canonical_payload_length(exact_length)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(exact_length)
+            .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+        Ok(Self {
+            bytes,
+            exact_length,
+        })
+    }
+
+    fn finish(self) -> Result<Vec<u8>, LinuxPytestContractError> {
+        if self.bytes.len() != self.exact_length {
+            return Err(LinuxPytestContractError::CanonicalEncoding);
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl ManifestCanonicalByteSinkV1 for ManifestCanonicalVecSinkV1 {
+    type Error = LinuxPytestContractError;
+
+    fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        let next_length = self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(LinuxPytestContractError::CanonicalEncoding)?;
+        if next_length > self.exact_length {
+            return Err(LinuxPytestContractError::CanonicalEncoding);
+        }
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn encode_manifest_canonical_vec(
+    exact_length: usize,
+    write: impl FnOnce(
+        &mut ManifestCanonicalWriterV1<'_, ManifestCanonicalVecSinkV1>,
+    ) -> Result<(), ManifestCanonicalWriteErrorV1<LinuxPytestContractError>>,
+) -> Result<Vec<u8>, LinuxPytestContractError> {
+    let mut sink = ManifestCanonicalVecSinkV1::new(exact_length)?;
+    let result = {
+        let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
+        write(&mut writer)
+    };
+    match result {
+        Ok(()) => sink.finish(),
+        Err(
+            ManifestCanonicalWriteErrorV1::Canonical(error)
+            | ManifestCanonicalWriteErrorV1::Sink(error),
+        ) => Err(error),
+    }
+}
+
 struct Field {
     tag: u16,
     wire_type: WireType,
@@ -300,6 +472,101 @@ fn enforce_size(bytes: &[u8]) -> Result<(), LinuxPytestContractError> {
         return Err(LinuxPytestContractError::CanonicalEncoding);
     }
     Ok(())
+}
+
+const OBJECT_HEADER_BYTES: usize = 2 + 2 + 2;
+const ENUM_HEADER_BYTES: usize = 2 + 2;
+const LIST_HEADER_BYTES: usize = 8;
+const OPTIONAL_ABSENT_BYTES: usize = 1;
+const OPTIONAL_PRESENT_HEADER_BYTES: usize = 1 + 8;
+
+fn canonical_collection_count(count: usize) -> Result<u64, LinuxPytestContractError> {
+    let count = u64::try_from(count).map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+    if count > EFFECT_IR_V2_MAX_COLLECTION_ITEMS {
+        return Err(LinuxPytestContractError::CanonicalEncoding);
+    }
+    Ok(count)
+}
+
+fn checked_canonical_add(left: usize, right: usize) -> Result<usize, LinuxPytestContractError> {
+    left.checked_add(right)
+        .ok_or(LinuxPytestContractError::CanonicalEncoding)
+}
+
+fn checked_canonical_payload_length(length: usize) -> Result<usize, LinuxPytestContractError> {
+    let length_u64 =
+        u64::try_from(length).map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+    if length_u64 > EFFECT_IR_V2_MAX_CANONICAL_BYTES {
+        return Err(LinuxPytestContractError::CanonicalEncoding);
+    }
+    Ok(length)
+}
+
+fn checked_canonical_field_length(
+    payload_length: usize,
+) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_payload_length(checked_canonical_add(FIELD_HEADER_BYTES, payload_length)?)
+}
+
+fn checked_canonical_object_length(
+    payload_lengths: &[usize],
+) -> Result<usize, LinuxPytestContractError> {
+    u16::try_from(payload_lengths.len())
+        .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+    let mut length = OBJECT_HEADER_BYTES;
+    for payload_length in payload_lengths {
+        length = checked_canonical_add(length, checked_canonical_field_length(*payload_length)?)?;
+    }
+    checked_canonical_payload_length(length)
+}
+
+fn checked_canonical_enum_length(
+    variant: u16,
+    payload_lengths: &[usize],
+) -> Result<usize, LinuxPytestContractError> {
+    if variant == 0 {
+        return Err(LinuxPytestContractError::CanonicalEncoding);
+    }
+    u16::try_from(payload_lengths.len())
+        .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+    let mut length = ENUM_HEADER_BYTES;
+    for payload_length in payload_lengths {
+        length = checked_canonical_add(length, checked_canonical_field_length(*payload_length)?)?;
+    }
+    checked_canonical_payload_length(length)
+}
+
+fn checked_canonical_list_length(
+    item_count: usize,
+    item_lengths: impl IntoIterator<Item = Result<usize, LinuxPytestContractError>>,
+) -> Result<usize, LinuxPytestContractError> {
+    canonical_collection_count(item_count)?;
+    let mut observed_count = 0usize;
+    let mut length = LIST_HEADER_BYTES;
+    for item_length in item_lengths {
+        observed_count = observed_count
+            .checked_add(1)
+            .ok_or(LinuxPytestContractError::CanonicalEncoding)?;
+        let item_length = item_length?;
+        length = checked_canonical_add(length, LIST_ITEM_HEADER_BYTES)?;
+        length = checked_canonical_add(length, item_length)?;
+    }
+    if observed_count != item_count {
+        return Err(LinuxPytestContractError::CanonicalEncoding);
+    }
+    checked_canonical_payload_length(length)
+}
+
+fn checked_canonical_optional_length(
+    payload_length: Option<usize>,
+) -> Result<usize, LinuxPytestContractError> {
+    match payload_length {
+        None => Ok(OPTIONAL_ABSENT_BYTES),
+        Some(payload_length) => checked_canonical_payload_length(checked_canonical_add(
+            OPTIONAL_PRESENT_HEADER_BYTES,
+            payload_length,
+        )?),
+    }
 }
 
 struct Cursor<'a> {
@@ -1784,144 +2051,683 @@ fn comparison_rules_bytes() -> Result<Vec<u8>, LinuxPytestContractError> {
     object.finish_top()
 }
 
-fn encode_timespec(value: &TimespecV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_TIMESPEC);
-    object.i64(1, value.seconds)?;
-    object.u32(2, value.nanoseconds)?;
-    object.finish_nested()
+fn manifest_timespec_canonical_length() -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_object_length(&[std::mem::size_of::<i64>(), std::mem::size_of::<u32>()])
 }
 
-fn encode_xattr(value: &XattrV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_XATTR);
-    object.bytes(1, &value.name)?;
-    object.bytes(2, &value.value)?;
-    object.finish_nested()
+fn manifest_xattr_canonical_length(value: &XattrV1) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_object_length(&[value.name.len(), value.value.len()])
 }
 
-fn encode_metadata(value: &MetadataV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_METADATA);
-    object.u32(1, value.mode)?;
-    object.u32(2, value.logical_uid)?;
-    object.u32(3, value.logical_gid)?;
-    object.u64(4, value.size)?;
-    object.u64(5, value.nlink)?;
-    object.object(6, encode_timespec(&value.atime)?)?;
-    object.object(7, encode_timespec(&value.mtime)?)?;
-    object.object(8, encode_timespec(&value.ctime)?)?;
-    object.optional(9, value.btime.as_ref().map(encode_timespec).transpose()?)?;
-    object.list(
-        10,
-        value
-            .xattrs
-            .iter()
-            .map(encode_xattr)
-            .collect::<Result<Vec<_>, _>>()?,
-    )?;
-    object.finish_nested()
+fn manifest_xattr_list_canonical_length(
+    values: &[XattrV1],
+) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_list_length(
+        values.len(),
+        values.iter().map(manifest_xattr_canonical_length),
+    )
 }
 
-fn encode_extent(value: &ExtentV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_EXTENT);
-    object.u64(1, value.offset)?;
-    object.u64(2, value.length)?;
-    object.finish_nested()
+fn manifest_metadata_canonical_length(
+    value: &MetadataV1,
+) -> Result<usize, LinuxPytestContractError> {
+    let timespec = manifest_timespec_canonical_length()?;
+    let btime = checked_canonical_optional_length(value.btime.as_ref().map(|_| timespec))?;
+    let xattrs = manifest_xattr_list_canonical_length(&value.xattrs)?;
+    checked_canonical_object_length(&[
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<u32>(),
+        std::mem::size_of::<u64>(),
+        std::mem::size_of::<u64>(),
+        timespec,
+        timespec,
+        timespec,
+        btime,
+        xattrs,
+    ])
 }
 
-fn encode_child(value: &ChildCommitmentV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_CHILD_COMMITMENT);
-    object.bytes(1, &value.name)?;
-    object.enumeration(2, value.kind as u16, Vec::new())?;
-    object.bytes(3, value.node_digest.as_bytes())?;
-    object.finish_nested()
+fn manifest_extent_canonical_length() -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_object_length(&[std::mem::size_of::<u64>(), std::mem::size_of::<u64>()])
 }
 
-fn encode_manifest_payload(value: &ManifestPayloadV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+fn manifest_extent_list_canonical_length(
+    values: &[ExtentV1],
+) -> Result<usize, LinuxPytestContractError> {
+    let extent = manifest_extent_canonical_length()?;
+    checked_canonical_list_length(values.len(), values.iter().map(|_| Ok(extent)))
+}
+
+fn manifest_child_canonical_length(
+    value: &ChildCommitmentV1,
+) -> Result<usize, LinuxPytestContractError> {
+    let kind = checked_canonical_enum_length(value.kind as u16, &[])?;
+    checked_canonical_object_length(&[value.name.len(), kind, value.node_digest.as_bytes().len()])
+}
+
+fn manifest_child_list_canonical_length(
+    values: &[ChildCommitmentV1],
+) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_list_length(
+        values.len(),
+        values.iter().map(manifest_child_canonical_length),
+    )
+}
+
+fn manifest_payload_canonical_length(
+    value: &ManifestPayloadV1,
+) -> Result<usize, LinuxPytestContractError> {
     match value {
-        ManifestPayloadV1::Directory { children } => Ok(encode_enum(
+        ManifestPayloadV1::Directory { children } => checked_canonical_enum_length(
             ManifestEntryKindV1::Directory as u16,
-            vec![enum_field(
-                1,
-                WireType::List,
-                encode_list(
-                    children
-                        .iter()
-                        .map(encode_child)
-                        .collect::<Result<Vec<_>, _>>()?,
-                )?,
-            )],
-        )?),
+            &[manifest_child_list_canonical_length(children)?],
+        ),
         ManifestPayloadV1::Regular {
             content_digest,
             data_extents,
-        } => Ok(encode_enum(
+        } => checked_canonical_enum_length(
             ManifestEntryKindV1::Regular as u16,
-            vec![
-                enum_field(1, WireType::Bytes, content_digest.as_bytes().to_vec()),
-                enum_field(
-                    2,
-                    WireType::List,
-                    encode_list(
-                        data_extents
-                            .iter()
-                            .map(encode_extent)
-                            .collect::<Result<Vec<_>, _>>()?,
-                    )?,
-                ),
+            &[
+                content_digest.as_bytes().len(),
+                manifest_extent_list_canonical_length(data_extents)?,
             ],
-        )?),
-        ManifestPayloadV1::Symlink { target } => Ok(encode_enum(
-            ManifestEntryKindV1::Symlink as u16,
-            vec![enum_field(1, WireType::Bytes, target.clone())],
-        )?),
+        ),
+        ManifestPayloadV1::Symlink { target } => {
+            checked_canonical_enum_length(ManifestEntryKindV1::Symlink as u16, &[target.len()])
+        }
+        ManifestPayloadV1::ExternalTree {
+            tree_role,
+            target_root,
+            ..
+        } => checked_canonical_enum_length(
+            ManifestEntryKindV1::ExternalTree as u16,
+            &[
+                checked_canonical_enum_length(*tree_role as u16, &[])?,
+                target_root.as_bytes().len(),
+                std::mem::size_of::<u8>(),
+            ],
+        ),
+    }
+}
+
+fn manifest_entry_canonical_length(
+    value: &ManifestEntryV1,
+) -> Result<usize, LinuxPytestContractError> {
+    let kind = checked_canonical_enum_length(value.payload.kind() as u16, &[])?;
+    let metadata = manifest_metadata_canonical_length(&value.metadata)?;
+    let payload = manifest_payload_canonical_length(&value.payload)?;
+    let hardlink = checked_canonical_optional_length(
+        value
+            .hardlink_group
+            .as_ref()
+            .map(|digest| digest.as_bytes().len()),
+    )?;
+    checked_canonical_object_length(&[
+        value.relative_path.len(),
+        kind,
+        metadata,
+        payload,
+        hardlink,
+        value.node_digest.as_bytes().len(),
+    ])
+}
+
+fn manifest_entry_list_canonical_length(
+    values: &[ManifestEntryV1],
+) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_list_length(
+        values.len(),
+        values.iter().map(manifest_entry_canonical_length),
+    )
+}
+
+/// Exact byte length of the frozen nested `TreeManifestV1` canonical object.
+///
+/// This performs checked arithmetic and collection-limit validation only; it
+/// does not allocate or replace `TreeManifestV1::validate`.
+pub(super) fn checked_tree_manifest_canonical_length_v1(
+    value: &TreeManifestV1,
+) -> Result<usize, LinuxPytestContractError> {
+    let role = checked_canonical_enum_length(value.tree_role as u16, &[])?;
+    let entries = manifest_entry_list_canonical_length(&value.entries)?;
+    checked_canonical_object_length(&[
+        value.mount_path.as_bytes().len(),
+        role,
+        entries,
+        value.root_digest.as_bytes().len(),
+    ])
+}
+
+fn write_manifest_timespec<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &TimespecV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.object_header(TYPE_TIMESPEC, 2)?;
+    writer.field_header(1, WireType::I64, std::mem::size_of::<i64>())?;
+    writer.bytes(&value.seconds.to_be_bytes())?;
+    writer.field_header(2, WireType::U32, std::mem::size_of::<u32>())?;
+    writer.bytes(&value.nanoseconds.to_be_bytes())
+}
+
+fn write_manifest_xattr<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &XattrV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.object_header(TYPE_XATTR, 2)?;
+    writer.field_header(1, WireType::Bytes, value.name.len())?;
+    writer.bytes(&value.name)?;
+    writer.field_header(2, WireType::Bytes, value.value.len())?;
+    writer.bytes(&value.value)
+}
+
+fn write_manifest_xattr_list<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    values: &[XattrV1],
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.list_header(values.len())?;
+    for value in values {
+        let length = manifest_xattr_canonical_length(value)?;
+        writer.list_item_header(length)?;
+        write_manifest_xattr(writer, value)?;
+    }
+    Ok(())
+}
+
+fn write_manifest_metadata<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &MetadataV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let timespec = manifest_timespec_canonical_length()?;
+    let btime = checked_canonical_optional_length(value.btime.as_ref().map(|_| timespec))?;
+    let xattrs = manifest_xattr_list_canonical_length(&value.xattrs)?;
+
+    writer.object_header(TYPE_METADATA, 10)?;
+    writer.field_header(1, WireType::U32, std::mem::size_of::<u32>())?;
+    writer.bytes(&value.mode.to_be_bytes())?;
+    writer.field_header(2, WireType::U32, std::mem::size_of::<u32>())?;
+    writer.bytes(&value.logical_uid.to_be_bytes())?;
+    writer.field_header(3, WireType::U32, std::mem::size_of::<u32>())?;
+    writer.bytes(&value.logical_gid.to_be_bytes())?;
+    writer.field_header(4, WireType::U64, std::mem::size_of::<u64>())?;
+    writer.bytes(&value.size.to_be_bytes())?;
+    writer.field_header(5, WireType::U64, std::mem::size_of::<u64>())?;
+    writer.bytes(&value.nlink.to_be_bytes())?;
+    writer.field_header(6, WireType::Object, timespec)?;
+    write_manifest_timespec(writer, &value.atime)?;
+    writer.field_header(7, WireType::Object, timespec)?;
+    write_manifest_timespec(writer, &value.mtime)?;
+    writer.field_header(8, WireType::Object, timespec)?;
+    write_manifest_timespec(writer, &value.ctime)?;
+    writer.field_header(9, WireType::Optional, btime)?;
+    match &value.btime {
+        None => writer.bytes(&[0])?,
+        Some(value) => {
+            writer.bytes(&[1])?;
+            writer.bytes(
+                &u64::try_from(timespec)
+                    .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?
+                    .to_be_bytes(),
+            )?;
+            write_manifest_timespec(writer, value)?;
+        }
+    }
+    writer.field_header(10, WireType::List, xattrs)?;
+    write_manifest_xattr_list(writer, &value.xattrs)
+}
+
+fn write_manifest_extent<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &ExtentV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.object_header(TYPE_EXTENT, 2)?;
+    writer.field_header(1, WireType::U64, std::mem::size_of::<u64>())?;
+    writer.bytes(&value.offset.to_be_bytes())?;
+    writer.field_header(2, WireType::U64, std::mem::size_of::<u64>())?;
+    writer.bytes(&value.length.to_be_bytes())
+}
+
+fn write_manifest_extent_list<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    values: &[ExtentV1],
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let item_length = manifest_extent_canonical_length()?;
+    writer.list_header(values.len())?;
+    for value in values {
+        writer.list_item_header(item_length)?;
+        write_manifest_extent(writer, value)?;
+    }
+    Ok(())
+}
+
+fn write_manifest_child<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &ChildCommitmentV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let kind = checked_canonical_enum_length(value.kind as u16, &[])?;
+    writer.object_header(TYPE_CHILD_COMMITMENT, 3)?;
+    writer.field_header(1, WireType::Bytes, value.name.len())?;
+    writer.bytes(&value.name)?;
+    writer.field_header(2, WireType::Enum, kind)?;
+    writer.enum_header(value.kind as u16, 0)?;
+    writer.field_header(3, WireType::Bytes, value.node_digest.as_bytes().len())?;
+    writer.bytes(value.node_digest.as_bytes())
+}
+
+fn write_manifest_child_list<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    values: &[ChildCommitmentV1],
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.list_header(values.len())?;
+    for value in values {
+        let length = manifest_child_canonical_length(value)?;
+        writer.list_item_header(length)?;
+        write_manifest_child(writer, value)?;
+    }
+    Ok(())
+}
+
+fn write_manifest_payload<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &ManifestPayloadV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    match value {
+        ManifestPayloadV1::Directory { children } => {
+            let children_length = manifest_child_list_canonical_length(children)?;
+            writer.enum_header(ManifestEntryKindV1::Directory as u16, 1)?;
+            writer.field_header(1, WireType::List, children_length)?;
+            write_manifest_child_list(writer, children)
+        }
+        ManifestPayloadV1::Regular {
+            content_digest,
+            data_extents,
+        } => {
+            let extents_length = manifest_extent_list_canonical_length(data_extents)?;
+            writer.enum_header(ManifestEntryKindV1::Regular as u16, 2)?;
+            writer.field_header(1, WireType::Bytes, content_digest.as_bytes().len())?;
+            writer.bytes(content_digest.as_bytes())?;
+            writer.field_header(2, WireType::List, extents_length)?;
+            write_manifest_extent_list(writer, data_extents)
+        }
+        ManifestPayloadV1::Symlink { target } => {
+            writer.enum_header(ManifestEntryKindV1::Symlink as u16, 1)?;
+            writer.field_header(1, WireType::Bytes, target.len())?;
+            writer.bytes(target)
+        }
         ManifestPayloadV1::ExternalTree {
             tree_role,
             target_root,
             readonly,
-        } => Ok(encode_enum(
-            ManifestEntryKindV1::ExternalTree as u16,
-            vec![
-                enum_field(
-                    1,
-                    WireType::Enum,
-                    encode_enum(*tree_role as u16, Vec::new())?,
-                ),
-                enum_field(2, WireType::Bytes, target_root.as_bytes().to_vec()),
-                enum_field(3, WireType::Bool, vec![u8::from(*readonly)]),
-            ],
-        )?),
+        } => {
+            let role = checked_canonical_enum_length(*tree_role as u16, &[])?;
+            writer.enum_header(ManifestEntryKindV1::ExternalTree as u16, 3)?;
+            writer.field_header(1, WireType::Enum, role)?;
+            writer.enum_header(*tree_role as u16, 0)?;
+            writer.field_header(2, WireType::Bytes, target_root.as_bytes().len())?;
+            writer.bytes(target_root.as_bytes())?;
+            writer.field_header(3, WireType::Bool, std::mem::size_of::<u8>())?;
+            writer.bytes(&[u8::from(*readonly)])
+        }
     }
 }
 
-fn encode_manifest_entry(value: &ManifestEntryV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_MANIFEST_ENTRY);
-    object.bytes(1, &value.relative_path)?;
-    object.enumeration(2, value.payload.kind() as u16, Vec::new())?;
-    object.object(3, encode_metadata(&value.metadata)?)?;
-    object.field(4, WireType::Enum, encode_manifest_payload(&value.payload)?)?;
-    object.optional(
-        5,
+fn write_manifest_entry<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &ManifestEntryV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let kind = checked_canonical_enum_length(value.payload.kind() as u16, &[])?;
+    let metadata = manifest_metadata_canonical_length(&value.metadata)?;
+    let payload = manifest_payload_canonical_length(&value.payload)?;
+    let hardlink = checked_canonical_optional_length(
         value
             .hardlink_group
-            .map(|digest| digest.as_bytes().to_vec()),
+            .as_ref()
+            .map(|digest| digest.as_bytes().len()),
     )?;
-    object.bytes(6, value.node_digest.as_bytes())?;
-    object.finish_nested()
+
+    writer.object_header(TYPE_MANIFEST_ENTRY, 6)?;
+    writer.field_header(1, WireType::Bytes, value.relative_path.len())?;
+    writer.bytes(&value.relative_path)?;
+    writer.field_header(2, WireType::Enum, kind)?;
+    writer.enum_header(value.payload.kind() as u16, 0)?;
+    writer.field_header(3, WireType::Object, metadata)?;
+    write_manifest_metadata(writer, &value.metadata)?;
+    writer.field_header(4, WireType::Enum, payload)?;
+    write_manifest_payload(writer, &value.payload)?;
+    writer.field_header(5, WireType::Optional, hardlink)?;
+    match &value.hardlink_group {
+        None => writer.bytes(&[0])?,
+        Some(digest) => {
+            writer.bytes(&[1])?;
+            writer.bytes(
+                &u64::try_from(digest.as_bytes().len())
+                    .map_err(|_| LinuxPytestContractError::CanonicalEncoding)?
+                    .to_be_bytes(),
+            )?;
+            writer.bytes(digest.as_bytes())?;
+        }
+    }
+    writer.field_header(6, WireType::Bytes, value.node_digest.as_bytes().len())?;
+    writer.bytes(value.node_digest.as_bytes())
+}
+
+fn write_manifest_entry_list<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    values: &[ManifestEntryV1],
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    writer.list_header(values.len())?;
+    for value in values {
+        let length = manifest_entry_canonical_length(value)?;
+        writer.list_item_header(length)?;
+        write_manifest_entry(writer, value)?;
+    }
+    Ok(())
+}
+
+fn write_tree_manifest_canonical_inner<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &TreeManifestV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let role = checked_canonical_enum_length(value.tree_role as u16, &[])?;
+    let entries = manifest_entry_list_canonical_length(&value.entries)?;
+    writer.object_header(TYPE_TREE_MANIFEST, 4)?;
+    writer.field_header(1, WireType::Bytes, value.mount_path.as_bytes().len())?;
+    writer.bytes(value.mount_path.as_bytes())?;
+    writer.field_header(2, WireType::Enum, role)?;
+    writer.enum_header(value.tree_role as u16, 0)?;
+    writer.field_header(3, WireType::List, entries)?;
+    write_manifest_entry_list(writer, &value.entries)?;
+    writer.field_header(4, WireType::Bytes, value.root_digest.as_bytes().len())?;
+    writer.bytes(value.root_digest.as_bytes())
+}
+
+/// Write the frozen nested tree-manifest object directly into a caller-owned
+/// bounded sink. No intermediate canonical `Vec` or nested payload allocation
+/// is created. The exact total length is checked before the first sink write.
+pub(super) fn write_tree_manifest_canonical_v1<S>(
+    value: &TreeManifestV1,
+    sink: &mut S,
+) -> Result<usize, ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let length = checked_tree_manifest_canonical_length_v1(value)?;
+    let mut writer = ManifestCanonicalWriterV1::new(sink);
+    write_tree_manifest_canonical_inner(&mut writer, value)?;
+    if writer.written() != length {
+        return Err(LinuxPytestContractError::CanonicalEncoding.into());
+    }
+    Ok(writer.written())
+}
+
+struct ManifestCanonicalHasherSinkV1<'hasher> {
+    hasher: &'hasher mut blake3::Hasher,
+}
+
+impl ManifestCanonicalByteSinkV1 for ManifestCanonicalHasherSinkV1<'_> {
+    type Error = std::convert::Infallible;
+
+    fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.hasher.update(bytes);
+        Ok(())
+    }
+}
+
+fn map_infallible_manifest_write(
+    result: Result<(), ManifestCanonicalWriteErrorV1<std::convert::Infallible>>,
+) -> Result<(), LinuxPytestContractError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(ManifestCanonicalWriteErrorV1::Canonical(error)) => Err(error),
+        Err(ManifestCanonicalWriteErrorV1::Sink(error)) => match error {},
+    }
+}
+
+struct ManifestTaggedDigestV1 {
+    hasher: blake3::Hasher,
+    declared_field_count: u32,
+    written_field_count: u32,
+    previous_tag: u16,
+}
+
+impl ManifestTaggedDigestV1 {
+    fn new(domain: &'static str, declared_field_count: u32) -> Self {
+        let mut hasher = blake3::Hasher::new_derive_key(domain);
+        hasher.update(HASH_FRAME_MAGIC);
+        hasher.update(&declared_field_count.to_be_bytes());
+        Self {
+            hasher,
+            declared_field_count,
+            written_field_count: 0,
+            previous_tag: 0,
+        }
+    }
+
+    fn field_header(&mut self, tag: u16, length: usize) -> Result<(), LinuxPytestContractError> {
+        if tag == 0
+            || tag <= self.previous_tag
+            || self.written_field_count >= self.declared_field_count
+        {
+            return Err(LinuxPytestContractError::CanonicalEncoding);
+        }
+        let length =
+            u64::try_from(length).map_err(|_| LinuxPytestContractError::CanonicalEncoding)?;
+        self.hasher.update(&tag.to_be_bytes());
+        self.hasher.update(&length.to_be_bytes());
+        self.previous_tag = tag;
+        self.written_field_count += 1;
+        Ok(())
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        self.hasher.update(bytes);
+    }
+
+    fn finish(self) -> Result<[u8; 32], LinuxPytestContractError> {
+        if self.written_field_count != self.declared_field_count {
+            return Err(LinuxPytestContractError::CanonicalEncoding);
+        }
+        Ok(*self.hasher.finalize().as_bytes())
+    }
+}
+
+fn write_optional_hardlink_digest(
+    digest: &mut ManifestTaggedDigestV1,
+    hardlink_group: Option<&HardlinkGroupDigest>,
+) {
+    match hardlink_group {
+        None => digest.bytes(&[0]),
+        Some(hardlink_group) => {
+            digest.bytes(&[1]);
+            digest.bytes(&32u64.to_be_bytes());
+            digest.bytes(hardlink_group.as_bytes());
+        }
+    }
+}
+
+fn write_manifest_metadata_to_hasher(
+    hasher: &mut blake3::Hasher,
+    value: &MetadataV1,
+) -> Result<(), LinuxPytestContractError> {
+    let mut sink = ManifestCanonicalHasherSinkV1 { hasher };
+    let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
+    map_infallible_manifest_write(write_manifest_metadata(&mut writer, value))
+}
+
+fn write_manifest_children_to_hasher(
+    hasher: &mut blake3::Hasher,
+    values: &[ChildCommitmentV1],
+) -> Result<(), LinuxPytestContractError> {
+    let mut sink = ManifestCanonicalHasherSinkV1 { hasher };
+    let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
+    map_infallible_manifest_write(write_manifest_child_list(&mut writer, values))
+}
+
+fn write_manifest_extents_to_hasher(
+    hasher: &mut blake3::Hasher,
+    values: &[ExtentV1],
+) -> Result<(), LinuxPytestContractError> {
+    let mut sink = ManifestCanonicalHasherSinkV1 { hasher };
+    let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
+    map_infallible_manifest_write(write_manifest_extent_list(&mut writer, values))
+}
+
+/// Allocation-free equivalent of the frozen manifest node digest framing.
+pub(super) fn derive_manifest_node_digest_streaming_v1(
+    metadata: &MetadataV1,
+    payload: &ManifestPayloadV1,
+    hardlink_group: Option<&HardlinkGroupDigest>,
+) -> Result<NodeDigest, LinuxPytestContractError> {
+    let metadata_length = manifest_metadata_canonical_length(metadata)?;
+    let field_count = match payload {
+        ManifestPayloadV1::Directory { .. } => 2,
+        ManifestPayloadV1::Regular { .. } => 4,
+        ManifestPayloadV1::Symlink { .. } => 3,
+        ManifestPayloadV1::ExternalTree { .. } => 4,
+    };
+    let domain = match payload {
+        ManifestPayloadV1::Directory { .. } => DIRECTORY_NODE_DOMAIN,
+        ManifestPayloadV1::Regular { .. } => REGULAR_NODE_DOMAIN,
+        ManifestPayloadV1::Symlink { .. } => SYMLINK_NODE_DOMAIN,
+        ManifestPayloadV1::ExternalTree { .. } => EXTERNAL_TREE_NODE_DOMAIN,
+    };
+    let mut digest = ManifestTaggedDigestV1::new(domain, field_count);
+    digest.field_header(1, metadata_length)?;
+    write_manifest_metadata_to_hasher(&mut digest.hasher, metadata)?;
+
+    match payload {
+        ManifestPayloadV1::Directory { children } => {
+            if hardlink_group.is_some() {
+                return Err(LinuxPytestContractError::MalformedManifest);
+            }
+            let children_length = manifest_child_list_canonical_length(children)?;
+            digest.field_header(2, children_length)?;
+            write_manifest_children_to_hasher(&mut digest.hasher, children)?;
+        }
+        ManifestPayloadV1::Regular {
+            content_digest,
+            data_extents,
+        } => {
+            let extents_length = manifest_extent_list_canonical_length(data_extents)?;
+            digest.field_header(2, content_digest.as_bytes().len())?;
+            digest.bytes(content_digest.as_bytes());
+            digest.field_header(3, extents_length)?;
+            write_manifest_extents_to_hasher(&mut digest.hasher, data_extents)?;
+            let hardlink_length = if hardlink_group.is_some() { 41 } else { 1 };
+            digest.field_header(4, hardlink_length)?;
+            write_optional_hardlink_digest(&mut digest, hardlink_group);
+        }
+        ManifestPayloadV1::Symlink { target } => {
+            digest.field_header(2, target.len())?;
+            digest.bytes(target);
+            let hardlink_length = if hardlink_group.is_some() { 41 } else { 1 };
+            digest.field_header(3, hardlink_length)?;
+            write_optional_hardlink_digest(&mut digest, hardlink_group);
+        }
+        ManifestPayloadV1::ExternalTree {
+            tree_role,
+            target_root,
+            readonly,
+        } => {
+            if !readonly || *tree_role != TreeRoleV1::Runtime || hardlink_group.is_some() {
+                return Err(LinuxPytestContractError::MalformedManifest);
+            }
+            digest.field_header(2, std::mem::size_of::<u16>())?;
+            digest.bytes(&(*tree_role as u16).to_be_bytes());
+            digest.field_header(3, target_root.as_bytes().len())?;
+            digest.bytes(target_root.as_bytes());
+            digest.field_header(4, 1)?;
+            digest.bytes(&[1]);
+        }
+    }
+    Ok(NodeDigest(digest.finish()?))
+}
+
+fn manifest_raw_path_list_canonical_length(
+    values: &[&[u8]],
+) -> Result<usize, LinuxPytestContractError> {
+    checked_canonical_list_length(values.len(), values.iter().map(|value| Ok(value.len())))
+}
+
+fn write_manifest_raw_path_list_to_hasher(
+    hasher: &mut blake3::Hasher,
+    values: &[&[u8]],
+) -> Result<(), LinuxPytestContractError> {
+    let mut sink = ManifestCanonicalHasherSinkV1 { hasher };
+    let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
+    let result = (|| {
+        writer.list_header(values.len())?;
+        for value in values {
+            writer.list_item_header(value.len())?;
+            writer.bytes(value)?;
+        }
+        Ok(())
+    })();
+    map_infallible_manifest_write(result)
+}
+
+/// Allocation-free equivalent of hashing the canonical sorted hard-link path
+/// list as the sole framed digest field.
+pub(super) fn derive_hardlink_group_digest_streaming_v1(
+    values: &[&[u8]],
+) -> Result<HardlinkGroupDigest, LinuxPytestContractError> {
+    if values.len() < 2 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(LinuxPytestContractError::MalformedManifest);
+    }
+    let paths_length = manifest_raw_path_list_canonical_length(values)?;
+    let mut digest = ManifestTaggedDigestV1::new(HARDLINK_GROUP_DOMAIN, 1);
+    digest.field_header(1, paths_length)?;
+    write_manifest_raw_path_list_to_hasher(&mut digest.hasher, values)?;
+    Ok(HardlinkGroupDigest(digest.finish()?))
+}
+
+fn encode_metadata(value: &MetadataV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+    encode_manifest_canonical_vec(manifest_metadata_canonical_length(value)?, |writer| {
+        write_manifest_metadata(writer, value)
+    })
 }
 
 fn encode_tree(value: &TreeManifestV1) -> Result<Vec<u8>, LinuxPytestContractError> {
-    let mut object = ObjectBuilder::new(TYPE_TREE_MANIFEST);
-    object.bytes(1, value.mount_path.as_bytes())?;
-    object.enumeration(2, value.tree_role as u16, Vec::new())?;
-    object.list(
-        3,
-        value
-            .entries
-            .iter()
-            .map(encode_manifest_entry)
-            .collect::<Result<Vec<_>, _>>()?,
-    )?;
-    object.bytes(4, value.root_digest.as_bytes())?;
-    object.finish_nested()
+    encode_manifest_canonical_vec(
+        checked_tree_manifest_canonical_length_v1(value)?,
+        |writer| write_tree_manifest_canonical_inner(writer, value),
+    )
 }
 
 fn encode_runtime_mount(value: &TreeManifestV1) -> Result<Vec<u8>, LinuxPytestContractError> {
@@ -2195,23 +3001,17 @@ pub(super) fn encode_metadata_for_hash(
 pub(super) fn encode_extents_for_hash(
     values: &[ExtentV1],
 ) -> Result<Vec<u8>, LinuxPytestContractError> {
-    encode_list(
-        values
-            .iter()
-            .map(encode_extent)
-            .collect::<Result<Vec<_>, _>>()?,
-    )
+    encode_manifest_canonical_vec(manifest_extent_list_canonical_length(values)?, |writer| {
+        write_manifest_extent_list(writer, values)
+    })
 }
 
 pub(super) fn encode_children_for_hash(
     values: &[ChildCommitmentV1],
 ) -> Result<Vec<u8>, LinuxPytestContractError> {
-    encode_list(
-        values
-            .iter()
-            .map(encode_child)
-            .collect::<Result<Vec<_>, _>>()?,
-    )
+    encode_manifest_canonical_vec(manifest_child_list_canonical_length(values)?, |writer| {
+        write_manifest_child_list(writer, values)
+    })
 }
 
 pub(super) fn encode_runtime_forest_for_hash(
@@ -2226,7 +3026,14 @@ pub(super) fn encode_runtime_forest_for_hash(
 }
 
 pub(super) fn encode_paths_for_hash(values: &[&[u8]]) -> Result<Vec<u8>, LinuxPytestContractError> {
-    encode_list(values.iter().map(|value| value.to_vec()))
+    encode_manifest_canonical_vec(manifest_raw_path_list_canonical_length(values)?, |writer| {
+        writer.list_header(values.len())?;
+        for value in values {
+            writer.list_item_header(value.len())?;
+            writer.bytes(value)?;
+        }
+        Ok(())
+    })
 }
 
 impl ShapeV1 {
@@ -2326,6 +3133,594 @@ pub(super) fn pair_comparison_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum FixedSliceSinkError {
+        Capacity,
+    }
+
+    struct FixedSliceSinkV1<'buffer> {
+        buffer: &'buffer mut [u8],
+        written: usize,
+    }
+
+    impl ManifestCanonicalByteSinkV1 for FixedSliceSinkV1<'_> {
+        type Error = FixedSliceSinkError;
+
+        fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            let Some(end) = self.written.checked_add(bytes.len()) else {
+                return Err(FixedSliceSinkError::Capacity);
+            };
+            let Some(destination) = self.buffer.get_mut(self.written..end) else {
+                return Err(FixedSliceSinkError::Capacity);
+            };
+            destination.copy_from_slice(bytes);
+            self.written = end;
+            Ok(())
+        }
+    }
+
+    fn reference_encode_timespec(value: &TimespecV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_TIMESPEC);
+        object.i64(1, value.seconds)?;
+        object.u32(2, value.nanoseconds)?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_xattr(value: &XattrV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_XATTR);
+        object.bytes(1, &value.name)?;
+        object.bytes(2, &value.value)?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_metadata(value: &MetadataV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_METADATA);
+        object.u32(1, value.mode)?;
+        object.u32(2, value.logical_uid)?;
+        object.u32(3, value.logical_gid)?;
+        object.u64(4, value.size)?;
+        object.u64(5, value.nlink)?;
+        object.object(6, reference_encode_timespec(&value.atime)?)?;
+        object.object(7, reference_encode_timespec(&value.mtime)?)?;
+        object.object(8, reference_encode_timespec(&value.ctime)?)?;
+        object.optional(
+            9,
+            value
+                .btime
+                .as_ref()
+                .map(reference_encode_timespec)
+                .transpose()?,
+        )?;
+        object.list(
+            10,
+            value
+                .xattrs
+                .iter()
+                .map(reference_encode_xattr)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_extent(value: &ExtentV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_EXTENT);
+        object.u64(1, value.offset)?;
+        object.u64(2, value.length)?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_child(
+        value: &ChildCommitmentV1,
+    ) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_CHILD_COMMITMENT);
+        object.bytes(1, &value.name)?;
+        object.enumeration(2, value.kind as u16, Vec::new())?;
+        object.bytes(3, value.node_digest.as_bytes())?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_payload(
+        value: &ManifestPayloadV1,
+    ) -> Result<Vec<u8>, LinuxPytestContractError> {
+        match value {
+            ManifestPayloadV1::Directory { children } => encode_enum(
+                ManifestEntryKindV1::Directory as u16,
+                vec![enum_field(
+                    1,
+                    WireType::List,
+                    encode_list(
+                        children
+                            .iter()
+                            .map(reference_encode_child)
+                            .collect::<Result<Vec<_>, _>>()?,
+                    )?,
+                )],
+            ),
+            ManifestPayloadV1::Regular {
+                content_digest,
+                data_extents,
+            } => encode_enum(
+                ManifestEntryKindV1::Regular as u16,
+                vec![
+                    enum_field(1, WireType::Bytes, content_digest.as_bytes().to_vec()),
+                    enum_field(
+                        2,
+                        WireType::List,
+                        encode_list(
+                            data_extents
+                                .iter()
+                                .map(reference_encode_extent)
+                                .collect::<Result<Vec<_>, _>>()?,
+                        )?,
+                    ),
+                ],
+            ),
+            ManifestPayloadV1::Symlink { target } => encode_enum(
+                ManifestEntryKindV1::Symlink as u16,
+                vec![enum_field(1, WireType::Bytes, target.clone())],
+            ),
+            ManifestPayloadV1::ExternalTree {
+                tree_role,
+                target_root,
+                readonly,
+            } => encode_enum(
+                ManifestEntryKindV1::ExternalTree as u16,
+                vec![
+                    enum_field(
+                        1,
+                        WireType::Enum,
+                        encode_enum(*tree_role as u16, Vec::new())?,
+                    ),
+                    enum_field(2, WireType::Bytes, target_root.as_bytes().to_vec()),
+                    enum_field(3, WireType::Bool, vec![u8::from(*readonly)]),
+                ],
+            ),
+        }
+    }
+
+    fn reference_encode_entry(
+        value: &ManifestEntryV1,
+    ) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_MANIFEST_ENTRY);
+        object.bytes(1, &value.relative_path)?;
+        object.enumeration(2, value.payload.kind() as u16, Vec::new())?;
+        object.object(3, reference_encode_metadata(&value.metadata)?)?;
+        object.field(4, WireType::Enum, reference_encode_payload(&value.payload)?)?;
+        object.optional(
+            5,
+            value
+                .hardlink_group
+                .map(|digest| digest.as_bytes().to_vec()),
+        )?;
+        object.bytes(6, value.node_digest.as_bytes())?;
+        object.finish_nested()
+    }
+
+    fn reference_encode_tree(value: &TreeManifestV1) -> Result<Vec<u8>, LinuxPytestContractError> {
+        let mut object = ObjectBuilder::new(TYPE_TREE_MANIFEST);
+        object.bytes(1, value.mount_path.as_bytes())?;
+        object.enumeration(2, value.tree_role as u16, Vec::new())?;
+        object.list(
+            3,
+            value
+                .entries
+                .iter()
+                .map(reference_encode_entry)
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+        object.bytes(4, value.root_digest.as_bytes())?;
+        object.finish_nested()
+    }
+
+    fn sample_metadata(mode: u32, size: u64, nlink: u64, detailed: bool) -> MetadataV1 {
+        MetadataV1 {
+            mode,
+            logical_uid: 12,
+            logical_gid: 34,
+            size,
+            nlink,
+            atime: TimespecV1 {
+                seconds: -7,
+                nanoseconds: 8,
+            },
+            mtime: TimespecV1 {
+                seconds: 9,
+                nanoseconds: 10,
+            },
+            ctime: TimespecV1 {
+                seconds: 11,
+                nanoseconds: 12,
+            },
+            btime: detailed.then_some(TimespecV1 {
+                seconds: 13,
+                nanoseconds: 14,
+            }),
+            xattrs: if detailed {
+                vec![
+                    XattrV1 {
+                        name: b"security.selinux".to_vec(),
+                        value: vec![0, 1, 0xff],
+                    },
+                    XattrV1 {
+                        name: b"user.\xff".to_vec(),
+                        value: b"raw\0value".to_vec(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
+    fn sample_tree() -> TreeManifestV1 {
+        let regular_metadata = sample_metadata(0o100_555, 3, 1, true);
+        let regular_payload = ManifestPayloadV1::Regular {
+            content_digest: FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[b"a\0b"]),
+            data_extents: vec![
+                ExtentV1 {
+                    offset: 0,
+                    length: 1,
+                },
+                ExtentV1 {
+                    offset: 2,
+                    length: 1,
+                },
+            ],
+        };
+        let regular = ManifestEntryV1::with_computed_node_digest(
+            b"raw-\xff".to_vec(),
+            regular_metadata,
+            regular_payload,
+            None,
+        )
+        .expect("regular fixture must be encodable");
+        let root_payload = ManifestPayloadV1::Directory {
+            children: vec![ChildCommitmentV1 {
+                name: b"raw-\xff".to_vec(),
+                kind: ManifestEntryKindV1::Regular,
+                node_digest: regular.node_digest,
+            }],
+        };
+        let root = ManifestEntryV1::with_computed_node_digest(
+            Vec::new(),
+            sample_metadata(0o040_555, 0, 1, false),
+            root_payload,
+            None,
+        )
+        .expect("directory fixture must be encodable");
+        let root_digest = root.node_digest;
+        let tree = TreeManifestV1 {
+            mount_path: SandboxPath::new(Box::<[u8]>::from(b"/workspace".as_slice()))
+                .expect("fixture path must be valid"),
+            tree_role: TreeRoleV1::Workspace,
+            entries: vec![root, regular],
+            root_digest,
+        };
+        tree.validate().expect("fixture tree must validate");
+        tree
+    }
+
+    fn encode_payload_with_streaming_writer(
+        value: &ManifestPayloadV1,
+    ) -> Result<Vec<u8>, LinuxPytestContractError> {
+        encode_manifest_canonical_vec(manifest_payload_canonical_length(value)?, |writer| {
+            write_manifest_payload(writer, value)
+        })
+    }
+
+    fn encode_entry_with_streaming_writer(
+        value: &ManifestEntryV1,
+    ) -> Result<Vec<u8>, LinuxPytestContractError> {
+        encode_manifest_canonical_vec(manifest_entry_canonical_length(value)?, |writer| {
+            write_manifest_entry(writer, value)
+        })
+    }
+
+    #[test]
+    fn streaming_manifest_encoding_matches_frozen_builder_for_every_shape() {
+        let metadata_without_optional = sample_metadata(0o040_555, 0, 1, false);
+        let metadata_with_optional = sample_metadata(0o100_555, 8, 2, true);
+        for metadata in [&metadata_without_optional, &metadata_with_optional] {
+            let expected = reference_encode_metadata(metadata).expect("reference metadata");
+            assert_eq!(
+                manifest_metadata_canonical_length(metadata),
+                Ok(expected.len())
+            );
+            assert_eq!(encode_metadata(metadata), Ok(expected));
+        }
+
+        let extents = vec![
+            ExtentV1 {
+                offset: 0,
+                length: 2,
+            },
+            ExtentV1 {
+                offset: 7,
+                length: 1,
+            },
+        ];
+        for values in [&[][..], extents.as_slice()] {
+            let expected = encode_list(
+                values
+                    .iter()
+                    .map(reference_encode_extent)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("reference extents"),
+            )
+            .expect("reference extent list");
+            assert_eq!(
+                manifest_extent_list_canonical_length(values),
+                Ok(expected.len())
+            );
+            assert_eq!(encode_extents_for_hash(values), Ok(expected));
+        }
+
+        let node_a = NodeDigest::derive(REGULAR_NODE_DOMAIN, &[b"node-a"]);
+        let node_b = NodeDigest::derive(SYMLINK_NODE_DOMAIN, &[b"node-b"]);
+        let children = vec![
+            ChildCommitmentV1 {
+                name: b"a".to_vec(),
+                kind: ManifestEntryKindV1::Regular,
+                node_digest: node_a,
+            },
+            ChildCommitmentV1 {
+                name: b"raw-\xff".to_vec(),
+                kind: ManifestEntryKindV1::Symlink,
+                node_digest: node_b,
+            },
+        ];
+        for values in [&[][..], children.as_slice()] {
+            let expected = encode_list(
+                values
+                    .iter()
+                    .map(reference_encode_child)
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("reference children"),
+            )
+            .expect("reference child list");
+            assert_eq!(
+                manifest_child_list_canonical_length(values),
+                Ok(expected.len())
+            );
+            assert_eq!(encode_children_for_hash(values), Ok(expected));
+        }
+
+        let payloads = vec![
+            ManifestPayloadV1::Directory {
+                children: children.clone(),
+            },
+            ManifestPayloadV1::Regular {
+                content_digest: FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[b"payload"]),
+                data_extents: extents,
+            },
+            ManifestPayloadV1::Symlink {
+                target: b"../raw-\xff".to_vec(),
+            },
+            ManifestPayloadV1::ExternalTree {
+                tree_role: TreeRoleV1::Runtime,
+                target_root: NodeDigest::derive(RUNTIME_MERKLE_DOMAIN, &[b"runtime"]),
+                readonly: true,
+            },
+        ];
+        for payload in &payloads {
+            let expected = reference_encode_payload(payload).expect("reference payload");
+            assert_eq!(
+                manifest_payload_canonical_length(payload),
+                Ok(expected.len())
+            );
+            assert_eq!(encode_payload_with_streaming_writer(payload), Ok(expected));
+        }
+
+        let hardlink_group = HardlinkGroupDigest::derive(HARDLINK_GROUP_DOMAIN, &[b"group"]);
+        let entries = [
+            ManifestEntryV1 {
+                relative_path: b"plain".to_vec(),
+                metadata: metadata_without_optional,
+                payload: payloads[0].clone(),
+                hardlink_group: None,
+                node_digest: node_a,
+            },
+            ManifestEntryV1 {
+                relative_path: b"linked-\xff".to_vec(),
+                metadata: metadata_with_optional,
+                payload: payloads[2].clone(),
+                hardlink_group: Some(hardlink_group),
+                node_digest: node_b,
+            },
+        ];
+        for entry in &entries {
+            let expected = reference_encode_entry(entry).expect("reference entry");
+            assert_eq!(manifest_entry_canonical_length(entry), Ok(expected.len()));
+            assert_eq!(encode_entry_with_streaming_writer(entry), Ok(expected));
+        }
+
+        let tree = sample_tree();
+        let expected = reference_encode_tree(&tree).expect("reference tree");
+        assert_eq!(
+            checked_tree_manifest_canonical_length_v1(&tree),
+            Ok(expected.len())
+        );
+        assert_eq!(encode_tree(&tree), Ok(expected));
+    }
+
+    #[test]
+    fn direct_tree_writer_honors_exact_and_exact_minus_one_capacity() {
+        let tree = sample_tree();
+        let expected = reference_encode_tree(&tree).expect("reference tree");
+        let mut exact = vec![0; expected.len()];
+        {
+            let mut sink = FixedSliceSinkV1 {
+                buffer: &mut exact,
+                written: 0,
+            };
+            let written = write_tree_manifest_canonical_v1(&tree, &mut sink)
+                .expect("exact sink must accept the manifest");
+            assert_eq!(written, expected.len());
+            assert_eq!(sink.written, expected.len());
+        }
+        assert_eq!(exact, expected);
+
+        let mut short = vec![0; expected.len() - 1];
+        let mut sink = FixedSliceSinkV1 {
+            buffer: &mut short,
+            written: 0,
+        };
+        assert_eq!(
+            write_tree_manifest_canonical_v1(&tree, &mut sink),
+            Err(ManifestCanonicalWriteErrorV1::Sink(
+                FixedSliceSinkError::Capacity
+            ))
+        );
+        assert!(sink.written < expected.len());
+    }
+
+    #[test]
+    fn checked_manifest_lengths_enforce_nested_and_total_bounds() {
+        let maximum = usize::try_from(EFFECT_IR_V2_MAX_CANONICAL_BYTES)
+            .expect("canonical bound must fit the supported target");
+        assert_eq!(checked_canonical_payload_length(maximum), Ok(maximum));
+        assert_eq!(
+            checked_canonical_payload_length(maximum + 1),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+        assert_eq!(
+            checked_canonical_field_length(maximum),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+        assert_eq!(
+            checked_canonical_add(usize::MAX, 1),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+        assert_eq!(
+            checked_canonical_list_length(2, [Ok(0)]),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+        assert_eq!(
+            canonical_collection_count(
+                usize::try_from(EFFECT_IR_V2_MAX_COLLECTION_ITEMS + 1)
+                    .expect("collection bound must fit the supported target")
+            ),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+
+        let mut digest = ManifestTaggedDigestV1::new(REGULAR_NODE_DOMAIN, 2);
+        assert_eq!(digest.field_header(2, 0), Ok(()));
+        assert_eq!(
+            digest.field_header(1, 0),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+        assert_eq!(
+            digest.finish(),
+            Err(LinuxPytestContractError::CanonicalEncoding)
+        );
+    }
+
+    #[test]
+    fn streaming_manifest_digests_match_frozen_digest_framing() {
+        let directory = ManifestPayloadV1::Directory {
+            children: vec![ChildCommitmentV1 {
+                name: b"child".to_vec(),
+                kind: ManifestEntryKindV1::Regular,
+                node_digest: NodeDigest::derive(REGULAR_NODE_DOMAIN, &[b"child"]),
+            }],
+        };
+        let regular = ManifestPayloadV1::Regular {
+            content_digest: FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[b"contents"]),
+            data_extents: vec![ExtentV1 {
+                offset: 2,
+                length: 3,
+            }],
+        };
+        let symlink = ManifestPayloadV1::Symlink {
+            target: b"raw-\xff".to_vec(),
+        };
+        let external = ManifestPayloadV1::ExternalTree {
+            tree_role: TreeRoleV1::Runtime,
+            target_root: NodeDigest::derive(RUNTIME_MERKLE_DOMAIN, &[b"external"]),
+            readonly: true,
+        };
+        let hardlink_group = HardlinkGroupDigest::derive(HARDLINK_GROUP_DOMAIN, &[b"hardlink"]);
+        let cases = [
+            (sample_metadata(0o040_555, 0, 1, false), directory, None),
+            (
+                sample_metadata(0o100_555, 5, 1, true),
+                regular.clone(),
+                None,
+            ),
+            (
+                sample_metadata(0o100_555, 5, 2, true),
+                regular,
+                Some(hardlink_group),
+            ),
+            (
+                sample_metadata(0o120_555, 5, 1, false),
+                symlink.clone(),
+                None,
+            ),
+            (
+                sample_metadata(0o120_555, 5, 2, false),
+                symlink,
+                Some(hardlink_group),
+            ),
+            (sample_metadata(0o040_555, 0, 1, true), external, None),
+        ];
+        for (metadata, payload, hardlink) in cases {
+            let expected =
+                super::super::compute_manifest_node_digest(&metadata, &payload, hardlink.as_ref())
+                    .expect("reference digest");
+            assert_eq!(
+                derive_manifest_node_digest_streaming_v1(&metadata, &payload, hardlink.as_ref()),
+                Ok(expected)
+            );
+        }
+
+        let invalid_directory_hardlink =
+            HardlinkGroupDigest::derive(HARDLINK_GROUP_DOMAIN, &[b"x"]);
+        assert_eq!(
+            derive_manifest_node_digest_streaming_v1(
+                &sample_metadata(0o040_555, 0, 2, false),
+                &ManifestPayloadV1::Directory {
+                    children: Vec::new()
+                },
+                Some(&invalid_directory_hardlink)
+            ),
+            Err(LinuxPytestContractError::MalformedManifest)
+        );
+        assert_eq!(
+            derive_manifest_node_digest_streaming_v1(
+                &sample_metadata(0o040_555, 0, 1, false),
+                &ManifestPayloadV1::ExternalTree {
+                    tree_role: TreeRoleV1::Runtime,
+                    target_root: NodeDigest::derive(RUNTIME_MERKLE_DOMAIN, &[b"x"]),
+                    readonly: false,
+                },
+                None
+            ),
+            Err(LinuxPytestContractError::MalformedManifest)
+        );
+
+        let paths = [&b"a"[..], &b"raw-\xff"[..]];
+        let reference_paths =
+            encode_list(paths.iter().map(|path| path.to_vec())).expect("reference path list");
+        let expected =
+            HardlinkGroupDigest::derive(HARDLINK_GROUP_DOMAIN, &[reference_paths.as_slice()]);
+        assert_eq!(
+            derive_hardlink_group_digest_streaming_v1(&paths),
+            Ok(expected)
+        );
+        for invalid in [
+            &[][..],
+            &[&b"only"[..]][..],
+            &[&b"same"[..], &b"same"[..]][..],
+            &[&b"z"[..], &b"a"[..]][..],
+        ] {
+            assert_eq!(
+                derive_hardlink_group_digest_streaming_v1(invalid),
+                Err(LinuxPytestContractError::MalformedManifest)
+            );
+        }
+    }
 
     #[test]
     fn declared_counts_require_minimum_framing_before_allocation() {
