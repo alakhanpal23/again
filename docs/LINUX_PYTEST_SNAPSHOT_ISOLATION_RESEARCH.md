@@ -176,9 +176,17 @@ nonforgeable, allocation-free cleanup envelope from the actual staged
 publisher. Its cleanup depth, entry count, basename limit, `openat2` attempts,
 and generic syscall attempts must each dominate the source-derived
 materialization policy. An independently configured or smaller cleanup guard
-is a typed pre-population refusal. Dropping the staged publisher then delegates
-bounded, best-effort cleanup; failure never grants readiness or publication
-authority.
+is a typed future pre-population refusal. The current connector stops before
+population: it can issue one unsplittable shared-ledger session to create a
+private staged directory, and the returned charged guard exposes only its
+pinned directory, cleanup envelope, and RAII cleanup. Forward and cleanup raw
+attempts, including retries, use disjoint buckets; the retained 55-byte staging
+basename is forward-charged and retained cleanup names are cleanup-charged. For
+cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
+live retained-name heap is `55 + min(E, 64 * (D + 1)) * (N + 1)` bytes, with
+the fixed 64 batch slots on the stack. The guard exposes no ready, publish, or
+execution transition. Every later snapshot and isolation step in this note
+remains a research requirement.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`

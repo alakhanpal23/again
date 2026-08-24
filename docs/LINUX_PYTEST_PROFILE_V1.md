@@ -22,19 +22,33 @@ best-effort cleanup to the staged publisher. These leaves do not yet form the
 required four-view sealed snapshot connector and are not wired to
 `SnapshotProvider`.
 
-A static policy projector now fallibly maps the preflighted shared policy into
-the current leaf-policy shapes before filesystem work. The projection itself
-performs no allocation and refuses zero-valued classes and aggregate ceilings
-that those shapes cannot represent exactly rather than silently increasing
-them. It grants no execution, descriptor, heap, or operation authority.
+A static, allocation-free projection now returns a non-`Clone`, non-`Copy`
+connector that owns the preflighted policy and one shared operation/heap
+ledger. It refuses zero-valued classes and aggregate ceilings that current leaf
+shapes cannot represent exactly rather than silently increasing them. The
+connector can issue exactly one unsplittable session and currently lends it
+only to private staged-directory creation and RAII cleanup. The charged guard
+exposes its pinned directory and cleanup envelope but no ready, publish, or
+execution transition.
 
-Until a connector lends the single resource capability to every leaf, charges
-allocator-observed capacity (including reallocation overlap), and wires the
-required ledger and four views, the local leaf limits are defense in depth
-rather than an exact whole-pipeline heap authority. In particular, frozen
-public source-plan and xattr shapes still finalize some pre-reserved vectors
-into boxed slices; their allocator capacity must move under that shared
-authority before connector admission.
+Within this narrow slice, every raw attempt, including every retry, is charged
+before invocation. Forward and cleanup attempts use disjoint buckets, so
+forward exhaustion cannot spend the cleanup reserve. The retained 55-byte
+staging basename is charged to the forward heap stage; each retained cleanup
+name is charged to the cleanup heap stage. For cleanup depth `D`, entry limit
+`E`, and basename limit `N`, the exact maximum live retained-name heap is
+`55 + min(E, 64 * (D + 1)) * (N + 1)` bytes. The fixed 64-slot cleanup batches
+are stack storage.
+
+Each charged `Vec<u8>` precharges its requested capacity, observes capacity
+after `try_reserve_exact`, and accepts only exact equality. Allocator
+overcapacity drops the storage and returns a typed compatibility refusal. The
+raw vector is never exposed, only byte buffers are admitted so nested owned
+allocations cannot escape, and backing storage is dropped before its ledger
+charge is released. Allocator-private metadata is outside this contract. All
+other leaf allocations, including frozen source-plan and xattr boxed slices,
+remain outside the ledger, so this is not an exact whole-pipeline heap
+authority.
 
 The intended next local product slice has exactly one public invocation
 shape:

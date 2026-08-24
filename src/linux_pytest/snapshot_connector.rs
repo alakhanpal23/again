@@ -1,22 +1,26 @@
-//! Allocation-free static projection from the shared snapshot resource policy.
+//! Shared resource connector for the snapshot pipeline.
 //!
-//! This is deliberately only a policy connector. It creates no staging
-//! directory, opens no descriptor, and grants no snapshot or execution
-//! authority. Every leaf input is derived solely from the one preflighted
-//! pipeline policy. Optional zero-valued classes and aggregate budgets that the
+//! Static projection is allocation-free and derives every leaf input from one
+//! preflighted policy. Optional zero-valued classes and aggregate budgets that
 //! current nonzero leaf shapes cannot enforce exactly are refused rather than
-//! widened. The returned token borrows the mutable resource authority but
-//! exposes no executable leaf policy. Later execution wiring must own all phase
-//! changes and charge that same authority before every budgeted syscall attempt
-//! and allocator-observed capacity increase.
+//! widened. The connector then owns the mutable resource ledger and keeps leaf
+//! policies private. Only staged-directory creation and its RAII cleanup are
+//! wired so far; the charged guard cannot enter the still-unmetered ready or
+//! publish transitions. Every wired phase charges the same ledger before each
+//! budgeted attempt and allocator-observed capacity increase.
 
+use std::ffi::CStr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::os::fd::BorrowedFd;
 
 use super::snapshot_materialize::SnapshotMaterializePolicyV1;
 use super::snapshot_policy::{
+    SnapshotChargedBytesV1, SnapshotPipelineForwardStageV1, SnapshotPipelineResourceErrorV1,
     SnapshotPipelineResourcesV1, SnapshotResourcePolicyFieldV1, SnapshotResourcePolicyV1,
 };
-use super::snapshot_publish::SnapshotPublishPolicyV1;
+use super::snapshot_publish::{
+    ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1, SnapshotPublishPolicyV1,
+};
 use super::snapshot_regular::RegularCopyPolicyV1;
 use super::snapshot_tree::{
     SourceEnumerationPolicyV1, SourceTraversalLimitsV1, SourceXattrLimitsV1,
@@ -97,26 +101,135 @@ pub(super) enum SnapshotPolicyProjectionErrorV1 {
     },
 }
 
-/// An inert proof that every current leaf can represent one shared policy.
-///
-/// Private fields, the resource borrow, and the lack of `Clone`/`Copy` prevent
-/// this static proof from becoming detached execution authority. The policies
-/// remain private until connector-owned execution methods can charge the same
-/// resource ledger for their complete lifetimes.
+#[derive(Eq, PartialEq)]
+pub(super) enum SnapshotChargedErrorV1<E> {
+    PublicationAlreadyStarted,
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(E),
+}
+
+impl<E> std::fmt::Debug for SnapshotChargedErrorV1<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PublicationAlreadyStarted => formatter.write_str("PublicationAlreadyStarted"),
+            Self::Resource(error) => formatter.debug_tuple("Resource").field(error).finish(),
+            Self::Leaf(_) => formatter.write_str("Leaf(<redacted>)"),
+        }
+    }
+}
+
+impl<E> From<SnapshotPipelineResourceErrorV1> for SnapshotChargedErrorV1<E> {
+    fn from(error: SnapshotPipelineResourceErrorV1) -> Self {
+        Self::Resource(error)
+    }
+}
+
+/// One matched publication session. It never exposes independently spliceable
+/// forward and cleanup authority.
 #[derive(Debug)]
-pub(super) struct SnapshotStaticPolicyProjectionV1<'resources> {
-    _resources: &'resources SnapshotPipelineResourcesV1,
+pub(super) struct SnapshotPublicationSessionV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    policy: &'resources SnapshotPublishPolicyV1,
+}
+
+impl<'resources> SnapshotPublicationSessionV1<'resources> {
+    pub(super) const fn policy(&self) -> &'resources SnapshotPublishPolicyV1 {
+        self.policy
+    }
+
+    pub(super) fn run_forward_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources
+            .run_forward_attempt(SnapshotPipelineForwardStageV1::Publication, attempt)
+    }
+
+    pub(super) fn run_cleanup_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources.run_cleanup_attempt(attempt)
+    }
+
+    pub(super) fn charged_forward_bytes(
+        &self,
+        max_capacity: usize,
+    ) -> Result<SnapshotChargedBytesV1<'resources>, SnapshotPipelineResourceErrorV1> {
+        self.resources
+            .charged_forward_bytes(SnapshotPipelineForwardStageV1::Publication, max_capacity)
+    }
+
+    pub(super) fn charged_cleanup_bytes(
+        &self,
+        max_capacity: usize,
+    ) -> Result<SnapshotChargedBytesV1<'resources>, SnapshotPipelineResourceErrorV1> {
+        self.resources.charged_cleanup_bytes(max_capacity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn forward_attempts_remaining(&self) -> u64 {
+        self.resources.forward_attempts_remaining_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_attempts_remaining(&self) -> u64 {
+        self.resources.cleanup_attempts_remaining_for_test()
+    }
+}
+
+/// Owns the sole mutable resource ledger and its exact leaf projections.
+///
+/// The lack of `Clone`/`Copy` prevents detaching the ledger from these
+/// policies. Resource-budget authority is exposed only by connector-owned
+/// phase methods that mint non-`Clone`, non-`Copy` shared-budget sessions.
+#[derive(Debug)]
+pub(super) struct SnapshotConnectorV1 {
+    resources: SnapshotPipelineResourcesV1,
     source: SourceEnumerationPolicyV1,
     materialization: SnapshotMaterializePolicyV1,
     publication: SnapshotPublishPolicyV1,
+    publication_started: std::cell::Cell<bool>,
 }
 
-/// Projects the already-validated policy carried by the borrowed pipeline
-/// authority. This function performs no allocation or filesystem work and its
-/// result grants no authority to perform either one.
-pub(super) fn project_static_snapshot_policies<'resources>(
-    resources: &'resources SnapshotPipelineResourcesV1,
-) -> Result<SnapshotStaticPolicyProjectionV1<'resources>, SnapshotPolicyProjectionErrorV1> {
+impl SnapshotConnectorV1 {
+    fn begin_publication(&self) -> Option<SnapshotPublicationSessionV1<'_>> {
+        if self.publication_started.replace(true) {
+            return None;
+        }
+        Some(SnapshotPublicationSessionV1 {
+            resources: &self.resources,
+            policy: &self.publication,
+        })
+    }
+
+    /// Consumes the sole publication attempt, even when staging refuses or
+    /// fails. A returned guard can expose its pinned directory and clean it up,
+    /// but cannot enter the still-unmetered ready or publish transitions.
+    pub(super) fn create_staged_snapshot_directory_at<'scope>(
+        &'scope self,
+        parent: BorrowedFd<'scope>,
+        staging_name: &CStr,
+    ) -> Result<
+        ChargedStagedSnapshotDirectoryV1<'scope>,
+        SnapshotChargedErrorV1<SnapshotPublishErrorV1>,
+    > {
+        let session = self
+            .begin_publication()
+            .ok_or(SnapshotChargedErrorV1::PublicationAlreadyStarted)?;
+        super::snapshot_publish::create_charged_staged_snapshot_directory_at(
+            parent,
+            staging_name,
+            session,
+        )
+    }
+}
+
+/// Consumes the already-preflighted resource authority and projects its policy
+/// before any allocation or filesystem work.
+pub(super) fn connect_snapshot_pipeline(
+    resources: SnapshotPipelineResourcesV1,
+) -> Result<SnapshotConnectorV1, SnapshotPolicyProjectionErrorV1> {
     use SnapshotProjectedLeafV1 as Leaf;
     use SnapshotResourcePolicyFieldV1 as Field;
 
@@ -243,11 +356,12 @@ pub(super) fn project_static_snapshot_policies<'resources>(
         );
     }
 
-    Ok(SnapshotStaticPolicyProjectionV1 {
-        _resources: resources,
+    Ok(SnapshotConnectorV1 {
+        resources,
         source,
         materialization,
         publication,
+        publication_started: std::cell::Cell::new(false),
     })
 }
 
@@ -501,6 +615,7 @@ fn nonzero_u64(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
     use super::*;
@@ -604,14 +719,14 @@ mod tests {
 
     fn projection_error(inputs: Inputs) -> SnapshotPolicyProjectionErrorV1 {
         let resources = resources(inputs);
-        project_static_snapshot_policies(&resources).unwrap_err()
+        connect_snapshot_pipeline(resources).unwrap_err()
     }
 
     #[test]
     fn exact_projection_preserves_every_leaf_input() {
         let inputs = Inputs::exact();
         let resources = resources(inputs);
-        let projected = project_static_snapshot_policies(&resources).unwrap();
+        let projected = connect_snapshot_pipeline(resources).unwrap();
         let traversal = SourceTraversalLimitsV1::checked(
             inputs.depth,
             nz16(inputs.name_bytes),
@@ -665,13 +780,13 @@ mod tests {
         assert_eq!(projected_four_view_heap, 17 * 1024 * 1024);
         assert_eq!(
             projected_four_view_heap,
-            resources.policy().max_four_view_heap_bytes()
+            projected.resources.policy().max_four_view_heap_bytes()
         );
         assert_eq!(
             projected.publication.cleanup_operation_attempt_bound(),
-            Some(resources.policy().cleanup_operation_reserve())
+            Some(projected.resources.policy().cleanup_operation_reserve())
         );
-        assert_eq!(resources.policy().max_live_snapshot_fds(), 16);
+        assert_eq!(projected.resources.policy().max_live_snapshot_fds(), 16);
     }
 
     #[test]
@@ -767,7 +882,7 @@ mod tests {
         inputs.syscall_attempts = 5;
         inputs.xattr_stability_rounds = 3;
         let resources = resources(inputs);
-        let projected = project_static_snapshot_policies(&resources).unwrap();
+        let projected = connect_snapshot_pipeline(resources).unwrap();
 
         assert_eq!(projected.source.openat2_attempts(), 7);
         assert_eq!(projected.source.syscall_attempts(), 5);
@@ -779,7 +894,7 @@ mod tests {
     }
 
     #[test]
-    fn static_projection_cannot_gain_clone_or_copy_and_zero_forward_budget_remains_inert() {
+    fn connector_and_publication_session_cannot_clone_and_zero_forward_stays_inert() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
         }
@@ -792,16 +907,60 @@ mod tests {
         impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
         impl<T: Copy> AmbiguousIfCopy<u8> for T {}
 
-        <SnapshotStaticPolicyProjectionV1<'static> as AmbiguousIfClone<_>>::probe();
-        <SnapshotStaticPolicyProjectionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotConnectorV1 as AmbiguousIfClone<_>>::probe();
+        <SnapshotConnectorV1 as AmbiguousIfCopy<_>>::probe();
+        <SnapshotPublicationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotPublicationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
 
         let mut inputs = Inputs::exact();
         // `(5E + 3) * open + (12E + 12) * syscall` for E=4.
         inputs.operation_attempts = 272;
         let resources = resources(inputs);
         assert_eq!(resources.policy().max_forward_operation_attempts(), 0);
-        let projected = project_static_snapshot_policies(&resources).unwrap();
-        assert!(std::ptr::eq(projected._resources, &resources));
+        let projected = connect_snapshot_pipeline(resources).unwrap();
+        assert_eq!(
+            projected
+                .resources
+                .policy()
+                .max_forward_operation_attempts(),
+            0
+        );
+        let session = projected.begin_publication().unwrap();
+        assert!(std::ptr::eq(session.policy(), &projected.publication));
+        assert_eq!(session.forward_attempts_remaining(), 0);
+        let invoked = Cell::new(false);
+        assert_eq!(
+            session
+                .run_forward_attempt(|| invoked.set(true))
+                .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::Publication,
+                ),
+                bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+            }
+        );
+        assert!(!invoked.get());
+        let cleanup_before = session.cleanup_attempts_remaining();
+        session.run_cleanup_attempt(|| invoked.set(true)).unwrap();
+        assert!(invoked.get());
+        assert_eq!(session.cleanup_attempts_remaining(), cleanup_before - 1);
+    }
+
+    #[test]
+    fn connector_issues_at_most_one_publication_session() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let _first = connector.begin_publication().unwrap();
+        assert!(connector.begin_publication().is_none());
+    }
+
+    #[test]
+    fn charged_error_debug_redacts_leaf_payloads() {
+        let rendered = format!(
+            "{:?}",
+            SnapshotChargedErrorV1::<&str>::Leaf("secret-leaf-sentinel")
+        );
+        assert_eq!(rendered, "Leaf(<redacted>)");
     }
 
     #[test]

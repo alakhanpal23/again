@@ -6,10 +6,13 @@ This is the frozen Stage 0 binary and identity contract for the future
 `linux-pytest-v1` profile. It documents the crate-private contract in
 `src/linux_pytest.rs`, `src/linux_pytest/canonical.rs`, and
 `src/linux_pytest/identity.rs`. The module remains unreachable from the public
-CLI, and its concrete admission, tree snapshot, sandbox, tracer, storage, and
-worker implementations do not exist yet. A descriptor-selected regular-file
-staging leaf exists but is not wired to those interfaces. Nothing in this
-document is evidence that pytest execution or reuse is available.
+CLI, and its concrete admission, sealed-snapshot, sandbox, tracer, storage, and
+worker implementations do not exist. The only connector-wired filesystem
+checkpoint can issue one unsplittable shared-ledger session for charged private
+staged-directory creation and RAII cleanup on Linux x86_64. Its guard exposes
+the pinned directory and cleanup envelope but no ready, publish, execution, or
+reuse transition. Nothing in this document is evidence that pytest execution
+or reuse is available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR

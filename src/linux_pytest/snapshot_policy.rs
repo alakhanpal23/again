@@ -149,6 +149,22 @@ pub(super) enum SnapshotPipelineResourceErrorV1 {
         requested: u64,
         limit: u64,
     },
+    ContainerCapacityArithmeticOverflow {
+        stage: SnapshotPipelineStageV1,
+    },
+    ContainerCapacityLimitExceeded {
+        stage: SnapshotPipelineStageV1,
+        required: u64,
+        limit: u64,
+    },
+    ContainerAllocationFailed {
+        stage: SnapshotPipelineStageV1,
+    },
+    AllocatorCapacityExceededPrecharge {
+        stage: SnapshotPipelineStageV1,
+        observed: u64,
+        precharged: u64,
+    },
 }
 
 /// Validated limits shared by every phase and every stability view.
@@ -204,16 +220,41 @@ pub(super) struct SnapshotPipelineResourcesV1 {
     transient_heap_live: Cell<u64>,
 }
 
-/// Scoped authority for bytes already charged to the shared transient limit.
-///
-/// Forgetting a reservation leaks budget and therefore fails closed. Private
-/// fields and the lack of `Clone` prevent a caller from fabricating or
-/// duplicating a release.
-#[derive(Debug)]
-#[must_use = "dropping the reservation releases its transient-heap charge"]
-pub(super) struct SnapshotTransientReservationV1<'resources> {
+/// Temporary RAII precharge held while an allocation is attempted.
+#[must_use = "dropping the charge releases its transient-heap bytes"]
+struct SnapshotTransientChargeV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
     bytes: u64,
+}
+
+/// A byte vector structurally bound to its exact container-observed capacity.
+///
+/// Requested capacity is precharged before allocation. A supported allocator
+/// must then report that exact logical capacity; allocator overcapacity is
+/// immediately dropped and becomes a typed compatibility refusal. The raw
+/// `Vec` is never exposed, so callers cannot grow it outside the ledger or
+/// detach it from its charge. Drop destroys the backing storage before
+/// releasing the charge. Restricting this type to bytes prevents nested owned
+/// allocations from escaping the ledger. Allocator-private metadata is outside
+/// this contract.
+pub(super) struct SnapshotChargedBytesV1<'resources> {
+    values: Vec<u8>,
+    resources: &'resources SnapshotPipelineResourcesV1,
+    stage: SnapshotPipelineStageV1,
+    charged_bytes: u64,
+}
+
+impl std::fmt::Debug for SnapshotChargedBytesV1<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SnapshotChargedBytesV1")
+            .field("values", &"<redacted>")
+            .field("len", &self.values.len())
+            .field("capacity", &self.values.capacity())
+            .field("stage", &self.stage)
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
 }
 
 impl SnapshotResourcePolicyV1 {
@@ -676,19 +717,33 @@ impl SnapshotPipelineResourcesV1 {
         Ok(attempt())
     }
 
-    pub(super) fn reserve_forward_transient(
+    pub(super) fn charged_forward_bytes(
         &self,
         stage: SnapshotPipelineForwardStageV1,
-        bytes: u64,
-    ) -> Result<SnapshotTransientReservationV1<'_>, SnapshotPipelineResourceErrorV1> {
-        self.reserve_transient(SnapshotPipelineStageV1::Forward(stage), bytes)
+        max_capacity: usize,
+    ) -> Result<SnapshotChargedBytesV1<'_>, SnapshotPipelineResourceErrorV1> {
+        SnapshotChargedBytesV1::with_capacity(
+            self,
+            SnapshotPipelineStageV1::Forward(stage),
+            max_capacity,
+        )
     }
 
-    pub(super) fn reserve_cleanup_transient(
+    pub(super) fn charged_cleanup_bytes(
         &self,
-        bytes: u64,
-    ) -> Result<SnapshotTransientReservationV1<'_>, SnapshotPipelineResourceErrorV1> {
-        self.reserve_transient(SnapshotPipelineStageV1::Cleanup, bytes)
+        max_capacity: usize,
+    ) -> Result<SnapshotChargedBytesV1<'_>, SnapshotPipelineResourceErrorV1> {
+        SnapshotChargedBytesV1::with_capacity(self, SnapshotPipelineStageV1::Cleanup, max_capacity)
+    }
+
+    #[cfg(test)]
+    pub(super) fn forward_attempts_remaining_for_test(&self) -> u64 {
+        self.forward_attempts_remaining.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_attempts_remaining_for_test(&self) -> u64 {
+        self.cleanup_attempts_remaining.get()
     }
 
     fn charge_attempt(
@@ -711,7 +766,7 @@ impl SnapshotPipelineResourcesV1 {
         &self,
         stage: SnapshotPipelineStageV1,
         bytes: u64,
-    ) -> Result<SnapshotTransientReservationV1<'_>, SnapshotPipelineResourceErrorV1> {
+    ) -> Result<SnapshotTransientChargeV1<'_>, SnapshotPipelineResourceErrorV1> {
         let live = self.transient_heap_live.get();
         let Some(next) = live.checked_add(bytes) else {
             return Err(
@@ -734,21 +789,128 @@ impl SnapshotPipelineResourcesV1 {
             );
         }
         self.transient_heap_live.set(next);
-        Ok(SnapshotTransientReservationV1 {
+        Ok(SnapshotTransientChargeV1 {
             resources: self,
             bytes,
         })
     }
+
+    fn release_transient(&self, bytes: u64) {
+        let live = self.transient_heap_live.get();
+        let restored = live
+            .checked_sub(bytes)
+            .expect("a private transient charge cannot release uncharged bytes");
+        self.transient_heap_live.set(restored);
+    }
 }
 
-impl Drop for SnapshotTransientReservationV1<'_> {
+impl Drop for SnapshotTransientChargeV1<'_> {
     fn drop(&mut self) {
-        let live = self.resources.transient_heap_live.get();
-        let restored = live
-            .checked_sub(self.bytes)
-            .expect("a private transient reservation cannot release uncharged bytes");
-        self.resources.transient_heap_live.set(restored);
+        self.resources.release_transient(self.bytes);
     }
+}
+
+impl<'resources> SnapshotChargedBytesV1<'resources> {
+    fn with_capacity(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        stage: SnapshotPipelineStageV1,
+        max_capacity: usize,
+    ) -> Result<Self, SnapshotPipelineResourceErrorV1> {
+        Self::with_capacity_using(resources, stage, max_capacity, |values, capacity| {
+            values.try_reserve_exact(capacity).map_err(|_| ())
+        })
+    }
+
+    fn with_capacity_using(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        stage: SnapshotPipelineStageV1,
+        max_capacity: usize,
+        reserve: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), ()>,
+    ) -> Result<Self, SnapshotPipelineResourceErrorV1> {
+        let precharged = observed_capacity_bytes(max_capacity, stage)?;
+        let mut charge = resources.reserve_transient(stage, precharged)?;
+        let mut values = Vec::new();
+        if reserve(&mut values, max_capacity).is_err() {
+            return Err(SnapshotPipelineResourceErrorV1::ContainerAllocationFailed { stage });
+        }
+        let observed = observed_capacity_bytes(values.capacity(), stage)?;
+        if observed > precharged {
+            drop(values);
+            return Err(
+                SnapshotPipelineResourceErrorV1::AllocatorCapacityExceededPrecharge {
+                    stage,
+                    observed,
+                    precharged,
+                },
+            );
+        }
+        debug_assert_eq!(observed, precharged);
+        charge.bytes = 0;
+        Ok(Self {
+            values,
+            resources,
+            stage,
+            charged_bytes: observed,
+        })
+    }
+
+    pub(super) fn try_push(&mut self, value: u8) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        let required = self.values.len().checked_add(1).ok_or(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: self.stage,
+            },
+        )?;
+        self.require_capacity(required)?;
+        self.values.push(value);
+        Ok(())
+    }
+
+    pub(super) fn try_extend_from_slice(
+        &mut self,
+        values: &[u8],
+    ) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        let required = self.values.len().checked_add(values.len()).ok_or(
+            SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow {
+                stage: self.stage,
+            },
+        )?;
+        self.require_capacity(required)?;
+        self.values.extend_from_slice(values);
+        Ok(())
+    }
+
+    fn require_capacity(&self, required: usize) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        let capacity = self.values.capacity();
+        if required > capacity {
+            return Err(
+                SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                    stage: self.stage,
+                    required: u64::try_from(required).unwrap_or(u64::MAX),
+                    limit: u64::try_from(capacity).unwrap_or(u64::MAX),
+                },
+            );
+        }
+        Ok(())
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.values
+    }
+}
+
+impl Drop for SnapshotChargedBytesV1<'_> {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.values));
+        self.resources.release_transient(self.charged_bytes);
+    }
+}
+
+fn observed_capacity_bytes(
+    capacity: usize,
+    stage: SnapshotPipelineStageV1,
+) -> Result<u64, SnapshotPipelineResourceErrorV1> {
+    u64::try_from(capacity)
+        .map_err(|_| SnapshotPipelineResourceErrorV1::ContainerCapacityArithmeticOverflow { stage })
 }
 
 fn checked_four_view_heap_bytes(
@@ -1345,10 +1507,16 @@ mod tests {
 
         let resources = pipeline_resources(1, 8);
         let one = resources
-            .reserve_forward_transient(SnapshotPipelineForwardStageV1::SourceEnumeration, 1)
+            .reserve_transient(
+                SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::SourceEnumeration),
+                1,
+            )
             .unwrap();
         assert_eq!(
-            resources.reserve_cleanup_transient(u64::MAX).unwrap_err(),
+            resources
+                .reserve_transient(SnapshotPipelineStageV1::Cleanup, u64::MAX)
+                .err()
+                .unwrap(),
             SnapshotPipelineResourceErrorV1::TransientHeapArithmeticOverflow {
                 stage: SnapshotPipelineStageV1::Cleanup,
                 live: 1,
@@ -1430,18 +1598,26 @@ mod tests {
     fn transient_reservations_compose_across_phases_and_restore_on_any_drop_order() {
         let resources = pipeline_resources(1, 10);
         let first = resources
-            .reserve_forward_transient(SnapshotPipelineForwardStageV1::RegularCopy, 4)
+            .reserve_transient(
+                SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::RegularCopy),
+                4,
+            )
             .unwrap();
-        let second = resources.reserve_cleanup_transient(6).unwrap();
+        let second = resources
+            .reserve_transient(SnapshotPipelineStageV1::Cleanup, 6)
+            .unwrap();
         assert_eq!(resources.transient_heap_live.get(), 10);
 
         assert_eq!(
             resources
-                .reserve_forward_transient(
-                    SnapshotPipelineForwardStageV1::DestinationObservation,
+                .reserve_transient(
+                    SnapshotPipelineStageV1::Forward(
+                        SnapshotPipelineForwardStageV1::DestinationObservation,
+                    ),
                     1
                 )
-                .unwrap_err(),
+                .err()
+                .unwrap(),
             SnapshotPipelineResourceErrorV1::TransientHeapCapacityExceeded {
                 stage: SnapshotPipelineStageV1::Forward(
                     SnapshotPipelineForwardStageV1::DestinationObservation
@@ -1455,7 +1631,10 @@ mod tests {
         drop(first);
         assert_eq!(resources.transient_heap_live.get(), 6);
         let replacement = resources
-            .reserve_forward_transient(SnapshotPipelineForwardStageV1::SourceObservation, 4)
+            .reserve_transient(
+                SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::SourceObservation),
+                4,
+            )
             .unwrap();
         assert_eq!(resources.transient_heap_live.get(), 10);
         drop(second);
@@ -1463,9 +1642,101 @@ mod tests {
         drop(replacement);
         assert_eq!(resources.transient_heap_live.get(), 0);
 
-        let zero = resources.reserve_cleanup_transient(0).unwrap();
+        let zero = resources
+            .reserve_transient(SnapshotPipelineStageV1::Cleanup, 0)
+            .unwrap();
         assert_eq!(resources.transient_heap_live.get(), 0);
         drop(zero);
+        assert_eq!(resources.transient_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn charged_bytes_own_exact_capacity_refuse_growth_and_release_on_drop() {
+        let resources = pipeline_resources(1, 8);
+        let mut bytes = resources.charged_cleanup_bytes(4).unwrap();
+        assert_eq!(resources.transient_heap_live.get(), 4);
+        bytes.try_extend_from_slice(b"name").unwrap();
+        assert_eq!(bytes.as_slice(), b"name");
+        assert_eq!(
+            bytes.try_push(b'!').unwrap_err(),
+            SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                stage: SnapshotPipelineStageV1::Cleanup,
+                required: 5,
+                limit: 4,
+            }
+        );
+        assert_eq!(bytes.as_slice(), b"name");
+        drop(bytes);
+        assert_eq!(resources.transient_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn charged_bytes_refuse_insufficient_precharge_before_allocation() {
+        let resources = pipeline_resources(1, 4);
+        let allocator_ran = Cell::new(false);
+        assert_eq!(
+            SnapshotChargedBytesV1::with_capacity_using(
+                &resources,
+                SnapshotPipelineStageV1::Cleanup,
+                5,
+                |_, _| {
+                    allocator_ran.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::TransientHeapCapacityExceeded {
+                stage: SnapshotPipelineStageV1::Cleanup,
+                live: 0,
+                requested: 5,
+                limit: 4,
+            }
+        );
+        assert!(!allocator_ran.get());
+        assert_eq!(resources.transient_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn charged_byte_allocation_failures_and_unwind_release_precharge() {
+        let resources = pipeline_resources(1, 16);
+        let stage = SnapshotPipelineStageV1::Cleanup;
+        let error = SnapshotChargedBytesV1::with_capacity_using(&resources, stage, 8, |_, _| {
+            assert_eq!(resources.transient_heap_live.get(), 8);
+            Err(())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error,
+            SnapshotPipelineResourceErrorV1::ContainerAllocationFailed { stage }
+        );
+        assert_eq!(resources.transient_heap_live.get(), 0);
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = SnapshotChargedBytesV1::with_capacity_using(&resources, stage, 8, |_, _| {
+                panic!("injected allocator unwind")
+            });
+        }));
+        assert!(panic.is_err());
+        assert_eq!(resources.transient_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn allocator_capacity_above_precharge_is_dropped_and_refused() {
+        let resources = pipeline_resources(1, 16);
+        let stage = SnapshotPipelineStageV1::Cleanup;
+        let error =
+            SnapshotChargedBytesV1::with_capacity_using(&resources, stage, 4, |values, _| {
+                values.try_reserve_exact(8).map_err(|_| ())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotPipelineResourceErrorV1::AllocatorCapacityExceededPrecharge {
+                stage: SnapshotPipelineStageV1::Cleanup,
+                observed,
+                precharged: 4,
+            } if observed >= 8
+        ));
         assert_eq!(resources.transient_heap_live.get(), 0);
     }
 
@@ -1492,11 +1763,9 @@ mod tests {
         <SnapshotPipelineResourcesV1 as AmbiguousIfClone<_>>::probe();
         <SnapshotPipelineResourcesV1 as AmbiguousIfCopy<_>>::probe();
         <SnapshotPipelineResourcesV1 as AmbiguousIfDefault<_>>::probe();
-        <SnapshotTransientReservationV1<'static> as AmbiguousIfClone<_>>::probe();
-        <SnapshotTransientReservationV1<'static> as AmbiguousIfCopy<_>>::probe();
-        <SnapshotTransientReservationV1<'static> as AmbiguousIfDefault<_>>::probe();
-        assert!(std::mem::needs_drop::<
-            SnapshotTransientReservationV1<'static>,
-        >());
+        <SnapshotChargedBytesV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotChargedBytesV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotChargedBytesV1<'static> as AmbiguousIfDefault<_>>::probe();
+        assert!(std::mem::needs_drop::<SnapshotChargedBytesV1<'static>>());
     }
 }
