@@ -451,14 +451,14 @@ mod tests {
         mtime: i64,
         ctime_delta: i64,
     ) -> SourceStatxV1 {
-        let (mount, inode, mode, uid, gid, ctime) = match role {
-            Role::Source => (1, inode, source_mode, 10, 20, 30),
-            Role::Destination => (11, inode + 100, destination_mode, 1_000, 2_000, 300),
+        let (mount, device_major, device_minor, inode, mode, uid, gid, ctime) = match role {
+            Role::Source => (1, 2, 0, inode, source_mode, 10, 20, 30),
+            Role::Destination => (11, 22, 33, inode + 100, destination_mode, 1_000, 2_000, 300),
         };
         SourceStatxV1::for_test(
             mount,
-            2,
-            0,
+            device_major,
+            device_minor,
             inode,
             mode,
             uid,
@@ -479,6 +479,7 @@ mod tests {
         inode: u64,
         seed: u8,
         size: u64,
+        extent_length: u64,
         source_mode: u32,
         destination_mode: u32,
         ctime_delta: i64,
@@ -504,10 +505,10 @@ mod tests {
             SourcePlanPayloadV1::Regular {
                 evidence: SourceRegularEvidenceV1::checked(
                     FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[&[seed]]),
-                    (size != 0)
+                    (extent_length != 0)
                         .then_some(ExtentV1 {
                             offset: 0,
-                            length: size,
+                            length: extent_length,
                         })
                         .into_iter()
                         .collect(),
@@ -519,7 +520,13 @@ mod tests {
         )
     }
 
-    fn fixture(role: Role, digest_seed: u8, ctime_delta: i64) -> SourceTreePlanV1 {
+    fn fixture_with(
+        role: Role,
+        digest_seed: u8,
+        ctime_delta: i64,
+        root_name: &[u8],
+        regular_extent_length: u64,
+    ) -> SourceTreePlanV1 {
         let root = SourceTreeEntryV1::unchecked_for_test(
             b"",
             b"tree",
@@ -551,6 +558,7 @@ mod tests {
                 2,
                 digest_seed,
                 4,
+                regular_extent_length,
                 S_IFREG | 0o755,
                 S_IFREG | 0o555,
                 ctime_delta,
@@ -563,12 +571,17 @@ mod tests {
                 3,
                 9,
                 0,
+                0,
                 S_IFREG | 0o644,
                 S_IFREG | 0o444,
                 ctime_delta,
             )
         };
-        SourceTreePlanV1::unchecked_for_test(b"tree", vec![root, a(), b()], Vec::new(), false)
+        SourceTreePlanV1::unchecked_for_test(root_name, vec![root, a(), b()], Vec::new(), false)
+    }
+
+    fn fixture(role: Role, digest_seed: u8, ctime_delta: i64) -> SourceTreePlanV1 {
+        fixture_with(role, digest_seed, ctime_delta, b"tree", 4)
     }
 
     fn source(seed: u8) -> SourceTreePlanV1 {
@@ -586,12 +599,38 @@ mod tests {
         }
     }
 
+    fn assert_mismatch<T>(
+        result: Result<T, SnapshotVerifyErrorV1>,
+        pair: SnapshotViewPairV1,
+        field: SnapshotMismatchFieldV1,
+        location: SnapshotVerifyLocationV1,
+    ) {
+        assert_eq!(
+            error(result),
+            SnapshotVerifyErrorV1 {
+                pair,
+                field,
+                location,
+            }
+        );
+    }
+
     #[test]
     fn exact_four_views_complete_all_three_comparisons() {
         let s1 = source(1);
         let s2 = source(1);
         let d1 = destination(1, 0);
         let d2 = destination(1, 0);
+        let source_root = s1.entries()[0].statx();
+        let destination_root = d1.entries()[0].statx();
+
+        // The projection deliberately ignores source-only physical identity,
+        // ctime, btime, and directory-size differences at the destination.
+        assert_ne!(source_root.inode_key(), destination_root.inode_key());
+        assert_ne!(source_root.ctime(), destination_root.ctime());
+        assert_ne!(source_root.btime(), destination_root.btime());
+        assert_ne!(source_root.size(), destination_root.size());
+
         begin_four_view_comparison(&s1)
             .compare_source_s2(&s2)
             .unwrap()
@@ -678,5 +717,56 @@ mod tests {
             SnapshotMismatchFieldV1::DestinationPhysicalOwner
         );
         assert_eq!(mismatch.location, SnapshotVerifyLocationV1::Entry(0));
+    }
+
+    #[test]
+    fn mismatch_precedence_is_header_then_entry_then_field() {
+        let s1 = source(1);
+
+        let wrong_header = fixture_with(Role::Source, 2, 1, b"wrong", 2);
+        assert_mismatch(
+            begin_four_view_comparison(&s1).compare_source_s2(&wrong_header),
+            SnapshotViewPairV1::S1S2,
+            SnapshotMismatchFieldV1::RootName,
+            SnapshotVerifyLocationV1::Header,
+        );
+
+        // Entry zero's ctime precedes entry one's digest and extent failures.
+        let wrong_entries = fixture_with(Role::Source, 2, 1, b"tree", 2);
+        assert_mismatch(
+            begin_four_view_comparison(&s1).compare_source_s2(&wrong_entries),
+            SnapshotViewPairV1::S1S2,
+            SnapshotMismatchFieldV1::Ctime,
+            SnapshotVerifyLocationV1::Entry(0),
+        );
+
+        // Within entry zero, inode identity precedes mode, ownership, size,
+        // ctime, and birth-time differences.
+        let wrong_fields = destination(2, 1);
+        assert_mismatch(
+            begin_four_view_comparison(&s1).compare_source_s2(&wrong_fields),
+            SnapshotViewPairV1::S1S2,
+            SnapshotMismatchFieldV1::InodeIdentity,
+            SnapshotVerifyLocationV1::Entry(0),
+        );
+    }
+
+    #[test]
+    fn destination_extent_mismatch_keeps_pair_field_and_location() {
+        let s1 = source(1);
+        let s2 = source(1);
+        let d1 = destination(1, 0);
+        let d2_with_different_extents = fixture_with(Role::Destination, 1, 0, b"tree", 2);
+        assert_mismatch(
+            begin_four_view_comparison(&s1)
+                .compare_source_s2(&s2)
+                .unwrap()
+                .compare_destination_d1(&d1, DestinationPhysicalIdentityV1::new(1_000, 2_000))
+                .unwrap()
+                .compare_destination_d2(&d2_with_different_extents),
+            SnapshotViewPairV1::D1D2,
+            SnapshotMismatchFieldV1::RegularExtents,
+            SnapshotVerifyLocationV1::Entry(1),
+        );
     }
 }

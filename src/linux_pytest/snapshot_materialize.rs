@@ -498,12 +498,18 @@ impl fmt::Debug for SnapshotTreeMaterializeErrorV1 {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+/// Populates and validates one charged private stage, returning that still-
+/// unready guard together with the exact source plan produced during copying.
+/// Neither value grants readiness, publication, or reuse authority.
 pub(super) fn materialize_source_tree_charged_at<'scope>(
     staging: ChargedStagedSnapshotDirectoryV1<'scope>,
     source_view: QualifiedNoAtimeSourceViewV1<'_>,
     root_name: &CStr,
     session: &SnapshotMaterializationSessionV1<'_>,
-) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotTreeMaterializeErrorV1> {
+) -> Result<
+    (ChargedStagedSnapshotDirectoryV1<'scope>, SourceTreePlanV1),
+    SnapshotTreeMaterializeErrorV1,
+> {
     platform::materialize_source_tree_charged_at(staging, source_view, root_name, session)
 }
 
@@ -1712,7 +1718,10 @@ mod platform {
         source_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
         session: &SnapshotMaterializationSessionV1<'_>,
-    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotTreeMaterializeErrorV1> {
+    ) -> Result<
+        (ChargedStagedSnapshotDirectoryV1<'scope>, SourceTreePlanV1),
+        SnapshotTreeMaterializeErrorV1,
+    > {
         let mut materializer = SnapshotMaterializerWithGateV1::new_with_gate(
             staging,
             *session.materialization_policy(),
@@ -1727,9 +1736,10 @@ mod platform {
             &mut materializer,
         )
         .map_err(flatten_tree_materialize_error)?;
-        materializer
+        let staging = materializer
             .finish_populated(&plan)
-            .map_err(flatten_charged_materialize_error)
+            .map_err(flatten_charged_materialize_error)?;
+        Ok((staging, plan))
     }
 
     struct DestinationIdentityV1 {

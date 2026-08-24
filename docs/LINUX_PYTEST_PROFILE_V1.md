@@ -37,8 +37,10 @@ two such full-plan leases at once. One connector-owned materialization
 operation reserves both ceilings for its enumerator plan and materializer
 workspace before filesystem work, creates the sole charged private stage,
 walks the already-qualified source, invokes the charged regular-copy leaf, and
-returns only the populated RAII-cleanup guard. The session binds the exact
-source, destination, and copy policies to the shared ledger. The guard exposes
+returns the populated RAII-cleanup guard beside the retained copy-time source
+plan. The materializer-workspace lease is released while the source-plan lease
+remains attached to that plan. The session binds the exact source,
+destination, and copy policies to the shared ledger. The guard and plan expose
 no ready, publish, or execution transition. Destination observation and the
 complete pairwise four-view orchestration remain in progress and unwired.
 

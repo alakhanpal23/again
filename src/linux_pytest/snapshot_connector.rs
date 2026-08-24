@@ -250,10 +250,11 @@ pub(super) struct SnapshotMaterializationSessionV1<'resources> {
 }
 
 /// One FD-free tree view paired with the connector's linear retained-heap
-/// lease. Only source observation mints this wrapper today; a future
-/// destination observer may share the retained representation but must use a
-/// distinct destination-stage session. Field order is intentional: the owned
-/// plan is destroyed before its budget lease is released.
+/// lease. Source observation and the materializer's copy-time source pass mint
+/// this wrapper today; a future destination observer may share the retained
+/// representation but must use a distinct destination-stage session. Field
+/// order is intentional: the owned plan is destroyed before its budget lease
+/// is released.
 pub(super) struct SnapshotRetainedTreeViewV1<'resources> {
     plan: SourceTreePlanV1,
     _lease: SnapshotRetainedViewLeaseV1<'resources>,
@@ -501,10 +502,12 @@ impl SnapshotConnectorV1 {
     /// In one connector-owned operation, selects this connector's policies and
     /// resource ledger, creates its sole private stage, and populates that
     /// stage through one charged source traversal. No independently spliceable
-    /// session or policy escapes. The returned guard can expose its pinned
-    /// directory and clean it up, but cannot enter readiness or publication
-    /// transitions. Capacity refusal before publication leaves the one-shot
-    /// unused; any failure after publication begins consumes it.
+    /// session or policy escapes. Success returns the populated guard beside
+    /// the exact copy-time source plan under its retained-view lease; the
+    /// materializer-workspace lease has already been released. The guard can
+    /// expose its pinned directory and clean it up, but cannot enter readiness
+    /// or publication transitions. Capacity refusal before publication leaves
+    /// the one-shot unused; any failure after publication begins consumes it.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub(super) fn materialize_source_tree_at<'scope>(
         &'scope self,
@@ -512,17 +515,22 @@ impl SnapshotConnectorV1 {
         staging_name: &CStr,
         source_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
-    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotPipelineMaterializationErrorV1>
-    {
+    ) -> Result<
+        (
+            ChargedStagedSnapshotDirectoryV1<'scope>,
+            SnapshotRetainedTreeViewV1<'scope>,
+        ),
+        SnapshotPipelineMaterializationErrorV1,
+    > {
         // The traversal's source plan and the materializer's event workspace
         // can each reach one full-plan ceiling. Reserve both before publication
         // or filesystem work. If the second reservation fails, ordinary drop
         // rollback releases the first before this method returns.
-        let _source_plan_lease = self
+        let source_plan_lease = self
             .resources
             .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
             .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
-        let _materializer_plan_lease = self
+        let materializer_plan_lease = self
             .resources
             .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
             .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
@@ -546,8 +554,17 @@ impl SnapshotConnectorV1 {
             }
         })?;
         let materialization = self.materialization_session();
-        materialize_source_tree_charged_at(staging, source_view, root_name, &materialization)
-            .map_err(flatten_pipeline_materialization_error)
+        let (staging, plan) =
+            materialize_source_tree_charged_at(staging, source_view, root_name, &materialization)
+                .map_err(flatten_pipeline_materialization_error)?;
+        drop(materializer_plan_lease);
+        Ok((
+            staging,
+            SnapshotRetainedTreeViewV1 {
+                plan,
+                _lease: source_plan_lease,
+            },
+        ))
     }
 
     /// Test-only access to the charged staging checkpoint. Production code
@@ -1539,7 +1556,7 @@ mod tests {
             )
         };
 
-        let staged = connector
+        let (staged, source_s1) = connector
             .materialize_source_tree_at(
                 publication_parent_fd.as_fd(),
                 staging_name,
@@ -1551,6 +1568,11 @@ mod tests {
         assert_eq!(fs::read(staging_path.join("tree/file")).unwrap(), expected);
         assert_eq!(source_atime(&source_tree), tree_atime);
         assert_eq!(source_atime(&source_file), file_atime);
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            connector.resources.policy().max_retained_view_bytes().get()
+        );
+        drop(source_s1);
         assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
         assert!(staging_path.exists());
 
@@ -1616,7 +1638,8 @@ mod tests {
             c"tree",
         ) {
             Err(error) => error,
-            Ok(staged) => {
+            Ok((staged, source_s1)) => {
+                drop(source_s1);
                 drop(staged);
                 panic!("an unqualified symlink must fail closed");
             }
@@ -1666,7 +1689,8 @@ mod tests {
             c"root",
         ) {
             Err(error) => error,
-            Ok(staged) => {
+            Ok((staged, source_s1)) => {
+                drop(source_s1);
                 drop(staged);
                 panic!("a non-directory source parent must fail closed");
             }

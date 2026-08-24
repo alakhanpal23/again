@@ -18,12 +18,13 @@ that authority through the charged pipeline. On Linux x86_64, one
 connector-owned operation now reserves two full-plan ceilings, creates the
 charged private stage, traverses the already-qualified source, invokes charged
 regular copying, finalizes supported metadata and durability, and returns the
-populated RAII-cleanup guard. Source-enumeration, materialization, and
-regular-copy policies are bound into the same connector-minted session. The
-populated guard exposes no ready, publish, execution, or reuse transition;
-destination observation and complete four-view orchestration remain unwired.
-Nothing in this document is evidence that pytest execution or reuse is
-available.
+populated RAII-cleanup guard beside the retained copy-time source plan. Its
+source-plan lease remains live after the materializer-workspace lease is
+released. Source-enumeration, materialization, and regular-copy policies are
+bound into the same connector-minted session. Neither result exposes a ready,
+publish, execution, or reuse transition; destination observation and complete
+four-view orchestration remain unwired. Nothing in this document is evidence
+that pytest execution or reuse is available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR

@@ -180,7 +180,9 @@ is a typed pre-population refusal. The current connector reserves both
 simultaneously live plan ceilings before filesystem work, creates one private
 charged stage, traverses the already-qualified source, populates supported
 entries through the connector-bound regular-copy leaf, and returns the
-populated guard. Forward and cleanup raw
+populated guard beside the retained copy-time source plan. The source-plan
+lease remains attached while the materializer-workspace lease is released.
+Forward and cleanup raw
 attempts, including retries, use disjoint buckets; the retained 55-byte staging
 basename is forward-charged and retained cleanup names are cleanup-charged. For
 cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
