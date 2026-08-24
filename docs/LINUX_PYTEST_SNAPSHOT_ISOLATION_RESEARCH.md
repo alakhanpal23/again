@@ -183,10 +183,12 @@ pinned directory, cleanup envelope, and RAII cleanup. Forward and cleanup raw
 attempts, including retries, use disjoint buckets; the retained 55-byte staging
 basename is forward-charged and retained cleanup names are cleanup-charged. For
 cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
-live retained-name heap is `55 + min(E, 64 * (D + 1)) * (N + 1)` bytes, with
-the fixed 64 batch slots on the stack. The guard exposes no ready, publish, or
-execution transition. Every later snapshot and isolation step in this note
-remains a research requirement.
+live retained-name heap is `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each
+active cleanup frame retains a fixed two-slot name batch on the stack; those
+stack bytes are outside the transient-heap ledger. The guard exposes no ready,
+publish, or execution transition. A charged iterative cleanup traversal and
+every later snapshot and isolation step in this note remain research
+requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`

@@ -47,11 +47,11 @@ const PUBLISH_TRANSIENT_FDS: u32 = 2;
 
 // Cleanup is deliberately charged before a staging directory is created.
 // These constants are the frozen conservative equation for the publisher's
-// fixed-size raw-`getdents64` batches. It covers exact-full-batch EOF probes,
-// dot-only reads for empty directories, every explicit raw directory-read
-// attempt, and identity/chmod/unlink work: `(5E + 3)` open-family calls and
-// `(12E + 12)` generic calls. Infallible RAII close calls are structurally
-// bounded by successful opens and are not retry-budgeted.
+// fixed two-name raw-`getdents64` batches. It covers fresh rescans,
+// exact-full-batch and dot-only EOF probes, maximally partial positive reads,
+// and identity/chmod/unlink work: `(5E + 3)` open-family calls and `(12E + 12)`
+// generic calls. Infallible RAII close calls are structurally bounded by
+// successful opens and are not retry-budgeted.
 const CLEANUP_FIXED_OPEN_CALLS: u64 = 3;
 const CLEANUP_FIXED_SYSCALL_CALLS: u64 = 12;
 const CLEANUP_OPEN_CALLS_PER_ENTRY: u64 = 5;

@@ -37,18 +37,21 @@ forward exhaustion cannot spend the cleanup reserve. The retained 55-byte
 staging basename is charged to the forward heap stage; each retained cleanup
 name is charged to the cleanup heap stage. For cleanup depth `D`, entry limit
 `E`, and basename limit `N`, the exact maximum live retained-name heap is
-`55 + min(E, 64 * (D + 1)) * (N + 1)` bytes. The fixed 64-slot cleanup batches
-are stack storage.
+`55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each active cleanup frame retains
+one fixed two-slot name batch on the stack; those stack bytes and
+allocator-private metadata are outside the transient-heap ledger. Maximum-depth
+cleanup is retained as a required test on each supported build/target; a
+charged iterative traversal remains required before this checkpoint can become
+a release-qualified snapshot backend.
 
 Each charged `Vec<u8>` precharges its requested capacity, observes capacity
 after `try_reserve_exact`, and accepts only exact equality. Allocator
 overcapacity drops the storage and returns a typed compatibility refusal. The
 raw vector is never exposed, only byte buffers are admitted so nested owned
 allocations cannot escape, and backing storage is dropped before its ledger
-charge is released. Allocator-private metadata is outside this contract. All
-other leaf allocations, including frozen source-plan and xattr boxed slices,
-remain outside the ledger, so this is not an exact whole-pipeline heap
-authority.
+charge is released. All other leaf allocations, including frozen source-plan
+and xattr boxed slices, remain outside the ledger, so this is not an exact
+whole-pipeline heap authority.
 
 The intended next local product slice has exactly one public invocation
 shape:

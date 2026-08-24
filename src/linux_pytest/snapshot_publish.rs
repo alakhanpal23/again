@@ -32,8 +32,10 @@ const STAGING_NONCE_HEX_BYTES: usize = 32;
 const MAX_STAGING_NAME_WITH_NUL: u64 =
     (STAGING_NAME_PREFIX.len() + STAGING_NONCE_HEX_BYTES + 1) as u64;
 const MAX_BASENAME_BYTES: usize = 255;
-// Each active recursion frame retains at most one fixed, on-stack batch.
-const CLEANUP_NAME_BATCH_SIZE: usize = 64;
+// Two names per frame are the smallest batch that preserves the frozen
+// getdents/operation bounds under maximally partial positive directory reads.
+// Keeping the batch fixed and small also bounds recursive stack retention.
+const CLEANUP_NAME_BATCH_SIZE: usize = 2;
 const CLEANUP_GETDENTS_BUFFER_BYTES: usize = 4096;
 const DIRENT64_NAME_OFFSET: usize = 19;
 const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
@@ -210,10 +212,11 @@ impl SnapshotPublishPolicyV1 {
         }
     }
 
-    /// Worst-case cleanup attempts for the fixed-size raw-`getdents64` batches.
-    /// Five opens per entry cover exact-full-batch EOF probes. Five bounded
-    /// raw directory reads plus the other per-entry identity/chmod/unlink work
-    /// give a conservative twelve generic calls per entry.
+    /// Worst-case cleanup attempts for two-name raw-`getdents64` batches. Five
+    /// opens per entry cover fresh rescans and exact-full-batch EOF probes.
+    /// Five bounded raw directory reads plus the other per-entry
+    /// identity/chmod/unlink work give twelve conservative generic calls per
+    /// entry, including maximally partial positive reads.
     pub(super) fn cleanup_operation_attempt_bound(self) -> Option<u64> {
         let entries = self.max_cleanup_entries.get() as u64;
         let opens = entries.checked_mul(5)?.checked_add(3)?;
@@ -2335,6 +2338,7 @@ mod platform {
 
         const STAGING: &CStr = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
         const FINAL: &CStr = c"snapshot-final";
+        const CLEANUP_STRESS_NAME_COUNT: usize = 65;
         const CREATE_TRANSITION_COUNT: usize = 4;
         const READY_TRANSITION_COUNT: usize = 3;
 
@@ -2507,7 +2511,7 @@ mod platform {
         }
 
         #[test]
-        fn charged_drop_cleans_a_full_batch_nested_read_only_tree_from_exact_operation_reserve() {
+        fn charged_drop_cleans_many_siblings_nested_read_only_tree_from_exact_operation_reserve() {
             const ENTRIES: u32 = 66;
             const OPEN_ATTEMPTS: u64 = 4;
             const SYSCALL_ATTEMPTS: u64 = 3;
@@ -2534,9 +2538,9 @@ mod platform {
                 Some(cleanup_reserve)
             );
 
-            // Sixty-three files plus the read-only directory make a full
-            // 64-name root batch. Its nested directory and file bring the
-            // exact charged cleanup entry count to 66.
+            // Sixty-three files plus the read-only directory make 64 root
+            // siblings. Its nested directory and file bring the exact charged
+            // cleanup entry count to 66 and force repeated two-name rescans.
             for index in 0..63 {
                 fs::write(
                     fixture.staging_path().join(format!("batch-{index:02}")),
@@ -2877,7 +2881,7 @@ mod platform {
                 let staged = fixture.stage();
                 fs::create_dir(staging_path.join("nested")).unwrap();
                 fs::write(staging_path.join("nested/file"), b"content").unwrap();
-                for index in 0..=CLEANUP_NAME_BATCH_SIZE {
+                for index in 0..CLEANUP_STRESS_NAME_COUNT {
                     fs::write(
                         staging_path.join("nested").join(format!("batch-{index}")),
                         b"content",
@@ -2991,7 +2995,7 @@ mod platform {
         }
 
         #[test]
-        fn raw_getdents_attempts_cover_chain_full_batch_and_exact_refusal() {
+        fn raw_getdents_attempts_cover_chain_two_name_batch_and_exact_refusal() {
             let one_directory = Fixture::new();
             let mut staged = one_directory.stage();
             staged.cleanup.policy_mut().max_cleanup_getdents_attempts = 4;
@@ -3009,10 +3013,15 @@ mod platform {
             );
             assert!(exhausted.staging_path().is_dir());
 
-            let full_batch = Fixture::new();
-            let mut staged = full_batch.stage();
+            let two_name_batch = Fixture::new();
+            let mut staged = two_name_batch.stage();
             for index in 0..CLEANUP_NAME_BATCH_SIZE {
-                fs::create_dir(full_batch.staging_path().join(format!("dir-{index:02}"))).unwrap();
+                fs::create_dir(
+                    two_name_batch
+                        .staging_path()
+                        .join(format!("dir-{index:02}")),
+                )
+                .unwrap();
             }
             staged.cleanup.remove_current().unwrap();
             assert_eq!(
@@ -3445,16 +3454,16 @@ mod portable_tests {
     fn policy_uses_the_exact_live_cleanup_heap_shape() {
         // Depth seven permits ten simultaneous cleanup frames after adding
         // the publication container levels. Eleven total entries therefore
-        // cap the live slots before the fixed 64-name batch width does.
+        // cap the live slots before the fixed two-name batch width does.
         let entry_capped = MAX_STAGING_NAME_WITH_NUL + 11 * (13 + 1);
         assert!(checked_policy(2, 3, 7, 11, 13, entry_capped).is_some());
         assert!(checked_policy(2, 3, 7, 11, 13, entry_capped - 1).is_none());
 
         // Source depth zero becomes cleanup depth two, so three active
-        // 64-name batches cap 193 admitted entries at 192 live names.
-        let depth_capped = MAX_STAGING_NAME_WITH_NUL + 192 * (13 + 1);
-        assert!(checked_policy(2, 3, 0, 193, 13, depth_capped).is_some());
-        assert!(checked_policy(2, 3, 0, 193, 13, depth_capped - 1).is_none());
+        // two-name batches cap seven admitted entries at six live names.
+        let depth_capped = MAX_STAGING_NAME_WITH_NUL + 6 * (13 + 1);
+        assert!(checked_policy(2, 3, 0, 7, 13, depth_capped).is_some());
+        assert!(checked_policy(2, 3, 0, 7, 13, depth_capped - 1).is_none());
     }
 
     #[test]
