@@ -178,8 +178,12 @@ Landlock ABI, or failed isolation probe is a typed refusal before Python
 executes, never a best-effort unsandboxed fallback.
 
 Stock GitHub-hosted Ubuntu is intentionally a negative, non-qualifying lane:
-host AppArmor policy blocks unprivileged user namespaces. It must demonstrate
-pre-Python refusal and cannot supply positive isolation/profile evidence.
+host policy prevents completion of the required rootless bootstrap. CI requires
+the independent single-namespace route to refuse with `EACCES` and the fixed
+combined diagnostic to verify its mapped child, fresh namespace ownership, and
+effective `CAP_SYS_ADMIN` before an exact `EPERM` at UTS configuration. The
+diagnostic accepts no command, must refuse before any workload surface, and
+cannot supply positive isolation or profile evidence.
 
 ## Product promise
 
@@ -471,13 +475,17 @@ Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
 the launcher captures a bounded canonical host-KGID vector; while PID 1 is
 blocked, the parent verifies the child's exact vector through its pinned proc
-view and commits the vector digest to the isolation/platform evidence. This
-namespace proof does not claim those groups are non-authoritative. Workload
-execution remains forbidden until a later outer proof has detached the old
-root, admitted only profile-created or descriptor-selected trees, closed every
-host descriptor above 2, denied namespace/descriptor/IPC escape paths, and
-made the inherited group vector unable to reveal or mutate any additional
-object.
+view and commits the vector digest to the isolation/platform evidence. The
+fixed diagnostic also requires the same bounded proc status to show effective
+`CAP_SYS_ADMIN` before release. Only its dedicated post-release UTS status with
+exact `EPERM` can then identify administrative policy; a missing capability,
+different errno, malformed frame, or cleanup uncertainty remains broken. This
+namespace proof does not claim inherited groups are non-authoritative.
+Workload execution remains forbidden until a later outer proof has detached
+the old root, admitted only profile-created or descriptor-selected trees,
+closed every host descriptor above 2, denied namespace/descriptor/IPC escape
+paths, and made the inherited group vector unable to reveal or mutate any
+additional object.
 
 - The mount namespace owns the tmpfs root and private mounts described above.
 - Namespace PID 1 is the reaper and tracer. It launches pytest, forwards the

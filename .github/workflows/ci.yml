@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   linux-capability-evidence:
-    name: Linux bootstrap evidence (stock user-namespace refusal required)
+    name: Linux bootstrap evidence (stock rootless refusal required)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -119,7 +119,7 @@ jobs:
               exit "${probe_exit}"
               ;;
           esac
-      - name: Require the stock-runner namespace refusal
+      - name: Require the exact stock-runner rootless refusal
         shell: bash
         run: |
           set +e
@@ -143,10 +143,10 @@ jobs:
             and .scope.accepts_command == false
             and .scope.execution_authority == false
             and (.refusal | keys == ["cleanup_complete", "code", "errno", "reason", "stage"])
-            and .refusal.code == "user_namespace_unavailable"
-            and .refusal.stage == "clone_namespaces"
+            and .refusal.code == "required_namespace_failed"
+            and .refusal.stage == "child_uts_configuration"
             and .refusal.reason == "administrative_policy"
-            and .refusal.errno == 13
+            and .refusal.errno == 1
             and .refusal.cleanup_complete == true
           ' linux-namespace-bootstrap-report.json > /dev/null
           jq -e '
@@ -158,7 +158,8 @@ jobs:
             linux-capability-report.json > /dev/null
           {
             echo "### Fixed namespace bootstrap"
-            echo "✅ The stock Ubuntu 24.04 runner refused before any workload surface."
+            echo "✅ The stock Ubuntu 24.04 runner refused during the fixed rootless bootstrap before any workload surface."
+            echo "The independent unshare route was denied with EACCES; Again's combined route reached its verified child and UTS capability use was denied with EPERM."
             echo "The diagnostic remains non-qualifying and grants no execution authority."
           } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the hosted Linux capability report

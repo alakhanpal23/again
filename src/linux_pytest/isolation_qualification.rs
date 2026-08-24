@@ -43,6 +43,7 @@ enum IsolationQualificationStageV1 {
     WriteGidMap,
     VerifyGidMap,
     VerifyChildGroups,
+    VerifyChildCapabilities,
     PinChildNamespaces,
     VerifyNamespaceFilesystem,
     VerifyNamespaceType,
@@ -53,6 +54,7 @@ enum IsolationQualificationStageV1 {
     SendControl,
     ReceiveChildProof,
     VerifyChildProof,
+    ChildUtsConfiguration,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -77,6 +79,7 @@ impl IsolationQualificationStageV1 {
             Self::WriteGidMap => "write_gid_map",
             Self::VerifyGidMap => "verify_gid_map",
             Self::VerifyChildGroups => "verify_child_groups",
+            Self::VerifyChildCapabilities => "verify_child_capabilities",
             Self::PinChildNamespaces => "pin_child_namespaces",
             Self::VerifyNamespaceFilesystem => "verify_namespace_filesystem",
             Self::VerifyNamespaceType => "verify_namespace_type",
@@ -87,6 +90,7 @@ impl IsolationQualificationStageV1 {
             Self::SendControl => "send_control",
             Self::ReceiveChildProof => "receive_child_proof",
             Self::VerifyChildProof => "verify_child_proof",
+            Self::ChildUtsConfiguration => "child_uts_configuration",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -230,6 +234,17 @@ impl IsolationQualificationFailureV1 {
     pub(super) const fn is_expected_unavailable(&self) -> bool {
         if !self.cleanup_complete() {
             return false;
+        }
+        if matches!(
+            (self.code, self.stage, self.reason, self.errno),
+            (
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::ChildUtsConfiguration,
+                IsolationQualificationReasonV1::AdministrativePolicy,
+                Some(libc::EPERM),
+            )
+        ) {
+            return true;
         }
         matches!(
             (self.stage, self.reason),
@@ -458,6 +473,7 @@ mod platform {
     const PROOF_STATUS_OS_ERROR_V1: u8 = 1;
     const PROOF_STATUS_INVARIANT_V1: u8 = 2;
     const PROOF_STATUS_PROTOCOL_V1: u8 = 3;
+    const PROOF_STATUS_UTS_CONFIGURATION_V1: u8 = 4;
     const PROOF_FLAGS_V1: u8 = 0b0000_0111;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
@@ -482,6 +498,7 @@ mod platform {
     const NS_GET_NSTYPE_V1: libc::c_ulong = 0xb703;
     const NS_GET_OWNER_UID_V1: libc::c_ulong = 0xb704;
     const CLONE_CLEAR_SIGHAND_V1: u64 = 0x1_0000_0000;
+    const CAP_SYS_ADMIN_MASK_V1: u64 = 1_u64 << 21;
     const HOSTNAME_V1: &[u8] = b"again";
 
     #[repr(C)]
@@ -1041,7 +1058,7 @@ mod platform {
             IsolationQualificationStageV1::VerifyGidMap,
             deadline,
         ));
-        guarded!(verify_child_supplementary_groups(
+        guarded!(verify_child_groups_and_capabilities(
             proc_fd,
             &supplementary_groups,
             deadline,
@@ -2314,9 +2331,9 @@ mod platform {
         failure(RefusalCode::UserNamespaceUnavailable, stage, reason, errno)
     }
 
-    fn verify_child_supplementary_groups(
+    fn verify_child_groups_and_capabilities(
         proc_directory: RawFd,
-        expected: &[u32],
+        expected_groups: &[u32],
         deadline: MonotonicDeadlineV1,
     ) -> Result<(), IsolationQualificationFailureV1> {
         deadline.ensure_open(IsolationQualificationStageV1::VerifyChildGroups)?;
@@ -2330,11 +2347,36 @@ mod platform {
                 )
             })?;
         let observed = parse_status_groups(&status)?;
-        if observed != expected {
+        if observed != expected_groups {
             return Err(failure(
                 RefusalCode::IsolationPreflightFailed,
                 IsolationQualificationStageV1::VerifyChildGroups,
                 IsolationQualificationReasonV1::GroupMismatch,
+                None,
+            ));
+        }
+        deadline.ensure_open(IsolationQualificationStageV1::VerifyChildCapabilities)?;
+        verify_child_sys_admin_capability(&status)?;
+        Ok(())
+    }
+
+    fn verify_child_sys_admin_capability(
+        status: &[u8],
+    ) -> Result<(), IsolationQualificationFailureV1> {
+        let malformed = || {
+            failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::VerifyChildCapabilities,
+                IsolationQualificationReasonV1::MalformedKernelResponse,
+                None,
+            )
+        };
+        let effective = parse_exact_status_hex(status, b"CapEff:").map_err(|_| malformed())?;
+        if effective & CAP_SYS_ADMIN_MASK_V1 == 0 {
+            return Err(failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::VerifyChildCapabilities,
+                IsolationQualificationReasonV1::ChildInvariantFailed,
                 None,
             ));
         }
@@ -2514,12 +2556,31 @@ mod platform {
         }
         let status = frame[FRAME_STATUS_OFFSET_V1];
         let errno = decode_i32(frame, FRAME_ERROR_OFFSET_V1);
+        let identity_is_exact = decode_u32(frame, FRAME_PID_OFFSET_V1) == 1
+            && decode_u32(frame, FRAME_UID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_EUID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_GID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_EGID_OFFSET_V1) == 0;
+        if status == PROOF_STATUS_UTS_CONFIGURATION_V1 {
+            if frame[FRAME_FLAGS_OFFSET_V1] != 0 || errno != libc::EPERM || !identity_is_exact {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::ChildUtsConfiguration,
+                IsolationQualificationReasonV1::AdministrativePolicy,
+                Some(errno),
+            ));
+        }
         if status != PROOF_STATUS_SUCCESS_V1 {
             let reason = match status {
                 PROOF_STATUS_OS_ERROR_V1 | PROOF_STATUS_INVARIANT_V1 => {
                     IsolationQualificationReasonV1::ChildInvariantFailed
                 }
-                PROOF_STATUS_PROTOCOL_V1 => IsolationQualificationReasonV1::ProtocolFrameMismatch,
                 _ => IsolationQualificationReasonV1::ProtocolFrameMismatch,
             };
             return Err(protocol_failure(
@@ -2528,14 +2589,7 @@ mod platform {
                 (errno != 0).then_some(errno),
             ));
         }
-        if frame[FRAME_FLAGS_OFFSET_V1] != PROOF_FLAGS_V1
-            || errno != 0
-            || decode_u32(frame, FRAME_PID_OFFSET_V1) != 1
-            || decode_u32(frame, FRAME_UID_OFFSET_V1) != 0
-            || decode_u32(frame, FRAME_EUID_OFFSET_V1) != 0
-            || decode_u32(frame, FRAME_GID_OFFSET_V1) != 0
-            || decode_u32(frame, FRAME_EGID_OFFSET_V1) != 0
-        {
+        if frame[FRAME_FLAGS_OFFSET_V1] != PROOF_FLAGS_V1 || errno != 0 || !identity_is_exact {
             return Err(protocol_failure(
                 stage,
                 IsolationQualificationReasonV1::ChildInvariantFailed,
@@ -3040,7 +3094,7 @@ mod platform {
             child_fail(
                 report_write,
                 &nonce,
-                PROOF_STATUS_OS_ERROR_V1,
+                PROOF_STATUS_UTS_CONFIGURATION_V1,
                 child_errno(),
                 deadline,
             );
@@ -3049,7 +3103,7 @@ mod platform {
             child_fail(
                 report_write,
                 &nonce,
-                PROOF_STATUS_OS_ERROR_V1,
+                PROOF_STATUS_UTS_CONFIGURATION_V1,
                 child_errno(),
                 deadline,
             );
@@ -3431,6 +3485,44 @@ mod platform {
         }
 
         #[test]
+        fn child_capability_verification_requires_sys_admin_bit() {
+            assert!(
+                verify_child_sys_admin_capability(b"Name:\tagain\nCapEff:\t0000000000200001\n")
+                    .is_ok()
+            );
+
+            let missing = verify_child_sys_admin_capability(b"CapEff:\t00100000\n")
+                .expect_err("wrong capability bit was accepted");
+            assert_eq!(missing.code, RefusalCode::RequiredNamespaceFailed);
+            assert_eq!(
+                (missing.stage, missing.reason),
+                (
+                    IsolationQualificationStageV1::VerifyChildCapabilities,
+                    IsolationQualificationReasonV1::ChildInvariantFailed,
+                )
+            );
+
+            for malformed in [
+                b"Name:\tagain\n".as_slice(),
+                b"CapEff:\t200000 extra\n".as_slice(),
+                b"CapEff:\t10000000000000000\n".as_slice(),
+            ] {
+                let error = match verify_child_sys_admin_capability(malformed) {
+                    Ok(()) => panic!("malformed CapEff row was accepted"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.stage,
+                    IsolationQualificationStageV1::VerifyChildCapabilities
+                );
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::MalformedKernelResponse
+                );
+            }
+        }
+
+        #[test]
         fn ready_frame_commits_phase_nonce_and_reserved_bytes() {
             let nonce = [0x5a_u8; NONCE_BYTES_V1];
             let frame = child_encode_common_frame(READY_MAGIC_V1, PHASE_READY_V1, &nonce);
@@ -3481,6 +3573,7 @@ mod platform {
             for offset in [
                 FRAME_STATUS_OFFSET_V1,
                 FRAME_FLAGS_OFFSET_V1,
+                13,
                 FRAME_PID_OFFSET_V1,
                 FRAME_UID_OFFSET_V1,
                 FRAME_RESERVED_OFFSET_V1,
@@ -3500,6 +3593,56 @@ mod platform {
                 IsolationQualificationReasonV1::ChildInvariantFailed
             );
             assert_eq!(error.errno, Some(libc::EPERM));
+            assert!(!error.is_expected_unavailable());
+
+            let valid_uts =
+                child_encode_proof_frame(&nonce, PROOF_STATUS_UTS_CONFIGURATION_V1, 0, libc::EPERM);
+            let uts_error =
+                verify_proof_frame(&valid_uts, &nonce).expect_err("UTS failure proof was accepted");
+            assert_eq!(
+                (
+                    uts_error.code,
+                    uts_error.stage,
+                    uts_error.reason,
+                    uts_error.errno
+                ),
+                (
+                    RefusalCode::RequiredNamespaceFailed,
+                    IsolationQualificationStageV1::ChildUtsConfiguration,
+                    IsolationQualificationReasonV1::AdministrativePolicy,
+                    Some(libc::EPERM),
+                )
+            );
+            assert!(uts_error.is_expected_unavailable());
+
+            let mut identity = valid_uts;
+            identity[FRAME_PID_OFFSET_V1] = 2;
+            for frame in [
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_UTS_CONFIGURATION_V1,
+                    PROOF_FLAGS_V1,
+                    libc::EPERM,
+                ),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_UTS_CONFIGURATION_V1,
+                    0,
+                    libc::EACCES,
+                ),
+                child_encode_proof_frame(&nonce, 0xff, 0, libc::EPERM),
+                identity,
+            ] {
+                let error = match verify_proof_frame(&frame, &nonce) {
+                    Ok(()) => panic!("noncanonical UTS proof was accepted"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
         }
 
         #[test]

@@ -16,35 +16,49 @@ Normative inputs:
 Stock GitHub-hosted Ubuntu 24.04 cannot be the positive qualification target
 for the rootless profile today.
 
-[Actions run 32687914825](https://github.com/alakhanpal23/again/actions/runs/32687914825)
-(repository authentication required) directly recorded this tuple:
+[Actions run 32784270117](https://github.com/alakhanpal23/again/actions/runs/32784270117)
+(repository authentication required) retained the decisive discovery tuple at
+commit `df68613`:
 
 - runner image `ubuntu24` version `20260816.277.1`;
 - x86_64, kernel `6.17.0-1022-azure`, glibc 2.39;
-- UID/GID 1001 with zero effective, permitted, inheritable, and ambient
+- UID/GID 1001 with zero effective, permitted, inheritable, and ambient host
   capabilities;
-- working `openat2` beneath/magic-link semantics;
-- working `close_range(..., CLOSE_RANGE_UNSHARE)` semantics with a shared FD
-  table;
-- Landlock ABI 7 from the version query, but no functional ruleset test; and
-- `CLONE_NEWUSER` failing with `EACCES`, despite
-  `kernel.unprivileged_userns_clone=1`, because
-  `kernel.apparmor_restrict_unprivileged_userns=1` and the process is
-  AppArmor `unconfined`.
+- working `openat2` beneath/magic-link and
+  `close_range(..., CLOSE_RANGE_UNSHARE)` semantics;
+- Landlock ABI 7 from the version query, but no functional ruleset test;
+- an independent `unshare(CLONE_NEWUSER)` returning `EACCES` while
+  `kernel.unprivileged_userns_clone=1`,
+  `kernel.apparmor_restrict_unprivileged_userns=1`, and the process is
+  AppArmor `unconfined`; and
+- Again's combined `clone3` route creating the child, writing the maps,
+  validating the six namespace descriptors, and reaching its post-release
+  proof, where the older protocol reported only a generic `EPERM`.
 
-Ubuntu 24.04 intentionally restricts user namespaces for unprivileged,
-unconfined applications. Canonical documents either an explicit AppArmor
-profile containing `userns,` or an administrator disabling the restriction:
+That failed run deliberately did not classify the generic `EPERM` as an
+expected refusal: it could not prove which child operation failed. The fixed
+diagnostic now checks effective `CAP_SYS_ADMIN` from the blocked child's pinned
+proc view and assigns one closed proof status only at `sethostname` and
+`setdomainname`. CI may classify only the exact status with `EPERM`, exact
+identity and reserved fields, and completed cleanup as administrative policy.
+Every other shape remains broken. This diagnostic accepts no command and
+grants no execution or profile authority.
+
+Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
+use inside a created namespace for unprivileged applications. Canonical
+background is in the
 [Ubuntu 24.04 release notes](https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions)
 and [AppArmor documentation](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/).
 
 The CI layout should therefore be:
 
-1. Stock `ubuntu-24.04`: a negative lane requiring a pre-exec
-   `user_namespace_unavailable` refusal and proof that Python never ran.
-2. Provisioned `ubuntu-24.04`: a positive integration lane after an
-   administrator installs an AppArmor `userns,` allowance. Again itself still
-   runs as the ordinary runner UID with zero host capabilities.
+1. Stock `ubuntu-24.04`: a negative lane requiring the exact independent
+   `EACCES` plus combined-bootstrap UTS `EPERM` tuple. The fixed diagnostic
+   accepts no command or workload surface.
+2. Provisioned `ubuntu-24.04`: a positive integration lane only after an
+   administrator supplies policy that permits every required user-namespace
+   and namespaced-capability operation. Again itself still runs as the ordinary
+   runner UID with zero host capabilities.
 3. Pinned self-hosted VM/image: release qualification. GitHub GA images update
    weekly, and even a versioned runner label does not pin the image or kernel;
    see the [runner-images policy](https://github.com/actions/runner-images#available-images).
@@ -430,8 +444,8 @@ After every namespace task is gone:
 
 | Failure | Existing reason |
 |---|---|
-| Stock Ubuntu blocks `CLONE_NEWUSER`; UID/GID map fails | `user_namespace_unavailable` |
-| Mount/PID/net/UTS/IPC creation or identity verification fails | `required_namespace_failed` |
+| User-namespace creation or UID/GID-map setup is refused | `user_namespace_unavailable` |
+| Required mount/PID/net/UTS/IPC namespace identity, child capability, or fixed UTS configuration fails | `required_namespace_failed` |
 | tmpfs, descriptor mount, procfs, pivot, or old-root detach fails | `mount_root_failed` |
 | `close_range` is absent or fails | `close_range_unavailable` |
 | Seccomp query, install, TSYNC, or TRACE semantics fail | `seccomp_unavailable` |
@@ -456,8 +470,8 @@ use a refusal rather than inventing an execute-only foreground.
 
 | Area | Fixtures and required oracle |
 |---|---|
-| Stock hosted runner | `ubuntu-24.04`; exact user-namespace refusal and no Python marker |
-| Provisioned hosted runner | AppArmor `userns,`; ordinary UID, zero host caps, complete positive handoff |
+| Stock hosted runner | `ubuntu-24.04`; exact independent `EACCES` plus combined-bootstrap UTS `EPERM`; the fixed diagnostic accepts no command |
+| Provisioned hosted runner | administrator-approved user-namespace and namespaced-capability policy; ordinary UID, zero host caps, complete positive handoff |
 | Path walk | Rename/unlink/recreate, symlink swap, bind crossing, magic link, `..`, non-UTF-8 names; no escape |
 | Destination | Name/symlink replacement at each create/reopen boundary; FD-selected destination remains stable |
 | Reflink | Success plus forced `EOPNOTSUPP`, `ENOTTY`, `EXDEV`, `EINVAL`, `EIO`, and `ENOSPC`; sealed/branch independence |
