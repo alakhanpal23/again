@@ -210,8 +210,11 @@ Runtime qualification and retained evidence are tracked in
 [STATUS.md](STATUS.md). The positive full-flow test remains ignored until both
 source and destination filesystems are functionally qualified for no-atime
 access, so hosted CI is not positive evidence for the qualified full flow.
-Canonical manifest/digest authority and every later isolation step in this
-note remain research requirements.
+The production-shaped charged compiler can now construct exact canonical tree
+data from a verifier-minted S1/D2 projection, but the connector does not yet
+carry that data through publication. Published-child binding, canonical
+manifest authority, and every later isolation step in this note remain
+research requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`
@@ -255,11 +258,13 @@ Only the opaque published directory capability leaves that operation. It
 grants no canonical manifest or digest, content-addressed name, execution,
 Python, isolation, or reuse authority.
 
-A complete backend must still construct and authenticate the canonical
-manifest and digest, bind them to a content-addressed immutable name, and mint
-the later isolation/execution authorities. The malicious same-UID and
-host-root threat boundary also remains open. The logical source mode remains
-in the future manifest and is restored only on the private execution branch.
+A complete backend must still carry the compiler's canonical tree evidence
+through publication, bind and authenticate it against the reopened immutable
+child, construct the full snapshot manifest and digest, choose a
+content-addressed name, and mint the later isolation/execution authorities.
+The malicious same-UID and host-root threat boundary also remains open. The
+logical source mode remains in the future manifest and is restored only on the
+private execution branch.
 
 The per-run branch uses the same verified reflink/sparse-copy algorithm from
 sealed input. Branch writes must not change either sealed input or the host

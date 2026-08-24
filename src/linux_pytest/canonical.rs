@@ -118,6 +118,180 @@ impl<E> From<LinuxPytestContractError> for ManifestCanonicalWriteErrorV1<E> {
     }
 }
 
+/// Borrowed metadata projection for allocation-free manifest hashing and
+/// canonical writing. Construction grants no validation or snapshot
+/// authority; callers must retain the owners behind every borrowed slice.
+#[derive(Clone, Copy)]
+pub(super) struct ManifestMetadataProjectionV1<'value> {
+    mode: u32,
+    logical_uid: u32,
+    logical_gid: u32,
+    size: u64,
+    nlink: u64,
+    atime: &'value TimespecV1,
+    mtime: &'value TimespecV1,
+    ctime: &'value TimespecV1,
+    btime: Option<&'value TimespecV1>,
+    xattrs: &'value [XattrV1],
+}
+
+impl<'value> ManifestMetadataProjectionV1<'value> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) const fn new(
+        mode: u32,
+        logical_uid: u32,
+        logical_gid: u32,
+        size: u64,
+        nlink: u64,
+        atime: &'value TimespecV1,
+        mtime: &'value TimespecV1,
+        ctime: &'value TimespecV1,
+        btime: Option<&'value TimespecV1>,
+        xattrs: &'value [XattrV1],
+    ) -> Self {
+        Self {
+            mode,
+            logical_uid,
+            logical_gid,
+            size,
+            nlink,
+            atime,
+            mtime,
+            ctime,
+            btime,
+            xattrs,
+        }
+    }
+}
+
+impl<'value> From<&'value MetadataV1> for ManifestMetadataProjectionV1<'value> {
+    fn from(value: &'value MetadataV1) -> Self {
+        Self::new(
+            value.mode,
+            value.logical_uid,
+            value.logical_gid,
+            value.size,
+            value.nlink,
+            &value.atime,
+            &value.mtime,
+            &value.ctime,
+            value.btime.as_ref(),
+            &value.xattrs,
+        )
+    }
+}
+
+/// Borrowed payload projection matching the frozen manifest variants without
+/// requiring their owning `Vec` containers.
+#[derive(Clone, Copy)]
+pub(super) enum ManifestPayloadProjectionV1<'value> {
+    Directory {
+        children: &'value [ChildCommitmentV1],
+    },
+    Regular {
+        content_digest: FileContentDigest,
+        data_extents: &'value [ExtentV1],
+    },
+    Symlink {
+        target: &'value [u8],
+    },
+    ExternalTree {
+        tree_role: TreeRoleV1,
+        target_root: NodeDigest,
+        readonly: bool,
+    },
+}
+
+impl ManifestPayloadProjectionV1<'_> {
+    const fn kind(self) -> ManifestEntryKindV1 {
+        match self {
+            Self::Directory { .. } => ManifestEntryKindV1::Directory,
+            Self::Regular { .. } => ManifestEntryKindV1::Regular,
+            Self::Symlink { .. } => ManifestEntryKindV1::Symlink,
+            Self::ExternalTree { .. } => ManifestEntryKindV1::ExternalTree,
+        }
+    }
+}
+
+impl<'value> From<&'value ManifestPayloadV1> for ManifestPayloadProjectionV1<'value> {
+    fn from(value: &'value ManifestPayloadV1) -> Self {
+        match value {
+            ManifestPayloadV1::Directory { children } => Self::Directory { children },
+            ManifestPayloadV1::Regular {
+                content_digest,
+                data_extents,
+            } => Self::Regular {
+                content_digest: *content_digest,
+                data_extents,
+            },
+            ManifestPayloadV1::Symlink { target } => Self::Symlink { target },
+            ManifestPayloadV1::ExternalTree {
+                tree_role,
+                target_root,
+                readonly,
+            } => Self::ExternalTree {
+                tree_role: *tree_role,
+                target_root: *target_root,
+                readonly: *readonly,
+            },
+        }
+    }
+}
+
+/// One borrowed entry view supplied by either the frozen manifest type or a
+/// charged compiler-owned projection.
+#[derive(Clone, Copy)]
+pub(super) struct ManifestEntryProjectionViewV1<'value> {
+    relative_path: &'value [u8],
+    metadata: ManifestMetadataProjectionV1<'value>,
+    payload: ManifestPayloadProjectionV1<'value>,
+    hardlink_group: Option<HardlinkGroupDigest>,
+    node_digest: NodeDigest,
+}
+
+impl<'value> ManifestEntryProjectionViewV1<'value> {
+    pub(super) const fn new(
+        relative_path: &'value [u8],
+        metadata: ManifestMetadataProjectionV1<'value>,
+        payload: ManifestPayloadProjectionV1<'value>,
+        hardlink_group: Option<HardlinkGroupDigest>,
+        node_digest: NodeDigest,
+    ) -> Self {
+        Self {
+            relative_path,
+            metadata,
+            payload,
+            hardlink_group,
+            node_digest,
+        }
+    }
+}
+
+/// Private, audited adapter used only by the frozen owning manifest type.
+/// Public projection entry points accept immutable view slices directly and
+/// never depend on a caller-provided replayable trait implementation.
+trait ManifestEntryProjectionV1 {
+    fn manifest_entry_projection_v1(&self) -> ManifestEntryProjectionViewV1<'_>;
+}
+
+impl ManifestEntryProjectionV1 for ManifestEntryV1 {
+    fn manifest_entry_projection_v1(&self) -> ManifestEntryProjectionViewV1<'_> {
+        ManifestEntryProjectionViewV1::new(
+            &self.relative_path,
+            (&self.metadata).into(),
+            (&self.payload).into(),
+            self.hardlink_group,
+            self.node_digest,
+        )
+    }
+}
+
+impl ManifestEntryProjectionV1 for ManifestEntryProjectionViewV1<'_> {
+    fn manifest_entry_projection_v1(&self) -> ManifestEntryProjectionViewV1<'_> {
+        *self
+    }
+}
+
 struct ManifestCanonicalWriterV1<'sink, S> {
     sink: &'sink mut S,
     written: usize,
@@ -2068,12 +2242,12 @@ fn manifest_xattr_list_canonical_length(
     )
 }
 
-fn manifest_metadata_canonical_length(
-    value: &MetadataV1,
+fn manifest_metadata_projection_canonical_length(
+    value: ManifestMetadataProjectionV1<'_>,
 ) -> Result<usize, LinuxPytestContractError> {
     let timespec = manifest_timespec_canonical_length()?;
-    let btime = checked_canonical_optional_length(value.btime.as_ref().map(|_| timespec))?;
-    let xattrs = manifest_xattr_list_canonical_length(&value.xattrs)?;
+    let btime = checked_canonical_optional_length(value.btime.map(|_| timespec))?;
+    let xattrs = manifest_xattr_list_canonical_length(value.xattrs)?;
     checked_canonical_object_length(&[
         std::mem::size_of::<u32>(),
         std::mem::size_of::<u32>(),
@@ -2086,6 +2260,12 @@ fn manifest_metadata_canonical_length(
         btime,
         xattrs,
     ])
+}
+
+fn manifest_metadata_canonical_length(
+    value: &MetadataV1,
+) -> Result<usize, LinuxPytestContractError> {
+    manifest_metadata_projection_canonical_length(value.into())
 }
 
 fn manifest_extent_canonical_length() -> Result<usize, LinuxPytestContractError> {
@@ -2115,15 +2295,15 @@ fn manifest_child_list_canonical_length(
     )
 }
 
-fn manifest_payload_canonical_length(
-    value: &ManifestPayloadV1,
+fn manifest_payload_projection_canonical_length(
+    value: ManifestPayloadProjectionV1<'_>,
 ) -> Result<usize, LinuxPytestContractError> {
     match value {
-        ManifestPayloadV1::Directory { children } => checked_canonical_enum_length(
+        ManifestPayloadProjectionV1::Directory { children } => checked_canonical_enum_length(
             ManifestEntryKindV1::Directory as u16,
             &[manifest_child_list_canonical_length(children)?],
         ),
-        ManifestPayloadV1::Regular {
+        ManifestPayloadProjectionV1::Regular {
             content_digest,
             data_extents,
         } => checked_canonical_enum_length(
@@ -2133,17 +2313,17 @@ fn manifest_payload_canonical_length(
                 manifest_extent_list_canonical_length(data_extents)?,
             ],
         ),
-        ManifestPayloadV1::Symlink { target } => {
+        ManifestPayloadProjectionV1::Symlink { target } => {
             checked_canonical_enum_length(ManifestEntryKindV1::Symlink as u16, &[target.len()])
         }
-        ManifestPayloadV1::ExternalTree {
+        ManifestPayloadProjectionV1::ExternalTree {
             tree_role,
             target_root,
             ..
         } => checked_canonical_enum_length(
             ManifestEntryKindV1::ExternalTree as u16,
             &[
-                checked_canonical_enum_length(*tree_role as u16, &[])?,
+                checked_canonical_enum_length(tree_role as u16, &[])?,
                 target_root.as_bytes().len(),
                 std::mem::size_of::<u8>(),
             ],
@@ -2151,12 +2331,19 @@ fn manifest_payload_canonical_length(
     }
 }
 
-fn manifest_entry_canonical_length(
-    value: &ManifestEntryV1,
+#[cfg(test)]
+fn manifest_payload_canonical_length(
+    value: &ManifestPayloadV1,
+) -> Result<usize, LinuxPytestContractError> {
+    manifest_payload_projection_canonical_length(value.into())
+}
+
+fn manifest_entry_projection_canonical_length(
+    value: ManifestEntryProjectionViewV1<'_>,
 ) -> Result<usize, LinuxPytestContractError> {
     let kind = checked_canonical_enum_length(value.payload.kind() as u16, &[])?;
-    let metadata = manifest_metadata_canonical_length(&value.metadata)?;
-    let payload = manifest_payload_canonical_length(&value.payload)?;
+    let metadata = manifest_metadata_projection_canonical_length(value.metadata)?;
+    let payload = manifest_payload_projection_canonical_length(value.payload)?;
     let hardlink = checked_canonical_optional_length(
         value
             .hardlink_group
@@ -2173,13 +2360,44 @@ fn manifest_entry_canonical_length(
     ])
 }
 
-fn manifest_entry_list_canonical_length(
-    values: &[ManifestEntryV1],
+#[cfg(test)]
+fn manifest_entry_canonical_length(
+    value: &ManifestEntryV1,
 ) -> Result<usize, LinuxPytestContractError> {
+    manifest_entry_projection_canonical_length(value.manifest_entry_projection_v1())
+}
+
+fn manifest_entry_projection_list_canonical_length<E>(
+    values: &[E],
+) -> Result<usize, LinuxPytestContractError>
+where
+    E: ManifestEntryProjectionV1,
+{
     checked_canonical_list_length(
         values.len(),
-        values.iter().map(manifest_entry_canonical_length),
+        values.iter().map(|value| {
+            manifest_entry_projection_canonical_length(value.manifest_entry_projection_v1())
+        }),
     )
+}
+
+/// Exact canonical length for a borrowed tree projection. This validates only
+/// canonical framing and collection bounds; semantic admission remains the
+/// charged compiler's responsibility.
+pub(super) fn checked_tree_manifest_projection_canonical_length_v1(
+    mount_path: &[u8],
+    tree_role: TreeRoleV1,
+    entries: &[ManifestEntryProjectionViewV1<'_>],
+    root_digest: NodeDigest,
+) -> Result<usize, LinuxPytestContractError> {
+    let role = checked_canonical_enum_length(tree_role as u16, &[])?;
+    let entries = manifest_entry_projection_list_canonical_length(entries)?;
+    checked_canonical_object_length(&[
+        mount_path.len(),
+        role,
+        entries,
+        root_digest.as_bytes().len(),
+    ])
 }
 
 /// Exact byte length of the frozen nested `TreeManifestV1` canonical object.
@@ -2190,7 +2408,7 @@ pub(super) fn checked_tree_manifest_canonical_length_v1(
     value: &TreeManifestV1,
 ) -> Result<usize, LinuxPytestContractError> {
     let role = checked_canonical_enum_length(value.tree_role as u16, &[])?;
-    let entries = manifest_entry_list_canonical_length(&value.entries)?;
+    let entries = manifest_entry_projection_list_canonical_length(&value.entries)?;
     checked_canonical_object_length(&[
         value.mount_path.as_bytes().len(),
         role,
@@ -2243,16 +2461,16 @@ where
     Ok(())
 }
 
-fn write_manifest_metadata<S>(
+fn write_manifest_metadata_projection<S>(
     writer: &mut ManifestCanonicalWriterV1<'_, S>,
-    value: &MetadataV1,
+    value: ManifestMetadataProjectionV1<'_>,
 ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
 where
     S: ManifestCanonicalByteSinkV1,
 {
     let timespec = manifest_timespec_canonical_length()?;
-    let btime = checked_canonical_optional_length(value.btime.as_ref().map(|_| timespec))?;
-    let xattrs = manifest_xattr_list_canonical_length(&value.xattrs)?;
+    let btime = checked_canonical_optional_length(value.btime.map(|_| timespec))?;
+    let xattrs = manifest_xattr_list_canonical_length(value.xattrs)?;
 
     writer.object_header(TYPE_METADATA, 10)?;
     writer.field_header(1, WireType::U32, std::mem::size_of::<u32>())?;
@@ -2266,13 +2484,13 @@ where
     writer.field_header(5, WireType::U64, std::mem::size_of::<u64>())?;
     writer.bytes(&value.nlink.to_be_bytes())?;
     writer.field_header(6, WireType::Object, timespec)?;
-    write_manifest_timespec(writer, &value.atime)?;
+    write_manifest_timespec(writer, value.atime)?;
     writer.field_header(7, WireType::Object, timespec)?;
-    write_manifest_timespec(writer, &value.mtime)?;
+    write_manifest_timespec(writer, value.mtime)?;
     writer.field_header(8, WireType::Object, timespec)?;
-    write_manifest_timespec(writer, &value.ctime)?;
+    write_manifest_timespec(writer, value.ctime)?;
     writer.field_header(9, WireType::Optional, btime)?;
-    match &value.btime {
+    match value.btime {
         None => writer.bytes(&[0])?,
         Some(value) => {
             writer.bytes(&[1])?;
@@ -2285,7 +2503,17 @@ where
         }
     }
     writer.field_header(10, WireType::List, xattrs)?;
-    write_manifest_xattr_list(writer, &value.xattrs)
+    write_manifest_xattr_list(writer, value.xattrs)
+}
+
+fn write_manifest_metadata<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: &MetadataV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    write_manifest_metadata_projection(writer, value.into())
 }
 
 fn write_manifest_extent<S>(
@@ -2351,21 +2579,21 @@ where
     Ok(())
 }
 
-fn write_manifest_payload<S>(
+fn write_manifest_payload_projection<S>(
     writer: &mut ManifestCanonicalWriterV1<'_, S>,
-    value: &ManifestPayloadV1,
+    value: ManifestPayloadProjectionV1<'_>,
 ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
 where
     S: ManifestCanonicalByteSinkV1,
 {
     match value {
-        ManifestPayloadV1::Directory { children } => {
+        ManifestPayloadProjectionV1::Directory { children } => {
             let children_length = manifest_child_list_canonical_length(children)?;
             writer.enum_header(ManifestEntryKindV1::Directory as u16, 1)?;
             writer.field_header(1, WireType::List, children_length)?;
             write_manifest_child_list(writer, children)
         }
-        ManifestPayloadV1::Regular {
+        ManifestPayloadProjectionV1::Regular {
             content_digest,
             data_extents,
         } => {
@@ -2376,38 +2604,49 @@ where
             writer.field_header(2, WireType::List, extents_length)?;
             write_manifest_extent_list(writer, data_extents)
         }
-        ManifestPayloadV1::Symlink { target } => {
+        ManifestPayloadProjectionV1::Symlink { target } => {
             writer.enum_header(ManifestEntryKindV1::Symlink as u16, 1)?;
             writer.field_header(1, WireType::Bytes, target.len())?;
             writer.bytes(target)
         }
-        ManifestPayloadV1::ExternalTree {
+        ManifestPayloadProjectionV1::ExternalTree {
             tree_role,
             target_root,
             readonly,
         } => {
-            let role = checked_canonical_enum_length(*tree_role as u16, &[])?;
+            let role = checked_canonical_enum_length(tree_role as u16, &[])?;
             writer.enum_header(ManifestEntryKindV1::ExternalTree as u16, 3)?;
             writer.field_header(1, WireType::Enum, role)?;
-            writer.enum_header(*tree_role as u16, 0)?;
+            writer.enum_header(tree_role as u16, 0)?;
             writer.field_header(2, WireType::Bytes, target_root.as_bytes().len())?;
             writer.bytes(target_root.as_bytes())?;
             writer.field_header(3, WireType::Bool, std::mem::size_of::<u8>())?;
-            writer.bytes(&[u8::from(*readonly)])
+            writer.bytes(&[u8::from(readonly)])
         }
     }
 }
 
-fn write_manifest_entry<S>(
+#[cfg(test)]
+fn write_manifest_payload<S>(
     writer: &mut ManifestCanonicalWriterV1<'_, S>,
-    value: &ManifestEntryV1,
+    value: &ManifestPayloadV1,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    write_manifest_payload_projection(writer, value.into())
+}
+
+fn write_manifest_entry_projection<S>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    value: ManifestEntryProjectionViewV1<'_>,
 ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
 where
     S: ManifestCanonicalByteSinkV1,
 {
     let kind = checked_canonical_enum_length(value.payload.kind() as u16, &[])?;
-    let metadata = manifest_metadata_canonical_length(&value.metadata)?;
-    let payload = manifest_payload_canonical_length(&value.payload)?;
+    let metadata = manifest_metadata_projection_canonical_length(value.metadata)?;
+    let payload = manifest_payload_projection_canonical_length(value.payload)?;
     let hardlink = checked_canonical_optional_length(
         value
             .hardlink_group
@@ -2417,15 +2656,15 @@ where
 
     writer.object_header(TYPE_MANIFEST_ENTRY, 6)?;
     writer.field_header(1, WireType::Bytes, value.relative_path.len())?;
-    writer.bytes(&value.relative_path)?;
+    writer.bytes(value.relative_path)?;
     writer.field_header(2, WireType::Enum, kind)?;
     writer.enum_header(value.payload.kind() as u16, 0)?;
     writer.field_header(3, WireType::Object, metadata)?;
-    write_manifest_metadata(writer, &value.metadata)?;
+    write_manifest_metadata_projection(writer, value.metadata)?;
     writer.field_header(4, WireType::Enum, payload)?;
-    write_manifest_payload(writer, &value.payload)?;
+    write_manifest_payload_projection(writer, value.payload)?;
     writer.field_header(5, WireType::Optional, hardlink)?;
-    match &value.hardlink_group {
+    match value.hardlink_group {
         None => writer.bytes(&[0])?,
         Some(digest) => {
             writer.bytes(&[1])?;
@@ -2441,20 +2680,57 @@ where
     writer.bytes(value.node_digest.as_bytes())
 }
 
-fn write_manifest_entry_list<S>(
+#[cfg(test)]
+fn write_manifest_entry<S>(
     writer: &mut ManifestCanonicalWriterV1<'_, S>,
-    values: &[ManifestEntryV1],
+    value: &ManifestEntryV1,
 ) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
 where
     S: ManifestCanonicalByteSinkV1,
 {
+    write_manifest_entry_projection(writer, value.manifest_entry_projection_v1())
+}
+
+fn write_manifest_entry_projection_list<S, E>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    values: &[E],
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+    E: ManifestEntryProjectionV1,
+{
     writer.list_header(values.len())?;
     for value in values {
-        let length = manifest_entry_canonical_length(value)?;
+        let value = value.manifest_entry_projection_v1();
+        let length = manifest_entry_projection_canonical_length(value)?;
         writer.list_item_header(length)?;
-        write_manifest_entry(writer, value)?;
+        write_manifest_entry_projection(writer, value)?;
     }
     Ok(())
+}
+
+fn write_tree_manifest_projection_canonical_inner<S, E>(
+    writer: &mut ManifestCanonicalWriterV1<'_, S>,
+    mount_path: &[u8],
+    tree_role: TreeRoleV1,
+    entries: &[E],
+    root_digest: NodeDigest,
+) -> Result<(), ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+    E: ManifestEntryProjectionV1,
+{
+    let role = checked_canonical_enum_length(tree_role as u16, &[])?;
+    let entries_length = manifest_entry_projection_list_canonical_length(entries)?;
+    writer.object_header(TYPE_TREE_MANIFEST, 4)?;
+    writer.field_header(1, WireType::Bytes, mount_path.len())?;
+    writer.bytes(mount_path)?;
+    writer.field_header(2, WireType::Enum, role)?;
+    writer.enum_header(tree_role as u16, 0)?;
+    writer.field_header(3, WireType::List, entries_length)?;
+    write_manifest_entry_projection_list(writer, entries)?;
+    writer.field_header(4, WireType::Bytes, root_digest.as_bytes().len())?;
+    writer.bytes(root_digest.as_bytes())
 }
 
 fn write_tree_manifest_canonical_inner<S>(
@@ -2464,22 +2740,51 @@ fn write_tree_manifest_canonical_inner<S>(
 where
     S: ManifestCanonicalByteSinkV1,
 {
-    let role = checked_canonical_enum_length(value.tree_role as u16, &[])?;
-    let entries = manifest_entry_list_canonical_length(&value.entries)?;
-    writer.object_header(TYPE_TREE_MANIFEST, 4)?;
-    writer.field_header(1, WireType::Bytes, value.mount_path.as_bytes().len())?;
-    writer.bytes(value.mount_path.as_bytes())?;
-    writer.field_header(2, WireType::Enum, role)?;
-    writer.enum_header(value.tree_role as u16, 0)?;
-    writer.field_header(3, WireType::List, entries)?;
-    write_manifest_entry_list(writer, &value.entries)?;
-    writer.field_header(4, WireType::Bytes, value.root_digest.as_bytes().len())?;
-    writer.bytes(value.root_digest.as_bytes())
+    write_tree_manifest_projection_canonical_inner(
+        writer,
+        value.mount_path.as_bytes(),
+        value.tree_role,
+        &value.entries,
+        value.root_digest,
+    )
+}
+
+/// Write a borrowed tree projection directly into a bounded caller-owned
+/// sink without materializing the frozen owning structs.
+pub(super) fn write_tree_manifest_projection_canonical_v1<S>(
+    mount_path: &[u8],
+    tree_role: TreeRoleV1,
+    entries: &[ManifestEntryProjectionViewV1<'_>],
+    root_digest: NodeDigest,
+    sink: &mut S,
+) -> Result<usize, ManifestCanonicalWriteErrorV1<S::Error>>
+where
+    S: ManifestCanonicalByteSinkV1,
+{
+    let length = checked_tree_manifest_projection_canonical_length_v1(
+        mount_path,
+        tree_role,
+        entries,
+        root_digest,
+    )?;
+    let mut writer = ManifestCanonicalWriterV1::new(sink);
+    write_tree_manifest_projection_canonical_inner(
+        &mut writer,
+        mount_path,
+        tree_role,
+        entries,
+        root_digest,
+    )?;
+    if writer.written() != length {
+        return Err(LinuxPytestContractError::CanonicalEncoding.into());
+    }
+    Ok(writer.written())
 }
 
 /// Write the frozen nested tree-manifest object directly into a caller-owned
 /// bounded sink. No intermediate canonical `Vec` or nested payload allocation
 /// is created. The exact total length is checked before the first sink write.
+#[cfg(test)]
 pub(super) fn write_tree_manifest_canonical_v1<S>(
     value: &TreeManifestV1,
     sink: &mut S,
@@ -2581,13 +2886,13 @@ fn write_optional_hardlink_digest(
     }
 }
 
-fn write_manifest_metadata_to_hasher(
+fn write_manifest_metadata_projection_to_hasher(
     hasher: &mut blake3::Hasher,
-    value: &MetadataV1,
+    value: ManifestMetadataProjectionV1<'_>,
 ) -> Result<(), LinuxPytestContractError> {
     let mut sink = ManifestCanonicalHasherSinkV1 { hasher };
     let mut writer = ManifestCanonicalWriterV1::new(&mut sink);
-    map_infallible_manifest_write(write_manifest_metadata(&mut writer, value))
+    map_infallible_manifest_write(write_manifest_metadata_projection(&mut writer, value))
 }
 
 fn write_manifest_children_to_hasher(
@@ -2608,31 +2913,31 @@ fn write_manifest_extents_to_hasher(
     map_infallible_manifest_write(write_manifest_extent_list(&mut writer, values))
 }
 
-/// Allocation-free equivalent of the frozen manifest node digest framing.
-pub(super) fn derive_manifest_node_digest_streaming_v1(
-    metadata: &MetadataV1,
-    payload: &ManifestPayloadV1,
+/// Allocation-free manifest node digest over borrowed projection views.
+pub(super) fn derive_manifest_node_digest_projection_streaming_v1(
+    metadata: ManifestMetadataProjectionV1<'_>,
+    payload: ManifestPayloadProjectionV1<'_>,
     hardlink_group: Option<&HardlinkGroupDigest>,
 ) -> Result<NodeDigest, LinuxPytestContractError> {
-    let metadata_length = manifest_metadata_canonical_length(metadata)?;
+    let metadata_length = manifest_metadata_projection_canonical_length(metadata)?;
     let field_count = match payload {
-        ManifestPayloadV1::Directory { .. } => 2,
-        ManifestPayloadV1::Regular { .. } => 4,
-        ManifestPayloadV1::Symlink { .. } => 3,
-        ManifestPayloadV1::ExternalTree { .. } => 4,
+        ManifestPayloadProjectionV1::Directory { .. } => 2,
+        ManifestPayloadProjectionV1::Regular { .. } => 4,
+        ManifestPayloadProjectionV1::Symlink { .. } => 3,
+        ManifestPayloadProjectionV1::ExternalTree { .. } => 4,
     };
     let domain = match payload {
-        ManifestPayloadV1::Directory { .. } => DIRECTORY_NODE_DOMAIN,
-        ManifestPayloadV1::Regular { .. } => REGULAR_NODE_DOMAIN,
-        ManifestPayloadV1::Symlink { .. } => SYMLINK_NODE_DOMAIN,
-        ManifestPayloadV1::ExternalTree { .. } => EXTERNAL_TREE_NODE_DOMAIN,
+        ManifestPayloadProjectionV1::Directory { .. } => DIRECTORY_NODE_DOMAIN,
+        ManifestPayloadProjectionV1::Regular { .. } => REGULAR_NODE_DOMAIN,
+        ManifestPayloadProjectionV1::Symlink { .. } => SYMLINK_NODE_DOMAIN,
+        ManifestPayloadProjectionV1::ExternalTree { .. } => EXTERNAL_TREE_NODE_DOMAIN,
     };
     let mut digest = ManifestTaggedDigestV1::new(domain, field_count);
     digest.field_header(1, metadata_length)?;
-    write_manifest_metadata_to_hasher(&mut digest.hasher, metadata)?;
+    write_manifest_metadata_projection_to_hasher(&mut digest.hasher, metadata)?;
 
     match payload {
-        ManifestPayloadV1::Directory { children } => {
+        ManifestPayloadProjectionV1::Directory { children } => {
             if hardlink_group.is_some() {
                 return Err(LinuxPytestContractError::MalformedManifest);
             }
@@ -2640,7 +2945,7 @@ pub(super) fn derive_manifest_node_digest_streaming_v1(
             digest.field_header(2, children_length)?;
             write_manifest_children_to_hasher(&mut digest.hasher, children)?;
         }
-        ManifestPayloadV1::Regular {
+        ManifestPayloadProjectionV1::Regular {
             content_digest,
             data_extents,
         } => {
@@ -2653,23 +2958,23 @@ pub(super) fn derive_manifest_node_digest_streaming_v1(
             digest.field_header(4, hardlink_length)?;
             write_optional_hardlink_digest(&mut digest, hardlink_group);
         }
-        ManifestPayloadV1::Symlink { target } => {
+        ManifestPayloadProjectionV1::Symlink { target } => {
             digest.field_header(2, target.len())?;
             digest.bytes(target);
             let hardlink_length = if hardlink_group.is_some() { 41 } else { 1 };
             digest.field_header(3, hardlink_length)?;
             write_optional_hardlink_digest(&mut digest, hardlink_group);
         }
-        ManifestPayloadV1::ExternalTree {
+        ManifestPayloadProjectionV1::ExternalTree {
             tree_role,
             target_root,
             readonly,
         } => {
-            if !readonly || *tree_role != TreeRoleV1::Runtime || hardlink_group.is_some() {
+            if !readonly || tree_role != TreeRoleV1::Runtime || hardlink_group.is_some() {
                 return Err(LinuxPytestContractError::MalformedManifest);
             }
             digest.field_header(2, std::mem::size_of::<u16>())?;
-            digest.bytes(&(*tree_role as u16).to_be_bytes());
+            digest.bytes(&(tree_role as u16).to_be_bytes());
             digest.field_header(3, target_root.as_bytes().len())?;
             digest.bytes(target_root.as_bytes());
             digest.field_header(4, 1)?;
@@ -2677,6 +2982,20 @@ pub(super) fn derive_manifest_node_digest_streaming_v1(
         }
     }
     Ok(NodeDigest(digest.finish()?))
+}
+
+/// Allocation-free equivalent of the frozen owning manifest node digest.
+#[cfg(test)]
+pub(super) fn derive_manifest_node_digest_streaming_v1(
+    metadata: &MetadataV1,
+    payload: &ManifestPayloadV1,
+    hardlink_group: Option<&HardlinkGroupDigest>,
+) -> Result<NodeDigest, LinuxPytestContractError> {
+    derive_manifest_node_digest_projection_streaming_v1(
+        metadata.into(),
+        payload.into(),
+        hardlink_group,
+    )
 }
 
 fn manifest_raw_path_list_canonical_length(
@@ -2702,12 +3021,15 @@ fn write_manifest_raw_path_list_to_hasher(
     map_infallible_manifest_write(result)
 }
 
-/// Allocation-free equivalent of hashing the canonical sorted hard-link path
-/// list as the sole framed digest field.
+/// Hash a stable slice of canonical hard-link member paths without allocating.
 pub(super) fn derive_hardlink_group_digest_streaming_v1(
     values: &[&[u8]],
 ) -> Result<HardlinkGroupDigest, LinuxPytestContractError> {
-    if values.len() < 2 || values.windows(2).any(|pair| pair[0] >= pair[1]) {
+    canonical_collection_count(values.len())?;
+    if values.len() < 2 {
+        return Err(LinuxPytestContractError::MalformedManifest);
+    }
+    if values.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(LinuxPytestContractError::MalformedManifest);
     }
     let paths_length = manifest_raw_path_list_canonical_length(values)?;
@@ -3401,6 +3723,116 @@ mod tests {
         tree
     }
 
+    fn test_metadata_projection(value: &MetadataV1) -> ManifestMetadataProjectionV1<'_> {
+        ManifestMetadataProjectionV1::new(
+            value.mode,
+            value.logical_uid,
+            value.logical_gid,
+            value.size,
+            value.nlink,
+            &value.atime,
+            &value.mtime,
+            &value.ctime,
+            value.btime.as_ref(),
+            &value.xattrs,
+        )
+    }
+
+    fn test_payload_projection(value: &ManifestPayloadV1) -> ManifestPayloadProjectionV1<'_> {
+        match value {
+            ManifestPayloadV1::Directory { children } => {
+                ManifestPayloadProjectionV1::Directory { children }
+            }
+            ManifestPayloadV1::Regular {
+                content_digest,
+                data_extents,
+            } => ManifestPayloadProjectionV1::Regular {
+                content_digest: *content_digest,
+                data_extents,
+            },
+            ManifestPayloadV1::Symlink { target } => {
+                ManifestPayloadProjectionV1::Symlink { target }
+            }
+            ManifestPayloadV1::ExternalTree {
+                tree_role,
+                target_root,
+                readonly,
+            } => ManifestPayloadProjectionV1::ExternalTree {
+                tree_role: *tree_role,
+                target_root: *target_root,
+                readonly: *readonly,
+            },
+        }
+    }
+
+    fn test_entry_projection(value: &ManifestEntryV1) -> ManifestEntryProjectionViewV1<'_> {
+        ManifestEntryProjectionViewV1::new(
+            &value.relative_path,
+            test_metadata_projection(&value.metadata),
+            test_payload_projection(&value.payload),
+            value.hardlink_group,
+            value.node_digest,
+        )
+    }
+
+    fn every_payload_tree() -> TreeManifestV1 {
+        let child = ChildCommitmentV1 {
+            name: b"child-\xff".to_vec(),
+            kind: ManifestEntryKindV1::Regular,
+            node_digest: NodeDigest::derive(REGULAR_NODE_DOMAIN, &[b"child"]),
+        };
+        let hardlink = HardlinkGroupDigest::derive(HARDLINK_GROUP_DOMAIN, &[b"test-group"]);
+        let payloads = [
+            ManifestPayloadV1::Directory {
+                children: vec![child],
+            },
+            ManifestPayloadV1::Regular {
+                content_digest: FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[b"contents"]),
+                data_extents: vec![ExtentV1 {
+                    offset: 3,
+                    length: 5,
+                }],
+            },
+            ManifestPayloadV1::Symlink {
+                target: b"../raw-\xff".to_vec(),
+            },
+            ManifestPayloadV1::ExternalTree {
+                tree_role: TreeRoleV1::Runtime,
+                target_root: NodeDigest::derive(RUNTIME_MERKLE_DOMAIN, &[b"runtime"]),
+                readonly: true,
+            },
+        ];
+        let entries = payloads
+            .into_iter()
+            .enumerate()
+            .map(|(index, payload)| ManifestEntryV1 {
+                relative_path: format!("entry-{index}").into_bytes(),
+                metadata: sample_metadata(
+                    match payload.kind() {
+                        ManifestEntryKindV1::Directory | ManifestEntryKindV1::ExternalTree => {
+                            0o040_555
+                        }
+                        ManifestEntryKindV1::Regular => 0o100_555,
+                        ManifestEntryKindV1::Symlink => 0o120_555,
+                    },
+                    u64::try_from(index).expect("small fixture index"),
+                    if index == 2 { 2 } else { 1 },
+                    index % 2 == 0,
+                ),
+                hardlink_group: (index == 2).then_some(hardlink),
+                node_digest: NodeDigest::derive(REGULAR_NODE_DOMAIN, &[&[index as u8]]),
+                payload,
+            })
+            .collect::<Vec<_>>();
+        TreeManifestV1 {
+            mount_path: SandboxPath::new(Box::<[u8]>::from(b"/projection".as_slice()))
+                .expect("fixture path"),
+            tree_role: TreeRoleV1::Workspace,
+            root_digest: entries[0].node_digest,
+            entries,
+        }
+    }
+
     fn encode_payload_with_streaming_writer(
         value: &ManifestPayloadV1,
     ) -> Result<Vec<u8>, LinuxPytestContractError> {
@@ -3576,6 +4008,64 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_tree_projection_matches_every_frozen_payload_and_capacity_boundary() {
+        let tree = every_payload_tree();
+        let entry_views = tree
+            .entries
+            .iter()
+            .map(test_entry_projection)
+            .collect::<Vec<_>>();
+        let expected = reference_encode_tree(&tree).expect("reference tree");
+        assert_eq!(
+            checked_tree_manifest_projection_canonical_length_v1(
+                tree.mount_path.as_bytes(),
+                tree.tree_role,
+                &entry_views,
+                tree.root_digest,
+            ),
+            Ok(expected.len())
+        );
+
+        let mut exact = vec![0; expected.len()];
+        {
+            let mut sink = FixedSliceSinkV1 {
+                buffer: &mut exact,
+                written: 0,
+            };
+            assert_eq!(
+                write_tree_manifest_projection_canonical_v1(
+                    tree.mount_path.as_bytes(),
+                    tree.tree_role,
+                    &entry_views,
+                    tree.root_digest,
+                    &mut sink,
+                ),
+                Ok(expected.len())
+            );
+            assert_eq!(sink.written, expected.len());
+        }
+        assert_eq!(exact, expected);
+
+        let mut short = vec![0; expected.len() - 1];
+        let mut sink = FixedSliceSinkV1 {
+            buffer: &mut short,
+            written: 0,
+        };
+        assert_eq!(
+            write_tree_manifest_projection_canonical_v1(
+                tree.mount_path.as_bytes(),
+                tree.tree_role,
+                &entry_views,
+                tree.root_digest,
+                &mut sink,
+            ),
+            Err(ManifestCanonicalWriteErrorV1::Sink(
+                FixedSliceSinkError::Capacity
+            ))
+        );
+    }
+
+    #[test]
     fn checked_manifest_lengths_enforce_nested_and_total_bounds() {
         let maximum = usize::try_from(EFFECT_IR_V2_MAX_CANONICAL_BYTES)
             .expect("canonical bound must fit the supported target");
@@ -3671,6 +4161,14 @@ mod tests {
                     .expect("reference digest");
             assert_eq!(
                 derive_manifest_node_digest_streaming_v1(&metadata, &payload, hardlink.as_ref()),
+                Ok(expected)
+            );
+            assert_eq!(
+                derive_manifest_node_digest_projection_streaming_v1(
+                    test_metadata_projection(&metadata),
+                    test_payload_projection(&payload),
+                    hardlink.as_ref(),
+                ),
                 Ok(expected)
             );
         }

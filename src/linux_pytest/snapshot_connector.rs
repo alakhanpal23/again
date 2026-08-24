@@ -48,6 +48,7 @@ use super::snapshot_tree::{
     SourceTreeAcquireFailureV1, SourceTreeFailureV1, SourceTreePlanV1, SourceXattrLimitsV1,
     admit_observed_regular_evidence, enumerate_source_tree_view_charged_at,
 };
+use super::snapshot_verify::StableManifestProjectionV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_verify::{
     DestinationPhysicalIdentityV1, SnapshotVerifyErrorV1, begin_four_view_comparison,
@@ -332,6 +333,15 @@ pub(super) struct SnapshotMaterializationSessionV1<'resources> {
     materialization_policy: &'resources SnapshotMaterializePolicyV1,
 }
 
+/// Narrow, connector-minted allocator for persistent manifest compilation.
+///
+/// It exposes neither the mutable resource cells nor caller-selected stages.
+/// The session is a reusable allocator within one compilation. The stable-view
+/// projection remains a separate, linear authority consumed by the compiler.
+pub(super) struct SnapshotManifestCompilationSessionV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+}
+
 /// One FD-free tree view paired with the connector's linear retained-heap
 /// lease. Qualified-source observation, the materializer's copy-time source
 /// pass, and private-destination observation all mint this wrapper through
@@ -342,10 +352,111 @@ pub(super) struct SnapshotRetainedTreeViewV1<'resources> {
     _lease: SnapshotRetainedViewLeaseV1<'resources>,
 }
 
+/// Non-forgeable connector-side decomposition of one verifier-minted stable
+/// S1/D2 projection. Only the bridge from `StableManifestProjectionV1` can
+/// construct it; arbitrary retained views cannot be repackaged as compiler
+/// input.
+pub(super) struct SnapshotStableManifestInputsV1<'resources> {
+    source_plan: Option<SourceTreePlanV1>,
+    destination_plan: Option<SourceTreePlanV1>,
+    source_lease: SnapshotRetainedViewLeaseV1<'resources>,
+    destination_lease: SnapshotRetainedViewLeaseV1<'resources>,
+}
+
 impl SnapshotRetainedTreeViewV1<'_> {
     pub(super) const fn plan(&self) -> &SourceTreePlanV1 {
         &self.plan
     }
+}
+
+impl<'resources> SnapshotRetainedTreeViewV1<'resources> {
+    fn into_plan_and_lease(self) -> (SourceTreePlanV1, SnapshotRetainedViewLeaseV1<'resources>) {
+        (self.plan, self._lease)
+    }
+}
+
+pub(super) fn consume_stable_manifest_projection<'resources>(
+    projection: StableManifestProjectionV1<'resources, 'resources>,
+) -> SnapshotStableManifestInputsV1<'resources> {
+    let (source, destination) = projection.into_views();
+    let (source_plan, source_lease) = source.into_plan_and_lease();
+    let (destination_plan, destination_lease) = destination.into_plan_and_lease();
+    SnapshotStableManifestInputsV1 {
+        source_plan: Some(source_plan),
+        destination_plan: Some(destination_plan),
+        source_lease,
+        destination_lease,
+    }
+}
+
+impl<'resources> SnapshotStableManifestInputsV1<'resources> {
+    pub(super) fn plans(&self) -> (&SourceTreePlanV1, &SourceTreePlanV1) {
+        (
+            self.source_plan
+                .as_ref()
+                .expect("private stable input retains its source plan until take"),
+            self.destination_plan
+                .as_ref()
+                .expect("private stable input retains its destination plan until take"),
+        )
+    }
+
+    pub(super) const fn leases(
+        &self,
+    ) -> (
+        &SnapshotRetainedViewLeaseV1<'resources>,
+        &SnapshotRetainedViewLeaseV1<'resources>,
+    ) {
+        (&self.source_lease, &self.destination_lease)
+    }
+
+    pub(super) fn take_plans(&mut self) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        (
+            self.source_plan
+                .take()
+                .expect("private stable source plan can be taken only once"),
+            self.destination_plan
+                .take()
+                .expect("private stable destination plan can be taken only once"),
+        )
+    }
+
+    pub(super) fn into_leases(
+        self,
+    ) -> (
+        SnapshotRetainedViewLeaseV1<'resources>,
+        SnapshotRetainedViewLeaseV1<'resources>,
+    ) {
+        assert!(
+            self.source_plan.is_none() && self.destination_plan.is_none(),
+            "private stable plans must move under their leases before evidence is returned"
+        );
+        (self.source_lease, self.destination_lease)
+    }
+}
+
+impl<'resources> SnapshotManifestCompilationSessionV1<'resources> {
+    pub(super) fn owns_lease(&self, lease: &SnapshotRetainedViewLeaseV1<'_>) -> bool {
+        lease.belongs_to(self.resources)
+    }
+
+    pub(super) fn charged_vec<T>(
+        &self,
+        capacity: usize,
+    ) -> Result<
+        super::snapshot_policy::SnapshotManifestCompilationVecV1<'resources, T>,
+        SnapshotPipelineResourceErrorV1,
+    > {
+        self.resources
+            .charged_manifest_compilation_vec::<T>(capacity)
+    }
+}
+
+#[cfg(test)]
+pub(super) const fn manifest_compilation_session_for_test(
+    resources: &SnapshotPipelineResourcesV1,
+) -> SnapshotManifestCompilationSessionV1<'_> {
+    SnapshotManifestCompilationSessionV1 { resources }
 }
 
 #[cfg(test)]

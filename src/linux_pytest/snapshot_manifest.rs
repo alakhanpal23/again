@@ -1,40 +1,50 @@
-//! Pure compilation of paired snapshot tree plans into the frozen manifest
-//! representation.
+//! Charged compilation of a verifier-minted stable S1/D2 projection.
 //!
-//! This module does not observe the filesystem and does not prove that its two
-//! inputs are stable views. The connector must first complete the S1/S2,
-//! S1/D1, and D1/D2 contract and pass only the resulting S1 logical view and
-//! destination-byte view here. Compilation consumes both plans so their owned
-//! paths, logical metadata, xattrs, and destination content evidence cannot be
-//! spliced into another result afterward.
+//! The production-shaped, non-test compiler consumes the non-forgeable
+//! four-view verifier result, moves plan-owned nested buffers under both
+//! retained-view leases, charges every new outer container to the
+//! persistent-manifest ledger, hashes nodes through allocation-free canonical
+//! projections, and retains exact canonical tree bytes plus the 102-byte D2
+//! `SourceStatxV1` commitment. It is not yet wired into connector publication.
 //!
-//! The returned value is data, not authority. In particular, it owns no file
-//! descriptor, does not bind a published directory, is not a full
-//! `SnapshotManifestV1`, and cannot grant isolation, execution, or reuse. Its
-//! top-level containers use fallible `try_reserve_exact`, but their observed
-//! capacities are not connector-ledger charges. Child-name cloning, manifest
-//! validation, and the existing canonical node hash helpers also use nested,
-//! infallible allocation paths. Production integration must therefore add an
-//! exact retained manifest/canonical-byte resource envelope and remove or
-//! charge every nested allocation before this compiler is placed on an
-//! authority-producing path.
+//! The result is still data, not authority: it owns no descriptor, binds no
+//! published directory, and cannot grant isolation, execution, or reuse. A
+//! later publisher must bind its D2 root commitment and canonical evidence to
+//! the reopened immutable child. The old allocation-heavy owning compiler is
+//! retained only under `cfg(test)` as an independent parity oracle.
+//! Per-field hard ceilings are refusal bounds, not a promise that every
+//! Cartesian-maximum plan fits the persistent envelope; exact precharge may
+//! reject such a plan before result construction.
 
 use super::canonical;
+use super::snapshot_connector::{
+    SnapshotManifestCompilationSessionV1, consume_stable_manifest_projection,
+};
+use super::snapshot_policy::{
+    SnapshotManifestCompilationVecV1, SnapshotPipelineResourceErrorV1, SnapshotRetainedViewLeaseV1,
+};
 use super::snapshot_tree::{
     CapturedXattrValueV1, SourcePlanPayloadV1, SourceTreeEntryV1, SourceTreePlanV1,
 };
+use super::snapshot_verify::StableManifestProjectionV1;
 use super::{
-    ChildCommitmentV1, HARDLINK_GROUP_DOMAIN, HardlinkGroupDigest, LinuxPytestContractError,
-    ManifestEntryV1, ManifestPayloadV1, MetadataV1, SandboxPath, TreeManifestV1, TreeRoleV1,
-    XattrV1,
+    ChildCommitmentV1, HardlinkGroupDigest, LinuxPytestContractError, ManifestEntryKindV1,
+    NodeDigest, SandboxPath, TimespecV1, TreeRoleV1, XattrV1,
+};
+#[cfg(test)]
+use super::{
+    HARDLINK_GROUP_DOMAIN, ManifestEntryV1, ManifestPayloadV1, MetadataV1, TreeManifestV1,
 };
 
 #[derive(Debug, Eq, PartialEq)]
 pub(super) enum SnapshotManifestCompileErrorV1 {
+    AuthorityMismatch,
     PlanMismatch,
     MalformedPlan,
     VisibleXattrUnrepresentable,
+    #[cfg(test)]
     AllocationFailed,
+    Resource(SnapshotPipelineResourceErrorV1),
     Canonical(LinuxPytestContractError),
 }
 
@@ -42,6 +52,694 @@ impl From<LinuxPytestContractError> for SnapshotManifestCompileErrorV1 {
     fn from(error: LinuxPytestContractError) -> Self {
         Self::Canonical(error)
     }
+}
+
+impl From<SnapshotPipelineResourceErrorV1> for SnapshotManifestCompileErrorV1 {
+    fn from(error: SnapshotPipelineResourceErrorV1) -> Self {
+        Self::Resource(error)
+    }
+}
+
+/// One charged, FD-free projection of a stable S1/D2 pair.
+///
+/// This value is deliberately not a `TreeManifestV1` and grants no snapshot,
+/// publication, execution, or reuse authority. Its exact outer container
+/// allocations remain charged to the connector's persistent-manifest ledger,
+/// while all moved plan-owned buffers remain covered by the two retained-view
+/// leases. Field order is part of the safety argument: charged entries and
+/// every nested moved buffer are destroyed before either lease is released.
+pub(super) struct ChargedTreeManifestV1<'resources, 'profile> {
+    mount_path: &'profile SandboxPath,
+    tree_role: TreeRoleV1,
+    entries: SnapshotManifestCompilationVecV1<'resources, ChargedManifestEntryV1<'resources>>,
+    root_digest: NodeDigest,
+    destination_root_statx_commitment: [u8; 102],
+    canonical_bytes: SnapshotManifestCompilationVecV1<'resources, u8>,
+    _source_lease: SnapshotRetainedViewLeaseV1<'resources>,
+    _destination_lease: SnapshotRetainedViewLeaseV1<'resources>,
+}
+
+impl ChargedTreeManifestV1<'_, '_> {
+    pub(super) const fn mount_path(&self) -> &SandboxPath {
+        self.mount_path
+    }
+
+    pub(super) const fn tree_role(&self) -> TreeRoleV1 {
+        self.tree_role
+    }
+
+    #[cfg(test)]
+    fn entries(&self) -> &[ChargedManifestEntryV1<'_>] {
+        self.entries.as_slice()
+    }
+
+    pub(super) const fn root_digest(&self) -> NodeDigest {
+        self.root_digest
+    }
+
+    pub(super) const fn destination_root_statx_commitment_v1(&self) -> &[u8; 102] {
+        &self.destination_root_statx_commitment
+    }
+
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        self.canonical_bytes.as_slice()
+    }
+}
+
+struct ChargedManifestEntryV1<'resources> {
+    relative_path: Vec<u8>,
+    // A non-root basename is moved exactly once into its parent's child
+    // commitment. The root's basename is dropped before result construction.
+    basename: Option<Vec<u8>>,
+    metadata: ChargedManifestMetadataV1<'resources>,
+    payload: ChargedManifestPayloadV1<'resources>,
+    hardlink_group: Option<HardlinkGroupDigest>,
+    node_digest: NodeDigest,
+}
+
+impl ChargedManifestEntryV1<'_> {
+    #[cfg(test)]
+    fn relative_path(&self) -> &[u8] {
+        &self.relative_path
+    }
+
+    #[cfg(test)]
+    const fn metadata(&self) -> &ChargedManifestMetadataV1<'_> {
+        &self.metadata
+    }
+
+    #[cfg(test)]
+    const fn payload(&self) -> &ChargedManifestPayloadV1<'_> {
+        &self.payload
+    }
+
+    #[cfg(test)]
+    const fn hardlink_group(&self) -> Option<HardlinkGroupDigest> {
+        self.hardlink_group
+    }
+
+    #[cfg(test)]
+    const fn node_digest(&self) -> NodeDigest {
+        self.node_digest
+    }
+
+    const fn kind(&self) -> ManifestEntryKindV1 {
+        self.payload.kind()
+    }
+
+    fn projection(&self) -> canonical::ManifestEntryProjectionViewV1<'_> {
+        canonical::ManifestEntryProjectionViewV1::new(
+            &self.relative_path,
+            self.metadata.projection(),
+            self.payload.projection(),
+            self.hardlink_group,
+            self.node_digest,
+        )
+    }
+}
+
+struct ChargedManifestMetadataV1<'resources> {
+    mode: u32,
+    logical_uid: u32,
+    logical_gid: u32,
+    size: u64,
+    nlink: u64,
+    atime: TimespecV1,
+    mtime: TimespecV1,
+    ctime: TimespecV1,
+    btime: Option<TimespecV1>,
+    xattrs: SnapshotManifestCompilationVecV1<'resources, XattrV1>,
+}
+
+impl ChargedManifestMetadataV1<'_> {
+    #[cfg(test)]
+    fn xattrs(&self) -> &[XattrV1] {
+        self.xattrs.as_slice()
+    }
+
+    fn projection(&self) -> canonical::ManifestMetadataProjectionV1<'_> {
+        canonical::ManifestMetadataProjectionV1::new(
+            self.mode,
+            self.logical_uid,
+            self.logical_gid,
+            self.size,
+            self.nlink,
+            &self.atime,
+            &self.mtime,
+            &self.ctime,
+            self.btime.as_ref(),
+            self.xattrs.as_slice(),
+        )
+    }
+}
+
+enum ChargedManifestPayloadV1<'resources> {
+    Directory {
+        children: SnapshotManifestCompilationVecV1<'resources, ChildCommitmentV1>,
+    },
+    Regular {
+        content_digest: super::FileContentDigest,
+        data_extents: Vec<super::ExtentV1>,
+    },
+    Symlink {
+        target: Vec<u8>,
+    },
+}
+
+impl ChargedManifestPayloadV1<'_> {
+    const fn kind(&self) -> ManifestEntryKindV1 {
+        match self {
+            Self::Directory { .. } => ManifestEntryKindV1::Directory,
+            Self::Regular { .. } => ManifestEntryKindV1::Regular,
+            Self::Symlink { .. } => ManifestEntryKindV1::Symlink,
+        }
+    }
+
+    fn projection(&self) -> canonical::ManifestPayloadProjectionV1<'_> {
+        match self {
+            Self::Directory { children } => canonical::ManifestPayloadProjectionV1::Directory {
+                children: children.as_slice(),
+            },
+            Self::Regular {
+                content_digest,
+                data_extents,
+            } => canonical::ManifestPayloadProjectionV1::Regular {
+                content_digest: *content_digest,
+                data_extents,
+            },
+            Self::Symlink { target } => canonical::ManifestPayloadProjectionV1::Symlink { target },
+        }
+    }
+}
+
+impl canonical::ManifestCanonicalByteSinkV1 for SnapshotManifestCompilationVecV1<'_, u8> {
+    type Error = SnapshotPipelineResourceErrorV1;
+
+    fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.try_extend_from_slice(bytes)
+    }
+}
+
+/// Production-shaped compilation of one connector-verified S1/D2 pair without
+/// creating an uncharged owning-manifest container. Connector publication does
+/// not call this function yet.
+///
+/// The only plan input is the verifier's non-forgeable stable projection. Its
+/// connector-owned bridge keeps each plan ahead of its retained-view lease in
+/// drop order. The session/lease identity check runs before semantic
+/// validation or allocation, preventing proof from one pipeline resource
+/// authority from being spliced into another authority's ledger. This remains
+/// a data-only projection: the 102-byte D2 `SourceStatxV1` commitment is retained for a
+/// later publisher binding, but no FD or publication proof is created here.
+pub(super) fn compile_tree_manifest_charged<'resources, 'profile>(
+    session: &SnapshotManifestCompilationSessionV1<'resources>,
+    stable: StableManifestProjectionV1<'resources, 'resources>,
+    mount_path: &'profile SandboxPath,
+    tree_role: TreeRoleV1,
+) -> Result<ChargedTreeManifestV1<'resources, 'profile>, SnapshotManifestCompileErrorV1> {
+    let mut inputs = consume_stable_manifest_projection(stable);
+    let (source_lease, destination_lease) = inputs.leases();
+    if !session.owns_lease(source_lease) || !session.owns_lease(destination_lease) {
+        return Err(SnapshotManifestCompileErrorV1::AuthorityMismatch);
+    }
+
+    let (source, destination) = inputs.plans();
+    validate_charged_manifest_projection_pair(source, destination)?;
+    let destination_root_statx_commitment = destination
+        .entries()
+        .first()
+        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?
+        .statx()
+        .commitment_bytes_v1();
+
+    let (source, destination) = inputs.take_plans();
+    let (_, source_entries, source_groups, _) = source.into_parts();
+    let (_, destination_entries, _, _) = destination.into_parts();
+    let group_digests =
+        compile_hardlink_group_digests_charged(session, &source_entries, &source_groups)?;
+
+    let entry_count = source_entries.len();
+    let mut entries_reversed =
+        session.charged_vec::<ChargedManifestEntryV1<'resources>>(entry_count)?;
+    let entry_pairs = source_entries
+        .into_vec()
+        .into_iter()
+        .zip(destination_entries.into_vec());
+    for (source, destination) in entry_pairs.rev() {
+        let (relative_path, basename, _, source_statx, _, source_payload, hardlink_group_index) =
+            source.into_parts();
+        let (_, _, _, _, destination_xattrs, destination_payload, _) = destination.into_parts();
+        let (mode, logical_uid, logical_gid, nlink, size, atime, mtime, ctime, btime) =
+            source_statx.into_manifest_parts();
+
+        let mut xattrs = session.charged_vec::<XattrV1>(destination_xattrs.len())?;
+        for xattr in destination_xattrs.into_vec() {
+            let (name, value) = xattr.into_parts();
+            let CapturedXattrValueV1::Bytes(value) = value else {
+                return Err(SnapshotManifestCompileErrorV1::VisibleXattrUnrepresentable);
+            };
+            xattrs.try_push(XattrV1 {
+                name: name.into_vec(),
+                value: value.into_vec(),
+            })?;
+        }
+        let metadata = ChargedManifestMetadataV1 {
+            mode,
+            logical_uid,
+            logical_gid,
+            size,
+            nlink,
+            atime,
+            mtime,
+            ctime,
+            btime,
+            xattrs,
+        };
+        let hardlink_group = hardlink_group_index
+            .map(|index| {
+                group_digests
+                    .as_slice()
+                    .get(checked_usize_from_u32(index)?)
+                    .copied()
+                    .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)
+            })
+            .transpose()?;
+
+        let payload = match (source_payload, destination_payload) {
+            (
+                SourcePlanPayloadV1::Directory { children },
+                SourcePlanPayloadV1::Directory { .. },
+            ) => {
+                let mut commitments = session.charged_vec::<ChildCommitmentV1>(children.len())?;
+                for child_index in children.into_vec() {
+                    let child_index = checked_usize_from_u32(child_index)?;
+                    let reverse_index = entry_count
+                        .checked_sub(1)
+                        .and_then(|last| last.checked_sub(child_index))
+                        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+                    let child = entries_reversed
+                        .as_mut_slice()
+                        .get_mut(reverse_index)
+                        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+                    let name = child
+                        .basename
+                        .take()
+                        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+                    commitments.try_push(ChildCommitmentV1 {
+                        name,
+                        kind: child.kind(),
+                        node_digest: child.node_digest,
+                    })?;
+                }
+                ChargedManifestPayloadV1::Directory {
+                    children: commitments,
+                }
+            }
+            (SourcePlanPayloadV1::Regular { .. }, SourcePlanPayloadV1::Regular { evidence }) => {
+                let (content_digest, data_extents) = evidence.into_parts();
+                ChargedManifestPayloadV1::Regular {
+                    content_digest,
+                    data_extents,
+                }
+            }
+            (SourcePlanPayloadV1::Symlink { .. }, SourcePlanPayloadV1::Symlink { target }) => {
+                ChargedManifestPayloadV1::Symlink { target }
+            }
+            _ => return Err(SnapshotManifestCompileErrorV1::PlanMismatch),
+        };
+        let node_digest = canonical::derive_manifest_node_digest_projection_streaming_v1(
+            metadata.projection(),
+            payload.projection(),
+            hardlink_group.as_ref(),
+        )?;
+        entries_reversed.try_push(ChargedManifestEntryV1 {
+            relative_path: relative_path.into_vec(),
+            basename: Some(basename.into_vec()),
+            metadata,
+            payload,
+            hardlink_group,
+            node_digest,
+        })?;
+    }
+    entries_reversed.as_mut_slice().reverse();
+
+    let root_basename = entries_reversed
+        .as_mut_slice()
+        .first_mut()
+        .and_then(|entry| entry.basename.take())
+        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+    drop(root_basename);
+    if entries_reversed
+        .as_slice()
+        .iter()
+        .any(|entry| entry.basename.is_some())
+    {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+
+    let root_digest = entries_reversed
+        .as_slice()
+        .first()
+        .map(|entry| entry.node_digest)
+        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+    // No digest-index lookup remains after every entry has copied its group
+    // digest. Release this temporary charged outer container before the exact
+    // canonical byte object is allocated to reduce overlap between phases.
+    drop(group_digests);
+    // This checked walk exercises the same projection framing used by future
+    // persistence without allocating canonical bytes. Semantic admission was
+    // completed before any plan-owned buffer was moved.
+    let mut entry_views = session.charged_vec::<canonical::ManifestEntryProjectionViewV1<'_>>(
+        entries_reversed.as_slice().len(),
+    )?;
+    for entry in entries_reversed.as_slice() {
+        entry_views.try_push(entry.projection())?;
+    }
+    let canonical_length = canonical::checked_tree_manifest_projection_canonical_length_v1(
+        mount_path.as_bytes(),
+        tree_role,
+        entry_views.as_slice(),
+        root_digest,
+    )?;
+    let mut canonical_bytes = session.charged_vec::<u8>(canonical_length)?;
+    let written = match canonical::write_tree_manifest_projection_canonical_v1(
+        mount_path.as_bytes(),
+        tree_role,
+        entry_views.as_slice(),
+        root_digest,
+        &mut canonical_bytes,
+    ) {
+        Ok(written) => written,
+        Err(canonical::ManifestCanonicalWriteErrorV1::Canonical(error)) => {
+            return Err(SnapshotManifestCompileErrorV1::Canonical(error));
+        }
+        Err(canonical::ManifestCanonicalWriteErrorV1::Sink(error)) => {
+            return Err(SnapshotManifestCompileErrorV1::Resource(error));
+        }
+    };
+    if written != canonical_length || canonical_bytes.as_slice().len() != canonical_length {
+        return Err(SnapshotManifestCompileErrorV1::Canonical(
+            LinuxPytestContractError::CanonicalEncoding,
+        ));
+    }
+    drop(entry_views);
+
+    let (source_lease, destination_lease) = inputs.into_leases();
+
+    Ok(ChargedTreeManifestV1 {
+        mount_path,
+        tree_role,
+        entries: entries_reversed,
+        root_digest,
+        destination_root_statx_commitment,
+        canonical_bytes,
+        _source_lease: source_lease,
+        _destination_lease: destination_lease,
+    })
+}
+
+fn compile_hardlink_group_digests_charged<'resources>(
+    session: &SnapshotManifestCompilationSessionV1<'resources>,
+    source_entries: &[SourceTreeEntryV1],
+    source_groups: &[super::snapshot_tree::SourceHardlinkGroupV1],
+) -> Result<
+    SnapshotManifestCompilationVecV1<'resources, HardlinkGroupDigest>,
+    SnapshotManifestCompileErrorV1,
+> {
+    let mut group_digests = session.charged_vec::<HardlinkGroupDigest>(source_groups.len())?;
+    for group in source_groups {
+        // Structural admission proves every index valid and member paths
+        // strictly ordered. The concrete charged slice ensures validation and
+        // hashing observe one immutable sequence.
+        let mut paths = session.charged_vec::<&[u8]>(group.member_indices().len())?;
+        for index in group.member_indices() {
+            paths.try_push(
+                source_entries
+                    .get(checked_usize_from_u32(*index)?)
+                    .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?
+                    .relative_path(),
+            )?;
+        }
+        let digest = canonical::derive_hardlink_group_digest_streaming_v1(paths.as_slice())?;
+        drop(paths);
+        group_digests.try_push(digest)?;
+    }
+    Ok(group_digests)
+}
+
+fn checked_usize_from_u32(value: u32) -> Result<usize, SnapshotManifestCompileErrorV1> {
+    usize::try_from(value).map_err(|_| SnapshotManifestCompileErrorV1::MalformedPlan)
+}
+
+fn checked_u32_from_usize(value: usize) -> Result<u32, SnapshotManifestCompileErrorV1> {
+    u32::try_from(value).map_err(|_| SnapshotManifestCompileErrorV1::MalformedPlan)
+}
+
+fn checked_u64_from_usize(value: usize) -> Result<u64, SnapshotManifestCompileErrorV1> {
+    u64::try_from(value).map_err(|_| SnapshotManifestCompileErrorV1::MalformedPlan)
+}
+
+fn validate_charged_manifest_projection_pair(
+    source: &SourceTreePlanV1,
+    destination: &SourceTreePlanV1,
+) -> Result<(), SnapshotManifestCompileErrorV1> {
+    validate_manifest_projection_pair(source, destination)?;
+    validate_charged_plan_semantics(source)?;
+    validate_charged_plan_semantics(destination)
+}
+
+fn validate_charged_plan_semantics(
+    plan: &SourceTreePlanV1,
+) -> Result<(), SnapshotManifestCompileErrorV1> {
+    let entries = plan.entries();
+    checked_u32_from_usize(entries.len())?;
+    checked_u32_from_usize(plan.hardlink_groups().len())?;
+    if entries.is_empty()
+        || !super::valid_basename(plan.root_name())
+        || entries[0].relative_path() != b""
+        || entries[0].basename() != plan.root_name()
+        || entries[0].parent_index().is_some()
+        || !matches!(entries[0].payload(), SourcePlanPayloadV1::Directory { .. })
+        || entries
+            .windows(2)
+            .any(|pair| pair[0].relative_path() >= pair[1].relative_path())
+    {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+
+    let mut child_reference_count = 0usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let parent_index = checked_u32_from_usize(index)?;
+        validate_plan_entry_semantics(index, entry)?;
+        match entry.payload() {
+            SourcePlanPayloadV1::Directory { children } => {
+                let mut previous_name: Option<&[u8]> = None;
+                for child_index in children {
+                    let child_index = checked_usize_from_u32(*child_index)?;
+                    let child = entries
+                        .get(child_index)
+                        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+                    if child_index <= index
+                        || child.parent_index() != Some(parent_index)
+                        || previous_name.is_some_and(|name| name >= child.basename())
+                        || !path_matches_parent(
+                            entry.relative_path(),
+                            child.basename(),
+                            child.relative_path(),
+                        )
+                    {
+                        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+                    }
+                    previous_name = Some(child.basename());
+                    child_reference_count = child_reference_count
+                        .checked_add(1)
+                        .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+                }
+            }
+            SourcePlanPayloadV1::Regular { evidence } => {
+                validate_charged_extent_sequence(evidence.data_extents(), entry.statx().size())?;
+            }
+            SourcePlanPayloadV1::Symlink { target } => {
+                let target_length = checked_u64_from_usize(target.len())?;
+                if target.is_empty() || target.contains(&0) || target_length != entry.statx().size()
+                {
+                    return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+                }
+            }
+        }
+    }
+    if child_reference_count
+        != entries
+            .len()
+            .checked_sub(1)
+            .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?
+    {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+    validate_hardlink_backlinks(plan)?;
+    Ok(())
+}
+
+fn validate_charged_extent_sequence(
+    extents: &[super::ExtentV1],
+    logical_size: u64,
+) -> Result<(), SnapshotManifestCompileErrorV1> {
+    let mut previous_end = None;
+    for extent in extents {
+        let next = extent
+            .offset
+            .checked_add(extent.length)
+            .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+        if extent.length == 0
+            || previous_end.is_some_and(|end| end >= extent.offset)
+            || next > logical_size
+        {
+            return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+        }
+        previous_end = Some(next);
+    }
+    Ok(())
+}
+
+fn validate_plan_entry_semantics(
+    index: usize,
+    entry: &SourceTreeEntryV1,
+) -> Result<(), SnapshotManifestCompileErrorV1> {
+    const S_IFMT: u32 = 0o170_000;
+    const S_IFDIR: u32 = 0o040_000;
+    const S_IFREG: u32 = 0o100_000;
+    const S_IFLNK: u32 = 0o120_000;
+
+    if !super::valid_manifest_relative_path(entry.relative_path())
+        || (index != 0 && !super::valid_basename(entry.basename()))
+        || entry.statx().nlink() == 0
+        || [
+            Some(entry.statx().atime()),
+            Some(entry.statx().mtime()),
+            Some(entry.statx().ctime()),
+            entry.statx().btime(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|time| time.nanoseconds >= 1_000_000_000)
+        || entry
+            .xattrs()
+            .windows(2)
+            .any(|pair| pair[0].name() >= pair[1].name())
+        || entry
+            .xattrs()
+            .iter()
+            .any(|xattr| xattr.name().is_empty() || xattr.name().contains(&0))
+    {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+    if entry.xattrs().iter().any(|xattr| {
+        matches!(
+            xattr.value(),
+            CapturedXattrValueV1::VisibleButUnsettable { .. }
+        )
+    }) {
+        return Err(SnapshotManifestCompileErrorV1::VisibleXattrUnrepresentable);
+    }
+    let expected_mode = match entry.payload() {
+        SourcePlanPayloadV1::Directory { .. } => S_IFDIR,
+        SourcePlanPayloadV1::Regular { .. } => S_IFREG,
+        SourcePlanPayloadV1::Symlink { .. } => S_IFLNK,
+    };
+    if entry.statx().mode() & S_IFMT != expected_mode
+        || (matches!(entry.payload(), SourcePlanPayloadV1::Directory { .. })
+            && entry.hardlink_group().is_some())
+        || (matches!(
+            entry.payload(),
+            SourcePlanPayloadV1::Regular { .. } | SourcePlanPayloadV1::Symlink { .. }
+        ) && ((entry.hardlink_group().is_some() && entry.statx().nlink() < 2)
+            || (entry.hardlink_group().is_none() && entry.statx().nlink() != 1)))
+    {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+    Ok(())
+}
+
+fn validate_hardlink_backlinks(
+    source: &SourceTreePlanV1,
+) -> Result<(), SnapshotManifestCompileErrorV1> {
+    let entries = source.entries();
+    let groups = source.hardlink_groups();
+    let mut member_count = 0usize;
+    for (group_index, group) in groups.iter().enumerate() {
+        let group_index = checked_u32_from_usize(group_index)?;
+        let members = group.member_indices();
+        checked_u32_from_usize(members.len())?;
+        if members.len() < 2 || members.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+        }
+        let expected_nlink = checked_u64_from_usize(members.len())?;
+        let first = entries
+            .get(checked_usize_from_u32(members[0])?)
+            .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+        for member_index in members {
+            let member = entries
+                .get(checked_usize_from_u32(*member_index)?)
+                .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+            if group.inode_key() != member.statx().inode_key()
+                || member.hardlink_group() != Some(group_index)
+                || member.statx().nlink() != expected_nlink
+                || member.payload().kind() != first.payload().kind()
+                || member.statx().mode() != first.statx().mode()
+                || member.statx().uid() != first.statx().uid()
+                || member.statx().gid() != first.statx().gid()
+                || member.statx().size() != first.statx().size()
+                || member.statx().atime() != first.statx().atime()
+                || member.statx().mtime() != first.statx().mtime()
+                || member.statx().ctime() != first.statx().ctime()
+                || member.statx().btime() != first.statx().btime()
+                || member.xattrs() != first.xattrs()
+                || member.payload() != first.payload()
+            {
+                return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+            }
+            member_count = member_count
+                .checked_add(1)
+                .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+        }
+    }
+    let backlink_count = entries
+        .iter()
+        .filter(|entry| entry.hardlink_group().is_some())
+        .count();
+    if member_count != backlink_count {
+        return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(group_index) = entry.hardlink_group() else {
+            continue;
+        };
+        let group = groups
+            .get(checked_usize_from_u32(group_index)?)
+            .ok_or(SnapshotManifestCompileErrorV1::MalformedPlan)?;
+        let index = checked_u32_from_usize(index)?;
+        if group.member_indices().binary_search(&index).is_err() {
+            return Err(SnapshotManifestCompileErrorV1::MalformedPlan);
+        }
+    }
+    Ok(())
+}
+
+fn path_matches_parent(parent: &[u8], basename: &[u8], child: &[u8]) -> bool {
+    if parent.is_empty() {
+        return child == basename;
+    }
+    let Some(expected_length) = parent
+        .len()
+        .checked_add(1)
+        .and_then(|length| length.checked_add(basename.len()))
+    else {
+        return false;
+    };
+    child.len() == expected_length
+        && child.starts_with(parent)
+        && child.get(parent.len()) == Some(&b'/')
+        && child.get(parent.len() + 1..) == Some(basename)
 }
 
 /// Consume one caller-selected logical-source plan and the paired destination
@@ -54,6 +752,7 @@ impl From<LinuxPytestContractError> for SnapshotManifestCompileErrorV1 {
 /// uid/gid, timestamps, link count, and directory size. A structural equality
 /// check is retained here as defense in depth; physical destination mode,
 /// owner, and identity remain the verifier's responsibility.
+#[cfg(test)]
 pub(super) fn compile_tree_manifest(
     source: SourceTreePlanV1,
     destination: SourceTreePlanV1,
@@ -209,6 +908,7 @@ fn validate_manifest_projection_pair(
     Ok(())
 }
 
+#[cfg(test)]
 fn compile_xattrs(
     xattrs: Box<[super::snapshot_tree::CapturedXattrV1]>,
 ) -> Result<Vec<XattrV1>, SnapshotManifestCompileErrorV1> {
@@ -229,6 +929,7 @@ fn compile_xattrs(
     Ok(output)
 }
 
+#[cfg(test)]
 fn compile_hardlink_group_digests(
     entries: &[SourceTreeEntryV1],
     groups: &[super::snapshot_tree::SourceHardlinkGroupV1],
@@ -265,11 +966,22 @@ fn compile_hardlink_group_digests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_pytest::snapshot_connector::{
+        manifest_compilation_session_for_test, mint_destination_witness_bytes_for_test,
+        retain_tree_plan_for_test,
+    };
+    use crate::linux_pytest::snapshot_policy::{
+        SnapshotPipelineForwardStageV1, SnapshotPipelineResourcesV1, SnapshotResourcePolicyV1,
+    };
     use crate::linux_pytest::snapshot_tree::{
         CapturedXattrV1, SourceHardlinkGroupV1, SourceRegularEvidenceV1, SourceStatxV1,
         SourceTreeEntryV1,
     };
+    use crate::linux_pytest::snapshot_verify::{
+        DestinationPhysicalIdentityV1, StableManifestProjectionV1, begin_four_view_comparison,
+    };
     use crate::linux_pytest::{ExtentV1, FILE_CONTENT_DOMAIN, FileContentDigest, TimespecV1};
+    use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
     const S_IFDIR: u32 = 0o040_000;
     const S_IFREG: u32 = 0o100_000;
@@ -392,6 +1104,256 @@ mod tests {
         SandboxPath::new(b"/workspace".to_vec().into_boxed_slice()).unwrap()
     }
 
+    fn replace_root_statx(plan: SourceTreePlanV1, replacement: SourceStatxV1) -> SourceTreePlanV1 {
+        let (root_name, entries, hardlink_groups, has_unsettable_xattrs) = plan.into_parts();
+        let mut entries = entries.into_vec();
+        let root = entries.remove(0);
+        let (relative_path, basename, parent_index, _, xattrs, payload, hardlink_group) =
+            root.into_parts();
+        entries.insert(
+            0,
+            SourceTreeEntryV1::unchecked_for_test(
+                &relative_path,
+                &basename,
+                parent_index,
+                replacement,
+                xattrs.into_vec(),
+                payload,
+                hardlink_group,
+            ),
+        );
+        SourceTreePlanV1::unchecked_for_test(
+            &root_name,
+            entries,
+            hardlink_groups.into_vec(),
+            has_unsettable_xattrs,
+        )
+    }
+
+    fn manifest_resources(persistent_manifest_heap_bytes: u64) -> SnapshotPipelineResourcesV1 {
+        let policy = SnapshotResourcePolicyV1::checked(
+            8,
+            NonZeroU32::new(64).unwrap(),
+            NonZeroU16::new(255).unwrap(),
+            16 * 1024,
+            16 * 1024,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024,
+            64,
+            1_024,
+            64,
+            1_024,
+            255,
+            64 * 1024,
+            64 * 1024,
+            1024 * 1024,
+            NonZeroU64::new(1024 * 1024).unwrap(),
+            persistent_manifest_heap_bytes,
+            1024 * 1024,
+            NonZeroU64::new(1_000_000).unwrap(),
+            NonZeroU8::new(4).unwrap(),
+            NonZeroU8::new(3).unwrap(),
+            NonZeroU8::new(4).unwrap(),
+        )
+        .unwrap();
+        SnapshotPipelineResourcesV1::preflight(policy, 0, u64::MAX, u64::MAX).unwrap()
+    }
+
+    fn stable_projection<'resources>(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        source_s1: SourceTreePlanV1,
+        source_s2: SourceTreePlanV1,
+        destination_d1: SourceTreePlanV1,
+        destination_d2: SourceTreePlanV1,
+    ) -> StableManifestProjectionV1<'resources, 'resources> {
+        let source_s1 = retain_tree_plan_for_test(
+            resources,
+            SnapshotPipelineForwardStageV1::SourceObservation,
+            source_s1,
+        )
+        .unwrap();
+        let source_s2 = retain_tree_plan_for_test(
+            resources,
+            SnapshotPipelineForwardStageV1::SourceObservation,
+            source_s2,
+        )
+        .unwrap();
+        let source_stable = begin_four_view_comparison(source_s1)
+            .compare_source_s2(&source_s2)
+            .unwrap();
+        drop(source_s2);
+        let destination_d1 = retain_tree_plan_for_test(
+            resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+            destination_d1,
+        )
+        .unwrap();
+        let destination_stable = source_stable
+            .compare_destination_d1(
+                &destination_d1,
+                DestinationPhysicalIdentityV1::new(1_000, 2_000),
+            )
+            .unwrap();
+        let awaiting_d2 = destination_stable
+            .capture_stability_witness(|capacity| {
+                mint_destination_witness_bytes_for_test(resources, capacity)
+            })
+            .unwrap();
+        drop(destination_d1);
+        let destination_d2 = retain_tree_plan_for_test(
+            resources,
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+            destination_d2,
+        )
+        .unwrap();
+        awaiting_d2.compare_destination_d2(destination_d2).unwrap()
+    }
+
+    fn compile_charged<'resources, 'profile>(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        stable: StableManifestProjectionV1<'resources, 'resources>,
+        mount_path: &'profile SandboxPath,
+    ) -> Result<ChargedTreeManifestV1<'resources, 'profile>, SnapshotManifestCompileErrorV1> {
+        compile_tree_manifest_charged(
+            &manifest_compilation_session_for_test(resources),
+            stable,
+            mount_path,
+            TreeRoleV1::Workspace,
+        )
+    }
+
+    #[derive(Default)]
+    struct TestCanonicalSink(Vec<u8>);
+
+    impl canonical::ManifestCanonicalByteSinkV1 for TestCanonicalSink {
+        type Error = ();
+
+        fn try_extend_canonical(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
+
+    fn legacy_canonical_bytes(manifest: &TreeManifestV1) -> Vec<u8> {
+        let mut sink = TestCanonicalSink::default();
+        let written = canonical::write_tree_manifest_canonical_v1(manifest, &mut sink).unwrap();
+        assert_eq!(written, sink.0.len());
+        sink.0
+    }
+
+    fn charged_outer_heap_phases(
+        source: &SourceTreePlanV1,
+        destination: &SourceTreePlanV1,
+        canonical_length: usize,
+    ) -> [u64; 3] {
+        let entries = u64::try_from(source.entries().len()).unwrap()
+            * u64::try_from(std::mem::size_of::<ChargedManifestEntryV1<'static>>()).unwrap();
+        let xattrs = u64::try_from(
+            destination
+                .entries()
+                .iter()
+                .map(|entry| entry.xattrs().len())
+                .sum::<usize>(),
+        )
+        .unwrap()
+            * u64::try_from(std::mem::size_of::<XattrV1>()).unwrap();
+        let children = u64::try_from(
+            source
+                .entries()
+                .iter()
+                .map(|entry| match entry.payload() {
+                    SourcePlanPayloadV1::Directory { children } => children.len(),
+                    SourcePlanPayloadV1::Regular { .. } | SourcePlanPayloadV1::Symlink { .. } => 0,
+                })
+                .sum::<usize>(),
+        )
+        .unwrap()
+            * u64::try_from(std::mem::size_of::<ChildCommitmentV1>()).unwrap();
+        let groups = u64::try_from(source.hardlink_groups().len()).unwrap()
+            * u64::try_from(std::mem::size_of::<HardlinkGroupDigest>()).unwrap();
+        let hardlink_paths = u64::try_from(
+            source
+                .hardlink_groups()
+                .iter()
+                .map(|group| group.member_indices().len())
+                .max()
+                .unwrap_or(0),
+        )
+        .unwrap()
+            * u64::try_from(std::mem::size_of::<&[u8]>()).unwrap();
+        let entry_views = u64::try_from(source.entries().len()).unwrap()
+            * u64::try_from(std::mem::size_of::<
+                canonical::ManifestEntryProjectionViewV1<'static>,
+            >())
+            .unwrap();
+        let retained = entries + xattrs + children;
+        // Actual production overlap: group slots + one path-ref group;
+        // completed manifest containers + group slots; then completed
+        // containers + immutable projection slots + canonical bytes.
+        [
+            groups + hardlink_paths,
+            retained + groups,
+            retained + entry_views + u64::try_from(canonical_length).unwrap(),
+        ]
+    }
+
+    fn assert_full_compiler_exact_boundary(
+        fixture: fn(u8) -> (SourceTreePlanV1, SourceTreePlanV1),
+        seed: u8,
+    ) {
+        let (legacy_source, legacy_destination) = fixture(seed);
+        let legacy = compile_tree_manifest(
+            legacy_source,
+            legacy_destination,
+            workspace_path(),
+            TreeRoleV1::Workspace,
+        )
+        .unwrap();
+        let canonical = legacy_canonical_bytes(&legacy);
+        let (source_s1, destination_d1) = fixture(seed);
+        let (source_s2, destination_d2) = fixture(seed);
+        let phases = charged_outer_heap_phases(&source_s1, &destination_d2, canonical.len());
+        let exact = phases.into_iter().max().unwrap();
+        assert_eq!(phases[2], exact, "canonical phase must select the peak");
+        let resources = manifest_resources(exact);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let mount = workspace_path();
+        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        assert_eq!(charged.canonical_bytes(), canonical);
+        drop(charged);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+
+        let (source_s1, destination_d1) = fixture(seed);
+        let (source_s2, destination_d2) = fixture(seed);
+        let resources = manifest_resources(exact - 1);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let error = match compile_charged(&resources, stable, &mount) {
+            Ok(_) => panic!("one-byte-short manifest budget must refuse"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SnapshotManifestCompileErrorV1::Resource(
+                SnapshotPipelineResourceErrorV1::PersistentManifestHeapCapacityExceeded { .. }
+            )
+        ));
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
     fn directory_entry(
         source: bool,
         path: &[u8],
@@ -455,6 +1417,121 @@ mod tests {
             },
             hardlink_group,
         )
+    }
+
+    fn symlink_entry(
+        source: bool,
+        path: &[u8],
+        basename: &[u8],
+        parent: u32,
+        inode: u64,
+        target: &[u8],
+    ) -> SourceTreeEntryV1 {
+        SourceTreeEntryV1::unchecked_for_test(
+            path,
+            basename,
+            Some(parent),
+            statx(
+                source,
+                inode,
+                0o120_000 | if source { 0o777 } else { 0o555 },
+                1,
+                target.len() as u64,
+                5,
+                6,
+                if source { 7 } else { 700 },
+                None,
+            ),
+            Vec::new(),
+            SourcePlanPayloadV1::Symlink {
+                target: target.to_vec(),
+            },
+            None,
+        )
+    }
+
+    fn rich_fixture(raw_name: &[u8]) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        let plan = |source| {
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1, 2]),
+                    regular_entry(source, raw_name, raw_name, 0, 2, 1, 0x51, None),
+                    symlink_entry(source, b"link", b"link", 0, 3, b"target"),
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        (plan(true), plan(false))
+    }
+
+    fn hardlink_fixture(seed: u8) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        let plan = |source| {
+            let first = regular_entry(source, b"a", b"a", 0, 2, 2, seed, Some(0));
+            let second = regular_entry(source, b"b", b"b", 0, 2, 2, seed, Some(0));
+            let group = SourceHardlinkGroupV1::unchecked_for_test(
+                first.statx().inode_key().clone(),
+                vec![1, 2],
+            );
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1, 2]),
+                    first,
+                    second,
+                ],
+                vec![group],
+                false,
+            )
+        };
+        (plan(true), plan(false))
+    }
+
+    fn nested_fixture(seed: u8) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        let plan = |source| {
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1]),
+                    directory_entry(source, b"dir", b"dir", Some(0), 2, vec![2]),
+                    regular_entry(source, b"dir/file", b"file", 1, 3, 1, seed, None),
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        (plan(true), plan(false))
+    }
+
+    fn nested_xattr_fixture(seed: u8) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        let plan = |source| {
+            let regular = regular_entry(source, b"dir/file", b"file", 1, 3, 1, seed, None);
+            let (path, basename, parent, statx, _, payload, hardlink) = regular.into_parts();
+            let regular = SourceTreeEntryV1::unchecked_for_test(
+                &path,
+                &basename,
+                parent,
+                statx,
+                vec![CapturedXattrV1::bytes_for_test(
+                    b"user.again",
+                    b"nested-value",
+                )],
+                payload,
+                hardlink,
+            );
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1]),
+                    directory_entry(source, b"dir", b"dir", Some(0), 2, vec![2]),
+                    regular,
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        (plan(true), plan(false))
     }
 
     #[test]
@@ -670,5 +1747,567 @@ mod tests {
             .unwrap_err(),
             SnapshotManifestCompileErrorV1::MalformedPlan
         );
+    }
+
+    #[test]
+    fn charged_compiler_preserves_owned_buffer_pointers_and_canonical_bytes() {
+        let (source_s1, destination_d1) = fixture(0x41, b"file");
+        let (source_s2, destination_d2) = fixture(0x41, b"file");
+        let source_path_pointer = source_s1.entries()[1].relative_path().as_ptr();
+        let source_basename_pointer = source_s1.entries()[1].basename().as_ptr();
+        let destination_root_commitment = destination_d2.entries()[0].statx().commitment_bytes_v1();
+        let destination_xattr_name_pointer =
+            destination_d2.entries()[1].xattrs()[0].name().as_ptr();
+        let destination_xattr_value_pointer = match destination_d2.entries()[1].xattrs()[0].value()
+        {
+            CapturedXattrValueV1::Bytes(value) => value.as_ptr(),
+            CapturedXattrValueV1::VisibleButUnsettable { .. } => panic!("fixture must be readable"),
+        };
+        let destination_extent_pointer = match destination_d2.entries()[1].payload() {
+            SourcePlanPayloadV1::Regular { evidence } => evidence.data_extents().as_ptr(),
+            _ => panic!("fixture must be regular"),
+        };
+        let (legacy_source, legacy_destination) = fixture(0x41, b"file");
+        let legacy = compile_tree_manifest(
+            legacy_source,
+            legacy_destination,
+            workspace_path(),
+            TreeRoleV1::Workspace,
+        )
+        .unwrap();
+        let expected_canonical = legacy_canonical_bytes(&legacy);
+
+        let resources = manifest_resources(4 * 1024 * 1024);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let mount = workspace_path();
+        let charged = compile_charged(&resources, stable, &mount).unwrap();
+
+        assert_eq!(charged.mount_path(), &mount);
+        assert_eq!(charged.tree_role(), TreeRoleV1::Workspace);
+        assert_eq!(charged.canonical_bytes(), expected_canonical);
+        assert_eq!(
+            charged.destination_root_statx_commitment_v1(),
+            &destination_root_commitment
+        );
+        assert_eq!(
+            charged.entries()[1].relative_path().as_ptr(),
+            source_path_pointer
+        );
+        assert_eq!(
+            charged.entries()[1].metadata().xattrs()[0].name.as_ptr(),
+            destination_xattr_name_pointer
+        );
+        assert_eq!(
+            charged.entries()[1].metadata().xattrs()[0].value.as_ptr(),
+            destination_xattr_value_pointer
+        );
+        let ChargedManifestPayloadV1::Directory { children } = charged.entries()[0].payload()
+        else {
+            panic!("root must be a directory");
+        };
+        assert_eq!(
+            children.as_slice()[0].name.as_ptr(),
+            source_basename_pointer
+        );
+        let ChargedManifestPayloadV1::Regular {
+            content_digest,
+            data_extents,
+        } = charged.entries()[1].payload()
+        else {
+            panic!("file must be regular");
+        };
+        let ManifestPayloadV1::Regular {
+            content_digest: legacy_content_digest,
+            ..
+        } = &legacy.entries[1].payload
+        else {
+            panic!("legacy fixture must be regular");
+        };
+        assert_eq!(content_digest, legacy_content_digest);
+        assert_eq!(data_extents.as_ptr(), destination_extent_pointer);
+        assert_eq!(
+            charged.entries()[0].node_digest(),
+            legacy.entries[0].node_digest
+        );
+        assert_eq!(charged.root_digest(), legacy.root_digest);
+    }
+
+    #[test]
+    fn charged_nested_and_hardlink_manifests_match_the_legacy_oracle() {
+        type Fixture = fn(u8) -> (SourceTreePlanV1, SourceTreePlanV1);
+        for fixture in [nested_fixture as Fixture, hardlink_fixture as Fixture] {
+            let (source_s1, destination_d1) = fixture(0xa1);
+            let (source_s2, destination_d2) = fixture(0xa1);
+            let (legacy_source, legacy_destination) = fixture(0xa1);
+            let legacy = compile_tree_manifest(
+                legacy_source,
+                legacy_destination,
+                workspace_path(),
+                TreeRoleV1::Workspace,
+            )
+            .unwrap();
+            let expected_canonical = legacy_canonical_bytes(&legacy);
+            let resources = manifest_resources(4 * 1024 * 1024);
+            let stable = stable_projection(
+                &resources,
+                source_s1,
+                source_s2,
+                destination_d1,
+                destination_d2,
+            );
+            let mount = workspace_path();
+            let charged = compile_charged(&resources, stable, &mount).unwrap();
+            assert_eq!(charged.canonical_bytes(), expected_canonical);
+            assert_eq!(charged.root_digest(), legacy.root_digest);
+            assert_eq!(charged.entries().len(), legacy.entries.len());
+            for (charged_entry, legacy_entry) in charged.entries().iter().zip(legacy.entries.iter())
+            {
+                assert_eq!(charged_entry.relative_path(), legacy_entry.relative_path);
+                assert_eq!(charged_entry.node_digest(), legacy_entry.node_digest);
+                assert_eq!(charged_entry.hardlink_group(), legacy_entry.hardlink_group);
+                assert_eq!(charged_entry.payload().kind(), legacy_entry.payload.kind());
+            }
+            if legacy.entries.len() == 3 && legacy.entries[1].relative_path == b"dir" {
+                let ChargedManifestPayloadV1::Directory { children } =
+                    charged.entries()[1].payload()
+                else {
+                    panic!("nested entry must be a directory");
+                };
+                assert_eq!(
+                    children.as_slice()[0].node_digest,
+                    charged.entries()[2].node_digest()
+                );
+            } else {
+                let group = charged.entries()[1]
+                    .hardlink_group()
+                    .expect("hardlink entry must carry its group digest");
+                assert_eq!(charged.entries()[2].hardlink_group(), Some(group));
+                assert_eq!(
+                    charged.entries()[1].node_digest(),
+                    charged.entries()[2].node_digest()
+                );
+            }
+            drop(charged);
+            assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+            assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+        }
+    }
+
+    #[test]
+    fn symlink_payload_move_and_digest_match_without_verifier_admission() {
+        // The current verified profile intentionally refuses symlink
+        // materialization before it can mint a stable projection. Exercise
+        // the compiler's move-only payload representation directly so future
+        // admission cannot regress to cloning this plan-owned buffer.
+        let (source, destination) = rich_fixture(b"file");
+        let target_pointer = match destination.entries()[2].payload() {
+            SourcePlanPayloadV1::Symlink { target } => target.as_ptr(),
+            _ => panic!("fixture must be a symlink"),
+        };
+        let (legacy_source, legacy_destination) = rich_fixture(b"file");
+        let legacy = compile_tree_manifest(
+            legacy_source,
+            legacy_destination,
+            workspace_path(),
+            TreeRoleV1::Workspace,
+        )
+        .unwrap();
+        let resources = manifest_resources(4 * 1024 * 1024);
+        let (_, source_entries, _, _) = source.into_parts();
+        let source_entry = source_entries.into_vec().into_iter().nth(2).unwrap();
+        let (_, _, _, source_statx, _, source_payload, _) = source_entry.into_parts();
+        assert!(matches!(
+            source_payload,
+            SourcePlanPayloadV1::Symlink { .. }
+        ));
+        let (_, destination_entries, _, _) = destination.into_parts();
+        let destination_entry = destination_entries.into_vec().into_iter().nth(2).unwrap();
+        let (_, _, _, _, _, destination_payload, _) = destination_entry.into_parts();
+        let SourcePlanPayloadV1::Symlink { target } = destination_payload else {
+            panic!("fixture must be a symlink");
+        };
+        let (mode, logical_uid, logical_gid, nlink, size, atime, mtime, ctime, btime) =
+            source_statx.into_manifest_parts();
+        let metadata = ChargedManifestMetadataV1 {
+            mode,
+            logical_uid,
+            logical_gid,
+            size,
+            nlink,
+            atime,
+            mtime,
+            ctime,
+            btime,
+            xattrs: manifest_compilation_session_for_test(&resources)
+                .charged_vec(0)
+                .unwrap(),
+        };
+        let payload = ChargedManifestPayloadV1::Symlink { target };
+        let digest = canonical::derive_manifest_node_digest_projection_streaming_v1(
+            metadata.projection(),
+            payload.projection(),
+            None,
+        )
+        .unwrap();
+        let ChargedManifestPayloadV1::Symlink { target } = &payload else {
+            panic!("charged payload must be a symlink");
+        };
+        assert_eq!(target.as_ptr(), target_pointer);
+        assert_eq!(digest, legacy.entries[2].node_digest);
+        drop(payload);
+        drop(metadata);
+    }
+
+    #[test]
+    fn charged_compiler_preserves_raw_names_end_to_end() {
+        let resources = manifest_resources(4 * 1024 * 1024);
+        let mount = workspace_path();
+        let (source_s1, destination_d1) = fixture(0x63, b"\xff");
+        let (source_s2, destination_d2) = fixture(0x63, b"\xff");
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        assert_eq!(charged.entries()[1].relative_path(), b"\xff");
+        let ChargedManifestPayloadV1::Directory { children } = charged.entries()[0].payload()
+        else {
+            panic!("root must be a directory");
+        };
+        assert_eq!(children.as_slice()[0].name, b"\xff");
+    }
+
+    #[test]
+    fn full_compiler_exact_boundaries_cover_hardlinks_and_nested_xattrs() {
+        assert_full_compiler_exact_boundary(hardlink_fixture, 0x52);
+        assert_full_compiler_exact_boundary(nested_xattr_fixture, 0x54);
+    }
+
+    #[test]
+    fn hardlink_path_phase_has_an_exact_and_one_byte_short_boundary() {
+        let (source, _) = hardlink_fixture(0x53);
+        let group_bytes = u64::try_from(source.hardlink_groups().len()).unwrap()
+            * u64::try_from(std::mem::size_of::<HardlinkGroupDigest>()).unwrap();
+        let path_bytes = u64::try_from(source.hardlink_groups()[0].member_indices().len()).unwrap()
+            * u64::try_from(std::mem::size_of::<&[u8]>()).unwrap();
+        let exact = group_bytes + path_bytes;
+        let resources = manifest_resources(exact);
+        let digests = compile_hardlink_group_digests_charged(
+            &manifest_compilation_session_for_test(&resources),
+            source.entries(),
+            source.hardlink_groups(),
+        )
+        .unwrap();
+        assert_eq!(digests.as_slice().len(), 1);
+        assert_eq!(
+            resources.persistent_manifest_heap_live_for_test(),
+            group_bytes
+        );
+        drop(digests);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+
+        let resources = manifest_resources(exact - 1);
+        let error = match compile_hardlink_group_digests_charged(
+            &manifest_compilation_session_for_test(&resources),
+            source.entries(),
+            source.hardlink_groups(),
+        ) {
+            Ok(_) => panic!("one-byte-short hardlink path budget must refuse"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            SnapshotManifestCompileErrorV1::Resource(
+                SnapshotPipelineResourceErrorV1::PersistentManifestHeapCapacityExceeded { .. }
+            )
+        ));
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+    }
+
+    #[test]
+    fn foreign_session_cannot_consume_a_stable_projection() {
+        let owner = manifest_resources(4 * 1024 * 1024);
+        let foreign = manifest_resources(4 * 1024 * 1024);
+        let (source_s1, destination_d1) = fixture(0x61, b"file");
+        let (source_s2, destination_d2) = fixture(0x61, b"file");
+        let stable =
+            stable_projection(&owner, source_s1, source_s2, destination_d1, destination_d2);
+        let mount = workspace_path();
+        let error = match compile_tree_manifest_charged(
+            &manifest_compilation_session_for_test(&foreign),
+            stable,
+            &mount,
+            TreeRoleV1::Workspace,
+        ) {
+            Ok(_) => panic!("foreign session must refuse stable proof"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SnapshotManifestCompileErrorV1::AuthorityMismatch);
+        assert_eq!(owner.retained_view_heap_live_for_test(), 0);
+        assert_eq!(foreign.persistent_manifest_heap_live_for_test(), 0);
+    }
+
+    #[test]
+    fn semantic_walk_rejects_hidden_unsettable_xattr_before_allocation() {
+        let root = |source| {
+            SourceTreeEntryV1::unchecked_for_test(
+                b"",
+                b"source-root",
+                None,
+                statx(source, 1, S_IFDIR | 0o555, 2, 4_096, 1, 2, 3, None),
+                vec![CapturedXattrV1::unsettable_for_test(
+                    b"security.again",
+                    libc::EPERM,
+                )],
+                SourcePlanPayloadV1::Directory {
+                    children: Vec::new().into_boxed_slice(),
+                },
+                None,
+            )
+        };
+        // Deliberately lie in the plan-level summary flag; the entry walk must
+        // still inspect the typed value rather than trusting the summary.
+        let source = SourceTreePlanV1::unchecked_for_test(
+            b"source-root",
+            vec![root(true)],
+            Vec::new(),
+            false,
+        );
+        let destination = SourceTreePlanV1::unchecked_for_test(
+            b"source-root",
+            vec![root(false)],
+            Vec::new(),
+            false,
+        );
+        assert_eq!(
+            validate_charged_manifest_projection_pair(&source, &destination).unwrap_err(),
+            SnapshotManifestCompileErrorV1::VisibleXattrUnrepresentable
+        );
+    }
+
+    #[test]
+    fn malformed_backlink_root_name_extent_and_hardlink_identity_are_rejected() {
+        assert_eq!(
+            validate_charged_extent_sequence(
+                &[
+                    ExtentV1 {
+                        offset: 0,
+                        length: 2,
+                    },
+                    ExtentV1 {
+                        offset: 2,
+                        length: 2,
+                    },
+                ],
+                4,
+            )
+            .unwrap_err(),
+            SnapshotManifestCompileErrorV1::MalformedPlan
+        );
+
+        let bad_root = |source| {
+            SourceTreePlanV1::unchecked_for_test(
+                b".",
+                vec![directory_entry(source, b"", b".", None, 1, Vec::new())],
+                Vec::new(),
+                false,
+            )
+        };
+        assert_eq!(
+            validate_charged_manifest_projection_pair(&bad_root(true), &bad_root(false))
+                .unwrap_err(),
+            SnapshotManifestCompileErrorV1::MalformedPlan
+        );
+
+        let bad_parent = |source| {
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1]),
+                    SourceTreeEntryV1::unchecked_for_test(
+                        b"file",
+                        b"file",
+                        Some(9),
+                        statx(source, 2, S_IFREG | 0o444, 1, 4, 5, 6, 7, None),
+                        Vec::new(),
+                        SourcePlanPayloadV1::Regular {
+                            evidence: regular_evidence(0x71, 4),
+                        },
+                        None,
+                    ),
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        assert_eq!(
+            validate_charged_manifest_projection_pair(&bad_parent(true), &bad_parent(false))
+                .unwrap_err(),
+            SnapshotManifestCompileErrorV1::MalformedPlan
+        );
+
+        let wrong_inode_group = |source| {
+            let root = directory_entry(source, b"", b"source-root", None, 1, vec![1, 2]);
+            let first = regular_entry(source, b"a", b"a", 0, 2, 2, 0x81, Some(0));
+            let second = regular_entry(source, b"b", b"b", 0, 2, 2, 0x81, Some(0));
+            let group = SourceHardlinkGroupV1::unchecked_for_test(
+                root.statx().inode_key().clone(),
+                vec![1, 2],
+            );
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![root, first, second],
+                vec![group],
+                false,
+            )
+        };
+        assert_eq!(
+            validate_charged_manifest_projection_pair(
+                &wrong_inode_group(true),
+                &wrong_inode_group(false),
+            )
+            .unwrap_err(),
+            SnapshotManifestCompileErrorV1::MalformedPlan
+        );
+    }
+
+    #[test]
+    fn malformed_verified_projection_releases_both_ledgers_on_refusal() {
+        let malformed = |source| {
+            let child = regular_entry(source, b"file", b"file", 0, 2, 1, 0xb1, None);
+            let (path, basename, _, statx, xattrs, payload, hardlink) = child.into_parts();
+            let child = SourceTreeEntryV1::unchecked_for_test(
+                &path,
+                &basename,
+                Some(9),
+                statx,
+                xattrs.into_vec(),
+                payload,
+                hardlink,
+            );
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1]),
+                    child,
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        let resources = manifest_resources(4 * 1024 * 1024);
+        let stable = stable_projection(
+            &resources,
+            malformed(true),
+            malformed(true),
+            malformed(false),
+            malformed(false),
+        );
+        let mount = workspace_path();
+        let error = match compile_charged(&resources, stable, &mount) {
+            Ok(_) => panic!("malformed parent backlink must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SnapshotManifestCompileErrorV1::MalformedPlan);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[test]
+    fn malformed_destination_semantics_refuse_before_allocation() {
+        let malformed_destination = || {
+            let (_, destination) = fixture(0xb2, b"file");
+            replace_root_statx(
+                destination,
+                SourceStatxV1::for_test(
+                    11,
+                    22,
+                    33,
+                    1,
+                    S_IFDIR | 0o555,
+                    1_000,
+                    2_000,
+                    2,
+                    8_192,
+                    time(1),
+                    time(2),
+                    TimespecV1 {
+                        seconds: 300,
+                        nanoseconds: 1_000_000_000,
+                    },
+                    Some(time(400)),
+                ),
+            )
+        };
+        let (source_s1, _) = fixture(0xb2, b"file");
+        let (source_s2, _) = fixture(0xb2, b"file");
+        // A zero-byte persistent envelope proves semantic refusal precedes
+        // every charged allocation, rather than merely releasing one later.
+        let resources = manifest_resources(0);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            malformed_destination(),
+            malformed_destination(),
+        );
+        let mount = workspace_path();
+        let error = match compile_charged(&resources, stable, &mount) {
+            Ok(_) => panic!("malformed D2 semantics must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, SnapshotManifestCompileErrorV1::MalformedPlan);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[test]
+    fn charged_result_is_linear_and_drop_releases_both_ledgers() {
+        trait AmbiguousIfClone<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        trait AmbiguousIfCopy<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+        impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+
+        <ChargedTreeManifestV1<'static, 'static> as AmbiguousIfClone<_>>::probe();
+        <ChargedTreeManifestV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<
+            ChargedTreeManifestV1<'static, 'static>,
+        >());
+
+        let resources = manifest_resources(4 * 1024 * 1024);
+        let (source_s1, destination_d1) = fixture(0x91, b"file");
+        let (source_s2, destination_d2) = fixture(0x91, b"file");
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let mount = workspace_path();
+        let charged = compile_charged(&resources, stable, &mount).unwrap();
+        assert!(resources.persistent_manifest_heap_live_for_test() > 0);
+        assert_eq!(
+            resources.retained_view_heap_live_for_test(),
+            2 * 1024 * 1024
+        );
+        drop(charged);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
     }
 }

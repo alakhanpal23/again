@@ -365,6 +365,10 @@ impl SnapshotResourcePolicyV1 {
     ///
     /// The long argument list is intentional: there are no defaults and no
     /// independently constructible sub-policies whose values could diverge.
+    /// Per-field hard ceilings are denial-of-service bounds, not a promise
+    /// that one input saturating every independent maximum can complete every
+    /// phase. Exact phase allocations still refuse against their selected
+    /// class ledger.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn checked(
         max_depth: u16,
@@ -1103,6 +1107,12 @@ impl Drop for SnapshotRetainedViewLeaseV1<'_> {
     }
 }
 
+impl SnapshotRetainedViewLeaseV1<'_> {
+    pub(super) fn belongs_to(&self, resources: &SnapshotPipelineResourcesV1) -> bool {
+        std::ptr::eq(self.resources, resources)
+    }
+}
+
 impl SnapshotFinalizationAttemptReservationV1<'_> {
     /// Charges one escrowed attempt before invoking `attempt`.
     ///
@@ -1316,6 +1326,10 @@ impl<'resources, T> SnapshotManifestCompilationVecV1<'resources, T> {
 
     pub(super) fn as_slice(&self) -> &[T] {
         &self.values
+    }
+
+    pub(super) fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.values
     }
 }
 

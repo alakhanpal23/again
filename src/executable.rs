@@ -472,7 +472,7 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn accepts_exact_audited_codex_rg_when_present() {
+    fn codex_bundled_rg_is_accepted_only_when_exact_audited_bytes_are_present() {
         if host_audited_apple_profile().is_err() {
             return;
         }
@@ -485,13 +485,39 @@ mod tests {
             return;
         };
         let path = std::fs::canonicalize(path).unwrap();
-        let identity = verify_executable("rg", &path).unwrap();
-        assert_eq!(identity.tool, ToolKind::Rg);
-        assert_eq!(identity.provenance, ExecutableProvenance::OpenAiCodexBundle);
-        assert_eq!(
-            identity.semantic_profile,
-            format!("{MACOS_SYSTEM_PROFILE_ID}+{CODEX_RG_PROFILE_ID}")
-        );
+        // Keep this expectation independent from `hash_file_bounded`, which is
+        // part of the admission implementation under test. The `take` keeps a
+        // changed or adversarial fixture from making the test allocate without
+        // the executable-size bound.
+        let mut audited_candidate = Vec::new();
+        std::fs::File::open(&path)
+            .unwrap()
+            .take(MAX_AUDITED_EXECUTABLE_BYTES + 1)
+            .read_to_end(&mut audited_candidate)
+            .unwrap();
+        assert!(audited_candidate.len() as u64 <= MAX_AUDITED_EXECUTABLE_BYTES);
+        let has_exact_audited_bytes =
+            blake3::hash(&audited_candidate).to_hex().as_str() == CODEX_RG_BLAKE3;
+        match (has_exact_audited_bytes, verify_executable("rg", &path)) {
+            (true, Ok(identity)) => {
+                assert_eq!(identity.tool, ToolKind::Rg);
+                assert_eq!(identity.provenance, ExecutableProvenance::OpenAiCodexBundle);
+                assert_eq!(
+                    identity.semantic_profile,
+                    format!("{MACOS_SYSTEM_PROFILE_ID}+{CODEX_RG_PROFILE_ID}")
+                );
+            }
+            // Codex may update or re-sign its bundled binary independently of
+            // Again. An otherwise recognized bundle with unreviewed bytes must
+            // remain an explicit fail-closed negative lane, not make the suite
+            // assume that any Codex-bundled `rg` is the audited executable.
+            (false, Err(VerifyError::ContentDigestMismatch)) => {}
+            (true, Err(error)) => {
+                panic!("exact audited Codex rg bytes must verify successfully: {error}")
+            }
+            (false, Ok(_)) => panic!("unreviewed Codex rg bytes must fail closed"),
+            (false, Err(error)) => panic!("unexpected Codex rg verification result: {error}"),
+        }
     }
 
     #[cfg(target_os = "macos")]

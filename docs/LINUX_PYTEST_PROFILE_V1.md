@@ -76,14 +76,14 @@ uses state-aware `renameat2(..., RENAME_NOREPLACE)` reconciliation, fsyncs the
 parent, reopens the final name, and binds the original and reopened identities.
 Success returns only an opaque `PublishedSnapshotDirectoryV1`.
 
-A separate pure compiler now consumes a logical source plan and an equal
-destination-byte plan into the existing `TreeManifestV1`. It computes real
-node digests bottom-up, uses source logical metadata, and moves destination
-payload and xattr evidence. It does not create another manifest model or any
-authority type. The compiler is intentionally not connector-wired: its
-manifest containers and the existing canonical hash helpers still have
-uncharged nested allocation paths, and the publication result still owns the
-outer container rather than a manifest-bound tree-root descriptor.
+A separate production-shaped compiler can consume only the verifier-minted
+stable S1/D2 projection. It computes real node and hard-link digests
+bottom-up, uses source logical metadata, moves destination payload and xattr
+evidence under the retained-view leases, charges each new outer allocation to
+the persistent-manifest ledger, and retains exact canonical tree bytes plus
+the 102-byte D2 `SourceStatxV1` commitment. It creates data, not authority. The current
+connector intentionally does not call it: publication still returns the outer
+container rather than a canonical-evidence-bound tree-root descriptor.
 
 This physical publication checkpoint does not construct or authenticate the
 canonical snapshot manifest, compute a snapshot digest, choose a
