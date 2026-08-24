@@ -12,6 +12,120 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-capability-evidence:
+    name: Linux capability inventory (non-qualifying; 77 accepted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal
+      - name: Build the independent read-only capability probe
+        run: rustc +1.88.0 --edition 2024 -D warnings ci/linux_capability_probe.rs -o linux-capability-probe
+      - name: Collect typed hosted Linux capability evidence
+        id: capability-probe
+        shell: bash
+        run: |
+          set +e
+          ./linux-capability-probe > linux-capability-report.json
+          probe_exit=$?
+          set -e
+          echo "exit_code=${probe_exit}" >> "${GITHUB_OUTPUT}"
+          jq -e --argjson probe_exit "${probe_exit}" '
+            def integer: type == "number" and . == floor;
+            (keys == [
+              "platform", "process", "results", "runner", "schema", "scope",
+              "security", "summary"
+            ])
+            and .schema == "again.linux-capability-evidence.v1"
+            and (.scope | type == "object"
+              and keys == ["host_policy_mutated", "kind", "profile_qualification"]
+              and .kind == "hosted_ci_capability_evidence"
+              and .profile_qualification == false
+              and .host_policy_mutated == false)
+            and (.runner | type == "object"
+              and has("image_os") and has("image_version")
+              and has("runner_os") and has("runner_arch") and has("github_sha"))
+            and (.platform | type == "object"
+              and .os == "linux" and (.arch | type == "string")
+              and has("kernel_release") and has("kernel_version") and has("glibc"))
+            and (.process | type == "object"
+              and (.uid | integer) and (.euid | integer)
+              and (.gid | integer) and (.egid | integer)
+              and (.capabilities | type == "object")
+              and has("no_new_privs") and has("seccomp") and has("seccomp_filters"))
+            and (.security | type == "object"
+              and has("lsm") and has("apparmor_profile") and (.sysctls | type == "object"))
+            and (.results | type == "object")
+            and (.results | keys == [
+              "close_range_unshare",
+              "landlock_abi",
+              "openat2",
+              "ordinary_unprivileged_user",
+              "user_namespace"
+            ])
+            and (all(.results[];
+              (keys == ["errno", "evidence", "reason", "stage", "status"])
+              and (.status == "supported" or .status == "unavailable" or .status == "broken")
+              and (.reason | type == "string" and length > 0)
+              and (.stage | type == "string" and length > 0)
+              and (.errno == null or (.errno | integer))
+              and (.evidence | type == "object")
+            ))
+            and (.summary | type == "object"
+              and keys == ["broken", "exit_code", "supported", "unavailable"]
+              and (.supported | integer) and .supported >= 0
+              and (.unavailable | integer) and .unavailable >= 0
+              and (.broken | integer) and .broken >= 0
+              and (.exit_code | integer))
+            and (.summary.supported + .summary.unavailable + .summary.broken == 5)
+            and .summary.exit_code == $probe_exit
+            and .summary.supported == ([.results[].status | select(. == "supported")] | length)
+            and .summary.unavailable == ([.results[].status | select(. == "unavailable")] | length)
+            and .summary.broken == ([.results[].status | select(. == "broken")] | length)
+            and (
+              (.summary.broken > 0 and $probe_exit == 1)
+              or (.summary.broken == 0 and .summary.unavailable > 0 and $probe_exit == 77)
+              or (.summary.broken == 0 and .summary.unavailable == 0 and $probe_exit == 0)
+            )
+          ' linux-capability-report.json > /dev/null
+          case "${probe_exit}" in
+            0)
+              echo "Five narrow hosted-runner probes passed; linux-pytest-v1 remains NOT QUALIFIED."
+              {
+                echo "### Linux capability inventory"
+                echo "✅ Five narrow probes passed. **linux-pytest-v1 remains NOT QUALIFIED.**"
+                echo "This informational lane cannot qualify the execution profile."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              ;;
+            77)
+              echo "::warning::At least one hosted-runner capability is unavailable; linux-pytest-v1 remains NOT QUALIFIED."
+              {
+                echo "### Linux capability inventory"
+                echo "⚠️ At least one narrow probe is unavailable. **linux-pytest-v1 remains NOT QUALIFIED.**"
+                echo "Exit 77 is accepted only for this non-qualifying evidence lane; inspect the report artifact."
+              } >> "${GITHUB_STEP_SUMMARY}"
+              ;;
+            *)
+              echo "::error::Hosted Linux capability probe found a broken invariant (exit ${probe_exit})."
+              {
+                echo "### Linux capability inventory"
+                echo "❌ A probe invariant is broken (exit ${probe_exit}). **linux-pytest-v1 remains NOT QUALIFIED.**"
+              } >> "${GITHUB_STEP_SUMMARY}"
+              exit "${probe_exit}"
+              ;;
+          esac
+      - name: Upload the hosted Linux capability report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-capability-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: linux-capability-report.json
+          if-no-files-found: error
+          retention-days: 30
+
   test:
     strategy:
       fail-fast: false
