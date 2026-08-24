@@ -64,8 +64,9 @@ Linux library lane passed 615 tests with 7 ignored and zero failures. This is
 positive evidence for the fixed negative-lane classifier and control framing,
 not for a private root, command execution, profile qualification, or reuse.
 
-The subsequent fixed child now contains the next no-command implementation
-slice: after the namespace, identity, UTS, and parent-death checks, it makes
+The subsequent fixed child contains the first no-command private-root
+implementation slice: after the namespace, identity, UTS, and parent-death
+checks, it makes
 mount propagation recursively private; mounts a fixed 16 MiB/4096-inode
 `nodev,nosuid,noswap` tmpfs over descriptor-checked `/tmp`; pivots into it;
 detaches the old-root pathname; reopens absolute `/`; and binds the final
@@ -83,6 +84,26 @@ jobs passed strict Clippy and the explicit 100,000-case gate, and the retained
 product artifact remained the exact earlier UTS-policy refusal with empty
 stderr. The run therefore confirms fail-closed compatibility while explicitly
 showing that stock CI did not execute the mount/pivot branch.
+
+Current source extends that same fixed child through the layout frozen in the
+normative profile without adding a command or authority surface. It uses
+child-local umask `0` for construction, then sets and verifies final umask
+`0077`. `/tmp`, `/run`, and `/home/again` become three independent writable
+`nodev,nosuid,noexec,noswap` tmpfs mounts, each capped at 4 MiB and 1024
+inodes. A fresh read-only `nodev,nosuid,noexec` procfs uses `subset=pid`,
+reports exact `self -> 1`, and must expose `/proc/1/ns/pid` as the same NSFS
+`CLONE_NEWPID` device/inode pinned from `/proc/self/ns/pid` before pivot. A
+final absolute-root reopen revalidates every constructed fixed path and mount.
+The success frame adds one combined layout/scratch/proc bit; OS and invariant
+failures retain the existing `mount_root_failed` / `child_mount_root` mapping.
+
+This is source-level implementation, not positive live runtime evidence:
+stock hosted Ubuntu still stops at UTS configuration before the root code.
+Malicious same-UID peers and host root remain outside the threat model. Fresh
+procfs still exposes diagnostic PID 1's live `fd`, `exe`, `maps`, and
+`map_files`; there is no workspace/runtime attachment, populated `/dev`, FD
+scrub, capability drop, Landlock, seccomp, command, Python, execution, or reuse
+authority.
 
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical

@@ -9,9 +9,11 @@ environment normalization, comparison exclusions, and manifest commitments
 are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
 The crate-private execution profile remains unreachable from the CLI and no
 concrete profile implementation exists; pytest execution and reuse are not
-implemented. A hidden, fixed, no-command namespace-bootstrap diagnostic is
-non-qualifying and grants no execution authority. Descriptor-stable source
-enumeration, regular-file copying,
+implemented. A hidden, fixed, no-command diagnostic contains the implemented
+private-root, layout, scratch, and procfs slices described below. It remains
+non-qualifying and grants no execution authority; stock hosted Ubuntu refuses
+at UTS configuration before executing them, so they have no positive live
+runtime evidence. Descriptor-stable source enumeration, regular-file copying,
 connector-owned charged materialization, identity-checked atomic publication,
 and one shared resource contract exist as internal leaves. A no-atime
 source-view qualification path is also implemented as a crate-private leaf,
@@ -472,17 +474,40 @@ is narrow bootstrap evidence only: it neither qualifies the profile nor grants
 execution authority.
 
 After the verified child configures its fixed UTS state, the diagnostic's
-next fixed no-command slice makes the mount tree recursively private and uses
+fixed no-command root slice makes the mount tree recursively private and uses
 the pre-existing `/tmp` only as a descriptor-checked mountpoint. It mounts a
 new 16 MiB/4096-inode `nodev,nosuid,noswap` tmpfs there, enters it by pinned
 descriptor, pivots, detaches and removes the old-root pathname, reopens
 absolute `/`, and verifies the exact mount identity, tmpfs type, mode,
-ownership, flags, limits, and absence of `.oldroot`, `/proc`, `/dev`, and
-`/sys`. The exact success proof adds a distinct root bit; stale namespace-only
-success frames and malformed root failures are rejected. This proves pathname
-detachment only. Inherited descriptors and executable mappings remain outside
-the slice, and stock hosted Ubuntu currently refuses before reaching it, so it
-still grants no workload or profile authority.
+ownership, flags, limits, and initial absence of `.oldroot`, `/proc`, `/dev`,
+and `/sys`.
+
+Before pivot, the child pins `/proc/self/ns/pid` and requires NSFS plus
+`NS_GET_NSTYPE == CLONE_NEWPID`, retaining its exact device/inode identity.
+Inside the new root, child-local umask is set to `0` while it creates the fixed
+directories `/workspace` `0755`, `/tmp` `01777`, `/run` `0755`, `/home`
+`0755`, `/home/again` `0700`, `/proc` `0555`, and `/dev` `0755`; it then
+sets and verifies the final `0077` policy. `/tmp`, `/run`, and `/home/again`
+are separate writable tmpfs mounts, each capped at 4 MiB and 1024 inodes, with
+`nodev,nosuid,noexec,noswap`. Each must differ from its pre-mount target, and
+all three must have distinct nonzero mount IDs and device tuples. The child
+mounts a fresh read-only `nodev,nosuid,noexec` procfs with `subset=pid`,
+requires its exact `self` link to be `1`, and verifies that `/proc/1/ns/pid` is
+the same NSFS `CLONE_NEWPID` device/inode pinned before pivot. A final absolute
+root reopen rechecks every constructed fixed path and mount, plus the absence
+of `.oldroot` and `/sys`.
+
+The exact success frame requires one additional combined layout/scratch/proc
+bit; stale root-only success frames are rejected. OS and invariant failures
+reuse `mount_root_failed` at `child_mount_root`; there is no new authority or
+caller-selected mount interface. Stock hosted Ubuntu currently refuses at UTS
+configuration before reaching the root or layout code, so no positive live
+root or layout evidence exists. The diagnostic makes no claim against
+malicious same-UID peers or host root. Its fresh procfs still exposes the
+diagnostic PID 1's live `fd`, `exe`, `maps`, and `map_files` surfaces because
+FD scrub and executable mapping replacement are not implemented. It has no
+descriptor-selected workspace/runtime attachment, populated `/dev` endpoints, capability drop,
+Landlock, seccomp, command, Python, execution authority, or reuse authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
@@ -518,6 +543,9 @@ or tear down one required namespace is a refusal or incomplete execution,
 never a reusable result.
 
 ## File-descriptor boundary
+
+This boundary is not implemented; the following text specifies required
+behavior, not current behavior.
 
 The setup child finishes mounts and Landlock setup, closes every internal
 ruleset, mount, directory, namespace, and control descriptor, then calls:
