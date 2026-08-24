@@ -408,6 +408,19 @@ pub(super) struct SourceInodeKeyV1 {
     inode: u64,
 }
 
+impl SourceInodeKeyV1 {
+    /// Fixed-width physical identity used only by stability witnesses and
+    /// connector-local commitments. It is never portable manifest metadata.
+    fn commitment_bytes_v1(&self) -> [u8; 24] {
+        let mut output = [0u8; 24];
+        output[0..8].copy_from_slice(&self.mount_id.to_le_bytes());
+        output[8..12].copy_from_slice(&self.device_major.to_le_bytes());
+        output[12..16].copy_from_slice(&self.device_minor.to_le_bytes());
+        output[16..24].copy_from_slice(&self.inode.to_le_bytes());
+        output
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceStatxV1 {
     inode_key: SourceInodeKeyV1,
@@ -429,10 +442,7 @@ impl SourceStatxV1 {
     pub(super) fn commitment_bytes_v1(&self) -> [u8; 102] {
         let mut output = [0u8; 102];
         output[0] = 1;
-        output[1..9].copy_from_slice(&self.inode_key.mount_id.to_le_bytes());
-        output[9..13].copy_from_slice(&self.inode_key.device_major.to_le_bytes());
-        output[13..17].copy_from_slice(&self.inode_key.device_minor.to_le_bytes());
-        output[17..25].copy_from_slice(&self.inode_key.inode.to_le_bytes());
+        output[1..25].copy_from_slice(&self.inode_key.commitment_bytes_v1());
         output[25..29].copy_from_slice(&self.mode.to_le_bytes());
         output[29..33].copy_from_slice(&self.uid.to_le_bytes());
         output[33..37].copy_from_slice(&self.gid.to_le_bytes());
@@ -448,6 +458,25 @@ impl SourceStatxV1 {
             output[89] = 1;
             output[90..98].copy_from_slice(&btime.seconds.to_le_bytes());
             output[98..102].copy_from_slice(&btime.nanoseconds.to_le_bytes());
+        }
+        output
+    }
+
+    /// Exact destination-only fields omitted by the logical
+    /// source-to-destination projection. Keeping these raw bytes lets D1 be
+    /// released before D2 without replacing equality with a hash assumption.
+    fn destination_stability_bytes_v1(&self, kind: SourceNodeKindV1) -> [u8; 57] {
+        let mut output = [0u8; 57];
+        output[0..24].copy_from_slice(&self.inode_key.commitment_bytes_v1());
+        if kind == SourceNodeKindV1::Directory {
+            output[24..32].copy_from_slice(&self.size.to_le_bytes());
+        }
+        output[32..40].copy_from_slice(&self.ctime.seconds.to_le_bytes());
+        output[40..44].copy_from_slice(&self.ctime.nanoseconds.to_le_bytes());
+        if let Some(btime) = &self.btime {
+            output[44] = 1;
+            output[45..53].copy_from_slice(&btime.seconds.to_le_bytes());
+            output[53..57].copy_from_slice(&btime.nanoseconds.to_le_bytes());
         }
         output
     }
@@ -527,6 +556,28 @@ impl SourceStatxV1 {
     pub(super) const fn btime(&self) -> Option<&TimespecV1> {
         self.btime.as_ref()
     }
+
+    /// Move the logical metadata fields that are committed by a snapshot
+    /// manifest. Physical inode and mount identity deliberately stay behind:
+    /// they are stability evidence, not portable snapshot semantics.
+    pub(super) fn into_manifest_parts(
+        self,
+    ) -> (
+        u32,
+        u32,
+        u32,
+        u64,
+        u64,
+        TimespecV1,
+        TimespecV1,
+        TimespecV1,
+        Option<TimespecV1>,
+    ) {
+        (
+            self.mode, self.uid, self.gid, self.nlink, self.size, self.atime, self.mtime,
+            self.ctime, self.btime,
+        )
+    }
 }
 
 /// A listed attribute whose value cannot be read is never silently dropped.
@@ -567,6 +618,10 @@ impl CapturedXattrV1 {
 
     pub(super) const fn value(&self) -> &CapturedXattrValueV1 {
         &self.value
+    }
+
+    pub(super) fn into_parts(self) -> (Box<[u8]>, CapturedXattrValueV1) {
+        (self.name, self.value)
     }
 }
 
@@ -643,6 +698,10 @@ impl SourceRegularEvidenceV1 {
 
     pub(super) fn data_extents(&self) -> &[ExtentV1] {
         &self.data_extents
+    }
+
+    pub(super) fn into_parts(self) -> (FileContentDigest, Vec<ExtentV1>) {
+        (self.content_digest, self.data_extents)
     }
 }
 
@@ -777,6 +836,37 @@ impl SourceTreeEntryV1 {
     pub(super) const fn hardlink_group(&self) -> Option<u32> {
         self.hardlink_group
     }
+
+    /// Encode the exact physical fields omitted by the logical destination
+    /// projection. The node kind comes from this same observation, so callers
+    /// cannot splice directory-size policy from another entry.
+    pub(super) fn destination_stability_bytes_v1(&self) -> [u8; 57] {
+        self.statx
+            .destination_stability_bytes_v1(self.payload.kind())
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Box<[u8]>,
+        Box<[u8]>,
+        Option<u32>,
+        SourceStatxV1,
+        Box<[CapturedXattrV1]>,
+        SourcePlanPayloadV1,
+        Option<u32>,
+    ) {
+        (
+            self.relative_path,
+            self.basename,
+            self.parent_index,
+            self.statx,
+            self.xattrs,
+            self.payload,
+            self.hardlink_group,
+        )
+    }
 }
 
 #[derive(Eq, PartialEq)]
@@ -786,12 +876,27 @@ pub(super) struct SourceHardlinkGroupV1 {
 }
 
 impl SourceHardlinkGroupV1 {
+    #[cfg(test)]
+    pub(super) fn unchecked_for_test(
+        inode_key: SourceInodeKeyV1,
+        member_indices: Vec<u32>,
+    ) -> Self {
+        Self {
+            inode_key,
+            member_indices: member_indices.into_boxed_slice(),
+        }
+    }
+
     pub(super) const fn inode_key(&self) -> &SourceInodeKeyV1 {
         &self.inode_key
     }
 
     pub(super) fn member_indices(&self) -> &[u32] {
         &self.member_indices
+    }
+
+    pub(super) fn destination_stability_bytes_v1(&self) -> [u8; 24] {
+        self.inode_key.commitment_bytes_v1()
     }
 }
 
@@ -858,6 +963,23 @@ impl SourceTreePlanV1 {
 
     pub(super) const fn has_unsettable_xattrs(&self) -> bool {
         self.has_unsettable_xattrs
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(super) fn into_parts(
+        self,
+    ) -> (
+        Box<[u8]>,
+        Box<[SourceTreeEntryV1]>,
+        Box<[SourceHardlinkGroupV1]>,
+        bool,
+    ) {
+        (
+            self.root_name,
+            self.entries,
+            self.hardlink_groups,
+            self.has_unsettable_xattrs,
+        )
     }
 }
 

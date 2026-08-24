@@ -11,6 +11,10 @@ tracer, storage, and worker implementations do not exist. A narrow
 crate-private physical-publication checkpoint is implemented; its mechanics
 and limits are specified by the
 [profile contract](LINUX_PYTEST_PROFILE_V1.md#charged-publication-checkpoint).
+A pure crate-private compiler can project already-equal logical-source and
+destination plans into the frozen `TreeManifestV1` data model, but it is not
+wired into the connector or publication path because its nested allocation
+envelope and tree-root descriptor binding are not complete.
 
 For this wire contract, its `PublishedSnapshotDirectoryV1` result is opaque
 and creates no canonical object, manifest, digest, or content-addressed name.

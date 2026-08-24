@@ -54,8 +54,17 @@ directory and regular-file content reads use `O_NOATIME`, and a destination
 symlink is refused after descriptor-selected type identification but before
 xattr or target acquisition, including before `readlinkat`. The connector
 compares S1/S2, S1/D1 with the stage's expected physical owner, and D1/D2, in
-that order. It drops S2 before D1, S1 before D2, and every remaining plan
-before finalization, so at most two retained-view leases coexist. The
+that order. It drops S2 before D1. After S1/D1 succeeds, the connector records
+only the exact D1 fields omitted by the logical projection: 57 raw bytes per
+entry for physical inode identity, directory size, ctime, and optional btime,
+plus 24 raw inode-identity bytes per hard-link group. This `57N + 24G` buffer
+is charged to the destination-observation transient heap through that exact
+connector session; it is not a hash or a retained-view lease. D1 is then
+dropped before D2. The D1/D2 comparator reconstructs the prior full-plan
+field order from S1 plus the raw witness, preserving exact mismatch locations
+while S1 remains available for future logical-manifest projection. It drops
+D2, S1, and the witness before finalization, so at most two retained-view
+leases coexist. The
 D2-complete cleanup guard remains private to the connector and flows
 immediately into a no-argument reservation bound to its embedded publication
 session. That reservation takes the leaf policy's exact worst-case raw-attempt
@@ -66,6 +75,15 @@ adjacent pre-rename identity check,
 uses state-aware `renameat2(..., RENAME_NOREPLACE)` reconciliation, fsyncs the
 parent, reopens the final name, and binds the original and reopened identities.
 Success returns only an opaque `PublishedSnapshotDirectoryV1`.
+
+A separate pure compiler now consumes a logical source plan and an equal
+destination-byte plan into the existing `TreeManifestV1`. It computes real
+node digests bottom-up, uses source logical metadata, and moves destination
+payload and xattr evidence. It does not create another manifest model or any
+authority type. The compiler is intentionally not connector-wired: its
+manifest containers and the existing canonical hash helpers still have
+uncharged nested allocation paths, and the publication result still owns the
+outer container rather than a manifest-bound tree-root descriptor.
 
 This physical publication checkpoint does not construct or authenticate the
 canonical snapshot manifest, compute a snapshot digest, choose a

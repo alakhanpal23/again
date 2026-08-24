@@ -274,6 +274,49 @@ pub(super) struct SnapshotDestinationObservationSessionV1<'resources> {
     policy: &'resources SourceEnumerationPolicyV1,
 }
 
+/// Connector-minted storage for the exact destination-stability witness.
+///
+/// The private charged container and constructor structurally bind every
+/// instance to the destination-observation stage. The verifier can only fill
+/// the initially empty, exactly precharged byte buffer and later inspect the
+/// bytes it filled; it cannot substitute raw pipeline resource authority.
+pub(super) struct SnapshotDestinationWitnessBytesV1<'resources> {
+    bytes: SnapshotChargedBytesV1<'resources>,
+}
+
+impl<'resources> SnapshotDestinationWitnessBytesV1<'resources> {
+    fn with_exact_capacity(
+        resources: &'resources SnapshotPipelineResourcesV1,
+        capacity: usize,
+    ) -> Result<Self, SnapshotPipelineResourceErrorV1> {
+        resources
+            .charged_forward_bytes(
+                SnapshotPipelineForwardStageV1::DestinationObservation,
+                capacity,
+            )
+            .map(|bytes| Self { bytes })
+    }
+
+    pub(super) fn try_extend_from_slice(
+        &mut self,
+        values: &[u8],
+    ) -> Result<(), SnapshotPipelineResourceErrorV1> {
+        self.bytes.try_extend_from_slice(values)
+    }
+
+    pub(super) fn as_slice(&self) -> &[u8] {
+        self.bytes.as_slice()
+    }
+}
+
+#[cfg(test)]
+pub(super) fn mint_destination_witness_bytes_for_test(
+    resources: &SnapshotPipelineResourcesV1,
+    capacity: usize,
+) -> Result<SnapshotDestinationWitnessBytesV1<'_>, SnapshotPipelineResourceErrorV1> {
+    SnapshotDestinationWitnessBytesV1::with_exact_capacity(resources, capacity)
+}
+
 /// Connector-minted authority for materializer-local and regular-copy attempts
 /// in one sequential, connector-owned traversal.
 ///
@@ -335,6 +378,14 @@ impl<'resources> SnapshotDestinationObservationSessionV1<'resources> {
             SnapshotPipelineForwardStageV1::DestinationObservation,
             attempt,
         )
+    }
+
+    fn charged_stability_witness_bytes(
+        &self,
+        capacity: usize,
+    ) -> Result<SnapshotDestinationWitnessBytesV1<'resources>, SnapshotPipelineResourceErrorV1>
+    {
+        SnapshotDestinationWitnessBytesV1::with_exact_capacity(self.resources, capacity)
     }
 }
 
@@ -676,7 +727,13 @@ impl SnapshotConnectorV1 {
                 DestinationPhysicalIdentityV1::new(uid, gid),
             )
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
-        drop(source_s1);
+        let destination_observation = self.destination_observation_session();
+        let destination_stable = destination_stable
+            .capture_stability_witness(|capacity| {
+                destination_observation.charged_stability_witness_bytes(capacity)
+            })
+            .map_err(SnapshotPipelineFourViewErrorV1::Resource)?;
+        drop(destination_d1);
 
         let destination_d2 = self
             .observe_destination_tree_view_at(&staging, root_name)
@@ -690,7 +747,7 @@ impl SnapshotConnectorV1 {
             .compare_destination_d2(&destination_d2.plan)
             .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
         drop(destination_d2);
-        drop(destination_d1);
+        drop(source_s1);
 
         Ok(staging)
     }
@@ -1524,6 +1581,8 @@ mod tests {
         <SnapshotPublicationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotDestinationWitnessBytesV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotDestinationWitnessBytesV1<'static> as AmbiguousIfCopy<_>>::probe();
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
             <SnapshotDestinationObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
@@ -2269,6 +2328,50 @@ mod tests {
             );
             assert!(!invoked.get());
         }
+    }
+
+    #[test]
+    fn destination_witness_wrapper_fixes_stage_capacity_and_charge_lifetime() {
+        let mut inputs = Inputs::exact();
+        inputs.transient_heap_bytes = 3;
+        let resources = resources(inputs);
+
+        let mut witness = mint_destination_witness_bytes_for_test(&resources, 3).unwrap();
+        assert!(witness.as_slice().is_empty());
+        witness.try_extend_from_slice(b"abc").unwrap();
+        assert_eq!(witness.as_slice(), b"abc");
+        assert_eq!(
+            witness.try_extend_from_slice(b"d"),
+            Err(
+                SnapshotPipelineResourceErrorV1::ContainerCapacityLimitExceeded {
+                    stage: crate::linux_pytest::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                        SnapshotPipelineForwardStageV1::DestinationObservation,
+                    ),
+                    required: 4,
+                    limit: 3,
+                }
+            )
+        );
+
+        let concurrent_error = match mint_destination_witness_bytes_for_test(&resources, 1) {
+            Ok(_) => panic!("the live wrapper must retain its exact transient charge"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            concurrent_error,
+            SnapshotPipelineResourceErrorV1::TransientHeapCapacityExceeded {
+                stage: crate::linux_pytest::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::DestinationObservation,
+                ),
+                live: 3,
+                requested: 1,
+                limit: 3,
+            }
+        );
+
+        drop(witness);
+        let replacement = mint_destination_witness_bytes_for_test(&resources, 3).unwrap();
+        assert!(replacement.as_slice().is_empty());
     }
 
     #[test]

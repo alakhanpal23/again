@@ -65,6 +65,7 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 mod canonical;
 mod identity;
 mod snapshot_connector;
+mod snapshot_manifest;
 mod snapshot_materialize;
 mod snapshot_policy;
 mod snapshot_publish;
@@ -1117,62 +1118,83 @@ impl MetadataV1 {
 }
 
 impl ManifestEntryV1 {
+    fn with_computed_node_digest(
+        relative_path: Vec<u8>,
+        metadata: MetadataV1,
+        payload: ManifestPayloadV1,
+        hardlink_group: Option<HardlinkGroupDigest>,
+    ) -> Result<Self, LinuxPytestContractError> {
+        let node_digest =
+            compute_manifest_node_digest(&metadata, &payload, hardlink_group.as_ref())?;
+        Ok(Self {
+            relative_path,
+            metadata,
+            payload,
+            hardlink_group,
+            node_digest,
+        })
+    }
+
     fn computed_node_digest(&self) -> Result<NodeDigest, LinuxPytestContractError> {
-        let metadata = canonical::encode_metadata_for_hash(&self.metadata)?;
-        let hardlink = encode_optional_digest(
-            self.hardlink_group
-                .as_ref()
-                .map(HardlinkGroupDigest::as_bytes),
-        );
-        match &self.payload {
-            ManifestPayloadV1::Directory { children } => {
-                if self.hardlink_group.is_some() {
-                    return Err(LinuxPytestContractError::MalformedManifest);
-                }
-                let children = canonical::encode_children_for_hash(children)?;
-                Ok(NodeDigest::derive_tagged(
-                    DIRECTORY_NODE_DOMAIN,
-                    &[(1, &metadata), (2, &children)],
-                ))
+        compute_manifest_node_digest(&self.metadata, &self.payload, self.hardlink_group.as_ref())
+    }
+}
+
+fn compute_manifest_node_digest(
+    metadata: &MetadataV1,
+    payload: &ManifestPayloadV1,
+    hardlink_group: Option<&HardlinkGroupDigest>,
+) -> Result<NodeDigest, LinuxPytestContractError> {
+    let metadata = canonical::encode_metadata_for_hash(metadata)?;
+    let hardlink = encode_optional_digest(hardlink_group.map(HardlinkGroupDigest::as_bytes));
+    match payload {
+        ManifestPayloadV1::Directory { children } => {
+            if hardlink_group.is_some() {
+                return Err(LinuxPytestContractError::MalformedManifest);
             }
-            ManifestPayloadV1::Regular {
-                content_digest,
-                data_extents,
-            } => {
-                let extents = canonical::encode_extents_for_hash(data_extents)?;
-                Ok(NodeDigest::derive_tagged(
-                    REGULAR_NODE_DOMAIN,
-                    &[
-                        (1, &metadata),
-                        (2, content_digest.as_bytes()),
-                        (3, &extents),
-                        (4, &hardlink),
-                    ],
-                ))
+            let children = canonical::encode_children_for_hash(children)?;
+            Ok(NodeDigest::derive_tagged(
+                DIRECTORY_NODE_DOMAIN,
+                &[(1, &metadata), (2, &children)],
+            ))
+        }
+        ManifestPayloadV1::Regular {
+            content_digest,
+            data_extents,
+        } => {
+            let extents = canonical::encode_extents_for_hash(data_extents)?;
+            Ok(NodeDigest::derive_tagged(
+                REGULAR_NODE_DOMAIN,
+                &[
+                    (1, &metadata),
+                    (2, content_digest.as_bytes()),
+                    (3, &extents),
+                    (4, &hardlink),
+                ],
+            ))
+        }
+        ManifestPayloadV1::Symlink { target } => Ok(NodeDigest::derive_tagged(
+            SYMLINK_NODE_DOMAIN,
+            &[(1, &metadata), (2, target), (3, &hardlink)],
+        )),
+        ManifestPayloadV1::ExternalTree {
+            tree_role,
+            target_root,
+            readonly,
+        } => {
+            if !readonly || *tree_role != TreeRoleV1::Runtime || hardlink_group.is_some() {
+                return Err(LinuxPytestContractError::MalformedManifest);
             }
-            ManifestPayloadV1::Symlink { target } => Ok(NodeDigest::derive_tagged(
-                SYMLINK_NODE_DOMAIN,
-                &[(1, &metadata), (2, target), (3, &hardlink)],
-            )),
-            ManifestPayloadV1::ExternalTree {
-                tree_role,
-                target_root,
-                readonly,
-            } => {
-                if !readonly || *tree_role != TreeRoleV1::Runtime || self.hardlink_group.is_some() {
-                    return Err(LinuxPytestContractError::MalformedManifest);
-                }
-                let role = (*tree_role as u16).to_be_bytes();
-                Ok(NodeDigest::derive_tagged(
-                    EXTERNAL_TREE_NODE_DOMAIN,
-                    &[
-                        (1, &metadata),
-                        (2, &role),
-                        (3, target_root.as_bytes()),
-                        (4, &[1]),
-                    ],
-                ))
-            }
+            let role = (*tree_role as u16).to_be_bytes();
+            Ok(NodeDigest::derive_tagged(
+                EXTERNAL_TREE_NODE_DOMAIN,
+                &[
+                    (1, &metadata),
+                    (2, &role),
+                    (3, target_root.as_bytes()),
+                    (4, &[1]),
+                ],
+            ))
         }
     }
 }
