@@ -1,7 +1,7 @@
 use std::fs;
 #[cfg(target_os = "macos")]
 use std::io::Read;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -68,12 +68,17 @@ fn run_process_with_env(
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(stdin.as_bytes())
-            .unwrap();
+        let write_result = child.stdin.take().unwrap().write_all(stdin.as_bytes());
+        if let Err(error) = write_result {
+            // The production hook intentionally may exit without reading its
+            // input. Its status and exact streams below remain the test oracle;
+            // a closed stdin pipe is not itself a harness failure.
+            assert_eq!(
+                error.kind(),
+                ErrorKind::BrokenPipe,
+                "failed to write child stdin: {error}"
+            );
+        }
         child.wait_with_output().unwrap()
     } else {
         command.output().unwrap()

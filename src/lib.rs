@@ -4,6 +4,12 @@ pub mod executable;
 pub mod fingerprint;
 pub mod hook;
 pub mod linux_sandbox;
+// Contract-only scaffolding for the disabled Linux pytest profile. Keeping the
+// module crate-private and allowing dead code prevents an unfinished execution
+// surface from becoming part of the public API while the implementations are
+// built behind its frozen interfaces.
+#[allow(dead_code)]
+pub(crate) mod linux_pytest;
 pub mod policy;
 pub mod privacy;
 pub mod remote;

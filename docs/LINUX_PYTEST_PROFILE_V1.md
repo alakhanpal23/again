@@ -4,8 +4,14 @@
 
 This document is an implementation contract, not a statement that the profile
 exists or has passed its gates. The profile identifier is
-`linux-pytest-v1`. It is the next local product slice after the current
-read-only profile and has exactly one public invocation shape:
+`linux-pytest-v1`. Its exact binary object registry, field tags, hash frame,
+environment normalization, comparison exclusions, and manifest commitments
+are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
+The current crate-private module is unreachable from the CLI and all concrete
+profile traits still fail closed; pytest execution and reuse are not
+implemented. A descriptor-selected regular-file staging leaf exists, but it
+is not yet a tree snapshot or wired to `SnapshotProvider`. The intended next
+local product slice has exactly one public invocation shape:
 
 ```text
 again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
@@ -39,7 +45,7 @@ or `python -m` for any module other than pytest is refused without execution.
 
 The first implementation targets rootless, glibc-based Linux on `x86_64`,
 with `openat2(2)`, `close_range(2)`, seccomp filter mode, ptrace fork/clone
-events, all six required namespace types, tmpfs, and Landlock ABI 3 or newer.
+events, all six required namespace types, tmpfs, and Landlock ABI 6 or newer.
 An exact kernel/configuration/runtime tuple is enabled only after that tuple
 passes this document's gates. A missing or administratively disabled user
 namespace, unsupported filesystem operation, untested architecture, old
@@ -61,11 +67,12 @@ The reusable semantic unit is the whole admitted pytest invocation. V1 does
 not select, skip, or cache individual tests. A hit is permitted only after
 current workspace dependencies, negative and directory dependencies,
 environment, interpreter, pytest/plugins, native libraries, kernel profile,
-and policy all match the promoted record. Cache replay preserves each stream
-individually; it does not claim to reproduce the timing or interleaving
+and policy all match both records referenced by the promoted pair. Cache
+replay preserves each stream individually; it does not claim to reproduce the
+timing or interleaving
 between writes to stdout and stderr.
 
-There are three outcomes:
+There are four outcomes:
 
 1. **Refused:** admission or the mandatory isolation preflight fails. Python
    is not executed.
@@ -73,9 +80,13 @@ There are three outcomes:
    exact result is returned, but an unsupported effect, incomplete trace,
    nondeterministic interface, limit, or policy violation prevents both a
    shadow and reuse.
-3. **Candidate/promoted:** a complete foreground result becomes a pending
-   candidate; a separate asynchronous shadow invocation may promote it. Only
-   a promoted pair can be served as a hit.
+3. **Candidate:** a complete foreground result becomes an immutable primary
+   candidate; a separate asynchronous invocation may produce an immutable
+   shadow candidate.
+4. **Promoted pair:** a separate promotion row may reference two distinct,
+   complete candidate records whose canonical semantic-comparison views are
+   byte-equal. Only that row grants reuse. Records themselves are never
+   changed to a promoted disposition.
 
 Once foreground streams have been delivered, failure to enqueue or finish a
 shadow cannot change the foreground status. It only leaves no reusable entry.
@@ -109,39 +120,78 @@ stderr.
 
 ## Invocation and identity
 
-Admission parses `OsString` argv directly and never reparses a shell string.
-The selector grammar is versioned with the profile. The cache shape key binds:
+Admission is deliberately two phase. `parse_lexical` inspects only the public
+argv/cwd/stdio/environment envelope and produces an in-memory draft; it cannot
+claim that a selector, symlink chain, executable, or runtime object is safe.
+`seal_full` then creates the immutable snapshot. Only
+`finalize_against_snapshot` may resolve selector targets and the executable
+chain against destination bytes and descriptor capabilities, finalize the
+runtime closure, and create `PreparedPytest`. That value owns both the
+admission result and live sealed-snapshot descriptor capabilities. Python
+cannot execute between those phases.
 
-- the ordered argv byte strings and workspace-relative cwd (`.` in v1);
-- canonical workspace identity and the ordered selector targets;
-- stdin kind and the assertion that it contains zero bytes;
-- a keyed, domain-separated digest of every passed environment name/value,
-  with no raw value persisted;
-- the executable symlink chain, Python executable, `pyvenv.cfg`, pytest and
-  pluggy distributions, loaded plugins, Python standard library, imported
-  bytecode/source, extension modules, ELF interpreter, and loaded shared
-  objects;
-- architecture, kernel release/config capability digest, namespace policy,
-  Landlock ABI/rules digest, seccomp program digest, tracer/runtime version,
-  ambient broker version, and EffectIR schema; and
-- all previously observed content, metadata, symlink, directory-membership,
-  and negative-path dependencies.
+Lexical admission parses `OsString` argv directly and never reparses a shell
+string. The selector grammar is versioned with the profile. After snapshot
+resolution, the canonical `ShapeV1` binds exactly:
 
-The final request key is BLAKE3 over deterministic length-prefixed fields with
-the domain `again linux pytest request v1`. Host paths are represented by
-their fixed sandbox paths plus workspace identity; raw home paths and raw
-environment values are not serialized. Hash equality is an identity check,
-not proof of trace completeness.
+- shape schema, profile ID, and profile digest;
+- canonical workspace identity;
+- the ordered argv byte strings, workspace-relative cwd (`.` in v1), ordered
+  selectors, and stdin profile;
+- the keyed environment binding, with no raw value persisted;
+- the ordered resolved selector sandbox paths;
+- the executable-chain digest, the complete canonical executable-chain
+  witness, and the runtime-forest root; and
+- architecture, kernel-capability digest, stable namespace-policy digest, and
+  all ten component policy digests.
+
+The embedded chain witness is bounded to 40 unique normalized sandbox paths,
+starts at `/workspace/.venv/bin/python`, ends at a regular-file manifest node,
+and binds every symlink target, normalized next hop, and node digest. Its
+digest is recomputed and every hop is checked against the sealed manifest; a
+digest without the witness has no authority. The pre-snapshot
+`LexicalShapeV1` is also frozen: it commits schema, profile, workspace,
+invocation, and keyed environment, but cannot grant lookup or execution.
+
+The finalized shape deliberately excludes the full workspace root, snapshot and record
+IDs, observations, results, effects, and raw per-run namespace inode IDs.
+Observed content, metadata, symlink, directory-membership, and negative-path
+inputs instead form a nonempty canonical `ObservationClosureV1`. Dependencies
+are ordered by `(kind, sandbox_subject, operation_key)`; byte-identical repeats
+merge, while the same identity with a different current blob value is
+malformed rather than order-dependent.
+
+The final request key is a domain-separated BLAKE3 identity over shape schema,
+profile ID, profile digest, canonical shape key, and canonical observation-
+closure digest. Host paths are represented by their fixed sandbox paths plus
+workspace identity; raw home paths and raw environment values are not
+serialized. A finalized-shape lookup is capped at exactly 64 rows. Each
+candidate's closure and exact request identity must be recomputed against a
+fresh validation snapshot before it can be selected. Hash equality is an
+identity check, not proof of trace completeness.
 
 `-I` is part of the admitted argv and is never inferred. Again still passes a
-profile-defined environment. `HOME=/home/again`, `TMPDIR=/tmp`, the hostname,
-locale, timezone, CPU affinity, and logical clocks are profile inputs rather
-than ambient host inputs. All remaining caller variables are passed exactly
-and locally keyed into the request; loader injection variables are refused.
-The environment policy and its exact normalized values are included in the
-profile digest. Pytest configuration or plugin discovery through the
-workspace or runtime is permitted only when the corresponding file and
-directory observations are complete.
+profile-defined environment. The exact name/value table and denylist are in
+the [wire contract](LINUX_PYTEST_WIRE_V1.md#environment-normalization-and-key-lifecycle).
+Caller entries are raw-byte validated and duplicate names are refused.
+Profile-owned names are replaced first; loader/Python injection names not in
+that owned table are then refused. Entries are sorted by raw name, and the
+profile-owned table supplies deterministic home, path, locale, timezone,
+Python, temp, and XDG values. Both the full name/value set and the names-only
+set are locally keyed; records contain only key ID, keyed digests, entry count,
+and environment-policy digest. Raw names and values are kept only in redacted,
+zero-on-drop memory and are never serialized.
+
+The 32-byte environment key is an owner-private persistent secret. Losing or
+corrupting it disables admission until an explicit rotation/recovery action;
+the implementation must never silently regenerate it. Rotation changes the
+key ID and deliberately partitions all older entries. Its exact path is
+`<private-state>/keys/linux-pytest-environment-v1`; creation, validation,
+fsync, and rotation semantics are frozen in the wire contract. The keystore
+implementation and explicit rotation command do not exist yet. Pytest
+configuration or plugin discovery through the workspace or runtime is
+permitted only when the corresponding file and directory observations are
+complete.
 
 Closed stdin and an empty non-TTY stdin are both normalized to a profile-owned
 EOF descriptor at fd 0 before the descriptor audit. Foreground stdout/stderr
@@ -177,16 +227,47 @@ the source and destination have separate logical contents under copy-on-write
 semantics. Failure of `FICLONE` falls back to copying, not to a live mount.
 
 Snapshot construction starts from owned directory file descriptors and uses
-`openat2` beneath/in-root resolution with magic links denied. It records
-regular files, directories, symlinks, hard-link groups, modes, uid/gid,
-timestamps, xattrs required by the profile, and negative selector resolution.
+`openat2` beneath/in-root resolution with magic links denied. Acquisition is
+permitted only when it is proven not to mutate host atime or any other host
+metadata: all read descriptors use `O_NOATIME`, and directory/symlink capture
+requires a qualified no-atime acquisition view. If the exact filesystem and
+mount tuple cannot prove that property, construction refuses before Python.
+It records
+regular files, directories, symlinks, hard-link groups, modes, logical
+uid/gid, size/link count, timestamps, all visible xattr names and values,
+sparse data extents, and negative selector resolution.
 FIFOs, sockets, devices, mount crossings, unreadable objects, sparse-file or
-xattr loss, source mutation during copy, and an unrepresentable filename make
-the foreground safe but execute-only, or refuse before execution when the
-object is needed to construct the root. A pre/post descriptor identity check
-and a second manifest pass must agree. The immutable manifest and every file
-digest are computed from destination bytes, never assumed from source
-metadata.
+xattr loss, source mutation during copy, and an unrepresentable filename
+refuse when encountered while constructing a required sealed root. They may
+be execute-only only when discovered after a safely isolated foreground has
+already run. A pre/post descriptor identity check and a second manifest pass
+must agree. The immutable manifest and every file digest are computed from
+destination bytes, never assumed from source metadata.
+
+Manifest `ctime` and optional `btime` are logical stable-source metadata used
+for identity and mutation detection; copied inodes are not required to have
+the same physical creation/change timestamps. Destination verification is
+physical for logical bytes, the destination-byte digest, mode/ownership and
+atime/mtime where representable, visible xattrs, and the normalized sparse
+extent sequence. That sequence is exactly the ordered nonempty ranges returned
+by `SEEK_DATA` followed by `SEEK_HOLE`, clipped to logical size; an empty or
+all-hole file has an empty sequence, and a filesystem may legally report the
+whole file as data. Source and destination must expose the same sequence.
+
+The canonical manifest has one workspace tree at `/workspace` and a nonempty,
+strictly mount-path-sorted forest of read-only runtime trees. Entries use raw
+relative Linux paths in strict byte order; every nonroot entry is committed
+exactly once by its parent. Per-kind node digests commit canonical metadata and
+directory children, file content/extents, symlink target, or external-tree
+root as applicable. Hard-link groups are scoped to one manifest tree. Their
+identities commit the complete sorted member list and must agree with every
+member's source link count; a link count larger than in-tree membership is an
+external hardlink and refuses the tree. The workspace
+Merkle summary commits the workspace-tree root. The runtime summary commits a
+canonical sorted list of runtime `(mount_path, root_digest)` pairs. Every
+workspace external-tree entry must correspond to exactly one runtime mount.
+The full validation rules and domain strings are frozen in the
+[wire contract](LINUX_PYTEST_WIRE_V1.md#snapshot-manifest-and-merkle-rules).
 
 The mount namespace is made recursively private before any mount operation.
 Its `/` is a new size-limited tmpfs with `nodev,nosuid`; fixed directories are
@@ -197,7 +278,10 @@ read-only at their fixed sandbox paths. `/tmp`, `/run`, and `/home/again` are
 fresh bounded tmpfs directories. `/proc` is a new procfs for the new PID
 namespace. `/dev` contains only profile-created `null`, `zero`, and controlled
 stdio/random endpoints. `/sys`, host procfs, host home, and the Again state
-directory are absent.
+directory are absent. The `/dev/null`, `/dev/zero`, and random paths are
+profile-owned regular placeholders with completely brokered read, write,
+stat, mmap, and ioctl behavior; v1 does not bind host device nodes into the
+`nodev` root.
 
 The runtime-closure builder must safely parse ELF metadata rather than run
 `ldd`. It seals the resolved Python executable and symlink chain, ELF program
@@ -220,9 +304,11 @@ network, UTS, and IPC namespaces. No host capability is requested or retained.
 The profile records and verifies all six namespace inode identities.
 
 - The mount namespace owns the tmpfs root and private mounts described above.
-- A minimal PID-1 reaper launches pytest, forwards the foreground termination
-  signals, reaps orphans, and kills the namespace when the invocation or
-  tracer ends.
+- Namespace PID 1 is the reaper and tracer. It launches pytest, forwards the
+  foreground termination signals, reaps orphans, and kills the namespace when
+  the invocation or outer watchdog ends. It remains outside the workload's
+  Landlock/seccomp policy and uses only child-user-namespace capabilities for
+  setup and exact seccomp-filter readback; no host capability is used.
 - The network namespace has no veth, route, address, or configured loopback.
   The tracee cannot move an interface into it.
 - The UTS namespace has the fixed hostname `again` and an empty domain name.
@@ -255,13 +341,17 @@ kills the candidate.
 
 ## Landlock as defense in depth
 
-After the private root is complete and before Python execs, the child sets
+After the private root is complete and before Python execs, the workload sets
 `no_new_privs` and installs a Landlock ruleset using every filesystem access
-right supported and tested by the selected ABI. It grants read/execute only
-to sealed runtime/input paths and write/create/remove only to the execution
-branch and bounded scratch mounts. Device ioctls and host-root traversal are
-not granted. Where available, TCP restrictions and abstract-Unix-socket
-scoping are installed too. Rules are inherited by all descendants.
+right supported and tested by the selected ABI. ABI 6 is the minimum positive
+profile: it includes `REFER`, `TRUNCATE`, TCP bind/connect, device-ioctl
+control, and abstract-Unix-socket/signal scoping. ABI 7 audit controls are
+included and committed when the qualified tuple exposes them. The ruleset
+grants read/execute only to sealed runtime/input paths and write/create/remove
+only to the execution branch and bounded scratch mounts. Device ioctls and
+host-root traversal are not granted. No TCP allow rule exists, and abstract-
+Unix-socket/signal scopes are mandatory. Rules are inherited by all
+descendants.
 
 Landlock is additive defense, not the observation proof. It does not mediate
 every metadata read or every possible effect, and descriptors opened before a
@@ -387,22 +477,47 @@ V2 is a new schema, `again.effect_ir.v2`; it does not reinterpret
 ```text
 EffectRecordV2 {
   schema, record_id, profile_id, profile_digest,
-  invocation, workspace_identity, environment_digest,
+  shape_key, request_key, invocation, workspace_identity,
+  environment { key_id, digest, names_digest, entry_count, policy_digest },
   sealed_snapshot { snapshot_id, workspace_root, runtime_root, manifest_blob },
-  platform { arch, kernel, capability_digest, namespace_ids, policy_digests },
+  platform {
+    architecture, kernel_release, capability_digest, namespace_ids,
+    namespace_policy_digest, policy_digests
+  },
   trace { required, complete, unsupported, violation, counters, first_failure },
   observations[], ambient_events[], ordered_effects[], final_workspace_root,
-  result { stdout_blob, stderr_blob, wait_status, byte_counts },
-  disposition, primary_record_id?, comparison_digest?, created_monotonic_ns
+  result { stdout, stderr, raw_linux_wait_status },
+  disposition, disposition_reason?, primary_record_id?,
+  reserved_comparison_digest_absent, created_monotonic_ns
 }
 ```
 
-Canonical encoding uses integers, byte strings, ordered arrays, and sorted
-map keys; it contains no floats, raw environment values, host home path, or
-duration in any semantic comparison. Digests use explicit domain-separated,
-length-prefixed BLAKE3 inputs. JSON diagnostics render each bitmap as exactly
-16 lowercase hexadecimal digits so JavaScript number precision cannot change
-it.
+Canonical encoding is the strict, dependency-free tagged binary format in the
+[wire contract](LINUX_PYTEST_WIRE_V1.md#canonical-object-envelope). It has
+fixed object IDs, versions, field tags, wire types, ordered lists, explicit
+optionals, and closed enums; maps and unknown/default fields do not exist. A
+decoder consumes every byte and rejects a value whose decoded form does not
+re-encode identically. The maximum canonical size is 512 MiB. Records contain
+no floats, raw environment values, host home path, or duration. Digests use
+the frozen `AGNHSH01` tagged, length-prefixed, domain-separated BLAKE3 frame.
+JSON diagnostics render each bitmap as exactly 16 lowercase hexadecimal
+digits so JavaScript number precision cannot change it; SQLite stores the same
+bitmap as an eight-byte big-endian BLOB.
+
+The output streams are closed states: `complete { blob }`,
+`exceeded { observed_bytes }`, or
+`incomplete { observed_bytes, reason }`. The result stores the raw 32-bit
+Linux wait word, not a lossy exit-code/signal enum. Only raw zero is successful
+for candidate eligibility.
+
+Record dispositions are immutable execution provenance:
+`executed_only`, `primary_candidate`, or `shadow_candidate`. An execute-only
+record requires an execute-only reason and cannot name a primary; a primary
+candidate has neither; a shadow candidate names its primary and has no
+execute-only reason. There is no promoted record disposition. The canonical
+record reserves its comparison-digest optional field but requires it to be
+absent. `comparison_digest` exists only in the separate promotion row that
+references both immutable record CAS objects.
 
 `required`, `complete`, `unsupported`, and `violation` are `u64` bitmaps. V1
 requires bits 0 through 31, so `required` is `00000000ffffffff`. A complete bit
@@ -454,19 +569,27 @@ Eligibility is the mechanical predicate:
 complete == required
 && unsupported == 0
 && violation == 0
-&& result capture is within limits
-&& disposition is promoted
+&& final_sequence == event_count
+&& task_birth_count == task_exit_count == task_reap_count
+&& denied_operation_count == unsupported_operation_count == 0
+&& decoder_error_count == lost_event_count == 0
+&& final_ack_count == 1
+&& stdout and stderr are complete blob captures
+&& raw_linux_wait_status == 0
+&& disposition is primary_candidate or shadow_candidate
 ```
 
 No aggregate `trace_complete=true` may be stored independently; it is derived
-from those fields. Reason codes retain the first failure plus the full masks
-and counters. Overflow, decoder disagreement, tracer restart, missing final
-acknowledgement, or record/CAS corruption always fails closed.
+from those fields. Candidate eligibility still does not grant replay authority;
+only a valid promotion row does. Reason codes retain the first failure plus
+the full masks and counters. Overflow, decoder disagreement, tracer restart,
+missing final acknowledgement, or record/CAS corruption always fails closed.
 
 ## Two-invocation asynchronous promotion
 
 On a miss, invocation A runs synchronously on branch A, streams to the caller,
-and finalizes `EffectRecordV2(A)`. A is never immediately reusable. If A is
+and finalizes an immutable primary-candidate `EffectRecordV2(A)`. A is never
+immediately reusable and its disposition is never mutated. If A is
 normally exited with status 0, within the fixed stream/branch limits, and has
 complete zero-violation masks, the CLI hands a sealed snapshot handle plus an in-memory
 invocation/environment envelope to a short-lived shadow worker. Raw
@@ -475,8 +598,15 @@ after the worker acknowledges ownership; it does not wait for invocation B.
 If A is signaled or exits nonzero, or if handoff fails, A remains a
 nonreusable record; its foreground status and streams are still returned.
 
+The durable shadow job commits the primary record, shape key, exact request
+key, and complete sealed-snapshot identity. Those fields are derived only from
+the verified primary record. Its live `ShadowEnvelopeV2` binds the job's shape
+and exact snapshot identity to the same `PreparedPytest`; the primary record
+and request key remain immutable durable-job bindings. Reconstructing an
+envelope from host path strings or a merely equal snapshot digest is forbidden.
 The worker creates a fresh namespace set, tmpfs root, and branch B from the
-same sealed input and runs the exact argv again with no user-visible streams.
+same sealed input and runs the exact argv again with no user-visible streams,
+then writes a distinct immutable shadow-candidate record that names A.
 This is a second process-tree invocation, not a second pass inside A. The
 worker has a bounded lease and lifetime and exits after terminal cleanup; a
 crash or expired lease leaves no hit and is not retried without a new live
@@ -491,26 +621,41 @@ Promotion requires exact equality of:
 - completeness/unsupported/violation masks and trace-integrity counters; and
 - final workspace Merkle root.
 
-Duration, record UUID, outer host PIDs, and storage timestamps are excluded.
-The comparison digest commits to both canonical records and the exclusion
-rules. A mismatch atomically quarantines the candidate and its generalization
-class (profile + Python/pytest/plugin/runtime closure + effect-shape digest).
+Record UUID, snapshot UUID, raw per-run namespace inode IDs, disposition and
+its reason/link, the reserved comparison-digest slot, creation monotonic time,
+outer host PIDs, and duration are excluded. Stable namespace-policy identity
+remains included. The comparison digest commits to the canonical exclusion
+rules, the ordered primary and shadow immutable-record CAS digests, and both
+semantic-view digests. The digest is stored only on the promotion row. A
+mismatch atomically quarantines the exact request-scoped class committing
+profile digest, workspace identity, shape key, and request key. `EffectShapeV1`
+is a canonical analytics/future-policy identity only; it does not widen v1
+quarantine or reuse authority.
 No matching-output special case can override a dependency, ambient, effect,
 or final-root mismatch.
 
 A request arriving while the shadow is pending does not wait for or consume
 the candidate; it executes normally and may supply a new candidate. A hit is
-visible only after one transaction changes the pair to `promoted`. Before
-replay, Again reconstructs and validates the recorded observation closure
-against a fresh descriptor-stable snapshot, checks CAS bytes and current
-runtime/executable authority, and runs the exact Python executable with fixed
-internal capability-probe arguments inside the same no-network boundary. A
-failed validation or probe becomes a miss, never a hit.
+visible only after one transaction creates the authoritative promoted pair.
+Lookup first returns at most 64 promoted rows for the finalized shape. For
+each row, Again strictly decodes both records, reconstructs and validates the
+recorded observation closure against a fresh descriptor-stable snapshot,
+recomputes the exact request key, checks every referenced CAS object and
+current runtime/executable authority, and runs the exact Python executable
+with fixed internal capability-probe arguments inside the same no-network
+boundary. Direct request-key lookup cannot bypass those checks. A failed
+validation or probe becomes a miss, never a hit.
 
 ## Storage and code interfaces
 
-EffectIR v2 uses new tables and immutable CAS objects. Existing v0/v1 rows are
-neither migrated nor queried by this profile. The minimum SQLite interface is:
+EffectIR v2 uses new tables and immutable objects in a distinct hardened V2
+CAS namespace/root. Existing v0/v1 rows and CAS aliases are neither migrated,
+queried, nor garbage-collected by this profile. The legacy 16 MiB object limit
+and legacy GC assumptions are incompatible with V2's 512 MiB canonical limit
+and manifest/record reference graph. V2 therefore requires its own typed
+object metadata, limits and quotas, staged-write/fsync protocol, digest
+verification, corruption handling, reachability graph, and GC. The minimum
+SQLite interface is:
 
 ```text
 pytest_snapshots(
@@ -520,10 +665,12 @@ pytest_snapshots(
 pytest_effect_records(
   record_id PRIMARY KEY, shape_key, request_key, snapshot_id, record_blob,
   stdout_blob, stderr_blob, required_mask, complete_mask, unsupported_mask,
-  violation_mask, disposition, created_ns
+  violation_mask, disposition, disposition_reason, primary_record_id,
+  created_ns
 )
 pytest_shadow_jobs(
-  job_id PRIMARY KEY, shape_key, primary_record_id UNIQUE, state,
+  job_id PRIMARY KEY, shape_key, request_key, snapshot_id,
+  primary_record_id UNIQUE, state,
   lease_owner, lease_expires_ns, shadow_record_id, terminal_reason
 )
 pytest_promotions(
@@ -537,35 +684,54 @@ pytest_quarantine_classes(
 
 Foreign keys are immediate and state values are checked enums. A promotion
 references two distinct immutable record ids and is valid only when both CAS
-records decode as v2 and independently satisfy the bitmap predicate. Blob and
-record bytes are written by private stage, fsync, digest verification, atomic
-rename, and directory fsync before a transaction references them. Promotion
-uses compare-and-swap from `pending_shadow`; crashes at every boundary leave
-either an unreferenced GC candidate or a non-hit row. Quarantine is monotonic.
-GC removes only expired, terminal, unreferenced snapshots/jobs/blobs and never
-touches the workspace.
+records strictly decode and re-encode as v2, independently satisfy candidate
+eligibility, and have identical semantic comparison views. The four bitmap
+columns are exactly eight-byte big-endian BLOBs, not signed SQLite integers or
+text. Blob and record bytes are written by private V2 stage, fsync, digest
+verification, atomic rename, and directory fsync before a transaction
+references them. Promotion uses compare-and-swap from `pending_shadow`; it
+inserts the comparison digest in `pytest_promotions` and never changes a
+record disposition. `promoted_ns` is nonzero and no earlier than either
+record's creation monotonic time. Shape lookup returns at most 64 pairs ordered
+by descending `promoted_ns`, then ascending request key; request keys and every
+primary/shadow record id are unique within the result, and malformed ordering
+or duplication fails closed. Crashes at every boundary leave either an
+unreferenced V2 GC candidate or a non-hit row. Quarantine is monotonic. V2 GC removes only
+expired, terminal, unreachable V2 snapshots/jobs/records/blobs and never
+touches legacy CAS or the workspace.
 
 The implementation boundary is four narrow Rust interfaces:
 
 ```text
-ProfileAdmission::parse(argv, cwd, stdio, env) -> AdmittedPytest | Refusal
-SnapshotProvider::seal_full(admitted) -> SealedSnapshot
-SnapshotProvider::seal_observation_closure(proof) -> ValidationSnapshot
-SandboxTracer::execute(snapshot, admitted, mode) -> EffectRecordV2
-PromotionStore::record_primary / claim_shadow / finish_shadow /
-                lookup_promoted / quarantine / expire
+ProfileAdmission::parse_lexical(input) -> PytestAdmissionDraft | Refusal
+SnapshotProvider::seal_full(draft) -> SealedSnapshot
+ProfileAdmission::finalize_against_snapshot(draft, snapshot)
+  -> PreparedPytest | Refusal
+SnapshotProvider::seal_validation_snapshot(draft, expected_shape,
+                                             expected_closure)
+  -> RevalidatedObservationClosureV1
+SandboxTracer::execute(prepared, mode) -> VerifiedExecutionRecordV2
+SandboxTracer::capability_probe(validation_snapshot, isolated_import_pytest)
+PromotionStore::record_primary / finish_shadow / fail_shadow /
+                lookup_promoted_by_shape(shape) / quarantine / expire
 ```
 
+`lookup_promoted_by_shape` has no caller-selected limit: the profile constant
+requires the store to return at most 64 rows in newest-promotion order with
+request-key tie breaking.
+
 `SandboxTracer` cannot accept raw arbitrary argv; it accepts only
-`AdmittedPytest`, whose fields are private to the profile parser. The internal
+`PreparedPytest`, whose admission fields are private to the profile parser and
+whose sealed descriptors are live capabilities. The internal
 fixed capability probe is a separate closed enum variant. `SealedSnapshot`
-exposes immutable directory fds/ids rather than host path strings. All
+owns immutable directory descriptor capabilities rather than serializable or
+cloneable host path strings; diagnostic formatting redacts them. All
 cross-interface data structures have round-trip, unknown-version, unknown-bit,
 and canonical-hash tests before integration.
 
 ## Parallel implementation plan
 
-The integration owner first freezes `AdmittedPytest`, `SealedSnapshot`,
+The integration owner first freezes `PreparedPytest`, `SealedSnapshot`,
 `EffectRecordV2`, bitmap constants, reason codes, and the four trait method
 signatures. After that checkpoint, three implementers work in parallel without
 sharing mutable modules.
