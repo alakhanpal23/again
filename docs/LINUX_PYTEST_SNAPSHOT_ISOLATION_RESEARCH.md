@@ -54,6 +54,16 @@ waiting for EOF after a complete frame, then loops back and still requires an
 actual zero-byte read. Partial and extra frames remain rejected, with
 deterministic 63/64/65-byte tests. The failed run is discovery evidence only.
 
+[Actions run 32786996039](https://github.com/alakhanpal23/again/actions/runs/32786996039)
+closed that race at commit `ca51b6a`. The retained product artifact contains
+the exact closed UTS `EPERM` refusal, completed cleanup, empty stderr, and false
+command/profile/execution-authority scope. The independent probe still records
+`EACCES` at user-namespace creation. Both hosted OS jobs passed formatting,
+pinned strict Clippy, locked tests, and the explicit 100,000-case gate; the
+Linux library lane passed 615 tests with 7 ignored and zero failures. This is
+positive evidence for the fixed negative-lane classifier and control framing,
+not for a private root, command execution, profile qualification, or reuse.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the
