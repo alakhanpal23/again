@@ -21,17 +21,17 @@
   },
   "latency_micros": {
     "native": {
-      "max": 2055,
-      "min": 1623,
-      "p50": 1703,
-      "p95": 2055
+      "max": 1994,
+      "min": 1546,
+      "p50": 1623,
+      "p95": 1994
     },
     "note": "Quick Tunnel latency is transport evidence, not a production speed gate",
     "quick_tunnel_exact_hit": {
-      "max": 648667,
-      "min": 535576,
-      "p50": 581785,
-      "p95": 648667
+      "max": 683846,
+      "min": 506195,
+      "p50": 539648,
+      "p95": 683846
     },
     "sample_count": 9
   },
@@ -44,12 +44,12 @@
     "host_os": "macos",
     "live_harness_blake3": "53a20f3e221f931011b8dabb0cc95c76140cb4cea4ac611bcdc1f223db312b5a",
     "production_source_set_blake3": "34c9054396c99836a6c2dfcd245816a2b8a4bcaf869c61cebda943935d1a9d05",
-    "source_commit": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
-    "working_tree_dirty": true,
-    "working_tree_entry_count": 101,
+    "source_commit": "bda267408e8de9bac3662e8333d9a63e79031ea3",
+    "working_tree_dirty": false,
+    "working_tree_entry_count": 0,
     "wrangler_version": "4.125.0"
   },
-  "recorded_at_unix_seconds": 1787538824,
+  "recorded_at_unix_seconds": 1787540175,
   "request_count_evidence": {
     "note": "The live profile enforces the ceiling; the deterministic remote::tests::bundle_pull_uses_exactly_two_requests_under_one_budget_without_retry test observes the exact two client routes. The direct public GET here validates response framing only.",
     "observed_by_live_harness": false,
