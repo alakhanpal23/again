@@ -184,14 +184,14 @@ pub(super) struct SnapshotSourceObservationSessionV1<'resources> {
     policy: &'resources SourceEnumerationPolicyV1,
 }
 
-/// Connector-minted authority for regular-copy attempts in one sequential,
-/// connector-owned traversal.
+/// Connector-minted authority for materializer-local and regular-copy attempts
+/// in one sequential, connector-owned traversal.
 ///
-/// The exact policy and both non-fungible attempt buckets come from the same
-/// preflighted pipeline ledger. No caller can substitute retry limits or spend
-/// publisher cleanup authority on leaf-local failure cleanup. The traversal
-/// must abort on its first fatal leaf, which keeps at most one failed local
-/// destination active against the fixed reserve.
+/// The exact regular-copy policy and both non-fungible attempt buckets come
+/// from the same preflighted pipeline ledger. No caller can substitute retry
+/// limits or spend publisher cleanup authority on leaf-local failure cleanup.
+/// The traversal must abort on its first fatal leaf, which keeps at most one
+/// failed local destination active against the fixed reserve.
 pub(super) struct SnapshotMaterializationSessionV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
     regular_copy_policy: RegularCopyPolicyV1,
@@ -228,6 +228,14 @@ impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
 impl SnapshotMaterializationSessionV1<'_> {
     pub(super) const fn regular_copy_policy(&self) -> RegularCopyPolicyV1 {
         self.regular_copy_policy
+    }
+
+    pub(super) fn run_materialization_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources
+            .run_forward_attempt(SnapshotPipelineForwardStageV1::Materialization, attempt)
     }
 
     pub(super) fn run_regular_copy_attempt<T>(
@@ -1246,13 +1254,53 @@ mod tests {
         let forward_before = first.forward_attempts_remaining();
         let local_before = first.local_cleanup_attempts_remaining();
 
-        first.run_regular_copy_attempt(|| ()).unwrap();
-        assert_eq!(second.forward_attempts_remaining(), forward_before - 1);
+        first.run_materialization_attempt(|| ()).unwrap();
+        second.run_regular_copy_attempt(|| ()).unwrap();
+        assert_eq!(second.forward_attempts_remaining(), forward_before - 2);
         assert_eq!(second.local_cleanup_attempts_remaining(), local_before);
 
         second.run_local_cleanup_attempt(|| ()).unwrap();
-        assert_eq!(first.forward_attempts_remaining(), forward_before - 1);
+        assert_eq!(first.forward_attempts_remaining(), forward_before - 2);
         assert_eq!(first.local_cleanup_attempts_remaining(), local_before - 1);
+    }
+
+    #[test]
+    fn materialization_exhaustion_is_typed_and_precedes_attempt() {
+        let mut inputs = Inputs::exact();
+        // Publisher cleanup plus one active regular-copy cleanup reserve leave
+        // no forward attempts.
+        inputs.operation_attempts = 272 + 4 + 2 * 3;
+        let connector = connect_snapshot_pipeline(resources(inputs)).unwrap();
+        let session = connector.materialization_session();
+        let local_cleanup_before = session.local_cleanup_attempts_remaining();
+        let publisher_cleanup_before = connector
+            .resources
+            .publisher_cleanup_attempts_remaining_for_test();
+        let invoked = Cell::new(false);
+
+        assert_eq!(
+            session
+                .run_materialization_attempt(|| invoked.set(true))
+                .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::Materialization,
+                ),
+                bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+            }
+        );
+        assert!(!invoked.get());
+        assert_eq!(session.forward_attempts_remaining(), 0);
+        assert_eq!(
+            session.local_cleanup_attempts_remaining(),
+            local_cleanup_before
+        );
+        assert_eq!(
+            connector
+                .resources
+                .publisher_cleanup_attempts_remaining_for_test(),
+            publisher_cleanup_before
+        );
     }
 
     #[test]

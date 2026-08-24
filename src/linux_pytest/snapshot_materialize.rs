@@ -16,6 +16,8 @@ use std::fmt;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
 use super::RefusalCode;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_connector::SnapshotMaterializationSessionV1;
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 use super::snapshot_publish::SnapshotCleanupEnvelopeV1;
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
@@ -429,6 +431,16 @@ trait SnapshotMaterializeAttemptGateV1 {
         &self,
         attempt: impl FnOnce() -> T,
     ) -> Result<T, SnapshotPipelineResourceErrorV1>;
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SnapshotMaterializeAttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
+    fn run_materialization_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        SnapshotMaterializationSessionV1::run_materialization_attempt(self, attempt)
+    }
 }
 
 /// A charged materializer failure keeps shared-ledger exhaustion distinct
