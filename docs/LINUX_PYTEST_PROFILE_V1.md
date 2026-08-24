@@ -20,18 +20,24 @@ publisher to dominate its source depth, entry count, basename, and retry
 limits. Mismatch refuses before materializer population and delegates bounded,
 best-effort cleanup to the staged publisher. These leaves do not yet form the
 required four-view sealed snapshot connector and are not wired to
-`SnapshotProvider`. The intended next local product slice has exactly one
-public invocation shape:
+`SnapshotProvider`.
 
-Until that connector lends the single resource capability to every leaf and
-charges allocator-observed capacity (including reallocation overlap), the
-local leaf limits are defense in depth rather than an exact whole-pipeline
-heap authority. In particular, frozen public source-plan and xattr shapes
-still finalize some pre-reserved vectors into boxed slices; their allocator
-capacity must move under that shared authority before connector admission.
-The shared shape also permits zero for optional resource classes that current
-leaf policies encode as nonzero; the connector must project zero as disabled
-or refuse it, never silently increase it to a leaf default.
+A static policy projector now fallibly maps the preflighted shared policy into
+the current leaf-policy shapes before filesystem work. The projection itself
+performs no allocation and refuses zero-valued classes and aggregate ceilings
+that those shapes cannot represent exactly rather than silently increasing
+them. It grants no execution, descriptor, heap, or operation authority.
+
+Until a connector lends the single resource capability to every leaf, charges
+allocator-observed capacity (including reallocation overlap), and wires the
+required ledger and four views, the local leaf limits are defense in depth
+rather than an exact whole-pipeline heap authority. In particular, frozen
+public source-plan and xattr shapes still finalize some pre-reserved vectors
+into boxed slices; their allocator capacity must move under that shared
+authority before connector admission.
+
+The intended next local product slice has exactly one public invocation
+shape:
 
 ```text
 again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
@@ -71,6 +77,10 @@ passes this document's gates. A missing or administratively disabled user
 namespace, unsupported filesystem operation, untested architecture, old
 Landlock ABI, or failed isolation probe is a typed refusal before Python
 executes, never a best-effort unsandboxed fallback.
+
+Stock GitHub-hosted Ubuntu is intentionally a negative, non-qualifying lane:
+host AppArmor policy blocks unprivileged user namespaces. It must demonstrate
+pre-Python refusal and cannot supply positive isolation/profile evidence.
 
 ## Product promise
 

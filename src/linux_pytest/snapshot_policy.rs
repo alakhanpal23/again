@@ -1,12 +1,14 @@
 //! One fail-closed resource contract for Linux snapshot construction.
 //!
-//! This is the intended connector-level snapshot resource authority. Tree
-//! enumeration, regular copying, materialization, publication cleanup, and
-//! read-only stability observers must eventually receive infallible
-//! projections of this value. The current leaf policies remain independently
-//! constructible for testing and defense in depth until that connector exists.
-//! Projections must not apply their own defaults or reset a whole-snapshot
-//! work budget.
+//! This is the connector-level snapshot resource authority.
+//! `snapshot_connector` performs one fallible, pre-filesystem static
+//! projection into the current leaf policies. A successful static projection
+//! proves representability only; it grants no execution, allocation,
+//! descriptor, or operation authority. Production execution must retain and
+//! charge this same mutable resource authority alongside those policies. Leaf
+//! constructors remain independently available for tests and defense in
+//! depth. Projection never applies defaults or resets a whole-snapshot work
+//! budget.
 
 use std::cell::Cell;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
@@ -563,6 +565,10 @@ impl SnapshotResourcePolicyV1 {
         STAGED_PUBLISHER_FDS
     }
 
+    pub(super) const fn max_live_publication_fds(self) -> u32 {
+        PUBLISH_TRANSIENT_FDS
+    }
+
     pub(super) const fn max_live_publisher_cleanup_fds(self) -> u32 {
         self.max_live_publisher_cleanup_fds
     }
@@ -631,8 +637,8 @@ impl SnapshotPipelineResourcesV1 {
         })
     }
 
-    /// Returns the immutable, already-validated policy for infallible leaf
-    /// projections. The mutable resource authority remains in `self`.
+    /// Returns the immutable, already-validated policy for fallible static
+    /// projection. The mutable resource authority remains in `self`.
     pub(super) const fn policy(&self) -> SnapshotResourcePolicyV1 {
         self.policy
     }
@@ -835,6 +841,7 @@ mod tests {
         assert_eq!(policy.max_live_materializer_fds(), 17);
         assert_eq!(policy.max_live_regular_copy_fds(), 3);
         assert_eq!(policy.max_live_staged_publisher_fds(), 1);
+        assert_eq!(policy.max_live_publication_fds(), 2);
         assert_eq!(policy.max_live_publisher_cleanup_fds(), 2 * 18 + 4);
         assert_eq!(policy.max_live_snapshot_fds(), 2 * 16 + 8 + 17);
         assert_eq!(

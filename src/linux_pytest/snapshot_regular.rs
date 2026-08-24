@@ -28,6 +28,11 @@ const HARD_MAX_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
 const HARD_MAX_DATA_EXTENTS: u32 = 1024 * 1024;
 const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
 const HARD_MAX_SYSCALL_ATTEMPTS: u8 = 32;
+// The leaf owns at most the source read descriptor and destination descriptor,
+// plus one name-reopen descriptor during either (sequential) identity check.
+// Caller-owned source/destination parent and pinned-source descriptors are not
+// included and remain the connector's additive responsibility.
+const MAX_LIVE_TRANSIENT_FDS: u32 = 3;
 
 /// Bounded inputs that must eventually be committed by the snapshot-policy
 /// digest.  Keeping them explicit prevents this leaf from inventing ambient
@@ -41,6 +46,11 @@ pub(super) struct RegularCopyPolicyV1 {
 }
 
 impl RegularCopyPolicyV1 {
+    /// Exact leaf-owned descriptor peak, excluding caller-owned capabilities.
+    pub(super) const fn max_live_transient_fds() -> u32 {
+        MAX_LIVE_TRANSIENT_FDS
+    }
+
     /// Returns `None` before any filesystem work if a caller requests work
     /// above this leaf's fixed hard ceilings.
     pub(super) const fn checked(
@@ -2184,6 +2194,11 @@ mod portable_tests {
         assert_eq!(policy.max_data_extents(), 32);
         assert_eq!(policy.openat2_attempts(), 4);
         assert_eq!(policy.syscall_attempts(), 3);
+    }
+
+    #[test]
+    fn leaf_owned_transient_fd_peak_is_exact() {
+        assert_eq!(RegularCopyPolicyV1::max_live_transient_fds(), 3);
     }
 
     #[test]

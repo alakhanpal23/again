@@ -145,6 +145,38 @@ impl SnapshotMaterializePolicyV1 {
         let depth_bound = self.max_depth as u32 + 1;
         if depth_bound > 4 { depth_bound } else { 4 }
     }
+
+    pub(super) const fn max_depth(self) -> u16 {
+        self.max_depth
+    }
+
+    pub(super) const fn max_entries(self) -> u32 {
+        self.max_entries.get()
+    }
+
+    pub(super) const fn max_basename_bytes(self) -> u16 {
+        self.max_basename_bytes.get()
+    }
+
+    pub(super) const fn max_plan_bytes(self) -> u64 {
+        self.max_plan_bytes.get()
+    }
+
+    pub(super) const fn max_total_xattrs(self) -> u64 {
+        self.max_total_xattrs.get()
+    }
+
+    pub(super) const fn max_total_xattr_bytes(self) -> u64 {
+        self.max_total_xattr_bytes.get()
+    }
+
+    pub(super) const fn openat2_attempts(self) -> u8 {
+        self.openat2_attempts.get()
+    }
+
+    pub(super) const fn syscall_attempts(self) -> u8 {
+        self.syscall_attempts.get()
+    }
 }
 
 fn cleanup_envelope_covers(
@@ -4173,6 +4205,30 @@ mod portable_tests {
             policy.max_live_destination_fds(),
             u32::from(HARD_MAX_DEPTH) + 1
         );
+    }
+
+    #[test]
+    fn materialize_policy_resource_witnesses_preserve_exact_values() {
+        let policy = SnapshotMaterializePolicyV1::checked_derived(
+            7,
+            nz16(131),
+            nz32(17),
+            nz64(12_345),
+            nz64(19),
+            nz64(65_537),
+            nz8(5),
+            nz8(7),
+        )
+        .unwrap();
+
+        assert_eq!(policy.max_depth(), 7);
+        assert_eq!(policy.max_entries(), 17);
+        assert_eq!(policy.max_basename_bytes(), 131);
+        assert_eq!(policy.max_plan_bytes(), 65_537);
+        assert_eq!(policy.max_total_xattrs(), 19);
+        assert_eq!(policy.max_total_xattr_bytes(), 12_345);
+        assert_eq!(policy.openat2_attempts(), 5);
+        assert_eq!(policy.syscall_attempts(), 7);
     }
 
     #[test]

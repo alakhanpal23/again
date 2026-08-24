@@ -38,6 +38,21 @@ const HARD_MAX_CLEANUP_RETAINED_NAME_BYTES: u64 = 512 * 1024 * 1024;
 // the source walker's descendant-depth budget.
 const PUBLICATION_CONTAINER_LEVELS: u16 = 2;
 const HARD_MAX_CLEANUP_DEPTH: u16 = HARD_MAX_SOURCE_TREE_DEPTH + PUBLICATION_CONTAINER_LEVELS;
+// One descriptor pins an unpublished staging directory. Publication briefly
+// owns that descriptor plus the constrained reopen of its final name.
+const MAX_LIVE_STAGED_FDS: u32 = 1;
+const MAX_LIVE_PUBLICATION_FDS: u32 = 2;
+// Cleanup retains the original staging descriptor and its current-name
+// revalidation descriptors. Each recursive level can additionally retain a
+// pinned O_PATH child and a directory descriptor. This is the leaf's frozen,
+// conservative descriptor envelope; caller-owned parent descriptors are not
+// included.
+const CLEANUP_FDS_PER_DEPTH: u32 = 2;
+const CLEANUP_FIXED_FDS: u32 = 4;
+
+const fn cleanup_fd_peak(max_cleanup_depth: u16) -> u32 {
+    max_cleanup_depth as u32 * CLEANUP_FDS_PER_DEPTH + CLEANUP_FIXED_FDS
+}
 
 /// Read-only evidence of the limits actually carried by a staged directory's
 /// cleanup guard. Private fields make the value non-forgeable outside this
@@ -138,6 +153,41 @@ impl SnapshotPublishPolicyV1 {
 
     pub(super) const fn syscall_attempts(self) -> u8 {
         self.syscall_attempts.get()
+    }
+
+    pub(super) const fn max_cleanup_depth(self) -> u16 {
+        self.max_cleanup_depth
+    }
+
+    pub(super) const fn max_cleanup_entries(self) -> u32 {
+        self.max_cleanup_entries.get()
+    }
+
+    pub(super) const fn max_cleanup_name_bytes(self) -> u16 {
+        self.max_cleanup_name_bytes.get()
+    }
+
+    pub(super) const fn max_cleanup_retained_name_bytes(self) -> u64 {
+        self.max_cleanup_retained_name_bytes.get()
+    }
+
+    pub(super) const fn max_cleanup_getdents_attempts(self) -> u64 {
+        self.max_cleanup_getdents_attempts
+    }
+
+    /// Descriptor retained while the caller builds and seals the stage.
+    pub(super) const fn max_live_staged_fds(self) -> u32 {
+        MAX_LIVE_STAGED_FDS
+    }
+
+    /// Conservative leaf-owned cleanup peak for this policy's depth.
+    pub(super) const fn max_live_cleanup_fds(self) -> u32 {
+        cleanup_fd_peak(self.max_cleanup_depth)
+    }
+
+    /// Descriptor peak while the final published name is reopened and bound.
+    pub(super) const fn max_live_publication_fds(self) -> u32 {
+        MAX_LIVE_PUBLICATION_FDS
     }
 
     const fn cleanup_envelope(self) -> SnapshotCleanupEnvelopeV1 {
@@ -2393,5 +2443,19 @@ mod portable_tests {
         assert_eq!(envelope.openat2_attempts(), 2);
         assert_eq!(envelope.generic_syscall_attempts(), 3);
         assert!(!std::mem::needs_drop::<SnapshotCleanupEnvelopeV1>());
+    }
+
+    #[test]
+    fn policy_reports_exact_cleanup_and_descriptor_witnesses() {
+        let policy = checked_policy(2, 3, 7, 11, 13, 64 * 1024).unwrap();
+
+        assert_eq!(policy.max_cleanup_depth(), 9);
+        assert_eq!(policy.max_cleanup_entries(), 11);
+        assert_eq!(policy.max_cleanup_name_bytes(), 13);
+        assert_eq!(policy.max_cleanup_retained_name_bytes(), 64 * 1024);
+        assert_eq!(policy.max_cleanup_getdents_attempts(), (5 * 11 + 3) * 3);
+        assert_eq!(policy.max_live_staged_fds(), 1);
+        assert_eq!(policy.max_live_cleanup_fds(), 2 * 9 + 4);
+        assert_eq!(policy.max_live_publication_fds(), 2);
     }
 }

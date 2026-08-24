@@ -64,6 +64,7 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 
 mod canonical;
 mod identity;
+mod snapshot_connector;
 mod snapshot_materialize;
 mod snapshot_policy;
 mod snapshot_publish;
