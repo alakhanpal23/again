@@ -44,6 +44,16 @@ identity and reserved fields, and completed cleanup as administrative policy.
 Every other shape remains broken. This diagnostic accepts no command and
 grants no execution or profile authority.
 
+[Actions run 32786126330](https://github.com/alakhanpal23/again/actions/runs/32786126330)
+then retained the exact fail-closed behavior of that rule at commit `948069e`:
+two bootstrap attempts returned authenticated child `PROTOCOL`/`EPROTO`, not a
+UTS-policy refusal. The child had drained the complete release frame before the
+parent closed the last writer; the resulting HUP-only wake was incorrectly
+treated as protocol failure. The correction accepts HUP only as a wake while
+waiting for EOF after a complete frame, then loops back and still requires an
+actual zero-byte read. Partial and extra frames remain rejected, with
+deterministic 63/64/65-byte tests. The failed run is discovery evidence only.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the

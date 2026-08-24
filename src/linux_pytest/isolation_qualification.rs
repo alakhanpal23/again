@@ -3335,7 +3335,7 @@ mod platform {
             if errno == libc::EINTR {
                 continue;
             }
-            if errno != libc::EAGAIN || !child_poll(fd, libc::POLLIN, deadline) {
+            if errno != libc::EAGAIN || !child_poll(fd, libc::POLLIN | libc::POLLHUP, deadline) {
                 return false;
             }
         }
@@ -3432,6 +3432,29 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        fn test_pipe() -> (OwnedFd, OwnedFd) {
+            create_pipe().unwrap_or_else(|_| panic!("nonblocking pipe fixture failed"))
+        }
+
+        fn write_test_payload(fd: RawFd, payload: &[u8]) {
+            loop {
+                let written = unsafe { libc::write(fd, payload.as_ptr().cast(), payload.len()) };
+                if usize::try_from(written).ok() == Some(payload.len()) {
+                    return;
+                }
+                if written < 0 && last_errno() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("pipe fixture write failed");
+            }
+        }
+
+        fn test_deadline() -> MonotonicDeadlineV1 {
+            probe_deadlines()
+                .map(|(deadline, _)| deadline)
+                .unwrap_or_else(|_| panic!("monotonic deadline fixture failed"))
+        }
 
         #[test]
         fn map_encoder_covers_zero_and_u32_max() {
@@ -3560,6 +3583,58 @@ mod platform {
                 let mut changed = frame;
                 changed[offset] ^= 1;
                 assert!(!child_verify_release_frame(&changed, &nonce));
+            }
+        }
+
+        #[test]
+        fn completed_frame_eof_wait_accepts_hup_only_then_requires_eof() {
+            let (read, write) = test_pipe();
+            let payload = [0x5a_u8; FRAME_BYTES_V1];
+            write_test_payload(write.as_raw_fd(), &payload);
+
+            let mut frame = [0_u8; FRAME_BYTES_V1];
+            let received =
+                unsafe { libc::read(read.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len()) };
+            assert_eq!(received, FRAME_BYTES_V1 as isize);
+            assert_eq!(frame, payload);
+
+            let mut extra = 0_u8;
+            assert_eq!(
+                unsafe { libc::read(read.as_raw_fd(), (&mut extra as *mut u8).cast(), 1) },
+                -1
+            );
+            assert_eq!(last_errno(), Some(libc::EAGAIN));
+            drop(write);
+
+            assert!(!child_poll(read.as_raw_fd(), libc::POLLIN, test_deadline()));
+            assert!(child_poll(
+                read.as_raw_fd(),
+                libc::POLLIN | libc::POLLHUP,
+                test_deadline(),
+            ));
+            assert_eq!(
+                unsafe { libc::read(read.as_raw_fd(), (&mut extra as *mut u8).cast(), 1) },
+                0
+            );
+        }
+
+        #[test]
+        fn release_reader_accepts_exactly_one_complete_frame() {
+            let payload = [0x3c_u8; FRAME_BYTES_V1 + 1];
+            for (length, accepted) in [
+                (FRAME_BYTES_V1 - 1, false),
+                (FRAME_BYTES_V1, true),
+                (FRAME_BYTES_V1 + 1, false),
+            ] {
+                let (read, write) = test_pipe();
+                write_test_payload(write.as_raw_fd(), &payload[..length]);
+                drop(write);
+                let mut frame = [0_u8; FRAME_BYTES_V1];
+                assert_eq!(
+                    child_read_frame_and_eof(read.as_raw_fd(), &mut frame, test_deadline()),
+                    accepted,
+                    "payload length {length}",
+                );
             }
         }
 
