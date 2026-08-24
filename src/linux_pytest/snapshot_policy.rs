@@ -243,6 +243,21 @@ pub(super) struct SnapshotRetainedViewLeaseV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
 }
 
+/// Linear escrow of forward attempts for irreversible finalization work.
+///
+/// Construction removes the exact requested allotment up front in one checked
+/// update to the pipeline's sole forward ledger. Each attempt is then charged
+/// against that allotment before its closure runs. Drop returns only unused
+/// attempts; it can never create authority beyond what was removed from the
+/// shared ledger.
+/// Private fields and construction keep the reservation non-forgeable, and
+/// the type intentionally implements neither `Clone` nor `Copy`.
+#[must_use = "dropping the reservation refunds its unused forward attempts"]
+pub(super) struct SnapshotFinalizationAttemptReservationV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    attempts_remaining: Cell<u64>,
+}
+
 /// Temporary RAII precharge held while an allocation is attempted.
 #[must_use = "dropping the charge releases its transient-heap bytes"]
 struct SnapshotTransientChargeV1<'resources> {
@@ -751,6 +766,34 @@ impl SnapshotPipelineResourcesV1 {
         Ok(attempt())
     }
 
+    /// Escrows an exact nonzero number of forward attempts for publication
+    /// finalization before any finalization raw operation can run.
+    ///
+    /// Insufficient shared authority is a typed refusal and leaves the ledger
+    /// unchanged. A successful reservation must be used through
+    /// [`SnapshotFinalizationAttemptReservationV1::run_attempt`]; unused
+    /// attempts are returned when the reservation is dropped.
+    pub(super) fn reserve_finalization_attempts(
+        &self,
+        requested: NonZeroU64,
+    ) -> Result<SnapshotFinalizationAttemptReservationV1<'_>, SnapshotPipelineResourceErrorV1> {
+        let requested = requested.get();
+        let remaining = self.forward_attempts_remaining.get();
+        let Some(next) = remaining.checked_sub(requested) else {
+            return Err(SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::Publication,
+                ),
+                bucket: SnapshotPipelineAttemptBucketV1::Forward,
+            });
+        };
+        self.forward_attempts_remaining.set(next);
+        Ok(SnapshotFinalizationAttemptReservationV1 {
+            resources: self,
+            attempts_remaining: Cell::new(requested),
+        })
+    }
+
     /// Charges one publisher-cleanup attempt before invoking `attempt`.
     ///
     /// Cleanup draws only from the reserve committed before staging creation;
@@ -920,6 +963,37 @@ impl SnapshotPipelineResourcesV1 {
 impl Drop for SnapshotRetainedViewLeaseV1<'_> {
     fn drop(&mut self) {
         self.resources.release_retained_view();
+    }
+}
+
+impl SnapshotFinalizationAttemptReservationV1<'_> {
+    /// Charges one escrowed attempt before invoking `attempt`.
+    ///
+    /// Exhaustion refuses with publication/forward evidence and never invokes
+    /// the closure. Failed or unwinding closures still consume their attempt.
+    pub(super) fn run_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources.charge_attempt(
+            &self.attempts_remaining,
+            SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::Publication),
+            SnapshotPipelineAttemptBucketV1::Forward,
+        )?;
+        Ok(attempt())
+    }
+}
+
+impl Drop for SnapshotFinalizationAttemptReservationV1<'_> {
+    fn drop(&mut self) {
+        let unused = self.attempts_remaining.get();
+        let restored = self
+            .resources
+            .forward_attempts_remaining
+            .get()
+            .checked_add(unused)
+            .expect("a private finalization reservation cannot refund unreserved attempts");
+        self.resources.forward_attempts_remaining.set(restored);
     }
 }
 
@@ -1752,6 +1826,63 @@ mod tests {
     }
 
     #[test]
+    fn finalization_reservation_accepts_exact_n_and_refuses_n_minus_one() {
+        let exhausted = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+            stage: SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::Publication),
+            bucket: SnapshotPipelineAttemptBucketV1::Forward,
+        };
+        let resources = pipeline_resources(3, 8);
+        let reservation = resources.reserve_finalization_attempts(nz64(3)).unwrap();
+        assert_eq!(resources.forward_attempts_remaining.get(), 0);
+        assert_eq!(reservation.attempts_remaining.get(), 3);
+
+        let invoked = Cell::new(0);
+        for expected_remaining in [2, 1, 0] {
+            let value = reservation
+                .run_attempt(|| {
+                    assert_eq!(reservation.attempts_remaining.get(), expected_remaining);
+                    invoked.set(invoked.get() + 1);
+                    37
+                })
+                .unwrap();
+            assert_eq!(value, 37);
+        }
+        assert_eq!(invoked.get(), 3);
+        assert_eq!(
+            reservation
+                .run_attempt(|| invoked.set(invoked.get() + 1))
+                .unwrap_err(),
+            exhausted
+        );
+        assert_eq!(invoked.get(), 3);
+        drop(reservation);
+        assert_eq!(resources.forward_attempts_remaining.get(), 0);
+
+        let short = pipeline_resources(2, 8);
+        assert_eq!(
+            short.reserve_finalization_attempts(nz64(3)).err().unwrap(),
+            exhausted
+        );
+        assert_eq!(short.forward_attempts_remaining.get(), 2);
+    }
+
+    #[test]
+    fn finalization_reservation_refunds_only_unused_attempts() {
+        let resources = pipeline_resources(7, 8);
+        let unused = resources.reserve_finalization_attempts(nz64(5)).unwrap();
+        assert_eq!(resources.forward_attempts_remaining.get(), 2);
+        drop(unused);
+        assert_eq!(resources.forward_attempts_remaining.get(), 7);
+
+        let partial = resources.reserve_finalization_attempts(nz64(5)).unwrap();
+        partial.run_attempt(|| ()).unwrap();
+        partial.run_attempt(|| ()).unwrap();
+        assert_eq!(partial.attempts_remaining.get(), 3);
+        drop(partial);
+        assert_eq!(resources.forward_attempts_remaining.get(), 5);
+    }
+
+    #[test]
     fn transient_reservations_compose_across_phases_and_restore_on_any_drop_order() {
         let resources = pipeline_resources(1, 10);
         let first = resources
@@ -1959,6 +2090,11 @@ mod tests {
         <SnapshotChargedBytesV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotChargedBytesV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotChargedBytesV1<'static> as AmbiguousIfDefault<_>>::probe();
+        <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<SnapshotChargedBytesV1<'static>>());
+        assert!(std::mem::needs_drop::<
+            SnapshotFinalizationAttemptReservationV1<'static>,
+        >());
     }
 }
