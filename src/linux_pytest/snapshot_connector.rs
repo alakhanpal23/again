@@ -4,10 +4,12 @@
 //! preflighted policy. Optional zero-valued classes and aggregate budgets that
 //! current nonzero leaf shapes cannot enforce exactly are refused rather than
 //! widened. The connector then owns the mutable resource ledger and keeps leaf
-//! policies private. Only staged-directory creation and its RAII cleanup are
-//! wired so far; the charged guard cannot enter the still-unmetered ready or
-//! publish transitions. Every wired phase charges the same ledger before each
-//! budgeted attempt and allocator-observed capacity increase.
+//! policies private. Connector-owned source observation and staged-directory
+//! creation with RAII cleanup are wired so far; the charged guard cannot enter
+//! the still-unmetered ready or publish transitions. Every wired kernel attempt
+//! charges the same ledger. Source-observation logical counts and payloads are
+//! bounded by leaf policy, but allocator-observed capacity is not yet
+//! structurally charged to the transient-heap ledger.
 
 use std::ffi::CStr;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
@@ -21,10 +23,14 @@ use super::snapshot_policy::{
 use super::snapshot_publish::{
     ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1, SnapshotPublishPolicyV1,
 };
-use super::snapshot_regular::RegularCopyPolicyV1;
+use super::snapshot_regular::{RegularCopyPolicyV1, SnapshotRegularFailureV1};
 use super::snapshot_tree::{
-    SourceEnumerationPolicyV1, SourceTraversalLimitsV1, SourceXattrLimitsV1,
+    QualifiedNoAtimeSourceViewV1, SourceEnumerationPolicyV1, SourceObservationTreeVisitorV1,
+    SourceObservedRegularVisitV1, SourceRegularEvidenceV1, SourceTraversalLimitsV1,
+    SourceTreeAcquireFailureV1, SourceTreeFailureV1, SourceTreePlanV1, SourceXattrLimitsV1,
+    enumerate_source_tree_view_charged_at,
 };
+use super::{ExtentV1, FileContentDigest};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotProjectedLeafV1 {
@@ -124,12 +130,138 @@ impl<E> From<SnapshotPipelineResourceErrorV1> for SnapshotChargedErrorV1<E> {
     }
 }
 
+/// A charged source-observation failure.
+///
+/// Publication state is deliberately absent: source observation has no
+/// publication transition, so that impossible state must not be representable
+/// on this path. Leaf debug payloads remain redacted because they may originate
+/// at a raw-path traversal boundary.
+#[derive(Eq, PartialEq)]
+pub(super) enum SnapshotSourceObservationErrorV1<E> {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(E),
+}
+
+impl<E> SnapshotSourceObservationErrorV1<E> {
+    fn map_leaf<F>(self, map: impl FnOnce(E) -> F) -> SnapshotSourceObservationErrorV1<F> {
+        match self {
+            Self::Resource(error) => SnapshotSourceObservationErrorV1::Resource(error),
+            Self::Leaf(error) => SnapshotSourceObservationErrorV1::Leaf(map(error)),
+        }
+    }
+}
+
+impl<E> std::fmt::Debug for SnapshotSourceObservationErrorV1<E> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resource(error) => formatter.debug_tuple("Resource").field(error).finish(),
+            Self::Leaf(_) => formatter.write_str("Leaf(<redacted>)"),
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SnapshotSourceObservationFailureV1 {
+    Tree(SourceTreeFailureV1),
+    Regular(SnapshotRegularFailureV1),
+    InvalidRegularEvidence,
+}
+
 /// One matched publication session. It never exposes independently spliceable
 /// forward and cleanup authority.
 #[derive(Debug)]
 pub(super) struct SnapshotPublicationSessionV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
     policy: &'resources SnapshotPublishPolicyV1,
+}
+
+/// One connector-minted source-observation authority.
+///
+/// Its private fields bind the exact derived source policy to the connector's
+/// sole mutable resource ledger. The stage is structural rather than stored,
+/// so a caller cannot splice another phase into this authority.
+pub(super) struct SnapshotSourceObservationSessionV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    policy: &'resources SourceEnumerationPolicyV1,
+}
+
+impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
+    pub(super) const fn source_policy(&self) -> &'resources SourceEnumerationPolicyV1 {
+        self.policy
+    }
+
+    pub(super) const fn regular_copy_policy(&self) -> RegularCopyPolicyV1 {
+        self.policy.regular_copy_policy()
+    }
+
+    pub(super) fn run_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources
+            .run_forward_attempt(SnapshotPipelineForwardStageV1::SourceObservation, attempt)
+    }
+}
+
+/// Connector-owned visitor for one charged source observation. The charged
+/// walker supplies a regular-file capability that can only observe through
+/// the exact embedded session; no unmetered copy operation is available here.
+struct SnapshotSourceObservationVisitorV1;
+
+impl SourceObservationTreeVisitorV1 for SnapshotSourceObservationVisitorV1 {
+    type Error = SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>;
+
+    fn regular(
+        &mut self,
+        visit: SourceObservedRegularVisitV1<'_, '_>,
+    ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+        let logical_size = visit.logical_size();
+        let evidence = visit
+            .observe()
+            .map_err(|error| error.map_leaf(SnapshotSourceObservationFailureV1::Regular))?;
+        let (content_digest, data_extents) = evidence.into_parts();
+        admit_observed_regular_parts(logical_size, content_digest, data_extents)
+    }
+}
+
+fn admit_observed_regular_parts(
+    logical_size: u64,
+    content_digest: FileContentDigest,
+    data_extents: Vec<ExtentV1>,
+) -> Result<
+    SourceRegularEvidenceV1,
+    SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
+> {
+    SourceRegularEvidenceV1::checked(content_digest, data_extents, logical_size).ok_or(
+        SnapshotSourceObservationErrorV1::Leaf(
+            SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+        ),
+    )
+}
+
+fn flatten_source_observation_error(
+    error: SnapshotSourceObservationErrorV1<
+        SourceTreeAcquireFailureV1<
+            SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
+        >,
+    >,
+) -> SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1> {
+    match error {
+        SnapshotSourceObservationErrorV1::Resource(error) => {
+            SnapshotSourceObservationErrorV1::Resource(error)
+        }
+        SnapshotSourceObservationErrorV1::Leaf(SourceTreeAcquireFailureV1::Source(error)) => {
+            SnapshotSourceObservationErrorV1::Leaf(SnapshotSourceObservationFailureV1::Tree(error))
+        }
+        SnapshotSourceObservationErrorV1::Leaf(SourceTreeAcquireFailureV1::Visitor {
+            source: SnapshotSourceObservationErrorV1::Resource(error),
+            ..
+        }) => SnapshotSourceObservationErrorV1::Resource(error),
+        SnapshotSourceObservationErrorV1::Leaf(SourceTreeAcquireFailureV1::Visitor {
+            source: SnapshotSourceObservationErrorV1::Leaf(error),
+            ..
+        }) => SnapshotSourceObservationErrorV1::Leaf(error),
+    }
 }
 
 impl<'resources> SnapshotPublicationSessionV1<'resources> {
@@ -193,6 +325,13 @@ pub(super) struct SnapshotConnectorV1 {
 }
 
 impl SnapshotConnectorV1 {
+    fn source_observation_session(&self) -> SnapshotSourceObservationSessionV1<'_> {
+        SnapshotSourceObservationSessionV1 {
+            resources: &self.resources,
+            policy: &self.source,
+        }
+    }
+
     fn begin_publication(&self) -> Option<SnapshotPublicationSessionV1<'_>> {
         if self.publication_started.replace(true) {
             return None;
@@ -201,6 +340,23 @@ impl SnapshotConnectorV1 {
             resources: &self.resources,
             policy: &self.publication,
         })
+    }
+
+    /// Observe one exact, qualified source view under the connector's derived
+    /// source policy and sole resource ledger. The session and visitor never
+    /// escape, and callback paths are discarded while errors are flattened.
+    pub(super) fn observe_source_tree_view_at(
+        &self,
+        source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<
+        SourceTreePlanV1,
+        SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
+    > {
+        let session = self.source_observation_session();
+        let mut visitor = SnapshotSourceObservationVisitorV1;
+        enumerate_source_tree_view_charged_at(source_view, root_name, &session, &mut visitor)
+            .map_err(flatten_source_observation_error)
     }
 
     /// Consumes the sole publication attempt, even when staging refuses or
@@ -786,7 +942,7 @@ mod tests {
             projected.publication.cleanup_operation_attempt_bound(),
             Some(projected.resources.policy().cleanup_operation_reserve())
         );
-        assert_eq!(projected.resources.policy().max_live_snapshot_fds(), 16);
+        assert_eq!(projected.resources.policy().max_live_snapshot_fds(), 17);
     }
 
     #[test]
@@ -894,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_and_publication_session_cannot_clone_and_zero_forward_stays_inert() {
+    fn connector_and_sessions_cannot_clone_and_zero_forward_stays_inert() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
         }
@@ -911,6 +1067,8 @@ mod tests {
         <SnapshotConnectorV1 as AmbiguousIfCopy<_>>::probe();
         <SnapshotPublicationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotPublicationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
 
         let mut inputs = Inputs::exact();
         // `(5E + 3) * open + (12E + 12) * syscall` for E=4.
@@ -948,9 +1106,72 @@ mod tests {
     }
 
     #[test]
+    fn source_observation_sessions_share_exact_policy_and_forward_ledger() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let first = connector.source_observation_session();
+        let second = connector.source_observation_session();
+
+        assert!(std::ptr::eq(first.source_policy(), &connector.source));
+        assert!(std::ptr::eq(first.source_policy(), second.source_policy()));
+        assert_eq!(first.regular_copy_policy(), second.regular_copy_policy());
+        assert!(std::ptr::eq(first.resources, second.resources));
+
+        let before = connector.resources.forward_attempts_remaining_for_test();
+        first.run_attempt(|| ()).unwrap();
+        assert_eq!(
+            second.resources.forward_attempts_remaining_for_test(),
+            before - 1
+        );
+    }
+
+    #[test]
+    fn source_observation_exhaustion_is_typed_and_precedes_attempt() {
+        let mut inputs = Inputs::exact();
+        // `(5E + 3) * open + (12E + 12) * syscall` for E=4 leaves no
+        // forward attempts after reserving cleanup.
+        inputs.operation_attempts = 272;
+        let connector = connect_snapshot_pipeline(resources(inputs)).unwrap();
+        let cleanup_before = connector.resources.cleanup_attempts_remaining_for_test();
+        let session = connector.source_observation_session();
+
+        let invoked = Cell::new(false);
+        assert_eq!(
+            session.run_attempt(|| invoked.set(true)).unwrap_err(),
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::SourceObservation,
+                ),
+                bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+            }
+        );
+        assert!(!invoked.get());
+        assert_eq!(
+            connector.resources.cleanup_attempts_remaining_for_test(),
+            cleanup_before
+        );
+    }
+
+    #[test]
     fn connector_issues_at_most_one_publication_session() {
         let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
         let _first = connector.begin_publication().unwrap();
+        assert!(connector.begin_publication().is_none());
+    }
+
+    #[test]
+    fn publication_session_does_not_block_source_observation() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let staging = connector.begin_publication().unwrap();
+        let forward_before = staging.forward_attempts_remaining();
+        let cleanup_before = staging.cleanup_attempts_remaining();
+
+        connector
+            .source_observation_session()
+            .run_attempt(|| ())
+            .unwrap();
+
+        assert_eq!(staging.forward_attempts_remaining(), forward_before - 1);
+        assert_eq!(staging.cleanup_attempts_remaining(), cleanup_before);
         assert!(connector.begin_publication().is_none());
     }
 
@@ -961,6 +1182,103 @@ mod tests {
             SnapshotChargedErrorV1::<&str>::Leaf("secret-leaf-sentinel")
         );
         assert_eq!(rendered, "Leaf(<redacted>)");
+    }
+
+    #[test]
+    fn source_observation_error_debug_redacts_leaf_payloads() {
+        let rendered = format!(
+            "{:?}",
+            SnapshotSourceObservationErrorV1::<&str>::Leaf("secret-leaf-sentinel")
+        );
+        assert_eq!(rendered, "Leaf(<redacted>)");
+    }
+
+    #[test]
+    fn observed_regular_parts_are_revalidated_before_plan_admission() {
+        let digest = FileContentDigest([7; 32]);
+        let admitted = admit_observed_regular_parts(
+            3,
+            digest,
+            vec![
+                ExtentV1 {
+                    offset: 0,
+                    length: 1,
+                },
+                ExtentV1 {
+                    offset: 2,
+                    length: 1,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(admitted.content_digest(), digest);
+        assert_eq!(admitted.data_extents().len(), 2);
+
+        let error = match admit_observed_regular_parts(
+            2,
+            digest,
+            vec![
+                ExtentV1 {
+                    offset: 0,
+                    length: 1,
+                },
+                ExtentV1 {
+                    offset: 1,
+                    length: 1,
+                },
+            ],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("overlapping extents must not enter the source plan"),
+        };
+        assert_eq!(
+            error,
+            SnapshotSourceObservationErrorV1::Leaf(
+                SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+            )
+        );
+    }
+
+    #[test]
+    fn source_visitor_resource_exhaustion_flattens_to_top_level_resource() {
+        let resource = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+            stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                SnapshotPipelineForwardStageV1::SourceObservation,
+            ),
+            bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+        };
+        let nested = SnapshotSourceObservationErrorV1::Leaf(SourceTreeAcquireFailureV1::Visitor {
+            stage: super::super::snapshot_tree::SourceTreeStageV1::VisitRegular,
+            relative_path: b"secret-path-sentinel".as_slice().into(),
+            source: SnapshotSourceObservationErrorV1::Resource(resource),
+        });
+
+        assert_eq!(
+            flatten_source_observation_error(nested),
+            SnapshotSourceObservationErrorV1::Resource(resource)
+        );
+    }
+
+    #[test]
+    fn source_visitor_leaf_flattening_discards_callback_path() {
+        let nested = SnapshotSourceObservationErrorV1::Leaf(SourceTreeAcquireFailureV1::Visitor {
+            stage: super::super::snapshot_tree::SourceTreeStageV1::VisitRegular,
+            relative_path: b"secret-path-sentinel".as_slice().into(),
+            source: SnapshotSourceObservationErrorV1::Leaf(
+                SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+            ),
+        });
+
+        let flattened = flatten_source_observation_error(nested);
+        assert_eq!(
+            flattened,
+            SnapshotSourceObservationErrorV1::Leaf(
+                SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+            )
+        );
+        let rendered = format!("{flattened:?}");
+        assert_eq!(rendered, "Leaf(<redacted>)");
+        assert!(!rendered.contains("secret-path-sentinel"));
     }
 
     #[test]

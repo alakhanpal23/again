@@ -14,7 +14,14 @@ use std::fmt;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::BorrowedFd;
 
-use super::snapshot_regular::{CopiedRegularV1, RegularCopyPolicyV1, SnapshotRegularFailureV1};
+use super::snapshot_connector::{
+    SnapshotSourceObservationErrorV1, SnapshotSourceObservationSessionV1,
+};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
+use super::snapshot_regular::{
+    CopiedRegularV1, RegularCopyEvidenceV1, RegularCopyPolicyV1, SnapshotRegularFailureV1,
+};
 use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
 
 const HARD_MAX_DEPTH: u16 = 256;
@@ -208,6 +215,21 @@ impl SourceEnumerationPolicyV1 {
             Some(value) => value,
             None => return None,
         };
+        // The regular observer retains the first extent pass as evidence while
+        // building a second pass for stability comparison. The all-entry term
+        // above covers the retained first pass; charge one additional file's
+        // logical maximum while both vectors are live.
+        let transient_extent_bound = match (max_data_extents.get() as u64)
+            .checked_mul(std::mem::size_of::<ExtentV1>() as u64)
+        {
+            Some(value) => value,
+            None => return None,
+        };
+        let retained_with_extents = match retained_with_extents.checked_add(transient_extent_bound)
+        {
+            Some(value) => value,
+            None => return None,
+        };
         let entry_count = traversal.max_entries.get() as u64;
         let per_entry_fixed = (std::mem::size_of::<SourceTreeEntryV1>()
             + std::mem::size_of::<SourceInodeKeyV1>()
@@ -311,7 +333,7 @@ impl SourceEnumerationPolicyV1 {
     /// caller-owned trusted-parent FD and any visitor destination FDs are
     /// additional and must be included in the backend RLIMIT preflight.
     pub(super) const fn max_live_source_fds(self) -> u32 {
-        self.traversal.max_depth as u32 * 2 + 4
+        self.traversal.max_depth as u32 * 2 + 5
     }
 
     pub(super) const fn max_depth(self) -> u16 {
@@ -348,6 +370,10 @@ impl SourceEnumerationPolicyV1 {
 
     pub(super) const fn xattr_stability_attempts(self) -> u8 {
         self.xattr_stability_attempts.get()
+    }
+
+    pub(super) const fn regular_copy_policy(self) -> RegularCopyPolicyV1 {
+        self.regular_copy
     }
 }
 
@@ -641,7 +667,9 @@ fn validate_regular_evidence(
             None,
         ));
     }
-    let retained_extent_bytes = (evidence.data_extents.len() as u64)
+    // Retain and account the allocator-observed Vec capacity, not only its
+    // logical length. `try_reserve_exact` may legally overallocate.
+    let retained_extent_bytes = (evidence.data_extents.capacity() as u64)
         .checked_mul(std::mem::size_of::<ExtentV1>() as u64)
         .ok_or_else(|| {
             SourceTreeFailureV1::new(
@@ -996,6 +1024,40 @@ impl<'a> SourceRegularVisitV1<'a> {
     }
 }
 
+/// A regular-file callback capability for connector-owned source observation.
+///
+/// Unlike [`SourceRegularVisitV1`], this value exposes no materialization
+/// operation. The exact connector session is embedded by the charged walker,
+/// so a callback can neither substitute another policy/stage nor perform an
+/// unmetered copy while charged traversal is in progress.
+pub(super) struct SourceObservedRegularVisitV1<'visit, 'resources> {
+    common: SourceVisitCommonV1<'visit>,
+    session: &'visit SnapshotSourceObservationSessionV1<'resources>,
+}
+
+impl<'visit, 'resources> SourceObservedRegularVisitV1<'visit, 'resources> {
+    pub(super) const fn logical_size(&self) -> u64 {
+        self.common.statx.size()
+    }
+
+    pub(super) fn observe(
+        self,
+    ) -> Result<RegularCopyEvidenceV1, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>>
+    {
+        // SAFETY: only the qualified charged walker can construct this value.
+        // It binds the parent, name, pinned handle, and exact connector-minted
+        // session for the callback's lifetime.
+        unsafe {
+            super::snapshot_regular::observe_regular_from_qualified_pinned_at(
+                self.common.parent,
+                self.common.name,
+                self.common.handle,
+                self.session,
+            )
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct SourceSymlinkVisitV1<'a> {
     common: SourceVisitCommonV1<'a>,
@@ -1030,14 +1092,38 @@ pub(super) trait SourceTreeVisitorV1 {
     fn directory_leave(&mut self, visit: SourceDirectoryVisitV1<'_>) -> Result<(), Self::Error>;
 }
 
-#[derive(Debug)]
+/// Visitor surface used only by connector-owned, charged source observation.
+/// Its regular callback receives no unmetered materialization capability.
+pub(super) trait SourceObservationTreeVisitorV1 {
+    type Error;
+
+    fn regular(
+        &mut self,
+        visit: SourceObservedRegularVisitV1<'_, '_>,
+    ) -> Result<SourceRegularEvidenceV1, Self::Error>;
+}
+
 pub(super) enum SourceTreeAcquireFailureV1<E> {
     Source(SourceTreeFailureV1),
     Visitor {
         stage: SourceTreeStageV1,
-        relative_path: Box<[u8]>,
+        relative_path: Vec<u8>,
         source: E,
     },
+}
+
+impl<E> fmt::Debug for SourceTreeAcquireFailureV1<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => formatter.debug_tuple("Source").field(error).finish(),
+            Self::Visitor { stage, .. } => formatter
+                .debug_struct("Visitor")
+                .field("stage", stage)
+                .field("relative_path", &"<redacted>")
+                .field("source", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 impl<E> From<SourceTreeFailureV1> for SourceTreeAcquireFailureV1<E> {
@@ -1046,6 +1132,17 @@ impl<E> From<SourceTreeFailureV1> for SourceTreeAcquireFailureV1<E> {
     }
 }
 
+pub(super) fn enumerate_source_tree_view_charged_at<V: SourceObservationTreeVisitorV1>(
+    source_view: QualifiedNoAtimeSourceViewV1<'_>,
+    root_name: &CStr,
+    session: &SnapshotSourceObservationSessionV1<'_>,
+    visitor: &mut V,
+) -> Result<SourceTreePlanV1, SnapshotSourceObservationErrorV1<SourceTreeAcquireFailureV1<V::Error>>>
+{
+    platform::enumerate_source_tree_view_charged_at(source_view, root_name, session, visitor)
+}
+
+#[cfg(test)]
 pub(super) fn enumerate_source_tree_view_at<V: SourceTreeVisitorV1>(
     source_view: QualifiedNoAtimeSourceViewV1<'_>,
     root_name: &CStr,
@@ -1109,6 +1206,209 @@ mod platform {
         Allocation,
     }
 
+    #[derive(Debug)]
+    enum TraversalFailureV1<E> {
+        Resource(SnapshotPipelineResourceErrorV1),
+        Leaf(E),
+    }
+
+    impl<E> TraversalFailureV1<E> {
+        fn map_leaf<F>(self, map: impl FnOnce(E) -> F) -> TraversalFailureV1<F> {
+            match self {
+                Self::Resource(error) => TraversalFailureV1::Resource(error),
+                Self::Leaf(error) => TraversalFailureV1::Leaf(map(error)),
+            }
+        }
+
+        fn into_source_observation(self) -> SnapshotSourceObservationErrorV1<E> {
+            match self {
+                Self::Resource(error) => SnapshotSourceObservationErrorV1::Resource(error),
+                Self::Leaf(error) => SnapshotSourceObservationErrorV1::Leaf(error),
+            }
+        }
+    }
+
+    impl From<SourceTreeFailureV1> for TraversalFailureV1<SourceTreeFailureV1> {
+        fn from(error: SourceTreeFailureV1) -> Self {
+            Self::Leaf(error)
+        }
+    }
+
+    impl<E> From<SourceTreeFailureV1> for TraversalFailureV1<SourceTreeAcquireFailureV1<E>> {
+        fn from(error: SourceTreeFailureV1) -> Self {
+            Self::Leaf(SourceTreeAcquireFailureV1::Source(error))
+        }
+    }
+
+    impl<E> From<SourceTreeAcquireFailureV1<E>> for TraversalFailureV1<SourceTreeAcquireFailureV1<E>> {
+        fn from(error: SourceTreeAcquireFailureV1<E>) -> Self {
+            Self::Leaf(error)
+        }
+    }
+
+    impl<E> From<TraversalFailureV1<SourceTreeFailureV1>>
+        for TraversalFailureV1<SourceTreeAcquireFailureV1<E>>
+    {
+        fn from(error: TraversalFailureV1<SourceTreeFailureV1>) -> Self {
+            error.map_leaf(SourceTreeAcquireFailureV1::Source)
+        }
+    }
+
+    trait AttemptGateV1 {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1>;
+    }
+
+    impl AttemptGateV1 for SnapshotSourceObservationSessionV1<'_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            SnapshotSourceObservationSessionV1::run_attempt(self, attempt)
+        }
+    }
+
+    #[cfg(test)]
+    struct UnmeteredAttemptGateV1;
+
+    #[cfg(test)]
+    impl AttemptGateV1 for UnmeteredAttemptGateV1 {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            Ok(attempt())
+        }
+    }
+
+    /// Internal adapter boundary shared by the one traversal implementation.
+    /// Production charged observation and test/materialization visitors are
+    /// converted into disjoint regular-file capabilities before reaching a
+    /// callback.
+    trait WalkVisitorV1 {
+        type Error;
+
+        fn directory_enter(&mut self, visit: SourceDirectoryVisitV1<'_>)
+        -> Result<(), Self::Error>;
+
+        fn regular(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            copy_policy: RegularCopyPolicyV1,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error>;
+
+        fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error>;
+
+        fn directory_leave(&mut self, visit: SourceDirectoryVisitV1<'_>)
+        -> Result<(), Self::Error>;
+    }
+
+    struct MaterializationVisitorAdapterV1<'visitor, V> {
+        visitor: &'visitor mut V,
+    }
+
+    impl<V: SourceTreeVisitorV1> WalkVisitorV1 for MaterializationVisitorAdapterV1<'_, V> {
+        type Error = V::Error;
+
+        fn directory_enter(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.visitor.directory_enter(visit)
+        }
+
+        fn regular(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            copy_policy: RegularCopyPolicyV1,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+            self.visitor.regular(SourceRegularVisitV1 {
+                common,
+                copy_policy,
+            })
+        }
+
+        fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
+            self.visitor.symlink(visit)
+        }
+
+        fn directory_leave(
+            &mut self,
+            visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            self.visitor.directory_leave(visit)
+        }
+    }
+
+    struct ObservationVisitorAdapterV1<'visitor, 'session, 'resources, V> {
+        visitor: &'visitor mut V,
+        session: &'session SnapshotSourceObservationSessionV1<'resources>,
+    }
+
+    impl<V: SourceObservationTreeVisitorV1> WalkVisitorV1
+        for ObservationVisitorAdapterV1<'_, '_, '_, V>
+    {
+        type Error = V::Error;
+
+        fn directory_enter(
+            &mut self,
+            _visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn regular(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            _copy_policy: RegularCopyPolicyV1,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+            self.visitor.regular(SourceObservedRegularVisitV1 {
+                common,
+                session: self.session,
+            })
+        }
+
+        fn symlink(&mut self, _visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn directory_leave(
+            &mut self,
+            _visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    fn run_io_attempt<G: AttemptGateV1, T>(
+        gate: &G,
+        attempt: impl FnOnce() -> io::Result<T>,
+    ) -> Result<T, TraversalFailureV1<io::Error>> {
+        gate.run_attempt(attempt)
+            .map_err(TraversalFailureV1::Resource)?
+            .map_err(TraversalFailureV1::Leaf)
+    }
+
+    fn run_io_with_retry<G: AttemptGateV1, T>(
+        gate: &G,
+        attempts: u8,
+        mut retry: impl FnMut(&io::Error) -> bool,
+        mut operation: impl FnMut() -> io::Result<T>,
+        exhausted_errno: i32,
+    ) -> Result<T, TraversalFailureV1<io::Error>> {
+        let mut last = io::Error::from_raw_os_error(exhausted_errno);
+        for _ in 0..attempts {
+            match run_io_attempt(gate, &mut operation) {
+                Ok(value) => return Ok(value),
+                Err(TraversalFailureV1::Leaf(error)) if retry(&error) => last = error,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(TraversalFailureV1::Leaf(last))
+    }
+
     fn try_reserve_bounded_for_push<T>(
         values: &mut Vec<T>,
         max_len: usize,
@@ -1163,6 +1463,37 @@ mod platform {
     }
 
     trait EnumerationHooks {
+        fn duplicate_fd_once(&self, fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+            raw_duplicate_fd_once(fd)
+        }
+
+        fn openat2_once(
+            &self,
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            flags: i32,
+            resolve: u64,
+        ) -> io::Result<OwnedFd> {
+            raw_openat2_once(parent, name, flags, resolve)
+        }
+
+        fn statx_once(&self, fd: BorrowedFd<'_>) -> io::Result<SourceStatxV1> {
+            raw_statx_identity_once(fd)
+        }
+
+        fn lseek_once(
+            &self,
+            fd: BorrowedFd<'_>,
+            offset: libc::off_t,
+            whence: i32,
+        ) -> io::Result<u64> {
+            raw_lseek_once(fd, offset, whence)
+        }
+
+        fn getdents64_once(&self, fd: BorrowedFd<'_>, output: &mut [u8]) -> io::Result<usize> {
+            raw_getdents64_once(fd, output)
+        }
+
         fn list_xattrs(&self, fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize>;
 
         fn get_xattr(&self, fd: RawFd, name: &CStr, output: Option<&mut [u8]>)
@@ -1306,10 +1637,11 @@ mod platform {
         Symlink { target: Vec<u8> },
     }
 
-    struct Builder<'a, 'v, H, V> {
+    struct Builder<'a, 'v, G, H, V> {
         root_parent: OwnedFd,
         root_name: &'a CStr,
         policy: SourceEnumerationPolicyV1,
+        gate: &'a G,
         hooks: &'a H,
         visitor: &'v mut V,
         root_mount_id: Option<u64>,
@@ -1320,28 +1652,63 @@ mod platform {
         total_plan_bytes: u64,
     }
 
+    pub(super) fn enumerate_source_tree_view_charged_at<V: SourceObservationTreeVisitorV1>(
+        source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+        session: &SnapshotSourceObservationSessionV1<'_>,
+        visitor: &mut V,
+    ) -> Result<
+        SourceTreePlanV1,
+        SnapshotSourceObservationErrorV1<SourceTreeAcquireFailureV1<V::Error>>,
+    > {
+        let mut visitor = ObservationVisitorAdapterV1 { visitor, session };
+        enumerate_source_tree_view_at_with(
+            source_view.trusted_parent(),
+            root_name,
+            *session.source_policy(),
+            session,
+            &KernelHooks,
+            &mut visitor,
+        )
+        .map_err(TraversalFailureV1::into_source_observation)
+    }
+
+    #[cfg(test)]
     pub(super) fn enumerate_source_tree_view_at<V: SourceTreeVisitorV1>(
         source_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
         policy: SourceEnumerationPolicyV1,
         visitor: &mut V,
     ) -> Result<SourceTreePlanV1, SourceTreeAcquireFailureV1<V::Error>> {
-        enumerate_source_tree_view_at_with(
+        let mut visitor = MaterializationVisitorAdapterV1 { visitor };
+        match enumerate_source_tree_view_at_with(
             source_view.trusted_parent(),
             root_name,
             policy,
+            &UnmeteredAttemptGateV1,
             &KernelHooks,
-            visitor,
-        )
+            &mut visitor,
+        ) {
+            Ok(plan) => Ok(plan),
+            Err(TraversalFailureV1::Leaf(error)) => Err(error),
+            Err(TraversalFailureV1::Resource(_)) => {
+                unreachable!("the test-only unmetered attempt gate cannot exhaust")
+            }
+        }
     }
 
-    fn enumerate_source_tree_view_at_with<H: EnumerationHooks, V: SourceTreeVisitorV1>(
+    fn enumerate_source_tree_view_at_with<
+        G: AttemptGateV1,
+        H: EnumerationHooks,
+        V: WalkVisitorV1,
+    >(
         trusted_parent: BorrowedFd<'_>,
         root_name: &CStr,
         policy: SourceEnumerationPolicyV1,
+        gate: &G,
         hooks: &H,
         visitor: &mut V,
-    ) -> Result<SourceTreePlanV1, SourceTreeAcquireFailureV1<V::Error>> {
+    ) -> Result<SourceTreePlanV1, TraversalFailureV1<SourceTreeAcquireFailureV1<V::Error>>> {
         if !valid_basename(root_name.to_bytes(), policy.traversal.max_name_bytes.get()) {
             return Err(failure(
                 SourceTreeStageV1::ValidatePolicy,
@@ -1351,8 +1718,9 @@ mod platform {
             )
             .into());
         }
-        let root_parent = duplicate_fd(trusted_parent)
-            .map_err(|error| io_failure(SourceTreeStageV1::DuplicateParent, b"", error))?;
+        let root_parent = duplicate_fd(gate, hooks, trusted_parent).map_err(|error| {
+            error.map_leaf(|error| io_failure(SourceTreeStageV1::DuplicateParent, b"", error))
+        })?;
         let initial_plan_bytes = (root_name.to_bytes().len() as u64)
             .checked_add(std::mem::size_of::<SourceTreePlanV1>() as u64)
             .ok_or_else(|| limit(b"", SourceTreeLimitV1::PlanBytes))?;
@@ -1363,6 +1731,7 @@ mod platform {
             root_parent,
             root_name,
             policy,
+            gate,
             hooks,
             visitor,
             root_mount_id: None,
@@ -1376,8 +1745,10 @@ mod platform {
             .entries
             .try_reserve_exact(1)
             .map_err(|_| limit(b"", SourceTreeLimitV1::PlanBytes))?;
-        let parent_fd = duplicate_fd(builder.root_parent.as_fd())
-            .map_err(|error| io_failure(SourceTreeStageV1::DuplicateParent, b"", error))?;
+        let parent_fd = duplicate_fd(builder.gate, builder.hooks, builder.root_parent.as_fd())
+            .map_err(|error| {
+                error.map_leaf(|error| io_failure(SourceTreeStageV1::DuplicateParent, b"", error))
+            })?;
         let root_index =
             builder.enumerate_entry(parent_fd.as_fd(), root_name, Vec::new(), None, 0)?;
         if root_index != 0 || !matches!(builder.entries[0].payload, BuildPayload::Directory { .. })
@@ -1393,7 +1764,7 @@ mod platform {
         Ok(normalize_plan(builder)?)
     }
 
-    impl<H: EnumerationHooks, V: SourceTreeVisitorV1> Builder<'_, '_, H, V> {
+    impl<G: AttemptGateV1, H: EnumerationHooks, V: WalkVisitorV1> Builder<'_, '_, G, H, V> {
         fn enumerate_entry(
             &mut self,
             parent_fd: BorrowedFd<'_>,
@@ -1401,18 +1772,26 @@ mod platform {
             relative_path: Vec<u8>,
             parent: Option<usize>,
             depth: u16,
-        ) -> Result<usize, SourceTreeAcquireFailureV1<V::Error>> {
+        ) -> Result<usize, TraversalFailureV1<SourceTreeAcquireFailureV1<V::Error>>> {
             self.check_entry_limits(name.to_bytes(), &relative_path, depth)?;
             let handle = openat2_owned(
+                self.gate,
+                self.hooks,
                 parent_fd,
                 name,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 SOURCE_RESOLVE,
                 self.policy.openat2_attempts.get(),
             )
-            .map_err(|error| map_open_error(SourceTreeStageV1::OpenEntry, &relative_path, error))?;
-            let statx = statx_identity(handle.as_fd()).map_err(|error| {
-                map_statx_error(SourceTreeStageV1::InspectEntry, &relative_path, error)
+            .map_err(|error| {
+                error.map_leaf(|error| {
+                    map_open_error(SourceTreeStageV1::OpenEntry, &relative_path, error)
+                })
+            })?;
+            let statx = statx_identity(self.gate, self.hooks, handle.as_fd()).map_err(|error| {
+                error.map_leaf(|error| {
+                    map_statx_error(SourceTreeStageV1::InspectEntry, &relative_path, error)
+                })
             })?;
             self.hooks
                 .observe_live_source_fds(depth, u32::from(depth) * 2 + 3);
@@ -1430,18 +1809,22 @@ mod platform {
                 None => self.root_mount_id = Some(mount_id),
                 _ => {}
             }
-            let xattrs = capture_stable_xattrs(
+            let xattrs = capture_stable_xattrs_with_gate(
+                self.gate,
                 self.hooks,
                 handle.as_raw_fd(),
                 &relative_path,
                 self.policy.xattrs,
                 self.policy.xattr_stability_attempts.get(),
-                self.policy
-                    .xattrs
-                    .max_total_bytes
-                    .get()
-                    .saturating_sub(self.total_xattr_bytes),
-                self.remaining_plan_bytes(),
+                XattrCaptureBoundsV1 {
+                    max_xattr_bytes: self
+                        .policy
+                        .xattrs
+                        .max_total_bytes
+                        .get()
+                        .saturating_sub(self.total_xattr_bytes),
+                    max_plan_bytes: self.remaining_plan_bytes(),
+                },
             )?;
             let (xattr_bytes, xattr_plan_bytes) = xattr_storage_bytes(&xattrs)?;
             self.total_xattr_bytes = self
@@ -1477,18 +1860,29 @@ mod platform {
                         .into());
                     }
                     let directory = openat2_owned(
+                        self.gate,
+                        self.hooks,
                         parent_fd,
                         name,
                         self.hooks.directory_open_flags(),
                         SOURCE_RESOLVE,
                         self.policy.openat2_attempts.get(),
                     )
-                    .map_err(|error| map_directory_open_error(&relative_path, error))?;
+                    .map_err(|error| {
+                        error.map_leaf(|error| map_directory_open_error(&relative_path, error))
+                    })?;
                     self.hooks
                         .observe_live_source_fds(depth, u32::from(depth) * 2 + 4);
-                    let read_statx = statx_identity(directory.as_fd()).map_err(|error| {
-                        map_statx_error(SourceTreeStageV1::OpenDirectory, &relative_path, error)
-                    })?;
+                    let read_statx = statx_identity(self.gate, self.hooks, directory.as_fd())
+                        .map_err(|error| {
+                            error.map_leaf(|error| {
+                                map_statx_error(
+                                    SourceTreeStageV1::OpenDirectory,
+                                    &relative_path,
+                                    error,
+                                )
+                            })
+                        })?;
                     if read_statx != statx {
                         return Err(source_changed(
                             SourceTreeStageV1::OpenDirectory,
@@ -1497,6 +1891,8 @@ mod platform {
                         .into());
                     }
                     let membership = read_directory_names(
+                        self.gate,
+                        self.hooks,
                         directory.as_fd(),
                         &relative_path,
                         self.policy.traversal,
@@ -1535,14 +1931,14 @@ mod platform {
                         },
                         membership: &membership,
                     };
-                    let visitor_error_path = try_boxed_bytes(&relative_path, &relative_path)?;
-                    self.visitor.directory_enter(enter).map_err(|source| {
-                        SourceTreeAcquireFailureV1::Visitor {
+                    if let Err(source) = self.visitor.directory_enter(enter) {
+                        return Err(SourceTreeAcquireFailureV1::Visitor {
                             stage: SourceTreeStageV1::VisitDirectoryEnter,
-                            relative_path: visitor_error_path,
+                            relative_path,
                             source,
                         }
-                    })?;
+                        .into());
+                    }
                     try_reserve_bounded_for_push(
                         &mut self.entries,
                         self.policy.traversal.max_entries.get() as usize,
@@ -1608,30 +2004,33 @@ mod platform {
                         return Err(limit(&relative_path, SourceTreeLimitV1::PlanBytes).into());
                     }
                     let membership_after = read_directory_names(
+                        self.gate,
+                        self.hooks,
                         directory.as_fd(),
                         &relative_path,
                         self.policy.traversal,
                         revalidation_storage_bytes,
                         self.policy.syscall_attempts.get(),
                     )?;
-                    let statx_after = statx_identity(directory.as_fd()).map_err(|error| {
-                        map_statx_error(
-                            SourceTreeStageV1::RevalidateDirectory,
-                            &relative_path,
-                            error,
-                        )
-                    })?;
-                    let handle_after = statx_identity(handle.as_fd()).map_err(|error| {
-                        map_statx_error(
-                            SourceTreeStageV1::RevalidateDirectory,
-                            &relative_path,
-                            error,
-                        )
-                    })?;
-                    if membership_after != membership
-                        || statx_after != statx
-                        || handle_after != statx
-                    {
+                    let statx_after = statx_identity(self.gate, self.hooks, directory.as_fd())
+                        .map_err(|error| {
+                            error.map_leaf(|error| {
+                                map_statx_error(
+                                    SourceTreeStageV1::RevalidateDirectory,
+                                    &relative_path,
+                                    error,
+                                )
+                            })
+                        })?;
+                    self.revalidate_one(
+                        parent_fd,
+                        name,
+                        handle.as_fd(),
+                        &relative_path,
+                        &statx,
+                        SourceTreeStageV1::RevalidateDirectory,
+                    )?;
+                    if membership_after != membership || statx_after != statx {
                         return Err(source_changed(
                             SourceTreeStageV1::RevalidateDirectory,
                             &relative_path,
@@ -1654,14 +2053,14 @@ mod platform {
                         },
                         membership: &membership,
                     };
-                    let visitor_error_path = try_boxed_bytes(&relative_path, &relative_path)?;
-                    self.visitor.directory_leave(leave).map_err(|source| {
-                        SourceTreeAcquireFailureV1::Visitor {
+                    if let Err(source) = self.visitor.directory_leave(leave) {
+                        return Err(SourceTreeAcquireFailureV1::Visitor {
                             stage: SourceTreeStageV1::VisitDirectoryLeave,
-                            relative_path: visitor_error_path,
+                            relative_path,
                             source,
                         }
-                    })?;
+                        .into());
+                    }
                 }
                 libc::S_IFREG => {
                     if statx.size > self.policy.traversal.max_file_bytes.get() {
@@ -1674,25 +2073,27 @@ mod platform {
                     if self.total_file_bytes > self.policy.traversal.max_total_file_bytes.get() {
                         return Err(limit(&relative_path, SourceTreeLimitV1::TotalFileBytes).into());
                     }
-                    let visitor_error_path = try_boxed_bytes(&relative_path, &relative_path)?;
-                    let evidence = self
-                        .visitor
-                        .regular(SourceRegularVisitV1 {
-                            common: SourceVisitCommonV1 {
-                                relative_path: &relative_path,
-                                name,
-                                parent: parent_fd,
-                                handle: handle.as_fd(),
-                                statx: &statx,
-                                xattrs: &xattrs,
-                            },
-                            copy_policy: self.policy.regular_copy,
-                        })
-                        .map_err(|source| SourceTreeAcquireFailureV1::Visitor {
-                            stage: SourceTreeStageV1::VisitRegular,
-                            relative_path: visitor_error_path,
-                            source,
-                        })?;
+                    let evidence = match self.visitor.regular(
+                        SourceVisitCommonV1 {
+                            relative_path: &relative_path,
+                            name,
+                            parent: parent_fd,
+                            handle: handle.as_fd(),
+                            statx: &statx,
+                            xattrs: &xattrs,
+                        },
+                        self.policy.regular_copy,
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(source) => {
+                            return Err(SourceTreeAcquireFailureV1::Visitor {
+                                stage: SourceTreeStageV1::VisitRegular,
+                                relative_path,
+                                source,
+                            }
+                            .into());
+                        }
+                    };
                     let retained_extent_bytes = validate_regular_evidence(
                         &evidence,
                         statx.size,
@@ -1709,7 +2110,14 @@ mod platform {
                                 error,
                             ))
                         })?;
-                    self.revalidate_one(parent_fd, name, handle.as_fd(), &relative_path, &statx)?;
+                    self.revalidate_one(
+                        parent_fd,
+                        name,
+                        handle.as_fd(),
+                        &relative_path,
+                        &statx,
+                        SourceTreeStageV1::RevalidateEntry,
+                    )?;
                     try_reserve_bounded_for_push(
                         &mut self.entries,
                         self.policy.traversal.max_entries.get() as usize,
@@ -1735,6 +2143,7 @@ mod platform {
                         .get()
                         .min(u32::try_from(self.remaining_plan_bytes()).unwrap_or(u32::MAX));
                     let target = read_stable_symlink_target(
+                        self.gate,
                         self.hooks,
                         &handle,
                         &relative_path,
@@ -1742,24 +2151,24 @@ mod platform {
                         self.remaining_plan_bytes(),
                     )?;
                     self.reserve_plan_bytes(&relative_path, target.capacity() as u64)?;
-                    let visitor_error_path = try_boxed_bytes(&relative_path, &relative_path)?;
-                    self.visitor
-                        .symlink(SourceSymlinkVisitV1 {
-                            common: SourceVisitCommonV1 {
-                                relative_path: &relative_path,
-                                name,
-                                parent: parent_fd,
-                                handle: handle.as_fd(),
-                                statx: &statx,
-                                xattrs: &xattrs,
-                            },
-                            target: &target,
-                        })
-                        .map_err(|source| SourceTreeAcquireFailureV1::Visitor {
+                    if let Err(source) = self.visitor.symlink(SourceSymlinkVisitV1 {
+                        common: SourceVisitCommonV1 {
+                            relative_path: &relative_path,
+                            name,
+                            parent: parent_fd,
+                            handle: handle.as_fd(),
+                            statx: &statx,
+                            xattrs: &xattrs,
+                        },
+                        target: &target,
+                    }) {
+                        return Err(SourceTreeAcquireFailureV1::Visitor {
                             stage: SourceTreeStageV1::VisitSymlink,
-                            relative_path: visitor_error_path,
+                            relative_path,
                             source,
-                        })?;
+                        }
+                        .into());
+                    }
                     self.hooks
                         .after_leaf_visitor(&relative_path)
                         .map_err(|error| {
@@ -1769,7 +2178,14 @@ mod platform {
                                 error,
                             ))
                         })?;
-                    self.revalidate_one(parent_fd, name, handle.as_fd(), &relative_path, &statx)?;
+                    self.revalidate_one(
+                        parent_fd,
+                        name,
+                        handle.as_fd(),
+                        &relative_path,
+                        &statx,
+                        SourceTreeStageV1::RevalidateEntry,
+                    )?;
                     try_reserve_bounded_for_push(
                         &mut self.entries,
                         self.policy.traversal.max_entries.get() as usize,
@@ -1883,33 +2299,48 @@ mod platform {
             handle: BorrowedFd<'_>,
             relative_path: &[u8],
             expected: &SourceStatxV1,
-        ) -> Result<(), SourceTreeFailureV1> {
+            stage: SourceTreeStageV1,
+        ) -> Result<(), TraversalFailureV1<SourceTreeFailureV1>> {
             let reopened = openat2_owned(
+                self.gate,
+                self.hooks,
                 parent_fd,
                 name,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 SOURCE_RESOLVE,
                 self.policy.openat2_attempts.get(),
             )
-            .map_err(|error| map_reopen_error(relative_path, error))?;
-            let pinned = statx_identity(handle).map_err(|error| {
-                map_statx_error(SourceTreeStageV1::RevalidateEntry, relative_path, error)
+            .map_err(|error| {
+                error.map_leaf(|error| map_reopen_error(stage, relative_path, error))
             })?;
-            let named = statx_identity(reopened.as_fd()).map_err(|error| {
-                map_statx_error(SourceTreeStageV1::RevalidateEntry, relative_path, error)
+            let depth = if relative_path.is_empty() {
+                0
+            } else {
+                1 + relative_path.iter().filter(|byte| **byte == b'/').count() as u16
+            };
+            let fixed_fds = if stage == SourceTreeStageV1::RevalidateDirectory {
+                5
+            } else {
+                4
+            };
+            self.hooks
+                .observe_live_source_fds(depth, u32::from(depth) * 2 + fixed_fds);
+            let pinned = statx_identity(self.gate, self.hooks, handle).map_err(|error| {
+                error.map_leaf(|error| map_statx_error(stage, relative_path, error))
             })?;
+            let named =
+                statx_identity(self.gate, self.hooks, reopened.as_fd()).map_err(|error| {
+                    error.map_leaf(|error| map_statx_error(stage, relative_path, error))
+                })?;
             if &pinned != expected || &named != expected {
-                return Err(source_changed(
-                    SourceTreeStageV1::RevalidateEntry,
-                    relative_path,
-                ));
+                return Err(source_changed(stage, relative_path).into());
             }
             Ok(())
         }
     }
 
-    fn normalize_plan<H: EnumerationHooks, V: SourceTreeVisitorV1>(
-        builder: Builder<'_, '_, H, V>,
+    fn normalize_plan<G: AttemptGateV1, H: EnumerationHooks, V: WalkVisitorV1>(
+        builder: Builder<'_, '_, G, H, V>,
     ) -> Result<SourceTreePlanV1, SourceTreeFailureV1> {
         let remaining_plan_bytes = builder
             .policy
@@ -2103,43 +2534,44 @@ mod platform {
         Ok(groups)
     }
 
-    fn read_directory_names(
+    fn read_directory_names<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
+        hooks: &H,
         fd: BorrowedFd<'_>,
         relative_path: &[u8],
         limits: SourceTraversalLimitsV1,
         max_retained_storage_bytes: u64,
         syscall_attempts: u8,
-    ) -> Result<Vec<Box<[u8]>>, SourceTreeFailureV1> {
-        if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
-            return Err(io_failure(
-                SourceTreeStageV1::EnumerateDirectory,
-                relative_path,
-                io::Error::last_os_error(),
-            ));
-        }
+    ) -> Result<Vec<Box<[u8]>>, TraversalFailureV1<SourceTreeFailureV1>> {
+        run_io_with_retry(
+            gate,
+            syscall_attempts,
+            |error| error.kind() == io::ErrorKind::Interrupted,
+            || hooks.lseek_once(fd, 0, libc::SEEK_SET),
+            libc::EINTR,
+        )
+        .map_err(|error| {
+            error.map_leaf(|error| {
+                io_failure(SourceTreeStageV1::EnumerateDirectory, relative_path, error)
+            })
+        })?;
         let mut output = Vec::new();
         let mut retained_name_bytes = 0u64;
         let mut buffer = [0u8; GETDENTS_BUFFER_BYTES];
         loop {
-            let used = getdents64_with_retry(syscall_attempts, || unsafe {
-                libc::syscall(
-                    libc::SYS_getdents64,
-                    fd.as_raw_fd(),
-                    buffer.as_mut_ptr(),
-                    buffer.len(),
-                )
+            let used = getdents64_with_retry(gate, syscall_attempts, || {
+                hooks.getdents64_once(fd, &mut buffer)
             })
             .map_err(|error| {
-                io_failure(SourceTreeStageV1::EnumerateDirectory, relative_path, error)
+                error.map_leaf(|error| {
+                    io_failure(SourceTreeStageV1::EnumerateDirectory, relative_path, error)
+                })
             })?;
             if used == 0 {
                 break;
             }
             if used > buffer.len() {
-                return Err(malformed(
-                    SourceTreeStageV1::EnumerateDirectory,
-                    relative_path,
-                ));
+                return Err(malformed(SourceTreeStageV1::EnumerateDirectory, relative_path).into());
             }
             parse_dirent_chunk(
                 &buffer[..used],
@@ -2150,25 +2582,21 @@ mod platform {
                 &mut retained_name_bytes,
             )?;
         }
-        normalize_directory_names(output, relative_path)
+        normalize_directory_names(output, relative_path).map_err(TraversalFailureV1::Leaf)
     }
 
-    fn getdents64_with_retry(
+    fn getdents64_with_retry<G: AttemptGateV1>(
+        gate: &G,
         attempts: u8,
-        mut operation: impl FnMut() -> libc::c_long,
-    ) -> io::Result<usize> {
-        for _ in 0..attempts {
-            let result = operation();
-            if result >= 0 {
-                return usize::try_from(result)
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW));
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-        Err(io::Error::from_raw_os_error(libc::EINTR))
+        operation: impl FnMut() -> io::Result<usize>,
+    ) -> Result<usize, TraversalFailureV1<io::Error>> {
+        run_io_with_retry(
+            gate,
+            attempts,
+            |error| error.kind() == io::ErrorKind::Interrupted,
+            operation,
+            libc::EINTR,
+        )
     }
 
     fn normalize_directory_names(
@@ -2245,58 +2673,72 @@ mod platform {
     }
 
     enum XattrPassError {
+        Resource(SnapshotPipelineResourceErrorV1),
         Retry(Option<i32>),
         Fatal(SourceTreeFailureV1),
     }
 
-    fn capture_stable_xattrs<H: EnumerationHooks>(
+    struct XattrCaptureBoundsV1 {
+        max_xattr_bytes: u64,
+        max_plan_bytes: u64,
+    }
+
+    fn capture_stable_xattrs_with_gate<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
         hooks: &H,
         fd: RawFd,
         relative_path: &[u8],
         limits: SourceXattrLimitsV1,
         attempts: u8,
-        max_xattr_bytes: u64,
-        max_plan_bytes: u64,
-    ) -> Result<Box<[CapturedXattrV1]>, SourceTreeFailureV1> {
+        bounds: XattrCaptureBoundsV1,
+    ) -> Result<Box<[CapturedXattrV1]>, TraversalFailureV1<SourceTreeFailureV1>> {
         let mut last_errno = None;
         for _ in 0..attempts {
             let first = match capture_xattr_pass(
+                gate,
                 hooks,
                 fd,
                 relative_path,
                 limits,
-                max_xattr_bytes,
-                max_plan_bytes,
+                bounds.max_xattr_bytes,
+                bounds.max_plan_bytes,
             ) {
                 Ok(value) => value,
+                Err(XattrPassError::Resource(error)) => {
+                    return Err(TraversalFailureV1::Resource(error));
+                }
                 Err(XattrPassError::Retry(errno)) => {
                     last_errno = errno;
                     continue;
                 }
-                Err(XattrPassError::Fatal(error)) => return Err(error),
+                Err(XattrPassError::Fatal(error)) => return Err(error.into()),
             };
             let second = match capture_xattr_pass(
+                gate,
                 hooks,
                 fd,
                 relative_path,
                 limits,
-                max_xattr_bytes,
-                max_plan_bytes,
+                bounds.max_xattr_bytes,
+                bounds.max_plan_bytes,
             ) {
                 Ok(value) => value,
+                Err(XattrPassError::Resource(error)) => {
+                    return Err(TraversalFailureV1::Resource(error));
+                }
                 Err(XattrPassError::Retry(errno)) => {
                     last_errno = errno;
                     continue;
                 }
-                Err(XattrPassError::Fatal(error)) => return Err(error),
+                Err(XattrPassError::Fatal(error)) => return Err(error.into()),
             };
             let (_, first_plan_bytes) = xattr_storage_bytes(&first)?;
             let (_, second_plan_bytes) = xattr_storage_bytes(&second)?;
             let combined_plan_bytes = first_plan_bytes
                 .checked_add(second_plan_bytes)
                 .ok_or_else(|| limit(relative_path, SourceTreeLimitV1::PlanBytes))?;
-            if combined_plan_bytes > max_plan_bytes {
-                return Err(limit(relative_path, SourceTreeLimitV1::PlanBytes));
+            if combined_plan_bytes > bounds.max_plan_bytes {
+                return Err(limit(relative_path, SourceTreeLimitV1::PlanBytes).into());
             }
             if first == second {
                 return Ok(first.into_boxed_slice());
@@ -2307,10 +2749,42 @@ mod platform {
             SourceTreeStageV1::CaptureXattrs,
             SourceTreeFailureReasonV1::SourceChanged,
             last_errno,
-        ))
+        )
+        .into())
     }
 
-    fn capture_xattr_pass<H: EnumerationHooks>(
+    #[cfg(test)]
+    fn capture_stable_xattrs<H: EnumerationHooks>(
+        hooks: &H,
+        fd: RawFd,
+        relative_path: &[u8],
+        limits: SourceXattrLimitsV1,
+        attempts: u8,
+        max_xattr_bytes: u64,
+        max_plan_bytes: u64,
+    ) -> Result<Box<[CapturedXattrV1]>, SourceTreeFailureV1> {
+        match capture_stable_xattrs_with_gate(
+            &UnmeteredAttemptGateV1,
+            hooks,
+            fd,
+            relative_path,
+            limits,
+            attempts,
+            XattrCaptureBoundsV1 {
+                max_xattr_bytes,
+                max_plan_bytes,
+            },
+        ) {
+            Ok(xattrs) => Ok(xattrs),
+            Err(TraversalFailureV1::Leaf(error)) => Err(error),
+            Err(TraversalFailureV1::Resource(_)) => {
+                unreachable!("the test-only unmetered attempt gate cannot exhaust")
+            }
+        }
+    }
+
+    fn capture_xattr_pass<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
         hooks: &H,
         fd: RawFd,
         relative_path: &[u8],
@@ -2318,9 +2792,11 @@ mod platform {
         max_xattr_bytes: u64,
         max_plan_bytes: u64,
     ) -> Result<Vec<CapturedXattrV1>, XattrPassError> {
-        let list_size = hooks
-            .list_xattrs(fd, None)
-            .map_err(|error| map_xattr_call(relative_path, error))?;
+        let list_size =
+            run_io_attempt(gate, || hooks.list_xattrs(fd, None)).map_err(|error| match error {
+                TraversalFailureV1::Resource(error) => XattrPassError::Resource(error),
+                TraversalFailureV1::Leaf(error) => map_xattr_call(relative_path, error),
+            })?;
         if list_size > limits.max_list_bytes.get() as usize {
             return Err(XattrPassError::Fatal(limit(
                 relative_path,
@@ -2338,9 +2814,13 @@ mod platform {
             XattrPassError::Fatal(limit(relative_path, SourceTreeLimitV1::PlanBytes))
         })?;
         list.resize(list_size.max(1), 0);
-        let used = hooks
-            .list_xattrs(fd, Some(&mut list))
-            .map_err(|error| map_xattr_call(relative_path, error))?;
+        let used =
+            run_io_attempt(gate, || hooks.list_xattrs(fd, Some(&mut list))).map_err(|error| {
+                match error {
+                    TraversalFailureV1::Resource(error) => XattrPassError::Resource(error),
+                    TraversalFailureV1::Leaf(error) => map_xattr_call(relative_path, error),
+                }
+            })?;
         if used > list_size {
             return Err(XattrPassError::Retry(Some(libc::ERANGE)));
         }
@@ -2401,7 +2881,7 @@ mod platform {
             }
             let c_name = try_cstring(&name, relative_path, SourceTreeStageV1::CaptureXattrs)
                 .map_err(XattrPassError::Fatal)?;
-            let value = match hooks.get_xattr(fd, &c_name, None) {
+            let value = match run_io_attempt(gate, || hooks.get_xattr(fd, &c_name, None)) {
                 Ok(size) => {
                     if size > limits.max_value_bytes.get() as usize {
                         return Err(XattrPassError::Fatal(limit(
@@ -2435,16 +2915,23 @@ mod platform {
                         XattrPassError::Fatal(limit(relative_path, SourceTreeLimitV1::PlanBytes))
                     })?;
                     value.resize(size.max(1), 0);
-                    let used = hooks
-                        .get_xattr(fd, &c_name, Some(&mut value))
-                        .map_err(|error| map_xattr_call(relative_path, error))?;
+                    let used =
+                        run_io_attempt(gate, || hooks.get_xattr(fd, &c_name, Some(&mut value)))
+                            .map_err(|error| match error {
+                                TraversalFailureV1::Resource(error) => {
+                                    XattrPassError::Resource(error)
+                                }
+                                TraversalFailureV1::Leaf(error) => {
+                                    map_xattr_call(relative_path, error)
+                                }
+                            })?;
                     if used > size {
                         return Err(XattrPassError::Retry(Some(libc::ERANGE)));
                     }
                     value.truncate(used);
                     CapturedXattrValueV1::Bytes(value.into_boxed_slice())
                 }
-                Err(error)
+                Err(TraversalFailureV1::Leaf(error))
                     if matches!(
                         error.raw_os_error(),
                         Some(libc::EACCES | libc::EPERM | libc::EOPNOTSUPP)
@@ -2454,7 +2941,12 @@ mod platform {
                         errno: error.raw_os_error().expect("matched Some errno"),
                     }
                 }
-                Err(error) => return Err(map_xattr_call(relative_path, error)),
+                Err(TraversalFailureV1::Resource(error)) => {
+                    return Err(XattrPassError::Resource(error));
+                }
+                Err(TraversalFailureV1::Leaf(error)) => {
+                    return Err(map_xattr_call(relative_path, error));
+                }
             };
             captured.push(CapturedXattrV1 { name, value });
         }
@@ -2547,36 +3039,37 @@ mod platform {
         Ok((dynamic, plan))
     }
 
-    fn read_stable_symlink_target<H: EnumerationHooks>(
+    fn read_stable_symlink_target<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
         hooks: &H,
         handle: &OwnedFd,
         relative_path: &[u8],
         max_bytes: u32,
         max_plan_bytes: u64,
-    ) -> Result<Vec<u8>, SourceTreeFailureV1> {
-        let first = read_symlink_target_once(hooks, handle.as_fd(), relative_path, max_bytes)?;
-        let second = read_symlink_target_once(hooks, handle.as_fd(), relative_path, max_bytes)?;
+    ) -> Result<Vec<u8>, TraversalFailureV1<SourceTreeFailureV1>> {
+        let first =
+            read_symlink_target_once(gate, hooks, handle.as_fd(), relative_path, max_bytes)?;
+        let second =
+            read_symlink_target_once(gate, hooks, handle.as_fd(), relative_path, max_bytes)?;
         if (first.capacity() as u64)
             .checked_add(second.capacity() as u64)
             .is_none_or(|bytes| bytes > max_plan_bytes)
         {
-            return Err(limit(relative_path, SourceTreeLimitV1::PlanBytes));
+            return Err(limit(relative_path, SourceTreeLimitV1::PlanBytes).into());
         }
         if first != second {
-            return Err(source_changed(
-                SourceTreeStageV1::CaptureSymlink,
-                relative_path,
-            ));
+            return Err(source_changed(SourceTreeStageV1::CaptureSymlink, relative_path).into());
         }
         Ok(first)
     }
 
-    fn read_symlink_target_once<H: EnumerationHooks>(
+    fn read_symlink_target_once<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
         hooks: &H,
         fd: BorrowedFd<'_>,
         relative_path: &[u8],
         max_bytes: u32,
-    ) -> Result<Vec<u8>, SourceTreeFailureV1> {
+    ) -> Result<Vec<u8>, TraversalFailureV1<SourceTreeFailureV1>> {
         let maximum_capacity = usize::try_from(max_bytes)
             .ok()
             .and_then(|value| value.checked_add(1))
@@ -2588,23 +3081,26 @@ mod platform {
                 .try_reserve_exact(capacity)
                 .map_err(|_| limit(relative_path, SourceTreeLimitV1::PlanBytes))?;
             output.resize(capacity, 0);
-            let used = hooks
-                .read_symlink(fd.as_raw_fd(), relative_path, &mut output)
-                .map_err(|error| {
+            let used = run_io_attempt(gate, || {
+                hooks.read_symlink(fd.as_raw_fd(), relative_path, &mut output)
+            })
+            .map_err(|error| {
+                error.map_leaf(|error| {
                     io_failure(SourceTreeStageV1::CaptureSymlink, relative_path, error)
-                })?;
+                })
+            })?;
             if used > output.len() {
-                return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path));
+                return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path).into());
             }
             if used < capacity {
                 if used == 0 || output[..used].contains(&0) {
-                    return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path));
+                    return Err(malformed(SourceTreeStageV1::CaptureSymlink, relative_path).into());
                 }
                 output.truncate(used);
                 return Ok(output);
             }
             if capacity == maximum_capacity {
-                return Err(limit(relative_path, SourceTreeLimitV1::SymlinkTargetBytes));
+                return Err(limit(relative_path, SourceTreeLimitV1::SymlinkTargetBytes).into());
             }
             capacity = capacity
                 .checked_mul(2)
@@ -2623,7 +3119,7 @@ mod platform {
         }
     }
 
-    fn duplicate_fd(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+    fn raw_duplicate_fd_once(fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
         let result = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
         if result < 0 {
             Err(io::Error::last_os_error())
@@ -2632,41 +3128,60 @@ mod platform {
         }
     }
 
-    fn openat2_owned(
+    fn duplicate_fd<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
+        hooks: &H,
+        fd: BorrowedFd<'_>,
+    ) -> Result<OwnedFd, TraversalFailureV1<io::Error>> {
+        run_io_attempt(gate, || hooks.duplicate_fd_once(fd))
+    }
+
+    fn raw_openat2_once(
         parent: BorrowedFd<'_>,
         name: &CStr,
         flags: i32,
         resolve: u64,
-        attempts: u8,
     ) -> io::Result<OwnedFd> {
         let how = OpenHow {
             flags: flags as u64,
             mode: 0,
             resolve,
         };
-        let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
-        for _ in 0..attempts {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    &how,
-                    mem::size_of::<OpenHow>(),
-                )
-            };
-            if result >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
-            }
-            last = io::Error::last_os_error();
-            if last.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(last);
-            }
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &how,
+                mem::size_of::<OpenHow>(),
+            )
+        };
+        if result >= 0 {
+            Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) })
+        } else {
+            Err(io::Error::last_os_error())
         }
-        Err(last)
     }
 
-    fn statx_identity(fd: BorrowedFd<'_>) -> io::Result<SourceStatxV1> {
+    fn openat2_owned<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
+        hooks: &H,
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        flags: i32,
+        resolve: u64,
+        attempts: u8,
+    ) -> Result<OwnedFd, TraversalFailureV1<io::Error>> {
+        run_io_with_retry(
+            gate,
+            attempts,
+            |error| error.raw_os_error() == Some(libc::EAGAIN),
+            || hooks.openat2_once(parent, name, flags, resolve),
+            libc::EAGAIN,
+        )
+    }
+
+    fn raw_statx_identity_once(fd: BorrowedFd<'_>) -> io::Result<SourceStatxV1> {
         let mut raw = MaybeUninit::<libc::statx>::zeroed();
         let result = unsafe {
             libc::syscall(
@@ -2716,6 +3231,35 @@ mod platform {
         })
     }
 
+    fn statx_identity<G: AttemptGateV1, H: EnumerationHooks>(
+        gate: &G,
+        hooks: &H,
+        fd: BorrowedFd<'_>,
+    ) -> Result<SourceStatxV1, TraversalFailureV1<io::Error>> {
+        run_io_attempt(gate, || hooks.statx_once(fd))
+    }
+
+    fn raw_lseek_once(fd: BorrowedFd<'_>, offset: libc::off_t, whence: i32) -> io::Result<u64> {
+        let result = unsafe { libc::lseek(fd.as_raw_fd(), offset, whence) };
+        if result < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            u64::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+        }
+    }
+
+    fn raw_getdents64_once(fd: BorrowedFd<'_>, output: &mut [u8]) -> io::Result<usize> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_getdents64,
+                fd.as_raw_fd(),
+                output.as_mut_ptr(),
+                output.len(),
+            )
+        };
+        syscall_size(result)
+    }
+
     fn map_open_error(
         stage: SourceTreeStageV1,
         relative_path: &[u8],
@@ -2752,15 +3296,19 @@ mod platform {
         }
     }
 
-    fn map_reopen_error(relative_path: &[u8], error: io::Error) -> SourceTreeFailureV1 {
+    fn map_reopen_error(
+        stage: SourceTreeStageV1,
+        relative_path: &[u8],
+        error: io::Error,
+    ) -> SourceTreeFailureV1 {
         match error.raw_os_error() {
             Some(libc::ENOENT | libc::ESTALE | libc::EAGAIN) => failure(
-                SourceTreeStageV1::RevalidateEntry,
+                stage,
                 SourceTreeFailureReasonV1::SourceChanged,
                 error.raw_os_error(),
                 relative_path,
             ),
-            _ => map_open_error(SourceTreeStageV1::RevalidateEntry, relative_path, error),
+            _ => map_open_error(stage, relative_path, error),
         }
     }
 
@@ -2853,9 +3401,51 @@ mod platform {
         use std::path::PathBuf;
         use std::sync::atomic::{AtomicU64, Ordering};
 
+        use crate::linux_pytest::snapshot_policy::{
+            SnapshotPipelineAttemptBucketV1, SnapshotPipelineForwardStageV1,
+            SnapshotPipelineStageV1,
+        };
+
         use super::*;
 
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+        struct TestAttemptGateV1 {
+            remaining: Cell<u64>,
+            charged: Cell<u64>,
+        }
+
+        impl TestAttemptGateV1 {
+            const fn new(remaining: u64) -> Self {
+                Self {
+                    remaining: Cell::new(remaining),
+                    charged: Cell::new(0),
+                }
+            }
+        }
+
+        impl AttemptGateV1 for TestAttemptGateV1 {
+            fn run_attempt<T>(
+                &self,
+                attempt: impl FnOnce() -> T,
+            ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+                let Some(remaining) = self.remaining.get().checked_sub(1) else {
+                    return Err(source_observation_budget_exhausted());
+                };
+                self.remaining.set(remaining);
+                self.charged.set(self.charged.get() + 1);
+                Ok(attempt())
+            }
+        }
+
+        const fn source_observation_budget_exhausted() -> SnapshotPipelineResourceErrorV1 {
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: SnapshotPipelineStageV1::Forward(
+                    SnapshotPipelineForwardStageV1::SourceObservation,
+                ),
+                bucket: SnapshotPipelineAttemptBucketV1::Forward,
+            }
+        }
 
         #[test]
         fn bounded_push_reserve_accepts_last_slot_and_reports_exact_ceiling() {
@@ -2927,6 +3517,67 @@ mod platform {
         impl Drop for TestTree {
             fn drop(&mut self) {
                 let _ = fs::remove_dir_all(&self.parent);
+            }
+        }
+
+        #[derive(Default)]
+        struct FirstAttemptHooks {
+            duplicate_calls: Cell<u64>,
+        }
+
+        impl EnumerationHooks for FirstAttemptHooks {
+            fn duplicate_fd_once(&self, _fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+                self.duplicate_calls.set(self.duplicate_calls.get() + 1);
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            }
+
+            fn list_xattrs(&self, _fd: RawFd, _output: Option<&mut [u8]>) -> io::Result<usize> {
+                unreachable!("zero budget must stop before xattr observation")
+            }
+
+            fn get_xattr(
+                &self,
+                _fd: RawFd,
+                _name: &CStr,
+                _output: Option<&mut [u8]>,
+            ) -> io::Result<usize> {
+                unreachable!("zero budget must stop before xattr observation")
+            }
+        }
+
+        struct EagainOpenHooksV1 {
+            calls: Cell<u64>,
+            eagain_before_success: u64,
+        }
+
+        impl EnumerationHooks for EagainOpenHooksV1 {
+            fn openat2_once(
+                &self,
+                parent: BorrowedFd<'_>,
+                name: &CStr,
+                flags: i32,
+                resolve: u64,
+            ) -> io::Result<OwnedFd> {
+                let call = self.calls.get() + 1;
+                self.calls.set(call);
+                if call <= self.eagain_before_success {
+                    Err(io::Error::from_raw_os_error(libc::EAGAIN))
+                } else {
+                    raw_openat2_once(parent, name, flags, resolve)
+                }
+            }
+
+            fn list_xattrs(&self, _fd: RawFd, _output: Option<&mut [u8]>) -> io::Result<usize> {
+                unreachable!("the direct openat2 retry test does not inspect xattrs")
+            }
+
+            fn get_xattr(
+                &self,
+                _fd: RawFd,
+                _name: &CStr,
+                _output: Option<&mut [u8]>,
+            ) -> io::Result<usize> {
+                unreachable!("the direct openat2 retry test does not inspect xattrs")
             }
         }
 
@@ -3048,6 +3699,164 @@ mod platform {
             }
         }
 
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum OpenedFdRoleV1 {
+            EntryHandle,
+            DirectoryReader,
+            ReopenedName,
+        }
+
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum AttemptEventV1 {
+            DuplicateFd,
+            OpenEntryHandle,
+            OpenDirectoryReader,
+            OpenReopenedName,
+            InspectEntryHandleStatx,
+            InspectDirectoryReaderStatx,
+            ListXattrsSize,
+            ListXattrsValue,
+            SeekDirectory,
+            ReadDirectory,
+            RevalidateDirectoryReaderStatx,
+            RevalidatePinnedHandleStatx,
+            RevalidateReopenedNameStatx,
+        }
+
+        /// Records only hook calls that stand in for a charged kernel attempt.
+        /// Pure barriers and FD-peak observers are deliberately excluded.
+        #[derive(Default)]
+        struct CountingEnumerationHooksV1 {
+            events: RefCell<Vec<AttemptEventV1>>,
+            opened_fds: RefCell<BTreeMap<RawFd, OpenedFdRoleV1>>,
+            path_open_calls: Cell<u8>,
+            entry_statx_calls: Cell<u8>,
+            directory_statx_calls: Cell<u8>,
+        }
+
+        impl CountingEnumerationHooksV1 {
+            fn record(&self, event: AttemptEventV1) {
+                self.events.borrow_mut().push(event);
+            }
+
+            fn into_events(self) -> Vec<AttemptEventV1> {
+                self.events.into_inner()
+            }
+        }
+
+        impl EnumerationHooks for CountingEnumerationHooksV1 {
+            fn duplicate_fd_once(&self, fd: BorrowedFd<'_>) -> io::Result<OwnedFd> {
+                self.record(AttemptEventV1::DuplicateFd);
+                raw_duplicate_fd_once(fd)
+            }
+
+            fn openat2_once(
+                &self,
+                parent: BorrowedFd<'_>,
+                name: &CStr,
+                flags: i32,
+                resolve: u64,
+            ) -> io::Result<OwnedFd> {
+                let role = if flags & libc::O_DIRECTORY != 0 {
+                    self.record(AttemptEventV1::OpenDirectoryReader);
+                    OpenedFdRoleV1::DirectoryReader
+                } else {
+                    let path_open_call = self.path_open_calls.get();
+                    self.path_open_calls.set(path_open_call + 1);
+                    if path_open_call == 0 {
+                        self.record(AttemptEventV1::OpenEntryHandle);
+                        OpenedFdRoleV1::EntryHandle
+                    } else {
+                        self.record(AttemptEventV1::OpenReopenedName);
+                        OpenedFdRoleV1::ReopenedName
+                    }
+                };
+                let opened = raw_openat2_once(parent, name, flags, resolve)?;
+                self.opened_fds
+                    .borrow_mut()
+                    .insert(opened.as_raw_fd(), role);
+                Ok(opened)
+            }
+
+            fn statx_once(&self, fd: BorrowedFd<'_>) -> io::Result<SourceStatxV1> {
+                let role = self
+                    .opened_fds
+                    .borrow()
+                    .get(&fd.as_raw_fd())
+                    .copied()
+                    .expect("every inspected descriptor is opened through the counting hook");
+                let event = match role {
+                    OpenedFdRoleV1::EntryHandle => {
+                        let call = self.entry_statx_calls.get();
+                        self.entry_statx_calls.set(call + 1);
+                        if call == 0 {
+                            AttemptEventV1::InspectEntryHandleStatx
+                        } else {
+                            AttemptEventV1::RevalidatePinnedHandleStatx
+                        }
+                    }
+                    OpenedFdRoleV1::DirectoryReader => {
+                        let call = self.directory_statx_calls.get();
+                        self.directory_statx_calls.set(call + 1);
+                        if call == 0 {
+                            AttemptEventV1::InspectDirectoryReaderStatx
+                        } else {
+                            AttemptEventV1::RevalidateDirectoryReaderStatx
+                        }
+                    }
+                    OpenedFdRoleV1::ReopenedName => AttemptEventV1::RevalidateReopenedNameStatx,
+                };
+                self.record(event);
+                raw_statx_identity_once(fd)
+            }
+
+            fn lseek_once(
+                &self,
+                fd: BorrowedFd<'_>,
+                offset: libc::off_t,
+                whence: i32,
+            ) -> io::Result<u64> {
+                self.record(AttemptEventV1::SeekDirectory);
+                raw_lseek_once(fd, offset, whence)
+            }
+
+            fn getdents64_once(&self, fd: BorrowedFd<'_>, output: &mut [u8]) -> io::Result<usize> {
+                self.record(AttemptEventV1::ReadDirectory);
+                raw_getdents64_once(fd, output)
+            }
+
+            fn list_xattrs(&self, _fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+                self.record(if output.is_some() {
+                    AttemptEventV1::ListXattrsValue
+                } else {
+                    AttemptEventV1::ListXattrsSize
+                });
+                Ok(0)
+            }
+
+            fn get_xattr(
+                &self,
+                _fd: RawFd,
+                _name: &CStr,
+                _output: Option<&mut [u8]>,
+            ) -> io::Result<usize> {
+                unreachable!("an empty synthetic xattr list cannot request a value")
+            }
+
+            fn read_symlink(
+                &self,
+                _fd: RawFd,
+                _relative_path: &[u8],
+                _output: &mut [u8],
+            ) -> io::Result<usize> {
+                unreachable!("the whole-tree fixture contains no symlink")
+            }
+
+            fn directory_open_flags(&self) -> i32 {
+                source_directory_open_flags() | libc::O_NOATIME
+            }
+        }
+
         #[derive(Default)]
         struct RecordingVisitor {
             events: Vec<(u8, Vec<u8>)>,
@@ -3141,7 +3950,21 @@ mod platform {
             visitor: &mut RecordingVisitor,
         ) -> Result<SourceTreePlanV1, SourceTreeAcquireFailureV1<Infallible>> {
             let parent = tree.open_parent();
-            enumerate_source_tree_view_at_with(parent.as_fd(), c"tree", policy, hooks, visitor)
+            let mut visitor = MaterializationVisitorAdapterV1 { visitor };
+            match enumerate_source_tree_view_at_with(
+                parent.as_fd(),
+                c"tree",
+                policy,
+                &UnmeteredAttemptGateV1,
+                hooks,
+                &mut visitor,
+            ) {
+                Ok(plan) => Ok(plan),
+                Err(TraversalFailureV1::Leaf(error)) => Err(error),
+                Err(TraversalFailureV1::Resource(_)) => {
+                    unreachable!("the test-only unmetered attempt gate cannot exhaust")
+                }
+            }
         }
 
         fn source_failure<E>(failure: SourceTreeAcquireFailureV1<E>) -> SourceTreeFailureV1 {
@@ -3187,15 +4010,46 @@ mod platform {
         }
 
         #[test]
+        fn zero_budget_stops_before_the_first_raw_attempt() {
+            let tree = TestTree::new();
+            let parent = tree.open_parent();
+            let gate = TestAttemptGateV1::new(0);
+            let hooks = FirstAttemptHooks::default();
+            let mut visitor = RecordingVisitor::default();
+
+            let error = {
+                let mut adapter = MaterializationVisitorAdapterV1 {
+                    visitor: &mut visitor,
+                };
+                enumerate_source_tree_view_at_with(
+                    parent.as_fd(),
+                    c"tree",
+                    policy(1, 1),
+                    &gate,
+                    &hooks,
+                    &mut adapter,
+                )
+                .unwrap_err()
+            };
+            let TraversalFailureV1::Resource(error) = error else {
+                panic!("zero budget must produce a resource failure")
+            };
+            assert_eq!(error, source_observation_budget_exhausted());
+            assert_eq!(gate.remaining.get(), 0);
+            assert_eq!(gate.charged.get(), 0);
+            assert_eq!(hooks.duplicate_calls.get(), 0);
+            assert!(visitor.events.is_empty());
+        }
+
+        #[test]
         fn getdents_retry_succeeds_on_exact_n_and_exhausts_after_n_interrupts() {
             let mut success_calls = 0;
-            let size = getdents64_with_retry(3, || {
+            let size = getdents64_with_retry(&UnmeteredAttemptGateV1, 3, || {
                 success_calls += 1;
                 if success_calls == 3 {
-                    17
+                    Ok(17)
                 } else {
-                    unsafe { *libc::__errno_location() = libc::EINTR };
-                    -1
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
                 }
             })
             .unwrap();
@@ -3203,12 +4057,14 @@ mod platform {
             assert_eq!(success_calls, 3);
 
             let mut exhausted_calls = 0;
-            let error = getdents64_with_retry(3, || {
+            let error = getdents64_with_retry(&UnmeteredAttemptGateV1, 3, || {
                 exhausted_calls += 1;
-                unsafe { *libc::__errno_location() = libc::EINTR };
-                -1
+                Err(io::Error::from_raw_os_error(libc::EINTR))
             })
             .unwrap_err();
+            let TraversalFailureV1::Leaf(error) = error else {
+                panic!("the unmetered attempt gate cannot exhaust")
+            };
             assert_eq!(error.raw_os_error(), Some(libc::EINTR));
             assert_eq!(exhausted_calls, 3);
 
@@ -3216,6 +4072,169 @@ mod platform {
             assert_eq!(failure.stage(), SourceTreeStageV1::EnumerateDirectory);
             assert_eq!(failure.reason(), SourceTreeFailureReasonV1::Io);
             assert_eq!(failure.errno(), Some(libc::EINTR));
+        }
+
+        #[test]
+        fn getdents_charges_each_attempt_and_stops_before_n_plus_one() {
+            let exact_gate = TestAttemptGateV1::new(3);
+            let mut exact_calls = 0;
+            let size = getdents64_with_retry(&exact_gate, 3, || {
+                exact_calls += 1;
+                if exact_calls == 3 {
+                    Ok(17)
+                } else {
+                    Err(io::Error::from_raw_os_error(libc::EINTR))
+                }
+            })
+            .unwrap();
+            assert_eq!(size, 17);
+            assert_eq!(exact_calls, 3);
+            assert_eq!(exact_gate.charged.get(), 3);
+            assert_eq!(exact_gate.remaining.get(), 0);
+
+            let short_gate = TestAttemptGateV1::new(2);
+            let mut short_calls = 0;
+            let error = getdents64_with_retry(&short_gate, 3, || {
+                short_calls += 1;
+                Err::<usize, _>(io::Error::from_raw_os_error(libc::EINTR))
+            })
+            .unwrap_err();
+            let TraversalFailureV1::Resource(error) = error else {
+                panic!("N - 1 budget must fail before raw attempt N")
+            };
+            assert_eq!(error, source_observation_budget_exhausted());
+            assert_eq!(short_calls, 2);
+            assert_eq!(short_gate.charged.get(), 2);
+            assert_eq!(short_gate.remaining.get(), 0);
+        }
+
+        #[test]
+        fn openat2_eagain_retry_charges_exact_n_and_stops_before_n_plus_one() {
+            let tree = TestTree::new();
+            let parent = tree.open_parent();
+            let exact_gate = TestAttemptGateV1::new(3);
+            let exact_hooks = EagainOpenHooksV1 {
+                calls: Cell::new(0),
+                eagain_before_success: 2,
+            };
+            let opened = openat2_owned(
+                &exact_gate,
+                &exact_hooks,
+                parent.as_fd(),
+                c"tree",
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                SOURCE_RESOLVE,
+                3,
+            )
+            .expect("attempt N must succeed");
+            drop(opened);
+            assert_eq!(exact_hooks.calls.get(), 3);
+            assert_eq!(exact_gate.charged.get(), 3);
+            assert_eq!(exact_gate.remaining.get(), 0);
+
+            let short_gate = TestAttemptGateV1::new(2);
+            let short_hooks = EagainOpenHooksV1 {
+                calls: Cell::new(0),
+                eagain_before_success: 2,
+            };
+            let error = openat2_owned(
+                &short_gate,
+                &short_hooks,
+                parent.as_fd(),
+                c"tree",
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                SOURCE_RESOLVE,
+                3,
+            )
+            .unwrap_err();
+            let TraversalFailureV1::Resource(error) = error else {
+                panic!("N - 1 must fail before raw openat2 attempt N")
+            };
+            assert_eq!(error, source_observation_budget_exhausted());
+            assert_eq!(short_hooks.calls.get(), 2);
+            assert_eq!(short_gate.charged.get(), 2);
+            assert_eq!(short_gate.remaining.get(), 0);
+        }
+
+        #[test]
+        fn whole_empty_directory_charges_every_attempt_and_stops_before_final_name_statx() {
+            struct AttemptRunV1 {
+                result: Result<(), SnapshotPipelineResourceErrorV1>,
+                charged: u64,
+                remaining: u64,
+                events: Vec<AttemptEventV1>,
+            }
+
+            fn run(tree: &TestTree, budget: u64) -> AttemptRunV1 {
+                let parent = tree.open_parent();
+                let gate = TestAttemptGateV1::new(budget);
+                let hooks = CountingEnumerationHooksV1::default();
+                let mut visitor = RecordingVisitor::default();
+                let result = {
+                    let mut adapter = MaterializationVisitorAdapterV1 {
+                        visitor: &mut visitor,
+                    };
+                    enumerate_source_tree_view_at_with(
+                        parent.as_fd(),
+                        c"tree",
+                        policy(1, 1),
+                        &gate,
+                        &hooks,
+                        &mut adapter,
+                    )
+                };
+                let result = match result {
+                    Ok(_) => Ok(()),
+                    Err(TraversalFailureV1::Resource(error)) => Err(error),
+                    Err(TraversalFailureV1::Leaf(_)) => {
+                        panic!("the attempt-accounting fixture must not produce a leaf failure")
+                    }
+                };
+                AttemptRunV1 {
+                    result,
+                    charged: gate.charged.get(),
+                    remaining: gate.remaining.get(),
+                    events: hooks.into_events(),
+                }
+            }
+
+            let tree = TestTree::new();
+            let generous = run(&tree, 10_000);
+            generous
+                .result
+                .expect("a generous attempt budget must enumerate the empty tree");
+            let exact = u64::try_from(generous.events.len()).unwrap();
+            assert_eq!(
+                generous.charged, exact,
+                "every attempted hook call must be charged"
+            );
+            assert_eq!(
+                generous.events.last(),
+                Some(&AttemptEventV1::RevalidateReopenedNameStatx),
+                "the whole-tree success path must end by inspecting the reopened name"
+            );
+
+            let exact_run = run(&tree, exact);
+            exact_run
+                .result
+                .expect("the exact successful budget must be sufficient");
+            assert_eq!(exact_run.charged, exact);
+            assert_eq!(exact_run.remaining, 0);
+            assert_eq!(exact_run.events, generous.events);
+
+            let short = run(&tree, exact - 1);
+            let error = short
+                .result
+                .expect_err("N - 1 must fail closed as source-observation exhaustion");
+            assert_eq!(error, source_observation_budget_exhausted());
+            assert_eq!(short.charged, exact - 1);
+            assert_eq!(short.remaining, 0);
+            assert_eq!(short.events, generous.events[..generous.events.len() - 1]);
+            assert!(
+                !short
+                    .events
+                    .contains(&AttemptEventV1::RevalidateReopenedNameStatx)
+            );
         }
 
         #[test]
@@ -3259,16 +4278,24 @@ mod platform {
                 .open("/")
                 .unwrap();
             let mut visitor = RecordingVisitor::default();
-            let failure = source_failure(
+            let failure = {
+                let mut adapter = MaterializationVisitorAdapterV1 {
+                    visitor: &mut visitor,
+                };
                 enumerate_source_tree_view_at_with(
                     root.as_fd(),
                     c"proc",
                     policy(2, 2),
+                    &UnmeteredAttemptGateV1,
                     &TestHooks::default(),
-                    &mut visitor,
+                    &mut adapter,
                 )
-                .unwrap_err(),
-            );
+                .unwrap_err()
+            };
+            let TraversalFailureV1::Leaf(failure) = failure else {
+                panic!("the test-only unmetered attempt gate cannot exhaust")
+            };
+            let failure = source_failure(failure);
             assert_eq!(failure.stage(), SourceTreeStageV1::OpenEntry);
             assert_eq!(failure.reason(), SourceTreeFailureReasonV1::MountCrossing);
             assert_eq!(failure.errno(), Some(libc::EXDEV));
@@ -3365,6 +4392,23 @@ mod platform {
             let mut visitor = RecordingVisitor::default();
             let failure =
                 source_failure(enumerate(&tree, policy(4, 8), &hooks, &mut visitor).unwrap_err());
+            assert_eq!(failure.stage(), SourceTreeStageV1::RevalidateDirectory);
+            assert_eq!(failure.reason(), SourceTreeFailureReasonV1::SourceChanged);
+        }
+
+        #[test]
+        fn directory_name_replacement_with_equal_membership_is_refused() {
+            let tree = TestTree::new();
+            let root = tree.root.clone();
+            let displaced = tree.parent.join("displaced-tree");
+            let hooks = TestHooks::mutate_directory(b"", move || {
+                fs::rename(&root, displaced)?;
+                fs::create_dir(root)
+            });
+            let mut visitor = RecordingVisitor::default();
+            let failure =
+                source_failure(enumerate(&tree, policy(4, 8), &hooks, &mut visitor).unwrap_err());
+
             assert_eq!(failure.stage(), SourceTreeStageV1::RevalidateDirectory);
             assert_eq!(failure.reason(), SourceTreeFailureReasonV1::SourceChanged);
         }
@@ -3733,7 +4777,7 @@ mod platform {
             let hooks = TestHooks::default();
             let mut visitor = RecordingVisitor::default();
             enumerate(&deep, policy(8, 16), &hooks, &mut visitor).unwrap();
-            let committed_bound = 2 * 8 + 4;
+            let committed_bound = 2 * 8 + 5;
             let observations = hooks.fd_observations.borrow();
             assert_eq!(
                 observations.iter().map(|(_, live)| *live).max(),
@@ -3752,23 +4796,40 @@ mod platform {
 mod platform {
     use super::*;
 
+    pub(super) fn enumerate_source_tree_view_charged_at<V: SourceObservationTreeVisitorV1>(
+        _source_view: QualifiedNoAtimeSourceViewV1<'_>,
+        _root_name: &CStr,
+        _session: &SnapshotSourceObservationSessionV1<'_>,
+        _visitor: &mut V,
+    ) -> Result<
+        SourceTreePlanV1,
+        SnapshotSourceObservationErrorV1<SourceTreeAcquireFailureV1<V::Error>>,
+    > {
+        Err(SnapshotSourceObservationErrorV1::Leaf(
+            unsupported_platform(),
+        ))
+    }
+
+    #[cfg(test)]
     pub(super) fn enumerate_source_tree_view_at<V: SourceTreeVisitorV1>(
         _source_view: QualifiedNoAtimeSourceViewV1<'_>,
         _root_name: &CStr,
         _policy: SourceEnumerationPolicyV1,
         _visitor: &mut V,
     ) -> Result<SourceTreePlanV1, SourceTreeAcquireFailureV1<V::Error>> {
+        Err(unsupported_platform())
+    }
+
+    fn unsupported_platform<E>() -> SourceTreeAcquireFailureV1<E> {
         #[cfg(not(target_os = "linux"))]
         let code = RefusalCode::UnsupportedOs;
         #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
         let code = RefusalCode::UnsupportedArchitecture;
-        Err(SourceTreeAcquireFailureV1::Source(
-            SourceTreeFailureV1::new(
-                code,
-                SourceTreeStageV1::ValidatePolicy,
-                SourceTreeFailureReasonV1::RequiredKernelCapability,
-                None,
-            ),
+        SourceTreeAcquireFailureV1::Source(SourceTreeFailureV1::new(
+            code,
+            SourceTreeStageV1::ValidatePolicy,
+            SourceTreeFailureReasonV1::RequiredKernelCapability,
+            None,
         ))
     }
 }
@@ -3799,6 +4860,21 @@ mod portable_tests {
             NonZeroU64::new(1024 * 1024).unwrap(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn source_tree_acquire_failure_debug_redacts_visitor_path_and_source() {
+        let failure = SourceTreeAcquireFailureV1::Visitor {
+            stage: SourceTreeStageV1::VisitRegular,
+            relative_path: b"path-secret-91".to_vec(),
+            source: "source-secret-73",
+        };
+
+        let rendered = format!("{failure:?}");
+        assert!(rendered.contains("VisitRegular"));
+        assert_eq!(rendered.matches("<redacted>").count(), 2);
+        assert!(!rendered.contains("path-secret-91"));
+        assert!(!rendered.contains("source-secret-73"));
     }
 
     #[test]
@@ -3937,7 +5013,7 @@ mod portable_tests {
         let exact = 2 * 3
             + 2 * 2
             + symlink_read_buffer
-            + std::mem::size_of::<ExtentV1>() as u64
+            + 2 * std::mem::size_of::<ExtentV1>() as u64
             + 2 * xattrs.max_total_bytes.get()
             + (std::mem::size_of::<SourceTreeEntryV1>()
                 + std::mem::size_of::<SourceInodeKeyV1>()
@@ -4016,6 +5092,28 @@ mod portable_tests {
             bytes_failure.reason(),
             SourceTreeFailureReasonV1::ResourceLimit(SourceTreeLimitV1::PlanBytes)
         );
+
+        let mut spare_capacity = Vec::with_capacity(8);
+        spare_capacity.push(ExtentV1 {
+            offset: 0,
+            length: 1,
+        });
+        let spare_capacity =
+            SourceRegularEvidenceV1::checked(FileContentDigest([8; 32]), spare_capacity, 1)
+                .unwrap();
+        let allocated_bytes =
+            spare_capacity.data_extents.capacity() as u64 * std::mem::size_of::<ExtentV1>() as u64;
+        assert!(allocated_bytes > std::mem::size_of::<ExtentV1>() as u64);
+        assert_eq!(
+            validate_regular_evidence(&spare_capacity, 1, 1, allocated_bytes),
+            Ok(allocated_bytes)
+        );
+        assert_eq!(
+            validate_regular_evidence(&spare_capacity, 1, 1, allocated_bytes - 1)
+                .unwrap_err()
+                .reason(),
+            SourceTreeFailureReasonV1::ResourceLimit(SourceTreeLimitV1::PlanBytes)
+        );
         assert!(
             SourceRegularEvidenceV1::checked(
                 FileContentDigest([1; 32]),
@@ -4051,6 +5149,8 @@ mod portable_tests {
 
         <SourceRegularVisitV1<'static> as AmbiguousIfClone<_>>::probe();
         <SourceRegularVisitV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SourceObservedRegularVisitV1<'static, 'static> as AmbiguousIfClone<_>>::probe();
+        <SourceObservedRegularVisitV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
     }
 
     #[test]
@@ -4065,6 +5165,6 @@ mod portable_tests {
             NonZeroU8::new(4).unwrap(),
         )
         .unwrap();
-        assert_eq!(policy.max_live_source_fds(), 2 * 16 + 4);
+        assert_eq!(policy.max_live_source_fds(), 2 * 16 + 5);
     }
 }

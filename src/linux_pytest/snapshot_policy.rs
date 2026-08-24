@@ -39,7 +39,7 @@ const HARD_MAX_FOUR_VIEW_HEAP_BYTES: u64 =
 const HARD_MAX_OPERATION_ATTEMPTS: u64 = 1 << 40;
 const HARD_MAX_ATTEMPTS_PER_CALL: u8 = 32;
 
-const TREE_FIXED_FDS: u32 = 4;
+const TREE_FIXED_FDS: u32 = 5;
 const MATERIALIZER_MIN_FDS: u32 = 4;
 const REGULAR_COPY_TRANSIENT_FDS: u32 = 3;
 const STAGED_PUBLISHER_FDS: u32 = 1;
@@ -999,13 +999,13 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.max_cleanup_depth(), 18);
-        assert_eq!(policy.max_live_tree_fds(), 2 * 16 + 4);
+        assert_eq!(policy.max_live_tree_fds(), 2 * 16 + 5);
         assert_eq!(policy.max_live_materializer_fds(), 17);
         assert_eq!(policy.max_live_regular_copy_fds(), 3);
         assert_eq!(policy.max_live_staged_publisher_fds(), 1);
         assert_eq!(policy.max_live_publication_fds(), 2);
         assert_eq!(policy.max_live_publisher_cleanup_fds(), 2 * 18 + 4);
-        assert_eq!(policy.max_live_snapshot_fds(), 2 * 16 + 8 + 17);
+        assert_eq!(policy.max_live_snapshot_fds(), 2 * 16 + 9 + 17);
         assert_eq!(
             policy.max_four_view_heap_bytes(),
             2 * 128 * 1024 * 1024 + 32 * 1024 * 1024

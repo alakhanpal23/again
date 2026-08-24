@@ -18,6 +18,11 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::FileContentHasherV1;
+use super::snapshot_connector::{
+    SnapshotSourceObservationErrorV1, SnapshotSourceObservationSessionV1,
+};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
 
 // These hard ceilings are defense-in-depth above the smaller values selected
@@ -188,6 +193,7 @@ pub(super) enum SnapshotRegularStageV1 {
     SparseCopy,
     EnumerateDestinationExtents,
     HashDestination,
+    HashSource,
     RevalidateSource,
     RevalidateDestination,
 }
@@ -261,6 +267,31 @@ pub(super) unsafe fn copy_regular_from_qualified_pinned_at(
     )
 }
 
+/// Observe one pinned regular source without creating a destination inode.
+///
+/// The connector-minted session binds the source policy, forward-attempt
+/// ledger, and `SourceObservation` stage. There is deliberately no separate
+/// policy or stage argument that a caller could splice into this operation.
+/// The returned extent count is bounded by the committed leaf policy, but the
+/// allocator-observed capacity is not yet attached to the shared transient-heap
+/// ledger. This API therefore claims charged kernel attempts, not a charged
+/// observation allocation boundary.
+///
+/// # Safety
+///
+/// `source_parent`, `source_name`, and `source_handle` must come from the same
+/// still-live `QualifiedNoAtimeSourceViewV1` enumeration callback. That view
+/// must guarantee that ordinary source reads cannot mutate host metadata for
+/// this call's full duration.
+pub(super) unsafe fn observe_regular_from_qualified_pinned_at(
+    source_parent: BorrowedFd<'_>,
+    source_name: &CStr,
+    source_handle: BorrowedFd<'_>,
+    session: &SnapshotSourceObservationSessionV1<'_>,
+) -> Result<RegularCopyEvidenceV1, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>> {
+    platform::observe_regular_from_pinned_at(source_parent, source_name, source_handle, session)
+}
+
 fn valid_basename(name: &CStr) -> bool {
     let bytes = name.to_bytes();
     !bytes.is_empty() && bytes != b"." && bytes != b".." && !bytes.contains(&b'/')
@@ -268,6 +299,7 @@ fn valid_basename(name: &CStr) -> bool {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
+    use std::convert::Infallible;
     use std::io;
     use std::mem::{self, MaybeUninit};
     use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -294,7 +326,98 @@ mod platform {
     const STATX_MNT_ID: u32 = 0x1000;
     const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    /// Private raw-attempt seam shared by the legacy direct-copy path and
+    /// charged observation. The charged observer always supplies the exact
+    /// connector session; `DirectGateV1` is selectable only by legacy copy
+    /// helpers in this module.
+    trait KernelAttemptGateV1 {
+        type ChargeError;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError>;
+    }
+
+    #[derive(Debug)]
+    enum MeteredIoV1<E> {
+        Charge(E),
+        Io(io::Error),
+    }
+
+    struct DirectGateV1;
+
+    impl KernelAttemptGateV1 for DirectGateV1 {
+        type ChargeError = Infallible;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            Ok(attempt())
+        }
+    }
+
+    impl KernelAttemptGateV1 for SnapshotSourceObservationSessionV1<'_> {
+        type ChargeError = SnapshotPipelineResourceErrorV1;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            SnapshotSourceObservationSessionV1::run_attempt(self, attempt)
+        }
+    }
+
+    fn run_io_attempt<G: KernelAttemptGateV1, T>(
+        gate: &G,
+        attempt: impl FnOnce() -> io::Result<T>,
+    ) -> Result<T, MeteredIoV1<G::ChargeError>> {
+        gate.run(attempt)
+            .map_err(MeteredIoV1::Charge)?
+            .map_err(MeteredIoV1::Io)
+    }
+
+    fn into_direct_io<T>(result: Result<T, MeteredIoV1<Infallible>>) -> io::Result<T> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(MeteredIoV1::Io(error)) => Err(error),
+            Err(MeteredIoV1::Charge(never)) => match never {},
+        }
+    }
+
+    #[derive(Debug)]
+    enum GatedRegularFailureV1<E> {
+        Charge(E),
+        Leaf(SnapshotRegularFailureV1),
+    }
+
+    fn map_gated_result<T, E>(
+        result: Result<T, MeteredIoV1<E>>,
+        map_io: impl FnOnce(io::Error) -> SnapshotRegularFailureV1,
+    ) -> Result<T, GatedRegularFailureV1<E>> {
+        result.map_err(|error| match error {
+            MeteredIoV1::Charge(error) => GatedRegularFailureV1::Charge(error),
+            MeteredIoV1::Io(error) => GatedRegularFailureV1::Leaf(map_io(error)),
+        })
+    }
+
+    fn into_direct_regular<T>(
+        result: Result<T, GatedRegularFailureV1<Infallible>>,
+    ) -> Result<T, SnapshotRegularFailureV1> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(GatedRegularFailureV1::Leaf(error)) => Err(error),
+            Err(GatedRegularFailureV1::Charge(never)) => match never {},
+        }
+    }
+
+    fn into_source_observation_regular<T>(
+        result: Result<T, GatedRegularFailureV1<SnapshotPipelineResourceErrorV1>>,
+    ) -> Result<T, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(GatedRegularFailureV1::Charge(error)) => {
+                Err(SnapshotSourceObservationErrorV1::Resource(error))
+            }
+            Err(GatedRegularFailureV1::Leaf(error)) => {
+                Err(SnapshotSourceObservationErrorV1::Leaf(error))
+            }
+        }
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
     enum BoundedReserveError {
         Full,
         Allocation,
@@ -430,6 +553,132 @@ mod platform {
         )
     }
 
+    pub(super) fn observe_regular_from_pinned_at(
+        source_parent: BorrowedFd<'_>,
+        source_name: &CStr,
+        source_handle: BorrowedFd<'_>,
+        session: &SnapshotSourceObservationSessionV1<'_>,
+    ) -> Result<RegularCopyEvidenceV1, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>>
+    {
+        let result = observe_regular_from_pinned_at_with_gate(
+            source_parent,
+            source_name,
+            source_handle,
+            session.regular_copy_policy(),
+            source_read_open_flags(),
+            session,
+        );
+        into_source_observation_regular(result)
+    }
+
+    fn observe_regular_from_pinned_at_with_gate<G: KernelAttemptGateV1>(
+        source_parent: BorrowedFd<'_>,
+        source_name: &CStr,
+        source_handle: BorrowedFd<'_>,
+        policy: RegularCopyPolicyV1,
+        source_open_flags: i32,
+        gate: &G,
+    ) -> Result<RegularCopyEvidenceV1, GatedRegularFailureV1<G::ChargeError>> {
+        if !valid_basename(source_name) {
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
+                RefusalCode::SnapshotRequiredObjectUnsupported,
+                SnapshotRegularStageV1::ValidateSourceName,
+                None,
+            )));
+        }
+
+        let source_identity =
+            map_gated_result(statx_identity_with_gate(source_handle, gate), |error| {
+                map_statx_failure(SnapshotRegularStageV1::InspectSource, error)
+            })?;
+        if source_identity.mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
+                RefusalCode::SnapshotRequiredObjectUnsupported,
+                SnapshotRegularStageV1::InspectSource,
+                None,
+            )));
+        }
+        if source_identity.size > policy.max_logical_bytes() {
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
+                SnapshotRegularStageV1::InspectSource,
+                None,
+            )));
+        }
+
+        let source_read = map_gated_result(
+            openat2_owned_with_gate(
+                source_parent,
+                source_name,
+                source_open_flags,
+                0,
+                SOURCE_RESOLVE,
+                policy.openat2_attempts(),
+                gate,
+            ),
+            |error| map_source_read_open(SnapshotRegularStageV1::OpenSourceRead, error),
+        )?;
+        let read_identity = map_gated_result(
+            statx_identity_with_gate(source_read.as_fd(), gate),
+            |error| map_statx_failure(SnapshotRegularStageV1::OpenSourceRead, error),
+        )?;
+        if read_identity != source_identity {
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
+                SnapshotRegularStageV1::OpenSourceRead,
+                None,
+            )));
+        }
+
+        let initial_extents = map_gated_result(
+            enumerate_extents_with_gate(
+                source_read.as_fd(),
+                source_identity.size,
+                policy.max_data_extents(),
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_extent_error(SnapshotRegularStageV1::EnumerateSourceExtents, error),
+        )?;
+        let content_digest = map_gated_result(
+            hash_logical_bytes_with_gate(
+                source_read.as_fd(),
+                source_identity.size,
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| construction_io(SnapshotRegularStageV1::HashSource, error),
+        )?;
+        let source_extents_after = map_gated_result(
+            enumerate_extents_with_gate(
+                source_read.as_fd(),
+                source_identity.size,
+                policy.max_data_extents(),
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_extent_error(SnapshotRegularStageV1::RevalidateSource, error),
+        )?;
+        if source_extents_after != initial_extents {
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
+                SnapshotRegularStageV1::RevalidateSource,
+                None,
+            )));
+        }
+        revalidate_source_with_gate(
+            source_parent,
+            source_name,
+            source_handle,
+            source_read.as_fd(),
+            &source_identity,
+            policy.openat2_attempts(),
+            gate,
+        )?;
+
+        Ok(RegularCopyEvidenceV1 {
+            content_digest,
+            data_extents: initial_extents,
+        })
+    }
+
     fn copy_regular_from_pinned_at_with<H: CopyHooks>(
         source_parent: BorrowedFd<'_>,
         source_name: &CStr,
@@ -507,10 +756,11 @@ mod platform {
             map_destination_error(SnapshotRegularStageV1::CreateDestination, error)
         })?;
 
-        let initial_extents = enumerate_extents(
+        let initial_extents = enumerate_extents_direct_with_attempts(
             source_read.as_fd(),
             source_identity.size,
             policy.max_data_extents(),
+            policy.syscall_attempts(),
         )
         .map_err(|error| map_extent_error(SnapshotRegularStageV1::EnumerateSourceExtents, error))?;
 
@@ -550,10 +800,11 @@ mod platform {
             map_destination_error(SnapshotRegularStageV1::RevalidateSource, error)
         })?;
 
-        let source_extents_after = enumerate_extents(
+        let source_extents_after = enumerate_extents_direct_with_attempts(
             source_read.as_fd(),
             source_identity.size,
             policy.max_data_extents(),
+            policy.syscall_attempts(),
         )
         .map_err(|error| map_extent_error(SnapshotRegularStageV1::RevalidateSource, error))?;
         #[cfg(test)]
@@ -585,10 +836,11 @@ mod platform {
                 None,
             ));
         }
-        let destination_extents = enumerate_extents(
+        let destination_extents = enumerate_extents_direct_with_attempts(
             destination.as_fd(),
             destination_identity.size,
             policy.max_data_extents(),
+            policy.syscall_attempts(),
         )
         .map_err(|error| {
             map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error)
@@ -646,7 +898,9 @@ mod platform {
     }
 
     const fn source_read_open_flags() -> i32 {
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        // `O_NONBLOCK` is ignored for regular files, but prevents a pathname
+        // replacement with a FIFO from blocking before identity comparison.
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
 
     const fn destination_open_flags() -> i32 {
@@ -666,26 +920,53 @@ mod platform {
         expected: &StableStatxV1,
         attempts: u8,
     ) -> Result<(), SnapshotRegularFailureV1> {
-        let path_after = statx_identity(path_handle)
-            .map_err(|error| map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error))?;
-        let read_after = statx_identity(read_handle)
-            .map_err(|error| map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error))?;
-        let reopened = openat2_owned(
+        into_direct_regular(revalidate_source_with_gate(
             parent,
             name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-            SOURCE_RESOLVE,
+            path_handle,
+            read_handle,
+            expected,
             attempts,
-        )
-        .map_err(|error| construction_io(SnapshotRegularStageV1::RevalidateSource, error))?;
-        let reopened_identity = statx_identity(reopened.as_fd())
-            .map_err(|error| map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error))?;
+            &DirectGateV1,
+        ))
+    }
+
+    fn revalidate_source_with_gate<G: KernelAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        path_handle: BorrowedFd<'_>,
+        read_handle: BorrowedFd<'_>,
+        expected: &StableStatxV1,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<(), GatedRegularFailureV1<G::ChargeError>> {
+        let path_after = map_gated_result(statx_identity_with_gate(path_handle, gate), |error| {
+            map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error)
+        })?;
+        let read_after = map_gated_result(statx_identity_with_gate(read_handle, gate), |error| {
+            map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error)
+        })?;
+        let reopened = map_gated_result(
+            openat2_owned_with_gate(
+                parent,
+                name,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+                SOURCE_RESOLVE,
+                attempts,
+                gate,
+            ),
+            |error| construction_io(SnapshotRegularStageV1::RevalidateSource, error),
+        )?;
+        let reopened_identity =
+            map_gated_result(statx_identity_with_gate(reopened.as_fd(), gate), |error| {
+                map_statx_failure(SnapshotRegularStageV1::RevalidateSource, error)
+            })?;
         if &path_after != expected || &read_after != expected || &reopened_identity != expected {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::RevalidateSource,
                 None,
-            ));
+            )));
         }
         Ok(())
     }
@@ -829,6 +1110,26 @@ mod platform {
         resolve: u64,
         attempts: u8,
     ) -> io::Result<OwnedFd> {
+        into_direct_io(openat2_owned_with_gate(
+            parent,
+            name,
+            flags,
+            mode,
+            resolve,
+            attempts,
+            &DirectGateV1,
+        ))
+    }
+
+    fn openat2_owned_with_gate<G: KernelAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        flags: i32,
+        mode: u32,
+        resolve: u64,
+        attempts: u8,
+        gate: &G,
+    ) -> Result<OwnedFd, MeteredIoV1<G::ChargeError>> {
         let how = OpenHow {
             flags: flags as u64,
             mode: mode as u64,
@@ -836,44 +1137,61 @@ mod platform {
         };
         let mut last = io::Error::from_raw_os_error(libc::EAGAIN);
         for _ in 0..attempts {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    &how,
-                    mem::size_of::<OpenHow>(),
-                )
-            };
-            if result >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
-            }
-            last = io::Error::last_os_error();
-            if last.raw_os_error() != Some(libc::EAGAIN) {
-                return Err(last);
+            match run_io_attempt(gate, || {
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_openat2,
+                        parent.as_raw_fd(),
+                        name.as_ptr(),
+                        &how,
+                        mem::size_of::<OpenHow>(),
+                    )
+                };
+                if result >= 0 {
+                    Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) })
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(descriptor) => return Ok(descriptor),
+                Err(MeteredIoV1::Io(error)) if error.raw_os_error() == Some(libc::EAGAIN) => {
+                    last = error;
+                }
+                Err(error) => return Err(error),
             }
         }
-        Err(last)
+        Err(MeteredIoV1::Io(last))
     }
 
     fn statx_identity(fd: BorrowedFd<'_>) -> io::Result<StableStatxV1> {
-        let mut raw = MaybeUninit::<libc::statx>::zeroed();
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                fd.as_raw_fd(),
-                c"".as_ptr(),
-                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                REQUESTED_STATX_MASK,
-                raw.as_mut_ptr(),
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let raw = unsafe { raw.assume_init() };
+        into_direct_io(statx_identity_with_gate(fd, &DirectGateV1))
+    }
+
+    fn statx_identity_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        gate: &G,
+    ) -> Result<StableStatxV1, MeteredIoV1<G::ChargeError>> {
+        let raw = run_io_attempt(gate, || {
+            let mut raw = MaybeUninit::<libc::statx>::zeroed();
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_statx,
+                    fd.as_raw_fd(),
+                    c"".as_ptr(),
+                    AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    REQUESTED_STATX_MASK,
+                    raw.as_mut_ptr(),
+                )
+            };
+            if result != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { raw.assume_init() })
+        })?;
         if raw.stx_mask & REQUIRED_STATX_MASK != REQUIRED_STATX_MASK {
-            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+            return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )));
         }
         Ok(StableStatxV1 {
             mount_id: raw.stx_mnt_id,
@@ -916,43 +1234,52 @@ mod platform {
         })
     }
 
-    fn enumerate_extents(
+    fn enumerate_extents_direct_with_attempts(
         fd: BorrowedFd<'_>,
         size: u64,
         max_extents: u32,
+        syscall_attempts: u8,
     ) -> io::Result<Vec<ExtentV1>> {
+        into_direct_io(enumerate_extents_with_gate(
+            fd,
+            size,
+            max_extents,
+            syscall_attempts,
+            &DirectGateV1,
+        ))
+    }
+
+    fn enumerate_extents_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        size: u64,
+        max_extents: u32,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<Vec<ExtentV1>, MeteredIoV1<G::ChargeError>> {
         if size == 0 {
             return Ok(Vec::new());
         }
         let mut extents = Vec::new();
         let mut cursor = 0u64;
         while cursor < size {
-            let data =
-                unsafe { libc::lseek(fd.as_raw_fd(), cursor as libc::off_t, libc::SEEK_DATA) };
-            if data < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENXIO) {
+            let data = match lseek_with_gate(fd, cursor, libc::SEEK_DATA, syscall_attempts, gate) {
+                Err(MeteredIoV1::Io(error)) if error.raw_os_error() == Some(libc::ENXIO) => {
                     break;
                 }
-                return Err(error);
-            }
-            let data = data as u64;
+                result => result?,
+            };
             if data < cursor || data >= size {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
+                return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)));
             }
-            let hole = unsafe { libc::lseek(fd.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
-            if hole < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let hole = hole as u64;
+            let hole = lseek_with_gate(fd, data, libc::SEEK_HOLE, syscall_attempts, gate)?;
             if hole <= data || hole > size {
-                return Err(io::Error::from_raw_os_error(libc::EIO));
+                return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)));
             }
             try_reserve_bounded_for_push(&mut extents, max_extents as usize).map_err(|error| {
-                io::Error::from_raw_os_error(match error {
+                MeteredIoV1::Io(io::Error::from_raw_os_error(match error {
                     BoundedReserveError::Full => libc::EFBIG,
                     BoundedReserveError::Allocation => libc::ENOMEM,
-                })
+                }))
             })?;
             extents.push(ExtentV1 {
                 offset: data,
@@ -961,6 +1288,35 @@ mod platform {
             cursor = hole;
         }
         Ok(extents)
+    }
+
+    fn lseek_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        offset: u64,
+        whence: i32,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<u64, MeteredIoV1<G::ChargeError>> {
+        let offset = libc::off_t::try_from(offset)
+            .map_err(|_| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
+        let mut last = io::Error::from_raw_os_error(libc::EINTR);
+        for _ in 0..syscall_attempts {
+            match run_io_attempt(gate, || {
+                let result = unsafe { libc::lseek(fd.as_raw_fd(), offset, whence) };
+                if result < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    u64::try_from(result).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+                }
+            }) {
+                Ok(result) => return Ok(result),
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    last = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(MeteredIoV1::Io(last))
     }
 
     fn truncate_to(destination: BorrowedFd<'_>, size: u64) -> io::Result<()> {
@@ -1001,7 +1357,23 @@ mod platform {
         offset: u64,
         syscall_attempts: u8,
     ) -> io::Result<()> {
-        pread_exact_with(output, offset, syscall_attempts, |output, offset| {
+        into_direct_io(pread_exact_raw_with_gate(
+            fd,
+            output,
+            offset,
+            syscall_attempts,
+            &DirectGateV1,
+        ))
+    }
+
+    fn pread_exact_raw_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        output: &mut [u8],
+        offset: u64,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+        pread_exact_operation_with_gate(output, offset, syscall_attempts, gate, |output, offset| {
             let result = unsafe {
                 libc::pread(
                     fd.as_raw_fd(),
@@ -1019,21 +1391,37 @@ mod platform {
     }
 
     fn pread_exact_with(
+        output: &mut [u8],
+        offset: u64,
+        syscall_attempts: u8,
+        operation: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        into_direct_io(pread_exact_operation_with_gate(
+            output,
+            offset,
+            syscall_attempts,
+            &DirectGateV1,
+            operation,
+        ))
+    }
+
+    fn pread_exact_operation_with_gate<G: KernelAttemptGateV1>(
         mut output: &mut [u8],
         mut offset: u64,
         syscall_attempts: u8,
+        gate: &G,
         mut operation: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
-    ) -> io::Result<()> {
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
         if output.is_empty() {
             return Ok(());
         }
         let mut exhaustion_errno = libc::EINTR;
         for _ in 0..syscall_attempts {
-            let read = match operation(output, offset) {
-                Ok(0) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+            let read = match run_io_attempt(gate, || operation(output, offset)) {
+                Ok(0) => return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO))),
                 Ok(read) if read <= output.len() => read,
-                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                Ok(_) => return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO))),
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
                     exhaustion_errno = libc::EINTR;
                     continue;
                 }
@@ -1042,13 +1430,15 @@ mod platform {
             exhaustion_errno = libc::EIO;
             offset = offset
                 .checked_add(read as u64)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+                .ok_or_else(|| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
             output = &mut output[read..];
             if output.is_empty() {
                 return Ok(());
             }
         }
-        Err(io::Error::from_raw_os_error(exhaustion_errno))
+        Err(MeteredIoV1::Io(io::Error::from_raw_os_error(
+            exhaustion_errno,
+        )))
     }
 
     fn pwrite_all(
@@ -1112,22 +1502,38 @@ mod platform {
         size: u64,
         syscall_attempts: u8,
     ) -> io::Result<FileContentDigest> {
+        into_direct_io(hash_logical_bytes_with_gate(
+            fd,
+            size,
+            syscall_attempts,
+            &DirectGateV1,
+        ))
+    }
+
+    fn hash_logical_bytes_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        size: u64,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<FileContentDigest, MeteredIoV1<G::ChargeError>> {
         let mut hasher = FileContentHasherV1::new(size);
 
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
         let mut offset = 0u64;
         while offset < size {
             let length = usize::try_from((size - offset).min(buffer.len() as u64))
-                .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-            pread_exact(fd, &mut buffer[..length], offset, syscall_attempts)?;
+                .map_err(|_| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
+            pread_exact_raw_with_gate(fd, &mut buffer[..length], offset, syscall_attempts, gate)?;
             if !hasher.update(&buffer[..length]) {
-                return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
+                return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(
+                    libc::EOVERFLOW,
+                )));
             }
             offset += length as u64;
         }
         hasher
             .finish()
-            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
+            .ok_or_else(|| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)))
     }
 
     fn clone_fallback_error(error: &io::Error) -> bool {
@@ -1223,7 +1629,7 @@ mod platform {
         use std::io::{Seek, SeekFrom, Write};
         use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
         use std::path::{Path, PathBuf};
 
         use tempfile::TempDir;
@@ -1348,6 +1754,125 @@ mod platform {
                 hooks: &H,
             ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
                 self.copy(c"input", c"output", policy, hooks)
+            }
+
+            fn observe_input<G: KernelAttemptGateV1>(
+                &self,
+                policy: RegularCopyPolicyV1,
+                gate: &G,
+            ) -> Result<RegularCopyEvidenceV1, GatedRegularFailureV1<G::ChargeError>> {
+                let source_handle = openat2_owned(
+                    self.source_parent.as_fd(),
+                    c"input",
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                    SOURCE_RESOLVE,
+                    policy.openat2_attempts(),
+                )
+                .unwrap();
+                observe_regular_from_pinned_at_with_gate(
+                    self.source_parent.as_fd(),
+                    c"input",
+                    source_handle.as_fd(),
+                    policy,
+                    source_read_open_flags() | libc::O_NOATIME,
+                    gate,
+                )
+            }
+        }
+
+        #[derive(Debug)]
+        struct GateExhausted;
+
+        enum TestReplacement {
+            Regular,
+            Fifo,
+            InPlace(Vec<u8>),
+        }
+
+        struct TestGate {
+            remaining: Cell<u64>,
+            raw_calls: Cell<u64>,
+            mutation: Option<(u64, PathBuf, TestReplacement)>,
+        }
+
+        impl TestGate {
+            fn bounded(attempts: u64) -> Self {
+                Self {
+                    remaining: Cell::new(attempts),
+                    raw_calls: Cell::new(0),
+                    mutation: None,
+                }
+            }
+
+            fn mutating(attempts: u64, mutate_at: u64, path: PathBuf) -> Self {
+                Self {
+                    remaining: Cell::new(attempts),
+                    raw_calls: Cell::new(0),
+                    mutation: Some((mutate_at, path, TestReplacement::Regular)),
+                }
+            }
+
+            fn mutating_to_fifo(attempts: u64, mutate_at: u64, path: PathBuf) -> Self {
+                Self {
+                    remaining: Cell::new(attempts),
+                    raw_calls: Cell::new(0),
+                    mutation: Some((mutate_at, path, TestReplacement::Fifo)),
+                }
+            }
+
+            fn mutating_in_place(
+                attempts: u64,
+                mutate_at: u64,
+                path: PathBuf,
+                bytes: Vec<u8>,
+            ) -> Self {
+                Self {
+                    remaining: Cell::new(attempts),
+                    raw_calls: Cell::new(0),
+                    mutation: Some((mutate_at, path, TestReplacement::InPlace(bytes))),
+                }
+            }
+        }
+
+        impl KernelAttemptGateV1 for TestGate {
+            type ChargeError = GateExhausted;
+
+            fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+                let Some(remaining) = self.remaining.get().checked_sub(1) else {
+                    return Err(GateExhausted);
+                };
+                self.remaining.set(remaining);
+                let call = self.raw_calls.get() + 1;
+                if let Some((mutate_at, path, replacement)) = &self.mutation {
+                    if call == *mutate_at {
+                        match replacement {
+                            TestReplacement::Regular => {
+                                fs::remove_file(path).unwrap();
+                                fs::write(path, b"replacement-observer-bytes").unwrap();
+                            }
+                            TestReplacement::Fifo => {
+                                fs::remove_file(path).unwrap();
+                                let path = c_name(path.as_os_str());
+                                let result = unsafe { libc::mkfifo(path.as_ptr(), 0o600) };
+                                assert_eq!(
+                                    result,
+                                    0,
+                                    "mkfifo failed: {}",
+                                    io::Error::last_os_error()
+                                );
+                            }
+                            TestReplacement::InPlace(bytes) => {
+                                fs::write(path, bytes).unwrap();
+                                let mut permissions = fs::metadata(path).unwrap().permissions();
+                                permissions.set_mode(0o400);
+                                fs::set_permissions(path, permissions).unwrap();
+                            }
+                        }
+                    }
+                }
+                self.raw_calls.set(call);
+                Ok(attempt())
             }
         }
 
@@ -1554,6 +2079,132 @@ mod platform {
         }
 
         #[test]
+        fn gate_accepts_exact_partial_preads_and_refuses_before_n_plus_one() {
+            let exact = TestGate::bounded(2);
+            let mut exact_output = [0u8; 2];
+            let exact_result =
+                pread_exact_operation_with_gate(&mut exact_output, 0, 2, &exact, |remaining, _| {
+                    remaining[0] = b'x';
+                    Ok(1)
+                });
+            assert!(exact_result.is_ok());
+            assert_eq!(exact_output, *b"xx");
+            assert_eq!(exact.raw_calls.get(), 2);
+            assert_eq!(exact.remaining.get(), 0);
+
+            let short = TestGate::bounded(1);
+            let mut short_output = [0u8; 2];
+            let short_result =
+                pread_exact_operation_with_gate(&mut short_output, 0, 2, &short, |remaining, _| {
+                    remaining[0] = b'y';
+                    Ok(1)
+                });
+            assert!(matches!(
+                short_result,
+                Err(MeteredIoV1::Charge(GateExhausted))
+            ));
+            assert_eq!(short_output, [b'y', 0]);
+            assert_eq!(short.raw_calls.get(), 1);
+        }
+
+        #[test]
+        fn observer_returns_exact_digest_honors_n_minus_one_and_detects_name_swap() {
+            let bytes = (0..(COPY_BUFFER_BYTES + 37))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let fixture = Fixture::with_input(&bytes);
+
+            let discovery = TestGate::bounded(u64::MAX);
+            let evidence = fixture.observe_input(policy(), &discovery).unwrap();
+            let required = discovery.raw_calls.get();
+            assert!(
+                required > 4,
+                "observer must include final source revalidation"
+            );
+            assert_eq!(
+                evidence.content_digest(),
+                FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[&bytes])
+            );
+
+            let exact = TestGate::bounded(required);
+            let exact_evidence = fixture.observe_input(policy(), &exact).unwrap();
+            assert_eq!(exact_evidence.content_digest(), evidence.content_digest());
+            assert_eq!(exact_evidence.data_extents(), evidence.data_extents());
+            assert_eq!(exact.raw_calls.get(), required);
+
+            let short = TestGate::bounded(required - 1);
+            assert!(matches!(
+                fixture.observe_input(policy(), &short),
+                Err(GatedRegularFailureV1::Charge(GateExhausted))
+            ));
+            assert_eq!(short.raw_calls.get(), required - 1);
+
+            let mutate_at = required - 3;
+            let swapping = TestGate::mutating(required, mutate_at, fixture.source("input"));
+            let failure = match fixture.observe_input(policy(), &swapping) {
+                Ok(_) => panic!("source replacement must fail observation"),
+                Err(failure) => failure,
+            };
+            match failure {
+                GatedRegularFailureV1::Leaf(failure) => {
+                    assert_eq!(failure.stage(), SnapshotRegularStageV1::RevalidateSource);
+                    assert_eq!(failure.code(), RefusalCode::SnapshotConstructionFailed);
+                }
+                GatedRegularFailureV1::Charge(_) => {
+                    panic!("the exact gate must reach semantic revalidation")
+                }
+            }
+            assert_eq!(
+                fs::read(fixture.source("input")).unwrap(),
+                b"replacement-observer-bytes"
+            );
+
+            let in_place_fixture = Fixture::with_input(&bytes);
+            let replacement = vec![b'Z'; bytes.len()];
+            let in_place = TestGate::mutating_in_place(
+                required,
+                required - 3,
+                in_place_fixture.source("input"),
+                replacement,
+            );
+            let failure = match in_place_fixture.observe_input(policy(), &in_place) {
+                Ok(_) => panic!("same-inode post-hash mutation must fail observation"),
+                Err(failure) => failure,
+            };
+            let GatedRegularFailureV1::Leaf(failure) = failure else {
+                panic!("the exact gate must reach semantic revalidation")
+            };
+            assert_eq!(failure.stage(), SnapshotRegularStageV1::RevalidateSource);
+            assert_eq!(failure.code(), RefusalCode::SnapshotConstructionFailed);
+        }
+
+        #[test]
+        fn observer_regular_to_fifo_swap_refuses_without_blocking() {
+            let fixture = Fixture::with_input(b"ordinary-regular-file");
+            // Attempt 1 inspects the pinned regular handle. Replace its name
+            // immediately before attempt 2 opens the readable descriptor.
+            let gate = TestGate::mutating_to_fifo(3, 2, fixture.source("input"));
+
+            let failure = match fixture.observe_input(policy(), &gate) {
+                Err(failure) => failure,
+                Ok(_) => panic!("FIFO replacement must fail observation"),
+            };
+            let GatedRegularFailureV1::Leaf(failure) = failure else {
+                panic!("three attempts must reach the post-open identity check")
+            };
+            assert_eq!(failure.stage(), SnapshotRegularStageV1::OpenSourceRead);
+            assert_eq!(failure.code(), RefusalCode::SnapshotConstructionFailed);
+            assert_eq!(gate.raw_calls.get(), 3);
+            assert_eq!(gate.remaining.get(), 0);
+            assert!(
+                fs::metadata(fixture.source("input"))
+                    .unwrap()
+                    .file_type()
+                    .is_fifo()
+            );
+        }
+
+        #[test]
         fn pwrite_budget_accepts_exact_n_and_refuses_n_plus_one() {
             let mut success_calls = 0;
             pwrite_all_with(b"abcd", 17, 3, |remaining, offset| {
@@ -1598,6 +2249,7 @@ mod platform {
         #[test]
         fn source_authority_uses_ordinary_reads_but_destination_keeps_noatime() {
             assert_eq!(source_read_open_flags() & libc::O_NOATIME, 0);
+            assert_ne!(source_read_open_flags() & libc::O_NONBLOCK, 0);
             assert_ne!(destination_open_flags() & libc::O_NOATIME, 0);
             assert_ne!(source_read_open_flags() & libc::O_NOFOLLOW, 0);
             assert_ne!(destination_open_flags() & libc::O_EXCL, 0);
@@ -1761,7 +2413,9 @@ mod platform {
             };
             let evidence = finish(fixture.copy(c"sparse", c"copy", policy(), &hooks).unwrap());
             let destination = File::open(fixture.destination("copy")).unwrap();
-            let observed = enumerate_extents(destination.as_fd(), 512 * 1024, 4096).unwrap();
+            let observed =
+                enumerate_extents_direct_with_attempts(destination.as_fd(), 512 * 1024, 4096, 1)
+                    .unwrap();
             assert_eq!(observed, evidence.data_extents());
             assert_eq!(
                 fs::metadata(fixture.destination("copy")).unwrap().len(),
@@ -2048,7 +2702,9 @@ mod platform {
             source.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
             source.write_all(&[0x22; 4096]).unwrap();
             source.sync_all().unwrap();
-            let observed = enumerate_extents(source.as_fd(), 16 * 1024 * 1024, 4096).unwrap();
+            let observed =
+                enumerate_extents_direct_with_attempts(source.as_fd(), 16 * 1024 * 1024, 4096, 1)
+                    .unwrap();
             assert!(
                 observed.len() >= 2,
                 "hosted Linux qualification filesystem must expose the two sparse data ranges"
@@ -2146,6 +2802,22 @@ mod platform {
 #[cfg(not(all(target_os = "linux", target_arch = "x86_64")))]
 mod platform {
     use super::*;
+
+    pub(super) fn observe_regular_from_pinned_at(
+        _source_parent: BorrowedFd<'_>,
+        _source_name: &CStr,
+        _source_handle: BorrowedFd<'_>,
+        _session: &SnapshotSourceObservationSessionV1<'_>,
+    ) -> Result<RegularCopyEvidenceV1, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>>
+    {
+        #[cfg(not(target_os = "linux"))]
+        let code = RefusalCode::UnsupportedOs;
+        #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+        let code = RefusalCode::UnsupportedArchitecture;
+        Err(SnapshotSourceObservationErrorV1::Leaf(
+            SnapshotRegularFailureV1::new(code, SnapshotRegularStageV1::OpenSourceRead, None),
+        ))
+    }
 
     pub(super) fn copy_regular_from_pinned_at(
         _source_parent: BorrowedFd<'_>,
