@@ -305,6 +305,14 @@ setup. Record all six namespace device/inode identities, verify their types,
 and use `NS_GET_USERNS` to verify that the non-user namespaces are owned by the
 new user namespace. See [`ioctl_ns(2)`](https://man7.org/linux/man-pages/man2/ioctl_ns.2.html).
 
+The required `setgroups=deny` transition does not clear supplementary groups
+inherited across `clone3`. Capture a bounded canonical host-KGID vector before
+the clone, verify the exact child vector from the pinned proc view while PID 1
+is blocked, and commit its digest. Treat those groups as potentially
+authoritative until the later private-root, mount, FD, network/IPC, and syscall
+audits prove that they grant no additional object access. Namespace-bootstrap
+evidence alone therefore cannot authorize a workload.
+
 The workload later locks `SECBIT_NOROOT` and `SECBIT_NO_SETUID_FIXUP`, drops
 every bounding, effective, permitted, inheritable, and ambient capability,
 sets `no_new_privs`, and verifies the result before Python.

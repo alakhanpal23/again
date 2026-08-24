@@ -442,11 +442,27 @@ profile.
 
 ## Rootless namespace boundary
 
-The launcher creates a fresh user namespace first, writes a one-entry uid map
-from namespace uid 0 to the caller's real uid, writes `deny` to `setgroups`,
-and writes the corresponding gid map. It then creates fresh mount, PID,
-network, UTS, and IPC namespaces. No host capability is requested or retained.
-The profile records and verifies all six namespace inode identities.
+The launcher makes one `clone3` call containing `CLONE_NEWUSER` and the fresh
+mount, PID, network, UTS, and IPC namespace flags. Linux creates the user
+namespace first. Namespace PID 1 remains blocked while the parent writes and
+verifies a one-entry uid map from namespace uid 0 to the caller's real uid,
+writes and verifies `deny` in `setgroups`, and writes and verifies the
+corresponding gid map. No host capability is requested or retained. The parent
+pins all six namespace descriptors, verifies each namespace type and
+device/inode identity, and proves through `NS_GET_USERNS` that every non-user
+namespace is owned by the new user namespace.
+
+Permanently denying `setgroups` is required for the unprivileged gid map, but
+does not clear the child's inherited supplementary groups. Before `clone3`,
+the launcher captures a bounded canonical host-KGID vector; while PID 1 is
+blocked, the parent verifies the child's exact vector through its pinned proc
+view and commits the vector digest to the isolation/platform evidence. This
+namespace proof does not claim those groups are non-authoritative. Workload
+execution remains forbidden until a later outer proof has detached the old
+root, admitted only profile-created or descriptor-selected trees, closed every
+host descriptor above 2, denied namespace/descriptor/IPC escape paths, and
+made the inherited group vector unable to reveal or mutate any additional
+object.
 
 - The mount namespace owns the tmpfs root and private mounts described above.
 - Namespace PID 1 is the reaper and tracer. It launches pytest, forwards the
