@@ -9,9 +9,29 @@ environment normalization, comparison exclusions, and manifest commitments
 are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
 The current crate-private module is unreachable from the CLI and all concrete
 profile traits still fail closed; pytest execution and reuse are not
-implemented. A descriptor-selected regular-file staging leaf exists, but it
-is not yet a tree snapshot or wired to `SnapshotProvider`. The intended next
-local product slice has exactly one public invocation shape:
+implemented. Descriptor-stable source enumeration, regular-file copying,
+tree materialization, identity-checked atomic publication, and one shared
+resource contract exist as internal leaves. The current materializer refuses
+every symlink before creating it because durable replay of symlink xattrs and
+timestamps still requires a qualified dedicated staging filesystem and a
+final bounded `syncfs`. Before any destination-tree population, it also
+requires a private-field cleanup envelope read from the actual staged
+publisher to dominate its source depth, entry count, basename, and retry
+limits. Mismatch refuses before materializer population and delegates bounded,
+best-effort cleanup to the staged publisher. These leaves do not yet form the
+required four-view sealed snapshot connector and are not wired to
+`SnapshotProvider`. The intended next local product slice has exactly one
+public invocation shape:
+
+Until that connector lends the single resource capability to every leaf and
+charges allocator-observed capacity (including reallocation overlap), the
+local leaf limits are defense in depth rather than an exact whole-pipeline
+heap authority. In particular, frozen public source-plan and xattr shapes
+still finalize some pre-reserved vectors into boxed slices; their allocator
+capacity must move under that shared authority before connector admission.
+The shared shape also permits zero for optional resource classes that current
+leaf policies encode as nonzero; the connector must project zero as disabled
+or refuse it, never silently increase it to a leaf default.
 
 ```text
 again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
@@ -229,9 +249,14 @@ semantics. Failure of `FICLONE` falls back to copying, not to a live mount.
 Snapshot construction starts from owned directory file descriptors and uses
 `openat2` beneath/in-root resolution with magic links denied. Acquisition is
 permitted only when it is proven not to mutate host atime or any other host
-metadata: all read descriptors use `O_NOATIME`, and directory/symlink capture
-requires a qualified no-atime acquisition view. If the exact filesystem and
-mount tuple cannot prove that property, construction refuses before Python.
+metadata. A functionally qualified no-atime acquisition view is the authority
+for ordinary `O_RDONLY` regular-file and `O_RDONLY|O_DIRECTORY` directory
+reads; source `O_NOATIME` is neither required nor sufficient, because Linux
+also requires file ownership or `CAP_FOWNER`. Destination regular-file FDs
+retain `O_NOATIME`. The raw copy leaf is unsafe and may be called safely only
+from a callback scoped to that qualified source view. If the exact filesystem,
+mount, credential, and source-type tuple cannot prove zero mutation,
+construction refuses before Python.
 It records
 regular files, directories, symlinks, hard-link groups, modes, logical
 uid/gid, size/link count, timestamps, all visible xattr names and values,
@@ -253,6 +278,17 @@ extent sequence. That sequence is exactly the ordered nonempty ranges returned
 by `SEEK_DATA` followed by `SEEK_HOLE`, clipped to logical size; an empty or
 all-hole file has an empty sequence, and a filesystem may legally report the
 whole file as data. Source and destination must expose the same sequence.
+Physical snapshot ownership is the current effective UID, while logical
+ownership and mode remain manifest metadata. Materialization uses private
+`0600`/`0700` builder modes, replays exact xattrs, then performs one final chmod
+from ordinary rwx bits only: strip `0o7000` and every write bit, add owner-read,
+add owner-execute for directories, and add owner-execute for a regular file if
+and only if any logical execute-class bit was set. Full logical mode, special
+bits, uid, and gid remain in the manifest. Physical uid and gid are
+creation-context metadata behind the private container and are excluded from
+the logical projection. Final mode and xattrs are reverified; ACL/xattr sets
+changed by that chmod refuse. No chmod follows the verified destination views.
+Directory `st_size` is not an exact projection.
 
 The canonical manifest has one workspace tree at `/workspace` and a nonempty,
 strictly mount-path-sorted forest of read-only runtime trees. Entries use raw

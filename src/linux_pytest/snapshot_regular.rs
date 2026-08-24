@@ -16,7 +16,17 @@ use std::fmt;
 use std::num::{NonZeroU8, NonZeroU32, NonZeroU64};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use super::{ExtentV1, FileContentDigest, ProfileFailure, RefusalCode, TimespecV1};
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+use super::FileContentHasherV1;
+use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
+
+// These hard ceilings are defense-in-depth above the smaller values selected
+// by a committed profile.  The byte ceiling matches the repository's existing
+// per-file capture ceiling, the extent ceiling matches the descriptor walker's
+// entry ceiling, and retry work matches that walker's bound.
+const HARD_MAX_LOGICAL_BYTES: u64 = 1024 * 1024 * 1024;
+const HARD_MAX_DATA_EXTENTS: u32 = 1024 * 1024;
+const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
 
 /// Bounded inputs that must eventually be committed by the snapshot-policy
 /// digest.  Keeping them explicit prevents this leaf from inventing ambient
@@ -29,16 +39,24 @@ pub(super) struct RegularCopyPolicyV1 {
 }
 
 impl RegularCopyPolicyV1 {
-    pub(super) const fn new(
+    /// Returns `None` before any filesystem work if a caller requests work
+    /// above this leaf's fixed hard ceilings.
+    pub(super) const fn checked(
         max_logical_bytes: NonZeroU64,
         max_data_extents: NonZeroU32,
         openat2_attempts: NonZeroU8,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if max_logical_bytes.get() > HARD_MAX_LOGICAL_BYTES
+            || max_data_extents.get() > HARD_MAX_DATA_EXTENTS
+            || openat2_attempts.get() > HARD_MAX_OPENAT2_ATTEMPTS
+        {
+            return None;
+        }
+        Some(Self {
             max_logical_bytes,
             max_data_extents,
             openat2_attempts,
-        }
+        })
     }
 
     pub(super) const fn max_logical_bytes(self) -> u64 {
@@ -54,17 +72,11 @@ impl RegularCopyPolicyV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum RegularCopyMethodV1 {
-    Reflink,
-    SparseCopy,
-}
-
 /// Stable source metadata needed by the later manifest/xattr/hardlink stage.
 /// `ctime` and `btime` are logical source metadata; a copied inode cannot have
 /// the same physical values.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct StableStatxV1 {
+struct StableStatxV1 {
     mount_id: u64,
     device_major: u32,
     device_minor: u32,
@@ -80,85 +92,57 @@ pub(super) struct StableStatxV1 {
     btime: Option<TimespecV1>,
 }
 
-impl StableStatxV1 {
-    pub(super) const fn mount_id(&self) -> u64 {
-        self.mount_id
-    }
-
-    pub(super) const fn device_major(&self) -> u32 {
-        self.device_major
-    }
-
-    pub(super) const fn device_minor(&self) -> u32 {
-        self.device_minor
-    }
-
-    pub(super) const fn inode(&self) -> u64 {
-        self.inode
-    }
-
-    pub(super) const fn mode(&self) -> u32 {
-        self.mode
-    }
-
-    pub(super) const fn uid(&self) -> u32 {
-        self.uid
-    }
-
-    pub(super) const fn gid(&self) -> u32 {
-        self.gid
-    }
-
-    pub(super) const fn nlink(&self) -> u64 {
-        self.nlink
-    }
-
-    pub(super) const fn size(&self) -> u64 {
-        self.size
-    }
-
-    pub(super) const fn atime(&self) -> &TimespecV1 {
-        &self.atime
-    }
-
-    pub(super) const fn mtime(&self) -> &TimespecV1 {
-        &self.mtime
-    }
-
-    pub(super) const fn ctime(&self) -> &TimespecV1 {
-        &self.ctime
-    }
-
-    pub(super) const fn btime(&self) -> Option<&TimespecV1> {
-        self.btime.as_ref()
-    }
+/// A staged destination that must be finalized while its descriptor is pinned.
+/// The source capabilities were revalidated before this value was returned.
+pub(super) struct CopiedRegularV1 {
+    destination: OwnedFd,
+    content_digest: FileContentDigest,
+    data_extents: Vec<ExtentV1>,
 }
 
-/// A staged destination plus the still-pinned source inode.  The higher-level
-/// builder retains the source handle while collecting xattrs, then applies
-/// metadata to `destination` and fsyncs before publication.
-pub(super) struct CopiedRegularV1 {
-    source_handle: OwnedFd,
-    destination: OwnedFd,
-    source_identity: StableStatxV1,
-    content_digest: FileContentDigest,
-    data_extents: Box<[ExtentV1]>,
-    method: RegularCopyMethodV1,
+impl fmt::Debug for CopiedRegularV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CopiedRegularV1")
+            .field("extent_count", &self.data_extents.len())
+            .field("destination", &"<owned-fd>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl CopiedRegularV1 {
-    pub(super) fn source_handle(&self) -> BorrowedFd<'_> {
-        self.source_handle.as_fd()
+    /// Complete destination-only work while the staged inode is pinned, then
+    /// close that descriptor before returning FD-free evidence. The callback
+    /// may apply metadata and must durably sync the inode; its scoped borrow
+    /// cannot be retained by safe Rust.
+    pub(super) fn finalize_with<T, E>(
+        self,
+        finalize: impl FnOnce(BorrowedFd<'_>) -> Result<T, E>,
+    ) -> Result<(T, RegularCopyEvidenceV1), E> {
+        let output = finalize(self.destination.as_fd())?;
+        let Self {
+            destination,
+            content_digest,
+            data_extents,
+        } = self;
+        drop(destination);
+        Ok((
+            output,
+            RegularCopyEvidenceV1 {
+                content_digest,
+                data_extents,
+            },
+        ))
     }
+}
 
-    pub(super) fn destination(&self) -> BorrowedFd<'_> {
-        self.destination.as_fd()
-    }
+/// Copy evidence with no retained filesystem capability.
+pub(super) struct RegularCopyEvidenceV1 {
+    content_digest: FileContentDigest,
+    data_extents: Vec<ExtentV1>,
+}
 
-    pub(super) fn source_identity(&self) -> &StableStatxV1 {
-        &self.source_identity
-    }
-
+impl RegularCopyEvidenceV1 {
     pub(super) const fn content_digest(&self) -> FileContentDigest {
         self.content_digest
     }
@@ -167,25 +151,8 @@ impl CopiedRegularV1 {
         &self.data_extents
     }
 
-    pub(super) const fn method(&self) -> RegularCopyMethodV1 {
-        self.method
-    }
-
-    pub(super) fn into_parts(self) -> (OwnedFd, OwnedFd) {
-        (self.source_handle, self.destination)
-    }
-}
-
-impl fmt::Debug for CopiedRegularV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("CopiedRegularV1")
-            .field("source_identity", &self.source_identity)
-            .field("content_digest", &self.content_digest)
-            .field("data_extents", &self.data_extents)
-            .field("method", &self.method)
-            .field("descriptor_capabilities", &"<owned-fds>")
-            .finish()
+    pub(super) fn into_parts(self) -> (FileContentDigest, Vec<ExtentV1>) {
+        (self.content_digest, self.data_extents)
     }
 }
 
@@ -193,7 +160,6 @@ impl fmt::Debug for CopiedRegularV1 {
 pub(super) enum SnapshotRegularStageV1 {
     ValidateSourceName,
     ValidateDestinationName,
-    OpenSourceHandle,
     InspectSource,
     OpenSourceRead,
     CreateDestination,
@@ -230,10 +196,6 @@ impl SnapshotRegularFailureV1 {
     pub(super) const fn errno(self) -> Option<i32> {
         self.errno
     }
-
-    pub(super) const fn into_profile_failure(self) -> ProfileFailure {
-        ProfileFailure::refused(self.code)
-    }
 }
 
 impl fmt::Display for SnapshotRegularFailureV1 {
@@ -248,20 +210,32 @@ impl fmt::Display for SnapshotRegularFailureV1 {
 
 impl std::error::Error for SnapshotRegularFailureV1 {}
 
-/// Copy one regular source child into one new destination child.
+/// Copy one pinned regular source child into one new destination child.
 ///
-/// Both directory descriptors must already be trusted capabilities. Names are
-/// raw C basenames, not paths. No ordinary-path fallback is permitted.
-pub(super) fn copy_regular_at(
+/// Both directory descriptors and `source_handle` must already be trusted
+/// capabilities. The source handle is bound to `source_parent/source_name`
+/// before and after the copy, closing name-swap ABA windows at this boundary.
+/// Names are raw C basenames, not paths. No ordinary-path fallback is
+/// permitted.
+/// # Safety
+///
+/// `source_parent`, `source_name`, and `source_handle` must come from the same
+/// still-live `QualifiedNoAtimeSourceViewV1` enumeration callback. That view
+/// must guarantee that ordinary source reads cannot mutate host metadata for
+/// this call's full duration. The destination parent must be a current-user,
+/// private staging directory in the already-qualified destination view.
+pub(super) unsafe fn copy_regular_from_qualified_pinned_at(
     source_parent: BorrowedFd<'_>,
     source_name: &CStr,
+    source_handle: BorrowedFd<'_>,
     destination_parent: BorrowedFd<'_>,
     destination_name: &CStr,
     policy: RegularCopyPolicyV1,
 ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
-    platform::copy_regular_at(
+    platform::copy_regular_from_pinned_at(
         source_parent,
         source_name,
+        source_handle,
         destination_parent,
         destination_name,
         policy,
@@ -271,22 +245,6 @@ pub(super) fn copy_regular_at(
 fn valid_basename(name: &CStr) -> bool {
     let bytes = name.to_bytes();
     !bytes.is_empty() && bytes != b"." && bytes != b".." && !bytes.contains(&b'/')
-}
-
-// Temporary until the parent hash layer exposes a domain-fixed streaming
-// `FileContentHasherV1`. Keep the parity tests below: this must remain exactly
-// equivalent to `FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[bytes])`.
-fn new_file_content_hasher(logical_size: u64) -> blake3::Hasher {
-    let mut hasher = blake3::Hasher::new_derive_key(super::FILE_CONTENT_DOMAIN);
-    hasher.update(super::HASH_FRAME_MAGIC);
-    hasher.update(&1u32.to_be_bytes());
-    hasher.update(&1u16.to_be_bytes());
-    hasher.update(&logical_size.to_be_bytes());
-    hasher
-}
-
-fn finish_file_content_hasher(hasher: blake3::Hasher) -> FileContentDigest {
-    FileContentDigest(*hasher.finalize().as_bytes())
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -317,6 +275,33 @@ mod platform {
     const STATX_MNT_ID: u32 = 0x1000;
     const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BoundedReserveError {
+        Full,
+        Allocation,
+    }
+
+    fn try_reserve_bounded_for_push<T>(
+        values: &mut Vec<T>,
+        max_len: usize,
+    ) -> Result<(), BoundedReserveError> {
+        if values.len() >= max_len {
+            return Err(BoundedReserveError::Full);
+        }
+        if values.len() < values.capacity() {
+            return Ok(());
+        }
+        let target = if values.capacity() == 0 {
+            1
+        } else {
+            values.capacity().saturating_mul(2)
+        }
+        .min(max_len);
+        values
+            .try_reserve_exact(target - values.len())
+            .map_err(|_| BoundedReserveError::Allocation)
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct OpenHow {
@@ -338,10 +323,45 @@ mod platform {
         Verified(CleanupIdentity),
     }
 
+    #[cfg(test)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ExtentObservationPoint {
+        SourceRecheck,
+        Destination,
+    }
+
     trait CopyHooks {
         fn clone_file(&self, destination: RawFd, source: RawFd) -> io::Result<()>;
 
+        #[cfg(test)]
+        fn after_source_handle_opened(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(test)]
+        fn destination_cleanup_identity(
+            &self,
+            destination: BorrowedFd<'_>,
+        ) -> io::Result<CleanupIdentity> {
+            fstat_cleanup_identity(destination)
+        }
+
+        #[cfg(test)]
         fn after_materialized(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(test)]
+        fn after_extent_observed(
+            &self,
+            _point: ExtentObservationPoint,
+            _extents: &mut Vec<ExtentV1>,
+        ) -> io::Result<()> {
+            Ok(())
+        }
+
+        #[cfg(test)]
+        fn before_destination_reopen(&self) -> io::Result<()> {
             Ok(())
         }
     }
@@ -359,16 +379,18 @@ mod platform {
         }
     }
 
-    pub(super) fn copy_regular_at(
+    pub(super) fn copy_regular_from_pinned_at(
         source_parent: BorrowedFd<'_>,
         source_name: &CStr,
+        source_handle: BorrowedFd<'_>,
         destination_parent: BorrowedFd<'_>,
         destination_name: &CStr,
         policy: RegularCopyPolicyV1,
     ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
-        copy_regular_at_with(
+        copy_regular_from_pinned_at_with(
             source_parent,
             source_name,
+            source_handle,
             destination_parent,
             destination_name,
             policy,
@@ -376,9 +398,10 @@ mod platform {
         )
     }
 
-    fn copy_regular_at_with<H: CopyHooks>(
+    fn copy_regular_from_pinned_at_with<H: CopyHooks>(
         source_parent: BorrowedFd<'_>,
         source_name: &CStr,
+        source_handle: BorrowedFd<'_>,
         destination_parent: BorrowedFd<'_>,
         destination_name: &CStr,
         policy: RegularCopyPolicyV1,
@@ -399,18 +422,7 @@ mod platform {
             ));
         }
 
-        let source_handle = openat2_owned(
-            source_parent,
-            source_name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-            SOURCE_RESOLVE,
-            policy.openat2_attempts(),
-        )
-        .map_err(|error| {
-            map_initial_source_open(SnapshotRegularStageV1::OpenSourceHandle, error)
-        })?;
-        let source_identity = statx_identity(source_handle.as_fd())
+        let source_identity = statx_identity(source_handle)
             .map_err(|error| map_statx_failure(SnapshotRegularStageV1::InspectSource, error))?;
         if source_identity.mode & libc::S_IFMT != libc::S_IFREG {
             return Err(SnapshotRegularFailureV1::new(
@@ -419,9 +431,7 @@ mod platform {
                 None,
             ));
         }
-        if source_identity.size > policy.max_logical_bytes()
-            || source_identity.size > i64::MAX as u64
-        {
+        if source_identity.size > policy.max_logical_bytes() {
             return Err(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotConstructionFailed,
                 SnapshotRegularStageV1::InspectSource,
@@ -429,10 +439,15 @@ mod platform {
             ));
         }
 
+        #[cfg(test)]
+        hooks
+            .after_source_handle_opened()
+            .map_err(|error| construction_io(SnapshotRegularStageV1::OpenSourceRead, error))?;
+
         let source_read = openat2_owned(
             source_parent,
             source_name,
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC,
+            source_read_open_flags(),
             0,
             SOURCE_RESOLVE,
             policy.openat2_attempts(),
@@ -452,7 +467,7 @@ mod platform {
             destination_name,
             policy.openat2_attempts(),
         );
-        let mut destination = create_destination(&mut cleanup).map_err(|error| {
+        let mut destination = create_destination(&mut cleanup, hooks).map_err(|error| {
             map_destination_error(SnapshotRegularStageV1::CreateDestination, error)
         })?;
 
@@ -463,14 +478,14 @@ mod platform {
         )
         .map_err(|error| map_extent_error(SnapshotRegularStageV1::EnumerateSourceExtents, error))?;
 
-        let method = match hooks.clone_file(destination.as_raw_fd(), source_read.as_raw_fd()) {
-            Ok(()) => RegularCopyMethodV1::Reflink,
+        match hooks.clone_file(destination.as_raw_fd(), source_read.as_raw_fd()) {
+            Ok(()) => {}
             Err(error) if clone_fallback_error(&error) => {
                 drop(destination);
                 cleanup.remove_current().map_err(|error| {
                     map_destination_error(SnapshotRegularStageV1::RecreateForFallback, error)
                 })?;
-                destination = create_destination(&mut cleanup).map_err(|error| {
+                destination = create_destination(&mut cleanup, hooks).map_err(|error| {
                     map_destination_error(SnapshotRegularStageV1::RecreateForFallback, error)
                 })?;
                 truncate_to(destination.as_fd(), source_identity.size).map_err(|error| {
@@ -480,7 +495,6 @@ mod platform {
                     .map_err(|error| {
                         map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
                     })?;
-                RegularCopyMethodV1::SparseCopy
             }
             Err(error) => {
                 return Err(map_destination_error(
@@ -488,8 +502,9 @@ mod platform {
                     error,
                 ));
             }
-        };
+        }
 
+        #[cfg(test)]
         hooks.after_materialized().map_err(|error| {
             map_destination_error(SnapshotRegularStageV1::RevalidateSource, error)
         })?;
@@ -500,6 +515,16 @@ mod platform {
             policy.max_data_extents(),
         )
         .map_err(|error| map_extent_error(SnapshotRegularStageV1::RevalidateSource, error))?;
+        #[cfg(test)]
+        let source_extents_after = {
+            let mut observed = source_extents_after;
+            hooks
+                .after_extent_observed(ExtentObservationPoint::SourceRecheck, &mut observed)
+                .map_err(|error| {
+                    map_extent_error(SnapshotRegularStageV1::RevalidateSource, error)
+                })?;
+            observed
+        };
         if source_extents_after != initial_extents {
             return Err(construction_failure(
                 SnapshotRegularStageV1::RevalidateSource,
@@ -527,6 +552,16 @@ mod platform {
         .map_err(|error| {
             map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error)
         })?;
+        #[cfg(test)]
+        let destination_extents = {
+            let mut observed = destination_extents;
+            hooks
+                .after_extent_observed(ExtentObservationPoint::Destination, &mut observed)
+                .map_err(|error| {
+                    map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error)
+                })?;
+            observed
+        };
         if destination_extents != initial_extents {
             return Err(construction_failure(
                 SnapshotRegularStageV1::EnumerateDestinationExtents,
@@ -542,11 +577,15 @@ mod platform {
         revalidate_source(
             source_parent,
             source_name,
-            source_handle.as_fd(),
+            source_handle,
             source_read.as_fd(),
             &source_identity,
             policy.openat2_attempts(),
         )?;
+        #[cfg(test)]
+        hooks.before_destination_reopen().map_err(|error| {
+            construction_io(SnapshotRegularStageV1::RevalidateDestination, error)
+        })?;
         revalidate_destination(
             destination_parent,
             destination_name,
@@ -557,13 +596,23 @@ mod platform {
 
         cleanup.disarm();
         Ok(CopiedRegularV1 {
-            source_handle,
             destination,
-            source_identity,
             content_digest,
-            data_extents: initial_extents.into_boxed_slice(),
-            method,
+            data_extents: initial_extents,
         })
+    }
+
+    const fn source_read_open_flags() -> i32 {
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+
+    const fn destination_open_flags() -> i32 {
+        libc::O_RDWR
+            | libc::O_CREAT
+            | libc::O_EXCL
+            | libc::O_NOFOLLOW
+            | libc::O_NOATIME
+            | libc::O_CLOEXEC
     }
 
     fn revalidate_source(
@@ -650,8 +699,14 @@ mod platform {
             self.state = CleanupState::CreatedUnverified;
         }
 
-        fn arm(&mut self, destination: BorrowedFd<'_>) -> io::Result<()> {
-            let identity = fstat_cleanup_identity(destination)?;
+        fn arm<H: CopyHooks>(&mut self, destination: BorrowedFd<'_>, hooks: &H) -> io::Result<()> {
+            #[cfg(not(test))]
+            let identity = {
+                let _ = hooks;
+                fstat_cleanup_identity(destination)?
+            };
+            #[cfg(test)]
+            let identity = hooks.destination_cleanup_identity(destination)?;
             self.state = CleanupState::Verified(identity);
             Ok(())
         }
@@ -699,22 +754,20 @@ mod platform {
         }
     }
 
-    fn create_destination(cleanup: &mut DestinationCleanup<'_>) -> io::Result<OwnedFd> {
+    fn create_destination<H: CopyHooks>(
+        cleanup: &mut DestinationCleanup<'_>,
+        hooks: &H,
+    ) -> io::Result<OwnedFd> {
         let destination = openat2_owned(
             cleanup.parent,
             cleanup.name,
-            libc::O_RDWR
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_NOFOLLOW
-                | libc::O_NOATIME
-                | libc::O_CLOEXEC,
+            destination_open_flags(),
             0o600,
             SOURCE_RESOLVE,
             cleanup.attempts,
         )?;
         cleanup.mark_created();
-        cleanup.arm(destination.as_fd())?;
+        cleanup.arm(destination.as_fd(), hooks)?;
         let identity = statx_identity(destination.as_fd())?;
         if identity.mode & libc::S_IFMT != libc::S_IFREG
             || identity.size != 0
@@ -852,9 +905,12 @@ mod platform {
             if hole <= data || hole > size {
                 return Err(io::Error::from_raw_os_error(libc::EIO));
             }
-            if extents.len() >= max_extents as usize {
-                return Err(io::Error::from_raw_os_error(libc::EFBIG));
-            }
+            try_reserve_bounded_for_push(&mut extents, max_extents as usize).map_err(|error| {
+                io::Error::from_raw_os_error(match error {
+                    BoundedReserveError::Full => libc::EFBIG,
+                    BoundedReserveError::Allocation => libc::ENOMEM,
+                })
+            })?;
             extents.push(ExtentV1 {
                 offset: data,
                 length: hole - data,
@@ -950,7 +1006,7 @@ mod platform {
     }
 
     fn hash_logical_bytes(fd: BorrowedFd<'_>, size: u64) -> io::Result<FileContentDigest> {
-        let mut hasher = new_file_content_hasher(size);
+        let mut hasher = FileContentHasherV1::new(size);
 
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
         let mut offset = 0u64;
@@ -958,10 +1014,14 @@ mod platform {
             let length = usize::try_from((size - offset).min(buffer.len() as u64))
                 .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
             pread_exact(fd, &mut buffer[..length], offset)?;
-            hasher.update(&buffer[..length]);
+            if !hasher.update(&buffer[..length]) {
+                return Err(io::Error::from_raw_os_error(libc::EOVERFLOW));
+            }
             offset += length as u64;
         }
-        Ok(finish_file_content_hasher(hasher))
+        hasher
+            .finish()
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn clone_fallback_error(error: &io::Error) -> bool {
@@ -969,23 +1029,6 @@ mod platform {
             error.raw_os_error(),
             Some(libc::ENOTTY | libc::EOPNOTSUPP | libc::EXDEV | libc::EINVAL)
         )
-    }
-
-    fn map_initial_source_open(
-        stage: SnapshotRegularStageV1,
-        error: io::Error,
-    ) -> SnapshotRegularFailureV1 {
-        let errno = error.raw_os_error();
-        let code = match errno {
-            Some(libc::ENOSYS | libc::EINVAL | libc::E2BIG) => {
-                RefusalCode::RequiredKernelCapabilityMissing
-            }
-            Some(libc::EACCES | libc::EPERM | libc::ELOOP | libc::EXDEV | libc::ENAMETOOLONG) => {
-                RefusalCode::SnapshotRequiredObjectUnsupported
-            }
-            _ => RefusalCode::SnapshotConstructionFailed,
-        };
-        SnapshotRegularFailureV1::new(code, stage, errno)
     }
 
     fn map_source_read_open(
@@ -1038,7 +1081,7 @@ mod platform {
     ) -> SnapshotRegularFailureV1 {
         let errno = error.raw_os_error();
         let code = match errno {
-            Some(libc::ENOSYS | libc::EINVAL | libc::E2BIG)
+            Some(libc::ENOSYS | libc::EOPNOTSUPP | libc::EINVAL | libc::E2BIG)
                 if matches!(
                     stage,
                     SnapshotRegularStageV1::CreateDestination
@@ -1069,26 +1112,42 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::cell::Cell;
-        use std::ffi::CString;
+        use std::ffi::{CStr, CString, OsStr};
         use std::fs::{self, File, OpenOptions};
         use std::io::{Seek, SeekFrom, Write};
-        use std::os::fd::AsFd;
+        use std::os::fd::{AsFd, AsRawFd};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::path::{Path, PathBuf};
 
         use tempfile::TempDir;
 
         use super::*;
 
         fn policy() -> RegularCopyPolicyV1 {
-            RegularCopyPolicyV1::new(
+            RegularCopyPolicyV1::checked(
                 NonZeroU64::new(16 * 1024 * 1024).unwrap(),
                 NonZeroU32::new(4096).unwrap(),
                 NonZeroU8::new(4).unwrap(),
             )
+            .unwrap()
         }
 
-        fn open_directory(path: &std::path::Path) -> File {
+        #[test]
+        fn bounded_vector_growth_refuses_the_exact_ceiling() {
+            let mut values = Vec::new();
+            for value in 0..3 {
+                try_reserve_bounded_for_push(&mut values, 3).unwrap();
+                values.push(value);
+            }
+            assert_eq!(
+                try_reserve_bounded_for_push(&mut values, 3),
+                Err(BoundedReserveError::Full)
+            );
+            assert_eq!(values, [0, 1, 2]);
+        }
+
+        fn open_directory(path: &Path) -> File {
             OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
@@ -1096,8 +1155,93 @@ mod platform {
                 .unwrap()
         }
 
-        fn c_name(name: &std::ffi::OsStr) -> CString {
+        fn c_name(name: &OsStr) -> CString {
             CString::new(name.as_bytes()).unwrap()
+        }
+
+        struct Fixture {
+            _temp: TempDir,
+            source_dir: PathBuf,
+            destination_dir: PathBuf,
+            source_parent: File,
+            destination_parent: File,
+        }
+
+        impl Fixture {
+            fn empty() -> Self {
+                let temp = TempDir::new().unwrap();
+                let source_dir = temp.path().join("source");
+                let destination_dir = temp.path().join("destination");
+                fs::create_dir(&source_dir).unwrap();
+                fs::create_dir(&destination_dir).unwrap();
+                let source_parent = open_directory(&source_dir);
+                let destination_parent = open_directory(&destination_dir);
+                Self {
+                    _temp: temp,
+                    source_dir,
+                    destination_dir,
+                    source_parent,
+                    destination_parent,
+                }
+            }
+
+            fn with_input(bytes: &[u8]) -> Self {
+                let fixture = Self::empty();
+                fs::write(fixture.source("input"), bytes).unwrap();
+                fixture
+            }
+
+            fn source(&self, name: impl AsRef<Path>) -> PathBuf {
+                self.source_dir.join(name)
+            }
+
+            fn destination(&self, name: impl AsRef<Path>) -> PathBuf {
+                self.destination_dir.join(name)
+            }
+
+            fn copy<H: CopyHooks>(
+                &self,
+                source_name: &CStr,
+                destination_name: &CStr,
+                policy: RegularCopyPolicyV1,
+                hooks: &H,
+            ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
+                if !valid_basename(source_name) {
+                    return Err(SnapshotRegularFailureV1::new(
+                        RefusalCode::SnapshotRequiredObjectUnsupported,
+                        SnapshotRegularStageV1::ValidateSourceName,
+                        None,
+                    ));
+                }
+                let source_handle = openat2_owned(
+                    self.source_parent.as_fd(),
+                    source_name,
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                    SOURCE_RESOLVE,
+                    policy.openat2_attempts(),
+                )
+                .map_err(|error| {
+                    map_source_read_open(SnapshotRegularStageV1::OpenSourceRead, error)
+                })?;
+                copy_regular_from_pinned_at_with(
+                    self.source_parent.as_fd(),
+                    source_name,
+                    source_handle.as_fd(),
+                    self.destination_parent.as_fd(),
+                    destination_name,
+                    policy,
+                    hooks,
+                )
+            }
+
+            fn copy_input<H: CopyHooks>(
+                &self,
+                policy: RegularCopyPolicyV1,
+                hooks: &H,
+            ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
+                self.copy(c"input", c"output", policy, hooks)
+            }
         }
 
         struct ForcedCloneError {
@@ -1113,7 +1257,8 @@ mod platform {
         }
 
         struct MutateAfterCopy {
-            source: std::path::PathBuf,
+            source: PathBuf,
+            original_mtime: std::time::SystemTime,
         }
 
         impl CopyHooks for MutateAfterCopy {
@@ -1122,13 +1267,51 @@ mod platform {
             }
 
             fn after_materialized(&self) -> io::Result<()> {
-                fs::write(&self.source, b"changed-after-copy")
+                // Same logical length and usually the same extent layout: the
+                // final statx identity check, not size or mtime alone, must
+                // catch this content drift.
+                fs::write(&self.source, b"changed!")?;
+                OpenOptions::new()
+                    .write(true)
+                    .open(&self.source)?
+                    .set_times(std::fs::FileTimes::new().set_modified(self.original_mtime))
             }
         }
 
         struct ReplaceAfterCopy {
-            path: std::path::PathBuf,
+            path: PathBuf,
             replacement: &'static [u8],
+        }
+
+        struct ReplaceBeforeRead {
+            path: PathBuf,
+        }
+
+        struct ReplaceBeforeDestinationReopen {
+            path: PathBuf,
+            replacement: &'static [u8],
+        }
+
+        impl CopyHooks for ReplaceBeforeDestinationReopen {
+            fn clone_file(&self, _destination: RawFd, _source: RawFd) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+
+            fn before_destination_reopen(&self) -> io::Result<()> {
+                fs::remove_file(&self.path)?;
+                fs::write(&self.path, self.replacement)
+            }
+        }
+
+        impl CopyHooks for ReplaceBeforeRead {
+            fn clone_file(&self, _destination: RawFd, _source: RawFd) -> io::Result<()> {
+                panic!("clone must not be reached after source-name replacement")
+            }
+
+            fn after_source_handle_opened(&self) -> io::Result<()> {
+                fs::remove_file(&self.path)?;
+                fs::write(&self.path, b"replacement-before-read")
+            }
         }
 
         impl CopyHooks for ReplaceAfterCopy {
@@ -1142,36 +1325,70 @@ mod platform {
             }
         }
 
+        struct FailDestinationArm {
+            errno: i32,
+        }
+
+        impl CopyHooks for FailDestinationArm {
+            fn clone_file(&self, _destination: RawFd, _source: RawFd) -> io::Result<()> {
+                panic!("clone must not be reached after destination-arm failure")
+            }
+
+            fn destination_cleanup_identity(
+                &self,
+                _destination: BorrowedFd<'_>,
+            ) -> io::Result<CleanupIdentity> {
+                Err(io::Error::from_raw_os_error(self.errno))
+            }
+        }
+
+        struct InjectExtentDrift {
+            point: ExtentObservationPoint,
+        }
+
+        impl CopyHooks for InjectExtentDrift {
+            fn clone_file(&self, _destination: RawFd, _source: RawFd) -> io::Result<()> {
+                Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP))
+            }
+
+            fn after_extent_observed(
+                &self,
+                point: ExtentObservationPoint,
+                extents: &mut Vec<ExtentV1>,
+            ) -> io::Result<()> {
+                if point == self.point {
+                    if let Some(first) = extents.first_mut() {
+                        first.length = first.length.saturating_add(1);
+                    } else {
+                        extents.push(ExtentV1 {
+                            offset: 0,
+                            length: 1,
+                        });
+                    }
+                }
+                Ok(())
+            }
+        }
+
+        fn finish(copied: CopiedRegularV1) -> RegularCopyEvidenceV1 {
+            copied
+                .finalize_with(|_| Ok::<(), std::convert::Infallible>(()))
+                .unwrap()
+                .1
+        }
+
         fn run_forced_fallback(
             source_bytes: &[u8],
             errno: i32,
-        ) -> (TempDir, CopiedRegularV1, std::path::PathBuf) {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            fs::write(source_dir.join("input"), source_bytes).unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let source_name = c_name(std::ffi::OsStr::new("input"));
-            let destination_name = c_name(std::ffi::OsStr::new("output"));
+        ) -> (Fixture, RegularCopyEvidenceV1) {
+            let fixture = Fixture::with_input(source_bytes);
             let hooks = ForcedCloneError {
                 errno,
                 calls: Cell::new(0),
             };
-            let copied = copy_regular_at_with(
-                source_parent.as_fd(),
-                &source_name,
-                destination_parent.as_fd(),
-                &destination_name,
-                policy(),
-                &hooks,
-            )
-            .unwrap();
+            let copied = fixture.copy_input(policy(), &hooks).unwrap();
             assert_eq!(hooks.calls.get(), 1);
-            let destination = destination_dir.join("output");
-            (temp, copied, destination)
+            (fixture, finish(copied))
         }
 
         #[test]
@@ -1185,25 +1402,119 @@ mod platform {
         }
 
         #[test]
+        fn source_authority_uses_ordinary_reads_but_destination_keeps_noatime() {
+            assert_eq!(source_read_open_flags() & libc::O_NOATIME, 0);
+            assert_ne!(destination_open_flags() & libc::O_NOATIME, 0);
+            assert_ne!(source_read_open_flags() & libc::O_NOFOLLOW, 0);
+            assert_ne!(destination_open_flags() & libc::O_EXCL, 0);
+
+            let source_denied = map_source_read_open(
+                SnapshotRegularStageV1::OpenSourceRead,
+                io::Error::from_raw_os_error(libc::EPERM),
+            );
+            assert_eq!(
+                source_denied.code(),
+                RefusalCode::SnapshotRequiredObjectUnsupported
+            );
+            assert_eq!(source_denied.errno(), Some(libc::EPERM));
+
+            let missing_destination_statx = map_destination_error(
+                SnapshotRegularStageV1::CreateDestination,
+                io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            );
+            assert_eq!(
+                missing_destination_statx.code(),
+                RefusalCode::RequiredKernelCapabilityMissing
+            );
+            let sparse_copy_io = map_destination_error(
+                SnapshotRegularStageV1::SparseCopy,
+                io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            );
+            assert_eq!(
+                sparse_copy_io.code(),
+                RefusalCode::SnapshotConstructionFailed
+            );
+        }
+
+        #[test]
+        fn failure_between_o_excl_create_and_arm_removes_unverified_inode() {
+            let fixture = Fixture::with_input(b"content");
+            let error = fixture
+                .copy_input(policy(), &FailDestinationArm { errno: libc::EIO })
+                .unwrap_err();
+            assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
+            assert_eq!(error.stage(), SnapshotRegularStageV1::CreateDestination);
+            assert_eq!(error.errno(), Some(libc::EIO));
+            assert!(!fixture.destination("output").exists());
+        }
+
+        #[test]
+        fn injected_source_and_destination_extent_drift_are_exact_refusals() {
+            for (point, expected_stage) in [
+                (
+                    ExtentObservationPoint::SourceRecheck,
+                    SnapshotRegularStageV1::RevalidateSource,
+                ),
+                (
+                    ExtentObservationPoint::Destination,
+                    SnapshotRegularStageV1::EnumerateDestinationExtents,
+                ),
+            ] {
+                let fixture = Fixture::with_input(&[0x5a; 8192]);
+                let error = fixture
+                    .copy_input(policy(), &InjectExtentDrift { point })
+                    .unwrap_err();
+                assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
+                assert_eq!(error.stage(), expected_stage);
+                assert!(!fixture.destination("output").exists());
+            }
+        }
+
+        #[test]
         fn forced_fallback_copies_dense_destination_bytes_and_digest() {
             let bytes = b"descriptor selected copy";
-            let (_temp, copied, destination) = run_forced_fallback(bytes, libc::EOPNOTSUPP);
-            assert_eq!(copied.method(), RegularCopyMethodV1::SparseCopy);
-            assert_eq!(fs::read(destination).unwrap(), bytes);
+            let (fixture, evidence) = run_forced_fallback(bytes, libc::EOPNOTSUPP);
+            assert_eq!(fs::read(fixture.destination("output")).unwrap(), bytes);
             assert_eq!(
-                copied.content_digest(),
+                evidence.content_digest(),
                 FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[bytes])
             );
         }
 
         #[test]
+        fn finalize_is_scoped_and_returns_fd_free_owned_evidence() {
+            let (_fixture, copied) = {
+                let fixture = Fixture::with_input(b"finalize");
+                let hooks = ForcedCloneError {
+                    errno: libc::EOPNOTSUPP,
+                    calls: Cell::new(0),
+                };
+                let copied = fixture.copy_input(policy(), &hooks).unwrap();
+                (fixture, copied)
+            };
+            let raw = Cell::new(-1);
+            let (marker, evidence) = copied
+                .finalize_with(|fd| {
+                    raw.set(fd.as_raw_fd());
+                    assert!(unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+                    Ok::<_, std::convert::Infallible>(7u8)
+                })
+                .unwrap();
+            assert_eq!(marker, 7);
+            assert_eq!(unsafe { libc::fcntl(raw.get(), libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            let (digest, extents) = evidence.into_parts();
+            assert_eq!(
+                digest,
+                FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[b"finalize"])
+            );
+            assert!(!extents.is_empty());
+        }
+
+        #[test]
         fn forced_fallback_preserves_api_visible_sparse_extents() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let source_path = source_dir.join("sparse");
+            let fixture = Fixture::empty();
+            let source_path = fixture.source("sparse");
             let mut source = OpenOptions::new()
                 .create_new(true)
                 .read(true)
@@ -1217,40 +1528,24 @@ mod platform {
             source.write_all(b"second-data-range").unwrap();
             source.sync_all().unwrap();
 
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let source_name = CString::new("sparse").unwrap();
-            let destination_name = CString::new("copy").unwrap();
             let hooks = ForcedCloneError {
                 errno: libc::EOPNOTSUPP,
                 calls: Cell::new(0),
             };
-            let copied = copy_regular_at_with(
-                source_parent.as_fd(),
-                &source_name,
-                destination_parent.as_fd(),
-                &destination_name,
-                policy(),
-                &hooks,
-            )
-            .unwrap();
-            let destination = File::open(destination_dir.join("copy")).unwrap();
+            let evidence = finish(fixture.copy(c"sparse", c"copy", policy(), &hooks).unwrap());
+            let destination = File::open(fixture.destination("copy")).unwrap();
             let observed = enumerate_extents(destination.as_fd(), 512 * 1024, 4096).unwrap();
-            assert_eq!(observed, copied.data_extents());
+            assert_eq!(observed, evidence.data_extents());
             assert_eq!(
-                fs::metadata(destination_dir.join("copy")).unwrap().len(),
+                fs::metadata(fixture.destination("copy")).unwrap().len(),
                 512 * 1024
             );
         }
 
         #[test]
         fn written_zero_extent_remains_data_and_hashes_as_logical_bytes() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let source_path = source_dir.join("zeros");
+            let fixture = Fixture::empty();
+            let source_path = fixture.source("zeros");
             let mut source = OpenOptions::new()
                 .create_new(true)
                 .read(true)
@@ -1262,108 +1557,46 @@ mod platform {
             source.write_all(&[0; 4096]).unwrap();
             source.sync_all().unwrap();
 
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let copied = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("zeros").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("copy").unwrap(),
-                policy(),
-                &ForcedCloneError {
-                    errno: libc::EOPNOTSUPP,
-                    calls: Cell::new(0),
-                },
-            )
-            .unwrap();
-            assert!(!copied.data_extents().is_empty());
-            let bytes = fs::read(destination_dir.join("copy")).unwrap();
+            let evidence = finish(
+                fixture
+                    .copy(
+                        c"zeros",
+                        c"copy",
+                        policy(),
+                        &ForcedCloneError {
+                            errno: libc::EOPNOTSUPP,
+                            calls: Cell::new(0),
+                        },
+                    )
+                    .unwrap(),
+            );
+            assert!(!evidence.data_extents().is_empty());
+            let bytes = fs::read(fixture.destination("copy")).unwrap();
             assert_eq!(bytes, vec![0; 1024 * 1024]);
             assert_eq!(
-                copied.content_digest(),
+                evidence.content_digest(),
                 FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[&bytes])
             );
         }
 
         #[test]
-        fn source_atime_is_unchanged_by_fallback_reads() {
-            use std::fs::FileTimes;
-            use std::os::unix::fs::MetadataExt;
-            use std::time::{Duration, UNIX_EPOCH};
-
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let source_path = source_dir.join("input");
-            let source = OpenOptions::new()
-                .create_new(true)
-                .read(true)
-                .write(true)
-                .open(&source_path)
-                .unwrap();
-            source.set_len(256 * 1024).unwrap();
-            source
-                .set_times(
-                    FileTimes::new()
-                        .set_accessed(UNIX_EPOCH + Duration::from_secs(946_684_800))
-                        .set_modified(UNIX_EPOCH + Duration::from_secs(946_684_801)),
-                )
-                .unwrap();
-            let before = fs::metadata(&source_path).unwrap();
-            let before_atime = (before.atime(), before.atime_nsec());
-
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("copy").unwrap(),
-                policy(),
-                &ForcedCloneError {
-                    errno: libc::EOPNOTSUPP,
-                    calls: Cell::new(0),
-                },
-            )
-            .unwrap();
-            let after = fs::metadata(source_path).unwrap();
-            assert_eq!((after.atime(), after.atime_nsec()), before_atime);
-        }
-
-        #[test]
         fn empty_and_all_hole_files_keep_empty_extent_lists() {
-            let (_temp, empty, _destination) = run_forced_fallback(b"", libc::EINVAL);
+            let (_fixture, empty) = run_forced_fallback(b"", libc::EINVAL);
             assert!(empty.data_extents().is_empty());
 
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            File::create(source_dir.join("hole"))
+            let fixture = Fixture::empty();
+            File::create(fixture.source("hole"))
                 .unwrap()
                 .set_len(1024 * 1024)
                 .unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
             let hooks = ForcedCloneError {
                 errno: libc::EXDEV,
                 calls: Cell::new(0),
             };
-            let copied = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("hole").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("copy").unwrap(),
-                policy(),
-                &hooks,
-            )
-            .unwrap();
-            assert!(copied.data_extents().is_empty());
+            let evidence = finish(fixture.copy(c"hole", c"copy", policy(), &hooks).unwrap());
+            assert!(evidence.data_extents().is_empty());
             assert_eq!(
-                fs::metadata(destination_dir.join("copy")).unwrap().len(),
+                fs::metadata(fixture.destination("copy")).unwrap().len(),
                 1024 * 1024
             );
         }
@@ -1371,114 +1604,102 @@ mod platform {
         #[test]
         fn hard_clone_errors_never_fall_back_and_raii_removes_partial_destination() {
             for errno in [libc::EIO, libc::ENOSPC, libc::EPERM] {
-                let temp = TempDir::new().unwrap();
-                let source_dir = temp.path().join("source");
-                let destination_dir = temp.path().join("destination");
-                fs::create_dir(&source_dir).unwrap();
-                fs::create_dir(&destination_dir).unwrap();
-                fs::write(source_dir.join("input"), b"content").unwrap();
-                let source_parent = open_directory(&source_dir);
-                let destination_parent = open_directory(&destination_dir);
+                let fixture = Fixture::with_input(b"content");
                 let hooks = ForcedCloneError {
                     errno,
                     calls: Cell::new(0),
                 };
-                let error = copy_regular_at_with(
-                    source_parent.as_fd(),
-                    &CString::new("input").unwrap(),
-                    destination_parent.as_fd(),
-                    &CString::new("output").unwrap(),
-                    policy(),
-                    &hooks,
-                )
-                .unwrap_err();
+                let error = fixture.copy_input(policy(), &hooks).unwrap_err();
                 assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
                 assert_eq!(error.stage(), SnapshotRegularStageV1::Reflink);
                 assert_eq!(error.errno(), Some(errno));
                 assert_eq!(hooks.calls.get(), 1);
-                assert!(!destination_dir.join("output").exists());
+                assert!(!fixture.destination("output").exists());
             }
         }
 
         #[test]
+        fn source_name_replacement_between_path_and_read_open_is_detected() {
+            let fixture = Fixture::with_input(b"original");
+            let source_path = fixture.source("input");
+            let error = fixture
+                .copy_input(
+                    policy(),
+                    &ReplaceBeforeRead {
+                        path: source_path.clone(),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
+            assert_eq!(error.stage(), SnapshotRegularStageV1::OpenSourceRead);
+            assert_eq!(fs::read(source_path).unwrap(), b"replacement-before-read");
+            assert!(!fixture.destination("output").exists());
+        }
+
+        #[test]
         fn deterministic_post_copy_mutation_is_refused_and_cleaned() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let source_path = source_dir.join("input");
-            fs::write(&source_path, b"original").unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let error = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &MutateAfterCopy {
-                    source: source_path,
-                },
-            )
-            .unwrap_err();
+            use std::os::unix::fs::MetadataExt;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            let fixture = Fixture::with_input(b"original");
+            let source_path = fixture.source("input");
+            let original_mtime = UNIX_EPOCH + Duration::from_secs(946_684_801);
+            OpenOptions::new()
+                .write(true)
+                .open(&source_path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+                .unwrap();
+            let before = fs::metadata(&source_path).unwrap();
+            let before_mtime = (before.mtime(), before.mtime_nsec());
+            let error = fixture
+                .copy_input(
+                    policy(),
+                    &MutateAfterCopy {
+                        source: source_path.clone(),
+                        original_mtime,
+                    },
+                )
+                .unwrap_err();
             assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(error.stage(), SnapshotRegularStageV1::RevalidateSource);
-            assert!(!destination_dir.join("output").exists());
+            let after = fs::metadata(source_path).unwrap();
+            assert_eq!((after.mtime(), after.mtime_nsec()), before_mtime);
+            assert!(!fixture.destination("output").exists());
         }
 
         #[test]
         fn source_unlink_recreate_is_detected_and_partial_destination_is_cleaned() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let source_path = source_dir.join("input");
-            fs::write(&source_path, b"original").unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let error = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &ReplaceAfterCopy {
-                    path: source_path.clone(),
-                    replacement: b"replacement",
-                },
-            )
-            .unwrap_err();
+            let fixture = Fixture::with_input(b"original");
+            let source_path = fixture.source("input");
+            let error = fixture
+                .copy_input(
+                    policy(),
+                    &ReplaceAfterCopy {
+                        path: source_path.clone(),
+                        replacement: b"replacement",
+                    },
+                )
+                .unwrap_err();
             assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(error.stage(), SnapshotRegularStageV1::RevalidateSource);
             assert_eq!(fs::read(source_path).unwrap(), b"replacement");
-            assert!(!destination_dir.join("output").exists());
+            assert!(!fixture.destination("output").exists());
         }
 
         #[test]
         fn destination_unlink_recreate_is_detected_without_deleting_replacement() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            fs::write(source_dir.join("input"), b"original").unwrap();
-            let destination_path = destination_dir.join("output");
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let error = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &ReplaceAfterCopy {
-                    path: destination_path.clone(),
-                    replacement: b"replacement-must-survive",
-                },
-            )
-            .unwrap_err();
+            let fixture = Fixture::with_input(b"original");
+            let destination_path = fixture.destination("output");
+            let error = fixture
+                .copy_input(
+                    policy(),
+                    &ReplaceBeforeDestinationReopen {
+                        path: destination_path.clone(),
+                        replacement: b"replacement-must-survive",
+                    },
+                )
+                .unwrap_err();
             assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(error.stage(), SnapshotRegularStageV1::RevalidateDestination);
             assert_eq!(
@@ -1491,110 +1712,177 @@ mod platform {
         fn source_symlink_and_destination_collision_fail_closed() {
             use std::os::unix::fs::symlink;
 
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            fs::write(source_dir.join("target"), b"secret").unwrap();
-            symlink("target", source_dir.join("input")).unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let source_error = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &ForcedCloneError {
-                    errno: libc::EOPNOTSUPP,
-                    calls: Cell::new(0),
-                },
-            )
-            .unwrap_err();
+            let fixture = Fixture::empty();
+            fs::write(fixture.source("target"), b"secret").unwrap();
+            symlink("target", fixture.source("input")).unwrap();
+            let source_error = fixture
+                .copy_input(
+                    policy(),
+                    &ForcedCloneError {
+                        errno: libc::EOPNOTSUPP,
+                        calls: Cell::new(0),
+                    },
+                )
+                .unwrap_err();
             assert_eq!(
                 source_error.code(),
                 RefusalCode::SnapshotRequiredObjectUnsupported
             );
 
-            fs::remove_file(source_dir.join("input")).unwrap();
-            fs::write(source_dir.join("input"), b"ordinary").unwrap();
-            symlink("do-not-touch", destination_dir.join("output")).unwrap();
-            let destination_error = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &ForcedCloneError {
-                    errno: libc::EOPNOTSUPP,
-                    calls: Cell::new(0),
-                },
-            )
-            .unwrap_err();
+            fs::remove_file(fixture.source("input")).unwrap();
+            fs::write(fixture.source("input"), b"ordinary").unwrap();
+            symlink("do-not-touch", fixture.destination("output")).unwrap();
+            let destination_error = fixture
+                .copy_input(
+                    policy(),
+                    &ForcedCloneError {
+                        errno: libc::EOPNOTSUPP,
+                        calls: Cell::new(0),
+                    },
+                )
+                .unwrap_err();
             assert_eq!(
                 destination_error.code(),
                 RefusalCode::SnapshotConstructionFailed
             );
             assert_eq!(
-                fs::read_link(destination_dir.join("output")).unwrap(),
-                std::path::Path::new("do-not-touch")
+                fs::read_link(fixture.destination("output")).unwrap(),
+                Path::new("do-not-touch")
+            );
+
+            fs::remove_file(fixture.destination("output")).unwrap();
+            fs::write(fixture.destination("output"), b"preexisting").unwrap();
+            let regular_collision = fixture
+                .copy_input(
+                    policy(),
+                    &ForcedCloneError {
+                        errno: libc::EOPNOTSUPP,
+                        calls: Cell::new(0),
+                    },
+                )
+                .unwrap_err();
+            assert_eq!(
+                regular_collision.stage(),
+                SnapshotRegularStageV1::CreateDestination
+            );
+            assert_eq!(regular_collision.errno(), Some(libc::EEXIST));
+            assert_eq!(
+                fs::read(fixture.destination("output")).unwrap(),
+                b"preexisting"
             );
         }
 
         #[test]
-        fn raw_non_utf8_basename_is_supported() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            let raw = std::ffi::OsStr::from_bytes(b"in-\xff");
-            fs::write(source_dir.join(raw), b"raw-name").unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
-            let copied = copy_regular_at_with(
-                source_parent.as_fd(),
-                &c_name(raw),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &ForcedCloneError {
-                    errno: libc::ENOTTY,
-                    calls: Cell::new(0),
+        fn directories_fifos_and_unix_sockets_are_rejected_before_read_open() {
+            use std::os::unix::net::UnixListener;
+
+            let fixture = Fixture::empty();
+            fs::create_dir(fixture.source("directory")).unwrap();
+            let fifo_name = CString::new("fifo").unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::mkfifoat(fixture.source_parent.as_raw_fd(), fifo_name.as_ptr(), 0o600)
                 },
+                0
+            );
+            let _listener = UnixListener::bind(fixture.source("socket")).unwrap();
+
+            for name in ["directory", "fifo", "socket"] {
+                let error = fixture
+                    .copy(
+                        &CString::new(name).unwrap(),
+                        &CString::new(format!("copy-{name}")).unwrap(),
+                        policy(),
+                        &ForcedCloneError {
+                            errno: libc::EOPNOTSUPP,
+                            calls: Cell::new(0),
+                        },
+                    )
+                    .unwrap_err();
+                assert_eq!(error.code(), RefusalCode::SnapshotRequiredObjectUnsupported);
+                assert_eq!(error.stage(), SnapshotRegularStageV1::InspectSource);
+                assert!(!fixture.destination(format!("copy-{name}")).exists());
+            }
+        }
+
+        #[test]
+        fn max_extent_count_fails_before_clone_and_cleans_destination() {
+            let fixture = Fixture::empty();
+            let source_path = fixture.source("fragmented");
+            let mut source = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .open(&source_path)
+                .unwrap();
+            source.set_len(16 * 1024 * 1024).unwrap();
+            source.seek(SeekFrom::Start(0)).unwrap();
+            source.write_all(&[0x11; 4096]).unwrap();
+            source.seek(SeekFrom::Start(8 * 1024 * 1024)).unwrap();
+            source.write_all(&[0x22; 4096]).unwrap();
+            source.sync_all().unwrap();
+            let observed = enumerate_extents(source.as_fd(), 16 * 1024 * 1024, 4096).unwrap();
+            assert!(
+                observed.len() >= 2,
+                "hosted Linux qualification filesystem must expose the two sparse data ranges"
+            );
+
+            let one_extent = RegularCopyPolicyV1::checked(
+                NonZeroU64::new(16 * 1024 * 1024).unwrap(),
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU8::new(4).unwrap(),
             )
             .unwrap();
-            assert_eq!(copied.method(), RegularCopyMethodV1::SparseCopy);
+            let hooks = ForcedCloneError {
+                errno: libc::EOPNOTSUPP,
+                calls: Cell::new(0),
+            };
+            let error = fixture
+                .copy(c"fragmented", c"output", one_extent, &hooks)
+                .unwrap_err();
+            assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(
-                fs::read(destination_dir.join("output")).unwrap(),
+                error.stage(),
+                SnapshotRegularStageV1::EnumerateSourceExtents
+            );
+            assert_eq!(error.errno(), Some(libc::EFBIG));
+            assert_eq!(hooks.calls.get(), 0);
+            assert!(!fixture.destination("output").exists());
+        }
+
+        #[test]
+        fn raw_non_utf8_basename_is_supported() {
+            let fixture = Fixture::empty();
+            let raw = OsStr::from_bytes(b"in-\xff");
+            fs::write(fixture.source(raw), b"raw-name").unwrap();
+            let copied = fixture
+                .copy(
+                    &c_name(raw),
+                    c"output",
+                    policy(),
+                    &ForcedCloneError {
+                        errno: libc::ENOTTY,
+                        calls: Cell::new(0),
+                    },
+                )
+                .unwrap();
+            let _ = finish(copied);
+            assert_eq!(
+                fs::read(fixture.destination("output")).unwrap(),
                 b"raw-name"
             );
         }
 
         #[test]
         fn invalid_names_and_size_limit_have_exact_refusals() {
-            let temp = TempDir::new().unwrap();
-            let source_dir = temp.path().join("source");
-            let destination_dir = temp.path().join("destination");
-            fs::create_dir(&source_dir).unwrap();
-            fs::create_dir(&destination_dir).unwrap();
-            fs::write(source_dir.join("input"), b"too-large").unwrap();
-            let source_parent = open_directory(&source_dir);
-            let destination_parent = open_directory(&destination_dir);
+            let fixture = Fixture::with_input(b"too-large");
             let hooks = ForcedCloneError {
                 errno: libc::EOPNOTSUPP,
                 calls: Cell::new(0),
             };
-            let invalid_source = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("..").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                policy(),
-                &hooks,
-            )
-            .unwrap_err();
+            let invalid_source = fixture
+                .copy(c"..", c"output", policy(), &hooks)
+                .unwrap_err();
             assert_eq!(
                 invalid_source.code(),
                 RefusalCode::SnapshotRequiredObjectUnsupported
@@ -1604,37 +1892,24 @@ mod platform {
                 SnapshotRegularStageV1::ValidateSourceName
             );
 
-            let invalid_destination = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("bad/name").unwrap(),
-                policy(),
-                &hooks,
-            )
-            .unwrap_err();
+            let invalid_destination = fixture
+                .copy(c"input", c"bad/name", policy(), &hooks)
+                .unwrap_err();
             assert_eq!(
                 invalid_destination.code(),
                 RefusalCode::SnapshotConstructionFailed
             );
 
-            let tiny_policy = RegularCopyPolicyV1::new(
+            let tiny_policy = RegularCopyPolicyV1::checked(
                 NonZeroU64::new(1).unwrap(),
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU8::new(1).unwrap(),
-            );
-            let limit = copy_regular_at_with(
-                source_parent.as_fd(),
-                &CString::new("input").unwrap(),
-                destination_parent.as_fd(),
-                &CString::new("output").unwrap(),
-                tiny_policy,
-                &hooks,
             )
-            .unwrap_err();
+            .unwrap();
+            let limit = fixture.copy_input(tiny_policy, &hooks).unwrap_err();
             assert_eq!(limit.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(limit.stage(), SnapshotRegularStageV1::InspectSource);
-            assert!(!destination_dir.join("output").exists());
+            assert!(!fixture.destination("output").exists());
         }
     }
 }
@@ -1643,9 +1918,10 @@ mod platform {
 mod platform {
     use super::*;
 
-    pub(super) fn copy_regular_at(
+    pub(super) fn copy_regular_from_pinned_at(
         _source_parent: BorrowedFd<'_>,
         _source_name: &CStr,
+        _source_handle: BorrowedFd<'_>,
         _destination_parent: BorrowedFd<'_>,
         _destination_name: &CStr,
         _policy: RegularCopyPolicyV1,
@@ -1656,7 +1932,7 @@ mod platform {
         let code = RefusalCode::UnsupportedArchitecture;
         Err(SnapshotRegularFailureV1::new(
             code,
-            SnapshotRegularStageV1::OpenSourceHandle,
+            SnapshotRegularStageV1::OpenSourceRead,
             None,
         ))
     }
@@ -1678,18 +1954,57 @@ mod portable_tests {
 
     #[test]
     fn policy_accessors_preserve_committed_values() {
-        let policy = RegularCopyPolicyV1::new(
+        let policy = RegularCopyPolicyV1::checked(
             NonZeroU64::new(1024).unwrap(),
             NonZeroU32::new(32).unwrap(),
             NonZeroU8::new(4).unwrap(),
-        );
+        )
+        .unwrap();
         assert_eq!(policy.max_logical_bytes(), 1024);
         assert_eq!(policy.max_data_extents(), 32);
         assert_eq!(policy.openat2_attempts(), 4);
     }
 
     #[test]
-    fn temporary_streaming_digest_matches_frozen_parent_derivation() {
+    fn checked_policy_accepts_hard_ceilings_and_rejects_every_excess() {
+        let at_ceiling = RegularCopyPolicyV1::checked(
+            NonZeroU64::new(HARD_MAX_LOGICAL_BYTES).unwrap(),
+            NonZeroU32::new(HARD_MAX_DATA_EXTENTS).unwrap(),
+            NonZeroU8::new(HARD_MAX_OPENAT2_ATTEMPTS).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(at_ceiling.max_logical_bytes(), HARD_MAX_LOGICAL_BYTES);
+        assert_eq!(at_ceiling.max_data_extents(), HARD_MAX_DATA_EXTENTS);
+        assert_eq!(at_ceiling.openat2_attempts(), HARD_MAX_OPENAT2_ATTEMPTS);
+
+        assert!(
+            RegularCopyPolicyV1::checked(
+                NonZeroU64::new(HARD_MAX_LOGICAL_BYTES + 1).unwrap(),
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
+            )
+            .is_none()
+        );
+        assert!(
+            RegularCopyPolicyV1::checked(
+                NonZeroU64::new(1).unwrap(),
+                NonZeroU32::new(HARD_MAX_DATA_EXTENTS + 1).unwrap(),
+                NonZeroU8::new(1).unwrap(),
+            )
+            .is_none()
+        );
+        assert!(
+            RegularCopyPolicyV1::checked(
+                NonZeroU64::new(1).unwrap(),
+                NonZeroU32::new(1).unwrap(),
+                NonZeroU8::new(HARD_MAX_OPENAT2_ATTEMPTS + 1).unwrap(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn streaming_digest_matches_frozen_parent_derivation_and_length() {
         let fixtures = [
             Vec::new(),
             vec![0x5a; 64 * 1024],
@@ -1701,14 +2016,23 @@ mod portable_tests {
                 .collect::<Vec<_>>(),
         ];
         for bytes in fixtures {
-            let mut streaming = new_file_content_hasher(bytes.len() as u64);
+            let mut streaming = FileContentHasherV1::new(bytes.len() as u64);
             for chunk in bytes.chunks(8191) {
-                streaming.update(chunk);
+                assert!(streaming.update(chunk));
             }
             assert_eq!(
-                finish_file_content_hasher(streaming),
+                streaming.finish().unwrap(),
                 FileContentDigest::derive(super::super::FILE_CONTENT_DOMAIN, &[&bytes])
             );
         }
+
+        let mut short = FileContentHasherV1::new(2);
+        assert!(short.update(b"x"));
+        assert!(short.finish().is_none());
+
+        let mut long = FileContentHasherV1::new(1);
+        assert!(!long.update(b"xx"));
+        assert!(!long.update(b"x"));
+        assert!(long.finish().is_none());
     }
 }

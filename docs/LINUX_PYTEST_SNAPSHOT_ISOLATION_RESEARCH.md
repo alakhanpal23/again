@@ -85,8 +85,14 @@ For every directory:
    `RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_XDEV`.
 3. Call `statx(fd, "", AT_EMPTY_PATH|AT_SYMLINK_NOFOLLOW, ...)` and record
    mount ID, device, inode, type, metadata, and identity.
-4. Open a verified `O_RDONLY|O_NOFOLLOW|O_NOATIME` read FD for a regular file,
-   or `O_RDONLY|O_DIRECTORY|O_NOATIME` for a directory.
+4. Within the still-live, functionally qualified no-atime source view, open an
+   `O_RDONLY|O_NOFOLLOW` read FD for a regular file or an
+   `O_RDONLY|O_DIRECTORY` FD for a directory. Do not add source `O_NOATIME`:
+   [`open(2)`](https://man7.org/linux/man-pages/man2/open.2.html) requires file
+   ownership or `CAP_FOWNER`, even on a no-atime mount, so that flag would
+   incorrectly refuse qualified root-owned runtime files. The raw regular-copy
+   boundary is unsafe; its caller must prove all source FDs came from the same
+   still-live qualified view. Destination regular-file FDs keep `O_NOATIME`.
 5. Create the destination only relative to a trusted destination-parent FD:
    regular files use `O_CREAT|O_EXCL|O_NOFOLLOW|O_NOATIME`; directories use `mkdirat`
    followed by reopen/verification; symlinks use `symlinkat` followed by an
@@ -145,15 +151,46 @@ primary definitions are the [x86_64 syscall table](https://github.com/torvalds/l
 [`struct xattr_args`](https://github.com/torvalds/linux/blob/v6.17/include/uapi/linux/xattr.h#L23-L27),
 and the [kernel implementation](https://github.com/torvalds/linux/blob/v6.17/fs/xattr.c#L863-L865).
 
-Materialization order is:
+Materialization order for each node is:
 
-1. content and links;
-2. representable ownership and mode;
-3. xattrs after chmod, because chmod may rewrite an ACL mask;
-4. atime and mtime; and
-5. directory metadata bottom-up.
+1. content and links under private builder modes (`0600` regular files and
+   `0700` directories), physically owned by the current effective UID;
+2. exact visible-xattr replay while those builder modes still permit access;
+3. one final chmod to the physical sealed-mode projection from ordinary rwx
+   bits only: strip `0o7000` and every write bit, add owner-read, add
+   owner-execute for directories, and add owner-execute for a regular file if
+   and only if any logical execute-class bit was set;
+4. apply atime and mtime;
+5. reverify the final mode, timestamps, and exact xattr set, refusing ACL/xattr
+   combinations whose value changes under the final chmod; and
+6. fsync the verified inode. Directories perform steps 2 through 6 only after
+   their descendants and therefore finalize bottom-up.
 
-Then require exact destination xattr agreement.
+Full logical source mode, special bits, uid, and gid remain in the manifest.
+Physical uid and gid are creation-context metadata behind the private
+container and are excluded from the logical projection. Directory `st_size`
+is not an exact destination projection and is never compared as one.
+
+Before the first destination-tree mutation, the materializer must read a
+nonforgeable, allocation-free cleanup envelope from the actual staged
+publisher. Its cleanup depth, entry count, basename limit, `openat2` attempts,
+and generic syscall attempts must each dominate the source-derived
+materialization policy. An independently configured or smaller cleanup guard
+is a typed pre-population refusal. Dropping the staged publisher then delegates
+bounded, best-effort cleanup; failure never grants readiness or publication
+authority.
+
+A regular file or directory can be made durable through its selected
+descriptor. Linux does not provide the equivalent generic inode-`fsync`
+boundary for a symlink after replaying its xattrs and timestamps. Therefore a
+materializer without a nonforgeable authority for a functionally qualified,
+dedicated staging filesystem refuses the symlink before `symlinkat`. With that
+authority, it must finish all regular-file and bottom-up directory syncs, run
+one bounded-`EINTR` `syncfs` on the dedicated filesystem, permit no later tree
+mutation, and let the publisher revalidate and sync the staging root. Never
+apply this fallback to an arbitrary shared filesystem: `syncfs` flushes the
+whole filesystem and couples correctness, latency, and error reporting to
+unrelated writers.
 
 Read symlink targets with `readlinkat(symlink_fd, "", ...)`, using a growing
 buffer and a second read. Identify hardlinks by `(mount-id, device, inode)`,
@@ -173,9 +210,15 @@ Construct all four views:
 - second complete destination manifest.
 
 Require the source passes to agree, the destination passes to agree, and each
-destination representation to match its logical source projection. Then fsync
-files and directories, change the tree to read-only modes, atomically publish
-with `renameat2(..., RENAME_NOREPLACE)`, and fsync the state parent directory.
+destination representation to match its logical source projection. The final
+physical sealed-mode projection and its post-chmod xattr verification are
+already part of both destination views; no chmod or other metadata mutation is
+permitted after the second destination view. Fsync files and directories before
+those verified views (or prove that a final fsync cannot change any compared
+semantic field), atomically publish with
+`renameat2(..., RENAME_NOREPLACE)`, and fsync the state parent directory. The
+logical source mode remains in the manifest and is restored only on the private
+execution branch.
 
 The per-run branch uses the same verified reflink/sparse-copy algorithm from
 sealed input. Branch writes must not change either sealed input or the host
@@ -362,6 +405,7 @@ use a refusal rather than inventing an execute-only foreground.
 | Xattrs | Empty/large values, unordered list, ACL, symlink attrs, list/value mutation, set failure, inherited attrs |
 | Hardlinks | Regular and symlink groups, cross-directory, outside-tree link, unlink/relink, directory-link rejection |
 | Metadata/host | Mode, logical IDs, timestamps, xattrs, links; host manifest identical after success, signal, crash, timeout, and ENOSPC |
+| No-atime authority | Qualified view with current-UID workspace plus root-owned runtime objects; ordinary regular/directory reads succeed and the host manifest, including atime, remains identical. Run on the provisioned qualifying runner, not stock CI. |
 | Namespace/root | Six fresh IDs and ownership, exact maps, fixed UTS, empty IPC/net, private mounts, bounded tmpfs, no old root |
 | FD boundary | Low/high FDs, socket, secret marker, `CLONE_FILES`; exactly 0/1/2 at the tagged stop |
 | Landlock | Runtime read, runtime/venv write denial, branch/scratch write, host denial, truncate/refer, TCP/ioctl/scope; ABI-7 audit controls |
@@ -378,10 +422,12 @@ sleeps.
    digest, extents, visible xattrs, and representable metadata; copied physical
    creation/change timestamps are not compared for equality.
 2. **Host atime:** snapshot acquisition must prove zero host-metadata mutation.
-   Regular-file and directory reads use `O_NOATIME`; symlink/directory capture
-   additionally requires a qualified no-atime acquisition view. A tuple that
-   cannot prove this property is refused rather than accepted with an atime
-   side effect.
+   A qualified no-atime acquisition view authorizes ordinary regular-file and
+   directory reads plus symlink/xattr capture. Source `O_NOATIME` is deliberately
+   absent because its ownership/`CAP_FOWNER` gate rejects otherwise qualified
+   root-owned runtime objects. Destination regular-file FDs retain the flag. A
+   tuple that cannot prove this property is refused rather than accepted with
+   an atime side effect.
 3. **Sparse semantics:** `data_extents` is the normalized, ordered
    `SEEK_DATA`/`SEEK_HOLE` sequence clipped to logical size. Linux may legally
    report an actually sparse file as entirely data; source and destination

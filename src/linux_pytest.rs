@@ -64,7 +64,11 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 
 mod canonical;
 mod identity;
+mod snapshot_materialize;
+mod snapshot_policy;
+mod snapshot_publish;
 mod snapshot_regular;
+mod snapshot_tree;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Blake3Digest([u8; 32]);
@@ -288,6 +292,51 @@ typed_digest!(HardlinkGroupDigest);
 typed_digest!(ObservationClosureDigest);
 typed_digest!(FileContentDigest);
 typed_digest!(ExecutableChainDigest);
+
+/// Domain-fixed streaming form of `FileContentDigest::derive(..., &[bytes])`.
+///
+/// The declared logical length is framed before any bytes are accepted.  A
+/// caller cannot finalize a prefix or append beyond that commitment.
+pub(super) struct FileContentHasherV1 {
+    hasher: Hasher,
+    remaining: Option<u64>,
+}
+
+impl FileContentHasherV1 {
+    pub(super) fn new(logical_size: u64) -> Self {
+        let mut hasher = Hasher::new_derive_key(FILE_CONTENT_DOMAIN);
+        hasher.update(HASH_FRAME_MAGIC);
+        hasher.update(&1u32.to_be_bytes());
+        hasher.update(&1u16.to_be_bytes());
+        hasher.update(&logical_size.to_be_bytes());
+        Self {
+            hasher,
+            remaining: Some(logical_size),
+        }
+    }
+
+    #[must_use = "a rejected update permanently poisons the digest"]
+    pub(super) fn update(&mut self, bytes: &[u8]) -> bool {
+        let Ok(length) = u64::try_from(bytes.len()) else {
+            self.remaining = None;
+            return false;
+        };
+        let Some(remaining) = self.remaining else {
+            return false;
+        };
+        if length > remaining {
+            self.remaining = None;
+            return false;
+        }
+        self.hasher.update(bytes);
+        self.remaining = Some(remaining - length);
+        true
+    }
+
+    pub(super) fn finish(self) -> Option<FileContentDigest> {
+        (self.remaining == Some(0)).then(|| FileContentDigest(*self.hasher.finalize().as_bytes()))
+    }
+}
 
 macro_rules! typed_id {
     ($name:ident) => {
