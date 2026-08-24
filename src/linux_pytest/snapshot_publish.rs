@@ -28,11 +28,14 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::{BorrowedFd, OwnedFd};
 
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
+use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::{
     SnapshotChargedBytesV1, SnapshotFinalizationAttemptReservationV1,
-    SnapshotPipelineResourceErrorV1,
+    SnapshotPublishedChildBindReservationV1,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::{SOURCE_TREE_REQUESTED_STATX_MASK_V1, SourceStatxV1};
 
 const STAGING_NAME_PREFIX: &[u8] = b".again-snapshot-stage-";
 const STAGING_NONCE_HEX_BYTES: usize = 32;
@@ -219,6 +222,13 @@ impl SnapshotPublishPolicyV1 {
         self.finalization_operation_attempt_bound
     }
 
+    /// Exact post-publication child-binding escrow: at most `O` constrained
+    /// `openat2` attempts followed by exactly one descriptor-based `statx`.
+    pub(super) fn published_child_bind_operation_attempt_bound(self) -> NonZeroU64 {
+        NonZeroU64::new(u64::from(self.openat2_attempts.get()) + 1)
+            .expect("a nonzero u8 retry count plus one is nonzero")
+    }
+
     /// Descriptor retained while the caller builds and seals the stage.
     pub(super) const fn max_live_staged_fds(self) -> u32 {
         MAX_LIVE_STAGED_FDS
@@ -274,6 +284,10 @@ pub(super) enum SnapshotPublishStageV1 {
     SyncParent,
     ReopenPublished,
     BindPublishedIdentity,
+    ValidatePublishedChildName,
+    OpenPublishedChild,
+    StatPublishedChild,
+    BindPublishedChildIdentity,
 }
 
 impl SnapshotPublishStageV1 {
@@ -311,6 +325,7 @@ pub(super) enum SnapshotPublishErrorKindV1 {
     RequiredKernelCapabilityMissing,
     RecursiveDurabilityFailed,
     IdentityMismatch,
+    InvalidPublishedChildName,
     Io,
 }
 
@@ -373,6 +388,67 @@ impl fmt::Display for SnapshotPublishErrorV1 {
 impl std::error::Error for SnapshotPublishErrorV1 {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotPublishedChildBindFailureV1 {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(SnapshotPublishErrorV1),
+}
+
+/// A post-publication failure that can never imply that the final name is
+/// unpublished or safe to remove. Private construction keeps the durable
+/// state invariant structural while preserving the underlying resource or
+/// leaf evidence for the connector.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SnapshotPublishedChildBindErrorV1 {
+    failure: SnapshotPublishedChildBindFailureV1,
+}
+
+impl SnapshotPublishedChildBindErrorV1 {
+    fn resource(error: SnapshotPipelineResourceErrorV1) -> Self {
+        Self {
+            failure: SnapshotPublishedChildBindFailureV1::Resource(error),
+        }
+    }
+
+    fn leaf(
+        kind: SnapshotPublishErrorKindV1,
+        stage: SnapshotPublishStageV1,
+        errno: Option<i32>,
+    ) -> Self {
+        Self {
+            failure: SnapshotPublishedChildBindFailureV1::Leaf(SnapshotPublishErrorV1::new(
+                kind,
+                stage,
+                SnapshotPublicationStateV1::PublishedDurable,
+                errno,
+            )),
+        }
+    }
+
+    pub(super) const fn failure(self) -> SnapshotPublishedChildBindFailureV1 {
+        self.failure
+    }
+
+    pub(super) const fn publication_state(self) -> SnapshotPublicationStateV1 {
+        SnapshotPublicationStateV1::PublishedDurable
+    }
+}
+
+impl fmt::Display for SnapshotPublishedChildBindErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.failure {
+            SnapshotPublishedChildBindFailureV1::Resource(error) => write!(
+                formatter,
+                "published snapshot child binding resource failure {error:?} ({:?})",
+                SnapshotPublicationStateV1::PublishedDurable
+            ),
+            SnapshotPublishedChildBindFailureV1::Leaf(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotPublishedChildBindErrorV1 {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SnapshotDirectoryIdentityV1 {
     mount_id: u64,
     device_major: u32,
@@ -427,6 +503,9 @@ pub(super) type ChargedStagedSnapshotDirectoryV1<'resources> =
 pub(super) type VerifiedReadySnapshotDirectoryV1<'parent> =
     platform::VerifiedReadySnapshotDirectoryV1<'parent>;
 pub(super) type PublishedSnapshotDirectoryV1 = platform::PublishedSnapshotDirectoryV1;
+/// Point-in-time physical descriptor binding only. It neither makes the path
+/// or descendants immutable nor grants isolation, execution, or reuse.
+pub(super) type BoundPublishedSnapshotChildV1 = platform::BoundPublishedSnapshotChildV1;
 
 pub(super) fn create_charged_staged_snapshot_directory_at<'scope>(
     parent: BorrowedFd<'scope>,
@@ -471,6 +550,9 @@ mod platform {
             std::cell::Cell::new(0)
         };
         static FINALIZATION_ATTEMPT_CHARGES: std::cell::Cell<u64> = const {
+            std::cell::Cell::new(0)
+        };
+        static PUBLISHED_CHILD_STATX_CALLS: std::cell::Cell<u64> = const {
             std::cell::Cell::new(0)
         };
     }
@@ -546,6 +628,15 @@ mod platform {
                 FINALIZATION_ATTEMPT_CHARGES.with(|calls| calls.set(calls.get() + 1));
                 attempt()
             })
+        }
+    }
+
+    impl PublisherAttemptGateV1 for SnapshotPublishedChildBindReservationV1<'_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            SnapshotPublishedChildBindReservationV1::run_attempt(self, attempt)
         }
     }
 
@@ -836,6 +927,16 @@ mod platform {
     pub(in crate::linux_pytest) struct PublishedSnapshotDirectoryV1 {
         directory: OwnedFd,
         identity: SnapshotDirectoryIdentityV1,
+        openat2_attempts: u8,
+    }
+
+    /// A durable published container together with the child inode selected
+    /// beneath it at bind time. Neither descriptor is detachable or clonable.
+    /// The pair does not stop same-UID mutation after binding and grants no
+    /// execution authority.
+    pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
+        published: PublishedSnapshotDirectoryV1,
+        root: OwnedFd,
     }
 
     impl fmt::Debug for VerifiedReadySnapshotDirectoryV1<'_> {
@@ -845,6 +946,16 @@ mod platform {
                 .field("staging_name", &"<private-basename>")
                 .field("identity", &self.cleanup.expected_identity)
                 .field("directory_capability", &"<owned-fd>")
+                .finish()
+        }
+    }
+
+    impl fmt::Debug for BoundPublishedSnapshotChildV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("BoundPublishedSnapshotChildV1")
+                .field("published_directory", &"<owned-fd>")
+                .field("root_directory", &"<owned-fd>")
                 .finish()
         }
     }
@@ -910,6 +1021,79 @@ mod platform {
         pub(super) const fn identity(&self) -> SnapshotDirectoryIdentityV1 {
             self.identity
         }
+    }
+
+    impl BoundPublishedSnapshotChildV1 {
+        pub(super) fn published_directory(&self) -> BorrowedFd<'_> {
+            self.published.directory()
+        }
+
+        pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
+            self.root.as_fd()
+        }
+    }
+
+    pub(super) fn bind_published_snapshot_child_at(
+        published: PublishedSnapshotDirectoryV1,
+        child_name: &CStr,
+        expected_statx_commitment: [u8; 102],
+        reservation: SnapshotPublishedChildBindReservationV1<'_>,
+    ) -> Result<BoundPublishedSnapshotChildV1, SnapshotPublishedChildBindErrorV1> {
+        if !valid_raw_basename(child_name) {
+            return Err(SnapshotPublishedChildBindErrorV1::leaf(
+                SnapshotPublishErrorKindV1::InvalidPublishedChildName,
+                SnapshotPublishStageV1::ValidatePublishedChildName,
+                None,
+            ));
+        }
+
+        let root = open_path_at_with_gate(
+            published.directory(),
+            child_name,
+            published.openat2_attempts,
+            &reservation,
+        )
+        .map_err(|error| {
+            published_child_bind_failure(
+                error,
+                SnapshotPublishStageV1::OpenPublishedChild,
+                |error| {
+                    if missing_kernel_capability(error) {
+                        SnapshotPublishErrorKindV1::RequiredKernelCapabilityMissing
+                    } else {
+                        SnapshotPublishErrorKindV1::Io
+                    }
+                },
+            )
+        })?;
+
+        let observed =
+            published_child_statx_with_gate(root.as_fd(), &reservation).map_err(|error| {
+                published_child_bind_failure(
+                    error,
+                    SnapshotPublishStageV1::StatPublishedChild,
+                    |error| {
+                        if missing_kernel_capability(error) {
+                            SnapshotPublishErrorKindV1::RequiredKernelCapabilityMissing
+                        } else if error.raw_os_error() == Some(libc::ESTALE)
+                            || error.kind() == io::ErrorKind::InvalidData
+                        {
+                            SnapshotPublishErrorKindV1::IdentityMismatch
+                        } else {
+                            SnapshotPublishErrorKindV1::Io
+                        }
+                    },
+                )
+            })?;
+        if observed.commitment_bytes_v1() != expected_statx_commitment {
+            return Err(SnapshotPublishedChildBindErrorV1::leaf(
+                SnapshotPublishErrorKindV1::IdentityMismatch,
+                SnapshotPublishStageV1::BindPublishedChildIdentity,
+                None,
+            ));
+        }
+
+        Ok(BoundPublishedSnapshotChildV1 { published, root })
     }
 
     impl<'parent> StagedSnapshotDirectoryV1<'parent> {
@@ -1064,6 +1248,7 @@ mod platform {
             Ok(PublishedSnapshotDirectoryV1 {
                 directory: reopened,
                 identity: reopened_identity,
+                openat2_attempts: cleanup.policy().openat2_attempts(),
             })
         }
     }
@@ -1247,6 +1432,7 @@ mod platform {
         Ok(PublishedSnapshotDirectoryV1 {
             directory: reopened,
             identity: reopened_identity,
+            openat2_attempts: cleanup.policy().openat2_attempts(),
         })
     }
 
@@ -2011,6 +2197,39 @@ mod platform {
         })
     }
 
+    fn published_child_statx_with_gate<G: PublisherAttemptGateV1>(
+        child: BorrowedFd<'_>,
+        gate: &G,
+    ) -> Result<SourceStatxV1, SnapshotChargedErrorV1<io::Error>> {
+        let mut raw = MaybeUninit::<libc::statx>::zeroed();
+        let result = gate
+            .run_attempt(|| unsafe {
+                #[cfg(test)]
+                PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.set(calls.get() + 1));
+                libc::syscall(
+                    libc::SYS_statx,
+                    child.as_raw_fd(),
+                    c"".as_ptr(),
+                    AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                    SOURCE_TREE_REQUESTED_STATX_MASK_V1,
+                    raw.as_mut_ptr(),
+                )
+            })
+            .map_err(SnapshotChargedErrorV1::Resource)?;
+        if result != 0 {
+            return Err(SnapshotChargedErrorV1::Leaf(io::Error::last_os_error()));
+        }
+        let raw = unsafe { raw.assume_init() };
+        let observed =
+            SourceStatxV1::from_linux_statx_v1(&raw).map_err(SnapshotChargedErrorV1::Leaf)?;
+        if u32::from(raw.stx_mode) & libc::S_IFMT != libc::S_IFDIR {
+            return Err(SnapshotChargedErrorV1::Leaf(io::Error::from_raw_os_error(
+                libc::ESTALE,
+            )));
+        }
+        Ok(observed)
+    }
+
     fn directory_identity_charged(
         authority: &PublisherAuthorityV1<'_>,
         bucket: PublisherAttemptBucketV1,
@@ -2707,6 +2926,35 @@ mod platform {
         }
     }
 
+    fn published_child_bind_failure(
+        error: SnapshotChargedErrorV1<io::Error>,
+        stage: SnapshotPublishStageV1,
+        leaf_kind: impl FnOnce(&io::Error) -> SnapshotPublishErrorKindV1,
+    ) -> SnapshotPublishedChildBindErrorV1 {
+        match map_charged_io_with(
+            error,
+            stage,
+            SnapshotPublicationStateV1::PublishedDurable,
+            leaf_kind,
+        ) {
+            SnapshotChargedErrorV1::Resource(error) => {
+                SnapshotPublishedChildBindErrorV1::resource(error)
+            }
+            SnapshotChargedErrorV1::Leaf(error) => {
+                debug_assert_eq!(
+                    error.publication_state(),
+                    SnapshotPublicationStateV1::PublishedDurable
+                );
+                SnapshotPublishedChildBindErrorV1 {
+                    failure: SnapshotPublishedChildBindFailureV1::Leaf(error),
+                }
+            }
+            SnapshotChargedErrorV1::PublicationAlreadyStarted => {
+                unreachable!("a published-child bind reservation has no one-shot connector state")
+            }
+        }
+    }
+
     fn map_charged_identity_io(
         error: SnapshotChargedErrorV1<io::Error>,
         stage: SnapshotPublishStageV1,
@@ -2796,7 +3044,7 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use std::ffi::{CString, OsStr};
-        use std::fs::{self, File, OpenOptions};
+        use std::fs::{self, File, FileTimes, OpenOptions};
         use std::os::fd::AsFd;
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};
@@ -2815,6 +3063,7 @@ mod platform {
 
         const STAGING: &CStr = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
         const FINAL: &CStr = c"snapshot-final";
+        const ROOT: &CStr = c"root";
         const CLEANUP_STRESS_NAME_COUNT: usize = 65;
         const CREATE_TRANSITION_COUNT: usize = 4;
         const READY_TRANSITION_COUNT: usize = 3;
@@ -2844,6 +3093,19 @@ mod platform {
             transient_heap_bytes: u64,
             entries: u32,
         ) -> SnapshotConnectorV1 {
+            connect_snapshot_pipeline(charged_resources_with_entries(
+                operation_attempts,
+                transient_heap_bytes,
+                entries,
+            ))
+            .unwrap()
+        }
+
+        fn charged_resources_with_entries(
+            operation_attempts: u64,
+            transient_heap_bytes: u64,
+            entries: u32,
+        ) -> SnapshotPipelineResourcesV1 {
             let resource_policy = SnapshotResourcePolicyV1::checked(
                 2,
                 NonZeroU32::new(entries).unwrap(),
@@ -2869,10 +3131,7 @@ mod platform {
                 NonZeroU8::new(2).unwrap(),
             )
             .unwrap();
-            let resources =
-                SnapshotPipelineResourcesV1::preflight(resource_policy, 0, u64::MAX, u64::MAX)
-                    .unwrap();
-            connect_snapshot_pipeline(resources).unwrap()
+            SnapshotPipelineResourcesV1::preflight(resource_policy, 0, u64::MAX, u64::MAX).unwrap()
         }
 
         fn charged_leaf_errno(error: SnapshotChargedErrorV1<io::Error>) -> Option<i32> {
@@ -3128,6 +3387,12 @@ mod platform {
             parent: File,
         }
 
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                make_fixture_tree_removable(self.temp.path());
+            }
+        }
+
         impl Fixture {
             fn new() -> Self {
                 let temp = TempDir::new().unwrap();
@@ -3150,6 +3415,73 @@ mod platform {
 
             fn stage(&self) -> StagedSnapshotDirectoryV1<'_> {
                 create_staged_snapshot_directory_at(self.parent.as_fd(), STAGING, policy()).unwrap()
+            }
+
+            fn publish_empty(&self) -> PublishedSnapshotDirectoryV1 {
+                self.stage()
+                    .verify_ready_with(|_| Ok(()))
+                    .unwrap()
+                    .publish_at(FINAL)
+                    .unwrap()
+            }
+
+            fn publish_root(&self) -> PublishedSnapshotDirectoryV1 {
+                let staged = self.stage();
+                fs::create_dir(self.staging_path().join(OsStr::from_bytes(ROOT.to_bytes())))
+                    .unwrap();
+                staged
+                    .verify_ready_with(|_| Ok(()))
+                    .unwrap()
+                    .publish_at(FINAL)
+                    .unwrap()
+            }
+        }
+
+        fn make_fixture_tree_removable(path: &Path) {
+            let Ok(metadata) = fs::symlink_metadata(path) else {
+                return;
+            };
+            if !metadata.file_type().is_dir() {
+                return;
+            }
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            let Ok(entries) = fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                make_fixture_tree_removable(&entry.path());
+            }
+        }
+
+        fn published_child_commitment(
+            published: &PublishedSnapshotDirectoryV1,
+            child_name: &CStr,
+        ) -> [u8; 102] {
+            let child = unmetered_leaf(open_path_at_with_gate(
+                published.directory(),
+                child_name,
+                published.openat2_attempts,
+                &UnmeteredPublisherAttemptGateV1,
+            ))
+            .unwrap();
+            unmetered_leaf(published_child_statx_with_gate(
+                child.as_fd(),
+                &UnmeteredPublisherAttemptGateV1,
+            ))
+            .unwrap()
+            .commitment_bytes_v1()
+        }
+
+        fn bind_leaf(error: SnapshotPublishedChildBindErrorV1) -> SnapshotPublishErrorV1 {
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::PublishedDurable
+            );
+            match error.failure() {
+                SnapshotPublishedChildBindFailureV1::Leaf(error) => error,
+                SnapshotPublishedChildBindFailureV1::Resource(error) => {
+                    panic!("expected leaf failure, got {error:?}")
+                }
             }
         }
 
@@ -3887,6 +4219,271 @@ mod platform {
         }
 
         #[test]
+        fn published_child_binding_pins_the_exact_directory_and_refunds_unused_escrow() {
+            let fixture = Fixture::new();
+            let published = fixture.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let before = resources.forward_attempts_remaining_for_test();
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            assert_eq!(
+                resources.forward_attempts_remaining_for_test(),
+                before - u64::from(policy().openat2_attempts()) - 1
+            );
+
+            let bound =
+                bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap();
+
+            // The first constrained open and the one statx are the only raw
+            // attempts on the successful path; the unused open retry suffix
+            // has already returned to the shared ledger.
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 2);
+            assert_eq!(
+                fstat_raw(bound.root_directory()).unwrap().st_mode & libc::S_IFMT,
+                libc::S_IFDIR
+            );
+            assert_eq!(
+                fstat_raw(bound.published_directory()).unwrap().st_mode & libc::S_IFMT,
+                libc::S_IFDIR
+            );
+            assert_eq!(
+                format!("{bound:?}"),
+                "BoundPublishedSnapshotChildV1 { published_directory: \"<owned-fd>\", root_directory: \"<owned-fd>\" }"
+            );
+            drop(bound);
+            assert!(fixture.final_path().join("root").is_dir());
+        }
+
+        #[test]
+        fn invalid_and_missing_published_child_names_fail_with_durable_state() {
+            let invalid = Fixture::new();
+            let published = invalid.publish_root();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let before = resources.forward_attempts_remaining_for_test();
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            let error = bind_leaf(
+                bind_published_snapshot_child_at(published, c"nested/root", [0; 102], reservation)
+                    .unwrap_err(),
+            );
+            assert_eq!(
+                error.kind(),
+                SnapshotPublishErrorKindV1::InvalidPublishedChildName
+            );
+            assert_eq!(
+                error.stage(),
+                SnapshotPublishStageV1::ValidatePublishedChildName
+            );
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before);
+            assert!(invalid.final_path().join("root").is_dir());
+
+            let missing = Fixture::new();
+            let published = missing.publish_empty();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let before = resources.forward_attempts_remaining_for_test();
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            let error = bind_leaf(
+                bind_published_snapshot_child_at(published, ROOT, [0; 102], reservation)
+                    .unwrap_err(),
+            );
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::Io);
+            assert_eq!(error.stage(), SnapshotPublishStageV1::OpenPublishedChild);
+            assert_eq!(error.errno(), Some(libc::ENOENT));
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 1);
+            assert!(missing.final_path().is_dir());
+        }
+
+        #[test]
+        fn published_child_symlink_is_never_admitted_as_the_root_directory() {
+            let fixture = Fixture::new();
+            let staged = fixture.stage();
+            fs::create_dir(fixture.staging_path().join("target")).unwrap();
+            symlink("target", fixture.staging_path().join("root")).unwrap();
+            let published = staged
+                .verify_ready_with(|_| Ok(()))
+                .unwrap()
+                .publish_at(FINAL)
+                .unwrap();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+
+            let error = bind_leaf(
+                bind_published_snapshot_child_at(published, ROOT, [0; 102], reservation)
+                    .unwrap_err(),
+            );
+
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::IdentityMismatch);
+            assert_eq!(error.stage(), SnapshotPublishStageV1::StatPublishedChild);
+            assert!(fixture.final_path().join("root").is_symlink());
+        }
+
+        #[test]
+        fn replacement_and_metadata_mutation_cannot_match_the_stable_commitment() {
+            let replacement = Fixture::new();
+            let published = replacement.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            let original_root_metadata =
+                fs::metadata(replacement.final_path().join("root")).unwrap();
+            fs::set_permissions(
+                replacement.final_path(),
+                fs::Permissions::from_mode(PRIVATE_DIRECTORY_MODE),
+            )
+            .unwrap();
+            fs::rename(
+                replacement.final_path().join("root"),
+                replacement.final_path().join("old-root"),
+            )
+            .unwrap();
+            fs::create_dir(replacement.final_path().join("root")).unwrap();
+            fs::set_permissions(
+                replacement.final_path().join("root"),
+                fs::Permissions::from_mode(original_root_metadata.permissions().mode() & 0o7777),
+            )
+            .unwrap();
+            File::open(replacement.final_path().join("root"))
+                .unwrap()
+                .set_times(
+                    FileTimes::new()
+                        .set_accessed(original_root_metadata.accessed().unwrap())
+                        .set_modified(original_root_metadata.modified().unwrap()),
+                )
+                .unwrap();
+            fs::set_permissions(
+                replacement.final_path(),
+                fs::Permissions::from_mode(SEALED_DIRECTORY_MODE),
+            )
+            .unwrap();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            let error = bind_leaf(
+                bind_published_snapshot_child_at(published, ROOT, expected, reservation)
+                    .unwrap_err(),
+            );
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::IdentityMismatch);
+            assert_eq!(
+                error.stage(),
+                SnapshotPublishStageV1::BindPublishedChildIdentity
+            );
+            assert!(replacement.final_path().join("old-root").is_dir());
+            assert!(replacement.final_path().join("root").is_dir());
+
+            let metadata = Fixture::new();
+            let published = metadata.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            fs::set_permissions(
+                metadata.final_path().join("root"),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            let error = bind_leaf(
+                bind_published_snapshot_child_at(published, ROOT, expected, reservation)
+                    .unwrap_err(),
+            );
+            assert_eq!(error.kind(), SnapshotPublishErrorKindV1::IdentityMismatch);
+            assert_eq!(
+                error.stage(),
+                SnapshotPublishStageV1::BindPublishedChildIdentity
+            );
+            assert_eq!(
+                fs::metadata(metadata.final_path().join("root"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o700
+            );
+        }
+
+        #[test]
+        fn representative_source_statx_commitment_bytes_are_bound_exactly() {
+            for index in [0, 51, 101] {
+                let fixture = Fixture::new();
+                let published = fixture.publish_root();
+                let mut expected = published_child_commitment(&published, ROOT);
+                expected[index] ^= 0x80;
+                let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+                let reservation = resources
+                    .reserve_published_child_bind_attempts(
+                        policy().published_child_bind_operation_attempt_bound(),
+                    )
+                    .unwrap();
+
+                let error = bind_leaf(
+                    bind_published_snapshot_child_at(published, ROOT, expected, reservation)
+                        .unwrap_err(),
+                );
+
+                assert_eq!(error.kind(), SnapshotPublishErrorKindV1::IdentityMismatch);
+                assert_eq!(
+                    error.stage(),
+                    SnapshotPublishStageV1::BindPublishedChildIdentity
+                );
+                assert!(fixture.final_path().join("root").is_dir());
+            }
+        }
+
+        #[test]
+        fn exhausted_bind_escrow_is_a_durable_resource_failure_and_keeps_the_tree() {
+            let fixture = Fixture::new();
+            let published = fixture.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let before = resources.forward_attempts_remaining_for_test();
+            // The constrained open consumes this sole attempt. The statx
+            // closure must never run and the typed post-publication wrapper
+            // still reports a durable final name.
+            let reservation = resources
+                .reserve_published_child_bind_attempts(NonZeroU64::new(1).unwrap())
+                .unwrap();
+            PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.set(0));
+            let error = bind_published_snapshot_child_at(published, ROOT, expected, reservation)
+                .unwrap_err();
+            assert_eq!(
+                error.publication_state(),
+                SnapshotPublicationStateV1::PublishedDurable
+            );
+            assert!(matches!(
+                error.failure(),
+                SnapshotPublishedChildBindFailureV1::Resource(
+                    SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                        stage: SnapshotPipelineStageV1::Forward(
+                            SnapshotPipelineForwardStageV1::Publication
+                        ),
+                        bucket: SnapshotPipelineAttemptBucketV1::Forward,
+                    }
+                )
+            ));
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 1);
+            assert_eq!(PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.get()), 0);
+            assert!(fixture.final_path().join("root").is_dir());
+        }
+
+        #[test]
         fn publish_time_replacement_cannot_be_mistaken_for_the_pinned_inode() {
             struct ReplaceBeforeRename {
                 parent_path: PathBuf,
@@ -3999,6 +4596,12 @@ mod platform {
     pub(in crate::linux_pytest) struct PublishedSnapshotDirectoryV1 {
         directory: OwnedFd,
         identity: SnapshotDirectoryIdentityV1,
+        openat2_attempts: u8,
+    }
+
+    pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
+        published: PublishedSnapshotDirectoryV1,
+        root: OwnedFd,
     }
 
     impl<'parent> StagedSnapshotDirectoryV1<'parent> {
@@ -4050,6 +4653,26 @@ mod platform {
         }
     }
 
+    impl BoundPublishedSnapshotChildV1 {
+        pub(super) fn published_directory(&self) -> BorrowedFd<'_> {
+            self.published.directory()
+        }
+
+        pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
+            self.root.as_fd()
+        }
+    }
+
+    impl fmt::Debug for BoundPublishedSnapshotChildV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("BoundPublishedSnapshotChildV1")
+                .field("published_directory", &"<owned-fd>")
+                .field("root_directory", &"<owned-fd>")
+                .finish()
+        }
+    }
+
     pub(super) fn create_charged_staged_snapshot_directory_at<'resources>(
         _parent: BorrowedFd<'resources>,
         _staging_name: &CStr,
@@ -4084,6 +4707,13 @@ mod platform {
 mod portable_tests {
     use super::*;
 
+    trait AmbiguousIfClone<A> {
+        fn probe() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+    impl<T: Clone> AmbiguousIfClone<u8> for T {}
+
     fn checked_policy(
         openat2_attempts: u8,
         syscall_attempts: u8,
@@ -4117,6 +4747,11 @@ mod portable_tests {
     }
 
     #[test]
+    fn bound_published_child_authority_is_not_cloneable() {
+        <BoundPublishedSnapshotChildV1 as AmbiguousIfClone<_>>::probe();
+    }
+
+    #[test]
     fn pure_final_name_validation_returns_one_typed_failure() {
         let staging = c".again-snapshot-stage-0123456789abcdef0123456789abcdef";
         assert_eq!(
@@ -4133,6 +4768,17 @@ mod portable_tests {
                 SnapshotPublicationStateV1::Unpublished
             );
             assert_eq!(error.errno(), None);
+        }
+    }
+
+    #[test]
+    fn published_child_bind_bound_is_exactly_open_retries_plus_one_statx() {
+        for openat2_attempts in [1, 4, HARD_MAX_OPENAT2_ATTEMPTS] {
+            let policy = checked_policy(openat2_attempts, 1, 0, 1, 1, 4096).unwrap();
+            assert_eq!(
+                policy.published_child_bind_operation_attempt_bound().get(),
+                u64::from(openat2_attempts) + 1
+            );
         }
     }
 

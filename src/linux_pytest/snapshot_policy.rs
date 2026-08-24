@@ -278,6 +278,22 @@ pub(super) struct SnapshotFinalizationAttemptReservationV1<'resources> {
     attempts_remaining: Cell<u64>,
 }
 
+/// Narrow linear escrow for binding a published child after publication.
+///
+/// This wrapper deliberately exposes only charged attempt execution. The
+/// production connector must choose the complete bind-attempt ceiling and
+/// remove it from the same shared forward ledger before irreversible
+/// publication begins. The publisher cannot inspect the resource cells,
+/// change the allotment, or recover the broader finalization token. Each
+/// attempted operation consumes authority before its closure runs. Dropping
+/// this wrapper drops the inner finalization reservation and therefore refunds
+/// exactly its unused suffix. The type intentionally implements neither
+/// `Clone` nor `Copy`.
+#[must_use = "published-child binding must retain its reserved attempts until binding completes"]
+pub(super) struct SnapshotPublishedChildBindReservationV1<'resources> {
+    inner: SnapshotFinalizationAttemptReservationV1<'resources>,
+}
+
 /// Temporary RAII precharge held while an allocation is attempted.
 #[must_use = "dropping the charge releases its transient-heap bytes"]
 struct SnapshotTransientChargeV1<'resources> {
@@ -878,6 +894,21 @@ impl SnapshotPipelineResourcesV1 {
         })
     }
 
+    /// Escrows one caller-supplied child-bind ceiling.
+    ///
+    /// This is a narrowing constructor: the returned authority exposes only
+    /// charged bind attempts. Reservation failure leaves the shared ledger
+    /// unchanged, and dropping a successful reservation refunds only attempts
+    /// that were never started. Production integration must derive the exact
+    /// ceiling from the publication policy and reserve it before sealing.
+    pub(super) fn reserve_published_child_bind_attempts(
+        &self,
+        requested: NonZeroU64,
+    ) -> Result<SnapshotPublishedChildBindReservationV1<'_>, SnapshotPipelineResourceErrorV1> {
+        self.reserve_finalization_attempts(requested)
+            .map(|inner| SnapshotPublishedChildBindReservationV1 { inner })
+    }
+
     /// Charges one publisher-cleanup attempt before invoking `attempt`.
     ///
     /// Cleanup draws only from the reserve committed before staging creation;
@@ -1141,6 +1172,20 @@ impl Drop for SnapshotFinalizationAttemptReservationV1<'_> {
             .checked_add(unused)
             .expect("a private finalization reservation cannot refund unreserved attempts");
         self.resources.forward_attempts_remaining.set(restored);
+    }
+}
+
+impl SnapshotPublishedChildBindReservationV1<'_> {
+    /// Charges one escrowed bind attempt before invoking `attempt`.
+    ///
+    /// Refusal never invokes the closure. A returned error or unwind from the
+    /// closure still consumes the attempt because the inner escrow is charged
+    /// first.
+    pub(super) fn run_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.inner.run_attempt(attempt)
     }
 }
 
@@ -2336,6 +2381,54 @@ mod tests {
     }
 
     #[test]
+    fn published_child_bind_reservation_accepts_exact_n_and_refuses_n_minus_one() {
+        let exhausted = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+            stage: SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::Publication),
+            bucket: SnapshotPipelineAttemptBucketV1::Forward,
+        };
+        let resources = pipeline_resources(3, 8);
+        let reservation = resources
+            .reserve_published_child_bind_attempts(nz64(3))
+            .unwrap();
+        assert_eq!(resources.forward_attempts_remaining.get(), 0);
+        drop(reservation);
+        assert_eq!(resources.forward_attempts_remaining.get(), 3);
+
+        let short = pipeline_resources(2, 8);
+        assert_eq!(
+            short
+                .reserve_published_child_bind_attempts(nz64(3))
+                .err()
+                .unwrap(),
+            exhausted
+        );
+        assert_eq!(short.forward_attempts_remaining.get(), 2);
+    }
+
+    #[test]
+    fn published_child_bind_unwind_consumes_started_attempt_and_refunds_only_unused() {
+        let resources = pipeline_resources(7, 8);
+        let reservation = resources
+            .reserve_published_child_bind_attempts(nz64(5))
+            .unwrap();
+        assert_eq!(resources.forward_attempts_remaining.get(), 2);
+
+        let invoked = Cell::new(false);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = reservation.run_attempt(|| {
+                invoked.set(true);
+                panic!("started bind attempt unwinds");
+            });
+        }));
+        assert!(unwind.is_err());
+        assert!(invoked.get());
+        assert_eq!(resources.forward_attempts_remaining.get(), 2);
+
+        drop(reservation);
+        assert_eq!(resources.forward_attempts_remaining.get(), 6);
+    }
+
+    #[test]
     fn transient_reservations_compose_across_phases_and_restore_on_any_drop_order() {
         let resources = pipeline_resources(1, 10);
         let first = resources
@@ -2753,6 +2846,8 @@ mod tests {
         <SnapshotManifestCompilationVecV1<'static, u64> as AmbiguousIfDefault<_>>::probe();
         <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotFinalizationAttemptReservationV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotPublishedChildBindReservationV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotPublishedChildBindReservationV1<'static> as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<SnapshotChargedBytesV1<'static>>());
         assert!(std::mem::needs_drop::<
             SnapshotPersistentManifestChargeV1<'static>,
@@ -2762,6 +2857,9 @@ mod tests {
         >());
         assert!(std::mem::needs_drop::<
             SnapshotFinalizationAttemptReservationV1<'static>,
+        >());
+        assert!(std::mem::needs_drop::<
+            SnapshotPublishedChildBindReservationV1<'static>,
         >());
     }
 }

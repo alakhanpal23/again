@@ -51,6 +51,31 @@ const HARD_MAX_TOTAL_XATTR_BYTES: u64 = 256 * 1024 * 1024;
 const HARD_MAX_PLAN_BYTES: u64 = 512 * 1024 * 1024;
 const HARD_MAX_ATTEMPTS: u8 = 32;
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const STATX_MNT_ID_V1: u32 = 0x1000;
+
+/// Fields required to reconstruct the complete modeled source-tree identity
+/// committed by [`SourceStatxV1`]. This is deliberately stronger than the
+/// publisher's separate container-identity mask.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const SOURCE_TREE_REQUIRED_STATX_MASK_V1: u32 = libc::STATX_TYPE
+    | libc::STATX_MODE
+    | libc::STATX_NLINK
+    | libc::STATX_UID
+    | libc::STATX_GID
+    | libc::STATX_ATIME
+    | libc::STATX_MTIME
+    | libc::STATX_CTIME
+    | libc::STATX_INO
+    | libc::STATX_SIZE
+    | STATX_MNT_ID_V1;
+
+/// Source-tree fields requested from Linux. Birth time remains optional even
+/// though it is requested, and is committed only when the kernel returns it.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) const SOURCE_TREE_REQUESTED_STATX_MASK_V1: u32 =
+    SOURCE_TREE_REQUIRED_STATX_MASK_V1 | libc::STATX_BTIME;
+
 /// Capability supplied only after the backend has functionally verified a
 /// mount/view on which directory, regular-file, and symlink acquisition cannot
 /// mutate host atime. This wrapper records that semantic precondition; this
@@ -436,6 +461,54 @@ pub(super) struct SourceStatxV1 {
 }
 
 impl SourceStatxV1 {
+    /// Decode the complete source-tree `statx(2)` response shared by traversal
+    /// and post-publication root binding. Missing mandatory fields are a
+    /// capability failure; malformed returned timestamps are rejected before
+    /// they can enter the fixed 102-byte commitment.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn from_linux_statx_v1(raw: &libc::statx) -> std::io::Result<Self> {
+        if raw.stx_mask & SOURCE_TREE_REQUIRED_STATX_MASK_V1 != SOURCE_TREE_REQUIRED_STATX_MASK_V1 {
+            return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+        }
+
+        fn checked_timestamp(value: &libc::statx_timestamp) -> std::io::Result<TimespecV1> {
+            if value.tv_nsec >= 1_000_000_000 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            Ok(TimespecV1 {
+                seconds: value.tv_sec,
+                nanoseconds: value.tv_nsec,
+            })
+        }
+
+        let atime = checked_timestamp(&raw.stx_atime)?;
+        let mtime = checked_timestamp(&raw.stx_mtime)?;
+        let ctime = checked_timestamp(&raw.stx_ctime)?;
+        let btime = if raw.stx_mask & libc::STATX_BTIME != 0 {
+            Some(checked_timestamp(&raw.stx_btime)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            inode_key: SourceInodeKeyV1 {
+                mount_id: raw.stx_mnt_id,
+                device_major: raw.stx_dev_major,
+                device_minor: raw.stx_dev_minor,
+                inode: raw.stx_ino,
+            },
+            mode: u32::from(raw.stx_mode),
+            uid: raw.stx_uid,
+            gid: raw.stx_gid,
+            nlink: u64::from(raw.stx_nlink),
+            size: raw.stx_size,
+            atime,
+            mtime,
+            ctime,
+            btime,
+        })
+    }
+
     /// Fixed, allocation-free canonical bytes for connector-side event/plan
     /// commitments. Byte zero is the format version; every integer is little
     /// endian and optional birth time has an explicit presence byte.
@@ -1433,7 +1506,6 @@ mod platform {
     const RESOLVE_BENEATH: u64 = 0x08;
     const SOURCE_RESOLVE: u64 = RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH;
     const AT_EMPTY_PATH: i32 = 0x1000;
-    const STATX_MNT_ID: u32 = 0x1000;
     const SYS_GETXATTRAT_X86_64: libc::c_long = 464;
     const SYS_LISTXATTRAT_X86_64: libc::c_long = 465;
     const GETDENTS_BUFFER_BYTES: usize = 32 * 1024;
@@ -1444,19 +1516,6 @@ mod platform {
         + std::mem::size_of::<u32>()) as u64;
     const DIRECTORY_MEMBER_FIXED_BYTES: u64 =
         (std::mem::size_of::<Box<[u8]>>() + std::mem::size_of::<usize>()) as u64;
-    const REQUIRED_STATX_MASK: u32 = libc::STATX_TYPE
-        | libc::STATX_MODE
-        | libc::STATX_NLINK
-        | libc::STATX_UID
-        | libc::STATX_GID
-        | libc::STATX_ATIME
-        | libc::STATX_MTIME
-        | libc::STATX_CTIME
-        | libc::STATX_INO
-        | libc::STATX_SIZE
-        | STATX_MNT_ID;
-    const REQUESTED_STATX_MASK: u32 = REQUIRED_STATX_MASK | libc::STATX_BTIME;
-
     #[derive(Debug)]
     enum BoundedPushReserveError {
         Full,
@@ -3654,7 +3713,7 @@ mod platform {
                 fd.as_raw_fd(),
                 c"".as_ptr(),
                 AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
-                REQUESTED_STATX_MASK,
+                SOURCE_TREE_REQUESTED_STATX_MASK_V1,
                 raw.as_mut_ptr(),
             )
         };
@@ -3662,38 +3721,7 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         let raw = unsafe { raw.assume_init() };
-        if raw.stx_mask & REQUIRED_STATX_MASK != REQUIRED_STATX_MASK {
-            return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
-        }
-        Ok(SourceStatxV1 {
-            inode_key: SourceInodeKeyV1 {
-                mount_id: raw.stx_mnt_id,
-                device_major: raw.stx_dev_major,
-                device_minor: raw.stx_dev_minor,
-                inode: raw.stx_ino,
-            },
-            mode: u32::from(raw.stx_mode),
-            uid: raw.stx_uid,
-            gid: raw.stx_gid,
-            nlink: u64::from(raw.stx_nlink),
-            size: raw.stx_size,
-            atime: TimespecV1 {
-                seconds: raw.stx_atime.tv_sec,
-                nanoseconds: raw.stx_atime.tv_nsec,
-            },
-            mtime: TimespecV1 {
-                seconds: raw.stx_mtime.tv_sec,
-                nanoseconds: raw.stx_mtime.tv_nsec,
-            },
-            ctime: TimespecV1 {
-                seconds: raw.stx_ctime.tv_sec,
-                nanoseconds: raw.stx_ctime.tv_nsec,
-            },
-            btime: (raw.stx_mask & libc::STATX_BTIME != 0).then_some(TimespecV1 {
-                seconds: raw.stx_btime.tv_sec,
-                nanoseconds: raw.stx_btime.tv_nsec,
-            }),
-        })
+        SourceStatxV1::from_linux_statx_v1(&raw)
     }
 
     fn statx_identity<G: AttemptGateV1, H: EnumerationHooks>(
@@ -3782,6 +3810,9 @@ mod platform {
         relative_path: &[u8],
         error: io::Error,
     ) -> SourceTreeFailureV1 {
+        if error.kind() == io::ErrorKind::InvalidData {
+            return malformed(stage, relative_path);
+        }
         match error.raw_os_error() {
             Some(libc::ENOSYS | libc::EINVAL | libc::EOPNOTSUPP) => failure(
                 stage,
@@ -3874,6 +3905,153 @@ mod platform {
         use super::*;
 
         static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+
+        fn complete_raw_statx(mask: u32) -> libc::statx {
+            let mut raw = unsafe { MaybeUninit::<libc::statx>::zeroed().assume_init() };
+            raw.stx_mask = mask;
+            raw.stx_mode = u16::try_from(libc::S_IFREG | 0o640).unwrap();
+            raw.stx_uid = 1_001;
+            raw.stx_gid = 1_002;
+            raw.stx_nlink = 7;
+            raw.stx_ino = 0x1122_3344_5566_7788;
+            raw.stx_size = 0x8877_6655_4433_2211;
+            raw.stx_mnt_id = 0x0102_0304_0506_0708;
+            raw.stx_dev_major = 259;
+            raw.stx_dev_minor = 65_535;
+            raw.stx_atime.tv_sec = -11;
+            raw.stx_atime.tv_nsec = 101;
+            raw.stx_mtime.tv_sec = 22;
+            raw.stx_mtime.tv_nsec = 999_999_999;
+            raw.stx_ctime.tv_sec = -33;
+            raw.stx_ctime.tv_nsec = 303;
+            raw.stx_btime.tv_sec = 44;
+            raw.stx_btime.tv_nsec = 404;
+            raw
+        }
+
+        fn expected_source_statx(btime: Option<TimespecV1>) -> SourceStatxV1 {
+            SourceStatxV1::for_test(
+                0x0102_0304_0506_0708,
+                259,
+                65_535,
+                0x1122_3344_5566_7788,
+                libc::S_IFREG | 0o640,
+                1_001,
+                1_002,
+                7,
+                0x8877_6655_4433_2211,
+                TimespecV1 {
+                    seconds: -11,
+                    nanoseconds: 101,
+                },
+                TimespecV1 {
+                    seconds: 22,
+                    nanoseconds: 999_999_999,
+                },
+                TimespecV1 {
+                    seconds: -33,
+                    nanoseconds: 303,
+                },
+                btime,
+            )
+        }
+
+        #[test]
+        fn source_statx_decoder_preserves_exact_commitment_with_btime() {
+            let raw = complete_raw_statx(SOURCE_TREE_REQUESTED_STATX_MASK_V1);
+            let decoded = SourceStatxV1::from_linux_statx_v1(&raw).unwrap();
+            let expected = expected_source_statx(Some(TimespecV1 {
+                seconds: 44,
+                nanoseconds: 404,
+            }));
+
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                decoded.commitment_bytes_v1(),
+                expected.commitment_bytes_v1()
+            );
+        }
+
+        #[test]
+        fn source_statx_decoder_ignores_unreturned_btime_storage() {
+            let mut raw = complete_raw_statx(SOURCE_TREE_REQUIRED_STATX_MASK_V1);
+            raw.stx_btime.tv_nsec = u32::MAX;
+
+            let decoded = SourceStatxV1::from_linux_statx_v1(&raw).unwrap();
+            let expected = expected_source_statx(None);
+            assert_eq!(decoded, expected);
+            assert_eq!(
+                decoded.commitment_bytes_v1(),
+                expected.commitment_bytes_v1()
+            );
+            assert_eq!(decoded.commitment_bytes_v1()[89], 0);
+        }
+
+        #[test]
+        fn source_statx_decoder_rejects_each_missing_required_mask_bit() {
+            let required_bits = [
+                libc::STATX_TYPE,
+                libc::STATX_MODE,
+                libc::STATX_NLINK,
+                libc::STATX_UID,
+                libc::STATX_GID,
+                libc::STATX_ATIME,
+                libc::STATX_MTIME,
+                libc::STATX_CTIME,
+                libc::STATX_INO,
+                libc::STATX_SIZE,
+                STATX_MNT_ID_V1,
+            ];
+
+            for missing in required_bits {
+                let raw = complete_raw_statx(SOURCE_TREE_REQUESTED_STATX_MASK_V1 & !missing);
+                let error = SourceStatxV1::from_linux_statx_v1(&raw).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EOPNOTSUPP));
+            }
+        }
+
+        #[test]
+        fn source_statx_decoder_rejects_each_invalid_returned_timestamp() {
+            for timestamp_index in 0..4 {
+                let mut raw = complete_raw_statx(SOURCE_TREE_REQUESTED_STATX_MASK_V1);
+                match timestamp_index {
+                    0 => raw.stx_atime.tv_nsec = 1_000_000_000,
+                    1 => raw.stx_mtime.tv_nsec = 1_000_000_000,
+                    2 => raw.stx_ctime.tv_nsec = 1_000_000_000,
+                    3 => raw.stx_btime.tv_nsec = 1_000_000_000,
+                    _ => unreachable!(),
+                }
+
+                let error = SourceStatxV1::from_linux_statx_v1(&raw).unwrap_err();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                assert_eq!(error.raw_os_error(), None);
+            }
+        }
+
+        #[test]
+        fn source_statx_decoder_errors_map_to_exact_typed_refusals() {
+            let malformed = map_statx_error(
+                SourceTreeStageV1::InspectEntry,
+                b"file",
+                io::Error::from(io::ErrorKind::InvalidData),
+            );
+            assert_eq!(
+                malformed.reason(),
+                SourceTreeFailureReasonV1::MalformedKernelResponse
+            );
+            assert_eq!(malformed.errno(), None);
+
+            let unavailable = map_statx_error(
+                SourceTreeStageV1::InspectEntry,
+                b"file",
+                io::Error::from_raw_os_error(libc::EOPNOTSUPP),
+            );
+            assert_eq!(
+                unavailable.reason(),
+                SourceTreeFailureReasonV1::RequiredKernelCapability
+            );
+            assert_eq!(unavailable.errno(), Some(libc::EOPNOTSUPP));
+        }
 
         struct TestAttemptGateV1 {
             remaining: Cell<u64>,
