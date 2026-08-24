@@ -21,10 +21,23 @@ regular copying, finalizes supported metadata and durability, and returns the
 populated RAII-cleanup guard beside the retained copy-time source plan. Its
 source-plan lease remains live after the materializer-workspace lease is
 released. Source-enumeration, materialization, and regular-copy policies are
-bound into the same connector-minted session. Neither result exposes a ready,
-publish, execution, or reuse transition; destination observation and complete
-four-view orchestration remain unwired. Nothing in this document is evidence
-that pytest execution or reuse is available.
+bound into the same connector-minted session.
+
+The Linux x86_64 connector now consumes that copy-time plan as S1, observes an
+independent S2, then observes D1 and D2 from the private stage under distinct
+connector-minted `DestinationObservation`-charged sessions. Destination
+directory and regular-file reads use `O_NOATIME`; destination symlinks are
+refused after descriptor-selected type identification and before xattr or
+target acquisition, including before `readlinkat`. Comparisons run in the
+fixed order S1/S2, S1/D1, and D1/D2. Plans are released between steps so at
+most two retained-view leases coexist, and all plans are gone on success.
+Success returns only the still-unready cleanup guard; comparison success mints
+no authority, and there is no ready, publish, Python-execution, or reuse
+transition.
+
+Runtime qualification and retained evidence are tracked in
+[STATUS.md](STATUS.md). Nothing in this document is evidence that a sealed
+snapshot, pytest execution, or reuse is available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR

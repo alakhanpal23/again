@@ -18,6 +18,10 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::FileContentHasherV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_connector::{
+    SnapshotDestinationObservationErrorV1, SnapshotDestinationObservationSessionV1,
+};
 use super::snapshot_connector::{
     SnapshotMaterializationSessionV1, SnapshotSourceObservationErrorV1,
     SnapshotSourceObservationSessionV1,
@@ -336,6 +340,34 @@ pub(super) unsafe fn observe_regular_from_qualified_pinned_at(
     platform::observe_regular_from_pinned_at(source_parent, source_name, source_handle, session)
 }
 
+/// Observe one pinned regular file in the owner-private staged destination.
+///
+/// The connector-minted session binds the committed regular policy, the
+/// shared forward-attempt ledger, and the distinct `DestinationObservation`
+/// stage. The descriptor is reopened with `O_NOATIME`; no copy, readiness,
+/// publication, or reuse authority is returned.
+///
+/// # Safety
+///
+/// `destination_parent`, `destination_name`, and `destination_handle` must
+/// come from the same still-live descriptor-stable traversal callback over the
+/// connector-owned private staging tree.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) unsafe fn observe_destination_regular_from_private_pinned_at(
+    destination_parent: BorrowedFd<'_>,
+    destination_name: &CStr,
+    destination_handle: BorrowedFd<'_>,
+    session: &SnapshotDestinationObservationSessionV1<'_>,
+) -> Result<RegularCopyEvidenceV1, SnapshotDestinationObservationErrorV1<SnapshotRegularFailureV1>>
+{
+    platform::observe_destination_regular_from_private_pinned_at(
+        destination_parent,
+        destination_name,
+        destination_handle,
+        session,
+    )
+}
+
 fn valid_basename(name: &CStr) -> bool {
     let bytes = name.to_bytes();
     !bytes.is_empty() && bytes != b"." && bytes != b".." && !bytes.contains(&b'/')
@@ -422,6 +454,14 @@ mod platform {
         }
     }
 
+    impl KernelAttemptGateV1 for SnapshotDestinationObservationSessionV1<'_> {
+        type ChargeError = SnapshotPipelineResourceErrorV1;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            SnapshotDestinationObservationSessionV1::run_attempt(self, attempt)
+        }
+    }
+
     impl KernelAttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
         type ChargeError = SnapshotPipelineResourceErrorV1;
 
@@ -501,7 +541,7 @@ mod platform {
         }
     }
 
-    fn into_source_observation_regular<T>(
+    fn into_observation_regular<T>(
         result: Result<T, GatedRegularFailureV1<SnapshotPipelineResourceErrorV1>>,
     ) -> Result<T, SnapshotSourceObservationErrorV1<SnapshotRegularFailureV1>> {
         match result {
@@ -699,7 +739,27 @@ mod platform {
             source_read_open_flags(),
             session,
         );
-        into_source_observation_regular(result)
+        into_observation_regular(result)
+    }
+
+    pub(super) fn observe_destination_regular_from_private_pinned_at(
+        destination_parent: BorrowedFd<'_>,
+        destination_name: &CStr,
+        destination_handle: BorrowedFd<'_>,
+        session: &SnapshotDestinationObservationSessionV1<'_>,
+    ) -> Result<
+        RegularCopyEvidenceV1,
+        SnapshotDestinationObservationErrorV1<SnapshotRegularFailureV1>,
+    > {
+        let result = observe_regular_from_pinned_at_with_gate(
+            destination_parent,
+            destination_name,
+            destination_handle,
+            session.regular_copy_policy(),
+            destination_observation_open_flags(),
+            session,
+        );
+        into_observation_regular(result)
     }
 
     fn observe_regular_from_pinned_at_with_gate<G: KernelAttemptGateV1>(
@@ -1088,6 +1148,10 @@ mod platform {
         // `O_NONBLOCK` is ignored for regular files, but prevents a pathname
         // replacement with a FIFO from blocking before identity comparison.
         libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+
+    const fn destination_observation_open_flags() -> i32 {
+        source_read_open_flags() | libc::O_NOATIME
     }
 
     const fn destination_open_flags() -> i32 {
@@ -2090,7 +2154,7 @@ mod platform {
                     c"input",
                     source_handle.as_fd(),
                     policy,
-                    source_read_open_flags() | libc::O_NOATIME,
+                    destination_observation_open_flags(),
                     gate,
                 )
             }
@@ -2451,11 +2515,18 @@ mod platform {
         }
 
         #[test]
-        fn observer_returns_exact_digest_honors_n_minus_one_and_detects_name_swap() {
+        fn destination_observer_core_returns_exact_evidence_charges_and_revalidates_identity() {
             let bytes = (0..(COPY_BUFFER_BYTES + 37))
                 .map(|index| (index % 251) as u8)
                 .collect::<Vec<_>>();
             let fixture = Fixture::with_input(&bytes);
+
+            let zero = TestGate::bounded(0);
+            assert!(matches!(
+                fixture.observe_input(policy(), &zero),
+                Err(GatedRegularFailureV1::Charge(GateExhausted))
+            ));
+            assert_eq!(zero.raw_calls.get(), 0);
 
             let discovery = TestGate::bounded(u64::MAX);
             let evidence = fixture.observe_input(policy(), &discovery).unwrap();
@@ -2661,7 +2732,7 @@ mod platform {
         }
 
         #[test]
-        fn observer_regular_to_fifo_swap_refuses_without_blocking() {
+        fn destination_observer_regular_to_fifo_swap_refuses_without_blocking() {
             let fixture = Fixture::with_input(b"ordinary-regular-file");
             // Attempt 1 inspects the pinned regular handle. Replace its name
             // immediately before attempt 2 opens the readable descriptor.
@@ -2757,9 +2828,17 @@ mod platform {
         }
 
         #[test]
-        fn source_authority_uses_ordinary_reads_but_destination_keeps_noatime() {
+        fn source_authority_uses_ordinary_reads_while_destination_paths_keep_noatime() {
             assert_eq!(source_read_open_flags() & libc::O_NOATIME, 0);
             assert_ne!(source_read_open_flags() & libc::O_NONBLOCK, 0);
+            assert_ne!(destination_observation_open_flags() & libc::O_NOATIME, 0);
+            assert_ne!(destination_observation_open_flags() & libc::O_NONBLOCK, 0);
+            assert_ne!(destination_observation_open_flags() & libc::O_NOFOLLOW, 0);
+            assert_eq!(
+                destination_observation_open_flags()
+                    & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC),
+                0
+            );
             assert_ne!(destination_open_flags() & libc::O_NOATIME, 0);
             assert_ne!(source_read_open_flags() & libc::O_NOFOLLOW, 0);
             assert_ne!(destination_open_flags() & libc::O_EXCL, 0);
@@ -2790,6 +2869,37 @@ mod platform {
                 sparse_copy_io.code(),
                 RefusalCode::SnapshotConstructionFailed
             );
+        }
+
+        #[test]
+        fn destination_observer_preserves_stale_atime_and_returns_exact_evidence() {
+            use std::os::unix::fs::MetadataExt;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            let bytes = b"destination observation exact bytes";
+            let fixture = Fixture::with_input(bytes);
+            let destination_path = fixture.source("input");
+            let stale_atime = UNIX_EPOCH + Duration::from_secs(946_684_800);
+            OpenOptions::new()
+                .read(true)
+                .open(&destination_path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_accessed(stale_atime))
+                .unwrap();
+            let before = fs::metadata(&destination_path).unwrap();
+            let before_atime = (before.atime(), before.atime_nsec());
+            assert!(before.atime() <= before.mtime());
+
+            let gate = TestGate::bounded(u64::MAX);
+            let evidence = fixture.observe_input(policy(), &gate).unwrap();
+
+            assert_eq!(
+                evidence.content_digest(),
+                FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[bytes])
+            );
+            assert!(!evidence.data_extents().is_empty());
+            let after = fs::metadata(destination_path).unwrap();
+            assert_eq!((after.atime(), after.atime_nsec()), before_atime);
         }
 
         #[test]

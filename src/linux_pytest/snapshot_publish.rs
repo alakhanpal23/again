@@ -732,6 +732,14 @@ mod platform {
             self.cleanup.directory()
         }
 
+        /// Returns the owner recorded when the connector created and pinned
+        /// this private stage. The pair is comparison input only; it carries
+        /// no descriptor, cleanup, readiness, or publication authority.
+        pub(in crate::linux_pytest) fn expected_owner(&self) -> (u32, u32) {
+            let identity = self.cleanup.expected_identity();
+            (identity.uid, identity.gid)
+        }
+
         pub(in crate::linux_pytest) fn cleanup_envelope(&self) -> SnapshotCleanupEnvelopeV1 {
             self.cleanup.policy().cleanup_envelope()
         }

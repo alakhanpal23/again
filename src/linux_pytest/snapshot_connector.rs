@@ -4,10 +4,12 @@
 //! preflighted policy. Optional zero-valued classes and aggregate budgets that
 //! current nonzero leaf shapes cannot enforce exactly are refused rather than
 //! widened. The connector then owns the mutable resource ledger and keeps leaf
-//! policies private. Connector-owned source observation and charged
-//! source-to-stage materialization with RAII cleanup are wired so far; the
-//! populated guard cannot enter the still-unmetered ready or publish
-//! transitions. Every wired kernel attempt charges the same ledger.
+//! policies private. On Linux x86_64, connector-owned source observation,
+//! charged source-to-stage materialization, independent destination
+//! observation, and the ordered S1/S2, S1/D1, D1/D2 comparisons are wired.
+//! Success still returns only the unready RAII cleanup guard and cannot enter
+//! ready or publish transitions. Every wired kernel attempt charges the same
+//! ledger.
 //! Source-observation logical counts and payloads are bounded by leaf policy.
 //! Source plans and materializer workspace use conservative full-ceiling
 //! leases; allocator-observed capacity inside them is not yet reconciled to
@@ -32,13 +34,18 @@ use super::snapshot_publish::SnapshotPublishPolicyV1;
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::snapshot_publish::{ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1};
 use super::snapshot_regular::{RegularCopyPolicyV1, SnapshotRegularFailureV1};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::enumerate_destination_tree_view_charged_at;
 use super::snapshot_tree::{
     QualifiedNoAtimeSourceViewV1, SourceEnumerationPolicyV1, SourceObservationTreeVisitorV1,
     SourceObservedRegularVisitV1, SourceRegularEvidenceV1, SourceTraversalLimitsV1,
     SourceTreeAcquireFailureV1, SourceTreeFailureV1, SourceTreePlanV1, SourceXattrLimitsV1,
-    enumerate_source_tree_view_charged_at,
+    admit_observed_regular_evidence, enumerate_source_tree_view_charged_at,
 };
-use super::{ExtentV1, FileContentDigest};
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_verify::{
+    DestinationPhysicalIdentityV1, SnapshotVerifyErrorV1, begin_four_view_comparison,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotProjectedLeafV1 {
@@ -120,21 +127,23 @@ pub(super) enum SnapshotChargedErrorV1<E> {
     Leaf(E),
 }
 
-/// One connector-owned staging-and-population failure.
-///
-/// Staging and traversal share the connector's sole resource ledger, but
-/// their correctness failures remain typed and redacted. This type carries no
-/// staging, publication, readiness, or execution authority.
+/// Flat connector-owned failure for materialization plus all three semantic
+/// comparisons. Resource exhaustion remains top-level regardless of the leaf
+/// that encountered it; potentially path-bearing leaf payloads stay redacted.
+/// The type carries no staged directory or transition authority.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) enum SnapshotPipelineMaterializationErrorV1 {
+pub(super) enum SnapshotPipelineFourViewErrorV1 {
     PublicationAlreadyStarted,
     Resource(SnapshotPipelineResourceErrorV1),
     Publication(SnapshotPublishErrorV1),
     Materialization(SnapshotTreeMaterializeErrorV1),
+    SourceObservation(SnapshotSourceObservationFailureV1),
+    DestinationObservation(SnapshotDestinationObservationFailureV1),
+    Comparison(SnapshotVerifyErrorV1),
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl std::fmt::Debug for SnapshotPipelineMaterializationErrorV1 {
+impl std::fmt::Debug for SnapshotPipelineFourViewErrorV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PublicationAlreadyStarted => formatter.write_str("PublicationAlreadyStarted"),
@@ -144,22 +153,25 @@ impl std::fmt::Debug for SnapshotPipelineMaterializationErrorV1 {
                 .debug_tuple("Materialization")
                 .field(error)
                 .finish(),
+            Self::SourceObservation(_) => formatter.write_str("SourceObservation(<redacted>)"),
+            Self::DestinationObservation(_) => {
+                formatter.write_str("DestinationObservation(<redacted>)")
+            }
+            Self::Comparison(error) => formatter.debug_tuple("Comparison").field(error).finish(),
         }
     }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-fn flatten_pipeline_materialization_error(
-    error: SnapshotTreeMaterializeErrorV1,
-) -> SnapshotPipelineMaterializationErrorV1 {
+fn flatten_four_view_observation_error(
+    error: SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
+    map_leaf: fn(SnapshotSourceObservationFailureV1) -> SnapshotPipelineFourViewErrorV1,
+) -> SnapshotPipelineFourViewErrorV1 {
     match error {
-        SnapshotTreeMaterializeErrorV1::Resource(error) => {
-            SnapshotPipelineMaterializationErrorV1::Resource(error)
+        SnapshotSourceObservationErrorV1::Resource(error) => {
+            SnapshotPipelineFourViewErrorV1::Resource(error)
         }
-        error @ (SnapshotTreeMaterializeErrorV1::Source(_)
-        | SnapshotTreeMaterializeErrorV1::Materializer(_)) => {
-            SnapshotPipelineMaterializationErrorV1::Materialization(error)
-        }
+        SnapshotSourceObservationErrorV1::Leaf(error) => map_leaf(error),
     }
 }
 
@@ -191,8 +203,17 @@ pub(super) enum SnapshotSourceObservationErrorV1<E> {
     Leaf(E),
 }
 
+/// Destination observation has the same fail-closed resource/leaf envelope as
+/// source observation. The connector-minted session below selects the distinct
+/// charged stage; an alias avoids a second identical error representation.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) type SnapshotDestinationObservationErrorV1<E> = SnapshotSourceObservationErrorV1<E>;
+
 impl<E> SnapshotSourceObservationErrorV1<E> {
-    fn map_leaf<F>(self, map: impl FnOnce(E) -> F) -> SnapshotSourceObservationErrorV1<F> {
+    pub(super) fn map_leaf<F>(
+        self,
+        map: impl FnOnce(E) -> F,
+    ) -> SnapshotSourceObservationErrorV1<F> {
         match self {
             Self::Resource(error) => SnapshotSourceObservationErrorV1::Resource(error),
             Self::Leaf(error) => SnapshotSourceObservationErrorV1::Leaf(map(error)),
@@ -216,6 +237,9 @@ pub(super) enum SnapshotSourceObservationFailureV1 {
     InvalidRegularEvidence,
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) type SnapshotDestinationObservationFailureV1 = SnapshotSourceObservationFailureV1;
+
 /// One matched publication session. It never exposes independently spliceable
 /// forward and cleanup authority.
 #[derive(Debug)]
@@ -230,6 +254,15 @@ pub(super) struct SnapshotPublicationSessionV1<'resources> {
 /// sole mutable resource ledger. The stage is structural rather than stored,
 /// so a caller cannot splice another phase into this authority.
 pub(super) struct SnapshotSourceObservationSessionV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    policy: &'resources SourceEnumerationPolicyV1,
+}
+
+/// Connector-minted authority for observing the owner-private staged tree.
+/// It shares the connector's immutable enumeration policy but charges every
+/// raw attempt to the distinct destination-observation stage.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct SnapshotDestinationObservationSessionV1<'resources> {
     resources: &'resources SnapshotPipelineResourcesV1,
     policy: &'resources SourceEnumerationPolicyV1,
 }
@@ -250,11 +283,10 @@ pub(super) struct SnapshotMaterializationSessionV1<'resources> {
 }
 
 /// One FD-free tree view paired with the connector's linear retained-heap
-/// lease. Source observation and the materializer's copy-time source pass mint
-/// this wrapper today; a future destination observer may share the retained
-/// representation but must use a distinct destination-stage session. Field
-/// order is intentional: the owned plan is destroyed before its budget lease
-/// is released.
+/// lease. Qualified-source observation, the materializer's copy-time source
+/// pass, and private-destination observation all mint this wrapper through
+/// their distinct connector-owned sessions. Field order is intentional: the
+/// owned plan is destroyed before its budget lease is released.
 pub(super) struct SnapshotRetainedTreeViewV1<'resources> {
     plan: SourceTreePlanV1,
     _lease: SnapshotRetainedViewLeaseV1<'resources>,
@@ -275,6 +307,27 @@ impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
     ) -> Result<T, SnapshotPipelineResourceErrorV1> {
         self.resources
             .run_forward_attempt(SnapshotPipelineForwardStageV1::SourceObservation, attempt)
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<'resources> SnapshotDestinationObservationSessionV1<'resources> {
+    pub(super) const fn enumeration_policy(&self) -> &'resources SourceEnumerationPolicyV1 {
+        self.policy
+    }
+
+    pub(super) const fn regular_copy_policy(&self) -> RegularCopyPolicyV1 {
+        self.policy.regular_copy_policy()
+    }
+
+    pub(super) fn run_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources.run_forward_attempt(
+            SnapshotPipelineForwardStageV1::DestinationObservation,
+            attempt,
+        )
     }
 }
 
@@ -341,27 +394,15 @@ impl SourceObservationTreeVisitorV1 for SnapshotSourceObservationVisitorV1 {
         let evidence = visit
             .observe()
             .map_err(|error| error.map_leaf(SnapshotSourceObservationFailureV1::Regular))?;
-        let (content_digest, data_extents) = evidence.into_parts();
-        admit_observed_regular_parts(logical_size, content_digest, data_extents)
+        admit_observed_regular_evidence(logical_size, evidence).ok_or(
+            SnapshotSourceObservationErrorV1::Leaf(
+                SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+            ),
+        )
     }
 }
 
-fn admit_observed_regular_parts(
-    logical_size: u64,
-    content_digest: FileContentDigest,
-    data_extents: Vec<ExtentV1>,
-) -> Result<
-    SourceRegularEvidenceV1,
-    SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
-> {
-    SourceRegularEvidenceV1::checked(content_digest, data_extents, logical_size).ok_or(
-        SnapshotSourceObservationErrorV1::Leaf(
-            SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
-        ),
-    )
-}
-
-fn flatten_source_observation_error(
+fn flatten_tree_observation_error(
     error: SnapshotSourceObservationErrorV1<
         SourceTreeAcquireFailureV1<
             SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
@@ -455,6 +496,14 @@ impl SnapshotConnectorV1 {
         }
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn destination_observation_session(&self) -> SnapshotDestinationObservationSessionV1<'_> {
+        SnapshotDestinationObservationSessionV1 {
+            resources: &self.resources,
+            policy: &self.source,
+        }
+    }
+
     fn materialization_session(&self) -> SnapshotMaterializationSessionV1<'_> {
         SnapshotMaterializationSessionV1 {
             resources: &self.resources,
@@ -492,11 +541,104 @@ impl SnapshotConnectorV1 {
         let mut visitor = SnapshotSourceObservationVisitorV1;
         let plan =
             enumerate_source_tree_view_charged_at(source_view, root_name, &session, &mut visitor)
-                .map_err(flatten_source_observation_error)?;
+                .map_err(flatten_tree_observation_error)?;
         Ok(SnapshotRetainedTreeViewV1 {
             plan,
             _lease: lease,
         })
+    }
+
+    /// Observe one exact view of the connector-created private destination.
+    /// The returned plan is FD-free and retains exactly one full-plan lease;
+    /// it grants no cleanup, readiness, publication, or execution authority.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn observe_destination_tree_view_at<'scope>(
+        &'scope self,
+        staging: &ChargedStagedSnapshotDirectoryV1<'_>,
+        root_name: &CStr,
+    ) -> Result<
+        SnapshotRetainedTreeViewV1<'scope>,
+        SnapshotDestinationObservationErrorV1<SnapshotDestinationObservationFailureV1>,
+    > {
+        let lease = self
+            .resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::DestinationObservation)
+            .map_err(SnapshotDestinationObservationErrorV1::Resource)?;
+        let session = self.destination_observation_session();
+        let plan =
+            enumerate_destination_tree_view_charged_at(staging.directory(), root_name, &session)
+                .map_err(flatten_tree_observation_error)?;
+        Ok(SnapshotRetainedTreeViewV1 {
+            plan,
+            _lease: lease,
+        })
+    }
+
+    /// Materialize a private stage and complete the mandatory comparison
+    /// sequence S1/S2, S1/D1, and D1/D2 while never retaining more than two
+    /// bounded plans. Success returns only the still-unready cleanup guard;
+    /// comparison success is deliberately not represented as authority.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn materialize_source_tree_four_view_at<'scope>(
+        &'scope self,
+        publication_parent: BorrowedFd<'scope>,
+        staging_name: &CStr,
+        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
+        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<ChargedStagedSnapshotDirectoryV1<'scope>, SnapshotPipelineFourViewErrorV1> {
+        let (staging, source_s1) = self.materialize_source_tree_at(
+            publication_parent,
+            staging_name,
+            source_s1_view,
+            root_name,
+        )?;
+
+        let source_s2 = self
+            .observe_source_tree_view_at(source_s2_view, root_name)
+            .map_err(|error| {
+                flatten_four_view_observation_error(
+                    error,
+                    SnapshotPipelineFourViewErrorV1::SourceObservation,
+                )
+            })?;
+        let source_stable = begin_four_view_comparison(&source_s1.plan)
+            .compare_source_s2(&source_s2.plan)
+            .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
+        drop(source_s2);
+
+        let destination_d1 = self
+            .observe_destination_tree_view_at(&staging, root_name)
+            .map_err(|error| {
+                flatten_four_view_observation_error(
+                    error,
+                    SnapshotPipelineFourViewErrorV1::DestinationObservation,
+                )
+            })?;
+        let (uid, gid) = staging.expected_owner();
+        let destination_stable = source_stable
+            .compare_destination_d1(
+                &destination_d1.plan,
+                DestinationPhysicalIdentityV1::new(uid, gid),
+            )
+            .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
+        drop(source_s1);
+
+        let destination_d2 = self
+            .observe_destination_tree_view_at(&staging, root_name)
+            .map_err(|error| {
+                flatten_four_view_observation_error(
+                    error,
+                    SnapshotPipelineFourViewErrorV1::DestinationObservation,
+                )
+            })?;
+        destination_stable
+            .compare_destination_d2(&destination_d2.plan)
+            .map_err(SnapshotPipelineFourViewErrorV1::Comparison)?;
+        drop(destination_d2);
+        drop(destination_d1);
+
+        Ok(staging)
     }
 
     /// In one connector-owned operation, selects this connector's policies and
@@ -509,7 +651,7 @@ impl SnapshotConnectorV1 {
     /// or publication transitions. Capacity refusal before publication leaves
     /// the one-shot unused; any failure after publication begins consumes it.
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    pub(super) fn materialize_source_tree_at<'scope>(
+    fn materialize_source_tree_at<'scope>(
         &'scope self,
         publication_parent: BorrowedFd<'scope>,
         staging_name: &CStr,
@@ -520,7 +662,7 @@ impl SnapshotConnectorV1 {
             ChargedStagedSnapshotDirectoryV1<'scope>,
             SnapshotRetainedTreeViewV1<'scope>,
         ),
-        SnapshotPipelineMaterializationErrorV1,
+        SnapshotPipelineFourViewErrorV1,
     > {
         // The traversal's source plan and the materializer's event workspace
         // can each reach one full-plan ceiling. Reserve both before publication
@@ -529,14 +671,14 @@ impl SnapshotConnectorV1 {
         let source_plan_lease = self
             .resources
             .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
-            .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
+            .map_err(SnapshotPipelineFourViewErrorV1::Resource)?;
         let materializer_plan_lease = self
             .resources
             .reserve_retained_view(SnapshotPipelineForwardStageV1::Materialization)
-            .map_err(SnapshotPipelineMaterializationErrorV1::Resource)?;
+            .map_err(SnapshotPipelineFourViewErrorV1::Resource)?;
         let publication = self
             .begin_publication()
-            .ok_or(SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted)?;
+            .ok_or(SnapshotPipelineFourViewErrorV1::PublicationAlreadyStarted)?;
         let staging = super::snapshot_publish::create_charged_staged_snapshot_directory_at(
             publication_parent,
             staging_name,
@@ -544,19 +686,27 @@ impl SnapshotConnectorV1 {
         )
         .map_err(|error| match error {
             SnapshotChargedErrorV1::PublicationAlreadyStarted => {
-                SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted
+                SnapshotPipelineFourViewErrorV1::PublicationAlreadyStarted
             }
             SnapshotChargedErrorV1::Resource(error) => {
-                SnapshotPipelineMaterializationErrorV1::Resource(error)
+                SnapshotPipelineFourViewErrorV1::Resource(error)
             }
             SnapshotChargedErrorV1::Leaf(error) => {
-                SnapshotPipelineMaterializationErrorV1::Publication(error)
+                SnapshotPipelineFourViewErrorV1::Publication(error)
             }
         })?;
         let materialization = self.materialization_session();
         let (staging, plan) =
             materialize_source_tree_charged_at(staging, source_view, root_name, &materialization)
-                .map_err(flatten_pipeline_materialization_error)?;
+                .map_err(|error| match error {
+                SnapshotTreeMaterializeErrorV1::Resource(error) => {
+                    SnapshotPipelineFourViewErrorV1::Resource(error)
+                }
+                error @ (SnapshotTreeMaterializeErrorV1::Source(_)
+                | SnapshotTreeMaterializeErrorV1::Materializer(_)) => {
+                    SnapshotPipelineFourViewErrorV1::Materialization(error)
+                }
+            })?;
         drop(materializer_plan_lease);
         Ok((
             staging,
@@ -568,8 +718,8 @@ impl SnapshotConnectorV1 {
     }
 
     /// Test-only access to the charged staging checkpoint. Production code
-    /// must use `materialize_source_tree_at` so a stage cannot escape before
-    /// its connector-owned population attempt.
+    /// must use `materialize_source_tree_four_view_at` so a stage cannot escape
+    /// before population and all mandatory comparisons complete.
     #[cfg(test)]
     pub(super) fn create_staged_snapshot_directory_at<'scope>(
         &'scope self,
@@ -1319,6 +1469,11 @@ mod tests {
         <SnapshotPublicationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            <SnapshotDestinationObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
+            <SnapshotDestinationObservationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        }
         <SnapshotMaterializationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotMaterializationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotRetainedTreeViewV1<'static> as AmbiguousIfClone<_>>::probe();
@@ -1372,6 +1527,29 @@ mod tests {
 
         assert!(std::ptr::eq(first.source_policy(), &connector.source));
         assert!(std::ptr::eq(first.source_policy(), second.source_policy()));
+        assert_eq!(first.regular_copy_policy(), second.regular_copy_policy());
+        assert!(std::ptr::eq(first.resources, second.resources));
+
+        let before = connector.resources.forward_attempts_remaining_for_test();
+        first.run_attempt(|| ()).unwrap();
+        assert_eq!(
+            second.resources.forward_attempts_remaining_for_test(),
+            before - 1
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn destination_observation_sessions_share_exact_policy_and_forward_ledger() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let first = connector.destination_observation_session();
+        let second = connector.destination_observation_session();
+
+        assert!(std::ptr::eq(first.enumeration_policy(), &connector.source));
+        assert!(std::ptr::eq(
+            first.enumeration_policy(),
+            second.enumeration_policy()
+        ));
         assert_eq!(first.regular_copy_policy(), second.regular_copy_policy());
         assert!(std::ptr::eq(first.resources, second.resources));
 
@@ -1458,6 +1636,148 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    fn publication_failure_is_flat_redacted_cleans_leases_and_consumes_one_shot() {
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let invalid_source = File::open("/dev/null").unwrap();
+        let invalid_staging_name = c"secret-invalid-staging-sentinel";
+        let invalid_staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(invalid_staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let forward_before = connector.resources.forward_attempts_remaining_for_test();
+        // SAFETY: the invalid staging basename refuses before either source
+        // view can be traversed.
+        let source_s1_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+        // SAFETY: the same pre-filesystem refusal keeps this independent view
+        // unused as well.
+        let source_s2_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+
+        let error = match connector.materialize_source_tree_four_view_at(
+            publication_parent_fd.as_fd(),
+            invalid_staging_name,
+            source_s1_view,
+            source_s2_view,
+            c"root",
+        ) {
+            Err(error) => error,
+            Ok(staging) => {
+                drop(staging);
+                panic!("an invalid staging basename must fail closed");
+            }
+        };
+
+        assert!(matches!(
+            &error,
+            SnapshotPipelineFourViewErrorV1::Publication(_)
+        ));
+        assert_eq!(format!("{error:?}"), "Publication(<redacted>)");
+        assert_eq!(
+            connector.resources.forward_attempts_remaining_for_test(),
+            forward_before
+        );
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert!(!invalid_staging_path.exists());
+        assert!(connector.publication_started.get());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn destination_observation_enforces_two_leases_and_rolls_back_leaf_failure() {
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let staging_name = c".again-snapshot-stage-55555555555555555555555555555555";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let staging = connector
+            .create_staged_snapshot_directory_at(publication_parent_fd.as_fd(), staging_name)
+            .unwrap();
+        fs::create_dir(staging_path.join("root")).unwrap();
+        let per_view = connector.resources.policy().max_retained_view_bytes().get();
+
+        let destination_d1 = connector
+            .observe_destination_tree_view_at(&staging, c"root")
+            .unwrap();
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            per_view
+        );
+        let destination_d2 = connector
+            .observe_destination_tree_view_at(&staging, c"root")
+            .unwrap();
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            per_view * 2
+        );
+
+        let forward_before_third = connector.resources.forward_attempts_remaining_for_test();
+        let third_error = match connector.observe_destination_tree_view_at(&staging, c"root") {
+            Err(error) => error,
+            Ok(view) => {
+                drop(view);
+                panic!("a third retained destination view must fail closed");
+            }
+        };
+        assert_eq!(
+            third_error,
+            SnapshotDestinationObservationErrorV1::Resource(
+                SnapshotPipelineResourceErrorV1::RetainedViewHeapCapacityExceeded {
+                    stage: SnapshotPipelineForwardStageV1::DestinationObservation,
+                    live: per_view * 2,
+                    requested: per_view,
+                    limit: per_view * 2,
+                }
+            )
+        );
+        assert_eq!(
+            connector.resources.forward_attempts_remaining_for_test(),
+            forward_before_third
+        );
+
+        drop(destination_d2);
+        assert_eq!(
+            connector.resources.retained_view_heap_live_for_test(),
+            per_view
+        );
+        drop(destination_d1);
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+
+        let missing_error = match connector
+            .observe_destination_tree_view_at(&staging, c"secret-missing-root-sentinel")
+        {
+            Err(error) => error,
+            Ok(view) => {
+                drop(view);
+                panic!("a missing destination root must fail closed");
+            }
+        };
+        assert!(matches!(
+            &missing_error,
+            SnapshotDestinationObservationErrorV1::Leaf(
+                SnapshotDestinationObservationFailureV1::Tree(_)
+            )
+        ));
+        let rendered = format!("{missing_error:?}");
+        assert_eq!(rendered, "Leaf(<redacted>)");
+        assert!(!rendered.contains("secret-missing-root-sentinel"));
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+
+        drop(staging);
+        assert!(!staging_path.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn materialization_plan_reservations_roll_back_before_staging() {
         let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
         let per_view = connector.resources.policy().max_retained_view_bytes().get();
@@ -1489,7 +1809,7 @@ mod tests {
                 source_view,
                 c"root",
             ),
-            Err(SnapshotPipelineMaterializationErrorV1::Resource(
+            Err(SnapshotPipelineFourViewErrorV1::Resource(
                 SnapshotPipelineResourceErrorV1::RetainedViewHeapCapacityExceeded {
                     stage: SnapshotPipelineForwardStageV1::Materialization,
                     live,
@@ -1516,7 +1836,7 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     #[ignore = "requires a provisioned ST_NOATIME source view that passes functional qualification"]
-    fn charged_materialization_copies_exact_bytes_preserves_atime_and_cleans_on_drop() {
+    fn four_view_materialization_copies_exact_bytes_preserves_atime_and_cleans_on_drop() {
         let source_parent = tempfile::tempdir().unwrap();
         let source_tree = source_parent.path().join("tree");
         let source_file = source_tree.join("file");
@@ -1540,27 +1860,33 @@ mod tests {
         let publication_parent = tempfile::tempdir().unwrap();
         let publication_parent_fd = File::open(publication_parent.path()).unwrap();
         let source_parent_fd = File::open(source_parent.path()).unwrap();
-        let staging_name = c".again-snapshot-stage-11111111111111111111111111111111";
+        let staging_name = c".again-snapshot-stage-44444444444444444444444444444444";
         let staging_path = publication_parent
             .path()
             .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
         let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
         // SAFETY: this mechanics-only fixture is owned by the test, has no
-        // concurrent writer, and an immediate second directory/regular probe
-        // above proved that the exact objects used here retain atime. The
-        // assertions below recheck that condition; this does not claim that
-        // the host passed production functional qualification.
-        let source_view = unsafe {
+        // concurrent writer, and the repeated probes above proved that the
+        // exact objects retain atime. This does not claim that the host passed
+        // production functional qualification.
+        let source_s1_view = unsafe {
             QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
                 source_parent_fd.as_fd(),
             )
         };
-
-        let (staged, source_s1) = connector
-            .materialize_source_tree_at(
+        // SAFETY: this is a separately constructed view for the independent
+        // S2 traversal over that still-live provisioned source mount.
+        let source_s2_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_parent_fd.as_fd(),
+            )
+        };
+        let staged = connector
+            .materialize_source_tree_four_view_at(
                 publication_parent_fd.as_fd(),
                 staging_name,
-                source_view,
+                source_s1_view,
+                source_s2_view,
                 c"tree",
             )
             .unwrap();
@@ -1568,16 +1894,82 @@ mod tests {
         assert_eq!(fs::read(staging_path.join("tree/file")).unwrap(), expected);
         assert_eq!(source_atime(&source_tree), tree_atime);
         assert_eq!(source_atime(&source_file), file_atime);
-        assert_eq!(
-            connector.resources.retained_view_heap_live_for_test(),
-            connector.resources.policy().max_retained_view_bytes().get()
-        );
-        drop(source_s1);
         assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
-        assert!(staging_path.exists());
-
         drop(staged);
         assert!(!staging_path.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[ignore = "requires a provisioned ST_NOATIME source view that passes functional qualification"]
+    fn source_s1_s2_mismatch_cleans_stage_leases_and_consumes_one_shot() {
+        use super::super::snapshot_verify::{SnapshotMismatchFieldV1, SnapshotViewPairV1};
+
+        let source_a = tempfile::tempdir().unwrap();
+        let source_b = tempfile::tempdir().unwrap();
+        let tree_a = source_a.path().join("tree");
+        let tree_b = source_b.path().join("tree");
+        fs::create_dir(&tree_a).unwrap();
+        fs::create_dir(&tree_b).unwrap();
+
+        assert_eq!(fs::read_dir(&tree_a).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&tree_b).unwrap().count(), 0);
+        let tree_a_atime = source_atime(&tree_a);
+        let tree_b_atime = source_atime(&tree_b);
+        assert_eq!(fs::read_dir(&tree_a).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&tree_b).unwrap().count(), 0);
+        assert_eq!(source_atime(&tree_a), tree_a_atime);
+        assert_eq!(source_atime(&tree_b), tree_b_atime);
+
+        let source_a_fd = File::open(source_a.path()).unwrap();
+        let source_b_fd = File::open(source_b.path()).unwrap();
+        let publication_parent = tempfile::tempdir().unwrap();
+        let publication_parent_fd = File::open(publication_parent.path()).unwrap();
+        let staging_name = c".again-snapshot-stage-66666666666666666666666666666666";
+        let staging_path = publication_parent
+            .path()
+            .join(std::ffi::OsStr::from_bytes(staging_name.to_bytes()));
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        // SAFETY: the repeated probes above establish the mechanics-only
+        // no-atime precondition for the exact source-A objects in this ignored
+        // provisioned-runner test.
+        let source_s1_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_a_fd.as_fd(),
+            )
+        };
+        // SAFETY: the repeated probes above independently establish the same
+        // precondition for the exact source-B objects.
+        let source_s2_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_b_fd.as_fd(),
+            )
+        };
+
+        let error = match connector.materialize_source_tree_four_view_at(
+            publication_parent_fd.as_fd(),
+            staging_name,
+            source_s1_view,
+            source_s2_view,
+            c"tree",
+        ) {
+            Err(error) => error,
+            Ok(staging) => {
+                drop(staging);
+                panic!("distinct source views must fail S1/S2 comparison");
+            }
+        };
+
+        let SnapshotPipelineFourViewErrorV1::Comparison(mismatch) = &error else {
+            panic!("expected a comparison failure: {error:?}")
+        };
+        assert_eq!(mismatch.pair, SnapshotViewPairV1::S1S2);
+        assert_eq!(mismatch.field, SnapshotMismatchFieldV1::InodeIdentity);
+        assert!(!staging_path.exists());
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
+        assert!(connector.publication_started.get());
+        assert_eq!(source_atime(&tree_a), tree_a_atime);
+        assert_eq!(source_atime(&tree_b), tree_b_atime);
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1647,7 +2039,7 @@ mod tests {
 
         assert!(matches!(
             &error,
-            SnapshotPipelineMaterializationErrorV1::Materialization(
+            SnapshotPipelineFourViewErrorV1::Materialization(
                 SnapshotTreeMaterializeErrorV1::Materializer(_)
             )
         ));
@@ -1676,21 +2068,28 @@ mod tests {
         // SAFETY: the non-directory descriptor makes traversal refuse at its
         // first path-resolution operation. No source data, directory stream,
         // regular bytes, symlink target, or xattrs can be read through it.
-        let source_view = unsafe {
+        let source_s1_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+        // SAFETY: materialization refuses before this independently supplied
+        // second view can be observed.
+        let source_s2_view = unsafe {
             QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
                 invalid_source.as_fd(),
             )
         };
 
-        let error = match connector.materialize_source_tree_at(
+        let error = match connector.materialize_source_tree_four_view_at(
             publication_parent_fd.as_fd(),
             staging_name,
-            source_view,
+            source_s1_view,
+            source_s2_view,
             c"root",
         ) {
             Err(error) => error,
-            Ok((staged, source_s1)) => {
-                drop(source_s1);
+            Ok(staged) => {
                 drop(staged);
                 panic!("a non-directory source parent must fail closed");
             }
@@ -1698,7 +2097,7 @@ mod tests {
 
         assert!(matches!(
             &error,
-            SnapshotPipelineMaterializationErrorV1::Materialization(
+            SnapshotPipelineFourViewErrorV1::Materialization(
                 SnapshotTreeMaterializeErrorV1::Source(_)
             )
         ));
@@ -1709,19 +2108,26 @@ mod tests {
         let forward_before = connector.resources.forward_attempts_remaining_for_test();
         // SAFETY: publication refusal occurs after structural lease
         // reservation but before traversal, so this descriptor is not read.
-        let second_source_view = unsafe {
+        let second_source_s1_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                invalid_source.as_fd(),
+            )
+        };
+        // SAFETY: publication refusal occurs before this second view is read.
+        let second_source_s2_view = unsafe {
             QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
                 invalid_source.as_fd(),
             )
         };
         assert!(matches!(
-            connector.materialize_source_tree_at(
+            connector.materialize_source_tree_four_view_at(
                 publication_parent_fd.as_fd(),
                 staging_name,
-                second_source_view,
+                second_source_s1_view,
+                second_source_s2_view,
                 c"root",
             ),
-            Err(SnapshotPipelineMaterializationErrorV1::PublicationAlreadyStarted)
+            Err(SnapshotPipelineFourViewErrorV1::PublicationAlreadyStarted)
         ));
         assert_eq!(
             connector.resources.forward_attempts_remaining_for_test(),
@@ -1729,26 +2135,6 @@ mod tests {
         );
         assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
         assert!(!staging_path.exists());
-    }
-
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[test]
-    fn pipeline_materialization_flattens_resource_to_outer_resource() {
-        let resource = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
-            stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
-                SnapshotPipelineForwardStageV1::Materialization,
-            ),
-            bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
-        };
-
-        match flatten_pipeline_materialization_error(SnapshotTreeMaterializeErrorV1::Resource(
-            resource,
-        )) {
-            SnapshotPipelineMaterializationErrorV1::Resource(actual) => {
-                assert_eq!(actual, resource);
-            }
-            other => panic!("resource error was nested instead of flattened: {other:?}"),
-        }
     }
 
     #[test]
@@ -1780,6 +2166,23 @@ mod tests {
                 .publisher_cleanup_attempts_remaining_for_test(),
             cleanup_before
         );
+
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            let destination_session = connector.destination_observation_session();
+            assert_eq!(
+                destination_session
+                    .run_attempt(|| invoked.set(true))
+                    .unwrap_err(),
+                SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                    stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                        SnapshotPipelineForwardStageV1::DestinationObservation,
+                    ),
+                    bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
+                }
+            );
+            assert!(!invoked.get());
+        }
     }
 
     #[test]
@@ -1827,49 +2230,53 @@ mod tests {
         assert_eq!(rendered, "Leaf(<redacted>)");
     }
 
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn observed_regular_parts_are_revalidated_before_plan_admission() {
-        let digest = FileContentDigest([7; 32]);
-        let admitted = admit_observed_regular_parts(
-            3,
-            digest,
-            vec![
-                ExtentV1 {
-                    offset: 0,
-                    length: 1,
-                },
-                ExtentV1 {
-                    offset: 2,
-                    length: 1,
-                },
-            ],
-        )
-        .unwrap();
-        assert_eq!(admitted.content_digest(), digest);
-        assert_eq!(admitted.data_extents().len(), 2);
-
-        let error = match admit_observed_regular_parts(
-            2,
-            digest,
-            vec![
-                ExtentV1 {
-                    offset: 0,
-                    length: 1,
-                },
-                ExtentV1 {
-                    offset: 1,
-                    length: 1,
-                },
-            ],
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("overlapping extents must not enter the source plan"),
+    fn four_view_error_flattening_routes_resources_and_roles_exactly() {
+        let resource = SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+            stage: super::super::snapshot_policy::SnapshotPipelineStageV1::Forward(
+                SnapshotPipelineForwardStageV1::DestinationObservation,
+            ),
+            bucket: super::super::snapshot_policy::SnapshotPipelineAttemptBucketV1::Forward,
         };
-        assert_eq!(
-            error,
+        let mapped_resource = flatten_four_view_observation_error(
+            SnapshotSourceObservationErrorV1::Resource(resource),
+            SnapshotPipelineFourViewErrorV1::SourceObservation,
+        );
+        assert!(matches!(
+            mapped_resource,
+            SnapshotPipelineFourViewErrorV1::Resource(actual) if actual == resource
+        ));
+
+        let source = flatten_four_view_observation_error(
             SnapshotSourceObservationErrorV1::Leaf(
                 SnapshotSourceObservationFailureV1::InvalidRegularEvidence,
+            ),
+            SnapshotPipelineFourViewErrorV1::SourceObservation,
+        );
+        assert!(matches!(
+            &source,
+            SnapshotPipelineFourViewErrorV1::SourceObservation(
+                SnapshotSourceObservationFailureV1::InvalidRegularEvidence
             )
+        ));
+        assert_eq!(format!("{source:?}"), "SourceObservation(<redacted>)");
+
+        let destination = flatten_four_view_observation_error(
+            SnapshotDestinationObservationErrorV1::Leaf(
+                SnapshotDestinationObservationFailureV1::InvalidRegularEvidence,
+            ),
+            SnapshotPipelineFourViewErrorV1::DestinationObservation,
+        );
+        assert!(matches!(
+            &destination,
+            SnapshotPipelineFourViewErrorV1::DestinationObservation(
+                SnapshotDestinationObservationFailureV1::InvalidRegularEvidence
+            )
+        ));
+        assert_eq!(
+            format!("{destination:?}"),
+            "DestinationObservation(<redacted>)"
         );
     }
 
@@ -1888,7 +2295,7 @@ mod tests {
         });
 
         assert_eq!(
-            flatten_source_observation_error(nested),
+            flatten_tree_observation_error(nested),
             SnapshotSourceObservationErrorV1::Resource(resource)
         );
     }
@@ -1903,7 +2310,7 @@ mod tests {
             ),
         });
 
-        let flattened = flatten_source_observation_error(nested);
+        let flattened = flatten_tree_observation_error(nested);
         assert_eq!(
             flattened,
             SnapshotSourceObservationErrorV1::Leaf(

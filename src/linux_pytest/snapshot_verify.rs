@@ -1,10 +1,10 @@
 //! Allocation-free semantic comparison for the four snapshot observations.
 //!
 //! Connector orchestration must retain at most two policy-bounded plans at
-//! once and drive this typestate in order: S1/S2, S1/D1, then D1/D2. That
-//! orchestration is not wired yet. This module only compares already-normalized
-//! plans. Successful comparison does not grant manifest or publication
-//! authority and is not a substitute for canonical verification.
+//! once and now drives this typestate in order: S1/S2, S1/D1, then D1/D2. This
+//! module only compares already-normalized plans. Successful comparison does
+//! not grant manifest or publication authority and is not a substitute for
+//! canonical verification.
 
 use super::snapshot_materialize::projected_materialized_permissions;
 use super::snapshot_tree::{

@@ -22,8 +22,9 @@ population, the materializer also requires a private-field cleanup envelope
 read from the actual staged publisher to dominate its source depth, entry
 count, basename, and retry limits. Mismatch refuses before materializer
 population and delegates bounded, best-effort cleanup to the staged publisher.
-These leaves do not yet form the required four-view sealed snapshot pipeline
-and are not wired to `SnapshotProvider`.
+The connector now joins the supported materialization and observation leaves
+into internal four-view comparison mechanics, but it does not produce a ready
+or sealed snapshot and is not wired to `SnapshotProvider`.
 
 A static, allocation-free projection now returns a non-`Clone`, non-`Copy`
 connector that owns the preflighted policy and one shared operation/heap
@@ -38,11 +39,24 @@ operation reserves both ceilings for its enumerator plan and materializer
 workspace before filesystem work, creates the sole charged private stage,
 walks the already-qualified source, invokes the charged regular-copy leaf, and
 returns the populated RAII-cleanup guard beside the retained copy-time source
-plan. The materializer-workspace lease is released while the source-plan lease
-remains attached to that plan. The session binds the exact source,
-destination, and copy policies to the shared ledger. The guard and plan expose
-no ready, publish, or execution transition. Destination observation and the
-complete pairwise four-view orchestration remain in progress and unwired.
+plan, S1. The materializer-workspace lease is released while the source-plan
+lease remains attached to that plan. The session binds the exact source,
+destination, and copy policies to the shared ledger.
+
+On Linux x86_64, the connector's atomic comparison path next observes an
+independent source plan S2 and then two independent destination plans D1 and
+D2. Destination observation uses a distinct connector-minted charged session;
+directory and regular-file content reads use `O_NOATIME`, and a destination
+symlink is refused after descriptor-selected type identification but before
+xattr or target acquisition, including before `readlinkat`. The connector
+compares S1/S2, S1/D1 with the stage's expected physical owner, and D1/D2, in
+that order. It drops S2 before D1, S1 before D2, and every remaining plan
+before returning, so at most two retained-view leases coexist. Success returns
+only the still-unready RAII cleanup guard. Comparison success is not an
+authority, and no ready, publish, Python-execution, or reuse transition exists.
+
+Runtime qualification and retained evidence are tracked in
+[STATUS.md](STATUS.md).
 
 Within the wired source-observation, materialization, and staged-publication
 slices, every raw attempt, including every retry, is charged before invocation.
@@ -56,9 +70,10 @@ retained-name heap is
 `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each active cleanup frame retains
 one fixed two-slot name batch on the stack; those stack bytes and
 allocator-private metadata are outside the transient-heap ledger. Maximum-depth
-cleanup is retained as a required test on each supported build/target;
-destination observation and the remaining charged orchestration are required
-before this checkpoint can become a release-qualified snapshot backend.
+cleanup is retained as a required test on each supported build/target. Positive
+qualified runtime evidence and every readiness, sealing, publication,
+isolation, Python-execution, and reuse transition remain required before this
+checkpoint can become a release-qualified snapshot backend.
 
 Each charged `Vec<u8>` precharges its requested capacity, observes capacity
 after `try_reserve_exact`, and accepts only exact equality. Allocator

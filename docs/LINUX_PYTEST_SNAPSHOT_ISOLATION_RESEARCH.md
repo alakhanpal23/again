@@ -189,9 +189,24 @@ cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact maximum
 live retained-name heap is `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each
 active cleanup frame retains a fixed two-slot name batch on the stack; those
 stack bytes are outside the transient-heap ledger. The guard exposes no ready,
-publish, or execution transition. Destination observation, four-view
-orchestration, publication, and every later isolation step in this note remain
-research requirements.
+publish, or execution transition.
+
+The current Linux x86_64 connector continues from the copy-time source plan S1
+with an independent source observation S2, followed by destination observations
+D1 and D2 over the owner-private stage. Destination observation has its own
+connector-minted charged session. Directory and regular-file reads use
+`O_NOATIME`; a destination symlink is refused after descriptor-selected type
+identification and before xattr or target acquisition, including before
+`readlinkat`. The connector compares S1/S2, S1/D1 with the stage's expected
+physical owner, and D1/D2, in that order. It drops retained plans between steps
+so no more than two retained-view leases coexist. On success all plans and
+leases are gone and only the still-unready cleanup guard returns; the
+comparison result does not mint readiness, publication, execution, or reuse
+authority, and no Python process can run through this checkpoint.
+
+Runtime qualification and retained evidence are tracked in
+[STATUS.md](STATUS.md). Readiness, immutable publication, and every later
+isolation step in this note remain research requirements.
 
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`
@@ -215,20 +230,23 @@ copied boundary and cannot satisfy the current wire contract.
 
 ### 5. Stability and sealing
 
-Construct all four views:
+The current connector constructs and consumes the four views in this order:
 
-- first logical source manifest while copying;
-- first destination manifest;
-- second complete source walk/hash/xattr/extent manifest; and
-- second complete destination manifest.
+- S1, the logical source manifest captured while copying;
+- S2, an independent complete source walk/hash/xattr/extent manifest;
+- D1, a complete destination manifest; and
+- D2, an independent complete destination manifest.
 
-Require the source passes to agree, the destination passes to agree, and each
-destination representation to match its logical source projection. The final
-physical sealed-mode projection and its post-chmod xattr verification are
-already part of both destination views; no chmod or other metadata mutation is
-permitted after the second destination view. Fsync files and directories before
-those verified views (or prove that a final fsync cannot change any compared
-semantic field), atomically publish with
+It compares S1/S2, S1/D1, and D1/D2. Exact comparison makes the D2 match to S1
+transitive rather than retaining a third plan for another direct comparison.
+The final physical sealed-mode projection and its post-chmod xattr verification
+are already part of both destination views. The current materializer fsyncs
+each supported file and directory before destination observation, but the
+success value remains only an unready cleanup guard whose staged-directory
+descriptor is still visible inside the crate. A complete backend must hide
+that mutation surface or perform another exact revalidation before turning the
+state into nonforgeable readiness. It must also preserve or reprove the
+durability boundary for every compared semantic field, atomically publish with
 `renameat2(..., RENAME_NOREPLACE)`, and fsync the state parent directory. The
 logical source mode remains in the manifest and is restored only on the private
 execution branch.

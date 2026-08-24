@@ -1,13 +1,15 @@
-//! Descriptor-stable source-tree enumeration for `linux-pytest-v1`.
+//! Descriptor-stable tree enumeration for `linux-pytest-v1`.
 //!
 //! This leaf turns one trusted parent descriptor plus one raw C basename into
-//! one independently revalidated source view. The parent must already belong
-//! to the profile-qualified no-atime acquisition view: `readlinkat` can update
-//! symlink atime on an ordinary host mount. A trusted visitor may consume each
-//! entry only while its descriptor is pinned; the returned normalized plan is
-//! FD-free. This module does not compare the required source and destination
-//! views, compute manifest node digests, publish a snapshot, or claim that a
-//! source tree is sealed.
+//! one independently revalidated logical tree view. A source parent must
+//! already belong to the profile-qualified no-atime acquisition view because
+//! `readlinkat` can update symlink atime on an ordinary host mount. Destination
+//! observation is restricted to the owner-private staging tree, uses no-atime
+//! directory and regular reads, and rejects symlinks before target acquisition.
+//! A trusted visitor may consume each entry only while its descriptor is
+//! pinned; the returned normalized plan is FD-free. This module does not
+//! compare the required views, compute manifest node digests, publish a
+//! snapshot, or claim that a tree is sealed.
 
 use std::ffi::CStr;
 use std::fmt;
@@ -15,7 +17,10 @@ use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::BorrowedFd;
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_connector::SnapshotMaterializationSessionV1;
+use super::snapshot_connector::{
+    SnapshotDestinationObservationErrorV1, SnapshotDestinationObservationFailureV1,
+    SnapshotDestinationObservationSessionV1, SnapshotMaterializationSessionV1,
+};
 use super::snapshot_connector::{
     SnapshotSourceObservationErrorV1, SnapshotSourceObservationSessionV1,
 };
@@ -641,6 +646,16 @@ impl SourceRegularEvidenceV1 {
     }
 }
 
+/// Admit the bounded regular observation shared by source and destination
+/// visitors into the normalized tree-plan representation.
+pub(super) fn admit_observed_regular_evidence(
+    logical_size: u64,
+    evidence: RegularCopyEvidenceV1,
+) -> Option<SourceRegularEvidenceV1> {
+    let (content_digest, data_extents) = evidence.into_parts();
+    SourceRegularEvidenceV1::checked(content_digest, data_extents, logical_size)
+}
+
 fn valid_extent_sequence(data_extents: &[ExtentV1], logical_size: u64) -> bool {
     !data_extents.iter().any(|extent| {
         extent.length == 0
@@ -790,8 +805,9 @@ impl fmt::Debug for SourceHardlinkGroupV1 {
     }
 }
 
-/// An immutable, FD-free record of one independently revalidated source view.
-/// It does not freeze bytes or directory membership and is not snapshot
+/// An immutable, FD-free record of one independently revalidated logical tree
+/// view, either the qualified source or owner-private staged destination. It
+/// does not freeze bytes or directory membership and is not snapshot
 /// publication authority.
 #[derive(Eq, PartialEq)]
 pub(super) struct SourceTreePlanV1 {
@@ -1235,6 +1251,22 @@ pub(super) fn enumerate_source_tree_view_charged_at<V: SourceObservationTreeVisi
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn enumerate_destination_tree_view_charged_at(
+    staged_parent: BorrowedFd<'_>,
+    root_name: &CStr,
+    session: &SnapshotDestinationObservationSessionV1<'_>,
+) -> Result<
+    SourceTreePlanV1,
+    SnapshotDestinationObservationErrorV1<
+        SourceTreeAcquireFailureV1<
+            SnapshotDestinationObservationErrorV1<SnapshotDestinationObservationFailureV1>,
+        >,
+    >,
+> {
+    platform::enumerate_destination_tree_view_charged_at(staged_parent, root_name, session)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn enumerate_source_tree_view_materializing_at<V: SourceMaterializationTreeVisitorV1>(
     source_view: QualifiedNoAtimeSourceViewV1<'_>,
     root_name: &CStr,
@@ -1323,7 +1355,7 @@ mod platform {
             }
         }
 
-        fn into_source_observation(self) -> SnapshotSourceObservationErrorV1<E> {
+        fn into_observation(self) -> SnapshotSourceObservationErrorV1<E> {
             match self {
                 Self::Resource(error) => SnapshotSourceObservationErrorV1::Resource(error),
                 Self::Leaf(error) => SnapshotSourceObservationErrorV1::Leaf(error),
@@ -1377,6 +1409,15 @@ mod platform {
             attempt: impl FnOnce() -> T,
         ) -> Result<T, SnapshotPipelineResourceErrorV1> {
             SnapshotSourceObservationSessionV1::run_attempt(self, attempt)
+        }
+    }
+
+    impl AttemptGateV1 for SnapshotDestinationObservationSessionV1<'_> {
+        fn run_attempt<T>(
+            &self,
+            attempt: impl FnOnce() -> T,
+        ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+            SnapshotDestinationObservationSessionV1::run_attempt(self, attempt)
         }
     }
 
@@ -1493,6 +1534,63 @@ mod platform {
 
         fn symlink(&mut self, _visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
             Ok(())
+        }
+
+        fn directory_leave(
+            &mut self,
+            _visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct DestinationObservationWalkVisitorV1<'session, 'resources> {
+        session: &'session SnapshotDestinationObservationSessionV1<'resources>,
+    }
+
+    impl WalkVisitorV1 for DestinationObservationWalkVisitorV1<'_, '_> {
+        type Error = SnapshotDestinationObservationErrorV1<SnapshotDestinationObservationFailureV1>;
+
+        fn directory_enter(
+            &mut self,
+            _visit: SourceDirectoryVisitV1<'_>,
+        ) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn regular(
+            &mut self,
+            common: SourceVisitCommonV1<'_>,
+            _copy_policy: RegularCopyPolicyV1,
+        ) -> Result<SourceRegularEvidenceV1, Self::Error> {
+            let logical_size = common.statx.size();
+            // SAFETY: this private fixed visitor is constructed only by the
+            // destination entrypoint over one still-live staged-tree callback.
+            let evidence = unsafe {
+                super::super::snapshot_regular::observe_destination_regular_from_private_pinned_at(
+                    common.parent,
+                    common.name,
+                    common.handle,
+                    self.session,
+                )
+            }
+            .map_err(|error| error.map_leaf(SnapshotDestinationObservationFailureV1::Regular))?;
+            admit_observed_regular_evidence(logical_size, evidence).ok_or(
+                SnapshotDestinationObservationErrorV1::Leaf(
+                    SnapshotDestinationObservationFailureV1::InvalidRegularEvidence,
+                ),
+            )
+        }
+
+        fn symlink(&mut self, visit: SourceSymlinkVisitV1<'_>) -> Result<(), Self::Error> {
+            Err(SnapshotDestinationObservationErrorV1::Leaf(
+                SnapshotDestinationObservationFailureV1::Tree(failure(
+                    SourceTreeStageV1::InspectEntry,
+                    SourceTreeFailureReasonV1::UnsupportedObject,
+                    None,
+                    visit.common().relative_path(),
+                )),
+            ))
         }
 
         fn directory_leave(
@@ -1681,10 +1779,25 @@ mod platform {
             source_directory_open_flags()
         }
 
-        fn observe_live_source_fds(&self, _depth: u16, _upper_bound: u32) {}
+        fn rejects_symlinks_before_xattrs(&self) -> bool {
+            false
+        }
+
+        fn observe_live_tree_fds(&self, _depth: u16, _upper_bound: u32) {}
     }
 
-    struct KernelHooks;
+    struct KernelHooks {
+        destination_observation: bool,
+    }
+
+    impl KernelHooks {
+        const SOURCE: Self = Self {
+            destination_observation: false,
+        };
+        const DESTINATION: Self = Self {
+            destination_observation: true,
+        };
+    }
 
     impl EnumerationHooks for KernelHooks {
         fn list_xattrs(&self, fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
@@ -1732,6 +1845,19 @@ mod platform {
                 )
             };
             syscall_size(result)
+        }
+
+        fn directory_open_flags(&self) -> i32 {
+            source_directory_open_flags()
+                | if self.destination_observation {
+                    libc::O_NOATIME
+                } else {
+                    0
+                }
+        }
+
+        fn rejects_symlinks_before_xattrs(&self) -> bool {
+            self.destination_observation
         }
     }
 
@@ -1828,10 +1954,34 @@ mod platform {
             root_name,
             *session.source_policy(),
             session,
-            &KernelHooks,
+            &KernelHooks::SOURCE,
             &mut visitor,
         )
-        .map_err(TraversalFailureV1::into_source_observation)
+        .map_err(TraversalFailureV1::into_observation)
+    }
+
+    pub(super) fn enumerate_destination_tree_view_charged_at(
+        staged_parent: BorrowedFd<'_>,
+        root_name: &CStr,
+        session: &SnapshotDestinationObservationSessionV1<'_>,
+    ) -> Result<
+        SourceTreePlanV1,
+        SnapshotDestinationObservationErrorV1<
+            SourceTreeAcquireFailureV1<
+                SnapshotDestinationObservationErrorV1<SnapshotDestinationObservationFailureV1>,
+            >,
+        >,
+    > {
+        let mut visitor = DestinationObservationWalkVisitorV1 { session };
+        enumerate_source_tree_view_at_with(
+            staged_parent,
+            root_name,
+            *session.enumeration_policy(),
+            session,
+            &KernelHooks::DESTINATION,
+            &mut visitor,
+        )
+        .map_err(TraversalFailureV1::into_observation)
     }
 
     pub(super) fn enumerate_source_tree_view_materializing_at<
@@ -1851,7 +2001,7 @@ mod platform {
             root_name,
             *session.source_policy(),
             session,
-            &KernelHooks,
+            &KernelHooks::SOURCE,
             &mut visitor,
         )
         .map_err(TraversalFailureV1::into_source_materialization)
@@ -1870,7 +2020,7 @@ mod platform {
             root_name,
             policy,
             &UnmeteredAttemptGateV1,
-            &KernelHooks,
+            &KernelHooks::SOURCE,
             &mut visitor,
         ) {
             Ok(plan) => Ok(plan),
@@ -1977,8 +2127,18 @@ mod platform {
                     map_statx_error(SourceTreeStageV1::InspectEntry, &relative_path, error)
                 })
             })?;
+            let file_type = statx.mode & libc::S_IFMT;
+            if file_type == libc::S_IFLNK && self.hooks.rejects_symlinks_before_xattrs() {
+                return Err(failure(
+                    SourceTreeStageV1::InspectEntry,
+                    SourceTreeFailureReasonV1::UnsupportedObject,
+                    None,
+                    &relative_path,
+                )
+                .into());
+            }
             self.hooks
-                .observe_live_source_fds(depth, u32::from(depth) * 2 + 3);
+                .observe_live_tree_fds(depth, u32::from(depth) * 2 + 3);
             let mount_id = statx.inode_key.mount_id;
             match self.root_mount_id {
                 Some(root) if root != mount_id => {
@@ -2020,7 +2180,6 @@ mod platform {
             }
             self.reserve_plan_bytes(&relative_path, xattr_plan_bytes)?;
 
-            let file_type = statx.mode & libc::S_IFMT;
             let index = self.entries.len();
             let original_index = u32::try_from(index)
                 .map_err(|_| limit(&relative_path, SourceTreeLimitV1::Entries))?;
@@ -2056,7 +2215,7 @@ mod platform {
                         error.map_leaf(|error| map_directory_open_error(&relative_path, error))
                     })?;
                     self.hooks
-                        .observe_live_source_fds(depth, u32::from(depth) * 2 + 4);
+                        .observe_live_tree_fds(depth, u32::from(depth) * 2 + 4);
                     let read_statx = statx_identity(self.gate, self.hooks, directory.as_fd())
                         .map_err(|error| {
                             error.map_leaf(|error| {
@@ -2508,7 +2667,7 @@ mod platform {
                 4
             };
             self.hooks
-                .observe_live_source_fds(depth, u32::from(depth) * 2 + fixed_fds);
+                .observe_live_tree_fds(depth, u32::from(depth) * 2 + fixed_fds);
             let pinned = statx_identity(self.gate, self.hooks, handle).map_err(|error| {
                 error.map_leaf(|error| map_statx_error(stage, relative_path, error))
             })?;
@@ -3772,6 +3931,10 @@ mod platform {
             directory_action: RefCell<Option<(Vec<u8>, BarrierAction)>>,
             leaf_action: RefCell<Option<(Vec<u8>, BarrierAction)>>,
             symlink_targets: BTreeMap<Vec<u8>, Vec<u8>>,
+            destination_observation: bool,
+            list_xattr_calls: Cell<u64>,
+            symlink_xattr_calls: Cell<u64>,
+            readlink_calls: Cell<u64>,
             fd_observations: RefCell<Vec<(u16, u32)>>,
         }
 
@@ -3805,10 +3968,32 @@ mod platform {
                     ..Self::default()
                 }
             }
+
+            fn destination_observation() -> Self {
+                Self {
+                    destination_observation: true,
+                    ..Self::default()
+                }
+            }
         }
 
         impl EnumerationHooks for TestHooks {
-            fn list_xattrs(&self, _fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+            fn list_xattrs(&self, fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+                self.list_xattr_calls.set(self.list_xattr_calls.get() + 1);
+                if self.destination_observation {
+                    let mut status = MaybeUninit::<libc::stat>::zeroed();
+                    // SAFETY: `status` points to writable storage for one
+                    // `libc::stat`; the traversal keeps `fd` live for this hook.
+                    if unsafe { libc::fstat(fd, status.as_mut_ptr()) } != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    // SAFETY: successful `fstat` initialized the full value.
+                    let status = unsafe { status.assume_init() };
+                    if status.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                        self.symlink_xattr_calls
+                            .set(self.symlink_xattr_calls.get() + 1);
+                    }
+                }
                 if let Some(output) = output {
                     assert!(!output.is_empty());
                 }
@@ -3830,6 +4015,7 @@ mod platform {
                 relative_path: &[u8],
                 output: &mut [u8],
             ) -> io::Result<usize> {
+                self.readlink_calls.set(self.readlink_calls.get() + 1);
                 let target = self
                     .symlink_targets
                     .get(relative_path)
@@ -3878,7 +4064,11 @@ mod platform {
                 source_directory_open_flags() | libc::O_NOATIME
             }
 
-            fn observe_live_source_fds(&self, depth: u16, live: u32) {
+            fn rejects_symlinks_before_xattrs(&self) -> bool {
+                self.destination_observation
+            }
+
+            fn observe_live_tree_fds(&self, depth: u16, live: u32) {
                 self.fd_observations.borrow_mut().push((depth, live));
             }
         }
@@ -4438,6 +4628,16 @@ mod platform {
             assert_eq!(source_directory_open_flags() & libc::O_NOATIME, 0);
             assert_ne!(source_directory_open_flags() & libc::O_DIRECTORY, 0);
             assert_ne!(source_directory_open_flags() & libc::O_NOFOLLOW, 0);
+            assert_eq!(
+                KernelHooks::SOURCE.directory_open_flags(),
+                source_directory_open_flags()
+            );
+            assert_eq!(
+                KernelHooks::DESTINATION.directory_open_flags(),
+                source_directory_open_flags() | libc::O_NOATIME
+            );
+            assert!(!KernelHooks::SOURCE.rejects_symlinks_before_xattrs());
+            assert!(KernelHooks::DESTINATION.rejects_symlinks_before_xattrs());
         }
 
         #[test]
@@ -4484,6 +4684,29 @@ mod platform {
             assert_eq!(failure.reason(), SourceTreeFailureReasonV1::MountCrossing);
             assert_eq!(failure.errno(), Some(libc::EXDEV));
             assert!(visitor.events.is_empty());
+        }
+
+        #[test]
+        fn destination_symlink_refuses_after_statx_without_xattrs_or_readlink() {
+            let tree = TestTree::new();
+            std::os::unix::fs::symlink("target", tree.root.join("link")).unwrap();
+            let hooks = TestHooks::destination_observation();
+            let mut visitor = RecordingVisitor::default();
+
+            let failure =
+                source_failure(enumerate(&tree, policy(2, 4), &hooks, &mut visitor).unwrap_err());
+
+            assert_eq!(failure.stage(), SourceTreeStageV1::InspectEntry);
+            assert_eq!(
+                failure.reason(),
+                SourceTreeFailureReasonV1::UnsupportedObject
+            );
+            // A stable empty-xattr capture makes two passes of size + value
+            // calls for the root directory. The inspected file-type marker
+            // independently proves none of those calls targeted the symlink.
+            assert_eq!(hooks.list_xattr_calls.get(), 4);
+            assert_eq!(hooks.symlink_xattr_calls.get(), 0);
+            assert_eq!(hooks.readlink_calls.get(), 0);
         }
 
         #[test]
