@@ -35,6 +35,7 @@ const HARD_MAX_XATTR_OPERATIONS: u64 = 32 * 1024 * 1024;
 const HARD_MAX_PLAN_OPEN_COMPONENTS: u64 = 16 * 1024 * 1024;
 const HARD_MAX_PLAN_BYTES: u64 = 512 * 1024 * 1024;
 const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
+const HARD_MAX_SYSCALL_ATTEMPTS: u8 = 32;
 const EVENT_COMMITMENT_BYTES: u64 = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,7 +122,7 @@ impl SnapshotMaterializePolicyV1 {
             || max_plan_bytes.get() > HARD_MAX_PLAN_BYTES
             || event_commitment_bytes > max_plan_bytes.get()
             || openat2_attempts.get() > HARD_MAX_OPENAT2_ATTEMPTS
-            || syscall_attempts.get() > HARD_MAX_OPENAT2_ATTEMPTS
+            || syscall_attempts.get() > HARD_MAX_SYSCALL_ATTEMPTS
         {
             return None;
         }
@@ -212,6 +213,7 @@ pub(super) enum SnapshotMaterializeStageV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotMaterializeLimitV1 {
     Depth,
+    BasenameBytes,
     Entries,
     TotalXattrBytes,
     TotalXattrs,
@@ -638,7 +640,6 @@ mod platform {
         root_name: Option<Vec<u8>>,
         total_xattr_bytes: u64,
         total_xattrs: u64,
-        stack_name_bytes: u32,
     }
 
     pub(in crate::linux_pytest) type SnapshotMaterializerV1<'parent> =
@@ -678,7 +679,6 @@ mod platform {
                 root_name: None,
                 total_xattr_bytes: 0,
                 total_xattrs: 0,
-                stack_name_bytes: 0,
             })
         }
 
@@ -687,6 +687,7 @@ mod platform {
             plan: &SourceTreePlanV1,
         ) -> Result<VerifiedReadySnapshotDirectoryV1<'parent>, SnapshotMaterializeFinishErrorV1>
         {
+            begin_plan_validation(&self.hooks, self.policy, plan)?;
             refuse_unqualified_plan_symlinks(plan)?;
             self.validate_finished_plan(plan)?;
             self.consolidate_hardlinks(plan)?;
@@ -705,9 +706,10 @@ mod platform {
             common: SourceVisitCommonV1<'_>,
             expected_kind: SourceNodeKindV1,
         ) -> Result<(), SnapshotMaterializeFailureV1> {
-            checkpoint(
+            begin_event_validation(
                 &self.hooks,
-                SnapshotMaterializeStageV1::ValidateEvent,
+                self.policy,
+                common.name(),
                 common.relative_path(),
             )?;
             if (self.root_name.is_some() && self.stack.is_empty())
@@ -804,7 +806,6 @@ mod platform {
             &mut self,
             plan: &SourceTreePlanV1,
         ) -> Result<(), SnapshotMaterializeFailureV1> {
-            checkpoint(&self.hooks, SnapshotMaterializeStageV1::ValidatePlan, b"")?;
             if !self.stack.is_empty()
                 || plan.entries().is_empty()
                 || plan.entries().len() != self.event_commitments.len()
@@ -1140,23 +1141,6 @@ mod platform {
                     event_index,
                 });
             } else {
-                let next_stack_name_bytes = self
-                    .stack_name_bytes
-                    .checked_add(retained_basename.len() as u32)
-                    .ok_or_else(|| {
-                        resource_failure(
-                            SnapshotMaterializeLimitV1::PlanBytes,
-                            common.relative_path(),
-                        )
-                    })?;
-                let maximum = u32::from(self.policy.max_depth).saturating_mul(255);
-                if next_stack_name_bytes > maximum {
-                    return Err(resource_failure(
-                        SnapshotMaterializeLimitV1::PlanBytes,
-                        common.relative_path(),
-                    ));
-                }
-                self.stack_name_bytes = next_stack_name_bytes;
                 let event_index = self.event_commitments.len();
                 self.stack.push(ActiveDirectoryV1 {
                     basename: Some(retained_basename),
@@ -1229,15 +1213,9 @@ mod platform {
             {
                 return Err(event_failure(common.relative_path()));
             }
-            let Some(active) = self.stack.pop() else {
+            let Some(_active) = self.stack.pop() else {
                 return Err(event_failure(common.relative_path()));
             };
-            if let Some(basename) = active.basename {
-                self.stack_name_bytes = self
-                    .stack_name_bytes
-                    .checked_sub(basename.len() as u32)
-                    .ok_or_else(|| event_failure(common.relative_path()))?;
-            }
             if common.relative_path().is_empty() && !self.stack.is_empty() {
                 return Err(event_failure(common.relative_path()));
             }
@@ -2598,6 +2576,57 @@ mod platform {
         Err(io::Error::from_raw_os_error(libc::EINTR))
     }
 
+    fn begin_event_validation<H: MaterializeHooks>(
+        hooks: &H,
+        policy: SnapshotMaterializePolicyV1,
+        name: &CStr,
+        relative_path: &[u8],
+    ) -> Result<(), SnapshotMaterializeFailureV1> {
+        if name.to_bytes().len() > usize::from(policy.max_basename_bytes.get()) {
+            return Err(resource_failure(
+                SnapshotMaterializeLimitV1::BasenameBytes,
+                relative_path,
+            ));
+        }
+        checkpoint(
+            hooks,
+            SnapshotMaterializeStageV1::ValidateEvent,
+            relative_path,
+        )
+    }
+
+    fn begin_plan_validation<H: MaterializeHooks>(
+        hooks: &H,
+        policy: SnapshotMaterializePolicyV1,
+        plan: &SourceTreePlanV1,
+    ) -> Result<(), SnapshotMaterializeFailureV1> {
+        if plan.entries().len() > policy.max_entries() as usize {
+            return Err(resource_failure_at(
+                SnapshotMaterializeStageV1::ValidatePlan,
+                SnapshotMaterializeLimitV1::Entries,
+                b"",
+            ));
+        }
+        let maximum = usize::from(policy.max_basename_bytes.get());
+        if plan.root_name().len() > maximum {
+            return Err(resource_failure_at(
+                SnapshotMaterializeStageV1::ValidatePlan,
+                SnapshotMaterializeLimitV1::BasenameBytes,
+                b"",
+            ));
+        }
+        for entry in plan.entries() {
+            if entry.basename().len() > maximum {
+                return Err(resource_failure_at(
+                    SnapshotMaterializeStageV1::ValidatePlan,
+                    SnapshotMaterializeLimitV1::BasenameBytes,
+                    entry.relative_path(),
+                ));
+            }
+        }
+        checkpoint(hooks, SnapshotMaterializeStageV1::ValidatePlan, b"")
+    }
+
     fn checkpoint<H: MaterializeHooks>(
         hooks: &H,
         stage: SnapshotMaterializeStageV1,
@@ -2840,7 +2869,7 @@ mod platform {
         use std::collections::BTreeMap;
         use std::ffi::{CString, OsStr};
         use std::fs::{self, File};
-        use std::num::NonZeroU16;
+        use std::num::{NonZeroU16, NonZeroU32};
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
         use std::path::Path;
@@ -2852,7 +2881,8 @@ mod platform {
         };
         use crate::linux_pytest::snapshot_tree::{
             QualifiedNoAtimeSourceViewV1, SourceEnumerationPolicyV1, SourceTraversalLimitsV1,
-            SourceTreeAcquireFailureV1, SourceXattrLimitsV1, enumerate_source_tree_view_at,
+            SourceTreeAcquireFailureV1, SourceTreeEntryV1, SourceXattrLimitsV1,
+            enumerate_source_tree_view_at,
         };
 
         #[derive(Default)]
@@ -3069,6 +3099,43 @@ mod platform {
             )
         }
 
+        fn plan_with_children(name: &[u8], children: &[&[u8]]) -> SourceTreePlanV1 {
+            let child_indices = (1..=children.len())
+                .map(|index| u32::try_from(index).unwrap())
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let root = SourceTreeEntryV1::unchecked_for_test(
+                b"",
+                name,
+                None,
+                test_stat(libc::S_IFDIR | 0o755, 2, 0),
+                Vec::new(),
+                SourcePlanPayloadV1::Directory {
+                    children: child_indices,
+                },
+                None,
+            );
+            let mut entries = vec![root];
+            for child in children {
+                entries.push(SourceTreeEntryV1::unchecked_for_test(
+                    child,
+                    child,
+                    Some(0),
+                    test_stat(libc::S_IFDIR | 0o755, 2, 0),
+                    Vec::new(),
+                    SourcePlanPayloadV1::Directory {
+                        children: Vec::new().into_boxed_slice(),
+                    },
+                    None,
+                ));
+            }
+            SourceTreePlanV1::unchecked_for_test(name, entries, Vec::new(), false)
+        }
+
+        fn root_only_plan(name: &[u8]) -> SourceTreePlanV1 {
+            plan_with_children(name, &[])
+        }
+
         #[test]
         fn bounded_eintr_retry_accepts_n_and_never_attempts_n_plus_one() {
             let mut calls = 0;
@@ -3267,6 +3334,100 @@ mod platform {
                     SnapshotMaterializeLimitV1::PlanBytes
                 )
             );
+        }
+
+        #[test]
+        fn basename_policy_precedes_event_and_finished_plan_checkpoints() {
+            let mut policy = test_policy();
+            policy.max_basename_bytes = NonZeroU16::new(3).unwrap();
+
+            let exact_event_hooks = FakeHooks::default();
+            begin_event_validation(&exact_event_hooks, policy, c"abc", b"").unwrap();
+            assert_eq!(
+                exact_event_hooks.checkpoints.borrow().as_slice(),
+                &[SnapshotMaterializeStageV1::ValidateEvent]
+            );
+
+            let excess_event_hooks = FakeHooks::default();
+            let failure =
+                begin_event_validation(&excess_event_hooks, policy, c"abcd", b"abcd").unwrap_err();
+            assert_eq!(failure.stage(), SnapshotMaterializeStageV1::ValidateEvent);
+            assert_eq!(
+                failure.kind(),
+                SnapshotMaterializeFailureKindV1::ResourceLimit(
+                    SnapshotMaterializeLimitV1::BasenameBytes
+                )
+            );
+            assert_eq!(failure.relative_path(), b"abcd");
+            assert!(excess_event_hooks.checkpoints.borrow().is_empty());
+
+            let exact_plan_hooks = FakeHooks::default();
+            begin_plan_validation(&exact_plan_hooks, policy, &root_only_plan(b"abc")).unwrap();
+            assert_eq!(
+                exact_plan_hooks.checkpoints.borrow().as_slice(),
+                &[SnapshotMaterializeStageV1::ValidatePlan]
+            );
+
+            let excess_plan_hooks = FakeHooks::default();
+            let failure =
+                begin_plan_validation(&excess_plan_hooks, policy, &root_only_plan(b"abcd"))
+                    .unwrap_err();
+            assert_eq!(failure.stage(), SnapshotMaterializeStageV1::ValidatePlan);
+            assert_eq!(
+                failure.kind(),
+                SnapshotMaterializeFailureKindV1::ResourceLimit(
+                    SnapshotMaterializeLimitV1::BasenameBytes
+                )
+            );
+            assert!(excess_plan_hooks.checkpoints.borrow().is_empty());
+        }
+
+        #[test]
+        fn finished_plan_entry_limit_precedes_name_scanning_and_checkpoints() {
+            let mut policy = test_policy();
+            policy.max_entries = NonZeroU32::new(2).unwrap();
+            policy.max_basename_bytes = NonZeroU16::new(3).unwrap();
+
+            let exact_hooks = FakeHooks::default();
+            begin_plan_validation(&exact_hooks, policy, &plan_with_children(b"abc", &[b"def"]))
+                .unwrap();
+            assert_eq!(
+                exact_hooks.checkpoints.borrow().as_slice(),
+                &[SnapshotMaterializeStageV1::ValidatePlan]
+            );
+
+            let excess_hooks = FakeHooks::default();
+            let failure = begin_plan_validation(
+                &excess_hooks,
+                policy,
+                &plan_with_children(b"abc", &[b"def", b"overlong"]),
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage(), SnapshotMaterializeStageV1::ValidatePlan);
+            assert_eq!(
+                failure.kind(),
+                SnapshotMaterializeFailureKindV1::ResourceLimit(
+                    SnapshotMaterializeLimitV1::Entries
+                )
+            );
+            assert!(excess_hooks.checkpoints.borrow().is_empty());
+
+            let long_name_hooks = FakeHooks::default();
+            let failure = begin_plan_validation(
+                &long_name_hooks,
+                policy,
+                &plan_with_children(b"abc", &[b"abcd"]),
+            )
+            .unwrap_err();
+            assert_eq!(failure.stage(), SnapshotMaterializeStageV1::ValidatePlan);
+            assert_eq!(
+                failure.kind(),
+                SnapshotMaterializeFailureKindV1::ResourceLimit(
+                    SnapshotMaterializeLimitV1::BasenameBytes
+                )
+            );
+            assert_eq!(failure.relative_path(), b"abcd");
+            assert!(long_name_hooks.checkpoints.borrow().is_empty());
         }
 
         #[test]
@@ -4198,7 +4359,7 @@ mod portable_tests {
             nz32(HARD_MAX_ENTRIES),
             nz64(HARD_MAX_TOTAL_XATTR_BYTES),
             nz8(HARD_MAX_OPENAT2_ATTEMPTS),
-            nz8(HARD_MAX_OPENAT2_ATTEMPTS),
+            nz8(HARD_MAX_SYSCALL_ATTEMPTS),
         )
         .unwrap();
         assert_eq!(
@@ -4285,7 +4446,7 @@ mod portable_tests {
                 entries,
                 xattrs,
                 open,
-                nz8(HARD_MAX_OPENAT2_ATTEMPTS + 1),
+                nz8(HARD_MAX_SYSCALL_ATTEMPTS + 1),
             )
             .is_none()
         );
@@ -4301,7 +4462,7 @@ mod portable_tests {
             nz64(HARD_MAX_TOTAL_XATTRS),
             nz64(HARD_MAX_PLAN_BYTES),
             nz8(HARD_MAX_OPENAT2_ATTEMPTS),
-            nz8(HARD_MAX_OPENAT2_ATTEMPTS),
+            nz8(HARD_MAX_SYSCALL_ATTEMPTS),
         )
         .unwrap();
         assert_eq!(exact.max_basename_bytes.get(), HARD_MAX_BASENAME_BYTES);
@@ -4315,7 +4476,7 @@ mod portable_tests {
                 nz64(HARD_MAX_TOTAL_XATTRS),
                 nz64(HARD_MAX_PLAN_BYTES),
                 nz8(HARD_MAX_OPENAT2_ATTEMPTS),
-                nz8(HARD_MAX_OPENAT2_ATTEMPTS),
+                nz8(HARD_MAX_SYSCALL_ATTEMPTS),
             )
             .is_none()
         );
@@ -4328,7 +4489,7 @@ mod portable_tests {
                 nz64(HARD_MAX_TOTAL_XATTRS + 1),
                 nz64(HARD_MAX_PLAN_BYTES),
                 nz8(HARD_MAX_OPENAT2_ATTEMPTS),
-                nz8(HARD_MAX_OPENAT2_ATTEMPTS),
+                nz8(HARD_MAX_SYSCALL_ATTEMPTS),
             )
             .is_none()
         );

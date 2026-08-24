@@ -674,6 +674,28 @@ pub(super) struct SourceTreeEntryV1 {
 }
 
 impl SourceTreeEntryV1 {
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn unchecked_for_test(
+        relative_path: &[u8],
+        basename: &[u8],
+        parent_index: Option<u32>,
+        statx: SourceStatxV1,
+        xattrs: Vec<CapturedXattrV1>,
+        payload: SourcePlanPayloadV1,
+        hardlink_group: Option<u32>,
+    ) -> Self {
+        Self {
+            relative_path: relative_path.into(),
+            basename: basename.into(),
+            parent_index,
+            statx,
+            xattrs: xattrs.into_boxed_slice(),
+            payload,
+            hardlink_group,
+        }
+    }
+
     pub(super) fn relative_path(&self) -> &[u8] {
         &self.relative_path
     }
@@ -735,33 +757,40 @@ impl fmt::Debug for SourceHardlinkGroupV1 {
 #[derive(Eq, PartialEq)]
 pub(super) struct SourceTreePlanV1 {
     root_name: Box<[u8]>,
-    root_mount_id: u64,
     entries: Box<[SourceTreeEntryV1]>,
     hardlink_groups: Box<[SourceHardlinkGroupV1]>,
     has_unsettable_xattrs: bool,
-    max_live_source_fds: u32,
 }
 
 impl fmt::Debug for SourceTreePlanV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SourceTreePlanV1")
-            .field("root_mount_id", &self.root_mount_id)
             .field("entry_count", &self.entries.len())
             .field("hardlink_group_count", &self.hardlink_groups.len())
             .field("has_unsettable_xattrs", &self.has_unsettable_xattrs)
-            .field("max_live_source_fds", &self.max_live_source_fds)
             .finish()
     }
 }
 
 impl SourceTreePlanV1 {
-    pub(super) fn root_name(&self) -> &[u8] {
-        &self.root_name
+    #[cfg(test)]
+    pub(super) fn unchecked_for_test(
+        root_name: &[u8],
+        entries: Vec<SourceTreeEntryV1>,
+        hardlink_groups: Vec<SourceHardlinkGroupV1>,
+        has_unsettable_xattrs: bool,
+    ) -> Self {
+        Self {
+            root_name: root_name.into(),
+            entries: entries.into_boxed_slice(),
+            hardlink_groups: hardlink_groups.into_boxed_slice(),
+            has_unsettable_xattrs,
+        }
     }
 
-    pub(super) const fn root_mount_id(&self) -> u64 {
-        self.root_mount_id
+    pub(super) fn root_name(&self) -> &[u8] {
+        &self.root_name
     }
 
     pub(super) fn entries(&self) -> &[SourceTreeEntryV1] {
@@ -774,10 +803,6 @@ impl SourceTreePlanV1 {
 
     pub(super) const fn has_unsettable_xattrs(&self) -> bool {
         self.has_unsettable_xattrs
-    }
-
-    pub(super) const fn max_live_source_fds(&self) -> u32 {
-        self.max_live_source_fds
     }
 }
 
@@ -1951,20 +1976,19 @@ mod platform {
                 )
             })
         });
+        builder.root_mount_id.ok_or_else(|| {
+            failure(
+                SourceTreeStageV1::NormalizePlan,
+                SourceTreeFailureReasonV1::SourceChanged,
+                None,
+                b"",
+            )
+        })?;
         Ok(SourceTreePlanV1 {
             root_name: try_boxed_bytes(builder.root_name.to_bytes(), b"")?,
-            root_mount_id: builder.root_mount_id.ok_or_else(|| {
-                failure(
-                    SourceTreeStageV1::NormalizePlan,
-                    SourceTreeFailureReasonV1::SourceChanged,
-                    None,
-                    b"",
-                )
-            })?,
             entries: entries.into_boxed_slice(),
             hardlink_groups: hardlink_groups.into_boxed_slice(),
             has_unsettable_xattrs,
-            max_live_source_fds: builder.policy.max_live_source_fds(),
         })
     }
 
@@ -3708,9 +3732,8 @@ mod platform {
             }
             let hooks = TestHooks::default();
             let mut visitor = RecordingVisitor::default();
-            let plan = enumerate(&deep, policy(8, 16), &hooks, &mut visitor).unwrap();
+            enumerate(&deep, policy(8, 16), &hooks, &mut visitor).unwrap();
             let committed_bound = 2 * 8 + 4;
-            assert_eq!(plan.max_live_source_fds(), committed_bound);
             let observations = hooks.fd_observations.borrow();
             assert_eq!(
                 observations.iter().map(|(_, live)| *live).max(),
