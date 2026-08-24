@@ -85,7 +85,7 @@ product artifact remained the exact earlier UTS-policy refusal with empty
 stderr. The run therefore confirms fail-closed compatibility while explicitly
 showing that stock CI did not execute the mount/pivot branch.
 
-Current source extends that same fixed child through the layout frozen in the
+Commit `883a0a6` extends that same fixed child through the layout frozen in the
 normative profile without adding a command or authority surface. It uses
 child-local umask `0` for construction, then sets and verifies final umask
 `0077`. `/tmp`, `/run`, and `/home/again` become three independent writable
@@ -104,6 +104,16 @@ procfs still exposes diagnostic PID 1's live `fd`, `exe`, `maps`, and
 `map_files`; there is no workspace/runtime attachment, populated `/dev`, FD
 scrub, capability drop, Landlock, seccomp, command, Python, execution, or reuse
 authority.
+
+[Actions run 32791466632](https://github.com/alakhanpal23/again/actions/runs/32791466632)
+passed that source checkpoint: the Ubuntu library lane passed 621 tests with 7
+ignored and zero failures, macOS passed 473 with 7 ignored, and both passed
+strict Clippy plus the explicit 100,000-case gate. The retained product
+artifact is still the exact UTS-policy `EPERM` refusal with completed cleanup,
+empty stderr, and every command/profile/execution-authority scope false. The
+run therefore validates source compilation, unit-policy checks, framing, and
+negative-lane compatibility only; stock CI did not execute the root, scratch,
+or procfs syscalls.
 
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
