@@ -76,6 +76,14 @@ for pinned x86_64 GNU production and test targets, but stock hosted Ubuntu
 refuses earlier at UTS configuration. A provisioned qualifying runner must
 exercise the branch before it becomes positive root-runtime evidence.
 
+[Actions run 32788942118](https://github.com/alakhanpal23/again/actions/runs/32788942118)
+passed that source checkpoint at commit `36f60f9`: Linux compiled and ran the
+closed frame/policy tests and 617 library tests with 7 ignored, both hosted OS
+jobs passed strict Clippy and the explicit 100,000-case gate, and the retained
+product artifact remained the exact earlier UTS-policy refusal with empty
+stderr. The run therefore confirms fail-closed compatibility while explicitly
+showing that stock CI did not execute the mount/pivot branch.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the
