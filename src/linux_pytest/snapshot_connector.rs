@@ -2362,8 +2362,7 @@ mod tests {
                 source_s2_view,
                 c"root",
             )
-            .err()
-            .expect("invalid final name must refuse before qualification");
+            .expect_err("invalid final name must refuse before qualification");
         let SnapshotPublishedCanonicalTreeErrorV1::Finalization(SnapshotChargedErrorV1::Leaf(
             error,
         )) = error
