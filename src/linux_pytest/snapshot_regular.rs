@@ -412,7 +412,7 @@ mod platform {
         })?;
         let source_identity = statx_identity(source_handle.as_fd())
             .map_err(|error| map_statx_failure(SnapshotRegularStageV1::InspectSource, error))?;
-        if source_identity.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        if source_identity.mode & libc::S_IFMT != libc::S_IFREG {
             return Err(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotRequiredObjectUnsupported,
                 SnapshotRegularStageV1::InspectSource,
@@ -510,7 +510,7 @@ mod platform {
         let destination_identity = statx_identity(destination.as_fd()).map_err(|error| {
             map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error)
         })?;
-        if destination_identity.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        if destination_identity.mode & libc::S_IFMT != libc::S_IFREG
             || destination_identity.size != source_identity.size
             || destination_identity.nlink != 1
         {
@@ -716,7 +716,7 @@ mod platform {
         cleanup.mark_created();
         cleanup.arm(destination.as_fd())?;
         let identity = statx_identity(destination.as_fd())?;
-        if identity.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        if identity.mode & libc::S_IFMT != libc::S_IFREG
             || identity.size != 0
             || identity.nlink != 1
         {
@@ -801,7 +801,7 @@ mod platform {
                 seconds: raw.stx_ctime.tv_sec,
                 nanoseconds: raw.stx_ctime.tv_nsec,
             },
-            btime: (raw.stx_mask & libc::STATX_BTIME != 0).then(|| TimespecV1 {
+            btime: (raw.stx_mask & libc::STATX_BTIME != 0).then_some(TimespecV1 {
                 seconds: raw.stx_btime.tv_sec,
                 nanoseconds: raw.stx_btime.tv_nsec,
             }),
@@ -815,7 +815,7 @@ mod platform {
         }
         let raw = unsafe { raw.assume_init() };
         Ok(CleanupIdentity {
-            device: raw.st_dev as u64,
+            device: raw.st_dev,
             inode: raw.st_ino,
         })
     }
