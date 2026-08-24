@@ -10,33 +10,47 @@ are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
 The current crate-private module is unreachable from the CLI and all concrete
 profile traits still fail closed; pytest execution and reuse are not
 implemented. Descriptor-stable source enumeration, regular-file copying,
-tree materialization, identity-checked atomic publication, and one shared
-resource contract exist as internal leaves. The current materializer refuses
-every symlink before creating it because durable replay of symlink xattrs and
-timestamps still requires a qualified dedicated staging filesystem and a
-final bounded `syncfs`. Before any destination-tree population, it also
-requires a private-field cleanup envelope read from the actual staged
-publisher to dominate its source depth, entry count, basename, and retry
-limits. Mismatch refuses before materializer population and delegates bounded,
-best-effort cleanup to the staged publisher. These leaves do not yet form the
-required four-view sealed snapshot connector and are not wired to
-`SnapshotProvider`.
+materialization mechanics exercised through a test-only traversal adapter,
+identity-checked atomic publication, and one shared resource contract exist as
+internal leaves. A no-atime source-view qualification path is also implemented
+as a crate-private leaf, but the connector does not invoke it and its fixed
+local probe retries are outside the shared resource ledger. No production API
+currently populates the materializer's event or root state. The test-only
+adapter refuses every symlink before creating it because durable replay of
+symlink xattrs and timestamps still requires a qualified dedicated staging
+filesystem and a final bounded `syncfs`. Before any destination-tree
+population, it also requires a private-field cleanup envelope read from the
+actual staged publisher to dominate its source depth, entry count, basename,
+and retry limits. Mismatch refuses before materializer population and delegates
+bounded, best-effort cleanup to the staged publisher.
+These leaves do not yet form the required four-view sealed snapshot pipeline
+and are not wired to `SnapshotProvider`.
 
 A static, allocation-free projection now returns a non-`Clone`, non-`Copy`
 connector that owns the preflighted policy and one shared operation/heap
 ledger. It refuses zero-valued classes and aggregate ceilings that current leaf
-shapes cannot represent exactly rather than silently increasing them. The
-connector can issue exactly one unsplittable session and currently lends it
-only to private staged-directory creation and RAII cleanup. The charged guard
-exposes its pinned directory and cleanup envelope but no ready, publish, or
-execution transition.
+shapes cannot represent exactly rather than silently increasing them. Source
+observation is connector-wired: it accepts an already-qualified source-view
+authority, charges raw attempts through a connector-minted session, reserves
+the full committed per-view ceiling before traversal, and returns the owned
+plan beside a linear lease. The shared retained-view boundary permits at most
+two such full-plan leases at once. The connector separately permits exactly
+one private staged-directory creation and RAII-cleanup session; its charged
+guard exposes the pinned directory and cleanup envelope but no ready, publish,
+or execution transition. A connector-bound charged regular-copy leaf exists,
+but no connector-owned materialization path invokes it. Destination
+observation and the complete pairwise four-view orchestration remain in
+progress and unwired.
 
-Within this narrow slice, every raw attempt, including every retry, is charged
-before invocation. Forward and cleanup attempts use disjoint buckets, so
-forward exhaustion cannot spend the cleanup reserve. The retained 55-byte
-staging basename is charged to the forward heap stage; each retained cleanup
-name is charged to the cleanup heap stage. For cleanup depth `D`, entry limit
-`E`, and basename limit `N`, the exact maximum live retained-name heap is
+Within the wired source-observation and staged-publication slices, every raw
+attempt, including every retry, is charged before invocation. Forward and
+publisher-cleanup attempts use disjoint buckets, so forward exhaustion cannot
+spend the cleanup reserve. The policy also pre-reserves a separate leaf-local
+cleanup bucket consumed by the charged regular-copy leaf, but that leaf has no
+pipeline caller. The retained 55-byte staging basename is charged to the
+forward heap stage; each retained cleanup name is charged to the cleanup heap
+stage. For cleanup depth `D`, entry limit `E`, and basename limit `N`, the exact
+maximum live retained-name heap is
 `55 + min(E, 2 * (D + 1)) * (N + 1)` bytes. Each active cleanup frame retains
 one fixed two-slot name batch on the stack; those stack bytes and
 allocator-private metadata are outside the transient-heap ledger. Maximum-depth
@@ -49,9 +63,11 @@ after `try_reserve_exact`, and accepts only exact equality. Allocator
 overcapacity drops the storage and returns a typed compatibility refusal. The
 raw vector is never exposed, only byte buffers are admitted so nested owned
 allocations cannot escape, and backing storage is dropped before its ledger
-charge is released. All other leaf allocations, including frozen source-plan
-and xattr boxed slices, remain outside the ledger, so this is not an exact
-whole-pipeline heap authority.
+charge is released. A retained-view lease precharges the full committed
+per-view ceiling, but allocator-observed capacities inside the source plan,
+including boxed plan and xattr storage, are not individually charged or proven
+exact. The lease therefore bounds full-view coexistence without making this an
+exact whole-pipeline heap authority.
 
 The intended next local product slice has exactly one public invocation
 shape:

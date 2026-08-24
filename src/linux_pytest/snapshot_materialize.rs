@@ -21,10 +21,13 @@ use super::snapshot_publish::{
     VerifiedReadySnapshotDirectoryV1,
 };
 use super::snapshot_regular::SnapshotRegularStageV1;
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+use super::snapshot_tree::SourceRegularEvidenceV1;
+#[cfg(test)]
 use super::snapshot_tree::{
-    SourceDirectoryVisitV1, SourceEnumerationPolicyV1, SourceRegularEvidenceV1,
-    SourceRegularVisitV1, SourceSymlinkVisitV1, SourceTreePlanV1, SourceTreeVisitorV1,
+    SourceDirectoryVisitV1, SourceRegularVisitV1, SourceSymlinkVisitV1, SourceTreeVisitorV1,
 };
+use super::snapshot_tree::{SourceEnumerationPolicyV1, SourceNodeKindV1, SourceTreePlanV1};
 
 const HARD_MAX_DEPTH: u16 = 256;
 const HARD_MAX_BASENAME_BYTES: u16 = 255;
@@ -37,6 +40,23 @@ const HARD_MAX_PLAN_BYTES: u64 = 512 * 1024 * 1024;
 const HARD_MAX_OPENAT2_ATTEMPTS: u8 = 32;
 const HARD_MAX_SYSCALL_ATTEMPTS: u8 = 32;
 const EVENT_COMMITMENT_BYTES: u64 = 32;
+
+/// Exact permission projection shared by the writer and destination verifier.
+/// Logical special bits remain manifest data and physical write bits are
+/// always removed. Symlinks remain outside the qualified materializer.
+pub(super) const fn projected_materialized_permissions(
+    logical_mode: u32,
+    kind: SourceNodeKindV1,
+) -> Option<u32> {
+    let sealed = logical_mode & 0o777 & !0o222;
+    match kind {
+        SourceNodeKindV1::Directory => Some(sealed | 0o500),
+        SourceNodeKindV1::Regular => {
+            Some(sealed | 0o400 | if logical_mode & 0o111 != 0 { 0o100 } else { 0 })
+        }
+        SourceNodeKindV1::Symlink => None,
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SnapshotMaterializePolicyV1 {
@@ -409,8 +429,8 @@ mod platform {
 
     use super::*;
     use crate::linux_pytest::snapshot_tree::{
-        CapturedXattrV1, CapturedXattrValueV1, SourceNodeKindV1, SourcePlanPayloadV1,
-        SourceStatxV1, SourceVisitCommonV1,
+        CapturedXattrV1, CapturedXattrValueV1, SourcePlanPayloadV1, SourceStatxV1,
+        SourceVisitCommonV1,
     };
 
     const RESOLVE_NO_XDEV: u64 = 0x01;
@@ -1095,6 +1115,7 @@ mod platform {
         }
     }
 
+    #[cfg(test)]
     impl<H: MaterializeHooks> SourceTreeVisitorV1 for SnapshotMaterializerWithHooksV1<'_, H> {
         type Error = SnapshotMaterializeFailureV1;
 
@@ -1946,7 +1967,8 @@ mod platform {
             )?;
             apply_mode(
                 fd,
-                projected_regular_mode(expected.mode()),
+                projected_materialized_permissions(expected.mode(), SourceNodeKindV1::Regular)
+                    .expect("regular projection is defined"),
                 self.policy.syscall_attempts.get(),
                 relative_path,
             )?;
@@ -2003,7 +2025,8 @@ mod platform {
             )?;
             apply_mode(
                 fd,
-                projected_directory_mode(expected.mode()),
+                projected_materialized_permissions(expected.mode(), SourceNodeKindV1::Directory)
+                    .expect("directory projection is defined"),
                 self.policy.syscall_attempts.get(),
                 relative_path,
             )?;
@@ -2138,8 +2161,10 @@ mod platform {
         relative_path: &[u8],
     ) -> Result<(), SnapshotMaterializeFailureV1> {
         let expected_physical_mode = match kind {
-            SourceNodeKindV1::Directory => projected_directory_mode(expected.mode()),
-            SourceNodeKindV1::Regular => projected_regular_mode(expected.mode()),
+            SourceNodeKindV1::Directory | SourceNodeKindV1::Regular => {
+                projected_materialized_permissions(expected.mode(), kind)
+                    .expect("directory and regular projections are defined")
+            }
             SourceNodeKindV1::Symlink => return Err(unqualified_symlink_durability(relative_path)),
         };
         let observed =
@@ -2168,8 +2193,10 @@ mod platform {
         euid: u32,
     ) -> bool {
         let expected_physical_mode = match kind {
-            SourceNodeKindV1::Directory => projected_directory_mode(expected.mode()),
-            SourceNodeKindV1::Regular => projected_regular_mode(expected.mode()),
+            SourceNodeKindV1::Directory | SourceNodeKindV1::Regular => {
+                projected_materialized_permissions(expected.mode(), kind)
+                    .expect("directory and regular projections are defined")
+            }
             SourceNodeKindV1::Symlink => return false,
         };
         let object_metadata_matches = match kind {
@@ -2424,18 +2451,6 @@ mod platform {
             return Err(metadata_mismatch_at(stage, relative_path));
         }
         Ok(names)
-    }
-
-    fn projected_directory_mode(logical_mode: u32) -> u32 {
-        // Logical special bits remain manifest data. Physical ownership is
-        // remapped to the builder EUID, so setuid/setgid/sticky are neither
-        // equivalent nor safe and are stripped from the sealed projection.
-        (logical_mode & 0o777 & !0o222) | 0o500
-    }
-
-    fn projected_regular_mode(logical_mode: u32) -> u32 {
-        let sealed = logical_mode & 0o777 & !0o222;
-        sealed | 0o400 | if logical_mode & 0o111 != 0 { 0o100 } else { 0 }
     }
 
     fn allocate_zeroed_at(
@@ -3439,13 +3454,59 @@ mod platform {
 
         #[test]
         fn physical_projection_is_read_only_and_preserves_builder_owner_access() {
-            assert_eq!(projected_regular_mode(libc::S_IFREG | 0o7777), 0o555);
-            assert_eq!(projected_directory_mode(libc::S_IFDIR | 0o2642), 0o540);
-            assert_eq!(projected_regular_mode(libc::S_IFREG | 0o400), 0o400);
-            assert_eq!(projected_regular_mode(libc::S_IFREG | 0o222), 0o400);
-            assert_eq!(projected_directory_mode(libc::S_IFDIR), 0o500);
-            assert_eq!(projected_regular_mode(libc::S_IFREG | 0o064), 0o444);
-            assert_eq!(projected_directory_mode(libc::S_IFDIR | 0o001), 0o501);
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFREG | 0o7777,
+                    SourceNodeKindV1::Regular
+                ),
+                Some(0o555)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFDIR | 0o2642,
+                    SourceNodeKindV1::Directory
+                ),
+                Some(0o540)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFREG | 0o400,
+                    SourceNodeKindV1::Regular
+                ),
+                Some(0o400)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFREG | 0o222,
+                    SourceNodeKindV1::Regular
+                ),
+                Some(0o400)
+            );
+            assert_eq!(
+                projected_materialized_permissions(libc::S_IFDIR, SourceNodeKindV1::Directory),
+                Some(0o500)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFREG | 0o064,
+                    SourceNodeKindV1::Regular
+                ),
+                Some(0o444)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFDIR | 0o001,
+                    SourceNodeKindV1::Directory
+                ),
+                Some(0o501)
+            );
+            assert_eq!(
+                projected_materialized_permissions(
+                    libc::S_IFLNK | 0o777,
+                    SourceNodeKindV1::Symlink
+                ),
+                None
+            );
         }
 
         #[test]
@@ -3982,8 +4043,8 @@ mod platform {
             // SAFETY: every object kind used below was probed immediately
             // above and retained its atime; the private tree is not mutated
             // again for the duration of this borrow.
-            let source_view = unsafe {
-                QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount(
+            let source_view = || unsafe {
+                QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
                     source_parent_fd.as_fd(),
                 )
             };
@@ -3993,7 +4054,7 @@ mod platform {
 
             let mut plan_only = PlanOnlyVisitor;
             let symlink_plan = enumerate_source_tree_view_at(
-                source_view,
+                source_view(),
                 c"symlink-tree",
                 enumeration_policy(),
                 &mut plan_only,
@@ -4049,7 +4110,7 @@ mod platform {
             let mut symlink_materializer =
                 SnapshotMaterializerV1::new(symlink_staged, test_policy()).unwrap();
             let failure = match enumerate_source_tree_view_at(
-                source_view,
+                source_view(),
                 c"symlink-tree",
                 enumeration_policy(),
                 &mut symlink_materializer,
@@ -4098,7 +4159,7 @@ mod platform {
             )
             .unwrap();
             let failure = match enumerate_source_tree_view_at(
-                source_view,
+                source_view(),
                 c"tree",
                 enumeration_policy(),
                 &mut failing_materializer,
@@ -4127,7 +4188,7 @@ mod platform {
             let mut swapped_materializer =
                 SnapshotMaterializerV1::new(swapped_staged, test_policy()).unwrap();
             let swapped_plan = enumerate_source_tree_view_at(
-                source_view,
+                source_view(),
                 c"tree",
                 enumeration_policy(),
                 &mut swapped_materializer,
@@ -4162,7 +4223,7 @@ mod platform {
             let mut materializer = SnapshotMaterializerV1::new(staged, test_policy()).unwrap();
             let fd_baseline = open_fd_count();
             let plan = enumerate_source_tree_view_at(
-                source_view,
+                source_view(),
                 c"tree",
                 enumeration_policy(),
                 &mut materializer,
@@ -4254,6 +4315,7 @@ mod platform {
         }
     }
 
+    #[cfg(test)]
     impl SourceTreeVisitorV1 for SnapshotMaterializerV1<'_> {
         type Error = SnapshotMaterializeFailureV1;
 

@@ -190,6 +190,16 @@ publish, or execution transition. A charged iterative cleanup traversal and
 every later snapshot and isolation step in this note remain research
 requirements.
 
+**Current implementation note (2026-08-24):** The paragraph above records the
+earlier staged-publication checkpoint. The connector now also wires charged
+source observation and reserves the full committed per-view ceiling before
+each traversal through a linear lease, limiting full retained plans to two.
+That structural precharge does not make allocator-observed capacities inside a
+plan exact. The no-atime source-view qualification path is implemented but
+unwired, and its fixed local probe retries are outside the shared resource
+ledger. A connector-bound charged regular-copy leaf exists but has no pipeline
+caller, and connector-owned four-view orchestration remains unwired.
+
 A regular file or directory can be made durable through its selected
 descriptor. Linux does not provide the equivalent generic inode-`fsync`
 boundary for a symlink after replaying its xattrs and timestamps. Therefore a

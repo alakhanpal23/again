@@ -486,7 +486,7 @@ mod platform {
                     session.run_forward_attempt(attempt)
                 }
                 (Self::Charged { session }, PublisherAttemptBucketV1::Cleanup) => {
-                    session.run_cleanup_attempt(attempt)
+                    session.run_publisher_cleanup_attempt(attempt)
                 }
                 #[cfg(test)]
                 (Self::Unmetered { .. }, _) => Ok(attempt()),
@@ -500,7 +500,7 @@ mod platform {
                     Some(session.forward_attempts_remaining())
                 }
                 (Self::Charged { session }, PublisherAttemptBucketV1::Cleanup) => {
-                    Some(session.cleanup_attempts_remaining())
+                    Some(session.publisher_cleanup_attempts_remaining())
                 }
                 (Self::Unmetered { .. }, _) => None,
             }
@@ -2341,6 +2341,7 @@ mod platform {
         const CLEANUP_STRESS_NAME_COUNT: usize = 65;
         const CREATE_TRANSITION_COUNT: usize = 4;
         const READY_TRANSITION_COUNT: usize = 3;
+        const LOCAL_REGULAR_CLEANUP_RESERVE: u64 = 4 + 2 * 3;
 
         fn policy() -> SnapshotPublishPolicyV1 {
             SnapshotPublishPolicyV1::checked(
@@ -2407,9 +2408,9 @@ mod platform {
         #[test]
         fn charged_creation_consumes_exactly_seven_forward_attempts() {
             let fixture = Fixture::new();
-            // Four entries with open=4/syscall=3 reserve 272 cleanup attempts;
-            // charged creation consumes exactly seven forward attempts.
-            let connector = charged_connector(279, 1024 * 1024);
+            // Four entries reserve 272 publisher-cleanup attempts and ten
+            // leaf-local attempts; charged creation consumes seven forward.
+            let connector = charged_connector(279 + LOCAL_REGULAR_CLEANUP_RESERVE, 1024 * 1024);
             let staged = connector
                 .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
                 .unwrap();
@@ -2424,10 +2425,10 @@ mod platform {
 
         #[test]
         fn zero_forward_budget_refuses_before_the_first_kernel_attempt() {
-            // Four entries with open=4/syscall=3 reserve exactly 272 cleanup
-            // attempts and leave no forward attempt.
+            // Four entries reserve exactly 272 publisher-cleanup attempts plus
+            // the disjoint leaf-local reserve and leave no forward attempt.
             let fixture = Fixture::new();
-            let connector = charged_connector(272, 1024 * 1024);
+            let connector = charged_connector(272 + LOCAL_REGULAR_CLEANUP_RESERVE, 1024 * 1024);
             CHARGED_DIRECTORY_FSTAT_CALLS.with(|calls| calls.set(0));
             let error = connector
                 .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
@@ -2453,7 +2454,7 @@ mod platform {
             let fixture = Fixture::new();
             // Parent fstat/statx/geteuid plus mkdir consume four forward
             // attempts. The openat2 charge then refuses before its raw hook.
-            let connector = charged_connector(276, 1024 * 1024);
+            let connector = charged_connector(276 + LOCAL_REGULAR_CLEANUP_RESERVE, 1024 * 1024);
             let error = connector
                 .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
                 .err()
@@ -2518,8 +2519,11 @@ mod platform {
             let cleanup_reserve = (5 * u64::from(ENTRIES) + 3) * OPEN_ATTEMPTS
                 + (12 * u64::from(ENTRIES) + 12) * SYSCALL_ATTEMPTS;
             let fixture = Fixture::new();
-            let connector =
-                charged_connector_with_entries(cleanup_reserve + 7, 1024 * 1024, ENTRIES);
+            let connector = charged_connector_with_entries(
+                cleanup_reserve + LOCAL_REGULAR_CLEANUP_RESERVE + 7,
+                1024 * 1024,
+                ENTRIES,
+            );
             let staged = connector
                 .create_staged_snapshot_directory_at(fixture.parent.as_fd(), STAGING)
                 .unwrap();

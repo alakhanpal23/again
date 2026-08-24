@@ -19,10 +19,15 @@ use super::snapshot_connector::{
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
+#[cfg(test)]
+use super::snapshot_regular::CopiedRegularV1;
 use super::snapshot_regular::{
-    CopiedRegularV1, RegularCopyEvidenceV1, RegularCopyPolicyV1, SnapshotRegularFailureV1,
+    RegularCopyEvidenceV1, RegularCopyPolicyV1, SnapshotRegularFailureV1,
 };
 use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
+
+#[path = "snapshot_qualification.rs"]
+mod snapshot_qualification;
 
 const HARD_MAX_DEPTH: u16 = 256;
 const HARD_MAX_NAME_BYTES: u16 = 255;
@@ -41,23 +46,25 @@ const HARD_MAX_ATTEMPTS: u8 = 32;
 /// mount/view on which directory, regular-file, and symlink acquisition cannot
 /// mutate host atime. This wrapper records that semantic precondition; this
 /// leaf does not create or verify the mount itself.
-#[derive(Clone, Copy)]
 pub(super) struct QualifiedNoAtimeSourceViewV1<'a> {
     trusted_parent: BorrowedFd<'a>,
 }
 
 impl<'a> QualifiedNoAtimeSourceViewV1<'a> {
-    /// The execution connector is the sole intended caller, after its
-    /// functional no-atime qualification succeeds. No atime-restoration
-    /// workaround satisfies this precondition.
+    /// Production construction is private to this module and requires the
+    /// nested functional qualifier's successful control flow.
+    const fn from_functionally_verified_mount(trusted_parent: BorrowedFd<'a>) -> Self {
+        Self { trusted_parent }
+    }
+
+    /// Test-only escape hatch for provisioned kernel integration fixtures.
     ///
     /// # Safety
     ///
-    /// `trusted_parent` must name the exact mount/view that passed the
-    /// profile's functional zero-host-metadata-mutation qualification for
-    /// directory reads, regular-file reads, symlink reads, and xattr reads.
-    /// The qualification must remain valid for this borrow's full lifetime.
-    pub(super) const unsafe fn from_functionally_verified_mount(
+    /// `trusted_parent` must name a view that satisfies the complete
+    /// production no-atime qualification contract for the borrow's lifetime.
+    #[cfg(test)]
+    pub(super) const unsafe fn from_functionally_verified_mount_for_test(
         trusted_parent: BorrowedFd<'a>,
     ) -> Self {
         Self { trusted_parent }
@@ -990,11 +997,13 @@ impl<'a> SourceDirectoryVisitV1<'a> {
     }
 }
 
+#[cfg(test)]
 pub(super) struct SourceRegularVisitV1<'a> {
     common: SourceVisitCommonV1<'a>,
     copy_policy: RegularCopyPolicyV1,
 }
 
+#[cfg(test)]
 impl<'a> SourceRegularVisitV1<'a> {
     pub(super) const fn common(&self) -> SourceVisitCommonV1<'a> {
         self.common
@@ -1026,10 +1035,10 @@ impl<'a> SourceRegularVisitV1<'a> {
 
 /// A regular-file callback capability for connector-owned source observation.
 ///
-/// Unlike [`SourceRegularVisitV1`], this value exposes no materialization
-/// operation. The exact connector session is embedded by the charged walker,
-/// so a callback can neither substitute another policy/stage nor perform an
-/// unmetered copy while charged traversal is in progress.
+/// Unlike the test-only legacy materialization visit, this value exposes no
+/// copy operation. The exact connector session is embedded by the charged
+/// walker, so a callback can neither substitute another policy/stage nor
+/// perform an unmetered copy while charged traversal is in progress.
 pub(super) struct SourceObservedRegularVisitV1<'visit, 'resources> {
     common: SourceVisitCommonV1<'visit>,
     session: &'visit SnapshotSourceObservationSessionV1<'resources>,
@@ -1077,6 +1086,7 @@ impl<'a> SourceSymlinkVisitV1<'a> {
 /// Deterministic event order is directory-enter, raw-name-sorted children,
 /// directory-leave; regular and symlink leaves each emit once.  Callbacks run
 /// only while both the trusted parent and pinned entry descriptors are live.
+#[cfg(test)]
 pub(super) trait SourceTreeVisitorV1 {
     type Error;
 
@@ -1305,10 +1315,12 @@ mod platform {
         -> Result<(), Self::Error>;
     }
 
+    #[cfg(test)]
     struct MaterializationVisitorAdapterV1<'visitor, V> {
         visitor: &'visitor mut V,
     }
 
+    #[cfg(test)]
     impl<V: SourceTreeVisitorV1> WalkVisitorV1 for MaterializationVisitorAdapterV1<'_, V> {
         type Error = V::Error;
 
@@ -5134,7 +5146,7 @@ mod portable_tests {
     }
 
     #[test]
-    fn regular_visit_copy_authority_is_linear() {
+    fn source_view_and_regular_visit_authorities_are_linear() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
         }
@@ -5151,6 +5163,8 @@ mod portable_tests {
         <SourceRegularVisitV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SourceObservedRegularVisitV1<'static, 'static> as AmbiguousIfClone<_>>::probe();
         <SourceObservedRegularVisitV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
+        <QualifiedNoAtimeSourceViewV1<'static> as AmbiguousIfClone<_>>::probe();
+        <QualifiedNoAtimeSourceViewV1<'static> as AmbiguousIfCopy<_>>::probe();
     }
 
     #[test]

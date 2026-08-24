@@ -70,6 +70,7 @@ mod snapshot_policy;
 mod snapshot_publish;
 mod snapshot_regular;
 mod snapshot_tree;
+mod snapshot_verify;
 
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Blake3Digest([u8; 32]);

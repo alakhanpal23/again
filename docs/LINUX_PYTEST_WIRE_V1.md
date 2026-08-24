@@ -7,12 +7,20 @@ This is the frozen Stage 0 binary and identity contract for the future
 `src/linux_pytest.rs`, `src/linux_pytest/canonical.rs`, and
 `src/linux_pytest/identity.rs`. The module remains unreachable from the public
 CLI, and its concrete admission, sealed-snapshot, sandbox, tracer, storage, and
-worker implementations do not exist. The only connector-wired filesystem
-checkpoint can issue one unsplittable shared-ledger session for charged private
-staged-directory creation and RAII cleanup on Linux x86_64. Its guard exposes
-the pinned directory and cleanup envelope but no ready, publish, execution, or
-reuse transition. Nothing in this document is evidence that pytest execution
-or reuse is available.
+worker implementations do not exist. The connector now wires source
+observation through its shared ledger and precharges one full retained-view
+ceiling before each walk; a linear lease held beside the resulting plan limits
+coexisting full views to two. This is a structural ceiling, not exact
+allocator-capacity accounting inside the plan. A no-atime source-view
+qualification path exists but is not connector-wired; its fixed local probe
+retries are outside the shared resource ledger, so callers cannot yet obtain
+that authority through the charged pipeline. The connector separately permits
+one charged private staged-directory creation and RAII-cleanup session on Linux
+x86_64. Its guard exposes the pinned directory and cleanup envelope but no
+ready, publish, execution, or reuse transition. Charged destination regular
+copying exists as a connector-bound leaf but has no pipeline caller; complete
+four-view orchestration also remains unwired. Nothing in this document is
+evidence that pytest execution or reuse is available.
 
 Serde/JSON is diagnostic only. It is not a storage, comparison, or digest
 format. Canonical bytes described here are the only bytes accepted for EffectIR

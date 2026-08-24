@@ -88,7 +88,7 @@ pub(super) enum SnapshotResourcePolicyErrorV1 {
     AboveHardCeiling(SnapshotResourcePolicyFieldV1),
     Inconsistent(SnapshotResourcePolicyFieldV1),
     ArithmeticOverflow,
-    CleanupReserveExceedsOperationBudget,
+    CleanupReservesExceedOperationBudget,
 }
 
 /// Coarse forward phase used only for whole-pipeline resource diagnostics.
@@ -98,7 +98,6 @@ pub(super) enum SnapshotResourcePolicyErrorV1 {
 /// the resource layer depend on any leaf error type.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotPipelineForwardStageV1 {
-    SourceEnumeration,
     RegularCopy,
     Materialization,
     Publication,
@@ -121,7 +120,8 @@ pub(super) enum SnapshotPipelinePreflightResourceV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotPipelineAttemptBucketV1 {
     Forward,
-    Cleanup,
+    PublisherCleanup,
+    LocalCleanup,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -145,6 +145,12 @@ pub(super) enum SnapshotPipelineResourceErrorV1 {
     },
     TransientHeapCapacityExceeded {
         stage: SnapshotPipelineStageV1,
+        live: u64,
+        requested: u64,
+        limit: u64,
+    },
+    RetainedViewHeapCapacityExceeded {
+        stage: SnapshotPipelineForwardStageV1,
         live: u64,
         requested: u64,
         limit: u64,
@@ -202,22 +208,39 @@ pub(super) struct SnapshotResourcePolicyV1 {
     max_live_publisher_cleanup_fds: u32,
     max_live_snapshot_fds: u32,
     max_four_view_heap_bytes: u64,
-    cleanup_operation_reserve: u64,
+    publisher_cleanup_operation_reserve: u64,
+    local_cleanup_operation_reserve: u64,
     max_forward_operation_attempts: u64,
 }
 
 /// A single, preflighted capability shared by the entire snapshot pipeline.
 ///
 /// This type intentionally implements neither `Clone` nor `Copy`. Its private
-/// cells are the only mutable authorities for forward work, cleanup work, and
-/// concurrently live transient heap. A connector must create one instance and
-/// lend it to every phase through the end of publication or RAII cleanup.
+/// cells are the only mutable authorities for forward work, publisher cleanup,
+/// leaf-local cleanup, retained-view leases, and concurrently live transient
+/// heap. A connector must create one instance and lend it to every phase
+/// through the end of publication or RAII cleanup.
 #[derive(Debug)]
 pub(super) struct SnapshotPipelineResourcesV1 {
     policy: SnapshotResourcePolicyV1,
     forward_attempts_remaining: Cell<u64>,
-    cleanup_attempts_remaining: Cell<u64>,
+    publisher_cleanup_attempts_remaining: Cell<u64>,
+    local_cleanup_attempts_remaining: Cell<u64>,
+    retained_view_heap_live: Cell<u64>,
     transient_heap_live: Cell<u64>,
+}
+
+/// Linear reservation for one retained stability view.
+///
+/// A source or destination view must hold this lease for as long as its owned
+/// plan remains live. The connector reserves the full per-view ceiling before
+/// traversal, so no more than the two views allowed by the four-view heap
+/// contract can coexist. The plan-producing leaf separately bounds modeled
+/// retained bytes; allocator-observed capacity exactness inside the plan
+/// remains outside this lease.
+#[must_use = "dropping the lease releases its retained-view bytes"]
+pub(super) struct SnapshotRetainedViewLeaseV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
 }
 
 /// Temporary RAII precharge held while an allocation is attempted.
@@ -437,8 +460,9 @@ impl SnapshotResourcePolicyV1 {
             .max(max_live_publisher_cleanup_fds)
             .max(PUBLISH_TRANSIENT_FDS);
 
-        // A streaming four-view comparison retains only S1 and D1. S2 and D2
-        // are compared as streams and must not allocate a third full view.
+        // Four-view verification compares retained plans pairwise: S1/S2,
+        // S1/D1, then D1/D2. The prior pair is released before the next is
+        // admitted, so at most two full views coexist.
         let max_four_view_heap_bytes =
             checked_four_view_heap_bytes(max_retained_view_bytes.get(), max_transient_heap_bytes)?;
 
@@ -460,14 +484,31 @@ impl SnapshotResourcePolicyV1 {
                     .and_then(|generic| value.checked_add(generic))
             })
             .ok_or(SnapshotResourcePolicyErrorV1::ArithmeticOverflow)?;
-        let cleanup_operation_reserve = u64::from(max_entries.get())
+        let publisher_cleanup_operation_reserve = u64::from(max_entries.get())
             .checked_mul(cleanup_per_entry)
             .and_then(|value| value.checked_add(fixed_cleanup))
             .ok_or(SnapshotResourcePolicyErrorV1::ArithmeticOverflow)?;
+        // A failed regular-file copy can require one retry-bounded destination
+        // name reopen plus retry-bounded destination identity and unlink work.
+        // It runs sequentially, so one fixed reserve covers the active leaf.
+        // Keep it disjoint from publisher cleanup: a failed local cleanup must
+        // not consume the reserve needed to remove the enclosing staged tree.
+        let local_cleanup_operation_reserve = if max_file_bytes == 0 {
+            0
+        } else {
+            open_attempts
+                .checked_add(
+                    generic_attempts
+                        .checked_mul(2)
+                        .ok_or(SnapshotResourcePolicyErrorV1::ArithmeticOverflow)?,
+                )
+                .ok_or(SnapshotResourcePolicyErrorV1::ArithmeticOverflow)?
+        };
         let max_forward_operation_attempts = max_operation_attempts
             .get()
-            .checked_sub(cleanup_operation_reserve)
-            .ok_or(SnapshotResourcePolicyErrorV1::CleanupReserveExceedsOperationBudget)?;
+            .checked_sub(publisher_cleanup_operation_reserve)
+            .and_then(|value| value.checked_sub(local_cleanup_operation_reserve))
+            .ok_or(SnapshotResourcePolicyErrorV1::CleanupReservesExceedOperationBudget)?;
 
         Ok(Self {
             max_depth,
@@ -497,7 +538,8 @@ impl SnapshotResourcePolicyV1 {
             max_live_publisher_cleanup_fds,
             max_live_snapshot_fds,
             max_four_view_heap_bytes,
-            cleanup_operation_reserve,
+            publisher_cleanup_operation_reserve,
+            local_cleanup_operation_reserve,
             max_forward_operation_attempts,
         })
     }
@@ -622,8 +664,12 @@ impl SnapshotResourcePolicyV1 {
         self.max_four_view_heap_bytes
     }
 
-    pub(super) const fn cleanup_operation_reserve(self) -> u64 {
-        self.cleanup_operation_reserve
+    pub(super) const fn publisher_cleanup_operation_reserve(self) -> u64 {
+        self.publisher_cleanup_operation_reserve
+    }
+
+    pub(super) const fn local_cleanup_operation_reserve(self) -> u64 {
+        self.local_cleanup_operation_reserve
     }
 
     pub(super) const fn max_forward_operation_attempts(self) -> u64 {
@@ -673,7 +719,11 @@ impl SnapshotPipelineResourcesV1 {
         Ok(Self {
             policy,
             forward_attempts_remaining: Cell::new(policy.max_forward_operation_attempts()),
-            cleanup_attempts_remaining: Cell::new(policy.cleanup_operation_reserve()),
+            publisher_cleanup_attempts_remaining: Cell::new(
+                policy.publisher_cleanup_operation_reserve(),
+            ),
+            local_cleanup_attempts_remaining: Cell::new(policy.local_cleanup_operation_reserve()),
+            retained_view_heap_live: Cell::new(0),
             transient_heap_live: Cell::new(0),
         })
     }
@@ -701,18 +751,35 @@ impl SnapshotPipelineResourcesV1 {
         Ok(attempt())
     }
 
-    /// Charges one cleanup attempt before invoking `attempt`.
+    /// Charges one publisher-cleanup attempt before invoking `attempt`.
     ///
     /// Cleanup draws only from the reserve committed before staging creation;
     /// forward exhaustion therefore cannot prevent fail-closed RAII cleanup.
-    pub(super) fn run_cleanup_attempt<T>(
+    pub(super) fn run_publisher_cleanup_attempt<T>(
         &self,
         attempt: impl FnOnce() -> T,
     ) -> Result<T, SnapshotPipelineResourceErrorV1> {
         self.charge_attempt(
-            &self.cleanup_attempts_remaining,
+            &self.publisher_cleanup_attempts_remaining,
             SnapshotPipelineStageV1::Cleanup,
-            SnapshotPipelineAttemptBucketV1::Cleanup,
+            SnapshotPipelineAttemptBucketV1::PublisherCleanup,
+        )?;
+        Ok(attempt())
+    }
+
+    /// Charges one leaf-local cleanup attempt before invoking `attempt`.
+    ///
+    /// This fixed reserve is independent of both forward work and publisher
+    /// cleanup, so a regular-copy refusal cannot strand its destination or
+    /// consume the authority needed to remove the staged tree afterward.
+    pub(super) fn run_local_cleanup_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.charge_attempt(
+            &self.local_cleanup_attempts_remaining,
+            SnapshotPipelineStageV1::Cleanup,
+            SnapshotPipelineAttemptBucketV1::LocalCleanup,
         )?;
         Ok(attempt())
     }
@@ -736,14 +803,51 @@ impl SnapshotPipelineResourcesV1 {
         SnapshotChargedBytesV1::with_capacity(self, SnapshotPipelineStageV1::Cleanup, max_capacity)
     }
 
+    /// Reserves one complete retained-view ceiling before a view-producing
+    /// traversal starts. The returned lease must remain owned beside the view.
+    pub(super) fn reserve_retained_view(
+        &self,
+        stage: SnapshotPipelineForwardStageV1,
+    ) -> Result<SnapshotRetainedViewLeaseV1<'_>, SnapshotPipelineResourceErrorV1> {
+        let requested = self.policy.max_retained_view_bytes().get();
+        let live = self.retained_view_heap_live.get();
+        // Policy construction already proves that two retained views fit the
+        // hard four-view heap ceiling. Compare before adding so arithmetic
+        // overflow is not a representable runtime branch.
+        let limit = requested * 2;
+        if live > limit - requested {
+            return Err(
+                SnapshotPipelineResourceErrorV1::RetainedViewHeapCapacityExceeded {
+                    stage,
+                    live,
+                    requested,
+                    limit,
+                },
+            );
+        }
+        let next = live + requested;
+        self.retained_view_heap_live.set(next);
+        Ok(SnapshotRetainedViewLeaseV1 { resources: self })
+    }
+
     #[cfg(test)]
     pub(super) fn forward_attempts_remaining_for_test(&self) -> u64 {
         self.forward_attempts_remaining.get()
     }
 
     #[cfg(test)]
-    pub(super) fn cleanup_attempts_remaining_for_test(&self) -> u64 {
-        self.cleanup_attempts_remaining.get()
+    pub(super) fn publisher_cleanup_attempts_remaining_for_test(&self) -> u64 {
+        self.publisher_cleanup_attempts_remaining.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn local_cleanup_attempts_remaining_for_test(&self) -> u64 {
+        self.local_cleanup_attempts_remaining.get()
+    }
+
+    #[cfg(test)]
+    pub(super) fn retained_view_heap_live_for_test(&self) -> u64 {
+        self.retained_view_heap_live.get()
     }
 
     fn charge_attempt(
@@ -801,6 +905,21 @@ impl SnapshotPipelineResourcesV1 {
             .checked_sub(bytes)
             .expect("a private transient charge cannot release uncharged bytes");
         self.transient_heap_live.set(restored);
+    }
+
+    fn release_retained_view(&self) {
+        let live = self.retained_view_heap_live.get();
+        let bytes = self.policy.max_retained_view_bytes().get();
+        let restored = live
+            .checked_sub(bytes)
+            .expect("a private retained-view lease cannot release unreserved bytes");
+        self.retained_view_heap_live.set(restored);
+    }
+}
+
+impl Drop for SnapshotRetainedViewLeaseV1<'_> {
+    fn drop(&mut self) {
+        self.resources.release_retained_view();
     }
 }
 
@@ -1017,19 +1136,35 @@ mod tests {
         let entries = 10u64;
         let open_attempts = 4u64;
         let syscall_attempts = 3u64;
-        let expected = 3 * open_attempts
+        let publisher_cleanup = 3 * open_attempts
             + 12 * syscall_attempts
             + entries * (5 * open_attempts + 12 * syscall_attempts);
-        let total = expected + 77;
+        let local_cleanup = open_attempts + 2 * syscall_attempts;
+        let total = publisher_cleanup + local_cleanup + 77;
         let committed_policy = policy(2, entries as u32, 1024, 512, total, 4, 3).unwrap();
 
-        assert_eq!(committed_policy.cleanup_operation_reserve(), expected);
+        assert_eq!(
+            committed_policy.publisher_cleanup_operation_reserve(),
+            publisher_cleanup
+        );
+        assert_eq!(
+            committed_policy.local_cleanup_operation_reserve(),
+            local_cleanup
+        );
         assert_eq!(committed_policy.max_forward_operation_attempts(), 77);
         assert_eq!(committed_policy.max_operation_attempts().get(), total);
 
         assert_eq!(
-            policy(2, entries as u32, 1024, 512, expected - 1, 4, 3),
-            Err(SnapshotResourcePolicyErrorV1::CleanupReserveExceedsOperationBudget)
+            policy(
+                2,
+                entries as u32,
+                1024,
+                512,
+                publisher_cleanup + local_cleanup - 1,
+                4,
+                3,
+            ),
+            Err(SnapshotResourcePolicyErrorV1::CleanupReservesExceedOperationBudget)
         );
     }
 
@@ -1150,6 +1285,7 @@ mod tests {
             + u64::from(HARD_MAX_ENTRIES)
                 * (CLEANUP_OPEN_CALLS_PER_ENTRY * u64::from(HARD_MAX_ATTEMPTS_PER_CALL)
                     + CLEANUP_SYSCALL_CALLS_PER_ENTRY * u64::from(HARD_MAX_ATTEMPTS_PER_CALL));
+        let local_cleanup = 3 * u64::from(HARD_MAX_ATTEMPTS_PER_CALL);
         let policy = SnapshotResourcePolicyV1::checked(
             HARD_MAX_DEPTH,
             nz32(HARD_MAX_ENTRIES),
@@ -1168,7 +1304,7 @@ mod tests {
             HARD_MAX_TOTAL_XATTR_PAYLOAD_BYTES,
             nz64(HARD_MAX_RETAINED_VIEW_BYTES),
             HARD_MAX_TRANSIENT_HEAP_BYTES,
-            nz64(cleanup),
+            nz64(cleanup + local_cleanup),
             nz8(HARD_MAX_ATTEMPTS_PER_CALL),
             nz8(HARD_MAX_ATTEMPTS_PER_CALL),
             nz8(HARD_MAX_ATTEMPTS_PER_CALL),
@@ -1176,6 +1312,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(policy.max_forward_operation_attempts(), 0);
+        assert_eq!(policy.local_cleanup_operation_reserve(), local_cleanup);
         assert_eq!(
             policy.max_four_view_heap_bytes(),
             2 * HARD_MAX_RETAINED_VIEW_BYTES + HARD_MAX_TRANSIENT_HEAP_BYTES
@@ -1396,8 +1533,8 @@ mod tests {
         let mut previous_cleanup = 0;
         for entries in 1..=128 {
             let policy = policy(4, entries, 4096, 1024, 100_000, 2, 2).unwrap();
-            assert!(policy.cleanup_operation_reserve() >= previous_cleanup);
-            previous_cleanup = policy.cleanup_operation_reserve();
+            assert!(policy.publisher_cleanup_operation_reserve() >= previous_cleanup);
+            previous_cleanup = policy.publisher_cleanup_operation_reserve();
         }
 
         let small = policy(4, 64, 4096, 1024, 100_000, 2, 2).unwrap();
@@ -1429,12 +1566,13 @@ mod tests {
             + entries
                 * (CLEANUP_OPEN_CALLS_PER_ENTRY * open_attempts
                     + CLEANUP_SYSCALL_CALLS_PER_ENTRY * syscall_attempts);
+        let local_cleanup = open_attempts + 2 * syscall_attempts;
         policy(
             2,
             entries as u32,
             4096,
             transient_heap_bytes,
-            cleanup + forward_attempts,
+            cleanup + local_cleanup + forward_attempts,
             open_attempts as u8,
             syscall_attempts as u8,
         )
@@ -1508,7 +1646,7 @@ mod tests {
         let resources = pipeline_resources(1, 8);
         let one = resources
             .reserve_transient(
-                SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::SourceEnumeration),
+                SnapshotPipelineStageV1::Forward(SnapshotPipelineForwardStageV1::SourceObservation),
                 1,
             )
             .unwrap();
@@ -1558,11 +1696,12 @@ mod tests {
         );
         assert_eq!(forward_ran.get(), 1);
 
-        let cleanup_before = resources.cleanup_attempts_remaining.get();
+        let cleanup_before = resources.publisher_cleanup_attempts_remaining.get();
+        let local_cleanup_before = resources.local_cleanup_attempts_remaining.get();
         resources
-            .run_cleanup_attempt(|| {
+            .run_publisher_cleanup_attempt(|| {
                 assert_eq!(
-                    resources.cleanup_attempts_remaining.get(),
+                    resources.publisher_cleanup_attempts_remaining.get(),
                     cleanup_before - 1
                 );
             })
@@ -1570,24 +1709,42 @@ mod tests {
         assert_eq!(resources.forward_attempts_remaining.get(), 0);
 
         for _ in 1..cleanup_before {
-            resources.run_cleanup_attempt(|| ()).unwrap();
+            resources.run_publisher_cleanup_attempt(|| ()).unwrap();
         }
         let cleanup_ran = Cell::new(false);
         assert_eq!(
             resources
-                .run_cleanup_attempt(|| cleanup_ran.set(true))
+                .run_publisher_cleanup_attempt(|| cleanup_ran.set(true))
                 .unwrap_err(),
             SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
                 stage: SnapshotPipelineStageV1::Cleanup,
-                bucket: SnapshotPipelineAttemptBucketV1::Cleanup,
+                bucket: SnapshotPipelineAttemptBucketV1::PublisherCleanup,
+            }
+        );
+        assert!(!cleanup_ran.get());
+        assert_eq!(
+            resources.local_cleanup_attempts_remaining.get(),
+            local_cleanup_before
+        );
+
+        for _ in 0..local_cleanup_before {
+            resources.run_local_cleanup_attempt(|| ()).unwrap();
+        }
+        assert_eq!(
+            resources
+                .run_local_cleanup_attempt(|| cleanup_ran.set(true))
+                .unwrap_err(),
+            SnapshotPipelineResourceErrorV1::OperationBudgetExhausted {
+                stage: SnapshotPipelineStageV1::Cleanup,
+                bucket: SnapshotPipelineAttemptBucketV1::LocalCleanup,
             }
         );
         assert!(!cleanup_ran.get());
 
         let resources = pipeline_resources(1, 8);
-        let cleanup_attempts = resources.cleanup_attempts_remaining.get();
+        let cleanup_attempts = resources.publisher_cleanup_attempts_remaining.get();
         for _ in 0..cleanup_attempts {
-            resources.run_cleanup_attempt(|| ()).unwrap();
+            resources.run_publisher_cleanup_attempt(|| ()).unwrap();
         }
         resources
             .run_forward_attempt(SnapshotPipelineForwardStageV1::RegularCopy, || ())
@@ -1648,6 +1805,42 @@ mod tests {
         assert_eq!(resources.transient_heap_live.get(), 0);
         drop(zero);
         assert_eq!(resources.transient_heap_live.get(), 0);
+    }
+
+    #[test]
+    fn exactly_two_retained_views_share_the_four_view_budget() {
+        let resources = pipeline_resources(1, 8);
+        let per_view = resources.policy().max_retained_view_bytes().get();
+        let source = resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::SourceObservation)
+            .unwrap();
+        let destination = resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::DestinationObservation)
+            .unwrap();
+        assert_eq!(resources.retained_view_heap_live.get(), per_view * 2);
+
+        assert_eq!(
+            resources
+                .reserve_retained_view(SnapshotPipelineForwardStageV1::SourceObservation)
+                .err()
+                .unwrap(),
+            SnapshotPipelineResourceErrorV1::RetainedViewHeapCapacityExceeded {
+                stage: SnapshotPipelineForwardStageV1::SourceObservation,
+                live: per_view * 2,
+                requested: per_view,
+                limit: per_view * 2,
+            }
+        );
+
+        drop(source);
+        assert_eq!(resources.retained_view_heap_live.get(), per_view);
+        let replacement = resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::SourceObservation)
+            .unwrap();
+        drop(destination);
+        assert_eq!(resources.retained_view_heap_live.get(), per_view);
+        drop(replacement);
+        assert_eq!(resources.retained_view_heap_live.get(), 0);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use super::snapshot_materialize::SnapshotMaterializePolicyV1;
 use super::snapshot_policy::{
     SnapshotChargedBytesV1, SnapshotPipelineForwardStageV1, SnapshotPipelineResourceErrorV1,
     SnapshotPipelineResourcesV1, SnapshotResourcePolicyFieldV1, SnapshotResourcePolicyV1,
+    SnapshotRetainedViewLeaseV1,
 };
 use super::snapshot_publish::{
     ChargedStagedSnapshotDirectoryV1, SnapshotPublishErrorV1, SnapshotPublishPolicyV1,
@@ -55,6 +56,7 @@ pub(super) enum SnapshotDerivedResourceV1 {
     TreeFileDescriptors,
     MaterializerFileDescriptors,
     RegularCopyFileDescriptors,
+    RegularCopyCleanupAttempts,
     StagedPublisherFileDescriptors,
     PublisherCleanupFileDescriptors,
     PublicationFileDescriptors,
@@ -68,6 +70,7 @@ pub(super) enum SnapshotDerivedResourceV1 {
     PublisherCleanupNameBytes,
     PublisherRetainedNameBytes,
     PublisherCleanupGetdentsAttempts,
+    PublisherCleanupAttempts,
     SourceOpenat2Attempts,
     SourceSyscallAttempts,
     SourceXattrStabilityRounds,
@@ -95,10 +98,6 @@ pub(super) enum SnapshotPolicyProjectionErrorV1 {
     LeafCapacityInsufficient {
         leaf: SnapshotProjectedLeafV1,
         field: SnapshotResourcePolicyFieldV1,
-    },
-    CleanupOperationReserveMismatch {
-        committed: u64,
-        projected: u64,
     },
     DerivedResourceMismatch {
         resource: SnapshotDerivedResourceV1,
@@ -185,6 +184,29 @@ pub(super) struct SnapshotSourceObservationSessionV1<'resources> {
     policy: &'resources SourceEnumerationPolicyV1,
 }
 
+/// Connector-minted authority for regular-copy attempts in one sequential,
+/// connector-owned traversal.
+///
+/// The exact policy and both non-fungible attempt buckets come from the same
+/// preflighted pipeline ledger. No caller can substitute retry limits or spend
+/// publisher cleanup authority on leaf-local failure cleanup. The traversal
+/// must abort on its first fatal leaf, which keeps at most one failed local
+/// destination active against the fixed reserve.
+pub(super) struct SnapshotMaterializationSessionV1<'resources> {
+    resources: &'resources SnapshotPipelineResourcesV1,
+    regular_copy_policy: RegularCopyPolicyV1,
+}
+
+/// One FD-free tree view paired with the connector's linear retained-heap
+/// lease. Only source observation mints this wrapper today; a future
+/// destination observer may share the retained representation but must use a
+/// distinct destination-stage session. Field order is intentional: the owned
+/// plan is destroyed before its budget lease is released.
+pub(super) struct SnapshotRetainedTreeViewV1<'resources> {
+    plan: SourceTreePlanV1,
+    _lease: SnapshotRetainedViewLeaseV1<'resources>,
+}
+
 impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
     pub(super) const fn source_policy(&self) -> &'resources SourceEnumerationPolicyV1 {
         self.policy
@@ -200,6 +222,37 @@ impl<'resources> SnapshotSourceObservationSessionV1<'resources> {
     ) -> Result<T, SnapshotPipelineResourceErrorV1> {
         self.resources
             .run_forward_attempt(SnapshotPipelineForwardStageV1::SourceObservation, attempt)
+    }
+}
+
+impl SnapshotMaterializationSessionV1<'_> {
+    pub(super) const fn regular_copy_policy(&self) -> RegularCopyPolicyV1 {
+        self.regular_copy_policy
+    }
+
+    pub(super) fn run_regular_copy_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources
+            .run_forward_attempt(SnapshotPipelineForwardStageV1::RegularCopy, attempt)
+    }
+
+    pub(super) fn run_local_cleanup_attempt<T>(
+        &self,
+        attempt: impl FnOnce() -> T,
+    ) -> Result<T, SnapshotPipelineResourceErrorV1> {
+        self.resources.run_local_cleanup_attempt(attempt)
+    }
+
+    #[cfg(test)]
+    pub(super) fn forward_attempts_remaining(&self) -> u64 {
+        self.resources.forward_attempts_remaining_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn local_cleanup_attempts_remaining(&self) -> u64 {
+        self.resources.local_cleanup_attempts_remaining_for_test()
     }
 }
 
@@ -277,11 +330,11 @@ impl<'resources> SnapshotPublicationSessionV1<'resources> {
             .run_forward_attempt(SnapshotPipelineForwardStageV1::Publication, attempt)
     }
 
-    pub(super) fn run_cleanup_attempt<T>(
+    pub(super) fn run_publisher_cleanup_attempt<T>(
         &self,
         attempt: impl FnOnce() -> T,
     ) -> Result<T, SnapshotPipelineResourceErrorV1> {
-        self.resources.run_cleanup_attempt(attempt)
+        self.resources.run_publisher_cleanup_attempt(attempt)
     }
 
     pub(super) fn charged_forward_bytes(
@@ -305,8 +358,9 @@ impl<'resources> SnapshotPublicationSessionV1<'resources> {
     }
 
     #[cfg(test)]
-    pub(super) fn cleanup_attempts_remaining(&self) -> u64 {
-        self.resources.cleanup_attempts_remaining_for_test()
+    pub(super) fn publisher_cleanup_attempts_remaining(&self) -> u64 {
+        self.resources
+            .publisher_cleanup_attempts_remaining_for_test()
     }
 }
 
@@ -332,6 +386,13 @@ impl SnapshotConnectorV1 {
         }
     }
 
+    fn materialization_session(&self) -> SnapshotMaterializationSessionV1<'_> {
+        SnapshotMaterializationSessionV1 {
+            resources: &self.resources,
+            regular_copy_policy: self.source.regular_copy_policy(),
+        }
+    }
+
     fn begin_publication(&self) -> Option<SnapshotPublicationSessionV1<'_>> {
         if self.publication_started.replace(true) {
             return None;
@@ -350,13 +411,22 @@ impl SnapshotConnectorV1 {
         source_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
     ) -> Result<
-        SourceTreePlanV1,
+        SnapshotRetainedTreeViewV1<'_>,
         SnapshotSourceObservationErrorV1<SnapshotSourceObservationFailureV1>,
     > {
+        let lease = self
+            .resources
+            .reserve_retained_view(SnapshotPipelineForwardStageV1::SourceObservation)
+            .map_err(SnapshotSourceObservationErrorV1::Resource)?;
         let session = self.source_observation_session();
         let mut visitor = SnapshotSourceObservationVisitorV1;
-        enumerate_source_tree_view_charged_at(source_view, root_name, &session, &mut visitor)
-            .map_err(flatten_source_observation_error)
+        let plan =
+            enumerate_source_tree_view_charged_at(source_view, root_name, &session, &mut visitor)
+                .map_err(flatten_source_observation_error)?;
+        Ok(SnapshotRetainedTreeViewV1 {
+            plan,
+            _lease: lease,
+        })
     }
 
     /// Consumes the sole publication attempt, even when staging refuses or
@@ -503,13 +573,21 @@ pub(super) fn connect_snapshot_pipeline(
     let projected_cleanup_attempts = publication.cleanup_operation_attempt_bound().ok_or(
         SnapshotPolicyProjectionErrorV1::ArithmeticOverflow(Field::OperationAttempts),
     )?;
-    if projected_cleanup_attempts != policy.cleanup_operation_reserve() {
-        return Err(
-            SnapshotPolicyProjectionErrorV1::CleanupOperationReserveMismatch {
-                committed: policy.cleanup_operation_reserve(),
-                projected: projected_cleanup_attempts,
-            },
-        );
+    if projected_cleanup_attempts != policy.publisher_cleanup_operation_reserve() {
+        return Err(SnapshotPolicyProjectionErrorV1::DerivedResourceMismatch {
+            resource: SnapshotDerivedResourceV1::PublisherCleanupAttempts,
+            committed: policy.publisher_cleanup_operation_reserve(),
+            projected: projected_cleanup_attempts,
+        });
+    }
+    let projected_local_cleanup_attempts =
+        source.regular_copy_policy().local_cleanup_attempt_bound();
+    if projected_local_cleanup_attempts != policy.local_cleanup_operation_reserve() {
+        return Err(SnapshotPolicyProjectionErrorV1::DerivedResourceMismatch {
+            resource: SnapshotDerivedResourceV1::RegularCopyCleanupAttempts,
+            committed: policy.local_cleanup_operation_reserve(),
+            projected: projected_local_cleanup_attempts,
+        });
     }
 
     Ok(SnapshotConnectorV1 {
@@ -772,7 +850,9 @@ fn nonzero_u64(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fs::File;
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::os::fd::AsFd;
 
     use super::*;
 
@@ -940,7 +1020,22 @@ mod tests {
         );
         assert_eq!(
             projected.publication.cleanup_operation_attempt_bound(),
-            Some(projected.resources.policy().cleanup_operation_reserve())
+            Some(
+                projected
+                    .resources
+                    .policy()
+                    .publisher_cleanup_operation_reserve()
+            )
+        );
+        assert_eq!(
+            projected
+                .source
+                .regular_copy_policy()
+                .local_cleanup_attempt_bound(),
+            projected
+                .resources
+                .policy()
+                .local_cleanup_operation_reserve()
         );
         assert_eq!(projected.resources.policy().max_live_snapshot_fds(), 17);
     }
@@ -968,6 +1063,10 @@ mod tests {
         file.file_bytes = 0;
         file.data_extents_per_file = 0;
         file.total_data_extents = 0;
+        assert_eq!(
+            resources(file).policy().local_cleanup_operation_reserve(),
+            0
+        );
 
         let mut extents = Inputs::exact();
         extents.data_extents_per_file = 0;
@@ -1069,10 +1168,14 @@ mod tests {
         <SnapshotPublicationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
         <SnapshotSourceObservationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotMaterializationSessionV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotMaterializationSessionV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <SnapshotRetainedTreeViewV1<'static> as AmbiguousIfClone<_>>::probe();
+        <SnapshotRetainedTreeViewV1<'static> as AmbiguousIfCopy<_>>::probe();
 
         let mut inputs = Inputs::exact();
-        // `(5E + 3) * open + (12E + 12) * syscall` for E=4.
-        inputs.operation_attempts = 272;
+        // Publisher cleanup plus one active regular-copy cleanup reserve.
+        inputs.operation_attempts = 272 + 4 + 2 * 3;
         let resources = resources(inputs);
         assert_eq!(resources.policy().max_forward_operation_attempts(), 0);
         let projected = connect_snapshot_pipeline(resources).unwrap();
@@ -1099,10 +1202,15 @@ mod tests {
             }
         );
         assert!(!invoked.get());
-        let cleanup_before = session.cleanup_attempts_remaining();
-        session.run_cleanup_attempt(|| invoked.set(true)).unwrap();
+        let cleanup_before = session.publisher_cleanup_attempts_remaining();
+        session
+            .run_publisher_cleanup_attempt(|| invoked.set(true))
+            .unwrap();
         assert!(invoked.get());
-        assert_eq!(session.cleanup_attempts_remaining(), cleanup_before - 1);
+        assert_eq!(
+            session.publisher_cleanup_attempts_remaining(),
+            cleanup_before - 1
+        );
     }
 
     #[test]
@@ -1125,13 +1233,38 @@ mod tests {
     }
 
     #[test]
+    fn materialization_sessions_bind_policy_and_disjoint_attempt_buckets() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let first = connector.materialization_session();
+        let second = connector.materialization_session();
+
+        assert_eq!(
+            first.regular_copy_policy(),
+            connector.source.regular_copy_policy()
+        );
+        assert_eq!(first.regular_copy_policy(), second.regular_copy_policy());
+        let forward_before = first.forward_attempts_remaining();
+        let local_before = first.local_cleanup_attempts_remaining();
+
+        first.run_regular_copy_attempt(|| ()).unwrap();
+        assert_eq!(second.forward_attempts_remaining(), forward_before - 1);
+        assert_eq!(second.local_cleanup_attempts_remaining(), local_before);
+
+        second.run_local_cleanup_attempt(|| ()).unwrap();
+        assert_eq!(first.forward_attempts_remaining(), forward_before - 1);
+        assert_eq!(first.local_cleanup_attempts_remaining(), local_before - 1);
+    }
+
+    #[test]
     fn source_observation_exhaustion_is_typed_and_precedes_attempt() {
         let mut inputs = Inputs::exact();
-        // `(5E + 3) * open + (12E + 12) * syscall` for E=4 leaves no
-        // forward attempts after reserving cleanup.
-        inputs.operation_attempts = 272;
+        // Publisher cleanup plus one active regular-copy cleanup reserve leave
+        // no forward attempts.
+        inputs.operation_attempts = 272 + 4 + 2 * 3;
         let connector = connect_snapshot_pipeline(resources(inputs)).unwrap();
-        let cleanup_before = connector.resources.cleanup_attempts_remaining_for_test();
+        let cleanup_before = connector
+            .resources
+            .publisher_cleanup_attempts_remaining_for_test();
         let session = connector.source_observation_session();
 
         let invoked = Cell::new(false);
@@ -1146,7 +1279,9 @@ mod tests {
         );
         assert!(!invoked.get());
         assert_eq!(
-            connector.resources.cleanup_attempts_remaining_for_test(),
+            connector
+                .resources
+                .publisher_cleanup_attempts_remaining_for_test(),
             cleanup_before
         );
     }
@@ -1163,7 +1298,7 @@ mod tests {
         let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
         let staging = connector.begin_publication().unwrap();
         let forward_before = staging.forward_attempts_remaining();
-        let cleanup_before = staging.cleanup_attempts_remaining();
+        let cleanup_before = staging.publisher_cleanup_attempts_remaining();
 
         connector
             .source_observation_session()
@@ -1171,7 +1306,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(staging.forward_attempts_remaining(), forward_before - 1);
-        assert_eq!(staging.cleanup_attempts_remaining(), cleanup_before);
+        assert_eq!(
+            staging.publisher_cleanup_attempts_remaining(),
+            cleanup_before
+        );
         assert!(connector.begin_publication().is_none());
     }
 
@@ -1292,6 +1430,26 @@ mod tests {
                 field: SnapshotResourcePolicyFieldV1::RetainedViewBytes,
             }
         );
+    }
+
+    #[test]
+    fn failed_source_observation_releases_its_retained_view_lease() {
+        let connector = connect_snapshot_pipeline(resources(Inputs::exact())).unwrap();
+        let non_directory = File::open("/dev/null").unwrap();
+        // SAFETY: the invalid parent is intentional: no source read can occur,
+        // and the test exercises only the failure-path lease lifetime.
+        let source_view = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                non_directory.as_fd(),
+            )
+        };
+
+        assert!(
+            connector
+                .observe_source_tree_view_at(source_view, c"root")
+                .is_err()
+        );
+        assert_eq!(connector.resources.retained_view_heap_live_for_test(), 0);
     }
 
     #[test]

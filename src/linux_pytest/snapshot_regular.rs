@@ -19,9 +19,9 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
 use super::FileContentHasherV1;
 use super::snapshot_connector::{
-    SnapshotSourceObservationErrorV1, SnapshotSourceObservationSessionV1,
+    SnapshotMaterializationSessionV1, SnapshotSourceObservationErrorV1,
+    SnapshotSourceObservationSessionV1,
 };
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
 
@@ -93,6 +93,13 @@ impl RegularCopyPolicyV1 {
 
     pub(super) const fn syscall_attempts(self) -> u8 {
         self.syscall_attempts.get()
+    }
+
+    /// Exact fixed reserve needed to remove the one active regular-copy
+    /// destination after a fatal forward error: destination-name reopen,
+    /// destination `fstat`, then `unlinkat`, each at its committed retry bound.
+    pub(super) fn local_cleanup_attempt_bound(self) -> u64 {
+        u64::from(self.openat2_attempts.get()) + 2 * u64::from(self.syscall_attempts.get())
     }
 }
 
@@ -235,6 +242,14 @@ impl fmt::Display for SnapshotRegularFailureV1 {
 
 impl std::error::Error for SnapshotRegularFailureV1 {}
 
+/// A charged regular-copy refusal. The connector's resource ledger and leaf
+/// correctness failures remain structurally distinguishable.
+#[derive(Debug, Eq, PartialEq)]
+pub(super) enum SnapshotRegularMaterializationErrorV1 {
+    Resource(SnapshotPipelineResourceErrorV1),
+    Leaf(SnapshotRegularFailureV1),
+}
+
 /// Copy one pinned regular source child into one new destination child.
 ///
 /// Both directory descriptors and `source_handle` must already be trusted
@@ -249,6 +264,7 @@ impl std::error::Error for SnapshotRegularFailureV1 {}
 /// must guarantee that ordinary source reads cannot mutate host metadata for
 /// this call's full duration. The destination parent must be a current-user,
 /// private staging directory in the already-qualified destination view.
+#[cfg(test)]
 pub(super) unsafe fn copy_regular_from_qualified_pinned_at(
     source_parent: BorrowedFd<'_>,
     source_name: &CStr,
@@ -264,6 +280,34 @@ pub(super) unsafe fn copy_regular_from_qualified_pinned_at(
         destination_parent,
         destination_name,
         policy,
+    )
+}
+
+/// Copy one pinned regular source child through the connector's non-forgeable
+/// regular-copy session. The session supplies both the committed leaf policy
+/// and the shared forward/local-cleanup ledgers; callers cannot splice either.
+///
+/// # Safety
+///
+/// `source_parent`, `source_name`, and `source_handle` must come from one
+/// still-live qualified source-view callback. The destination parent must be
+/// a current-user private staging directory in the already-qualified
+/// destination view.
+pub(super) unsafe fn copy_regular_from_qualified_pinned_charged_at(
+    source_parent: BorrowedFd<'_>,
+    source_name: &CStr,
+    source_handle: BorrowedFd<'_>,
+    destination_parent: BorrowedFd<'_>,
+    destination_name: &CStr,
+    session: &SnapshotMaterializationSessionV1<'_>,
+) -> Result<CopiedRegularV1, SnapshotRegularMaterializationErrorV1> {
+    platform::copy_regular_from_pinned_charged_at(
+        source_parent,
+        source_name,
+        source_handle,
+        destination_parent,
+        destination_name,
+        session,
     )
 }
 
@@ -299,6 +343,7 @@ fn valid_basename(name: &CStr) -> bool {
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
+    #[cfg(test)]
     use std::convert::Infallible;
     use std::io;
     use std::mem::{self, MaybeUninit};
@@ -326,14 +371,22 @@ mod platform {
     const STATX_MNT_ID: u32 = 0x1000;
     const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
-    /// Private raw-attempt seam shared by the legacy direct-copy path and
-    /// charged observation. The charged observer always supplies the exact
-    /// connector session; `DirectGateV1` is selectable only by legacy copy
-    /// helpers in this module.
+    /// Private raw-attempt seam shared by charged paths and legacy unit tests.
+    /// Production callers always supply an exact connector session;
+    /// `DirectGateV1` does not exist outside test builds.
     trait KernelAttemptGateV1 {
         type ChargeError;
 
         fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError>;
+    }
+
+    /// A regular-copy authority has a second, non-fungible reserve for
+    /// best-effort removal of its one active private destination. Traversal is
+    /// sequential and aborts on its first fatal leaf, so two such cleanups can
+    /// never overlap. Normal fallback removal remains forward work and never
+    /// spends this reserve.
+    trait MaterializationAttemptGateV1: KernelAttemptGateV1 {
+        fn run_cleanup<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError>;
     }
 
     #[derive(Debug)]
@@ -342,12 +395,21 @@ mod platform {
         Io(io::Error),
     }
 
+    #[cfg(test)]
     struct DirectGateV1;
 
+    #[cfg(test)]
     impl KernelAttemptGateV1 for DirectGateV1 {
         type ChargeError = Infallible;
 
         fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            Ok(attempt())
+        }
+    }
+
+    #[cfg(test)]
+    impl MaterializationAttemptGateV1 for DirectGateV1 {
+        fn run_cleanup<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
             Ok(attempt())
         }
     }
@@ -360,6 +422,20 @@ mod platform {
         }
     }
 
+    impl KernelAttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
+        type ChargeError = SnapshotPipelineResourceErrorV1;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            SnapshotMaterializationSessionV1::run_regular_copy_attempt(self, attempt)
+        }
+    }
+
+    impl MaterializationAttemptGateV1 for SnapshotMaterializationSessionV1<'_> {
+        fn run_cleanup<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            SnapshotMaterializationSessionV1::run_local_cleanup_attempt(self, attempt)
+        }
+    }
+
     fn run_io_attempt<G: KernelAttemptGateV1, T>(
         gate: &G,
         attempt: impl FnOnce() -> io::Result<T>,
@@ -369,6 +445,7 @@ mod platform {
             .map_err(MeteredIoV1::Io)
     }
 
+    #[cfg(test)]
     fn into_direct_io<T>(result: Result<T, MeteredIoV1<Infallible>>) -> io::Result<T> {
         match result {
             Ok(value) => Ok(value),
@@ -393,6 +470,7 @@ mod platform {
         })
     }
 
+    #[cfg(test)]
     fn into_direct_regular<T>(
         result: Result<T, GatedRegularFailureV1<Infallible>>,
     ) -> Result<T, SnapshotRegularFailureV1> {
@@ -413,6 +491,20 @@ mod platform {
             }
             Err(GatedRegularFailureV1::Leaf(error)) => {
                 Err(SnapshotSourceObservationErrorV1::Leaf(error))
+            }
+        }
+    }
+
+    fn into_materialization_regular<T>(
+        result: Result<T, GatedRegularFailureV1<SnapshotPipelineResourceErrorV1>>,
+    ) -> Result<T, SnapshotRegularMaterializationErrorV1> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(GatedRegularFailureV1::Charge(error)) => {
+                Err(SnapshotRegularMaterializationErrorV1::Resource(error))
+            }
+            Err(GatedRegularFailureV1::Leaf(error)) => {
+                Err(SnapshotRegularMaterializationErrorV1::Leaf(error))
             }
         }
     }
@@ -489,11 +581,8 @@ mod platform {
         }
 
         #[cfg(test)]
-        fn destination_cleanup_identity(
-            &self,
-            destination: BorrowedFd<'_>,
-        ) -> io::Result<CleanupIdentity> {
-            fstat_cleanup_identity(destination)
+        fn before_destination_arm(&self) -> io::Result<()> {
+            Ok(())
         }
 
         #[cfg(test)]
@@ -534,6 +623,7 @@ mod platform {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn copy_regular_from_pinned_at(
         source_parent: BorrowedFd<'_>,
         source_name: &CStr,
@@ -542,7 +632,7 @@ mod platform {
         destination_name: &CStr,
         policy: RegularCopyPolicyV1,
     ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
-        copy_regular_from_pinned_at_with(
+        into_direct_regular(copy_regular_from_pinned_at_with_gate(
             source_parent,
             source_name,
             source_handle,
@@ -550,7 +640,28 @@ mod platform {
             destination_name,
             policy,
             &KernelHooks,
-        )
+            &DirectGateV1,
+        ))
+    }
+
+    pub(super) fn copy_regular_from_pinned_charged_at(
+        source_parent: BorrowedFd<'_>,
+        source_name: &CStr,
+        source_handle: BorrowedFd<'_>,
+        destination_parent: BorrowedFd<'_>,
+        destination_name: &CStr,
+        session: &SnapshotMaterializationSessionV1<'_>,
+    ) -> Result<CopiedRegularV1, SnapshotRegularMaterializationErrorV1> {
+        into_materialization_regular(copy_regular_from_pinned_at_with_gate(
+            source_parent,
+            source_name,
+            source_handle,
+            destination_parent,
+            destination_name,
+            session.regular_copy_policy(),
+            &KernelHooks,
+            session,
+        ))
     }
 
     pub(super) fn observe_regular_from_pinned_at(
@@ -679,7 +790,11 @@ mod platform {
         })
     }
 
-    fn copy_regular_from_pinned_at_with<H: CopyHooks>(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the private leaf must bind both descriptor-selected names/handles, policy, hooks, and one gate without an argument bag that adds no semantic authority"
+    )]
+    fn copy_regular_from_pinned_at_with_gate<H: CopyHooks, G: MaterializationAttemptGateV1>(
         source_parent: BorrowedFd<'_>,
         source_name: &CStr,
         source_handle: BorrowedFd<'_>,
@@ -687,206 +802,258 @@ mod platform {
         destination_name: &CStr,
         policy: RegularCopyPolicyV1,
         hooks: &H,
-    ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
+        gate: &G,
+    ) -> Result<CopiedRegularV1, GatedRegularFailureV1<G::ChargeError>> {
         if !valid_basename(source_name) {
-            return Err(SnapshotRegularFailureV1::new(
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotRequiredObjectUnsupported,
                 SnapshotRegularStageV1::ValidateSourceName,
                 None,
-            ));
+            )));
         }
         if !valid_basename(destination_name) {
-            return Err(SnapshotRegularFailureV1::new(
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotConstructionFailed,
                 SnapshotRegularStageV1::ValidateDestinationName,
                 None,
-            ));
+            )));
         }
 
-        let source_identity = statx_identity(source_handle)
-            .map_err(|error| map_statx_failure(SnapshotRegularStageV1::InspectSource, error))?;
+        let source_identity =
+            map_gated_result(statx_identity_with_gate(source_handle, gate), |error| {
+                map_statx_failure(SnapshotRegularStageV1::InspectSource, error)
+            })?;
         if source_identity.mode & libc::S_IFMT != libc::S_IFREG {
-            return Err(SnapshotRegularFailureV1::new(
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotRequiredObjectUnsupported,
                 SnapshotRegularStageV1::InspectSource,
                 None,
-            ));
+            )));
         }
         if source_identity.size > policy.max_logical_bytes() {
-            return Err(SnapshotRegularFailureV1::new(
+            return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
                 RefusalCode::SnapshotConstructionFailed,
                 SnapshotRegularStageV1::InspectSource,
                 None,
-            ));
+            )));
         }
 
         #[cfg(test)]
-        hooks
-            .after_source_handle_opened()
-            .map_err(|error| construction_io(SnapshotRegularStageV1::OpenSourceRead, error))?;
+        hooks.after_source_handle_opened().map_err(|error| {
+            GatedRegularFailureV1::Leaf(construction_io(
+                SnapshotRegularStageV1::OpenSourceRead,
+                error,
+            ))
+        })?;
 
         #[cfg(not(test))]
         let source_open_flags = source_read_open_flags();
         #[cfg(test)]
         let source_open_flags = hooks.test_source_read_open_flags();
-        let source_read = openat2_owned(
-            source_parent,
-            source_name,
-            source_open_flags,
-            0,
-            SOURCE_RESOLVE,
-            policy.openat2_attempts(),
-        )
-        .map_err(|error| map_source_read_open(SnapshotRegularStageV1::OpenSourceRead, error))?;
-        let read_identity = statx_identity(source_read.as_fd())
-            .map_err(|error| map_statx_failure(SnapshotRegularStageV1::OpenSourceRead, error))?;
+        let source_read = map_gated_result(
+            openat2_owned_with_gate(
+                source_parent,
+                source_name,
+                source_open_flags,
+                0,
+                SOURCE_RESOLVE,
+                policy.openat2_attempts(),
+                gate,
+            ),
+            |error| map_source_read_open(SnapshotRegularStageV1::OpenSourceRead, error),
+        )?;
+        let read_identity = map_gated_result(
+            statx_identity_with_gate(source_read.as_fd(), gate),
+            |error| map_statx_failure(SnapshotRegularStageV1::OpenSourceRead, error),
+        )?;
         if read_identity != source_identity {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::OpenSourceRead,
                 None,
-            ));
+            )));
         }
 
         let mut cleanup = DestinationCleanup::new(
             destination_parent,
             destination_name,
             policy.openat2_attempts(),
-        );
-        let mut destination = create_destination(&mut cleanup, hooks).map_err(|error| {
-            map_destination_error(SnapshotRegularStageV1::CreateDestination, error)
-        })?;
-
-        let initial_extents = enumerate_extents_direct_with_attempts(
-            source_read.as_fd(),
-            source_identity.size,
-            policy.max_data_extents(),
             policy.syscall_attempts(),
-        )
-        .map_err(|error| map_extent_error(SnapshotRegularStageV1::EnumerateSourceExtents, error))?;
+            gate,
+        );
+        let mut destination =
+            map_gated_result(create_destination_with_gate(&mut cleanup, hooks), |error| {
+                map_destination_error(SnapshotRegularStageV1::CreateDestination, error)
+            })?;
 
-        match hooks.clone_file(destination.as_raw_fd(), source_read.as_raw_fd()) {
+        let initial_extents = map_gated_result(
+            enumerate_extents_with_gate(
+                source_read.as_fd(),
+                source_identity.size,
+                policy.max_data_extents(),
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_extent_error(SnapshotRegularStageV1::EnumerateSourceExtents, error),
+        )?;
+
+        match run_io_attempt(gate, || {
+            hooks.clone_file(destination.as_raw_fd(), source_read.as_raw_fd())
+        }) {
             Ok(()) => {}
-            Err(error) if clone_fallback_error(&error) => {
+            Err(MeteredIoV1::Io(error)) if clone_fallback_error(&error) => {
                 drop(destination);
-                cleanup.remove_current().map_err(|error| {
+                map_gated_result(cleanup.remove_current_forward(), |error| {
                     map_destination_error(SnapshotRegularStageV1::RecreateForFallback, error)
                 })?;
-                destination = create_destination(&mut cleanup, hooks).map_err(|error| {
-                    map_destination_error(SnapshotRegularStageV1::RecreateForFallback, error)
-                })?;
-                truncate_to(destination.as_fd(), source_identity.size).map_err(|error| {
-                    map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
-                })?;
-                copy_data_extents(
-                    source_read.as_fd(),
-                    destination.as_fd(),
-                    &initial_extents,
-                    policy.syscall_attempts(),
-                )
-                .map_err(|error| {
-                    map_destination_error(SnapshotRegularStageV1::SparseCopy, error)
-                })?;
+                destination =
+                    map_gated_result(create_destination_with_gate(&mut cleanup, hooks), |error| {
+                        map_destination_error(SnapshotRegularStageV1::RecreateForFallback, error)
+                    })?;
+                map_gated_result(
+                    truncate_to_with_gate(
+                        destination.as_fd(),
+                        source_identity.size,
+                        policy.syscall_attempts(),
+                        gate,
+                    ),
+                    |error| map_destination_error(SnapshotRegularStageV1::SparseCopy, error),
+                )?;
+                map_gated_result(
+                    copy_data_extents_with_gate(
+                        source_read.as_fd(),
+                        destination.as_fd(),
+                        &initial_extents,
+                        policy.syscall_attempts(),
+                        gate,
+                    ),
+                    |error| map_destination_error(SnapshotRegularStageV1::SparseCopy, error),
+                )?;
             }
-            Err(error) => {
-                return Err(map_destination_error(
+            Err(MeteredIoV1::Io(error)) => {
+                return Err(GatedRegularFailureV1::Leaf(map_destination_error(
                     SnapshotRegularStageV1::Reflink,
                     error,
-                ));
+                )));
+            }
+            Err(MeteredIoV1::Charge(error)) => {
+                return Err(GatedRegularFailureV1::Charge(error));
             }
         }
 
         #[cfg(test)]
         hooks.after_materialized().map_err(|error| {
-            map_destination_error(SnapshotRegularStageV1::RevalidateSource, error)
+            GatedRegularFailureV1::Leaf(map_destination_error(
+                SnapshotRegularStageV1::RevalidateSource,
+                error,
+            ))
         })?;
 
-        let source_extents_after = enumerate_extents_direct_with_attempts(
-            source_read.as_fd(),
-            source_identity.size,
-            policy.max_data_extents(),
-            policy.syscall_attempts(),
-        )
-        .map_err(|error| map_extent_error(SnapshotRegularStageV1::RevalidateSource, error))?;
+        let source_extents_after = map_gated_result(
+            enumerate_extents_with_gate(
+                source_read.as_fd(),
+                source_identity.size,
+                policy.max_data_extents(),
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_extent_error(SnapshotRegularStageV1::RevalidateSource, error),
+        )?;
         #[cfg(test)]
         let source_extents_after = {
             let mut observed = source_extents_after;
             hooks
                 .after_extent_observed(ExtentObservationPoint::SourceRecheck, &mut observed)
                 .map_err(|error| {
-                    map_extent_error(SnapshotRegularStageV1::RevalidateSource, error)
+                    GatedRegularFailureV1::Leaf(map_extent_error(
+                        SnapshotRegularStageV1::RevalidateSource,
+                        error,
+                    ))
                 })?;
             observed
         };
         if source_extents_after != initial_extents {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::RevalidateSource,
                 None,
-            ));
+            )));
         }
 
-        let destination_identity = statx_identity(destination.as_fd()).map_err(|error| {
-            map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error)
-        })?;
+        let destination_identity = map_gated_result(
+            statx_identity_with_gate(destination.as_fd(), gate),
+            |error| map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error),
+        )?;
         if destination_identity.mode & libc::S_IFMT != libc::S_IFREG
             || destination_identity.size != source_identity.size
             || destination_identity.nlink != 1
         {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::RevalidateDestination,
                 None,
-            ));
+            )));
         }
-        let destination_extents = enumerate_extents_direct_with_attempts(
-            destination.as_fd(),
-            destination_identity.size,
-            policy.max_data_extents(),
-            policy.syscall_attempts(),
-        )
-        .map_err(|error| {
-            map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error)
-        })?;
+        let destination_extents = map_gated_result(
+            enumerate_extents_with_gate(
+                destination.as_fd(),
+                destination_identity.size,
+                policy.max_data_extents(),
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error),
+        )?;
         #[cfg(test)]
         let destination_extents = {
             let mut observed = destination_extents;
             hooks
                 .after_extent_observed(ExtentObservationPoint::Destination, &mut observed)
                 .map_err(|error| {
-                    map_extent_error(SnapshotRegularStageV1::EnumerateDestinationExtents, error)
+                    GatedRegularFailureV1::Leaf(map_extent_error(
+                        SnapshotRegularStageV1::EnumerateDestinationExtents,
+                        error,
+                    ))
                 })?;
             observed
         };
         if destination_extents != initial_extents {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::EnumerateDestinationExtents,
                 None,
-            ));
+            )));
         }
 
-        let content_digest = hash_logical_bytes(
-            destination.as_fd(),
-            destination_identity.size,
-            policy.syscall_attempts(),
-        )
-        .map_err(|error| map_destination_error(SnapshotRegularStageV1::HashDestination, error))?;
+        let content_digest = map_gated_result(
+            hash_logical_bytes_with_gate(
+                destination.as_fd(),
+                destination_identity.size,
+                policy.syscall_attempts(),
+                gate,
+            ),
+            |error| map_destination_error(SnapshotRegularStageV1::HashDestination, error),
+        )?;
 
-        revalidate_source(
+        revalidate_source_with_gate(
             source_parent,
             source_name,
             source_handle,
             source_read.as_fd(),
             &source_identity,
             policy.openat2_attempts(),
+            gate,
         )?;
         #[cfg(test)]
         hooks.before_destination_reopen().map_err(|error| {
-            construction_io(SnapshotRegularStageV1::RevalidateDestination, error)
+            GatedRegularFailureV1::Leaf(construction_io(
+                SnapshotRegularStageV1::RevalidateDestination,
+                error,
+            ))
         })?;
-        revalidate_destination(
+        revalidate_destination_with_gate(
             destination_parent,
             destination_name,
             destination.as_fd(),
             &destination_identity,
             policy.openat2_attempts(),
+            gate,
         )?;
 
         cleanup.disarm();
@@ -910,25 +1077,6 @@ mod platform {
             | libc::O_NOFOLLOW
             | libc::O_NOATIME
             | libc::O_CLOEXEC
-    }
-
-    fn revalidate_source(
-        parent: BorrowedFd<'_>,
-        name: &CStr,
-        path_handle: BorrowedFd<'_>,
-        read_handle: BorrowedFd<'_>,
-        expected: &StableStatxV1,
-        attempts: u8,
-    ) -> Result<(), SnapshotRegularFailureV1> {
-        into_direct_regular(revalidate_source_with_gate(
-            parent,
-            name,
-            path_handle,
-            read_handle,
-            expected,
-            attempts,
-            &DirectGateV1,
-        ))
     }
 
     fn revalidate_source_with_gate<G: KernelAttemptGateV1>(
@@ -971,51 +1119,78 @@ mod platform {
         Ok(())
     }
 
-    fn revalidate_destination(
+    fn revalidate_destination_with_gate<G: KernelAttemptGateV1>(
         parent: BorrowedFd<'_>,
         name: &CStr,
         destination: BorrowedFd<'_>,
         expected: &StableStatxV1,
         attempts: u8,
-    ) -> Result<(), SnapshotRegularFailureV1> {
-        let fd_after = statx_identity(destination).map_err(|error| {
+        gate: &G,
+    ) -> Result<(), GatedRegularFailureV1<G::ChargeError>> {
+        let fd_after = map_gated_result(statx_identity_with_gate(destination, gate), |error| {
             map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error)
         })?;
-        let reopened = openat2_owned(
-            parent,
-            name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-            SOURCE_RESOLVE,
-            attempts,
-        )
-        .map_err(|error| construction_io(SnapshotRegularStageV1::RevalidateDestination, error))?;
-        let reopened_identity = statx_identity(reopened.as_fd()).map_err(|error| {
-            map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error)
-        })?;
+        let reopened = map_gated_result(
+            openat2_owned_with_gate(
+                parent,
+                name,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0,
+                SOURCE_RESOLVE,
+                attempts,
+                gate,
+            ),
+            |error| construction_io(SnapshotRegularStageV1::RevalidateDestination, error),
+        )?;
+        let reopened_identity =
+            map_gated_result(statx_identity_with_gate(reopened.as_fd(), gate), |error| {
+                map_statx_failure(SnapshotRegularStageV1::RevalidateDestination, error)
+            })?;
         if fd_after != *expected || reopened_identity != *expected {
-            return Err(construction_failure(
+            return Err(GatedRegularFailureV1::Leaf(construction_failure(
                 SnapshotRegularStageV1::RevalidateDestination,
                 None,
-            ));
+            )));
         }
         Ok(())
     }
 
-    struct DestinationCleanup<'a> {
-        parent: BorrowedFd<'a>,
-        name: &'a CStr,
-        attempts: u8,
-        state: CleanupState,
+    struct CleanupGateV1<'gate, G: MaterializationAttemptGateV1>(&'gate G);
+
+    impl<G: MaterializationAttemptGateV1> KernelAttemptGateV1 for CleanupGateV1<'_, G> {
+        type ChargeError = G::ChargeError;
+
+        fn run<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+            self.0.run_cleanup(attempt)
+        }
     }
 
-    impl<'a> DestinationCleanup<'a> {
-        fn new(parent: BorrowedFd<'a>, name: &'a CStr, attempts: u8) -> Self {
+    struct DestinationCleanup<'destination, 'gate, G: MaterializationAttemptGateV1> {
+        parent: BorrowedFd<'destination>,
+        name: &'destination CStr,
+        openat2_attempts: u8,
+        syscall_attempts: u8,
+        state: CleanupState,
+        gate: &'gate G,
+    }
+
+    impl<'destination, 'gate, G: MaterializationAttemptGateV1>
+        DestinationCleanup<'destination, 'gate, G>
+    {
+        fn new(
+            parent: BorrowedFd<'destination>,
+            name: &'destination CStr,
+            openat2_attempts: u8,
+            syscall_attempts: u8,
+            gate: &'gate G,
+        ) -> Self {
             Self {
                 parent,
                 name,
-                attempts,
+                openat2_attempts,
+                syscall_attempts,
                 state: CleanupState::Absent,
+                gate,
             }
         }
 
@@ -1023,50 +1198,73 @@ mod platform {
             self.state = CleanupState::CreatedUnverified;
         }
 
-        fn arm<H: CopyHooks>(&mut self, destination: BorrowedFd<'_>, hooks: &H) -> io::Result<()> {
-            #[cfg(not(test))]
-            let identity = {
-                let _ = hooks;
-                fstat_cleanup_identity(destination)?
-            };
-            #[cfg(test)]
-            let identity = hooks.destination_cleanup_identity(destination)?;
+        fn arm(&mut self, identity: CleanupIdentity) {
             self.state = CleanupState::Verified(identity);
-            Ok(())
         }
 
         fn disarm(&mut self) {
             self.state = CleanupState::Absent;
         }
 
-        fn remove_current(&mut self) -> io::Result<()> {
-            match self.state {
-                CleanupState::Absent => return Ok(()),
-                CleanupState::CreatedUnverified => {}
-                CleanupState::Verified(expected) => {
-                    let current = openat2_owned(
-                        self.parent,
-                        self.name,
-                        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                        0,
-                        SOURCE_RESOLVE,
-                        self.attempts,
-                    )?;
-                    if fstat_cleanup_identity(current.as_fd())? != expected {
-                        return Err(io::Error::from_raw_os_error(libc::ESTALE));
-                    }
-                }
-            }
-            let result = unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), 0) };
-            if result != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        fn remove_current_with_gate<A: KernelAttemptGateV1<ChargeError = G::ChargeError>>(
+            &mut self,
+            gate: &A,
+        ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+            remove_destination_with_gate(
+                self.parent,
+                self.name,
+                self.openat2_attempts,
+                self.syscall_attempts,
+                self.state,
+                gate,
+            )?;
             self.disarm();
             Ok(())
         }
+
+        fn remove_current_forward(&mut self) -> Result<(), MeteredIoV1<G::ChargeError>> {
+            let gate = self.gate;
+            self.remove_current_with_gate(gate)
+        }
+
+        fn remove_current_cleanup(&mut self) -> Result<(), MeteredIoV1<G::ChargeError>> {
+            let gate = CleanupGateV1(self.gate);
+            self.remove_current_with_gate(&gate)
+        }
     }
 
-    impl Drop for DestinationCleanup<'_> {
+    fn remove_destination_with_gate<G: KernelAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        openat2_attempts: u8,
+        syscall_attempts: u8,
+        state: CleanupState,
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+        match state {
+            CleanupState::Absent => return Ok(()),
+            CleanupState::CreatedUnverified => {}
+            CleanupState::Verified(expected) => {
+                let current = openat2_owned_with_gate(
+                    parent,
+                    name,
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0,
+                    SOURCE_RESOLVE,
+                    openat2_attempts,
+                    gate,
+                )?;
+                if fstat_cleanup_identity_with_gate(current.as_fd(), syscall_attempts, gate)?
+                    != expected
+                {
+                    return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::ESTALE)));
+                }
+            }
+        }
+        unlinkat_with_gate(parent, name, syscall_attempts, gate)
+    }
+
+    impl<G: MaterializationAttemptGateV1> Drop for DestinationCleanup<'_, '_, G> {
         fn drop(&mut self) {
             // The destination parent is required to be owner-private and the
             // same-UID hostile-peer threat is outside the profile.  Once the
@@ -1074,34 +1272,45 @@ mod platform {
             // unlinking so ordinary path replacement never deletes the
             // replacement.  Before that fstat, the O_EXCL-created name is
             // still removed rather than leaked.
-            let _ = self.remove_current();
+            let _ = self.remove_current_cleanup();
         }
     }
 
-    fn create_destination<H: CopyHooks>(
-        cleanup: &mut DestinationCleanup<'_>,
+    fn create_destination_with_gate<H: CopyHooks, G: MaterializationAttemptGateV1>(
+        cleanup: &mut DestinationCleanup<'_, '_, G>,
         hooks: &H,
-    ) -> io::Result<OwnedFd> {
-        let destination = openat2_owned(
+    ) -> Result<OwnedFd, MeteredIoV1<G::ChargeError>> {
+        let destination = openat2_owned_with_gate(
             cleanup.parent,
             cleanup.name,
             destination_open_flags(),
             0o600,
             SOURCE_RESOLVE,
-            cleanup.attempts,
+            cleanup.openat2_attempts,
+            cleanup.gate,
         )?;
         cleanup.mark_created();
-        cleanup.arm(destination.as_fd(), hooks)?;
-        let identity = statx_identity(destination.as_fd())?;
+        #[cfg(test)]
+        hooks.before_destination_arm().map_err(MeteredIoV1::Io)?;
+        #[cfg(not(test))]
+        let _ = hooks;
+        let cleanup_identity = fstat_cleanup_identity_with_gate(
+            destination.as_fd(),
+            cleanup.syscall_attempts,
+            cleanup.gate,
+        )?;
+        cleanup.arm(cleanup_identity);
+        let identity = statx_identity_with_gate(destination.as_fd(), cleanup.gate)?;
         if identity.mode & libc::S_IFMT != libc::S_IFREG
             || identity.size != 0
             || identity.nlink != 1
         {
-            return Err(io::Error::from_raw_os_error(libc::EIO));
+            return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)));
         }
         Ok(destination)
     }
 
+    #[cfg(test)]
     fn openat2_owned(
         parent: BorrowedFd<'_>,
         name: &CStr,
@@ -1163,10 +1372,6 @@ mod platform {
         Err(MeteredIoV1::Io(last))
     }
 
-    fn statx_identity(fd: BorrowedFd<'_>) -> io::Result<StableStatxV1> {
-        into_direct_io(statx_identity_with_gate(fd, &DirectGateV1))
-    }
-
     fn statx_identity_with_gate<G: KernelAttemptGateV1>(
         fd: BorrowedFd<'_>,
         gate: &G,
@@ -1222,18 +1427,61 @@ mod platform {
         })
     }
 
-    fn fstat_cleanup_identity(fd: BorrowedFd<'_>) -> io::Result<CleanupIdentity> {
-        let mut raw = MaybeUninit::<libc::stat>::zeroed();
-        if unsafe { libc::fstat(fd.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
+    fn fstat_cleanup_identity_with_gate<G: KernelAttemptGateV1>(
+        fd: BorrowedFd<'_>,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<CleanupIdentity, MeteredIoV1<G::ChargeError>> {
+        let mut last = io::Error::from_raw_os_error(libc::EINTR);
+        for _ in 0..syscall_attempts {
+            match run_io_attempt(gate, || {
+                let mut raw = MaybeUninit::<libc::stat>::zeroed();
+                if unsafe { libc::fstat(fd.as_raw_fd(), raw.as_mut_ptr()) } != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                let raw = unsafe { raw.assume_init() };
+                Ok(CleanupIdentity {
+                    device: raw.st_dev,
+                    inode: raw.st_ino,
+                })
+            }) {
+                Ok(identity) => return Ok(identity),
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    last = error;
+                }
+                Err(error) => return Err(error),
+            }
         }
-        let raw = unsafe { raw.assume_init() };
-        Ok(CleanupIdentity {
-            device: raw.st_dev,
-            inode: raw.st_ino,
-        })
+        Err(MeteredIoV1::Io(last))
     }
 
+    fn unlinkat_with_gate<G: KernelAttemptGateV1>(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+        let mut last = io::Error::from_raw_os_error(libc::EINTR);
+        for _ in 0..syscall_attempts {
+            match run_io_attempt(gate, || {
+                let result = unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), 0) };
+                if result == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(()) => return Ok(()),
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    last = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(MeteredIoV1::Io(last))
+    }
+
+    #[cfg(test)]
     fn enumerate_extents_direct_with_attempts(
         fd: BorrowedFd<'_>,
         size: u64,
@@ -1319,51 +1567,68 @@ mod platform {
         Err(MeteredIoV1::Io(last))
     }
 
-    fn truncate_to(destination: BorrowedFd<'_>, size: u64) -> io::Result<()> {
-        if unsafe { libc::ftruncate(destination.as_raw_fd(), size as libc::off_t) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+    fn truncate_to_with_gate<G: KernelAttemptGateV1>(
+        destination: BorrowedFd<'_>,
+        size: u64,
+        syscall_attempts: u8,
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+        let size = libc::off_t::try_from(size)
+            .map_err(|_| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
+        let mut last = io::Error::from_raw_os_error(libc::EINTR);
+        for _ in 0..syscall_attempts {
+            match run_io_attempt(gate, || {
+                if unsafe { libc::ftruncate(destination.as_raw_fd(), size) } == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            }) {
+                Ok(()) => return Ok(()),
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
+                    last = error;
+                }
+                Err(error) => return Err(error),
+            }
         }
+        Err(MeteredIoV1::Io(last))
     }
 
-    fn copy_data_extents(
+    fn copy_data_extents_with_gate<G: KernelAttemptGateV1>(
         source: BorrowedFd<'_>,
         destination: BorrowedFd<'_>,
         extents: &[ExtentV1],
         syscall_attempts: u8,
-    ) -> io::Result<()> {
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
         let mut buffer = [0u8; COPY_BUFFER_BYTES];
         for extent in extents {
             let end = extent
                 .offset
                 .checked_add(extent.length)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+                .ok_or_else(|| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
             let mut offset = extent.offset;
             while offset < end {
                 let length = usize::try_from((end - offset).min(buffer.len() as u64))
-                    .map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
-                pread_exact(source, &mut buffer[..length], offset, syscall_attempts)?;
-                pwrite_all(destination, &buffer[..length], offset, syscall_attempts)?;
+                    .map_err(|_| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
+                pread_exact_raw_with_gate(
+                    source,
+                    &mut buffer[..length],
+                    offset,
+                    syscall_attempts,
+                    gate,
+                )?;
+                pwrite_all_raw_with_gate(
+                    destination,
+                    &buffer[..length],
+                    offset,
+                    syscall_attempts,
+                    gate,
+                )?;
                 offset += length as u64;
             }
         }
         Ok(())
-    }
-
-    fn pread_exact(
-        fd: BorrowedFd<'_>,
-        output: &mut [u8],
-        offset: u64,
-        syscall_attempts: u8,
-    ) -> io::Result<()> {
-        into_direct_io(pread_exact_raw_with_gate(
-            fd,
-            output,
-            offset,
-            syscall_attempts,
-            &DirectGateV1,
-        ))
     }
 
     fn pread_exact_raw_with_gate<G: KernelAttemptGateV1>(
@@ -1390,6 +1655,7 @@ mod platform {
         })
     }
 
+    #[cfg(test)]
     fn pread_exact_with(
         output: &mut [u8],
         offset: u64,
@@ -1441,13 +1707,14 @@ mod platform {
         )))
     }
 
-    fn pwrite_all(
+    fn pwrite_all_raw_with_gate<G: KernelAttemptGateV1>(
         fd: BorrowedFd<'_>,
         input: &[u8],
         offset: u64,
         syscall_attempts: u8,
-    ) -> io::Result<()> {
-        pwrite_all_with(input, offset, syscall_attempts, |input, offset| {
+        gate: &G,
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
+        pwrite_all_operation_with_gate(input, offset, syscall_attempts, gate, |input, offset| {
             let result = unsafe {
                 libc::pwrite(
                     fd.as_raw_fd(),
@@ -1464,22 +1731,43 @@ mod platform {
         })
     }
 
+    #[cfg(test)]
     fn pwrite_all_with(
+        input: &[u8],
+        offset: u64,
+        syscall_attempts: u8,
+        operation: impl FnMut(&[u8], u64) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        into_direct_io(pwrite_all_operation_with_gate(
+            input,
+            offset,
+            syscall_attempts,
+            &DirectGateV1,
+            operation,
+        ))
+    }
+
+    fn pwrite_all_operation_with_gate<G: KernelAttemptGateV1>(
         mut input: &[u8],
         mut offset: u64,
         syscall_attempts: u8,
+        gate: &G,
         mut operation: impl FnMut(&[u8], u64) -> io::Result<usize>,
-    ) -> io::Result<()> {
+    ) -> Result<(), MeteredIoV1<G::ChargeError>> {
         if input.is_empty() {
             return Ok(());
         }
         let mut exhaustion_errno = libc::EINTR;
         for _ in 0..syscall_attempts {
-            let written = match operation(input, offset) {
-                Ok(0) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+            let written = match run_io_attempt(gate, || operation(input, offset)) {
+                Ok(0) => {
+                    return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)));
+                }
                 Ok(written) if written <= input.len() => written,
-                Ok(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                Ok(_) => {
+                    return Err(MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EIO)));
+                }
+                Err(MeteredIoV1::Io(error)) if error.kind() == io::ErrorKind::Interrupted => {
                     exhaustion_errno = libc::EINTR;
                     continue;
                 }
@@ -1488,26 +1776,15 @@ mod platform {
             exhaustion_errno = libc::EIO;
             offset = offset
                 .checked_add(written as u64)
-                .ok_or_else(|| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+                .ok_or_else(|| MeteredIoV1::Io(io::Error::from_raw_os_error(libc::EOVERFLOW)))?;
             input = &input[written..];
             if input.is_empty() {
                 return Ok(());
             }
         }
-        Err(io::Error::from_raw_os_error(exhaustion_errno))
-    }
-
-    fn hash_logical_bytes(
-        fd: BorrowedFd<'_>,
-        size: u64,
-        syscall_attempts: u8,
-    ) -> io::Result<FileContentDigest> {
-        into_direct_io(hash_logical_bytes_with_gate(
-            fd,
-            size,
-            syscall_attempts,
-            &DirectGateV1,
-        ))
+        Err(MeteredIoV1::Io(io::Error::from_raw_os_error(
+            exhaustion_errno,
+        )))
     }
 
     fn hash_logical_bytes_with_gate<G: KernelAttemptGateV1>(
@@ -1719,12 +1996,29 @@ mod platform {
                 policy: RegularCopyPolicyV1,
                 hooks: &H,
             ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
+                into_direct_regular(self.copy_with_gate(
+                    source_name,
+                    destination_name,
+                    policy,
+                    hooks,
+                    &DirectGateV1,
+                ))
+            }
+
+            fn copy_with_gate<H: CopyHooks, G: MaterializationAttemptGateV1>(
+                &self,
+                source_name: &CStr,
+                destination_name: &CStr,
+                policy: RegularCopyPolicyV1,
+                hooks: &H,
+                gate: &G,
+            ) -> Result<CopiedRegularV1, GatedRegularFailureV1<G::ChargeError>> {
                 if !valid_basename(source_name) {
-                    return Err(SnapshotRegularFailureV1::new(
+                    return Err(GatedRegularFailureV1::Leaf(SnapshotRegularFailureV1::new(
                         RefusalCode::SnapshotRequiredObjectUnsupported,
                         SnapshotRegularStageV1::ValidateSourceName,
                         None,
-                    ));
+                    )));
                 }
                 let source_handle = openat2_owned(
                     self.source_parent.as_fd(),
@@ -1735,9 +2029,12 @@ mod platform {
                     policy.openat2_attempts(),
                 )
                 .map_err(|error| {
-                    map_source_read_open(SnapshotRegularStageV1::OpenSourceRead, error)
+                    GatedRegularFailureV1::Leaf(map_source_read_open(
+                        SnapshotRegularStageV1::OpenSourceRead,
+                        error,
+                    ))
                 })?;
-                copy_regular_from_pinned_at_with(
+                copy_regular_from_pinned_at_with_gate(
                     self.source_parent.as_fd(),
                     source_name,
                     source_handle.as_fd(),
@@ -1745,6 +2042,7 @@ mod platform {
                     destination_name,
                     policy,
                     hooks,
+                    gate,
                 )
             }
 
@@ -1754,6 +2052,15 @@ mod platform {
                 hooks: &H,
             ) -> Result<CopiedRegularV1, SnapshotRegularFailureV1> {
                 self.copy(c"input", c"output", policy, hooks)
+            }
+
+            fn copy_input_with_gate<H: CopyHooks, G: MaterializationAttemptGateV1>(
+                &self,
+                policy: RegularCopyPolicyV1,
+                hooks: &H,
+                gate: &G,
+            ) -> Result<CopiedRegularV1, GatedRegularFailureV1<G::ChargeError>> {
+                self.copy_with_gate(c"input", c"output", policy, hooks, gate)
             }
 
             fn observe_input<G: KernelAttemptGateV1>(
@@ -1793,6 +2100,8 @@ mod platform {
         struct TestGate {
             remaining: Cell<u64>,
             raw_calls: Cell<u64>,
+            cleanup_remaining: Cell<u64>,
+            cleanup_raw_calls: Cell<u64>,
             mutation: Option<(u64, PathBuf, TestReplacement)>,
         }
 
@@ -1801,6 +2110,18 @@ mod platform {
                 Self {
                     remaining: Cell::new(attempts),
                     raw_calls: Cell::new(0),
+                    cleanup_remaining: Cell::new(u64::MAX),
+                    cleanup_raw_calls: Cell::new(0),
+                    mutation: None,
+                }
+            }
+
+            fn bounded_with_cleanup(forward_attempts: u64, cleanup_attempts: u64) -> Self {
+                Self {
+                    remaining: Cell::new(forward_attempts),
+                    raw_calls: Cell::new(0),
+                    cleanup_remaining: Cell::new(cleanup_attempts),
+                    cleanup_raw_calls: Cell::new(0),
                     mutation: None,
                 }
             }
@@ -1809,6 +2130,8 @@ mod platform {
                 Self {
                     remaining: Cell::new(attempts),
                     raw_calls: Cell::new(0),
+                    cleanup_remaining: Cell::new(u64::MAX),
+                    cleanup_raw_calls: Cell::new(0),
                     mutation: Some((mutate_at, path, TestReplacement::Regular)),
                 }
             }
@@ -1817,6 +2140,8 @@ mod platform {
                 Self {
                     remaining: Cell::new(attempts),
                     raw_calls: Cell::new(0),
+                    cleanup_remaining: Cell::new(u64::MAX),
+                    cleanup_raw_calls: Cell::new(0),
                     mutation: Some((mutate_at, path, TestReplacement::Fifo)),
                 }
             }
@@ -1830,6 +2155,8 @@ mod platform {
                 Self {
                     remaining: Cell::new(attempts),
                     raw_calls: Cell::new(0),
+                    cleanup_remaining: Cell::new(u64::MAX),
+                    cleanup_raw_calls: Cell::new(0),
                     mutation: Some((mutate_at, path, TestReplacement::InPlace(bytes))),
                 }
             }
@@ -1872,6 +2199,17 @@ mod platform {
                     }
                 }
                 self.raw_calls.set(call);
+                Ok(attempt())
+            }
+        }
+
+        impl MaterializationAttemptGateV1 for TestGate {
+            fn run_cleanup<T>(&self, attempt: impl FnOnce() -> T) -> Result<T, Self::ChargeError> {
+                let Some(remaining) = self.cleanup_remaining.get().checked_sub(1) else {
+                    return Err(GateExhausted);
+                };
+                self.cleanup_remaining.set(remaining);
+                self.cleanup_raw_calls.set(self.cleanup_raw_calls.get() + 1);
                 Ok(attempt())
             }
         }
@@ -1966,10 +2304,7 @@ mod platform {
                 panic!("clone must not be reached after destination-arm failure")
             }
 
-            fn destination_cleanup_identity(
-                &self,
-                _destination: BorrowedFd<'_>,
-            ) -> io::Result<CleanupIdentity> {
+            fn before_destination_arm(&self) -> io::Result<()> {
                 Err(io::Error::from_raw_os_error(self.errno))
             }
         }
@@ -2179,6 +2514,101 @@ mod platform {
         }
 
         #[test]
+        fn charged_copy_accepts_exact_forward_n_and_n_minus_one_cleans() {
+            let bytes = (0..(COPY_BUFFER_BYTES + 37))
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+
+            let discovery_fixture = Fixture::with_input(&bytes);
+            let discovery_hooks = ForcedCloneError {
+                errno: libc::EOPNOTSUPP,
+                calls: Cell::new(0),
+            };
+            let discovery = TestGate::bounded_with_cleanup(u64::MAX, u64::MAX);
+            let evidence = finish(
+                discovery_fixture
+                    .copy_input_with_gate(policy(), &discovery_hooks, &discovery)
+                    .unwrap(),
+            );
+            let required = discovery.raw_calls.get();
+            assert!(
+                required > 10,
+                "the whole copy and revalidation must be gated"
+            );
+            assert_eq!(discovery.cleanup_raw_calls.get(), 0);
+            assert_eq!(
+                evidence.content_digest(),
+                FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[&bytes])
+            );
+
+            let exact_fixture = Fixture::with_input(&bytes);
+            let exact_hooks = ForcedCloneError {
+                errno: libc::EOPNOTSUPP,
+                calls: Cell::new(0),
+            };
+            let exact = TestGate::bounded_with_cleanup(required, u64::MAX);
+            let exact_evidence = finish(
+                exact_fixture
+                    .copy_input_with_gate(policy(), &exact_hooks, &exact)
+                    .unwrap(),
+            );
+            assert_eq!(exact.raw_calls.get(), required);
+            assert_eq!(exact.remaining.get(), 0);
+            assert_eq!(exact.cleanup_raw_calls.get(), 0);
+            assert_eq!(exact_evidence.content_digest(), evidence.content_digest());
+            assert_eq!(exact_evidence.data_extents(), evidence.data_extents());
+
+            let short_fixture = Fixture::with_input(&bytes);
+            let short_hooks = ForcedCloneError {
+                errno: libc::EOPNOTSUPP,
+                calls: Cell::new(0),
+            };
+            let short = TestGate::bounded_with_cleanup(required - 1, u64::MAX);
+            assert!(matches!(
+                short_fixture.copy_input_with_gate(policy(), &short_hooks, &short),
+                Err(GatedRegularFailureV1::Charge(GateExhausted))
+            ));
+            assert_eq!(short.raw_calls.get(), required - 1);
+            assert_eq!(short.cleanup_raw_calls.get(), 3);
+            assert!(!short_fixture.destination("output").exists());
+        }
+
+        #[test]
+        fn fatal_copy_uses_exact_local_cleanup_and_short_gate_never_unlinks() {
+            let exact_fixture = Fixture::with_input(b"cleanup-on-fatal-clone");
+            let exact_hooks = ForcedCloneError {
+                errno: libc::EIO,
+                calls: Cell::new(0),
+            };
+            let exact = TestGate::bounded_with_cleanup(u64::MAX, 3);
+            assert!(matches!(
+                exact_fixture.copy_input_with_gate(policy(), &exact_hooks, &exact),
+                Err(GatedRegularFailureV1::Leaf(_))
+            ));
+            assert_eq!(exact.cleanup_raw_calls.get(), 3);
+            assert_eq!(exact.cleanup_remaining.get(), 0);
+            assert!(!exact_fixture.destination("output").exists());
+
+            let short_fixture = Fixture::with_input(b"cleanup-gate-is-linear");
+            let short_hooks = ForcedCloneError {
+                errno: libc::EIO,
+                calls: Cell::new(0),
+            };
+            let short = TestGate::bounded_with_cleanup(u64::MAX, 2);
+            assert!(matches!(
+                short_fixture.copy_input_with_gate(policy(), &short_hooks, &short),
+                Err(GatedRegularFailureV1::Leaf(_))
+            ));
+            assert_eq!(short.cleanup_raw_calls.get(), 2);
+            assert_eq!(short.cleanup_remaining.get(), 0);
+            assert!(
+                short_fixture.destination("output").exists(),
+                "the N+1 unlink must not run after cleanup authority is exhausted"
+            );
+            fs::remove_file(short_fixture.destination("output")).unwrap();
+        }
+
+        #[test]
         fn observer_regular_to_fifo_swap_refuses_without_blocking() {
             let fixture = Fixture::with_input(b"ordinary-regular-file");
             // Attempt 1 inspects the pinned regular handle. Replace its name
@@ -2244,6 +2674,34 @@ mod platform {
             .unwrap_err();
             assert_eq!(error.raw_os_error(), Some(libc::EIO));
             assert_eq!(partial_calls, 2);
+        }
+
+        #[test]
+        fn gate_accepts_exact_partial_pwrites_and_refuses_before_n_plus_one() {
+            let exact = TestGate::bounded(2);
+            let mut exact_calls = 0usize;
+            pwrite_all_operation_with_gate(b"xy", 7, 2, &exact, |remaining, offset| {
+                exact_calls += 1;
+                assert_eq!(offset, 6 + u64::try_from(exact_calls).unwrap());
+                assert_eq!(remaining.len(), 3 - exact_calls);
+                Ok(1)
+            })
+            .unwrap();
+            assert_eq!(exact_calls, 2);
+            assert_eq!(exact.raw_calls.get(), 2);
+            assert_eq!(exact.remaining.get(), 0);
+
+            let short = TestGate::bounded(1);
+            let mut short_calls = 0;
+            assert!(matches!(
+                pwrite_all_operation_with_gate(b"xy", 7, 2, &short, |_, _| {
+                    short_calls += 1;
+                    Ok(1)
+                }),
+                Err(MeteredIoV1::Charge(GateExhausted))
+            ));
+            assert_eq!(short_calls, 1);
+            assert_eq!(short.raw_calls.get(), 1);
         }
 
         #[test]
@@ -2316,14 +2774,20 @@ mod platform {
         }
 
         #[test]
-        fn failure_between_o_excl_create_and_arm_removes_unverified_inode() {
+        fn failure_between_o_excl_create_and_arm_spends_one_cleanup_attempt() {
             let fixture = Fixture::with_input(b"content");
+            let gate = TestGate::bounded_with_cleanup(u64::MAX, 1);
             let error = fixture
-                .copy_input(policy(), &FailDestinationArm { errno: libc::EIO })
+                .copy_input_with_gate(policy(), &FailDestinationArm { errno: libc::EIO }, &gate)
                 .unwrap_err();
+            let GatedRegularFailureV1::Leaf(error) = error else {
+                panic!("the forward ledger is intentionally unbounded")
+            };
             assert_eq!(error.code(), RefusalCode::SnapshotConstructionFailed);
             assert_eq!(error.stage(), SnapshotRegularStageV1::CreateDestination);
             assert_eq!(error.errno(), Some(libc::EIO));
+            assert_eq!(gate.cleanup_raw_calls.get(), 1);
+            assert_eq!(gate.cleanup_remaining.get(), 0);
             assert!(!fixture.destination("output").exists());
         }
 
@@ -2819,6 +3283,24 @@ mod platform {
         ))
     }
 
+    pub(super) fn copy_regular_from_pinned_charged_at(
+        _source_parent: BorrowedFd<'_>,
+        _source_name: &CStr,
+        _source_handle: BorrowedFd<'_>,
+        _destination_parent: BorrowedFd<'_>,
+        _destination_name: &CStr,
+        _session: &SnapshotMaterializationSessionV1<'_>,
+    ) -> Result<CopiedRegularV1, SnapshotRegularMaterializationErrorV1> {
+        #[cfg(not(target_os = "linux"))]
+        let code = RefusalCode::UnsupportedOs;
+        #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+        let code = RefusalCode::UnsupportedArchitecture;
+        Err(SnapshotRegularMaterializationErrorV1::Leaf(
+            SnapshotRegularFailureV1::new(code, SnapshotRegularStageV1::OpenSourceRead, None),
+        ))
+    }
+
+    #[cfg(test)]
     pub(super) fn copy_regular_from_pinned_at(
         _source_parent: BorrowedFd<'_>,
         _source_name: &CStr,
@@ -2866,6 +3348,7 @@ mod portable_tests {
         assert_eq!(policy.max_data_extents(), 32);
         assert_eq!(policy.openat2_attempts(), 4);
         assert_eq!(policy.syscall_attempts(), 3);
+        assert_eq!(policy.local_cleanup_attempt_bound(), 10);
     }
 
     #[test]
