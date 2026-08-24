@@ -24,7 +24,7 @@ export type PrivacyClass = "public" | "internal" | "confidential" | "secret";
 export type Shareability = "local_only" | "tenant" | "repository";
 
 export interface RemoteCacheManifest {
-  schema_version: number;
+  schema_version: 1;
   record_id: string;
   tenant_id: string;
   repository_id: string;
@@ -51,7 +51,7 @@ export interface RemoteCacheManifest {
   };
 }
 
-export function parseManifest(value: Record<string, unknown>, now: number): RemoteCacheManifest {
+export function parseManifest(value: Record<string, unknown>, now: number | null): RemoteCacheManifest {
   assertExactKeys(
     value,
     [
@@ -86,9 +86,18 @@ export function parseManifest(value: Record<string, unknown>, now: number): Remo
   if (expires <= created || expires - created > MAX_LIFETIME_SECONDS) {
     throw new ApiError(422, "invalid_lifetime", "manifest lifetime must be positive and at most 30 days");
   }
-  if (expires <= now) throw new ApiError(422, "expired_manifest", "manifest has expired");
-  if (created > now + 300) {
+  if (now !== null && expires <= now) {
+    throw new ApiError(422, "expired_manifest", "manifest has expired");
+  }
+  if (now !== null && created > now + 300) {
     throw new ApiError(422, "future_manifest", "manifest creation time is too far in the future");
+  }
+  if (privacy.classification === "confidential") {
+    throw new ApiError(
+      422,
+      "unencrypted_confidential",
+      "confidential manifests require an encrypted schema",
+    );
   }
   if (privacy.secret_tainted || privacy.classification === "secret") {
     throw new ApiError(422, "secret_tainted", "secret-tainted manifests must remain local");

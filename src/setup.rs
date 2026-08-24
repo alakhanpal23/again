@@ -16,7 +16,7 @@ const CODEX_SKILL_NAME: &str = "again";
 const CODEX_SKILL_MANIFEST: &str = ".again-install-v1.json";
 const CODEX_SKILL: &str = r#"---
 name: again
-description: "Accelerate repeated supported local read-only shell calls with `again run --`; use for repository inspection commands, but not for mutating, networked, interactive, piped, redirected, or environment-sensitive work."
+description: "Accelerate repeated supported local read-only shell calls with `again run --`, and explicitly reference an already-visible result with `again reference --`; use for repository inspection commands, but not for mutating, networked, interactive, piped, redirected, or environment-sensitive work."
 ---
 
 # Again
@@ -30,6 +30,14 @@ again run -- <command> <arguments...>
 Use this only for `cat`, `head`, `tail`, `wc`, `ls --color=never`, `pwd -P`, `grep`, and `rg`. Every `rg` invocation must already include `--no-ignore --sort=path` and at least one explicit path operand. Keep the same working directory and argv the unwrapped command would have used.
 
 Again admits commands through a fail-closed policy. If it reports that a command is not eligible, rerun the original command normally and unchanged. Do not weaken or reshape the command merely to make it cacheable.
+
+If the complete output of the exact command is already visible in this same active context and you only need to prove that its inputs and stored result are unchanged, invoke:
+
+```sh
+again reference -- <command> <arguments...>
+```
+
+This emits a small content-addressed JSON reference after the same input, runtime, executable, proof, and blob checks. It never executes the command on a miss. If it misses, use `again run --` to obtain the real output. Do not use a reference after context compaction, across agents or conversations, or whenever you need the output bytes again; use `again show <result_id>` to retrieve the exact stored streams explicitly.
 
 Never wrap shell composition or expansion, including pipes, redirects, `&&`, substitutions, globs, or environment assignments. Never wrap a command that mutates state, uses the network, consumes stdin, needs a TTY, or reads outside the current repository. Never invoke Again's hidden `hook` or `exec` subcommands.
 "#;

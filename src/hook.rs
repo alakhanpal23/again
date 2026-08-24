@@ -91,8 +91,9 @@ impl PreToolUseInput {
             .ok_or_else(|| anyhow!("Bash tool_input.command must be a string"))
     }
 
-    /// Current Codex exposes exactly `{ "command": ... }` to Bash hooks while
-    /// retaining effective workdir/TTY/sandbox controls internally. Unknown
+    /// Current Codex exposes exactly `{ "command": ... }` to Bash hooks. Its
+    /// top-level `cwd` is the session cwd, not necessarily the effective
+    /// per-call workdir; TTY/sandbox controls also remain internal. Unknown
     /// hook-visible fields fail open until their semantics are audited.
     pub fn rewrite_compatible(&self) -> bool {
         self.tool_input

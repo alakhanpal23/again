@@ -1,0 +1,10 @@
+{
+  "$schema": "../service/node_modules/wrangler/config-schema.json",
+  "name": "again-lookup-bundle-local-benchmark",
+  "main": "lookup_bundle_worker.ts",
+  "compatibility_date": "2026-08-23",
+  "compatibility_flags": ["enable_request_signal"],
+  "observability": {
+    "enabled": false
+  }
+}

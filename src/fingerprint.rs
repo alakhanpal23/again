@@ -6,7 +6,7 @@
 //! Callers must provide the complete environment visible to the child process; the
 //! returned value contains only digests of environment names and values.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
@@ -95,7 +95,7 @@ pub struct FileIdentity {
 }
 
 impl FileIdentity {
-    fn from_metadata(metadata: &Metadata) -> Self {
+    pub(crate) fn from_metadata(metadata: &Metadata) -> Self {
         Self {
             device: metadata.dev(),
             inode: metadata.ino(),
@@ -127,8 +127,44 @@ pub trait FileDigestCache {
     fn record(&mut self, identity: &FileIdentity, digest: [u8; 32]);
 }
 
+/// Per-invocation memory layer over a persistent digest cache.
+///
+/// The fingerprinting code still opens, fstats, and compares the path identity
+/// before calling `lookup`; this layer only avoids repeating SQLite lookups and
+/// content hashing for the same fully validated identity during pull/capture
+/// boundary rechecks.
+pub(crate) struct SessionFileDigestCache<'a> {
+    persistent: &'a mut dyn FileDigestCache,
+    memory: HashMap<FileIdentity, [u8; 32]>,
+}
+
+impl<'a> SessionFileDigestCache<'a> {
+    pub(crate) fn new(persistent: &'a mut dyn FileDigestCache) -> Self {
+        Self {
+            persistent,
+            memory: HashMap::new(),
+        }
+    }
+}
+
+impl FileDigestCache for SessionFileDigestCache<'_> {
+    fn lookup(&mut self, identity: &FileIdentity) -> Option<[u8; 32]> {
+        if let Some(digest) = self.memory.get(identity) {
+            return Some(*digest);
+        }
+        let digest = self.persistent.lookup(identity)?;
+        self.memory.insert(*identity, digest);
+        Some(digest)
+    }
+
+    fn record(&mut self, identity: &FileIdentity, digest: [u8; 32]) {
+        self.memory.insert(*identity, digest);
+        self.persistent.record(identity, digest);
+    }
+}
+
 #[derive(Default)]
-struct NoFileDigestCache;
+pub(crate) struct NoFileDigestCache;
 
 impl FileDigestCache for NoFileDigestCache {
     fn lookup(&mut self, _identity: &FileIdentity) -> Option<[u8; 32]> {
@@ -1377,7 +1413,7 @@ fn hash_file_with_cache(
         });
     }
 
-    let mut hasher = domain_hasher("again.file.content.v1");
+    let mut hasher = portable_file_content_hasher();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file
@@ -1427,6 +1463,13 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Fingerpr
 
 fn domain_hasher(domain: &'static str) -> Hasher {
     Hasher::new_derive_key(domain)
+}
+
+/// Construct the canonical content-only hasher shared by native and portable
+/// request fingerprints. Paths and sizes belong in their enclosing descriptor,
+/// so this digest is reusable across equivalent checkouts.
+pub(crate) fn portable_file_content_hasher() -> Hasher {
+    domain_hasher("again.file.content.v1")
 }
 
 fn hash_fields<'a>(domain: &'static str, fields: impl IntoIterator<Item = &'a [u8]>) -> Hash {
@@ -1547,12 +1590,14 @@ mod tests {
     #[derive(Default)]
     struct CountingCache {
         digests: HashMap<FileIdentity, [u8; 32]>,
+        lookups: usize,
         hits: usize,
         records: usize,
     }
 
     impl FileDigestCache for CountingCache {
         fn lookup(&mut self, identity: &FileIdentity) -> Option<[u8; 32]> {
+            self.lookups += 1;
             let digest = self.digests.get(identity).copied();
             if digest.is_some() {
                 self.hits += 1;
@@ -1600,6 +1645,27 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(cache.records, 2, "warm hit must not re-read either file");
         assert_eq!(cache.hits, 2);
+    }
+
+    #[test]
+    fn session_digest_cache_avoids_repeated_persistent_lookups() {
+        let fixture = Fixture::new();
+        let metadata = fs::metadata(&fixture.executable).unwrap();
+        let identity = FileIdentity::from_metadata(&metadata);
+        let digest = [0x5a; 32];
+        let mut persistent = CountingCache::default();
+        persistent.digests.insert(identity, digest);
+
+        {
+            let mut session = SessionFileDigestCache::new(&mut persistent);
+            assert_eq!(session.lookup(&identity), Some(digest));
+            assert_eq!(session.lookup(&identity), Some(digest));
+            session.record(&identity, [0x6b; 32]);
+            assert_eq!(session.lookup(&identity), Some([0x6b; 32]));
+        }
+
+        assert_eq!(persistent.lookups, 1);
+        assert_eq!(persistent.records, 1);
     }
 
     #[test]

@@ -1,0 +1,35 @@
+{
+  "benchmark": "sealed macOS runtime-checkpoint fresh-process attestation",
+  "command": "cargo +1.88.0 test --locked --lib runtime_attestation::tests::benchmark_fresh_process_checkpoint_attestation -- --ignored --exact --nocapture",
+  "correctness": {
+    "checkpoint_max_age_seconds": 86400,
+    "checkpoint_owner_mode_nofollow_single_link": true,
+    "different_unprivileged_user_boundary": true,
+    "missing_or_stale_checkpoint_fails_closed": true,
+    "root_kernel_and_same_user_excluded": true
+  },
+  "host": {
+    "architecture": "aarch64",
+    "kernel_build": "24G90",
+    "kernel_release": "24.6.0",
+    "macos_version": "15.6.1",
+    "shared_cache": "arm64e main plus exactly one .01 subcache"
+  },
+  "measurement": {
+    "attestation_p50_micros": 37463,
+    "attestation_p95_micros": 39121,
+    "process_p50_micros": 41114,
+    "process_p95_micros": 42724,
+    "runs": 25,
+    "target_attestation_p95_micros": 50000
+  },
+  "revision": {
+    "base_commit": "490c94f",
+    "working_tree": "uncommitted team-runtime checkpoint implementation"
+  },
+  "rust": "1.88.0",
+  "scope": {
+    "attestation": "strict checkpoint read+checksum+age validation; exact sysctl/kernel/CSR facts; in-process dyld-selected cache UUID+range; current main/subcache headers; exact codesign, dyld and cat bytes; Mach-O closure sealing",
+    "process": "fresh Rust test-process startup plus one complete checkpoint attestation"
+  }
+}

@@ -2,13 +2,13 @@
 
 ## Exact promise
 
-> Again makes a narrow, policy-admitted set of explicit local read-only commands fast while returning their exact full streams. Prefix the command with `again run --`; commands outside the policy are not cached.
+> Again makes a narrow, policy-admitted set of explicit local read-only commands fast while returning their exact full streams. Prefix the command with `again run --`; explicitly use `again reference --` only when the complete unchanged result is already visible. Commands outside the policy are not cached.
 
 This sentence is both the product pitch and the reuse boundary. “Policy-admitted” means only that a command matches the active versioned observation model and current checks; it is not a general safety or equivalence certification. Two executions printing the same bytes is not sufficient.
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex locally on a repository where agent runs repeatedly search or inspect the same material and can invoke `again run -- <argv...>`. The initial job is narrower: remove repeated repository-read latency without asking the developer to declare a build graph.
+The first customer is a technical individual using Codex locally on a repository where agent runs repeatedly search or inspect the same material and can invoke `again run -- <argv...>`. The initial job is narrower: remove repeated repository-read latency without asking the developer to declare a build graph, and avoid resending already-visible bytes through an explicit verified reference.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
@@ -21,17 +21,27 @@ brew install again
 again setup --codex
 # Start a new Codex session; it can now invoke:
 again run -- rg --no-ignore --sort=path needle src
+# only if those exact complete bytes remain visible in this active context:
+again reference -- rg --no-ignore --sort=path needle src
 ```
 
-`again setup --codex` installs an instruction-only skill at `$HOME/.agents/skills/again` by default. `again setup --codex --project` instead installs `<repo>/.agents/skills/again`; scoped `--remove` reverses an unchanged owned install. The skill tells Codex when to use explicit `again run --` and to rerun an ineligible command unchanged outside Again. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
+`again setup --codex` installs an instruction-only skill at `$HOME/.agents/skills/again` by default. `again setup --codex --project` instead installs `<repo>/.agents/skills/again`; scoped `--remove` reverses an unchanged owned install. The skill tells Codex when to use explicit `again run --`, when an explicit `again reference --` is context-safe, and to rerun an ineligible command unchanged outside Again. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
 
 Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
 
 On Unix, disposable local state defaults to `${TMPDIR}/again-<euid>/workspaces/<BLAKE3(canonical-workspace-path)>`, with private app-owned directory levels, so the first run never mutates the observed repository. `AGAIN_HOME` selects one exact persistent root; it must be absolute and outside the active workspace, and an existing root must already satisfy the owned-real-`0700` policy. Every canonical ancestor must be a real directory owned by the current uid or root, with sticky protection if group/world writable. Path checks and creation are still raceable by the same user or root.
 
-Production automatic Codex hook rewriting is disabled: the normal hook returns before reading or parsing stdin and emits no allow decision. The hook contract does not expose effective TTY, workdir, shell/login, sandbox, remote `environment_id`, output ceiling, or delivery receipt, so transparent substitution cannot preserve the complete call. Strict current-envelope parsing, an explicit-absolute-executable guard, opaque handoff, and defensive runtime checks remain dormant/tested plumbing behind `--experimental-unsafe-rewrite`. That flag enables the path only for controlled differential tests; there, a hidden TTY or same-repository cwd difference runs the revalidated command once uncached with inherited streams, while a different repository/non-Git cwd or remote executable/state mismatch can fail. It must never be installed as a production hook.
+Production automatic Codex hook rewriting is disabled: the normal hook returns before reading or parsing stdin and emits no allow decision. Current hooks support `updatedInput` and expose the session `cwd`, but they do not expose an `exec_command` call's effective per-call workdir, effective TTY, shell/login, sandbox, remote `environment_id`, output ceiling, or delivery receipt. Transparent substitution therefore cannot preserve the complete call. Strict current-envelope parsing, an explicit-absolute-executable guard, opaque handoff, and defensive runtime checks remain dormant/tested plumbing behind `--experimental-unsafe-rewrite`. That flag enables the path only for controlled differential tests; there, a hidden TTY or same-repository cwd difference runs the revalidated command once uncached with inherited streams, while a different repository/non-Git cwd or remote executable/state mismatch can fail. It must never be installed as a production hook.
 
 Explicit `again run` is local/default-environment only. Because it starts inside the actual tool shell context, it sees the effective cwd, streams, environment and executable resolution. If any standard stream is a TTY, it performs a single audited execution with inherited streams and no cache read/write.
+
+The separately provisioned team-alpha command is `again team run --profile <absolute-private-profile> -- <bare argv...>`. It admits only portable `cat`/`head`/`tail`/`wc`/`grep`/`rg` forms, executes with exactly `LANG=C` and `LC_ALL=C`, and never builds a team key or contacts the service when any standard stream is a TTY. A remote hit is returned only after live request/runtime parity, fresh root-signed trust, revocation/allowlist checks, producer signature, ciphertext digest/size, AEAD authentication, and local privacy rescan. An authenticated exact-generation response is a miss only when no reusable candidate exists: absent/deleted, normally expired/not-yet-valid, or made unusable by current producer/record revocation or trust allowlists. Missing trust/blob state, quarantined or inconsistent metadata, generation changes, and malformed authenticated objects are hard failures rather than misses. Read-only misses and documented degraded transport paths execute locally once; corruption can never become a hit. See [`TEAM_ALPHA.md`](TEAM_ALPHA.md).
+
+`again team inspect --profile <absolute-private-profile> --json -- <bare argv...>`
+uses the same local admission to emit deterministic, secret-free request,
+runtime, producer-public-key, and unsigned trust-requirement bindings. It does
+not contact the service or execute the requested argv; it is an operator
+bootstrap artifact, not a signed trust bundle or public onboarding flow.
 
 ## v0 admission boundary
 
@@ -57,9 +67,13 @@ Linux trace-backed admission expands only behind a named capability profile. An 
 
 ## Exact-output behavior
 
-Again stores exact stdout and stderr as immutable blobs, and every cache hit currently returns both complete streams. Before replay, every served hit starts the exact audited executable with fixed cheap capability-probe arguments. This confirms point-in-time exec authority but does not rerun the requested argv, eliminate all process spawn, or prove the requested work would succeed under transient global resource pressure. Automatic output compaction is disabled because Codex hooks expose neither the effective output ceiling nor a delivery receipt, so Again cannot establish that a previous complete stream was delivered.
+Again stores exact stdout and stderr as immutable blobs, and every `again run` cache hit returns both complete streams. Before replay, every served hit starts the exact audited executable with fixed cheap capability-probe arguments. This confirms point-in-time exec authority but does not rerun the requested argv, eliminate all process spawn, or prove the requested work would succeed under transient global resource pressure.
 
-The repository still contains a context-keyed delivery ledger, `PreCompact`/`PostCompact` handlers, and a compact-reference representation. They are dormant future infrastructure and do not activate automatically. `again show` remains an explicit way to inspect stored exact bytes; it is not needed to reconstruct ordinary cache-hit output.
+`again reference -- <argv...>` is deliberately not transparent replay. It verifies the same live request, runtime, executable capability, stored proof, and both CAS blobs, then emits one bounded JSON reference containing the result id, status, BLAKE3 digests, and byte lengths. A miss never executes the requested command. The caller explicitly owns the context assertion: use a reference only when those complete bytes remain visible in the same active context, and use `again show <result-id>` or `again run` otherwise. The reference event records the actual positive byte difference between full streams and the reference; small outputs may save zero bytes.
+
+Automatic output compaction is disabled because Codex hooks expose neither the effective output ceiling nor a delivery receipt, so Again cannot establish by itself that a previous complete stream was delivered.
+
+The repository still contains a context-keyed delivery ledger and `PreCompact`/`PostCompact` handlers. They remain dormant future infrastructure and do not activate automatically. `again show` remains an explicit way to inspect stored exact bytes; it is not needed to reconstruct ordinary `again run` cache-hit output.
 
 ## Product stages
 

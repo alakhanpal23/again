@@ -1,0 +1,42 @@
+name: Team CI integration
+
+on:
+  push:
+    paths:
+      - ".github/actions/team-run/**"
+      - ".github/workflows/team-ci-integration.yml"
+      - "scripts/again-team-ci.sh"
+      - "scripts/materialize-team-ci-bundle.py"
+      - "scripts/test_team_ci.sh"
+      - "docs/TEAM_CI.md"
+  pull_request:
+    paths:
+      - ".github/actions/team-run/**"
+      - ".github/workflows/team-ci-integration.yml"
+      - "scripts/again-team-ci.sh"
+      - "scripts/materialize-team-ci-bundle.py"
+      - "scripts/test_team_ci.sh"
+      - "docs/TEAM_CI.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: team-ci-integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wrapper-tests:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Check out the source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run deterministic wrapper and action-boundary tests
+        run: bash scripts/test_team_ci.sh

@@ -341,6 +341,122 @@ fn explicit_run_replays_full_output_preserves_argv_and_invalidates() {
 
 #[test]
 #[cfg(target_os = "macos")]
+fn explicit_reference_is_compact_verified_and_never_executes_on_a_miss() {
+    if !audited_host_profile_available() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let input = vec![b'x'; 64 * 1024];
+    fs::write(temp.path().join("input.txt"), &input).unwrap();
+
+    let cold_reference = run_again(temp.path(), &["reference", "--", "cat", "input.txt"], None);
+    assert!(!cold_reference.status.success());
+    assert!(cold_reference.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&cold_reference.stderr).contains("no command was executed"));
+
+    let cold = run_again(temp.path(), &["run", "--", "cat", "input.txt"], None);
+    assert!(cold.status.success(), "cold run failed: {:?}", cold.stderr);
+    assert_eq!(cold.stdout, input);
+
+    let reference = run_again(temp.path(), &["reference", "--", "cat", "input.txt"], None);
+    assert!(
+        reference.status.success(),
+        "reference failed: {:?}",
+        reference.stderr
+    );
+    assert!(reference.stderr.is_empty());
+    assert!(reference.stdout.len() < 512);
+    let reference_json: Value = serde_json::from_slice(&reference.stdout).unwrap();
+    assert_eq!(reference_json["schema"], "again.reference.v1");
+    assert_eq!(reference_json["exit_code"], 0);
+    assert_eq!(reference_json["stdout"]["bytes"], input.len() as u64);
+    assert_eq!(reference_json["stderr"]["bytes"], 0);
+    assert_eq!(
+        reference_json["stdout"]["blake3"],
+        blake3::hash(&input).to_hex().as_str()
+    );
+    let result_id = reference_json["result_id"].as_str().unwrap();
+
+    let shown = run_again(temp.path(), &["show", result_id], None);
+    assert!(shown.status.success(), "show failed: {:?}", shown.stderr);
+    assert_eq!(shown.stdout, input);
+
+    fs::write(temp.path().join("input.txt"), b"changed\n").unwrap();
+    let stale_reference = run_again(temp.path(), &["reference", "--", "cat", "input.txt"], None);
+    assert!(!stale_reference.status.success());
+    assert!(stale_reference.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&stale_reference.stderr).contains("no command was executed"));
+
+    let stats = run_again(temp.path(), &["stats", "--json"], None);
+    assert!(stats.status.success(), "stats failed: {:?}", stats.stderr);
+    let stats: Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(stats["executions"], 1);
+    assert_eq!(stats["full_replays"], 0);
+    assert_eq!(stats["compact_replays"], 1);
+    assert_eq!(stats["bypasses"], 2);
+    assert!(stats["duplicate_bytes_omitted"].as_u64().unwrap() > 60 * 1024);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn explicit_reference_quarantines_corrupt_blob_bytes_without_execution() {
+    if !audited_host_profile_available() {
+        return;
+    }
+    let temp = TempDir::new().unwrap();
+    let input = vec![b'x'; 64 * 1024];
+    fs::write(temp.path().join("input.txt"), &input).unwrap();
+
+    let cold = run_again(temp.path(), &["run", "--", "cat", "input.txt"], None);
+    assert!(cold.status.success(), "cold run failed: {:?}", cold.stderr);
+    assert_eq!(cold.stdout, input);
+
+    let database = state_dir(temp.path()).join("again.sqlite");
+    let connection = Connection::open(&database).unwrap();
+    let stdout_digest: String = connection
+        .query_row(
+            "SELECT stdout_digest FROM results WHERE quarantined = 0",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(connection);
+    let blob = state_dir(temp.path())
+        .join("blobs")
+        .join(&stdout_digest[..2])
+        .join(&stdout_digest[2..]);
+    fs::write(blob, b"corrupt").unwrap();
+
+    let reference = run_again(temp.path(), &["reference", "--", "cat", "input.txt"], None);
+    assert!(!reference.status.success());
+    assert!(reference.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&reference.stderr).contains("invalid blob and was quarantined"),
+        "unexpected stderr: {:?}",
+        reference.stderr
+    );
+
+    let connection = Connection::open(database).unwrap();
+    let (quarantined, reason): (bool, String) = connection
+        .query_row(
+            "SELECT quarantined, quarantine_reason FROM results LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(quarantined);
+    assert_eq!(reason, "stdout_blob_invalid");
+
+    let stats = run_again(temp.path(), &["stats", "--json"], None);
+    assert!(stats.status.success(), "stats failed: {:?}", stats.stderr);
+    let stats: Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(stats["executions"], 1);
+    assert_eq!(stats["compact_replays"], 0);
+    assert_eq!(stats["quarantines"], 1);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
 fn cached_output_preserves_broken_pipe_status_and_is_not_counted_as_delivered() {
     if !audited_host_profile_available() {
         return;

@@ -1,6 +1,6 @@
 # Remote cache threat model
 
-This threat model covers the Worker in [`service/`](../service/README.md), its D1/R2 bindings, operator bootstrap, bearer tokens, producer keys, signed manifests, audit API, and scheduled reconciliation. It does not cover the account-free local runtime except at the boundary where the existing, not-yet-CLI-wired Rust client module can accept remote data.
+This threat model covers the Worker in [`service/`](../service/README.md), its D1/R2 bindings, operator bootstrap, bearer tokens, producer keys, signed manifests, audit API, scheduled reconciliation, and the manually provisioned `again team run` client boundary. It does not otherwise cover the account-free local runtime.
 
 Status labels used below:
 
@@ -28,7 +28,7 @@ Implemented; locally scenario-tested controls:
 - D1 reads and mutations qualify tenant and repository; repository existence is checked within the tenant.
 - Repository-scoped tokens receive `404` outside their scope.
 - Manifest tenant/repository/request bindings must equal token and route bindings before signature admission.
-- R2 keys are `v1/{tenant}/{repository}/blake3/{digest}`.
+- R2 keys are `v1/{tenant}/{repository}/{generation}/blake3/{digest}`; a recreated human-readable repository ID receives a new random generation.
 - Tests place the same digest path under different tenants and require isolation.
 
 Residual risk/requirements:
@@ -74,7 +74,7 @@ Implemented; locally scenario-tested controls:
 Residual risk/requirements:
 
 - A compromised authorized producer can sign bad outputs. There is no independent two-producer quorum, trusted-build attestation, transparency log, or remote-execution proof.
-- The existing async client module verifies strict bounded transfers/wire data, concrete Ed25519 signatures, supplied trust context, bindings, and blob bytes, but the CLI does not yet construct that context from recomputed local inputs and authenticated authorization/revocation state. `VerificationContext` has no authenticated envelope, source, freshness epoch, or tenant-policy version; stale or mis-scoped caller state can therefore accept a key/record that current policy would reject. That integration must obtain and freshness-check the snapshot through an authenticated channel, then fail closed to local execution.
+- The opt-in team-alpha CLI recomputes request/policy/execution-profile/platform/image bindings and obtains a root-signed, short-lived trust bundle carrying epoch, producer keys, revocations, and allowlists. The accepted epoch is durably checkpointed before manifest/blob retrieval. Runtime and request inputs are checked again after network I/O and immediately before decryption. Only a typed manifest 404 is a miss; signature, AEAD, trust, binding, rollback, and corruption failures cannot become hits. This remains manually provisioned alpha state rather than a public control plane.
 - The service does not make arbitrary shell caching safe and never executes uploaded bytes.
 
 ### R2/D1 partial failure and reconciliation
@@ -83,20 +83,21 @@ Threat: D1 reserves quota without an R2 object, R2 is written before D1 promotio
 
 Implemented; locally scenario-tested controls:
 
-- Upload begins with a D1 `pending` reservation that counts against quota, then conditionally puts R2, validates the stored bytes and metadata, and promotes to `ready`.
-- A failed upload preserves `pending` as a durable repair record rather than releasing accounted quota.
-- Client retry repairs missing R2 for a pending/formerly-ready row.
-- The due-work query is indexed. Cron processes at most 64 rows: valid pending objects become ready, invalid ones quarantine, deleting objects are retried and confirmed absent before D1 removal, and missing objects, incomplete deletes, and caught per-row exceptions receive exponential retry times so one due page does not continuously monopolize the queue.
-- An administrator may cancel a pending reservation only after its one-hour upload lease expires. A one-hour D1 deletion tombstone remains after the initial R2 delete as a bounded late-writer mitigation before quota is released.
+- Upload begins with a D1 `pending` reservation that counts against quota and a unique durable operation candidate bound to the exact repository generation, digest, and immutable blob incarnation. It then conditionally puts R2, validates stored bytes/metadata, and atomically promotes that incarnation to `ready`.
+- A failed or genuinely ambiguous upload preserves `pending` plus its bounded operation candidate rather than releasing accounted quota or guessing that no late object can arrive. A definitely settled failed attempt retires only its own candidate.
+- Client retry repairs missing R2 for the same pending incarnation; every replacement uses a new random incarnation and object identity.
+- The due-work query is indexed. The hourly byte-reconciliation cron processes at most 16 rows: valid pending objects become ready, invalid ones quarantine, deleting objects are retried and confirmed absent before D1 removal, and missing objects, incomplete deletes, and caught per-row exceptions receive exponential retry times so one due page does not continuously monopolize the queue.
+- An administrator may cancel a pending reservation only after its one-hour adoption window expires. The service deletes the exact current-generation incarnation, retains deleting state until absence is confirmed, and preserves unresolved operation candidates for later exact-object sweeping rather than relying on a finite late-writer timeout.
 - Tests cover D1-pending/R2-valid recovery, R2 loss after ready, interrupted deletion, cancellation grace, missing-object page advancement, and overlapping scheduled invocations with one transition audit. They do not inject arbitrary R2/D1 exceptions or prove all interleavings.
 
 Residual risk/requirements:
 
-- Missing R2 for `pending` remains reserved until client repair or explicit post-lease administrator cancellation; there is no automatic abandonment policy.
-- R2 objects with no D1 row are not enumerated or collected.
-- The tombstone is time-based, not a generation fence. An abnormally delayed PUT can finish after final absence confirmation or tombstone expiry and leave an untracked R2 object.
+- Missing R2 for `pending` remains reserved until client repair or explicit post-adoption-window administrator cancellation; there is no timer-based automatic abandonment of ambiguous operations.
+- Tenant-fair orphan-candidate sweeps delete an exact active-repository object only when no live row owns its incarnation. Completed repository receipts retain exact-generation graveyard work that repeatedly sweeps the deleted prefix, including very late Worker-owned writes after D1 finalization. Candidate counts are capped per tenant and repository and surfaced in stats; capacity recovery is an explicit operator action.
+- Repository generations prevent an old object namespace or old DELETE retry from targeting a recreated repository. Every admitted normal repository mutation holds and renews a generation-scoped D1 write lease, and repository deletion waits for retained leases before listing R2 or erasing metadata. Final mutation statements either carry the live-generation predicate or are protected by D1 generation triggers. The lease expires after 15 minutes for liveness: an abnormally stalled upload can finish after expiry, but its durable exact-object candidate and the old-generation graveyard preserve cleanup work, while subsequent D1 promotion fails closed. An out-of-band R2/S3 writer bypasses both the D1 lease and operation-candidate protocol, so production still requires this Worker to be the bucket's sole writer.
+- The encrypted team protocol also binds the exact generation end to end: it is hashed into the portable request key, signed by the trust root, persisted in the anti-rollback checkpoint scope, signed and AEAD-bound in manifest v2, checked against the live D1 repository, and carried in a mandatory request/response header for every normal repository-scoped route. A generation-A trust body, request key, manifest, or ciphertext reference cannot authorize generation B. Legacy manifest v1 lacks a signed generation and is explicitly outside this invariant.
 - D1 state changes and security audit inserts are separate operations. Audit failure can occur after an authoritative mutation, so mutation-plus-audit atomicity/outbox semantics and fault injection remain required.
-- Cron is configured every 15 minutes, not an immediate guarantee; repeated platform failure creates backlog.
+- Lightweight lifecycle work runs every 15 minutes and byte reconciliation runs hourly, not immediately; repeated platform failure creates backlog.
 - Production needs backlog/error alerts, reconciliation runbooks, review of the explicit stale-pending cancellation policy, and verified backup/restore behavior.
 
 ### Deletion races and retention
@@ -107,16 +108,20 @@ Implemented; locally scenario-tested controls:
 
 - Blob transition to `deleting` is conditional on no non-deleted manifest reference.
 - The manifest insert trigger independently requires both blobs still be `ready`, closing the check/insert race in D1.
-- Pending cancellation requires administrator authority, an expired upload lease, and a deletion grace tombstone; quarantined remediation requires administrator authority.
+- Pending cancellation requires administrator authority, an expired adoption window, exact-incarnation deletion/absence confirmation, and retained unresolved-operation evidence; quarantined remediation requires administrator authority.
 - R2 absence is checked before D1 row removal; the D1 delete trigger then releases quota.
 - Manifest deletion is soft state and must precede referenced blob deletion.
+- Repository DELETE requires the current generation ETag, atomically tombstones the repository, and creates an O(1), generation-scoped lifecycle job plus an independent idempotency receipt. A direct D1 tombstone invokes the same trigger.
+- Every normal repository mutation acquires and renews a generation-scoped write lease before its potentially slow work and final state change; uploads retain the lease across R2 mutation. Deletion waits for retained leases, sweeps the exact generation prefix in pages of at most 1,000, resets an unusable cursor, restarts completed cursor passes, and requires two fresh empty listings separated by at least 60 seconds.
+- D1 erasure is restartable and bounded to 256 rows per statement and eight chunks per leased job pass. Guarded finalization removes the repository only after every scoped child class is empty, then completes the old-generation receipt. Tests cover a blocked in-flight PUT, late objects before a cursor, large phased cleanup, direct tombstones, and generation-A deletion/recreation as generation B.
+- Deleted and expired manifests are physically removed in bounded batches. Manifest transitions enqueue only their referenced blobs, and the atomic candidate decision retains a GC signal if the final reference disappears during processing.
 
 Residual risk/requirements:
 
-- There is no tenant/repository deletion API or end-to-end erasure workflow.
-- There is no automated retention for expired/deleted/quarantined manifests, conflicts, blobs, or audit events.
-- Expired manifests, manifests signed by revoked keys, and quarantined manifests remain non-deleted references and can pin blobs even though normal GET no longer exposes them. Conflict quarantine has no administrative adjudication/recovery generation.
-- A production design must define legal holds, grace periods, idempotent tenant deletion across D1/R2, deletion tombstones, retry monitoring, and proof/completion reporting.
+- There is no complete tenant-deletion workflow, backup erasure integration, legal-hold policy, or externally durable proof/completion report.
+- Repository deletion cannot fence an out-of-band bucket principal, and its 15-minute write-lease expiry is a liveness tradeoff rather than a proof against an arbitrarily stalled admitted PUT. Such writes are isolated to the old generation but can become orphans after completion.
+- Conflict rows and audit events do not have independent age-based retention, and conflict quarantine has no administrative adjudication/recovery workflow.
+- Production still needs deletion-backlog monitoring, IAM-enforced sole-writer isolation, orphan discovery, fault injection against real D1/R2, legal-hold/grace policy, and tested backup/restore/erasure procedures.
 
 ### Producer-key compromise and revocation
 
@@ -149,8 +154,8 @@ Implemented; locally scenario-tested controls:
 Residual risk/requirements:
 
 - Rate limiting occurs after bearer parsing, D1 lookup, and secret hashing; invalid/unauthenticated traffic is not limited by this application counter.
-- Limits are per token, not per source IP, tenant, repository, or global service capacity. Pending reservations hold quota until repair or explicit post-lease administrator cancellation.
-- Soft-deleted and otherwise retained metadata continues to consume metadata quota. Retention/GC and an operator recovery path are not implemented.
+- Limits are per token, not per source IP, tenant, repository, or global service capacity. Pending reservations hold quota until repair or explicit post-adoption-window administrator cancellation.
+- Soft-deleted metadata consumes quota until bounded physical retention runs. Conflict and audit age-based retention and an operator quota-recovery workflow remain unimplemented.
 - **Remaining requirement:** configure and test edge pre-authentication rate limiting/WAF rules, abuse detection, tenant-level request budgets, backlog limits, and alerts before public exposure.
 
 ### Audit privacy and observability
@@ -175,13 +180,13 @@ Residual risk/requirements:
 The following remain explicit release blockers, not implied future controls:
 
 1. Edge pre-authentication rate limiting and abuse protection, tested against invalid-token floods and body attacks.
-2. Documented/enforced retention plus complete tenant/repository deletion across D1, R2, audit, conflicts, tokens, keys, and backups.
+2. Documented/enforced tenant deletion and backup erasure, legal-hold/grace policy, deletion proof/reporting, and production fault injection for the implemented repository lifecycle.
 3. An authenticated operator control plane or reviewed provisioning automation for tenants, quotas, token issue/rotation/revocation, and incident response.
-4. Orphan-R2 discovery plus per-key generation fencing/serialization for late writers, a reviewed automatic stale-pending policy if desired, reconciliation monitoring/alerts, and disaster-recovery exercises.
+4. Production fault injection and monitoring for the implemented operation-candidate and generation-graveyard sweeps, IAM-enforced sole-writer isolation, documented candidate-capacity recovery, a reviewed stale-pending policy if desired, reconciliation alerts, and disaster-recovery exercises.
 5. Transactional mutation-plus-audit outbox semantics, bounded audit retention, and binding-failure fault-injection tests.
-6. Wire the existing strict Rust transport/verification module into the CLI; recompute its verification context from local inputs and obtain fresh trusted producer/revocation state through an authenticated channel before any fail-closed local reuse flow can be claimed.
-7. Expired/revoked/quarantined manifest GC, blob unpinning, conflict adjudication/recovery, and metadata-quota recovery workflows.
-8. Application-layer confidentiality decision and implementation if provider/TLS protections do not meet customer requirements.
+6. A deployed cross-host design-partner lifecycle proving independent provisioning, reuse, trust rotation, revocation, corruption quarantine, and recovery under real service operations; the existing single-host public-CA tunnel run is not that evidence.
+7. Conflict adjudication/recovery, age-based conflict/audit retention, and operator metadata-quota recovery workflows.
+8. Repository-key rotation/recovery UX and a reviewed metadata-confidentiality policy; encrypted v2 protects stream plaintext, but tenant/repository identifiers, sizes, timing, and activity metadata remain visible to the service/platform.
 9. Independent external security architecture review and penetration test, with remediation tracked before production exposure.
 10. Deployment-specific IAM, environment separation, custom-domain/TLS, WAF, observability privacy, backups, and on-call runbooks.
 

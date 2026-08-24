@@ -46,6 +46,10 @@ enum CommandName {
     Setup(SetupArgs),
     /// Execute a strictly admitted command through the local engine.
     Run(RunArgs),
+    /// Emit a compact reference to an existing validated local result.
+    Reference(ReferenceArgs),
+    /// Reuse or publish an encrypted result through an explicit team profile.
+    Team(TeamArgs),
     /// Handle one Codex tool or compaction lifecycle hook event on stdin.
     #[command(hide = true)]
     Hook(HookArgs),
@@ -85,6 +89,50 @@ struct SetupArgs {
 struct RunArgs {
     /// Command argv. Put `--` before the executable.
     #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct ReferenceArgs {
+    /// Command argv. Put `--` before the executable. A miss never executes it.
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct TeamArgs {
+    #[command(subcommand)]
+    command: TeamCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TeamCommand {
+    /// Run one bare command through the sealed team-cache boundary.
+    Run(TeamRunArgs),
+    /// Inspect one sealed team request without network or command execution.
+    Inspect(TeamInspectArgs),
+}
+
+#[derive(Debug, Args)]
+struct TeamRunArgs {
+    /// Absolute owner-private team profile path.
+    #[arg(long)]
+    profile: PathBuf,
+    /// Bare command argv. The `--` delimiter is mandatory.
+    #[arg(required = true, last = true, allow_hyphen_values = true)]
+    command: Vec<OsString>,
+}
+
+#[derive(Debug, Args)]
+struct TeamInspectArgs {
+    /// Absolute owner-private team profile path.
+    #[arg(long)]
+    profile: PathBuf,
+    /// Emit the strict machine-readable bootstrap document.
+    #[arg(long, required = true)]
+    json: bool,
+    /// Bare command argv. The `--` delimiter is mandatory.
+    #[arg(required = true, last = true, allow_hyphen_values = true)]
     command: Vec<OsString>,
 }
 
@@ -151,6 +199,27 @@ struct CapturedStream {
     broken_pipe: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitPresentation {
+    ExactStreams,
+    ExplicitReference,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplicitResultReference<'a> {
+    schema: &'static str,
+    result_id: &'a str,
+    exit_code: i32,
+    stdout: ReferencedStream<'a>,
+    stderr: ReferencedStream<'a>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReferencedStream<'a> {
+    blake3: &'a str,
+    bytes: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct V0Proof<'a> {
     schema: &'static str,
@@ -214,6 +283,13 @@ pub fn run_cli() -> Result<i32> {
     match cli.command {
         CommandName::Setup(args) => setup(args),
         CommandName::Run(args) => direct_run(args.command),
+        CommandName::Reference(args) => direct_reference(args.command),
+        CommandName::Team(args) => match args.command {
+            TeamCommand::Run(args) => crate::team_cli::run(args.profile, args.command),
+            TeamCommand::Inspect(args) => {
+                crate::team_inspect::inspect(args.profile, args.command, args.json)
+            }
+        },
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         CommandName::Exec(args) => execute_pending_call(&args.call),
         CommandName::Explain(args) => explain(args),
@@ -306,10 +382,11 @@ fn handle_hook(experimental_unsafe_rewrite: bool) -> Result<i32> {
         // therefore be true no-ops and must not create repository state.
         CodexHookInput::Compact { .. } => return Ok(0),
     };
-    // Official Codex hooks currently hide effective workdir, TTY, sandbox and
-    // remote-environment inputs. Replacing a tool call without those values can
-    // change behavior or fail after an allow decision, so production hooks are
-    // instruction-only and this legacy rewrite path is disabled by default.
+    // Official Codex hooks expose session cwd but hide effective per-call
+    // workdir, TTY, sandbox and remote-environment inputs. Replacing a tool call
+    // without those values can change behavior or fail after an allow decision,
+    // so production hooks are instruction-only and this legacy rewrite path is
+    // disabled by default.
     // The explicit, conspicuously unsafe switch exists only for controlled
     // differential tests while the future native integration is developed.
     if !input.rewrite_compatible() {
@@ -364,6 +441,7 @@ fn handle_hook(experimental_unsafe_rewrite: bool) -> Result<i32> {
 }
 
 fn execute_pending_call(call_id: &str) -> Result<i32> {
+    let invocation_started = Instant::now();
     let invocation_cwd = fs::canonicalize(std::env::current_dir()?)
         .context("resolve rewritten tool working directory")?;
     let invocation_workspace = discover_workspace(&invocation_cwd)?;
@@ -398,7 +476,14 @@ fn execute_pending_call(call_id: &str) -> Result<i32> {
         store.delete_call(call_id)?;
         bail!("stored call argv failed integrity reparse");
     }
-    let code = run_admitted(&mut store, &call, &workspace, &access_plan)?;
+    let code = run_admitted(
+        &mut store,
+        &call,
+        &workspace,
+        &access_plan,
+        invocation_started,
+        HitPresentation::ExactStreams,
+    )?;
     store.delete_call(call_id)?;
     Ok(code)
 }
@@ -440,6 +525,15 @@ fn run_uncached_inherited(
 }
 
 fn direct_run(command: Vec<OsString>) -> Result<i32> {
+    direct_request(command, HitPresentation::ExactStreams)
+}
+
+fn direct_reference(command: Vec<OsString>) -> Result<i32> {
+    direct_request(command, HitPresentation::ExplicitReference)
+}
+
+fn direct_request(command: Vec<OsString>, presentation: HitPresentation) -> Result<i32> {
+    let invocation_started = Instant::now();
     if command.is_empty() {
         bail!("a command is required");
     }
@@ -478,11 +572,20 @@ fn direct_run(command: Vec<OsString>) -> Result<i32> {
         raw_command,
         argv,
     };
-    if io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal() {
+    if presentation == HitPresentation::ExactStreams
+        && (io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal())
+    {
         return run_uncached_inherited(&call, &workspace, &call.cwd, false);
     }
     let mut store = Store::open_for_workspace(&workspace)?;
-    run_admitted(&mut store, &call, &workspace, &access_plan)
+    run_admitted(
+        &mut store,
+        &call,
+        &workspace,
+        &access_plan,
+        invocation_started,
+        presentation,
+    )
 }
 
 fn run_admitted(
@@ -490,6 +593,8 @@ fn run_admitted(
     call: &PendingCall,
     workspace: &Path,
     access_plan: &AccessPlan,
+    invocation_started: Instant,
+    presentation: HitPresentation,
 ) -> Result<i32> {
     let environment: Vec<(OsString, OsString)> = std::env::vars_os().collect();
     let argv: Vec<OsString> = call.argv.iter().map(OsString::from).collect();
@@ -536,31 +641,77 @@ fn run_admitted(
             ));
         }
         verify_current_exec_capability(&executable_identity, &executable, &call.cwd, &environment)?;
-        let stdout = store.get_blob(&result.stdout_digest)?;
-        let stderr = store.get_blob(&result.stderr_digest)?;
+        let stdout = load_cached_blob_or_quarantine(
+            store,
+            &result.id,
+            &result.stdout_digest,
+            "stdout_blob_invalid",
+        )?;
+        let stderr = load_cached_blob_or_quarantine(
+            store,
+            &result.id,
+            &result.stderr_digest,
+            "stderr_blob_invalid",
+        )?;
         if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
         {
             store.quarantine(&result.id, "blob_length_mismatch")?;
             bail!("cached result {} failed blob length validation", result.id);
         }
-        if let Err(error) = emit_bytes(&stdout, &stderr) {
-            if error.kind() == io::ErrorKind::BrokenPipe {
-                return Ok(signal_exit_code(libc::SIGPIPE));
+        let (disposition, reason, bytes_omitted) = match presentation {
+            HitPresentation::ExactStreams => {
+                if let Err(error) = emit_bytes(&stdout, &stderr) {
+                    if error.kind() == io::ErrorKind::BrokenPipe {
+                        return Ok(signal_exit_code(libc::SIGPIPE));
+                    }
+                    return Err(error).context("present cached output");
+                }
+                (EventDisposition::ReplayedFull, "EXACT_REUSE_NET_V1", 0)
             }
-            return Err(error).context("present cached output");
-        }
-        // Once exact output has been presented, bookkeeping must never change
-        // the wrapped command's successful status.
+            HitPresentation::ExplicitReference => {
+                let presented_bytes = match emit_explicit_reference(&result) {
+                    Ok(presented_bytes) => presented_bytes,
+                    Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                        return Ok(signal_exit_code(libc::SIGPIPE));
+                    }
+                    Err(error) => return Err(error).context("present explicit result reference"),
+                };
+                let full_bytes = result.stdout_bytes.saturating_add(result.stderr_bytes);
+                (
+                    EventDisposition::ReplayedCompact,
+                    "EXPLICIT_REFERENCE_NET_V1",
+                    full_bytes.saturating_sub(presented_bytes),
+                )
+            }
+        };
+        // Once the selected output representation has been presented,
+        // bookkeeping must never change the command's successful status.
         let _ = store.note_hit(&result.id);
+        let estimated_net_ms_saved =
+            estimated_net_saved_millis(result.duration_ms, invocation_started.elapsed());
         let _ = store.record_event(
             Some(&call.id),
             Some(&result.id),
-            EventDisposition::ReplayedFull,
-            "EXACT_REUSE",
-            result.duration_ms,
-            0,
+            disposition,
+            reason,
+            estimated_net_ms_saved,
+            bytes_omitted,
         );
         return Ok(result.exit_code);
+    }
+
+    if presentation == HitPresentation::ExplicitReference {
+        let _ = store.record_event(
+            Some(&call.id),
+            None,
+            EventDisposition::PassedThrough,
+            "REFERENCE_MISS_NO_EXECUTION",
+            0,
+            0,
+        );
+        bail!(
+            "no validated cached result exists for this request; no command was executed; run it once with `again run --`"
+        );
     }
 
     let first = execute_once(&executable, &argv[1..], &call.cwd, &environment, true)?;
@@ -748,6 +899,14 @@ fn run_admitted(
     Ok(first.exit_code)
 }
 
+fn estimated_net_saved_millis(
+    original_duration_ms: u64,
+    replay_elapsed: std::time::Duration,
+) -> u64 {
+    let replay_elapsed_ms = replay_elapsed.as_millis().min(u64::MAX as u128) as u64;
+    original_duration_ms.saturating_sub(replay_elapsed_ms)
+}
+
 fn fingerprint_scopes(plan: &AccessPlan) -> Vec<ScopeEntry> {
     plan.scopes
         .iter()
@@ -895,6 +1054,50 @@ fn emit_bytes(stdout: &[u8], stderr: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+fn load_cached_blob_or_quarantine(
+    store: &Store,
+    result_id: &str,
+    digest: &str,
+    quarantine_reason: &str,
+) -> Result<Vec<u8>> {
+    match store.get_blob(digest) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) => {
+            if let Err(quarantine_error) = store.quarantine(result_id, quarantine_reason) {
+                return Err(error).context(format!(
+                    "cached result {result_id} contains an invalid blob and quarantine failed: {quarantine_error:#}"
+                ));
+            }
+            Err(error).context(format!(
+                "cached result {result_id} contains an invalid blob and was quarantined"
+            ))
+        }
+    }
+}
+
+fn emit_explicit_reference(result: &StoredResult) -> io::Result<u64> {
+    let reference = ExplicitResultReference {
+        schema: "again.reference.v1",
+        result_id: &result.id,
+        exit_code: result.exit_code,
+        stdout: ReferencedStream {
+            blake3: &result.stdout_digest,
+            bytes: result.stdout_bytes,
+        },
+        stderr: ReferencedStream {
+            blake3: &result.stderr_digest,
+            bytes: result.stderr_bytes,
+        },
+    };
+    let mut encoded = serde_json::to_vec(&reference).map_err(io::Error::other)?;
+    encoded.push(b'\n');
+    let encoded_bytes = encoded.len() as u64;
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(&encoded)?;
+    stdout.flush()?;
+    Ok(encoded_bytes)
+}
+
 fn signal_exit_code(signal: i32) -> i32 {
     128_i32.saturating_add(signal).min(255)
 }
@@ -1002,7 +1205,10 @@ fn verify_current_exec_capability(
 ) -> Result<()> {
     let (arguments, expected_code): (&[&str], i32) = match identity.tool {
         ToolKind::Cat => (&[], 0),
-        ToolKind::Head => (&["-n", "0"], 0),
+        // BSD head rejects a zero line count. Reading one line from the fixed
+        // null stdin still emits no bytes while proving current exec/read
+        // authority on the exact audited binary.
+        ToolKind::Head => (&["-n", "1"], 0),
         ToolKind::Tail => (&["-n", "0"], 0),
         ToolKind::Wc => (&["-c"], 0),
         ToolKind::Grep => (&["--", "__again_exec_probe_never_match__"], 1),
@@ -1238,7 +1444,7 @@ fn platform_epoch() -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-fn resolve_executable(
+pub(crate) fn resolve_executable(
     program: &OsStr,
     cwd: &Path,
     environment: &[(OsString, OsString)],
@@ -1275,7 +1481,7 @@ fn resolve_executable(
     bail!("executable {program:?} was not found on PATH")
 }
 
-fn discover_workspace(cwd: &Path) -> Result<PathBuf> {
+pub(crate) fn discover_workspace(cwd: &Path) -> Result<PathBuf> {
     let canonical = fs::canonicalize(cwd)
         .with_context(|| format!("resolve working directory {}", cwd.display()))?;
     if !canonical.is_dir() {
@@ -1390,7 +1596,7 @@ fn stats(json: bool) -> Result<i32> {
         println!("quarantines: {}", stats.quarantines);
         println!("duplicate bytes omitted: {}", stats.duplicate_bytes_omitted);
         println!(
-            "estimated execution time saved: {} ms",
+            "estimated net execution time saved: {} ms",
             stats.estimated_execution_ms_saved
         );
     }
@@ -1506,6 +1712,18 @@ mod tests {
     }
 
     #[test]
+    fn savings_metric_is_positive_net_wall_time_and_never_underflows() {
+        assert_eq!(
+            estimated_net_saved_millis(500, std::time::Duration::from_millis(12)),
+            488
+        );
+        assert_eq!(
+            estimated_net_saved_millis(2, std::time::Duration::from_millis(7)),
+            0
+        );
+    }
+
+    #[test]
     fn broken_downstream_pipe_stops_capture_without_admitting_output() {
         let captured =
             capture_and_present(Cursor::new(b"streamed output"), BrokenPipeWriter).unwrap();
@@ -1553,6 +1771,99 @@ mod tests {
     }
 
     #[test]
+    fn team_cli_requires_explicit_profile_and_command_delimiter() {
+        let parsed = Cli::try_parse_from([
+            "again",
+            "team",
+            "run",
+            "--profile",
+            "/private/profile.json",
+            "--",
+            "wc",
+            "-c",
+            "README.md",
+        ])
+        .unwrap();
+        let CommandName::Team(TeamArgs {
+            command: TeamCommand::Run(args),
+        }) = parsed.command
+        else {
+            panic!("team run did not parse to the team command");
+        };
+        assert_eq!(args.profile, PathBuf::from("/private/profile.json"));
+        assert_eq!(args.command, ["wc", "-c", "README.md"].map(OsString::from));
+
+        assert!(
+            Cli::try_parse_from([
+                "again",
+                "team",
+                "run",
+                "--profile",
+                "/private/profile.json",
+                "wc",
+                "-c",
+                "README.md",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["again", "team", "run", "--", "wc", "-c", "README.md"]).is_err()
+        );
+
+        let inspected = Cli::try_parse_from([
+            "again",
+            "team",
+            "inspect",
+            "--profile",
+            "/private/profile.json",
+            "--json",
+            "--",
+            "wc",
+            "-c",
+            "README.md",
+        ])
+        .unwrap();
+        let CommandName::Team(TeamArgs {
+            command: TeamCommand::Inspect(args),
+        }) = inspected.command
+        else {
+            panic!("team inspect did not parse to the team command");
+        };
+        assert_eq!(args.profile, PathBuf::from("/private/profile.json"));
+        assert!(args.json);
+        assert_eq!(args.command, ["wc", "-c", "README.md"].map(OsString::from));
+
+        assert!(
+            Cli::try_parse_from([
+                "again",
+                "team",
+                "inspect",
+                "--profile",
+                "/private/profile.json",
+                "--",
+                "wc",
+                "-c",
+                "README.md",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "again",
+                "team",
+                "inspect",
+                "--profile",
+                "/private/profile.json",
+                "--json",
+                "wc",
+                "-c",
+                "README.md",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn ambient_option_sources_fail_closed() {
         let environment = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
         assert!(ambient_inputs_supported(&["grep".to_owned()], &environment));
@@ -1593,6 +1904,33 @@ mod tests {
                 &["cat".to_owned()],
                 &[(OsString::from(name), OsString::from("/tmp/external"))],
             ));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_audited_apple_tool_capability_probe_succeeds_on_the_reviewed_host() {
+        if crate::executable::host_audited_apple_profile().is_err() {
+            return;
+        }
+        let cwd = TempDir::new().unwrap();
+        let environment = [
+            (OsString::from("LANG"), OsString::from("C")),
+            (OsString::from("LC_ALL"), OsString::from("C")),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+        ];
+        for (name, path) in [
+            ("cat", Path::new("/bin/cat")),
+            ("head", Path::new("/usr/bin/head")),
+            ("tail", Path::new("/usr/bin/tail")),
+            ("wc", Path::new("/usr/bin/wc")),
+            ("grep", Path::new("/usr/bin/grep")),
+            ("ls", Path::new("/bin/ls")),
+            ("pwd", Path::new("/bin/pwd")),
+        ] {
+            let identity = verify_executable(name, path).unwrap();
+            verify_current_exec_capability(&identity, path, cwd.path(), &environment)
+                .unwrap_or_else(|error| panic!("{name} capability probe failed: {error:#}"));
         }
     }
 

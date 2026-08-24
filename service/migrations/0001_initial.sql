@@ -13,6 +13,10 @@ CREATE TABLE tenants (
 CREATE TABLE repositories (
     tenant_id TEXT NOT NULL,
     id TEXT NOT NULL,
+    generation_id TEXT NOT NULL CHECK (
+        length(generation_id) = 32
+        AND generation_id NOT GLOB '*[^0-9a-f]*'
+    ),
     created_at INTEGER NOT NULL,
     deleted_at INTEGER,
     PRIMARY KEY (tenant_id, id),

@@ -1,0 +1,268 @@
+{
+  "configuration": {
+    "child_file_and_capture_limit_bytes": 16777216,
+    "environment": {
+      "AGAIN_HOME": "fresh temporary directory",
+      "LC_ALL": "C",
+      "PATH": "/usr/bin:/bin",
+      "removed_unmodeled_inputs": []
+    },
+    "iterations_each": 25,
+    "max_reference_p95_ms": 100.0,
+    "payload_bytes": 1048576,
+    "required_byte_reduction": 0.99,
+    "timeout_seconds_per_process": 30.0
+  },
+  "correctness": {
+    "all_full_hits_exact": true,
+    "all_references_bound_to_cold_result": true,
+    "cold_reference_event_and_zero_execution_counters": true,
+    "cold_reference_input_unchanged": true,
+    "cold_reference_miss_executed_command": false,
+    "cold_run_exact": true,
+    "invalidated_reference_miss_executed_command": false,
+    "show_exact": true,
+    "stats_match_observed_bytes": true
+  },
+  "fixture": {
+    "bytes": 1048576,
+    "native_executable": "/bin/cat",
+    "path": "payload.txt",
+    "result_id": "r_57c3748c313845f29084b003939eb039",
+    "sha256_before_mutation": "4d4c4ef1b207f1f07f6c58bf22438d97729144101a95e945751251e96cdd8b9b"
+  },
+  "gates": {
+    "byte_reduction": {
+      "observed": 0.9997186660766602,
+      "required": 0.99,
+      "status": "pass"
+    },
+    "correctness": {
+      "status": "pass"
+    },
+    "reference_latency": {
+      "maximum_p95_ms": 100.0,
+      "observed_p95_ms": 11.468416,
+      "status": "pass"
+    }
+  },
+  "generated_at_utc": "2026-08-24T00:19:43.022540+00:00",
+  "harness_version": "1.0.0",
+  "measurements": {
+    "cold_run_ms": 38.643375,
+    "full_hits": {
+      "maximum_ms": 12.659625,
+      "mean_ms": 11.05093004,
+      "minimum_ms": 10.216833,
+      "p50_ms": 11.019333,
+      "p95_ms": 11.779417,
+      "samples_ms": [
+        11.448542,
+        10.884,
+        11.019333,
+        11.009375,
+        10.917917,
+        10.759,
+        10.745083,
+        10.674583,
+        11.072083,
+        10.821917,
+        10.528167,
+        10.936958,
+        10.956042,
+        11.072417,
+        11.141709,
+        11.779417,
+        11.1255,
+        11.252084,
+        12.659625,
+        11.079458,
+        10.454375,
+        11.139916,
+        10.216833,
+        11.368334,
+        11.210583
+      ]
+    },
+    "full_output_bytes_total": 26214400,
+    "observed_byte_reduction_fraction": 0.9997186660766602,
+    "observed_bytes_omitted": 26207025,
+    "reference_output_bytes_total": 7375,
+    "reference_wire_example": {
+      "exit_code": 0,
+      "result_id": "r_57c3748c313845f29084b003939eb039",
+      "schema": "again.reference.v1",
+      "stderr": {
+        "blake3": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        "bytes": 0
+      },
+      "stdout": {
+        "blake3": "575ac37267ec957120b0bb0d90c2ee8af4dc35373bd615a62dadd687e094ef21",
+        "bytes": 1048576
+      }
+    },
+    "references": {
+      "maximum_ms": 11.644084,
+      "mean_ms": 11.18249332,
+      "minimum_ms": 10.821834,
+      "p50_ms": 11.147375,
+      "p95_ms": 11.468416,
+      "samples_ms": [
+        11.340875,
+        11.297333,
+        11.335666,
+        11.028292,
+        11.147375,
+        10.958375,
+        11.085708,
+        11.096375,
+        10.867458,
+        10.821834,
+        10.96675,
+        11.299458,
+        11.162667,
+        10.950583,
+        11.329,
+        11.088959,
+        11.055,
+        10.99075,
+        11.468416,
+        11.309208,
+        11.335916,
+        11.40675,
+        11.436292,
+        11.644084,
+        11.139209
+      ]
+    },
+    "stats": {
+      "bypasses": 2,
+      "compact_replays": 25,
+      "duplicate_bytes_omitted": 26207025,
+      "estimated_execution_ms_saved": 0,
+      "executions": 1,
+      "full_replays": 25,
+      "quarantines": 0
+    }
+  },
+  "provenance": {
+    "binary": {
+      "path": "/Users/arjun/again/target/release/again",
+      "sha256": "621812154def385785d2966b62fd339e570b4dc202a841633c2b24b261ce1d73",
+      "version": "again 0.1.0"
+    },
+    "harness": {
+      "path": "/Users/arjun/again/bench/reference_benchmark.py",
+      "sha256": "4a39e51e828b05c435cfb71b733aa990aafc2cfa2ac7bb36057ca92311ddb0b8"
+    },
+    "host": {
+      "machine": "arm64",
+      "processor": "arm",
+      "python_executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+      "python_implementation": "CPython",
+      "python_version": "3.9.13",
+      "release": "24.6.0",
+      "system": "Darwin",
+      "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+    },
+    "repository": {
+      "commit": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
+      "dirty": true,
+      "dirty_entries": [
+        "M Cargo.lock",
+        " M Cargo.toml",
+        " M README.md",
+        " M bench/README.md",
+        " M bench/direct_benchmark.py",
+        " M docs/ARCHITECTURE.md",
+        " M docs/CORPUS.md",
+        " M docs/DECISIONS.md",
+        " M docs/EVIDENCE.md",
+        " M docs/PRODUCT.md",
+        " M docs/REMOTE_THREAT_MODEL.md",
+        " M docs/RESEARCH.md",
+        " M docs/ROADMAP.md",
+        " M docs/STATUS.md",
+        " M service/README.md",
+        " M service/migrations/0001_initial.sql",
+        " M service/package-lock.json",
+        " M service/package.json",
+        " M service/src/audit.ts",
+        " M service/src/auth.ts",
+        " M service/src/index.ts",
+        " M service/src/manifest.ts",
+        " M service/src/util.ts",
+        " M service/test/apply-migrations.ts",
+        " M service/test/service.spec.ts",
+        " M service/vitest.config.ts",
+        " M service/wrangler.jsonc",
+        " M src/engine.rs",
+        " M src/fingerprint.rs",
+        " M src/hook.rs",
+        " M src/lib.rs",
+        " M src/remote.rs",
+        " M src/setup.rs",
+        " M src/store.rs",
+        " M src/team.rs",
+        " M src/team_crypto.rs",
+        " M tests/codex_skill_setup.rs",
+        " M tests/engine_e2e.rs",
+        "?? bench/polyglot_reuse_corpus.py",
+        "?? bench/reference_benchmark.py",
+        "?? bench/results/2026-08-23-direct-current-v2.json",
+        "?? bench/results/2026-08-23-direct-net-current-v3.json",
+        "?? bench/results/2026-08-23-direct-release-current-v2.json",
+        "?? bench/results/2026-08-23-polyglot-reuse-v1.json",
+        "?? bench/results/2026-08-23-reference-v1.json",
+        "?? bench/results/2026-08-23-runtime-attestation-v1.json",
+        "?? bench/results/2026-08-23-runtime-checkpoint-fast-v1.json",
+        "?? bench/results/2026-08-23-team-session-digest-cache-v1.json",
+        "?? docs/TEAM_ALPHA.md",
+        "?? docs/TEAM_LOOKUP_BUNDLE_V1.md",
+        "?? service/migrations/0002_trust_bundles.sql",
+        "?? service/migrations/0003_retention_lifecycle.sql",
+        "?? service/migrations/0004_repository_generation_protocol.sql",
+        "?? service/migrations/0005_commit_freshness.sql",
+        "?? service/migrations/0006_blob_incarnations.sql",
+        "?? service/src/ed25519-strict.ts",
+        "?? service/src/lookup-bundle-v1.ts",
+        "?? service/src/manifest-v2.ts",
+        "?? service/src/trust.ts",
+        "?? service/test/fixtures/lookup-bundle-v1-wire.json",
+        "?? service/test/fixtures/manifest-v2-canonical-rust.json",
+        "?? service/test/fixtures/trust-v1-canonical-rust.json",
+        "?? service/test/lookup-bundle-v1.spec.ts",
+        "?? service/test/migrations.spec.ts",
+        "?? src/privacy.rs",
+        "?? src/runtime_attestation.rs",
+        "?? src/team_admission.rs",
+        "?? src/team_cli.rs",
+        "?? src/team_clock.rs",
+        "?? src/team_config.rs",
+        "?? src/team_inspect.rs",
+        "?? src/team_lookup_bundle.rs",
+        "?? src/team_manifest_v2.rs",
+        "?? src/team_manifest_v2/",
+        "?? src/team_publish.rs",
+        "?? src/team_pull.rs",
+        "?? src/team_request_key.rs",
+        "?? src/trust_bundle.rs",
+        "?? tests/team_inspect_e2e.rs",
+        "?? tests/team_service_live_e2e.rs"
+      ],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.reference-benchmark.v1",
+  "scope": {
+    "automatic_hooks_exercised": false,
+    "codex_models_exercised": false,
+    "model_token_reduction_measured": false,
+    "output_byte_reduction_measured": true,
+    "product_paths": [
+      "again run -- argv",
+      "again reference -- argv"
+    ],
+    "tokenizer_exercised": false
+  }
+}

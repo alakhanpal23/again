@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -87,6 +87,8 @@ pub struct StoreStats {
     pub bypasses: u64,
     pub quarantines: u64,
     pub duplicate_bytes_omitted: u64,
+    /// Sum of positive `(recorded execution duration - observed replay wall
+    /// time)` estimates. Slower replays contribute zero, never negative time.
     pub estimated_execution_ms_saved: u64,
 }
 
@@ -295,6 +297,23 @@ impl Store {
                     FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE
                 );
                 PRAGMA user_version = 4;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 5 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                -- Before schema v5, local full replays recorded the producer's
+                -- gross duration rather than end-to-end net wall time saved.
+                -- Team events were net estimates, but the shared column cannot
+                -- distinguish the historical writers safely. Reset prior
+                -- replay metrics instead of carrying an inflated claim forward.
+                UPDATE events
+                SET elapsed_ms = 0
+                WHERE disposition IN ('replayed_full', 'replayed_compact');
+                PRAGMA user_version = 5;
                 COMMIT;
                 "#,
             )?;
@@ -592,7 +611,7 @@ impl Store {
         result_id: Option<&str>,
         disposition: EventDisposition,
         reason_code: &str,
-        elapsed_ms: u64,
+        metric_ms: u64,
         bytes_omitted: u64,
     ) -> Result<()> {
         self.conn.execute(
@@ -602,7 +621,7 @@ impl Store {
                 result_id,
                 disposition.as_str(),
                 reason_code,
-                elapsed_ms,
+                metric_ms,
                 bytes_omitted,
                 now_ms(),
             ],
@@ -1640,7 +1659,12 @@ mod tests {
                     stdout_digest TEXT NOT NULL,
                     stderr_digest TEXT NOT NULL
                 );
-                CREATE TABLE events (id INTEGER PRIMARY KEY, created_ms INTEGER NOT NULL);
+                CREATE TABLE events (
+                    id INTEGER PRIMARY KEY,
+                    disposition TEXT NOT NULL,
+                    elapsed_ms INTEGER NOT NULL DEFAULT 0,
+                    created_ms INTEGER NOT NULL
+                );
                 PRAGMA user_version = 1;
                 "#,
             )
@@ -1662,6 +1686,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1);
+    }
+
+    #[test]
+    fn version_four_replay_metrics_are_reset_before_net_savings_are_reported() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .record_event(
+                    None,
+                    None,
+                    EventDisposition::ReplayedFull,
+                    "LEGACY_GROSS_DURATION",
+                    9_999,
+                    0,
+                )
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        let reopened = Store::open(temp.path()).unwrap();
+        let version: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let stats = reopened.stats().unwrap();
+        assert_eq!(stats.full_replays, 1);
+        assert_eq!(stats.estimated_execution_ms_saved, 0);
     }
 
     #[test]

@@ -1,0 +1,31 @@
+{
+  "benchmark": "sealed macOS team-runtime attestation",
+  "command": "cargo +1.88.0 test --locked --lib runtime_attestation::tests::benchmark_cold_and_warm_runtime_attestation -- --ignored --exact --nocapture",
+  "correctness": {
+    "cold_and_warm_platform_digests_equal": true,
+    "cold_and_warm_image_digests_equal": true,
+    "exact_host_closure_authenticated": true
+  },
+  "host": {
+    "architecture": "aarch64",
+    "kernel_build": "24G90",
+    "kernel_release": "24.6.0",
+    "macos_version": "15.6.1",
+    "shared_cache": "arm64e main plus exactly one .01 subcache"
+  },
+  "measurement": {
+    "cold_micros": 9765891,
+    "static_evidence_cache": "once per process, failures cached fail-closed",
+    "warm_micros": 5103,
+    "warm_over_cold_ratio": 0.0005225312472781485
+  },
+  "revision": {
+    "base_commit": "490c94f",
+    "working_tree": "uncommitted team-runtime implementation"
+  },
+  "rust": "1.88.0",
+  "scope": {
+    "cold": "sysctl/CSR/in-process dyld-selected cache UUID+mapped-range inspection, exact validator+dyld hashing, strict dyld/main/subcache code-sign validation, selected executable stable read and Mach-O closure parsing",
+    "warm": "selected executable stable read, audited identity verification, and Mach-O closure parsing; static OS/runtime evidence reused"
+  }
+}

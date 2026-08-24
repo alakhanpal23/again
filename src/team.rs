@@ -242,6 +242,9 @@ impl RemoteCacheManifest {
         {
             return Err(VerificationError::InvalidLifetime);
         }
+        if self.privacy.classification == PrivacyClass::Confidential {
+            return Err(VerificationError::UnencryptedConfidential);
+        }
         if self.privacy.secret_tainted || self.privacy.classification == PrivacyClass::Secret {
             return Err(VerificationError::SecretTainted);
         }
@@ -311,7 +314,16 @@ pub struct VerificationContext {
 /// bindings, lifecycle, privacy, and signature checks have succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VerifiedCandidate<'a> {
-    pub manifest: &'a RemoteCacheManifest,
+    manifest: &'a RemoteCacheManifest,
+}
+
+impl<'a> VerifiedCandidate<'a> {
+    /// Access the manifest only through a capability returned by
+    /// [`verify_candidate`]. The field stays private so downstream code cannot
+    /// forge a verified wrapper with a struct literal.
+    pub fn manifest(&self) -> &'a RemoteCacheManifest {
+        self.manifest
+    }
 }
 
 /// Cryptographic verification is deliberately injected. Again does not claim
@@ -373,6 +385,8 @@ pub enum VerificationError {
     ImageMismatch,
     #[error("candidate is not shareable")]
     Unshareable,
+    #[error("confidential candidates require an encrypted manifest schema")]
+    UnencryptedConfidential,
     #[error("candidate is secret-tainted")]
     SecretTainted,
     #[error("signature verification failed")]
@@ -604,7 +618,7 @@ mod tests {
         assert_eq!(
             verify_candidate(&manifest, &context, &verifier)
                 .unwrap()
-                .manifest,
+                .manifest(),
             &manifest
         );
         assert_eq!(
@@ -709,6 +723,13 @@ mod tests {
         assert_eq!(
             verify_candidate(&tainted, &expected(&tainted), &verifier),
             Err(VerificationError::SecretTainted)
+        );
+
+        let mut confidential = base.clone();
+        confidential.privacy.classification = PrivacyClass::Confidential;
+        assert_eq!(
+            verify_candidate(&confidential, &expected(&confidential), &verifier),
+            Err(VerificationError::UnencryptedConfidential)
         );
 
         let mut secret = base.clone();

@@ -1,0 +1,148 @@
+{
+  "correctness": {
+    "aggregate_fixture_output_sha256": "aacedc02efe35299d320753ec79276cea031d50fe0964f651abf1fada1af104e",
+    "compact_replays": 0,
+    "every_initial_repeat_was_full_replay": true,
+    "every_modeled_mutation_forced_execution": true,
+    "every_mutated_repeat_was_full_replay": true,
+    "exact_status_stdout_stderr": true
+  },
+  "languages": [
+    {
+      "again_invocations": 202,
+      "cases": 100,
+      "extension": "rs",
+      "language": "rust",
+      "mutation_invalidations": 1,
+      "stats": {
+        "bypasses": 0,
+        "compact_replays": 0,
+        "duplicate_bytes_omitted": 0,
+        "estimated_execution_ms_saved": 0,
+        "executions": 101,
+        "full_replays": 101,
+        "quarantines": 0
+      },
+      "timing_ms": {
+        "cold_p50": 14.416021,
+        "native_p50": 2.198771,
+        "warm_p50": 6.454416999999999,
+        "warm_p95": 7.148666
+      }
+    },
+    {
+      "again_invocations": 202,
+      "cases": 100,
+      "extension": "py",
+      "language": "python",
+      "mutation_invalidations": 1,
+      "stats": {
+        "bypasses": 0,
+        "compact_replays": 0,
+        "duplicate_bytes_omitted": 0,
+        "estimated_execution_ms_saved": 0,
+        "executions": 101,
+        "full_replays": 101,
+        "quarantines": 0
+      },
+      "timing_ms": {
+        "cold_p50": 14.385334,
+        "native_p50": 2.1523535000000003,
+        "warm_p50": 6.362729,
+        "warm_p95": 7.015833
+      }
+    },
+    {
+      "again_invocations": 202,
+      "cases": 100,
+      "extension": "go",
+      "language": "go",
+      "mutation_invalidations": 1,
+      "stats": {
+        "bypasses": 0,
+        "compact_replays": 0,
+        "duplicate_bytes_omitted": 0,
+        "estimated_execution_ms_saved": 0,
+        "executions": 101,
+        "full_replays": 101,
+        "quarantines": 0
+      },
+      "timing_ms": {
+        "cold_p50": 14.5772295,
+        "native_p50": 2.1945835000000002,
+        "warm_p50": 6.449270500000001,
+        "warm_p95": 7.002458
+      }
+    },
+    {
+      "again_invocations": 202,
+      "cases": 100,
+      "extension": "ts",
+      "language": "typescript",
+      "mutation_invalidations": 1,
+      "stats": {
+        "bypasses": 0,
+        "compact_replays": 0,
+        "duplicate_bytes_omitted": 0,
+        "estimated_execution_ms_saved": 0,
+        "executions": 101,
+        "full_replays": 101,
+        "quarantines": 0
+      },
+      "timing_ms": {
+        "cold_p50": 14.418375000000001,
+        "native_p50": 2.1558125,
+        "warm_p50": 6.3705835,
+        "warm_p95": 7.004333
+      }
+    },
+    {
+      "again_invocations": 202,
+      "cases": 100,
+      "extension": "sh",
+      "language": "shell",
+      "mutation_invalidations": 1,
+      "stats": {
+        "bypasses": 0,
+        "compact_replays": 0,
+        "duplicate_bytes_omitted": 0,
+        "estimated_execution_ms_saved": 0,
+        "executions": 101,
+        "full_replays": 101,
+        "quarantines": 0
+      },
+      "timing_ms": {
+        "cold_p50": 14.461958500000001,
+        "native_p50": 2.1999579999999996,
+        "warm_p50": 6.4506665000000005,
+        "warm_p95": 7.114375
+      }
+    }
+  ],
+  "provenance": {
+    "binary": "/Users/arjun/again/target/release/again",
+    "binary_sha256": "51c004e12f9d9494a939d066184e05f32195eec6ec80574f0febbaf8d30d2ec8",
+    "harness_sha256": "bc3e596d83989f2128702142f114ed82e97a108e8ea4ae4ea5f87752176e11ca",
+    "platform": "macOS-15.6.1-arm64-arm-64bit",
+    "python": "3.9.13",
+    "source_commit": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
+    "source_status": "M Cargo.lock\n M Cargo.toml\n M README.md\n M docs/ARCHITECTURE.md\n M docs/DECISIONS.md\n M docs/EVIDENCE.md\n M docs/PRODUCT.md\n M docs/REMOTE_THREAT_MODEL.md\n M docs/RESEARCH.md\n M docs/ROADMAP.md\n M docs/STATUS.md\n M service/README.md\n M service/migrations/0001_initial.sql\n M service/package-lock.json\n M service/package.json\n M service/src/audit.ts\n M service/src/auth.ts\n M service/src/index.ts\n M service/src/manifest.ts\n M service/src/util.ts\n M service/test/apply-migrations.ts\n M service/test/service.spec.ts\n M service/vitest.config.ts\n M service/wrangler.jsonc\n M src/engine.rs\n M src/fingerprint.rs\n M src/hook.rs\n M src/lib.rs\n M src/remote.rs\n M src/store.rs\n M src/team.rs\n M src/team_crypto.rs\n?? bench/polyglot_reuse_corpus.py\n?? bench/results/2026-08-23-direct-current-v2.json\n?? bench/results/2026-08-23-direct-release-current-v2.json\n?? bench/results/2026-08-23-runtime-attestation-v1.json\n?? bench/results/2026-08-23-runtime-checkpoint-fast-v1.json\n?? bench/results/2026-08-23-team-session-digest-cache-v1.json\n?? docs/TEAM_ALPHA.md\n?? docs/TEAM_LOOKUP_BUNDLE_V1.md\n?? service/migrations/0002_trust_bundles.sql\n?? service/migrations/0003_retention_lifecycle.sql\n?? service/migrations/0004_repository_generation_protocol.sql\n?? service/migrations/0005_commit_freshness.sql\n?? service/migrations/0006_blob_incarnations.sql\n?? service/src/ed25519-strict.ts\n?? service/src/lookup-bundle-v1.ts\n?? service/src/manifest-v2.ts\n?? service/src/trust.ts\n?? service/test/fixtures/lookup-bundle-v1-wire.json\n?? service/test/fixtures/manifest-v2-canonical-rust.json\n?? service/test/fixtures/trust-v1-canonical-rust.json\n?? service/test/lookup-bundle-v1.spec.ts\n?? service/test/migrations.spec.ts\n?? src/privacy.rs\n?? src/runtime_attestation.rs\n?? src/team_admission.rs\n?? src/team_cli.rs\n?? src/team_clock.rs\n?? src/team_config.rs\n?? src/team_inspect.rs\n?? src/team_lookup_bundle.rs\n?? src/team_manifest_v2.rs\n?? src/team_manifest_v2/\n?? src/team_publish.rs\n?? src/team_pull.rs\n?? src/team_request_key.rs\n?? src/trust_bundle.rs\n?? tests/team_inspect_e2e.rs\n?? tests/team_service_live_e2e.rs",
+    "unmodeled_inputs_removed": []
+  },
+  "result": "pass",
+  "schema": "again.polyglot-reuse-corpus.v1",
+  "scope": {
+    "again_invocations": 1010,
+    "cases_per_language": 100,
+    "claim": "explicit narrow read-only product path; not language-semantic or arbitrary-command coverage",
+    "languages": [
+      "rust",
+      "python",
+      "go",
+      "typescript",
+      "shell"
+    ],
+    "mutation_invalidations": 5,
+    "native_comparisons": 505
+  }
+}

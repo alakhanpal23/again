@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "benchmark": "team_store_backed_session_digest_cache",
+  "date": "2026-08-23",
+  "command": "cargo +1.88.0 test --release --locked --lib team_request_key::tests::benchmark_store_backed_session_cache_at_team_scale -- --ignored --nocapture",
+  "profile": "release",
+  "host": {
+    "os": "macOS Darwin 24.6.0",
+    "kernel": "Darwin Kernel Version 24.6.0; RELEASE_ARM64_T6000",
+    "architecture": "arm64",
+    "cpu": "Apple M1 Pro"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)",
+    "host": "aarch64-apple-darwin",
+    "llvm": "20.1.5"
+  },
+  "source_identity": {
+    "git_head": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
+    "dirty_worktree": true,
+    "dirty_paths_at_measurement": 58,
+    "caveat": "Results were measured from the live, uncommitted team-alpha security/generation revision layered on this HEAD, including the Store-backed in-memory session cache. The HEAD alone does not reproduce these numbers until the dirty revision is captured. No clean-commit claim is made."
+  },
+  "method": "For each scale, construct the same recursive portable request three times: cold hashing into Store, a repeat through the same in-memory SessionFileDigestCache, and a new session backed by the populated Store. Every warm lookup still reopens and identity-checks the file before cache use.",
+  "results": [
+    {
+      "files": 1000,
+      "cold_micros": 126235,
+      "same_session_micros": 14933,
+      "reopened_store_micros": 23303,
+      "same_session_speedup": 8.45,
+      "reopened_store_speedup": 5.42,
+      "cold_bytes_hashed": 31000,
+      "same_session_cache_hits": 1000,
+      "reopened_store_cache_hits": 1000
+    },
+    {
+      "files": 10000,
+      "cold_micros": 989659,
+      "same_session_micros": 170652,
+      "reopened_store_micros": 243185,
+      "same_session_speedup": 5.8,
+      "reopened_store_speedup": 4.07,
+      "cold_bytes_hashed": 310000,
+      "same_session_cache_hits": 10000,
+      "reopened_store_cache_hits": 10000
+    }
+  ],
+  "correctness_gates": {
+    "request_keys_identical": true,
+    "same_session_files_rehashed": 0,
+    "reopened_store_files_rehashed": 0,
+    "identity_checks_retained": true
+  }
+}

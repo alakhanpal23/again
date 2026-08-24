@@ -15,3 +15,6 @@ Again treats papers as constraints to test, not borrowed marketing claims.
 
 Each source gets a reproducibility entry before it changes an eligibility rule: tested version/platform, fixture, measured effect, divergence, and decision. Upstream code and licenses are reviewed before reuse.
 
+## Codex interception contract
+
+On 2026-08-23, the installed `codex-cli 0.149.0` and the official [Codex hooks documentation](https://learn.chatgpt.com/docs/hooks) were rechecked. `PreToolUse` can rewrite supported local tool inputs and its common envelope contains a session `cwd`. However, the strict generated schema has no effective tool cwd, TTY, sandbox, remote-environment, output-ceiling, or delivery-receipt field. The open upstream [effective-workdir contract report](https://github.com/openai/codex/issues/37251) demonstrates that `exec_command` honors a per-call workdir while the hook sees only the turn/session cwd and `{ "command": ... }`. Consequence: automatic rewriting remains disabled; explicit `again run` remains the production path until an observed hook envelope can be proven equivalent to the pending execution context.

@@ -456,7 +456,7 @@ def main() -> int:
             require_event(
                 event,
                 disposition="replayed_full",
-                reason="EXACT_REUSE",
+                reason="EXACT_REUSE_NET_V1",
                 label=f"warm run {index + 1}",
             )
             if event["result_id"] != cold_event["result_id"]:

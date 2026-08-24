@@ -4,7 +4,7 @@ This log records choices that affect Again's reuse boundary. A later optimizatio
 
 ## D-001 — Production hooks never rewrite automatically
 
-The production Codex hook returns before reading or parsing stdin and emits no automatic `allow` or rewritten input, even for a command the direct policy could admit. `PreToolUse` hides effective workdir, TTY, shell/login, sandbox and remote-environment semantics, so transparent substitution cannot be established from `tool_input.command`. Explicit `again run -- <argv...>` is the production interface; an ineligible explicit call errors before execution, and the caller reruns the original argv unchanged outside Again.
+The production Codex hook returns before reading or parsing stdin and emits no automatic `allow` or rewritten input, even for a command the direct policy could admit. Current `PreToolUse` reports the session `cwd` and supports `updatedInput`, but its Bash payload drops an `exec_command` call's effective per-call `workdir` and still hides TTY, shell/login, sandbox and remote-environment semantics. Transparent substitution therefore cannot be established from the session `cwd` plus `tool_input.command`. Explicit `again run -- <argv...>` is the production interface; an ineligible explicit call errors before execution, and the caller reruns the original argv unchanged outside Again.
 
 ## D-002 — Trust executable identity, not `PATH` names
 
@@ -24,7 +24,9 @@ A successful miss is run twice immediately. Stdout, stderr, exit status, and pos
 
 ## D-006 — Automatic output compaction is disabled
 
-Every miss and hit returns byte-exact full stdout and stderr. Codex hooks expose neither the effective output ceiling nor a delivery receipt, so a `PreToolUse` handler cannot establish that a previous complete stream was delivered. Compact-reference emission is therefore disabled. Production returns before parsing `PreCompact`/`PostCompact`; the unsafe experimental parser treats those events as state-free no-ops. The context-keyed delivery ledger and clearing primitives remain dormant infrastructure for a future hook contract with a stable delivery receipt. Their presence is not an active output-reduction claim. `again show <id>` remains explicit retrieval for stored results.
+Every `again run` miss and hit returns byte-exact full stdout and stderr. Codex hooks expose neither the effective output ceiling nor a delivery receipt, so a `PreToolUse` handler cannot establish that a previous complete stream was delivered. Automatic compact-reference emission is therefore disabled. Production returns before parsing `PreCompact`/`PostCompact`; the unsafe experimental parser treats those events as state-free no-ops. The context-keyed delivery ledger and clearing primitives remain dormant infrastructure for a future hook contract with a stable delivery receipt.
+
+The separate `again reference -- <argv...>` command is allowed because it changes output only after an explicit caller choice. It repeats live request/runtime/executable/proof/blob validation, never executes on a miss, and emits a bounded content-addressed JSON reference. The caller—not Again—asserts that the complete bytes remain visible in the same active context. `again show <id>` remains explicit retrieval for stored results, and stats count only the positive full-stream bytes actually omitted by the smaller reference.
 
 ## D-007 — Per-workspace state stays outside the workspace
 
@@ -36,7 +38,7 @@ Again can compile a deterministic macOS Seatbelt profile with exact executable a
 
 ## D-009 — Performance gates include fingerprint overhead
 
-A current product benchmark must measure explicit CLI startup, fingerprint, lookup, the per-hit exact-executable capability-probe process, and full-stream presentation. `bench/direct_benchmark.py` exercises that path with all standard streams non-TTY, exact cold/warm/mutation comparisons, and a 3x speed gate only where the native baseline is at least 500 ms. The retained `2026-08-23-direct-v1.json` run satisfies that conditional gate for its recorded clean commit, host and 2 GiB sparse-file `grep` fixture; it is not a general speed claim. `bench/benchmark.py` and `bench/slow_gate.py` deliberately exercise the unsafe experimental hook and are regression harnesses, not product evidence. Trivial commands and first-run double validation may be slower. Automatic hook or output compaction is not a current gate. Failing and superseded measurements stay in the evidence ledger.
+A current product benchmark must measure explicit CLI startup, fingerprint, lookup, the per-hit exact-executable capability-probe process, and full-stream presentation. `bench/direct_benchmark.py` exercises that path with all standard streams non-TTY, exact cold/warm/mutation comparisons, and a 3x speed gate only where the native baseline is at least 500 ms. The retained `2026-08-23-direct-net-current-v3.json` working-tree run satisfies that conditional gate for its recorded binary, host and 2 GiB sparse-file `grep` fixture; `2026-08-23-direct-v1.json` remains the prior clean-commit timing/exactness result. Savings accounting reports only positive producer-duration minus measured replay-wall-time, never the gross producer duration. Neither run is a general speed claim. `bench/reference_benchmark.py` separately gates the explicit lookup-only reference against exact full retrieval, mutation, event/counter, byte-reduction, and latency checks; it measures bytes, not tokenizer or model tokens. `bench/benchmark.py` and `bench/slow_gate.py` deliberately exercise the unsafe experimental hook and are regression harnesses, not product evidence. Trivial commands and first-run double validation may be slower. Automatic hook rewriting or inferred output compaction is not a current gate. Failing and superseded measurements stay in the evidence ledger.
 
 ## D-010 — Codex onboarding is an owned instruction skill
 
@@ -48,7 +50,7 @@ Local result compare/insert runs under an immediate SQLite transaction. Identica
 
 ## D-012 — Shared records use signed, producer-bound manifests
 
-Remote manifests sign a manual length-prefixed canonical encoding with Ed25519. Tenant, repository, request, policy, execution profile, platform/image, blob, lifetime, privacy, key-id, and producer bindings are verified before acceptance. A key id cannot be silently rebound to different key material or a different producer. This secures the protocol object. The repository now contains an undeployed Worker transport and fail-closed Rust client module, but neither is CLI-integrated or a production team-cache claim.
+Remote manifests sign a manual length-prefixed canonical encoding with Ed25519. Tenant, repository, request, policy, execution profile, platform/image, blob, lifetime, privacy, key-id, and producer bindings are verified before acceptance. A key id cannot be silently rebound to different key material or a different producer. This secures the protocol object. The undeployed Worker and sealed Rust v2 client are now connected to an explicit, manually provisioned team-alpha CLI; this is not a deployed or production team-cache claim.
 
 ## D-013 — Scoped observations bind a filesystem-object epoch
 
@@ -56,7 +58,7 @@ Scoped file, directory-member, and executable metadata includes device, inode, a
 
 ## D-014 — Hidden Codex context disables automatic rewriting
 
-Codex does not expose effective TTY, workdir, shell/login, sandbox, remote `environment_id`, or output-cap settings to `PreToolUse`. Production automatic rewriting is therefore a true no-op until an official envelope exposes the semantics needed for transparent substitution. Dormant plumbing accepts only the audited top-level shape and a `tool_input` object containing only `command`, requires an explicit absolute audited executable, uses an opaque handoff, and retains runtime mismatch defenses. It is reachable only through the conspicuously named `--experimental-unsafe-rewrite` flag for controlled differential tests and must not be installed. None of those partial checks upgrades the hidden hook context into an active reuse path. Explicit `again run` observes the actual local/default tool-shell context and remains the MVP.
+Codex exposes a session `cwd` to `PreToolUse`, but not the effective per-call workdir used by `exec_command`; it also omits effective TTY, shell/login, sandbox, remote `environment_id`, and output-cap settings. Production automatic rewriting is therefore a true no-op until an official envelope exposes the semantics needed for transparent substitution. Dormant plumbing accepts only the audited top-level shape and a `tool_input` object containing only `command`, requires an explicit absolute audited executable, uses an opaque handoff, and retains runtime mismatch defenses. It is reachable only through the conspicuously named `--experimental-unsafe-rewrite` flag for controlled differential tests and must not be installed. None of those partial checks upgrades the hidden hook context into an active reuse path. Explicit `again run` observes the actual local/default tool-shell context and remains the MVP.
 
 ## D-015 — The direct policy requires explicit, deterministic operands
 
@@ -85,3 +87,7 @@ Release artifacts may install and expose diagnostics on Linux or an unknown macO
 ## D-021 — Explain reports persisted facts only
 
 `again explain <id>` reads a stored, non-quarantined result, and `again explain` reads the latest persisted execution event. It does not infer or synthesize a reason for calls that failed or were refused before event creation.
+
+## D-022 — Team bundles stream only after an object-identity fence
+
+The two-request team lookup keeps the 16 MiB ciphertext limit but may not materialize ciphertext-sized JavaScript buffers in the Worker. A successful upload binds the R2-returned version, ETag, R2-verified SHA-256, size, storage key, and random blob incarnation into D1. Lookup obtains conditional R2 body streams, checks that metadata, and then runs one final D1 query binding the same repository generation, manifest, trust head, blob incarnations, and R2 identities. Only after that fence may the response stream begin. This follows the 128 MiB-per-isolate Workers limit, which is shared across concurrent requests, while retaining client-side BLAKE3, AEAD, signed-manifest, local privacy, and post-decryption trust verification as the plaintext-release authority. Lowering the output limit merely to accommodate buffering would narrow the product without fixing the architecture.

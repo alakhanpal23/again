@@ -1,0 +1,61 @@
+{
+  "checks": {
+    "generated_secret_log_scan_passed": true,
+    "new_generation_republish_and_hit": true,
+    "old_generation_cli_never_hit": true,
+    "old_generation_transport_rejected_412": true,
+    "post_rotation_second_client_exact_hit": true,
+    "producer_revocation_hides_manifest": true,
+    "public_bundle_content_length_matches_body": true,
+    "publisher_miss_and_publish": true,
+    "r2_corruption_quarantined": true,
+    "read_only_miss_local_fallback": true,
+    "second_client_exact_hit": true,
+    "temporary_secret_tree_removed_before_report_write": true,
+    "wrong_repository_key_quarantined": true
+  },
+  "clients": 2,
+  "generation": {
+    "old_and_new_differ": true,
+    "request_keys_differ": true
+  },
+  "latency_micros": {
+    "native": {
+      "max": 2055,
+      "min": 1623,
+      "p50": 1703,
+      "p95": 2055
+    },
+    "note": "Quick Tunnel latency is transport evidence, not a production speed gate",
+    "quick_tunnel_exact_hit": {
+      "max": 648667,
+      "min": 535576,
+      "p50": 581785,
+      "p95": 648667
+    },
+    "sample_count": 9
+  },
+  "lookup_protocol": "bundle_v1",
+  "max_requests_per_exact_hit": 2,
+  "provenance": {
+    "client_binary_blake3": "284e3bd466b35fde14da91ea8b5feb7eb56dec17cf43c8fd2a3bfa13af9580ad",
+    "cloudflared_version": "cloudflared version 2026.8.2 (built 2026-08-14-12:18 UTC)",
+    "host_arch": "aarch64",
+    "host_os": "macos",
+    "live_harness_blake3": "53a20f3e221f931011b8dabb0cc95c76140cb4cea4ac611bcdc1f223db312b5a",
+    "production_source_set_blake3": "34c9054396c99836a6c2dfcd245816a2b8a4bcaf869c61cebda943935d1a9d05",
+    "source_commit": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
+    "working_tree_dirty": true,
+    "working_tree_entry_count": 101,
+    "wrangler_version": "4.125.0"
+  },
+  "recorded_at_unix_seconds": 1787538824,
+  "request_count_evidence": {
+    "note": "The live profile enforces the ceiling; the deterministic remote::tests::bundle_pull_uses_exactly_two_requests_under_one_budget_without_retry test observes the exact two client routes. The direct public GET here validates response framing only.",
+    "observed_by_live_harness": false,
+    "separate_public_framing_get_is_not_counted": true
+  },
+  "schema_version": 1,
+  "service": "wrangler-local-d1-r2",
+  "transport": "production-rustls-over-cloudflare-quick-tunnel-https"
+}

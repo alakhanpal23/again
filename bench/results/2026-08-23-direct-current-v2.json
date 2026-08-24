@@ -1,0 +1,338 @@
+{
+  "configuration": {
+    "baseline_iterations": 5,
+    "child_address_space_limit_bytes": null,
+    "environment_overrides": {
+      "AGAIN_HOME": "fresh temporary directory",
+      "GREP_OPTIONS": "unset",
+      "LC_ALL": "C",
+      "PATH": "/usr/bin:/bin",
+      "unmodeled_loader_locale_terminal_inputs_removed": []
+    },
+    "filesystem_page_cache_dropped": false,
+    "fixture_files": 4,
+    "fixture_size_mib": 2048,
+    "memory_limit_note": "no portable hard limit; child peak RSS is recorded",
+    "per_stream_hard_file_and_capture_limit_bytes": 16777216,
+    "speed_gate_enforced_by_exit_code": true,
+    "timeout_seconds_per_process": 120.0,
+    "warm_iterations": 15
+  },
+  "correctness": {
+    "all_warm_events_are_full_hits": true,
+    "all_warm_exact": true,
+    "cold_exact": true,
+    "mutation_event_is_miss": true,
+    "mutation_exact": true,
+    "stats": {
+      "bypasses": 0,
+      "compact_replays": 0,
+      "duplicate_bytes_omitted": 0,
+      "estimated_execution_ms_saved": 16470,
+      "executions": 2,
+      "full_replays": 15,
+      "quarantines": 0
+    }
+  },
+  "fixture": {
+    "again_argv": [
+      "/Users/arjun/again/target/debug/again",
+      "run",
+      "--",
+      "grep",
+      "needle",
+      "payload-000.bin",
+      "payload-001.bin",
+      "payload-002.bin",
+      "payload-003.bin"
+    ],
+    "aggregate_logical_size_bytes": 2147483648,
+    "allocated_size_bytes_after_mutation": 81920,
+    "construction": "aggregate bytes split across sparse zero-filled files, each ending in ASCII needle\\n",
+    "logical_size_bytes_by_file": [
+      536870912,
+      536870912,
+      536870912,
+      536870912
+    ],
+    "mutation": {
+      "file": "payload-000.bin",
+      "native_streams_unchanged": true,
+      "offset_bytes": 268435456,
+      "replacement_hex": "78"
+    },
+    "native_argv": [
+      "/usr/bin/grep",
+      "needle",
+      "payload-000.bin",
+      "payload-001.bin",
+      "payload-002.bin",
+      "payload-003.bin"
+    ],
+    "stream_evidence": {
+      "exit_code": 0,
+      "stderr_bytes": 0,
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_bytes": 144,
+      "stdout_sha256": "24c6f65304db6197ae816df511d79bf9bc30c5126d6de53d953c1379b04a8887"
+    }
+  },
+  "gates": {
+    "correctness": {
+      "status": "pass"
+    },
+    "speed": {
+      "baseline_p50_ms": 1141.400417,
+      "comparison": ">=",
+      "observed_speedup": 55.30744181369967,
+      "required_speedup": 3.0,
+      "status": "pass",
+      "warm_again_p95_ms": 20.637375
+    }
+  },
+  "generated_at_utc": "2026-08-23T23:13:50.887765+00:00",
+  "harness_version": "1.0.0",
+  "measurements": {
+    "again_cold": {
+      "elapsed_ms": 29690.041042,
+      "event": {
+        "disposition": "executed",
+        "reason": "DOUBLE_EXECUTION_VALIDATED",
+        "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+      },
+      "exact_stream_match": true
+    },
+    "again_warm": {
+      "all_exact_full_stream_matches": true,
+      "events": [
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        },
+        {
+          "disposition": "replayed_full",
+          "reason": "EXACT_REUSE",
+          "result_id": "r_fb8ce7f4626749c7ae4b20d37a183cf9"
+        }
+      ],
+      "maximum_ms": 20.637375,
+      "mean_ms": 19.970688933333335,
+      "minimum_ms": 18.626792,
+      "p50_ms": 20.308625,
+      "p95_ms": 20.637375,
+      "samples_ms": [
+        20.637375,
+        20.320792,
+        20.164875,
+        19.513,
+        19.282291,
+        20.356083,
+        20.317,
+        20.26775,
+        18.626792,
+        20.429209,
+        20.308625,
+        19.6205,
+        18.939542,
+        20.440875,
+        20.335625
+      ]
+    },
+    "mutation_miss": {
+      "again_elapsed_ms": 8819.000833,
+      "event": {
+        "disposition": "executed",
+        "reason": "DOUBLE_EXECUTION_VALIDATED",
+        "result_id": "r_5f1f1e006f4d486cbb961c091961216b"
+      },
+      "exact_stream_match": true,
+      "native_elapsed_ms": 770.481084
+    },
+    "native": {
+      "maximum_ms": 2212.561542,
+      "mean_ms": 1286.7774502,
+      "minimum_ms": 918.16425,
+      "p50_ms": 1141.400417,
+      "p95_ms": 2212.561542,
+      "samples_ms": [
+        2212.561542,
+        1190.022209,
+        971.738833,
+        918.16425,
+        1141.400417
+      ]
+    },
+    "resource_observation": {
+      "initial_child_rss_high_water_bytes": 0,
+      "peak_child_rss_bytes": 756400128,
+      "platform_interpretation": "ru_maxrss is bytes on Darwin",
+      "scope": "high-water mark from the first native run through Again stats; provenance subprocesses were launched afterward"
+    }
+  },
+  "provenance": {
+    "binary": {
+      "path": "/Users/arjun/again/target/debug/again",
+      "sha256": "e03e458bb66eeaedb4cb1fe77cab9227c55acb056d5a00bddeb1c6c04756e7b1",
+      "version": "again 0.1.0"
+    },
+    "harness": {
+      "path": "/Users/arjun/again/bench/direct_benchmark.py",
+      "sha256": "619c625a090c93abd92267e4e47dc904db23530836d851f9841796f7c802db50"
+    },
+    "host": {
+      "machine": "arm64",
+      "processor": "arm",
+      "python_executable": "/Library/Frameworks/Python.framework/Versions/3.9/bin/python3",
+      "python_implementation": "CPython",
+      "python_version": "3.9.13",
+      "release": "24.6.0",
+      "system": "Darwin",
+      "version": "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000"
+    },
+    "repository": {
+      "commit": "490c94f3afb2b6fa4ba5b1beeb06cf2b4836657a",
+      "dirty": true,
+      "dirty_entries": [
+        "M Cargo.lock",
+        " M Cargo.toml",
+        " M README.md",
+        " M docs/ARCHITECTURE.md",
+        " M docs/DECISIONS.md",
+        " M docs/EVIDENCE.md",
+        " M docs/PRODUCT.md",
+        " M docs/REMOTE_THREAT_MODEL.md",
+        " M docs/RESEARCH.md",
+        " M docs/ROADMAP.md",
+        " M docs/STATUS.md",
+        " M service/README.md",
+        " M service/migrations/0001_initial.sql",
+        " M service/package-lock.json",
+        " M service/package.json",
+        " M service/src/audit.ts",
+        " M service/src/auth.ts",
+        " M service/src/index.ts",
+        " M service/src/manifest.ts",
+        " M service/src/util.ts",
+        " M service/test/apply-migrations.ts",
+        " M service/test/service.spec.ts",
+        " M service/vitest.config.ts",
+        " M service/wrangler.jsonc",
+        " M src/engine.rs",
+        " M src/fingerprint.rs",
+        " M src/hook.rs",
+        " M src/lib.rs",
+        " M src/remote.rs",
+        " M src/team.rs",
+        " M src/team_crypto.rs",
+        "?? bench/results/2026-08-23-runtime-attestation-v1.json",
+        "?? bench/results/2026-08-23-runtime-checkpoint-fast-v1.json",
+        "?? bench/results/2026-08-23-team-session-digest-cache-v1.json",
+        "?? docs/TEAM_ALPHA.md",
+        "?? docs/TEAM_LOOKUP_BUNDLE_V1.md",
+        "?? service/migrations/0002_trust_bundles.sql",
+        "?? service/migrations/0003_retention_lifecycle.sql",
+        "?? service/migrations/0004_repository_generation_protocol.sql",
+        "?? service/migrations/0005_commit_freshness.sql",
+        "?? service/src/ed25519-strict.ts",
+        "?? service/src/lookup-bundle-v1.ts",
+        "?? service/src/manifest-v2.ts",
+        "?? service/src/trust.ts",
+        "?? service/test/fixtures/manifest-v2-canonical-rust.json",
+        "?? service/test/fixtures/trust-v1-canonical-rust.json",
+        "?? service/test/lookup-bundle-v1.spec.ts",
+        "?? service/test/migrations.spec.ts",
+        "?? src/privacy.rs",
+        "?? src/runtime_attestation.rs",
+        "?? src/team_admission.rs",
+        "?? src/team_cli.rs",
+        "?? src/team_clock.rs",
+        "?? src/team_config.rs",
+        "?? src/team_inspect.rs",
+        "?? src/team_lookup_bundle.rs",
+        "?? src/team_manifest_v2.rs",
+        "?? src/team_manifest_v2/",
+        "?? src/team_publish.rs",
+        "?? src/team_pull.rs",
+        "?? src/team_request_key.rs",
+        "?? src/trust_bundle.rs",
+        "?? tests/team_inspect_e2e.rs",
+        "?? tests/team_service_live_e2e.rs"
+      ],
+      "source_root": "/Users/arjun/again"
+    }
+  },
+  "schema": "again.direct-benchmark.v1",
+  "scope": {
+    "automatic_hooks_exercised": false,
+    "codex_models_exercised": false,
+    "output_compaction_exercised": false,
+    "product_path": "explicit again run -- argv",
+    "token_reduction_measured": false
+  }
+}

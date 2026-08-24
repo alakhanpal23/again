@@ -1,0 +1,31 @@
+name: Again team run
+description: Build pinned Again, validate one team request offline, and run its exact argv
+
+inputs:
+  bundle:
+    description: Multiline again.team-ci-bundle.v1 JSON supplied from one masked GitHub secret
+    required: true
+  argv:
+    description: JSON array containing the bare executable and each argument as a separate string
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Validate and run the exact team argv
+      shell: /bin/bash --noprofile --norc -p -euo pipefail {0}
+      env:
+        AGAIN_TEAM_CI_BUNDLE_JSON: ${{ inputs.bundle }}
+        AGAIN_TEAM_CI_ARGV_JSON: ${{ inputs.argv }}
+        LD_AUDIT: ""
+        LD_LIBRARY_PATH: ""
+        LD_PRELOAD: ""
+        DYLD_FRAMEWORK_PATH: ""
+        DYLD_INSERT_LIBRARIES: ""
+        DYLD_LIBRARY_PATH: ""
+        DYLD_ROOT_PATH: ""
+      run: |
+        set +x
+        set +a
+        unset BASH_ENV ENV CDPATH GLOBIGNORE
+        exec /usr/bin/python3 -I "$GITHUB_ACTION_PATH/run.py"

@@ -22,6 +22,7 @@ interface RateRow {
 
 export interface AuthContext {
   tokenId: string;
+  tokenSecretSha256: string;
   tenantId: string;
   subject: string;
   repositoryScope: string | null;
@@ -62,6 +63,14 @@ export async function authenticate(
   if (row === null || !secretMatches) {
     throw unauthorized();
   }
+  try {
+    requireRouteIdentifier(row.tenant_id, "tenant_id");
+  } catch {
+    // Tenant identifiers are embedded in R2 prefixes. A malformed
+    // out-of-band provisioning row must fail closed before any object key is
+    // constructed, without revealing that the credential otherwise matched.
+    throw unauthorized();
+  }
   const now = nowSeconds();
   const requestCount = await enforceRateLimit(env.DB, row.id, now);
   if (requestCount === 1) {
@@ -99,6 +108,7 @@ export async function authenticate(
 
   return {
     tokenId: row.id,
+    tokenSecretSha256: row.secret_sha256,
     tenantId: row.tenant_id,
     subject: row.subject,
     repositoryScope: row.repository_scope,

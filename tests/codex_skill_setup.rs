@@ -35,6 +35,7 @@ fn dry_run_renders_the_skill_without_touching_disk() {
     assert_eq!(change.path, directory.join("SKILL.md"));
     assert!(change.rendered.starts_with("---\nname: again\n"));
     assert!(change.rendered.contains("again run --"));
+    assert!(change.rendered.contains("again reference --"));
     assert!(change.rendered.contains("Never invoke Again's hidden"));
     assert!(!directory.exists());
 }

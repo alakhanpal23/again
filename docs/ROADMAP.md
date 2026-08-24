@@ -7,9 +7,9 @@ Dates are phase labels, not excuses to widen the documented reuse boundary. A fe
 Sequence:
 
 1. Freeze product promise, first user, v0 allowlist, refusal/no-store rules, and EffectIR v1.
-2. Build native explicit `again run`, an ownership-checked instruction-only Codex skill, doctor scope reporting, and a true no-op production hook while effective workdir/TTY/shell/remote semantics are hidden. Retain exact-envelope, explicit-absolute-executable and opaque-handoff plumbing for experimental tests only.
+2. Build native explicit `again run`, an ownership-checked instruction-only Codex skill, doctor scope reporting, and a true no-op production hook while effective per-call workdir/TTY/shell/remote semantics are hidden. Retain exact-envelope, explicit-absolute-executable and opaque-handoff plumbing for experimental tests only.
 3. Build deterministic workspace/request fingerprint, SQLite index, immutable blob store, exact result replay, and full-output retrieval.
-4. Return exact full streams on every hit; add stats and human/machine-readable explanations. Keep delivery-ledger compaction disabled until Codex supplies a stable delivery receipt.
+4. Return exact full streams on every `again run` hit; add stats and human/machine-readable explanations. Keep delivery-ledger compaction disabled until Codex supplies a stable delivery receipt. A separately requested lookup-only reference may omit bytes only when the caller asserts those exact bytes remain in the same active context.
 5. Run policy tables, no-op hook/envelope fixtures, explicit-run TTY behavior, mutation invalidation, state/path symlink, ownership, mode and hard-link checks, output-limit/nonempty-stderr admission, corruption, concurrency, crash, and non-zero-result tests.
 6. Run `bench/direct_benchmark.py` for cold overhead, warm latency including the exact-executable probe child, wall time, mutation invalidation, resource observations, and full-stream equality with non-TTY streams.
 7. Test personal-only and project-only Codex skill installs, record limitations, and commit only a green checkpoint.

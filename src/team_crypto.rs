@@ -5,9 +5,11 @@
 //! parser when a key or signature is malformed.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 use crate::team::{
     ED25519_SIGNATURE_SIZE, RemoteCacheManifest, SIGNATURE_ENVELOPE_SCHEMA_VERSION,
@@ -38,7 +40,6 @@ pub enum CryptoError {
 }
 
 /// A signing key with an explicit key-id and producer binding.
-#[derive(Debug)]
 pub struct Ed25519Signer {
     key_id: String,
     producer_id: String,
@@ -53,9 +54,11 @@ impl Ed25519Signer {
     ) -> Result<Self, CryptoError> {
         validate_identifier(key_id, "key_id")?;
         validate_identifier(producer_id, "producer_id")?;
-        let key_bytes: [u8; ED25519_SECRET_KEY_BYTES] = secret_key
-            .try_into()
-            .map_err(|_| CryptoError::InvalidSecretKeyLength)?;
+        if secret_key.len() != ED25519_SECRET_KEY_BYTES {
+            return Err(CryptoError::InvalidSecretKeyLength);
+        }
+        let mut key_bytes = Zeroizing::new([0u8; ED25519_SECRET_KEY_BYTES]);
+        key_bytes.copy_from_slice(secret_key);
         Ok(Self {
             key_id: key_id.to_owned(),
             producer_id: producer_id.to_owned(),
@@ -73,6 +76,19 @@ impl Ed25519Signer {
 
     pub fn public_key_bytes(&self) -> [u8; ED25519_PUBLIC_KEY_BYTES] {
         self.signing_key.verifying_key().to_bytes()
+    }
+
+    /// Authenticate canonical bytes for another reviewed Again protocol.
+    ///
+    /// The protocol module is responsible for domain separation and complete
+    /// canonical encoding. Keeping this crate-private prevents callers from
+    /// turning a producer key into a general-purpose signing oracle.
+    #[allow(
+        dead_code,
+        reason = "used only by the intentionally unwired encrypted-manifest v2 builder"
+    )]
+    pub(crate) fn sign_protocol_message(&self, message: &[u8]) -> [u8; ED25519_SIGNATURE_SIZE] {
+        self.signing_key.sign(message).to_bytes()
     }
 
     /// Signs the manifest's canonical bytes. The signature bytes themselves
@@ -109,6 +125,17 @@ impl Ed25519Signer {
             .signature = signature.to_bytes().to_vec();
         manifest.signature = candidate.signature;
         Ok(())
+    }
+}
+
+impl fmt::Debug for Ed25519Signer {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Ed25519Signer")
+            .field("key_id", &self.key_id)
+            .field("producer_id", &self.producer_id)
+            .field("signing_key", &"<redacted>")
+            .finish()
     }
 }
 
@@ -250,6 +277,19 @@ mod tests {
             },
             signature: None,
         }
+    }
+
+    #[test]
+    fn signer_debug_is_explicitly_redacted() {
+        let secret = [0xabu8; 32];
+        let signer =
+            Ed25519Signer::from_secret_key("key-debug", "producer-debug", &secret).unwrap();
+        let rendered = format!("{signer:?}");
+        assert!(rendered.contains("key-debug"));
+        assert!(rendered.contains("producer-debug"));
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains(&"ab".repeat(32)));
+        assert!(!rendered.contains("171, 171"));
     }
 
     fn context(

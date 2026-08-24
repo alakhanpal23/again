@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "namespace": "again.team-ci-boundary-evidence.v1",
+  "recorded_at": "2026-08-23T18:12:10-07:00",
+  "source_commit": "490c94f0",
+  "working_tree": "dirty",
+  "host": {
+    "os": "macOS 15.6.1",
+    "build": "24G90",
+    "architecture": "arm64"
+  },
+  "pinned_toolchain": "Rust 1.88.0",
+  "tests": {
+    "portable_boundary": {
+      "command": "/bin/bash scripts/test_team_ci.sh",
+      "status": "passed",
+      "observed_wall_seconds": 7.8
+    },
+    "real_binary_boundary": {
+      "command": "AGAIN_TEAM_CI_REAL_BINARY=target/debug/again /bin/bash scripts/test_team_ci.sh",
+      "status": "passed",
+      "observed_wall_seconds": 17.2,
+      "binary_sha256": "7b9145d6d5ac031b4c4ac483e38dd61a175744d61d8752252480178aff2228af"
+    },
+    "fresh_production_wrapper": {
+      "command_shape": "AGAIN_TEAM_CI_BUNDLE_JSON=<fixture> GITHUB_WORKSPACE=/Users/arjun/again RUNNER_TEMP=<fresh-external-dir> /bin/bash --noprofile --norc -p scripts/again-team-ci.sh -- cat README.md",
+      "status": "passed",
+      "requested_stdout_redirected_to_dev_null": true,
+      "observed_wall_seconds": 68.3,
+      "cargo_reported_release_build_seconds": 60,
+      "remote_endpoint": "deliberately nonexistent fixture endpoint",
+      "outcome": "offline inspection passed; bounded lookup failed; audited local fallback returned success",
+      "remote_cache_hit_claimed": false
+    }
+  },
+  "adversarial_environment": [
+    "PATH without system or Rust tools",
+    "hostile BASH_ENV",
+    "hostile PYTHONPATH",
+    "hostile RUSTC_WRAPPER",
+    "hostile RUSTC_WORKSPACE_WRAPPER",
+    "consumer-workspace .cargo/config.toml",
+    "fake PATH bash",
+    "fake PATH python3",
+    "fake PATH wc",
+    "fake PATH cargo",
+    "fake PATH rustup"
+  ],
+  "frozen_sha256": {
+    ".github/actions/team-run/action.yml": "11e75301f996153da22fe8bee8692e70ebe4227d4879877aece5b4614c1a10f3",
+    ".github/actions/team-run/run.py": "00d4c80dedc2d76d75ddffb036562313f11d146ae464a28cd494e93f64d18319",
+    "scripts/again-team-ci.sh": "a3dc9d2bba607256f02e7daced63c0db698cde6aae171e3137f21ef9419b1cd0",
+    "scripts/materialize-team-ci-bundle.py": "e581d0d51ad82941e5b0f4de518d02c6881dd1f81de9bc0c3a486a99a5e77201",
+    "scripts/test_team_ci.sh": "de3f342ec7022e7aebde907cbfe054a3c7a220a1f31ae64c262d7ed4550d475a",
+    ".github/workflows/team-ci-integration.yml": "995e2c424fa34eb5a465ab25c800b041a689fe4b0d34515922ae6d34103c4377",
+    "docs/TEAM_CI.md": "03cc7087ce92c6bd3dbc6bf104e9fbda21de7e9c7e39b3a231a27a2941a5201a"
+  },
+  "independent_reaudit": {
+    "status": "passed",
+    "service_tests": 138,
+    "npm_audit_vulnerabilities": 0,
+    "ci_must_fix_findings_remaining": 0
+  },
+  "limitations": [
+    "The sample endpoint was not deployed and no remote hit was measured.",
+    "The initial process still requires a fresh trusted runner; same-UID, root, and previously compromised runner state are excluded.",
+    "The generic wrapper is trusted only from an immutable reviewed Again checkout; a consumer repository must use a remote action pinned to a reviewed full commit SHA.",
+    "A fresh isolated source build takes about one minute on this host; a signed release-binary path is still needed for fast onboarding.",
+    "The current sealed runtime admits cat on this host. Other parser-accepted tools still require their exact executable and dependency closures to be audited before they work."
+  ]
+}
