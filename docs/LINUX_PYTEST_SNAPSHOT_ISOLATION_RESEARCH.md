@@ -186,7 +186,7 @@ groups and inherited executable mappings remain, and `no_new_privs` does not
 block nested user namespaces; production attachment, seccomp, tracer, and
 pre-exec audits remain mandatory.
 
-The next source slice extends the same fixed no-command child with a terminal
+The current source slice extends the same fixed no-command child with a terminal
 Landlock diagnostic. It selects exactly ABI 6 or 7, applies exact handled
 filesystem/TCP/scope masks `0xFFFF`/`0x3`/`0x3`, grants only `tmp` `0x77BE` and
 `run/restricted` `0x17BE`, and runs fixed allow/deny filesystem and TCP
@@ -197,6 +197,21 @@ scope mask and ABI-7 logging flag are accepted-policy evidence only: this one
 child does not prove cross-process scope behavior or inspect audit logs. Stock
 hosted Ubuntu still stops at the earlier UTS refusal, so this remains source
 and adversarial-contract evidence until a qualifying runner composes it.
+
+[Actions run 32800397734](https://github.com/alakhanpal23/again/actions/runs/32800397734)
+passed the Landlock source checkpoint at commit `0f3d34b`. Ubuntu and macOS
+both passed pinned formatting, strict Clippy, the full suite, and the explicit
+100,000-case gate; Ubuntu compiled and ran the Linux-only ABI, UAPI, tracker,
+syscall-classifier, protocol-V2, and status-10/11 adversarial tests. The
+retained Ubuntu 24 artifact came from image `20260816.277.1` on kernel
+`6.17.0-1022-azure`: its independent query observed Landlock ABI 7, while the
+fixed product diagnostic preserved the exact earlier UTS `EPERM` refusal with
+completed cleanup and empty stderr. The capability and namespace report
+SHA-256 values are respectively
+`99f90b7c274047ebb907bb0cbfd418c889feb79689ca12cba25dbb16d326b883` and
+`7346fa492d952f85cb1b38e4c9a1497b60d09893f7bc3cefb6fe47bf9781ec34`.
+This is immutable compile, contract-test, and negative-lane evidence, not a
+positive live Landlock-enforcement or composed-isolation result.
 
 [Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
 passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
