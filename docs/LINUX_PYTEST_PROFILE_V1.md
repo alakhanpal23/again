@@ -670,6 +670,18 @@ diagnostic JSON is not a persisted profile object and changes no field in
 [`LINUX_PYTEST_WIRE_V1.md`](LINUX_PYTEST_WIRE_V1.md). The profile remains
 **not qualified**.
 
+The production-tracer foundation now also includes a syscall-free,
+fixed-capacity supervisor planner. It composes the strict wait, event-message,
+syscall-info, fork-family, and task-lifecycle decoders; brands every linear
+exchange token to one supervisor instance and exact stop generation; and
+correlates both parent-event-first and child-stop-first fork delivery by the
+kernel-reported child TID. Child and parent resumes must then be confirmed one
+step at a time. Its
+constructor is intentionally private, so it is not a kernel-backed supervisor
+issuer. It cannot install the production filter, call ptrace, accept a
+workload, capture `clone3` memory, prove `ECHILD`, or grant any completeness or
+execution authority. Those remain implementation requirements below.
+
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
 the launcher captures a bounded canonical host-KGID vector; while PID 1 is

@@ -96,6 +96,7 @@ mod trace_protocol;
 mod tracer_event_message;
 mod tracer_fork_decode;
 mod tracer_seccomp;
+mod tracer_supervisor_state;
 mod tracer_syscall_info;
 mod tracer_task_state;
 mod tracer_wait_status;

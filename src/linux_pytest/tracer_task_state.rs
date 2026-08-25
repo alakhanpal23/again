@@ -380,6 +380,36 @@ impl TracerTaskStateRecorderV1 {
         }
     }
 
+    /// Whether `raw_tid` currently names one non-reaped task lifetime.
+    ///
+    /// This is a correlation predicate only. It does not prove that the task
+    /// is ptrace-stopped, that its address space is quiescent, or that any
+    /// kernel response belongs to the current stop.
+    pub(super) fn contains_live_raw_tid(&self, raw_tid: i32) -> bool {
+        self.find_live_task(raw_tid).is_some()
+    }
+
+    /// Whether a child announcement is waiting for that child's distinct
+    /// initial `PTRACE_EVENT_STOP` observation.
+    ///
+    /// The result exposes no parent identity or lifecycle data and grants no
+    /// authority to classify or resume a stop.
+    pub(super) fn is_announced_child_awaiting_ready(&self, raw_tid: i32) -> bool {
+        self.pending_children.iter().any(|pending| {
+            pending.raw_tid == raw_tid && pending.announcement.is_some() && !pending.ready_seen
+        })
+    }
+
+    /// Return the syscall currently awaiting resolution for one live task.
+    ///
+    /// The value is transient correlation state already owned by this
+    /// recorder. It proves neither a current ptrace stop nor syscall-frame
+    /// provenance.
+    pub(super) fn pending_syscall_number(&self, raw_tid: i32) -> Option<u32> {
+        self.find_live_task(raw_tid)
+            .and_then(|index| self.tasks[index].pending_syscall)
+    }
+
     pub(super) fn observe<S: NormalizedTracerTaskEventSinkV1>(
         &mut self,
         observation: TracerTaskObservationV1,
@@ -1342,6 +1372,49 @@ mod tests {
             ),
             Err(reason)
         );
+    }
+
+    #[test]
+    fn supervisor_correlation_queries_expose_only_lifecycle_shape() {
+        let mut recorder = TracerTaskStateRecorderV1::new();
+        let mut sink = FixedSinkV1::<16>::new();
+
+        assert!(!recorder.contains_live_raw_tid(ROOT_TID));
+        assert!(!recorder.is_announced_child_awaiting_ready(CHILD_TID));
+        assert_eq!(recorder.pending_syscall_number(ROOT_TID), None);
+
+        initial(&mut recorder, &mut sink);
+        assert!(recorder.contains_live_raw_tid(ROOT_TID));
+
+        entry(
+            &mut recorder,
+            &mut sink,
+            ROOT_TID,
+            TRACER_TASK_CLONE_NR_X86_64_V1,
+        );
+        assert_eq!(
+            recorder.pending_syscall_number(ROOT_TID),
+            Some(TRACER_TASK_CLONE_NR_X86_64_V1)
+        );
+        announce(
+            &mut recorder,
+            &mut sink,
+            ROOT_TID,
+            CHILD_TID,
+            TracerTaskChildBirthKindV1::Clone,
+            TracerTaskGroupRelationV1::NewThreadGroup,
+        );
+        assert!(!recorder.contains_live_raw_tid(CHILD_TID));
+        assert!(recorder.is_announced_child_awaiting_ready(CHILD_TID));
+
+        ready(&mut recorder, &mut sink, CHILD_TID);
+        assert!(recorder.contains_live_raw_tid(CHILD_TID));
+        assert!(!recorder.is_announced_child_awaiting_ready(CHILD_TID));
+
+        syscall_exit(&mut recorder, &mut sink, ROOT_TID, i64::from(CHILD_TID));
+        assert_eq!(recorder.pending_syscall_number(ROOT_TID), None);
+        normal_exit(&mut recorder, &mut sink, CHILD_TID, 0, false);
+        assert!(!recorder.contains_live_raw_tid(CHILD_TID));
     }
 
     #[test]
