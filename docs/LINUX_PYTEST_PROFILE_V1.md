@@ -527,14 +527,40 @@ private FD table, this proves flag-bearing syscall acceptance and its exact
 terminal close postcondition, not the kernel's shared-table unshare path and
 not the workload boundary specified below.
 
+The following fixed no-command slice then eliminates namespace capabilities
+without accepting a command or opening another descriptor. It scans
+`PR_CAPBSET_READ` for every capability id 0 through 64 and requires exactly one
+contiguous supported prefix whose last id is 40 through 63; id 64 must be
+invalid. Exact v3 `capget` state must contain effective and permitted
+`CAP_SETPCAP` and no effective, permitted, or inheritable bit above that
+boundary. The child sets and immediately reads exact securebits `0xEF`: root
+and setuid-fixup semantics are disabled and locked, `KEEP_CAPS` is locked off,
+and ambient raises are disabled and locked. It then drops every supported
+bounding capability in ascending order, clears the ambient set and scans it
+again, writes all six v3 capability words to zero, and sets `no_new_privs`.
+Before success it independently requires all six words zero, the same empty
+bounding and ambient ranges, exact securebits `0xEF`, `no_new_privs == 1`, and
+the original authenticated fd 0 identity.
+
+Capability-drop OS and invariant failures share one canonical status 9 with
+zero flags and map to `isolation_preflight_failed` at
+`child_capability_drop`; none is expected unavailability. Success requires the
+new exact `0x7F` mask, so the prior `0x3F` frame is stale. A failure ends in a
+canonical report, fd close, and `_exit`; it cannot continue to a workload.
+This terminal diagnostic still does not prove a production tracer/workload
+split. In particular, `no_new_privs` does not prohibit a new nested user
+namespace, and the later seccomp policy must block `clone`, `clone3`,
+`unshare`, and `setns` escape forms before execution.
+
 Stock hosted Ubuntu currently refuses at UTS configuration before reaching
-the root, layout, or FD code, so no positive live evidence exists that those
-slices compose. The diagnostic makes no claim against malicious same-UID peers
-or host root. Its fresh procfs still exposes the diagnostic PID 1's `exe`,
-`maps`, and `map_files` surfaces, and inherited executable mappings remain.
-It has no descriptor-selected workspace/runtime attachment, populated `/dev`
-endpoints, profile-owned stdio, capability drop, Landlock, seccomp, command,
-Python, execution authority, or reuse authority.
+the root, layout, FD, or capability code, so no positive live evidence exists
+that those slices compose. The diagnostic makes no claim against malicious
+same-UID peers or host root. Its fresh procfs still exposes the diagnostic PID
+1's `exe`, `maps`, and `map_files` surfaces, inherited executable mappings and
+potentially authoritative supplementary groups remain, and nested user
+namespaces are not yet denied. It has no descriptor-selected workspace/runtime
+attachment, populated `/dev` endpoints, profile-owned stdio, Landlock,
+seccomp, command, Python, execution authority, or reuse authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,

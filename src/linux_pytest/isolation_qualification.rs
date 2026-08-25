@@ -9,14 +9,19 @@
 //! child's PID namespace. It then authenticates the fixed report pipe at file
 //! descriptor 0, closes every descriptor at or above 1 with one
 //! `CLOSE_RANGE_UNSHARE` call, and uses the fresh procfs to audit the exact
-//! transient descriptor inventory before closing the audit descriptor. The
-//! child already owns a private descriptor table, so this does not exercise
-//! the kernel's shared-table unshare path. Executable mappings also remain
-//! outside this slice. It does not prove workload stdio, descriptor-selected
-//! workspace/runtime mounts, populated `/dev` endpoints, or executable
-//! workload isolation. A completed marker is returned only after that direct
-//! child has exited and been reaped. A cleanup-uncertain failure remains
-//! possible.
+//! transient descriptor inventory before closing the audit descriptor. It
+//! then locks the classic root and UID capability semantics, drops the entire
+//! bounding capability set, clears the ambient, effective, permitted, and
+//! inheritable sets, sets `no_new_privs`, and independently reads every state
+//! back before reporting. The child already owns a private descriptor table,
+//! so this does not exercise the kernel's shared-table unshare path. A future
+//! seccomp slice must still prohibit nested-user-namespace creation; this
+//! terminal diagnostic does not claim that `no_new_privs` does so. Executable
+//! mappings also remain outside this slice. It does not prove workload stdio,
+//! descriptor-selected workspace/runtime mounts, populated `/dev` endpoints,
+//! or executable workload isolation. A completed marker is returned only
+//! after that direct child has exited and been reaped. A cleanup-uncertain
+//! failure remains possible.
 //! The result is not an execution, snapshot, isolation-session, or reuse
 //! authority.
 
@@ -68,6 +73,7 @@ enum IsolationQualificationStageV1 {
     ChildUtsConfiguration,
     ChildMountRoot,
     ChildDescriptorScrub,
+    ChildCapabilityDrop,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -106,6 +112,7 @@ impl IsolationQualificationStageV1 {
             Self::ChildUtsConfiguration => "child_uts_configuration",
             Self::ChildMountRoot => "child_mount_root",
             Self::ChildDescriptorScrub => "child_descriptor_scrub",
+            Self::ChildCapabilityDrop => "child_capability_drop",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -509,7 +516,8 @@ mod platform {
     const PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1: u8 = 6;
     const PROOF_STATUS_CLOSE_RANGE_OS_V1: u8 = 7;
     const PROOF_STATUS_FD_SCRUB_V1: u8 = 8;
-    const PROOF_FLAGS_V1: u8 = 0b0011_1111;
+    const PROOF_STATUS_CAPABILITY_DROP_V1: u8 = 9;
+    const PROOF_FLAGS_V1: u8 = 0b0111_1111;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -605,6 +613,22 @@ mod platform {
     const FD_AUDIT_ONE_BIT_V1: u8 = 1 << 3;
     const FD_AUDIT_COMPLETE_MASK_V1: u8 =
         FD_AUDIT_DOT_BIT_V1 | FD_AUDIT_DOT_DOT_BIT_V1 | FD_AUDIT_ZERO_BIT_V1 | FD_AUDIT_ONE_BIT_V1;
+    const LINUX_CAPABILITY_VERSION_3_V1: u32 = 0x2008_0522;
+    const CAPABILITY_SCAN_MAX_V1: u32 = 64;
+    const CAPABILITY_SCAN_LENGTH_V1: usize = CAPABILITY_SCAN_MAX_V1 as usize + 1;
+    const CAPABILITY_MINIMUM_LAST_V1: u32 = 40;
+    const CAP_SETPCAP_V1: u32 = 8;
+    const CAPABILITY_SCAN_UNOBSERVED_V1: i8 = -2;
+    const CAPABILITY_SCAN_INVALID_V1: i8 = -1;
+    const CAPABILITY_SCAN_CLEAR_V1: i8 = 0;
+    const CAPABILITY_SCAN_SET_V1: i8 = 1;
+    const CAPABILITY_SECUREBITS_V1: libc::c_int = libc::SECBIT_NOROOT
+        | libc::SECBIT_NOROOT_LOCKED
+        | libc::SECBIT_NO_SETUID_FIXUP
+        | libc::SECBIT_NO_SETUID_FIXUP_LOCKED
+        | libc::SECBIT_KEEP_CAPS_LOCKED
+        | libc::SECBIT_NO_CAP_AMBIENT_RAISE
+        | libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
     const MAX_LINUX_ERRNO_V1: i32 = 4_095;
 
     #[repr(C)]
@@ -630,6 +654,21 @@ mod platform {
         resolve: u64,
     }
 
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LinuxCapabilityHeaderV1 {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct LinuxCapabilityDataV1 {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
     #[derive(PartialEq)]
     struct ChildPathIdentityV1 {
         mount_id: u64,
@@ -648,6 +687,12 @@ mod platform {
 
     enum ChildDescriptorFailureV1 {
         CloseRange(i32),
+        Os(i32),
+        Invariant,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ChildCapabilityFailureV1 {
         Os(i32),
         Invariant,
     }
@@ -2769,7 +2814,10 @@ mod platform {
                 Some(errno),
             ));
         }
-        if status == PROOF_STATUS_FD_SCRUB_V1 {
+        if matches!(
+            status,
+            PROOF_STATUS_FD_SCRUB_V1 | PROOF_STATUS_CAPABILITY_DROP_V1
+        ) {
             if frame[FRAME_FLAGS_OFFSET_V1] != 0
                 || !(0..=MAX_LINUX_ERRNO_V1).contains(&errno)
                 || !identity_is_exact
@@ -2780,9 +2828,14 @@ mod platform {
                     None,
                 ));
             }
+            let failure_stage = if status == PROOF_STATUS_FD_SCRUB_V1 {
+                IsolationQualificationStageV1::ChildDescriptorScrub
+            } else {
+                IsolationQualificationStageV1::ChildCapabilityDrop
+            };
             return Err(failure(
                 RefusalCode::IsolationPreflightFailed,
-                IsolationQualificationStageV1::ChildDescriptorScrub,
+                failure_stage,
                 if errno == 0 {
                     IsolationQualificationReasonV1::ChildInvariantFailed
                 } else {
@@ -3431,6 +3484,9 @@ mod platform {
         }
         if let Err(error) = child_scrub_and_audit_descriptors_v1(&report_identity) {
             child_descriptor_fail_v1(report_write, &nonce, error, deadline);
+        }
+        if let Err(error) = child_eliminate_capabilities_v1(&report_identity) {
+            child_capability_fail_v1(report_write, &nonce, error, deadline);
         }
 
         let proof = child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
@@ -4466,6 +4522,353 @@ mod platform {
         true
     }
 
+    fn child_eliminate_capabilities_v1(
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        let initial_bounding = child_read_bounding_capabilities_v1()?;
+        let Some(last_capability) = child_last_capability_v1(&initial_bounding) else {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        };
+        let initial_sets = child_read_capability_sets_v1()?;
+        if !child_capability_sets_are_admissible_v1(&initial_sets, last_capability) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+
+        child_set_and_verify_securebits_v1()?;
+        child_drop_bounding_capabilities_v1(last_capability)?;
+        child_clear_ambient_capabilities_v1()?;
+        let cleared_ambient = child_read_ambient_capabilities_v1()?;
+        if !child_empty_capability_scan_matches_v1(&cleared_ambient, last_capability) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        child_clear_capability_sets_v1()?;
+        child_set_no_new_privileges_v1()?;
+
+        let final_sets = child_read_capability_sets_v1()?;
+        if !child_capability_sets_are_empty_v1(&final_sets) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        let final_bounding = child_read_bounding_capabilities_v1()?;
+        if !child_empty_capability_scan_matches_v1(&final_bounding, last_capability) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        let final_ambient = child_read_ambient_capabilities_v1()?;
+        if !child_empty_capability_scan_matches_v1(&final_ambient, last_capability) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        child_verify_securebits_v1()?;
+        child_verify_no_new_privileges_v1()?;
+        child_reauthenticate_capability_report_v1(report_identity)
+    }
+
+    fn child_read_bounding_capabilities_v1()
+    -> Result<[i8; CAPABILITY_SCAN_LENGTH_V1], ChildCapabilityFailureV1> {
+        let mut scan = [CAPABILITY_SCAN_UNOBSERVED_V1; CAPABILITY_SCAN_LENGTH_V1];
+        let mut capability = 0_u32;
+        while capability <= CAPABILITY_SCAN_MAX_V1 {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    libc::PR_CAPBSET_READ,
+                    u64::from(capability),
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                )
+            };
+            scan[capability as usize] = child_capability_scan_observation_v1(result)?;
+            capability += 1;
+        }
+        Ok(scan)
+    }
+
+    fn child_read_ambient_capabilities_v1()
+    -> Result<[i8; CAPABILITY_SCAN_LENGTH_V1], ChildCapabilityFailureV1> {
+        let mut scan = [CAPABILITY_SCAN_UNOBSERVED_V1; CAPABILITY_SCAN_LENGTH_V1];
+        let mut capability = 0_u32;
+        while capability <= CAPABILITY_SCAN_MAX_V1 {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    libc::PR_CAP_AMBIENT,
+                    libc::PR_CAP_AMBIENT_IS_SET,
+                    u64::from(capability),
+                    0_u64,
+                    0_u64,
+                )
+            };
+            scan[capability as usize] = child_capability_scan_observation_v1(result)?;
+            capability += 1;
+        }
+        Ok(scan)
+    }
+
+    fn child_capability_scan_observation_v1(
+        result: libc::c_long,
+    ) -> Result<i8, ChildCapabilityFailureV1> {
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_capability_scan_observation_with_errno_v1(result, errno)
+    }
+
+    fn child_capability_scan_observation_with_errno_v1(
+        result: libc::c_long,
+        errno: i32,
+    ) -> Result<i8, ChildCapabilityFailureV1> {
+        match (result, errno) {
+            (0, _) => Ok(CAPABILITY_SCAN_CLEAR_V1),
+            (1, _) => Ok(CAPABILITY_SCAN_SET_V1),
+            (-1, libc::EINVAL) => Ok(CAPABILITY_SCAN_INVALID_V1),
+            (-1, errno) => Err(child_capability_failure_from_errno_v1(errno)),
+            _ => Err(ChildCapabilityFailureV1::Invariant),
+        }
+    }
+
+    fn child_last_capability_v1(scan: &[i8; CAPABILITY_SCAN_LENGTH_V1]) -> Option<u32> {
+        let mut first_invalid = None;
+        for (index, observation) in scan.iter().copied().enumerate() {
+            match observation {
+                CAPABILITY_SCAN_CLEAR_V1 | CAPABILITY_SCAN_SET_V1 if first_invalid.is_none() => {}
+                CAPABILITY_SCAN_INVALID_V1 => {
+                    if first_invalid.is_none() {
+                        first_invalid = Some(index);
+                    }
+                }
+                _ => return None,
+            }
+        }
+        let first_invalid = u32::try_from(first_invalid?).ok()?;
+        let last = first_invalid.checked_sub(1)?;
+        (CAPABILITY_MINIMUM_LAST_V1..CAPABILITY_SCAN_MAX_V1)
+            .contains(&last)
+            .then_some(last)
+    }
+
+    fn child_empty_capability_scan_matches_v1(
+        scan: &[i8; CAPABILITY_SCAN_LENGTH_V1],
+        expected_last: u32,
+    ) -> bool {
+        child_last_capability_v1(scan) == Some(expected_last)
+            && scan.iter().copied().enumerate().all(|(index, value)| {
+                if index <= expected_last as usize {
+                    value == CAPABILITY_SCAN_CLEAR_V1
+                } else {
+                    value == CAPABILITY_SCAN_INVALID_V1
+                }
+            })
+    }
+
+    fn child_read_capability_sets_v1()
+    -> Result<[LinuxCapabilityDataV1; 2], ChildCapabilityFailureV1> {
+        let mut header = LinuxCapabilityHeaderV1 {
+            version: LINUX_CAPABILITY_VERSION_3_V1,
+            pid: 0,
+        };
+        let mut data = [LinuxCapabilityDataV1::default(); 2];
+        let result = unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) };
+        child_require_exact_zero_capability_result_v1(result)?;
+        if !child_capability_header_is_exact_v1(&header) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        Ok(data)
+    }
+
+    fn child_capability_header_is_exact_v1(header: &LinuxCapabilityHeaderV1) -> bool {
+        header.version == LINUX_CAPABILITY_VERSION_3_V1 && header.pid == 0
+    }
+
+    fn child_capability_sets_are_admissible_v1(
+        data: &[LinuxCapabilityDataV1; 2],
+        last_capability: u32,
+    ) -> bool {
+        let Some(masks) = child_capability_word_masks_v1(last_capability) else {
+            return false;
+        };
+        for (word, allowed) in data.iter().zip(masks) {
+            if (word.effective | word.permitted | word.inheritable) & !allowed != 0 {
+                return false;
+            }
+        }
+        let setpcap_mask = 1_u32 << CAP_SETPCAP_V1;
+        data[0].effective & setpcap_mask != 0 && data[0].permitted & setpcap_mask != 0
+    }
+
+    fn child_capability_word_masks_v1(last_capability: u32) -> Option<[u32; 2]> {
+        if last_capability > 63 {
+            return None;
+        }
+        let word_mask = |first: u32| {
+            if last_capability < first {
+                0
+            } else if last_capability - first >= 31 {
+                u32::MAX
+            } else {
+                let bit_count = last_capability - first + 1;
+                (1_u32 << bit_count) - 1
+            }
+        };
+        Some([word_mask(0), word_mask(32)])
+    }
+
+    fn child_capability_sets_are_empty_v1(data: &[LinuxCapabilityDataV1; 2]) -> bool {
+        data.iter()
+            .all(|word| word.effective == 0 && word.permitted == 0 && word.inheritable == 0)
+    }
+
+    fn child_set_and_verify_securebits_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_SET_SECUREBITS,
+                CAPABILITY_SECUREBITS_V1,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        child_require_exact_zero_capability_result_v1(result)?;
+        child_verify_securebits_v1()
+    }
+
+    fn child_verify_securebits_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_GET_SECUREBITS,
+                0_u64,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        child_require_exact_capability_value_v1(
+            result,
+            libc::c_long::from(CAPABILITY_SECUREBITS_V1),
+        )
+    }
+
+    fn child_drop_bounding_capabilities_v1(
+        last_capability: u32,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        let mut capability = 0_u32;
+        while capability <= last_capability {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_prctl,
+                    libc::PR_CAPBSET_DROP,
+                    u64::from(capability),
+                    0_u64,
+                    0_u64,
+                    0_u64,
+                )
+            };
+            child_require_exact_zero_capability_result_v1(result)?;
+            capability += 1;
+        }
+        Ok(())
+    }
+
+    fn child_clear_ambient_capabilities_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_CAP_AMBIENT,
+                libc::PR_CAP_AMBIENT_CLEAR_ALL,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        child_require_exact_zero_capability_result_v1(result)
+    }
+
+    fn child_clear_capability_sets_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let mut header = LinuxCapabilityHeaderV1 {
+            version: LINUX_CAPABILITY_VERSION_3_V1,
+            pid: 0,
+        };
+        let data = [LinuxCapabilityDataV1::default(); 2];
+        let result = unsafe { libc::syscall(libc::SYS_capset, &mut header, data.as_ptr()) };
+        child_require_exact_zero_capability_result_v1(result)?;
+        if !child_capability_header_is_exact_v1(&header) {
+            return Err(ChildCapabilityFailureV1::Invariant);
+        }
+        Ok(())
+    }
+
+    fn child_set_no_new_privileges_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_SET_NO_NEW_PRIVS,
+                1_u64,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        child_require_exact_zero_capability_result_v1(result)
+    }
+
+    fn child_verify_no_new_privileges_v1() -> Result<(), ChildCapabilityFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                libc::PR_GET_NO_NEW_PRIVS,
+                0_u64,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        child_require_exact_capability_value_v1(result, 1)
+    }
+
+    fn child_reauthenticate_capability_report_v1(
+        expected: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        match child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1) {
+            Ok(observed) if observed == *expected => Ok(()),
+            Ok(_) | Err(ChildDescriptorFailureV1::Invariant) => {
+                Err(ChildCapabilityFailureV1::Invariant)
+            }
+            Err(ChildDescriptorFailureV1::CloseRange(errno))
+            | Err(ChildDescriptorFailureV1::Os(errno)) => {
+                Err(child_capability_failure_from_errno_v1(errno))
+            }
+        }
+    }
+
+    fn child_require_exact_zero_capability_result_v1(
+        result: libc::c_long,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        child_require_exact_capability_value_v1(result, 0)
+    }
+
+    fn child_require_exact_capability_value_v1(
+        result: libc::c_long,
+        expected: libc::c_long,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        if result == expected {
+            return Ok(());
+        }
+        if result == -1 {
+            return Err(child_capability_os_failure_v1());
+        }
+        Err(ChildCapabilityFailureV1::Invariant)
+    }
+
+    fn child_capability_os_failure_v1() -> ChildCapabilityFailureV1 {
+        child_capability_failure_from_errno_v1(child_errno())
+    }
+
+    fn child_capability_failure_from_errno_v1(errno: i32) -> ChildCapabilityFailureV1 {
+        if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+            ChildCapabilityFailureV1::Os(errno)
+        } else {
+            ChildCapabilityFailureV1::Invariant
+        }
+    }
+
     fn child_descriptor_os_failure_v1() -> ChildDescriptorFailureV1 {
         child_descriptor_failure_from_errno_v1(child_errno())
     }
@@ -4490,6 +4893,25 @@ mod platform {
             ChildDescriptorFailureV1::Invariant => (PROOF_STATUS_FD_SCRUB_V1, 0),
         };
         child_fail(report_write, nonce, status, errno, deadline)
+    }
+
+    fn child_capability_fail_v1(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        failure: ChildCapabilityFailureV1,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let errno = match failure {
+            ChildCapabilityFailureV1::Os(errno) => errno,
+            ChildCapabilityFailureV1::Invariant => 0,
+        };
+        child_fail(
+            report_write,
+            nonce,
+            PROOF_STATUS_CAPABILITY_DROP_V1,
+            errno,
+            deadline,
+        )
     }
 
     fn child_fail(
@@ -4861,6 +5283,27 @@ mod platform {
             chunk
         }
 
+        fn capability_scan_fixture(
+            last_capability: u32,
+            supported_value: i8,
+        ) -> [i8; CAPABILITY_SCAN_LENGTH_V1] {
+            let mut scan = [CAPABILITY_SCAN_INVALID_V1; CAPABILITY_SCAN_LENGTH_V1];
+            scan[..=last_capability as usize].fill(supported_value);
+            scan
+        }
+
+        fn admissible_capability_sets() -> [LinuxCapabilityDataV1; 2] {
+            let setpcap = 1_u32 << CAP_SETPCAP_V1;
+            [
+                LinuxCapabilityDataV1 {
+                    effective: setpcap,
+                    permitted: setpcap,
+                    inheritable: 0,
+                },
+                LinuxCapabilityDataV1::default(),
+            ]
+        }
+
         fn disposable_proc_fd_path_v1(pid: libc::pid_t) -> Option<[u8; 32]> {
             let pid = encode_pid_name(pid)?;
             let prefix = b"proc/";
@@ -5152,7 +5595,252 @@ mod platform {
             assert_eq!(FD_AUDIT_BUFFER_BYTES_V1, 256);
             assert_eq!(FD_AUDIT_MAX_GETDENTS_CALLS_V1, 8);
             assert_eq!(FD_AUDIT_COMPLETE_MASK_V1, 0b1111);
-            assert_eq!(PROOF_FLAGS_V1, 0x3f);
+            assert_eq!(PROOF_FLAGS_V1, 0x7f);
+        }
+
+        #[test]
+        fn capability_word_masks_saturate_without_overshifting() {
+            assert_eq!(child_capability_word_masks_v1(31), Some([u32::MAX, 0]));
+            assert_eq!(child_capability_word_masks_v1(32), Some([u32::MAX, 1]));
+            assert_eq!(child_capability_word_masks_v1(40), Some([u32::MAX, 0x1ff]));
+            assert_eq!(
+                child_capability_word_masks_v1(63),
+                Some([u32::MAX, u32::MAX])
+            );
+            assert_eq!(child_capability_word_masks_v1(64), None);
+        }
+
+        #[test]
+        fn capability_range_scan_requires_one_bounded_contiguous_prefix() {
+            for last_capability in CAPABILITY_MINIMUM_LAST_V1..CAPABILITY_SCAN_MAX_V1 {
+                let mut scan = capability_scan_fixture(last_capability, CAPABILITY_SCAN_CLEAR_V1);
+                scan[last_capability as usize] = CAPABILITY_SCAN_SET_V1;
+                assert_eq!(
+                    child_last_capability_v1(&scan),
+                    Some(last_capability),
+                    "last capability {last_capability}",
+                );
+            }
+
+            let too_old =
+                capability_scan_fixture(CAPABILITY_MINIMUM_LAST_V1 - 1, CAPABILITY_SCAN_CLEAR_V1);
+            assert_eq!(child_last_capability_v1(&too_old), None);
+
+            let mut hole =
+                capability_scan_fixture(CAPABILITY_MINIMUM_LAST_V1, CAPABILITY_SCAN_CLEAR_V1);
+            hole[20] = CAPABILITY_SCAN_INVALID_V1;
+            assert_eq!(child_last_capability_v1(&hole), None);
+
+            let mut valid_after_invalid = [CAPABILITY_SCAN_INVALID_V1; CAPABILITY_SCAN_LENGTH_V1];
+            valid_after_invalid[0] = CAPABILITY_SCAN_CLEAR_V1;
+            valid_after_invalid[1] = CAPABILITY_SCAN_INVALID_V1;
+            valid_after_invalid[2] = CAPABILITY_SCAN_SET_V1;
+            assert_eq!(child_last_capability_v1(&valid_after_invalid), None);
+
+            let valid_through_64 = [CAPABILITY_SCAN_CLEAR_V1; CAPABILITY_SCAN_LENGTH_V1];
+            assert_eq!(child_last_capability_v1(&valid_through_64), None);
+
+            for malformed in [CAPABILITY_SCAN_UNOBSERVED_V1, 2, i8::MAX] {
+                let mut scan =
+                    capability_scan_fixture(CAPABILITY_MINIMUM_LAST_V1, CAPABILITY_SCAN_CLEAR_V1);
+                scan[10] = malformed;
+                assert_eq!(child_last_capability_v1(&scan), None);
+            }
+        }
+
+        #[test]
+        fn capability_scan_syscall_results_and_errno_are_canonical() {
+            assert_eq!(
+                child_capability_scan_observation_with_errno_v1(0, MAX_LINUX_ERRNO_V1 + 1),
+                Ok(CAPABILITY_SCAN_CLEAR_V1),
+            );
+            assert_eq!(
+                child_capability_scan_observation_with_errno_v1(1, MAX_LINUX_ERRNO_V1 + 1),
+                Ok(CAPABILITY_SCAN_SET_V1),
+            );
+            for errno in 1..=MAX_LINUX_ERRNO_V1 {
+                let observed = child_capability_scan_observation_with_errno_v1(-1, errno);
+                if errno == libc::EINVAL {
+                    assert_eq!(observed, Ok(CAPABILITY_SCAN_INVALID_V1));
+                } else {
+                    assert_eq!(observed, Err(ChildCapabilityFailureV1::Os(errno)));
+                }
+            }
+            for errno in [-1, 0, MAX_LINUX_ERRNO_V1 + 1] {
+                assert_eq!(
+                    child_capability_scan_observation_with_errno_v1(-1, errno),
+                    Err(ChildCapabilityFailureV1::Invariant),
+                );
+            }
+            for result in [-2, 2, libc::c_long::MAX] {
+                assert_eq!(
+                    child_capability_scan_observation_with_errno_v1(result, libc::EINVAL),
+                    Err(ChildCapabilityFailureV1::Invariant),
+                );
+            }
+        }
+
+        #[test]
+        fn empty_capability_scan_requires_zero_supported_bits_and_same_boundary() {
+            for last_capability in [CAPABILITY_MINIMUM_LAST_V1, 63] {
+                let scan = capability_scan_fixture(last_capability, CAPABILITY_SCAN_CLEAR_V1);
+                assert!(child_empty_capability_scan_matches_v1(
+                    &scan,
+                    last_capability
+                ));
+
+                let mut set = scan;
+                set[last_capability as usize] = CAPABILITY_SCAN_SET_V1;
+                assert!(!child_empty_capability_scan_matches_v1(
+                    &set,
+                    last_capability
+                ));
+
+                let mut hole = scan;
+                hole[0] = CAPABILITY_SCAN_INVALID_V1;
+                assert!(!child_empty_capability_scan_matches_v1(
+                    &hole,
+                    last_capability
+                ));
+
+                let mut changed_boundary = scan;
+                changed_boundary[last_capability as usize + 1] = CAPABILITY_SCAN_CLEAR_V1;
+                assert!(!child_empty_capability_scan_matches_v1(
+                    &changed_boundary,
+                    last_capability
+                ));
+            }
+        }
+
+        #[test]
+        fn capability_v3_headers_and_initial_sets_are_exact() {
+            assert_eq!(std::mem::size_of::<LinuxCapabilityHeaderV1>(), 8);
+            assert_eq!(std::mem::size_of::<LinuxCapabilityDataV1>(), 12);
+            assert_eq!(std::mem::size_of::<[LinuxCapabilityDataV1; 2]>(), 24);
+            let exact_header = LinuxCapabilityHeaderV1 {
+                version: LINUX_CAPABILITY_VERSION_3_V1,
+                pid: 0,
+            };
+            assert!(child_capability_header_is_exact_v1(&exact_header));
+            assert!(!child_capability_header_is_exact_v1(
+                &LinuxCapabilityHeaderV1 {
+                    version: LINUX_CAPABILITY_VERSION_3_V1 ^ 1,
+                    ..exact_header
+                }
+            ));
+            assert!(!child_capability_header_is_exact_v1(
+                &LinuxCapabilityHeaderV1 {
+                    pid: 1,
+                    ..exact_header
+                }
+            ));
+
+            let exact = admissible_capability_sets();
+            assert!(child_capability_sets_are_admissible_v1(
+                &exact,
+                CAPABILITY_MINIMUM_LAST_V1
+            ));
+            assert!(child_capability_sets_are_admissible_v1(&exact, 63));
+
+            let mut missing_effective = exact;
+            missing_effective[0].effective = 0;
+            assert!(!child_capability_sets_are_admissible_v1(
+                &missing_effective,
+                CAPABILITY_MINIMUM_LAST_V1
+            ));
+            let mut missing_permitted = exact;
+            missing_permitted[0].permitted = 0;
+            assert!(!child_capability_sets_are_admissible_v1(
+                &missing_permitted,
+                CAPABILITY_MINIMUM_LAST_V1
+            ));
+
+            for field in 0..3 {
+                let mut above_last = exact;
+                let forbidden = 1_u32 << (CAPABILITY_MINIMUM_LAST_V1 + 1 - 32);
+                match field {
+                    0 => above_last[1].effective |= forbidden,
+                    1 => above_last[1].permitted |= forbidden,
+                    2 => above_last[1].inheritable |= forbidden,
+                    _ => unreachable!(),
+                }
+                assert!(!child_capability_sets_are_admissible_v1(
+                    &above_last,
+                    CAPABILITY_MINIMUM_LAST_V1,
+                ));
+            }
+            assert!(!child_capability_sets_are_admissible_v1(&exact, 64));
+        }
+
+        #[test]
+        fn final_capability_sets_require_all_six_words_zero() {
+            let empty = [LinuxCapabilityDataV1::default(); 2];
+            assert!(child_capability_sets_are_empty_v1(&empty));
+            for field in 0..6 {
+                let mut nonempty = empty;
+                match field {
+                    0 => nonempty[0].effective = 1,
+                    1 => nonempty[0].permitted = 1,
+                    2 => nonempty[0].inheritable = 1,
+                    3 => nonempty[1].effective = 1,
+                    4 => nonempty[1].permitted = 1,
+                    5 => nonempty[1].inheritable = 1,
+                    _ => unreachable!(),
+                }
+                assert!(!child_capability_sets_are_empty_v1(&nonempty));
+            }
+        }
+
+        #[test]
+        fn securebits_and_no_new_privileges_values_are_frozen() {
+            assert_eq!(CAPABILITY_SECUREBITS_V1, 0xef);
+            for bit in [
+                libc::SECBIT_NOROOT,
+                libc::SECBIT_NOROOT_LOCKED,
+                libc::SECBIT_NO_SETUID_FIXUP,
+                libc::SECBIT_NO_SETUID_FIXUP_LOCKED,
+                libc::SECBIT_KEEP_CAPS_LOCKED,
+                libc::SECBIT_NO_CAP_AMBIENT_RAISE,
+                libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED,
+            ] {
+                assert_ne!(CAPABILITY_SECUREBITS_V1 & bit, 0);
+                assert_eq!(
+                    child_require_exact_capability_value_v1(
+                        libc::c_long::from(CAPABILITY_SECUREBITS_V1 & !bit),
+                        libc::c_long::from(CAPABILITY_SECUREBITS_V1),
+                    ),
+                    Err(ChildCapabilityFailureV1::Invariant),
+                );
+            }
+            assert_eq!(CAPABILITY_SECUREBITS_V1 & libc::SECBIT_KEEP_CAPS, 0);
+            assert_eq!(
+                child_require_exact_capability_value_v1(
+                    libc::c_long::from(CAPABILITY_SECUREBITS_V1),
+                    libc::c_long::from(CAPABILITY_SECUREBITS_V1),
+                ),
+                Ok(()),
+            );
+            for wrong in [
+                0,
+                libc::c_long::from(CAPABILITY_SECUREBITS_V1 ^ libc::SECBIT_NOROOT),
+                libc::c_long::from(CAPABILITY_SECUREBITS_V1 | libc::SECBIT_KEEP_CAPS),
+                libc::c_long::from(CAPABILITY_SECUREBITS_V1 | libc::SECBIT_EXEC_RESTRICT_FILE),
+            ] {
+                assert_eq!(
+                    child_require_exact_capability_value_v1(
+                        wrong,
+                        libc::c_long::from(CAPABILITY_SECUREBITS_V1),
+                    ),
+                    Err(ChildCapabilityFailureV1::Invariant),
+                );
+            }
+            assert_eq!(child_require_exact_capability_value_v1(1, 1), Ok(()));
+            for wrong in [0, 2, libc::c_long::MAX] {
+                assert_eq!(
+                    child_require_exact_capability_value_v1(wrong, 1),
+                    Err(ChildCapabilityFailureV1::Invariant),
+                );
+            }
         }
 
         #[test]
@@ -5484,7 +6172,7 @@ mod platform {
             let frame =
                 child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
             assert!(verify_proof_frame(&frame, &nonce).is_ok());
-            for stale_flags in [0x0f, 0x1f] {
+            for stale_flags in [0x0f, 0x1f, 0x3f, 0xff] {
                 let stale =
                     child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, stale_flags, 0);
                 assert!(verify_proof_frame(&stale, &nonce).is_err());
@@ -5760,6 +6448,97 @@ mod platform {
                     assert!(!error.is_expected_unavailable());
                 }
             }
+        }
+
+        #[test]
+        fn capability_drop_failure_proofs_are_exact_and_never_expected() {
+            let nonce = [0xa7_u8; NONCE_BYTES_V1];
+            for (errno, reason) in [
+                (0, IsolationQualificationReasonV1::ChildInvariantFailed),
+                (libc::EPERM, IsolationQualificationReasonV1::Io),
+                (libc::ENOSYS, IsolationQualificationReasonV1::Io),
+                (MAX_LINUX_ERRNO_V1, IsolationQualificationReasonV1::Io),
+            ] {
+                let frame =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_CAPABILITY_DROP_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("capability-drop failure proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::IsolationPreflightFailed,
+                        IsolationQualificationStageV1::ChildCapabilityDrop,
+                        reason,
+                        (errno != 0).then_some(errno),
+                    )
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for errno in [-1, MAX_LINUX_ERRNO_V1 + 1] {
+                let malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_CAPABILITY_DROP_V1, 0, errno);
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("noncanonical capability errno was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for flags in [1, PROOF_FLAGS_V1, u8::MAX] {
+                let malformed = child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_CAPABILITY_DROP_V1,
+                    flags,
+                    libc::EIO,
+                );
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("nonzero capability failure flags were accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
+
+            for offset in [
+                FRAME_PID_OFFSET_V1,
+                FRAME_UID_OFFSET_V1,
+                FRAME_EUID_OFFSET_V1,
+                FRAME_GID_OFFSET_V1,
+                FRAME_EGID_OFFSET_V1,
+            ] {
+                let mut malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_CAPABILITY_DROP_V1, 0, libc::EIO);
+                malformed[offset] ^= 1;
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("capability failure accepted a wrong identity");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
+
+            for offset in FRAME_RESERVED_OFFSET_V1..FRAME_BYTES_V1 {
+                let mut malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_CAPABILITY_DROP_V1, 0, libc::EIO);
+                malformed[offset] = 1;
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("capability failure accepted reserved data");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
+
+            let cleanup = IsolationQualificationFailureV1::cleanup_uncertain(Some(libc::EIO));
+            assert_eq!(cleanup.stage, IsolationQualificationStageV1::Cleanup);
+            assert_eq!(
+                cleanup.reason,
+                IsolationQualificationReasonV1::CleanupUncertain
+            );
+            assert!(!cleanup.is_expected_unavailable());
         }
 
         #[test]

@@ -162,6 +162,28 @@ race that published its process-group readiness marker before required stdout.
 The final checkpoint contains only the corresponding test-oracle correction
 and causal write-before-ready reorder in addition to the source slice.
 
+The next fixed terminal slice removes namespace capabilities after the exact
+descriptor audit, still without accepting a command. It scans ids 0 through
+64 and admits only one contiguous capability prefix ending at 40 through 63,
+with id 64 invalid. Exact v3 `capget` state must include effective and
+permitted `CAP_SETPCAP` and contain no bit above the observed range. The child
+sets and reads securebits `0xEF`, drops every supported bounding capability in
+ascending order, clears and scans the ambient set, zeros all six v3
+effective/permitted/inheritable words, and sets `no_new_privs`. It then
+independently rereads the six zero words, empty bounding and ambient sets with
+the same boundary, exact securebits, `no_new_privs == 1`, and the authenticated
+fd 0 identity. Only then can success mask `0x7F` be sent; the prior `0x3F`
+frame is stale. Canonical status 9 failures are always
+`isolation_preflight_failed` and never expected unavailability.
+
+This is source and adversarial-contract evidence until a qualifying runner
+executes the complete product child. Stock hosted Ubuntu still stops at its
+earlier exact UTS-policy refusal. The terminal slice grants no command,
+Python, isolation-session, execution, or reuse authority. Supplementary
+groups and inherited executable mappings remain, and `no_new_privs` does not
+block nested user namespaces; later attachment, Landlock, seccomp, tracer, and
+pre-exec audits remain mandatory.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the
@@ -445,9 +467,10 @@ authoritative until the later private-root, mount, FD, network/IPC, and syscall
 audits prove that they grant no additional object access. Namespace-bootstrap
 evidence alone therefore cannot authorize a workload.
 
-The workload later locks `SECBIT_NOROOT` and `SECBIT_NO_SETUID_FIXUP`, drops
-every bounding, effective, permitted, inheritable, and ambient capability,
-sets `no_new_privs`, and verifies the result before Python.
+The fixed terminal diagnostic now locks `SECBIT_NOROOT` and
+`SECBIT_NO_SETUID_FIXUP`, drops every bounding, effective, permitted,
+inheritable, and ambient capability, sets `no_new_privs`, and verifies the
+result. This is not yet a workload or a before-Python composition proof.
 
 ### 7. Mount root and namespace state
 
