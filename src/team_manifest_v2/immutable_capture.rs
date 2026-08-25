@@ -3422,7 +3422,7 @@ mod tests {
             )
         };
         let body = format!(
-            "#!/bin/sh\n{trap}\nprintf x >> '{}'\nprintf '%s\\n' \"$$\" > '{}'\nprintf before-signal\n/bin/sleep 3600 &\nwait\n",
+            "#!/bin/sh\n{trap}\nprintf x >> '{}'\nprintf before-signal\nprintf '%s\\n' \"$$\" > '{}'\n/bin/sleep 3600 &\nwait\n",
             counter.display(),
             process_group_file.display(),
         );
