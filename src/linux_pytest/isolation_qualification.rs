@@ -5185,7 +5185,10 @@ mod platform {
             }
 
             let valid = fd_audit_dirent(b"0");
-            for header_length in 0..DIRENT64_MIN_RECORD_BYTES_V1 {
+            let mut empty_seen = FD_AUDIT_ONE_BIT_V1;
+            assert!(child_parse_fd_audit_dirents_v1(&[], &mut empty_seen));
+            assert_eq!(empty_seen, FD_AUDIT_ONE_BIT_V1);
+            for header_length in 1..DIRENT64_MIN_RECORD_BYTES_V1 {
                 assert!(!child_parse_fd_audit_dirents_v1(
                     &valid[..header_length],
                     &mut 0_u8,
