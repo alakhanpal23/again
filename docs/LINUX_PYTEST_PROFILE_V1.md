@@ -14,7 +14,10 @@ private-root, layout, scratch, procfs, descriptor-scrub, capability-drop,
 Landlock, and terminal seccomp slices described below. It remains non-
 qualifying and grants no execution authority; stock hosted Ubuntu refuses at
 UTS configuration before executing them, so they have no positive live runtime
-evidence. Descriptor-stable source enumeration, regular-file copying,
+evidence. A separate hidden, fixed, no-command ptrace transport diagnostic has
+positive live evidence for one four-event child transcript. It is not composed
+with that namespace child or any workload and does not qualify this profile.
+Descriptor-stable source enumeration, regular-file copying,
 connector-owned charged materialization, identity-checked atomic publication,
 and one shared resource contract exist as internal leaves. A no-atime
 source-view qualification path is also implemented as a crate-private leaf,
@@ -624,6 +627,47 @@ executable mappings and potentially authoritative supplementary groups remain.
 It has no descriptor-selected workspace/runtime attachment, populated `/dev`,
 profile-owned stdio, tracer, command, Python, execution authority, or reuse
 authority.
+
+A separate evidence-only diagnostic,
+`again __linux-pytest-ptrace-transport-probe-v1`, now exercises one fixed
+ptrace/seccomp transport without accepting a command or workload. It first
+requires a dedicated single-task helper with default `SIGCHLD`, no existing
+child, and a canonical `/proc/self/environ` record no larger than 1 MiB; any
+`LD_*`, `DYLD_*`, `MALLOC_*`, `GLIBC_TUNABLES`, `GCONV_PATH`, `LOCPATH`, or
+`NLSPATH` name refuses before child creation. It creates exactly one child with
+`clone3(CLONE_PIDFD)` and holds that child on a private release channel. The
+parent applies `PTRACE_SEIZE` with exact `PTRACE_O_EXITKILL`,
+`PTRACE_O_TRACESYSGOOD`, and fork, vfork, clone, exec, exit, and seccomp trace
+options before releasing it.
+
+The raw child sets and verifies `no_new_privs`, then installs one frozen
+122-instruction x86_64 cBPF filter whose test fingerprint is
+`0xe6896c987224e00d`. Wrong architecture and x32 are fatal. The filter traces
+only zero-argument raw `getpid` and `getppid` with cookies `0xA611` and
+`0xA612`, permits raw `exit(0)` or `exit(125)`, and returns a private errno
+marker for every other admitted architecture/syscall/argument shape. For each
+seccomp stop, the parent requires both the exact `PTRACE_GETEVENTMSG` cookie
+and an exact 84-byte `PTRACE_GET_SYSCALL_INFO` response containing x86_64, the
+expected syscall number, six zero arguments, and the same cookie. It then
+requires one zero-status ptrace exit event, one terminal exit-zero reap, a
+subsequent `ECHILD` proof, bounded signal draining, exact restoration of the
+prior signal mask, and completed RAII cleanup of the pidfd and control FDs.
+
+Safe construction of the incremental protocol recorder requires a
+qualification-module-private permit. It accepts exactly those four events—two
+seccomp stops, one ptrace exit event, and one terminal reap—from one positive
+raw TID and emits
+only a redacted summary with fingerprint `0xf4101836ef74bb4f`. [Actions run
+32806429152](https://github.com/alakhanpal23/again/actions/runs/32806429152)
+retained 32/32 identical successful samples at commit
+`4b98b2ad574209ed3e7048d79d6b177034cffe4c`; every exit status was zero,
+stderr was empty, cleanup completed, and every authority flag was false. This
+is positive evidence for the fixed single-child transport only. It proves no
+namespace/root/Landlock composition, task tree, workload or Python execution,
+EffectIR, tracing completeness, or execution/profile/reuse authority. Its
+diagnostic JSON is not a persisted profile object and changes no field in
+[`LINUX_PYTEST_WIRE_V1.md`](LINUX_PYTEST_WIRE_V1.md). The profile remains
+**not qualified**.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,

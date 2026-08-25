@@ -278,6 +278,75 @@ the adversarial protocol/filter tests, and the stock-Ubuntu negative lane only.
 It is not positive live `TSYNC`/Landlock composition, Python, tracing,
 execution, or reuse evidence.
 
+The independent fixed ptrace transport diagnostic is now implemented without
+changing the namespace child or accepting a command. It requires a dedicated
+single-task process, default `SIGCHLD`, no existing child, and a canonical
+loader environment bounded to 1 MiB; loader-injection names refuse before
+child creation. It creates one child with `clone3(CLONE_PIDFD)` and blocks that
+child on a private release channel. Before release, the parent applies
+`PTRACE_SEIZE` with exact `PTRACE_O_EXITKILL`, `PTRACE_O_TRACESYSGOOD`,
+`PTRACE_O_TRACEFORK`, `PTRACE_O_TRACEVFORK`, `PTRACE_O_TRACECLONE`,
+`PTRACE_O_TRACEEXEC`, `PTRACE_O_TRACEEXIT`, and
+`PTRACE_O_TRACESECCOMP` options.
+
+The raw child sets and rereads `no_new_privs`, installs one frozen
+122-instruction x86_64 cBPF filter with test fingerprint
+`0xe6896c987224e00d`, and issues only zero-argument raw `getpid` and `getppid`
+calls with seccomp cookies `0xA611` and `0xA612` before raw exit. The parent
+requires each matching `PTRACE_EVENT_SECCOMP`, exact `PTRACE_GETEVENTMSG`
+cookie, and exact 84-byte `PTRACE_GET_SYSCALL_INFO` response with the expected
+architecture, syscall number, six zero arguments, and cookie. It then requires
+one zero-status `PTRACE_EVENT_EXIT`, one terminal exit-zero reap, a subsequent
+`ECHILD` proof, bounded signal draining, exact prior-mask restoration, and
+complete cleanup. Safe construction of the incremental four-event recorder
+requires the qualification module's private permit. It binds one positive raw
+TID and accepts exactly two seccomp stops, one ptrace exit event, and one
+terminal reap before emitting the redacted protocol fingerprint
+`0xf4101836ef74bb4f`.
+
+[Actions run 32806429152](https://github.com/alakhanpal23/again/actions/runs/32806429152)
+passed this checkpoint at source commit
+`4b98b2ad574209ed3e7048d79d6b177034cffe4c`. The qualifier and pure protocol
+source SHA-256 values were
+`d1493f1f3be7db935fcc8c7844a487594741e09fcbb658e1fb9763c4e2be6914` and
+`6a411a7efc36c8c3a47189cca254867f099496aecd9b748e62181ccbaad510c3`.
+Ubuntu passed 656 library tests with 7 ignored and macOS passed 478 with 7
+ignored; both passed pinned formatting, strict all-target/all-feature Clippy,
+the full locked suites, and the explicit 100,000-case gate.
+
+Artifact `9548321539`, named
+`linux-capability-32806429152-1-4b98b2ad574209ed3e7048d79d6b177034cffe4c`,
+was created `2026-08-25T03:48:06Z`, expires
+`2026-09-24T03:48:06Z`, and contains exactly 101 files. Its GitHub archive
+digest is
+`sha256:94653f2ae85dc97823438c92e5853893944745d656d9ffa774b0ca1da4196153`;
+the canonical extracted-manifest SHA-256 is
+`bb042b03f074f963df673991bfa61596cf666c25d291c61f636ae3d149571a11`.
+The capability, namespace, ptrace aggregate, and validated JSONL SHA-256 values
+are respectively
+`256feee193edd2a269f505904f84190a18f392d264a6260fdf724d513f0d5586`,
+`7346fa492d952f85cb1b38e4c9a1497b60d09893f7bc3cefb6fe47bf9781ec34`,
+`9f4c51e0aa7bc887fb4d39e57af438feec83704087d6fd94ee6e44d539f8ec3f`,
+and `fd2597756be5a5be905cba2e8f8d60fb9c48044cc2fa74b79029adc28c007a08`.
+All 32 raw stdout files have identical SHA-256
+`8fa5eac1b9746f1a0defcf1770c56c846d272b61fd55dccedd93a8a2f03a0424`;
+all numeric exit statuses are zero, and all stderr files are empty with
+SHA-256
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`.
+Every validated record contains the exact four-event transcript, complete
+cleanup, fingerprint `f4101836ef74bb4f`, and false command, EffectIR,
+execution, profile-qualification, and reuse-authority fields.
+
+The runner used image `20260816.277.1`, kernel `6.17.0-1022-azure`, and glibc
+2.39. The separate namespace diagnostic still returned exact UTS `EPERM`
+expected unavailability. Therefore this is positive evidence only for one
+fixed no-command child transport. It is **not** evidence for a command or
+workload, namespace/root/Landlock composition, a task tree, Python, EffectIR,
+tracing completeness, or execution/profile/reuse authority; the profile is
+**not qualified**. The diagnostic JSON is evidence-only: no persisted EffectIR
+or profile wire field changed, and
+[`LINUX_PYTEST_WIRE_V1.md`](LINUX_PYTEST_WIRE_V1.md) remains unchanged.
+
 [Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
 passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
 Linux-only range, v3 layout, securebits, empty-set, stale-mask, and status-9
@@ -612,6 +681,11 @@ Unix namespace; see [`network_namespaces(7)`](https://man7.org/linux/man-pages/m
 
 ### 8. Landlock, FD scrub, and ptrace/seccomp handoff
 
+The positive fixed four-event transport evidence above does not implement this
+production handoff. It has one child, no namespaces or Landlock, no workload,
+no descendant task tree, no EffectIR recorder, and no tracing-completeness or
+authority result. The following composition remains required in full.
+
 Use namespace PID 1 as both reaper and tracer. It remains outside Landlock and
 seccomp, forks the blocked workload, and attaches with `PTRACE_SEIZE`. This
 satisfies Yama parent/child tracing and lets the tracer use `CAP_SYS_ADMIN` only
@@ -734,7 +808,7 @@ use a refusal rather than inventing an execute-only foreground.
 | Namespace/root | Six fresh IDs and ownership, exact maps, fixed UTS, empty IPC/net, private mounts, bounded tmpfs, no old root |
 | FD boundary | Low/high FDs, socket, secret marker, `CLONE_FILES`; exactly 0/1/2 at the tagged stop |
 | Landlock | Runtime read, runtime/venv write denial, branch/scratch write, host denial, truncate/refer, TCP/ioctl/scope; ABI-7 audit controls |
-| Seccomp/ptrace | Wrong arch/x32, absent tracer, wrong cookie/filter, TSYNC failure, all task events, tracer crash |
+| Seccomp/ptrace | Retain the fixed no-command transport's exact 32-sample/four-event oracle separately; for production, test wrong arch/x32, absent tracer, wrong cookie/filter, TSYNC failure, all descendant task events, EffectIR completeness, and tracer crash |
 | Cleanup | Double fork, orphan, PID-1 exit, tracer/outer death, task holding FD/cwd; no leftovers |
 
 Race tests must use explicit barriers or fault-injection hooks, never timing
