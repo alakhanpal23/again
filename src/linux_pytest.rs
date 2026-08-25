@@ -69,6 +69,7 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 mod canonical;
 mod identity;
 mod isolation_qualification;
+mod ptrace_transport_qualification;
 mod snapshot_connector;
 mod snapshot_manifest;
 mod snapshot_materialize;
@@ -77,6 +78,19 @@ mod snapshot_publish;
 mod snapshot_regular;
 mod snapshot_tree;
 mod snapshot_verify;
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    )),
+    allow(
+        dead_code,
+        reason = "unsupported targets retain only the opaque completion type for the typed refusal signature"
+    )
+)]
+mod trace_protocol;
 
 /// Diagnostic-only result for the fixed rootless namespace probe.
 ///
@@ -100,6 +114,55 @@ pub(crate) fn diagnose_rootless_namespace_tuple_v1() -> RootlessNamespaceProbeDi
     match isolation_qualification::qualify_rootless_namespace_tuple_v1() {
         Ok(_) => RootlessNamespaceProbeDiagnosticV1::Completed,
         Err(failure) => RootlessNamespaceProbeDiagnosticV1::Refused {
+            code: failure.code(),
+            stage: failure.stage(),
+            reason: failure.reason(),
+            errno: failure.errno(),
+            cleanup_complete: failure.cleanup_complete(),
+            expected_unavailable: failure.is_expected_unavailable(),
+        },
+    }
+}
+
+/// Redacted result of the fixed no-command ptrace transport probe.
+///
+/// Completion proves only the diagnostic's four-event kernel transport and
+/// terminal cleanup. It cannot expose a raw task id, descriptor, command,
+/// EffectIR record, execution authority, or reuse authority.
+pub(crate) enum FixedPtraceTransportProbeDiagnosticV1 {
+    Completed {
+        logical_task_id: u32,
+        event_count: u8,
+        seccomp_stop_count: u8,
+        ptrace_exit_event_count: u8,
+        terminal_reap_count: u8,
+        protocol_fingerprint: u64,
+    },
+    Refused {
+        code: RefusalCode,
+        stage: &'static str,
+        reason: &'static str,
+        errno: Option<i32>,
+        cleanup_complete: bool,
+        expected_unavailable: bool,
+    },
+}
+
+/// Run the closed ptrace transport diagnostic and erase its private proof.
+pub(crate) fn diagnose_fixed_ptrace_transport_v1() -> FixedPtraceTransportProbeDiagnosticV1 {
+    match ptrace_transport_qualification::qualify_fixed_ptrace_transport_v1() {
+        Ok(completed) => {
+            let summary = completed.redacted_summary();
+            FixedPtraceTransportProbeDiagnosticV1::Completed {
+                logical_task_id: summary.logical_task_id().0,
+                event_count: summary.event_count(),
+                seccomp_stop_count: summary.seccomp_stop_count(),
+                ptrace_exit_event_count: summary.ptrace_exit_event_count(),
+                terminal_reap_count: summary.terminal_reap_count(),
+                protocol_fingerprint: summary.protocol_fingerprint(),
+            }
+        }
+        Err(failure) => FixedPtraceTransportProbeDiagnosticV1::Refused {
             code: failure.code(),
             stage: failure.stage(),
             reason: failure.reason(),

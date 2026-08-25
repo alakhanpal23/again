@@ -162,6 +162,84 @@ jobs:
             echo "The independent unshare route was denied with EACCES; Again's combined route reached its verified child and UTS capability use was denied with EPERM."
             echo "The diagnostic remains non-qualifying and grants no execution authority."
           } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Require the fixed ptrace transport proof
+        shell: bash
+        run: |
+          : > linux-ptrace-transport-validated.jsonl
+          mkdir -p linux-ptrace-transport-samples
+          for iteration in {1..32}; do
+            printf -v sample_dir 'linux-ptrace-transport-samples/%02d' "${iteration}"
+            mkdir -p "${sample_dir}"
+            set +e
+            target/debug/again __linux-pytest-ptrace-transport-probe-v1 \
+              > "${sample_dir}/stdout.raw" \
+              2> "${sample_dir}/stderr.raw"
+            probe_exit=$?
+            printf '%d\n' "${probe_exit}" > "${sample_dir}/exit-status.txt"
+            status_write_exit=$?
+            set -e
+            test "${status_write_exit}" -eq 0
+            test "${probe_exit}" -eq 0
+            test ! -s "${sample_dir}/stderr.raw"
+            jq -c -s -e --argjson iteration "${iteration}" '
+              select(
+                length == 1
+                and (.[0] |
+                  (keys == ["profile_id", "refusal", "result", "schema", "scope", "status"])
+                  and .schema == "again.linux-pytest-ptrace-transport-probe.v1"
+                  and .profile_id == "linux-pytest-v1"
+                  and .status == "completed"
+                  and .refusal == null
+                  and (.scope | keys == [
+                    "accepts_command", "effect_ir_authority", "execution_authority", "kind",
+                    "profile_qualification", "reuse_authority"
+                  ])
+                  and .scope.kind == "fixed_no_command_ptrace_transport"
+                  and .scope.profile_qualification == false
+                  and .scope.accepts_command == false
+                  and .scope.effect_ir_authority == false
+                  and .scope.execution_authority == false
+                  and .scope.reuse_authority == false
+                  and (.result | keys == [
+                    "cleanup_complete", "event_count", "logical_task_id", "lost_event_count",
+                    "protocol_fingerprint", "ptrace_exit_event_count", "seccomp_stop_count",
+                    "task_count", "terminal_reap_count", "unknown_event_count"
+                  ])
+                  and .result.logical_task_id == 1
+                  and .result.task_count == 1
+                  and .result.event_count == 4
+                  and .result.seccomp_stop_count == 2
+                  and .result.ptrace_exit_event_count == 1
+                  and .result.terminal_reap_count == 1
+                  and .result.unknown_event_count == 0
+                  and .result.lost_event_count == 0
+                  and .result.cleanup_complete == true
+                  and .result.protocol_fingerprint == "f4101836ef74bb4f"
+                )
+              )
+              | .[0] + {iteration: $iteration}
+            ' \
+              "${sample_dir}/stdout.raw" \
+              >> linux-ptrace-transport-validated.jsonl
+          done
+          jq -s -e '
+            select(
+              length == 32
+              and ([.[].iteration] == [range(1; 33)])
+            )
+            | {
+                schema: "again.linux-pytest-ptrace-transport-ci.v1",
+                validated_sample_count: length,
+                first_iteration: .[0].iteration,
+                last_iteration: .[-1].iteration
+              }
+          ' linux-ptrace-transport-validated.jsonl \
+            > linux-ptrace-transport-report.json
+          {
+            echo "### Fixed ptrace transport"
+            echo "✅ 32/32 no-command probes observed the exact two seccomp stops, exit event, terminal reap, and cleanup proof."
+            echo "This transport diagnostic grants no EffectIR, execution, profile, or reuse authority."
+          } >> "${GITHUB_STEP_SUMMARY}"
       - name: Upload the hosted Linux capability report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -171,6 +249,9 @@ jobs:
             linux-capability-report.json
             linux-namespace-bootstrap-report.json
             linux-namespace-bootstrap.stderr
+            linux-ptrace-transport-report.json
+            linux-ptrace-transport-validated.jsonl
+            linux-ptrace-transport-samples/
           if-no-files-found: error
           retention-days: 30
 

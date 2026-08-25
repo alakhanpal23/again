@@ -67,6 +67,9 @@ enum CommandName {
     /// Run the fixed no-command Linux namespace diagnostic.
     #[command(name = "__linux-pytest-namespace-probe-v1", hide = true)]
     LinuxPytestNamespaceProbeV1,
+    /// Run the fixed no-command Linux ptrace transport diagnostic.
+    #[command(name = "__linux-pytest-ptrace-transport-probe-v1", hide = true)]
+    LinuxPytestPtraceTransportProbeV1,
 }
 
 #[derive(Debug, Args)]
@@ -287,7 +290,7 @@ struct RootlessNamespaceProbeReport {
     profile_id: &'static str,
     scope: RootlessNamespaceProbeScope,
     status: &'static str,
-    refusal: Option<RootlessNamespaceProbeRefusal>,
+    refusal: Option<FixedProbeRefusal>,
 }
 
 #[derive(Serialize)]
@@ -299,12 +302,46 @@ struct RootlessNamespaceProbeScope {
 }
 
 #[derive(Serialize)]
-struct RootlessNamespaceProbeRefusal {
+struct FixedProbeRefusal {
     code: &'static str,
     stage: &'static str,
     reason: &'static str,
     errno: Option<i32>,
     cleanup_complete: bool,
+}
+
+#[derive(Serialize)]
+struct FixedPtraceTransportProbeReport {
+    schema: &'static str,
+    profile_id: &'static str,
+    scope: FixedPtraceTransportProbeScope,
+    status: &'static str,
+    result: Option<FixedPtraceTransportProbeResult>,
+    refusal: Option<FixedProbeRefusal>,
+}
+
+#[derive(Serialize)]
+struct FixedPtraceTransportProbeScope {
+    kind: &'static str,
+    profile_qualification: bool,
+    accepts_command: bool,
+    effect_ir_authority: bool,
+    execution_authority: bool,
+    reuse_authority: bool,
+}
+
+#[derive(Serialize)]
+struct FixedPtraceTransportProbeResult {
+    logical_task_id: u32,
+    task_count: u8,
+    event_count: u8,
+    seccomp_stop_count: u8,
+    ptrace_exit_event_count: u8,
+    terminal_reap_count: u8,
+    unknown_event_count: u8,
+    lost_event_count: u8,
+    cleanup_complete: bool,
+    protocol_fingerprint: String,
 }
 
 pub fn run_cli() -> Result<i32> {
@@ -326,6 +363,7 @@ pub fn run_cli() -> Result<i32> {
         CommandName::Stats(args) => stats(args.json),
         CommandName::Doctor(args) => doctor(args.json),
         CommandName::LinuxPytestNamespaceProbeV1 => linux_pytest_namespace_probe_v1(),
+        CommandName::LinuxPytestPtraceTransportProbeV1 => linux_pytest_ptrace_transport_probe_v1(),
     }
 }
 
@@ -366,7 +404,85 @@ fn linux_pytest_namespace_probe_v1() -> Result<i32> {
                 } else {
                     "broken"
                 },
-                refusal: Some(RootlessNamespaceProbeRefusal {
+                refusal: Some(FixedProbeRefusal {
+                    code: code.as_str(),
+                    stage,
+                    reason,
+                    errno,
+                    cleanup_complete,
+                }),
+            },
+            if expected_unavailable { 77 } else { 1 },
+        ),
+    };
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &report)?;
+    output.write_all(b"\n")?;
+    Ok(exit_code)
+}
+
+fn linux_pytest_ptrace_transport_probe_v1() -> Result<i32> {
+    use crate::linux_pytest::{FixedPtraceTransportProbeDiagnosticV1, LINUX_PYTEST_PROFILE_ID};
+
+    let scope = FixedPtraceTransportProbeScope {
+        kind: "fixed_no_command_ptrace_transport",
+        profile_qualification: false,
+        accepts_command: false,
+        effect_ir_authority: false,
+        execution_authority: false,
+        reuse_authority: false,
+    };
+    let (report, exit_code) = match crate::linux_pytest::diagnose_fixed_ptrace_transport_v1() {
+        FixedPtraceTransportProbeDiagnosticV1::Completed {
+            logical_task_id,
+            event_count,
+            seccomp_stop_count,
+            ptrace_exit_event_count,
+            terminal_reap_count,
+            protocol_fingerprint,
+        } => (
+            FixedPtraceTransportProbeReport {
+                schema: "again.linux-pytest-ptrace-transport-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: "completed",
+                result: Some(FixedPtraceTransportProbeResult {
+                    logical_task_id,
+                    task_count: 1,
+                    event_count,
+                    seccomp_stop_count,
+                    ptrace_exit_event_count,
+                    terminal_reap_count,
+                    unknown_event_count: 0,
+                    lost_event_count: 0,
+                    cleanup_complete: true,
+                    protocol_fingerprint: format!("{protocol_fingerprint:016x}"),
+                }),
+                refusal: None,
+            },
+            0,
+        ),
+        FixedPtraceTransportProbeDiagnosticV1::Refused {
+            code,
+            stage,
+            reason,
+            errno,
+            cleanup_complete,
+            expected_unavailable,
+        } => (
+            FixedPtraceTransportProbeReport {
+                schema: "again.linux-pytest-ptrace-transport-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: if expected_unavailable {
+                    "unavailable"
+                } else {
+                    "broken"
+                },
+                result: None,
+                refusal: Some(FixedProbeRefusal {
                     code: code.as_str(),
                     stage,
                     reason,
