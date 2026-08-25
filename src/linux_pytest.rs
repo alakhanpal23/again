@@ -2,8 +2,9 @@
 //! `linux-pytest-v1` execution profile.
 //!
 //! The execution profile is intentionally unreachable from the public CLI. A
-//! hidden, fixed diagnostic can exercise its no-command namespace bootstrap,
-//! but explicitly grants neither profile qualification nor execution authority.
+//! hidden, fixed diagnostics can exercise its no-command namespace bootstrap
+//! and one-child ptrace transport, but explicitly grant neither profile
+//! qualification nor execution authority.
 //! This module defines the privacy, completeness, snapshot-capability,
 //! trace-record, and promotion boundaries that the isolated Linux
 //! implementations build against. No concrete execution profile exists yet,
@@ -91,6 +92,10 @@ mod snapshot_verify;
     )
 )]
 mod trace_protocol;
+mod tracer_seccomp;
+mod tracer_syscall_info;
+mod tracer_task_state;
+mod tracer_wait_status;
 
 /// Diagnostic-only result for the fixed rootless namespace probe.
 ///
@@ -1028,8 +1033,14 @@ impl TraceCompletenessV2 {
         Ok(())
     }
 
-    pub fn candidate_complete(&self) -> bool {
-        self.required == EffectBitmap::REQUIRED_V2
+    fn candidate_complete(&self) -> bool {
+        let expected_ptrace_event_count = self
+            .counters
+            .task_birth_count
+            .checked_add(self.counters.task_exec_count)
+            .and_then(|count| count.checked_add(self.counters.task_exit_count));
+        self.validate().is_ok()
+            && self.required == EffectBitmap::REQUIRED_V2
             && self.complete == self.required
             && self.unsupported == EffectBitmap::EMPTY
             && self.violation == EffectBitmap::EMPTY
@@ -1037,10 +1048,7 @@ impl TraceCompletenessV2 {
             && self.counters.event_count != 0
             && self.counters.syscall_event_count == self.counters.event_count
             && self.counters.seccomp_trace_count == self.counters.syscall_event_count
-            && self.counters.ptrace_event_count
-                == self.counters.task_birth_count
-                    + self.counters.task_exec_count
-                    + self.counters.task_exit_count
+            && Some(self.counters.ptrace_event_count) == expected_ptrace_event_count
             && self.counters.trace_encoded_bytes >= self.counters.event_count
             && self.counters.task_birth_count != 0
             && self.counters.task_exec_count != 0
@@ -3522,20 +3530,6 @@ pub trait SnapshotProvider: Send + Sync {
     ) -> Result<RevalidatedObservationClosureV1, ProfileFailure>;
 }
 
-pub trait SandboxTracer: Send + Sync {
-    fn execute(
-        &self,
-        prepared: &PreparedPytest,
-        mode: TraceExecutionMode,
-    ) -> Result<VerifiedExecutionRecordV2, ProfileFailure>;
-
-    fn capability_probe(
-        &self,
-        snapshot: &ValidationSnapshot,
-        probe: PythonCapabilityProbeV1,
-    ) -> Result<(), ProfileFailure>;
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ShadowJobV2 {
     job_id: ShadowJobId,
@@ -4374,6 +4368,12 @@ mod tests {
         let mut forged = record();
         forged.trace.counters.ptrace_event_count = 2;
         assert!(forged.validate().is_err());
+
+        let mut forged = complete_trace();
+        forged.counters.task_birth_count = u64::MAX;
+        forged.counters.task_exec_count = u64::MAX;
+        forged.counters.task_exit_count = u64::MAX;
+        assert!(!forged.candidate_complete());
 
         let mut forged = record();
         forged.result.stdout = StreamCaptureV2::Complete {

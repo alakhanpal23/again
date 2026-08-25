@@ -24,7 +24,7 @@ jobs:
         run: rustup toolchain install 1.88.0 --profile minimal
       - name: Build the independent read-only capability probe
         run: rustc +1.88.0 --edition 2024 -D warnings ci/linux_capability_probe.rs -o linux-capability-probe
-      - name: Build the fixed Again namespace diagnostic
+      - name: Build the fixed Again Linux diagnostics
         run: cargo +1.88.0 build --locked --bin again
       - name: Collect typed hosted Linux capability evidence
         id: capability-probe
