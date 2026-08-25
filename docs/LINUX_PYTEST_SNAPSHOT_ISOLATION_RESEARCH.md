@@ -250,6 +250,34 @@ not a positive live seccomp or composed-isolation result: stock hosted Ubuntu
 still returns the earlier exact UTS-policy refusal. There remains no workload,
 Python, tracer, execution, isolation-session, or reuse authority.
 
+[Actions run 32802788152](https://github.com/alakhanpal23/again/actions/runs/32802788152)
+passed this source checkpoint at commit
+`d7ffb4ecd43ed2be9be2ec16e4f24fb907219a6d`; the source SHA-256 was
+`8f05d4ad1bd97a7d4efd944dd816e5f141e43d710e6d9b353ccd607613b7de65`.
+Ubuntu ran 650 library tests (643 passed, 7 ignored), macOS ran 480 (473 passed,
+7 ignored), and both passed pinned formatting, strict all-target/all-feature
+Clippy, the full locked suites, and the explicit 100,000-case gate.
+Artifact `9547105077`, named
+`linux-capability-32802788152-1-d7ffb4ecd43ed2be9be2ec16e4f24fb907219a6d`,
+was created `2026-08-25T02:49:49Z` with GitHub archive digest
+`sha256:5b846ee094c69f48a920484eb90a606247af3676ec5791b0e4493d634fec1caf`.
+Its exactly three files had SHA-256 values
+`f2b050d4a34cc01779cc5c3ac8fa3bb1b1bacd99aa1e49b02563b08ae63d9a99`
+(capability),
+`7346fa492d952f85cb1b38e4c9a1497b60d09893f7bc3cefb6fe47bf9781ec34`
+(namespace), and
+`e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+(empty stderr).
+
+On image `20260816.277.1`, kernel `6.17.0-1022-azure`, the independent
+Landlock query returned ABI 7 and the independent user-namespace probe returned
+`EACCES`; the product diagnostic exited 77 with the exact UTS `EPERM` refusal,
+completed cleanup, and every authority field false. The archive expires
+`2026-09-24T02:49:48Z`. This is immutable run/digest evidence for compilation,
+the adversarial protocol/filter tests, and the stock-Ubuntu negative lane only.
+It is not positive live `TSYNC`/Landlock composition, Python, tracing,
+execution, or reuse evidence.
+
 [Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
 passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
 Linux-only range, v3 layout, securebits, empty-set, stale-mask, and status-9
