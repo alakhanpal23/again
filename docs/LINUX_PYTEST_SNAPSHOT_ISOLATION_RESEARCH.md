@@ -135,9 +135,32 @@ the shared-table unshare branch and does not establish workload stdio. A
 Linux-only disposable child test separately seeds a sparse descriptor at or
 above 127, exercises the same range-close and exact-inventory tail, returns a
 test-only nonce-bound marker, and uses the production pidfd cleanup guard. It
-does not forge the diagnostic's full namespace/root/layout success frame. No
-hosted run for this new checkpoint is claimed yet, and stock hosted Ubuntu is
-still expected to stop the full product diagnostic at UTS configuration.
+does not forge the diagnostic's full namespace/root/layout success frame, and
+no product-authority claim follows from it.
+
+[Actions run 32795373220](https://github.com/alakhanpal23/again/actions/runs/32795373220)
+passed the corrected checkpoint at commit `a6ec471`. Ubuntu executed the
+Linux-only disposable sparse-high-FD/range-close/exact-inventory test and
+passed 624 library tests with 7 ignored; macOS passed 473 with 7 ignored. Both
+jobs passed strict Clippy and the explicit 100,000-case gate. The independent
+capability artifact functionally proved `CLOSE_RANGE_UNSHARE` against a
+deliberately `CLONE_FILES`-shared table, while the retained product artifact
+remained the exact UTS-policy `EPERM` refusal with completed cleanup, empty
+stderr, and every authority scope false. Therefore the run is positive live
+evidence for the isolated disposable FD test and independent shared-table
+probe, but only compile/unit/fail-closed compatibility evidence for their
+placement after the product's root/layout branch. Stock CI did not execute
+that composed product branch.
+
+[Failed predecessor 32794670806](https://github.com/alakhanpal23/again/actions/runs/32794670806)
+found that the truncation oracle incorrectly treated an empty streaming-parser
+chunk as malformed; the parser already handled it as the intentional identity
+operation, while production handles zero-byte `getdents64` as EOF before the
+parser. [Failed predecessor 32795004750](https://github.com/alakhanpal23/again/actions/runs/32795004750)
+then passed the full Ubuntu lane but exposed an unrelated existing macOS test
+race that published its process-group readiness marker before required stdout.
+The final checkpoint contains only the corresponding test-oracle correction
+and causal write-before-ready reorder in addition to the source slice.
 
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
