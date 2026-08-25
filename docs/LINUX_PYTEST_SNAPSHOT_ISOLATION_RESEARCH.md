@@ -184,6 +184,17 @@ groups and inherited executable mappings remain, and `no_new_privs` does not
 block nested user namespaces; later attachment, Landlock, seccomp, tracer, and
 pre-exec audits remain mandatory.
 
+[Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
+passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
+Linux-only range, v3 layout, securebits, empty-set, stale-mask, and status-9
+adversarial tests and passed 632 library tests with 7 ignored; macOS passed 473
+with 7 ignored. Both jobs passed pinned strict Clippy and the explicit
+100,000-case gate. The retained product artifact remained the exact earlier
+UTS-policy `EPERM` refusal with completed cleanup, empty stderr, and every
+authority scope false. This is immutable compile, unit-contract, and negative-
+lane compatibility evidence, not a positive live capability-elimination or
+composed-isolation result.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the
