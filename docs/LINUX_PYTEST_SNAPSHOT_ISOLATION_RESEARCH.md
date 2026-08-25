@@ -115,6 +115,30 @@ run therefore validates source compilation, unit-policy checks, framing, and
 negative-lane compatibility only; stock CI did not execute the root, scratch,
 or procfs syscalls.
 
+The next source checkpoint extends the same fixed terminal child through a
+no-command descriptor scrub without adding an input or authority surface. It
+authenticates the report FIFO before and after moving it to fd 0, calls exactly
+`close_range(1, UINT_MAX, CLOSE_RANGE_UNSHARE)`, reauthenticates fd 0, and
+opens fixed relative `proc/1/fd` through no-symlink/no-magic-link `openat2`.
+That open must allocate fd 1 on the previously verified fresh procfs. A
+bounded raw `getdents64` loop requires exactly dot, dot-dot, `0`, and `1`, then
+the child closes fd 1, proves `EBADF`, reauthenticates fd 0, and sends the new
+combined success bit. The parent still requires exact frame, EOF, exit-zero
+pidfd reap, and completed cleanup. `close_range` failures have a distinct
+`close_range_unavailable` wire status; other handoff or audit failures are
+`isolation_preflight_failed` and cannot become expected unavailability.
+
+This ordered slice proves only flag-bearing syscall acceptance and the exact
+terminal close postcondition. The child already has a private FD table because
+its `clone3` call omits `CLONE_FILES`, so this is not functional evidence for
+the shared-table unshare branch and does not establish workload stdio. A
+Linux-only disposable child test separately seeds a sparse descriptor at or
+above 127, exercises the same range-close and exact-inventory tail, returns a
+test-only nonce-bound marker, and uses the production pidfd cleanup guard. It
+does not forge the diagnostic's full namespace/root/layout success frame. No
+hosted run for this new checkpoint is claimed yet, and stock hosted Ubuntu is
+still expected to stop the full product diagnostic at UTS configuration.
+
 Ubuntu 24.04 intentionally restricts user namespaces and can deny capability
 use inside a created namespace for unprivileged applications. Canonical
 background is in the

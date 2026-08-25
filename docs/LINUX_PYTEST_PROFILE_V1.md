@@ -497,17 +497,44 @@ the same NSFS `CLONE_NEWPID` device/inode pinned before pivot. A final absolute
 root reopen rechecks every constructed fixed path and mount, plus the absence
 of `.oldroot` and `/sys`.
 
-The exact success frame requires one additional combined layout/scratch/proc
-bit; stale root-only success frames are rejected. OS and invariant failures
-reuse `mount_root_failed` at `child_mount_root`; there is no new authority or
-caller-selected mount interface. Stock hosted Ubuntu currently refuses at UTS
-configuration before reaching the root or layout code, so no positive live
-root or layout evidence exists. The diagnostic makes no claim against
-malicious same-UID peers or host root. Its fresh procfs still exposes the
-diagnostic PID 1's live `fd`, `exe`, `maps`, and `map_files` surfaces because
-FD scrub and executable mapping replacement are not implemented. It has no
-descriptor-selected workspace/runtime attachment, populated `/dev` endpoints, capability drop,
-Landlock, seccomp, command, Python, execution authority, or reuse authority.
+The exact success frame first added a combined layout/scratch/proc bit; stale
+root-only success frames remain rejected. OS and invariant failures in that
+slice reuse `mount_root_failed` at `child_mount_root`; there is no
+caller-selected mount interface.
+
+The next fixed no-command slice authenticates the nonblocking, close-on-exec
+report FIFO, duplicates its write end to fd 0, and requires the duplicate to
+retain the exact pipe identity, access mode, status flags, and descriptor
+flags. One raw
+`close_range(1, UINT_MAX, CLOSE_RANGE_UNSHARE)` call must then succeed, with no
+numeric-close fallback. The child reauthenticates fd 0 and opens fixed relative
+`proc/1/fd` beneath its already-verified `/`; the open must allocate fd 1 and
+resolve without symlinks or magic links. The audit directory must be a
+close-on-exec directory on the fixed read-only procfs. A bounded raw
+`getdents64` loop accepts only one each of dot, dot-dot, `0`, and `1`, reaches
+EOF, closes fd 1, proves fd 1 is `EBADF`, and reauthenticates fd 0 before the
+new combined FD-success bit can be sent. The parent still requires the exact
+nonce-bound frame, exact EOF, and exit-zero pidfd reap before constructing its
+private completion marker.
+
+`close_range` syscall failures have their own canonical
+`close_range_unavailable` status. Only exact `ENOSYS`/`EINVAL` capability
+failures and `EPERM`/`EACCES` administrative-policy failures are expected
+unavailability; every other errno remains broken. All other FD handoff,
+inventory, close, or identity failures are `isolation_preflight_failed` and
+never expected-unavailable. Because the diagnostic child already owns a
+private FD table, this proves flag-bearing syscall acceptance and its exact
+terminal close postcondition, not the kernel's shared-table unshare path and
+not the workload boundary specified below.
+
+Stock hosted Ubuntu currently refuses at UTS configuration before reaching
+the root, layout, or FD code, so no positive live evidence exists that those
+slices compose. The diagnostic makes no claim against malicious same-UID peers
+or host root. Its fresh procfs still exposes the diagnostic PID 1's `exe`,
+`maps`, and `map_files` surfaces, and inherited executable mappings remain.
+It has no descriptor-selected workspace/runtime attachment, populated `/dev`
+endpoints, profile-owned stdio, capability drop, Landlock, seccomp, command,
+Python, execution authority, or reuse authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
@@ -544,8 +571,11 @@ never a reusable result.
 
 ## File-descriptor boundary
 
-This boundary is not implemented; the following text specifies required
-behavior, not current behavior.
+This workload boundary is not implemented; the following text specifies
+required behavior, not current behavior. The fixed diagnostic above has a
+narrower terminal no-command proof that closes from fd 1 and uses fd 0 only as
+its authenticated report channel. It does not establish profile-owned
+descriptors 0/1/2, execute a workload, or exercise shared-table unsharing.
 
 The setup child finishes mounts and Landlock setup, closes every internal
 ruleset, mount, directory, namespace, and control descriptor, then calls:

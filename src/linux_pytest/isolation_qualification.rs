@@ -6,13 +6,17 @@
 //! never executes caller code. The leaf verifies the namespace bootstrap and
 //! a fixed, path-disconnected private tmpfs root with a fixed directory
 //! topology, separately bounded scratch mounts, and a fresh procfs for the
-//! child's PID namespace. This is only a pathname-root diagnostic: inherited
-//! descriptors and executable mappings remain outside its scope, and procfs
-//! still exposes the diagnostic PID 1's own descriptors and mappings. It does
-//! not prove descriptor-selected workload/runtime mounts, does not populate or
-//! broker `/dev` endpoints, and does not run an executable workload. A
-//! completed marker is returned only after that direct child has exited and
-//! been reaped. A cleanup-uncertain failure remains possible.
+//! child's PID namespace. It then authenticates the fixed report pipe at file
+//! descriptor 0, closes every descriptor at or above 1 with one
+//! `CLOSE_RANGE_UNSHARE` call, and uses the fresh procfs to audit the exact
+//! transient descriptor inventory before closing the audit descriptor. The
+//! child already owns a private descriptor table, so this does not exercise
+//! the kernel's shared-table unshare path. Executable mappings also remain
+//! outside this slice. It does not prove workload stdio, descriptor-selected
+//! workspace/runtime mounts, populated `/dev` endpoints, or executable
+//! workload isolation. A completed marker is returned only after that direct
+//! child has exited and been reaped. A cleanup-uncertain failure remains
+//! possible.
 //! The result is not an execution, snapshot, isolation-session, or reuse
 //! authority.
 
@@ -63,6 +67,7 @@ enum IsolationQualificationStageV1 {
     VerifyChildProof,
     ChildUtsConfiguration,
     ChildMountRoot,
+    ChildDescriptorScrub,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -100,6 +105,7 @@ impl IsolationQualificationStageV1 {
             Self::VerifyChildProof => "verify_child_proof",
             Self::ChildUtsConfiguration => "child_uts_configuration",
             Self::ChildMountRoot => "child_mount_root",
+            Self::ChildDescriptorScrub => "child_descriptor_scrub",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -251,6 +257,22 @@ impl IsolationQualificationFailureV1 {
                 IsolationQualificationStageV1::ChildUtsConfiguration,
                 IsolationQualificationReasonV1::AdministrativePolicy,
                 Some(libc::EPERM),
+            )
+        ) {
+            return true;
+        }
+        if matches!(
+            (self.code, self.stage, self.reason, self.errno),
+            (
+                RefusalCode::CloseRangeUnavailable,
+                IsolationQualificationStageV1::ChildDescriptorScrub,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                Some(libc::ENOSYS) | Some(libc::EINVAL),
+            ) | (
+                RefusalCode::CloseRangeUnavailable,
+                IsolationQualificationStageV1::ChildDescriptorScrub,
+                IsolationQualificationReasonV1::AdministrativePolicy,
+                Some(libc::EPERM) | Some(libc::EACCES),
             )
         ) {
             return true;
@@ -485,7 +507,9 @@ mod platform {
     const PROOF_STATUS_UTS_CONFIGURATION_V1: u8 = 4;
     const PROOF_STATUS_MOUNT_ROOT_OS_V1: u8 = 5;
     const PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1: u8 = 6;
-    const PROOF_FLAGS_V1: u8 = 0b0001_1111;
+    const PROOF_STATUS_CLOSE_RANGE_OS_V1: u8 = 7;
+    const PROOF_STATUS_FD_SCRUB_V1: u8 = 8;
+    const PROOF_FLAGS_V1: u8 = 0b0011_1111;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -536,6 +560,7 @@ mod platform {
     const RUN_PATH_V1: &CStr = c"/run";
     const AGAIN_HOME_PATH_V1: &CStr = c"/home/again";
     const PROC_PATH_V1: &CStr = c"/proc";
+    const PROC_FD_AUDIT_PATH_V1: &CStr = c"proc/1/fd";
     const SCRATCH_TMPFS_BYTES_V1: u64 = 4 * 1024 * 1024;
     const SCRATCH_TMPFS_INODES_V1: u64 = 1_024;
     const TMP_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=1777,noswap";
@@ -565,6 +590,21 @@ mod platform {
         | libc::STATX_GID
         | libc::STATX_INO
         | libc::STATX_MNT_ID;
+    const REPORT_DESCRIPTOR_V1: RawFd = 0;
+    const FD_AUDIT_DESCRIPTOR_V1: RawFd = 1;
+    const CLOSE_RANGE_FIRST_V1: u32 = 1;
+    const CLOSE_RANGE_LAST_V1: u32 = u32::MAX;
+    const FD_AUDIT_BUFFER_BYTES_V1: usize = 256;
+    const FD_AUDIT_MAX_GETDENTS_CALLS_V1: usize = 8;
+    const DIRENT64_NAME_OFFSET_V1: usize = 19;
+    const DIRENT64_MIN_RECORD_BYTES_V1: usize = 24;
+    const DIRENT64_ALIGNMENT_V1: usize = 8;
+    const FD_AUDIT_DOT_BIT_V1: u8 = 1 << 0;
+    const FD_AUDIT_DOT_DOT_BIT_V1: u8 = 1 << 1;
+    const FD_AUDIT_ZERO_BIT_V1: u8 = 1 << 2;
+    const FD_AUDIT_ONE_BIT_V1: u8 = 1 << 3;
+    const FD_AUDIT_COMPLETE_MASK_V1: u8 =
+        FD_AUDIT_DOT_BIT_V1 | FD_AUDIT_DOT_DOT_BIT_V1 | FD_AUDIT_ZERO_BIT_V1 | FD_AUDIT_ONE_BIT_V1;
     const MAX_LINUX_ERRNO_V1: i32 = 4_095;
 
     #[repr(C)]
@@ -604,6 +644,20 @@ mod platform {
     enum ChildMountRootFailureV1 {
         Os(i32),
         Invariant,
+    }
+
+    enum ChildDescriptorFailureV1 {
+        CloseRange(i32),
+        Os(i32),
+        Invariant,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct ChildReportDescriptorIdentityV1 {
+        device: libc::dev_t,
+        inode: libc::ino_t,
+        mode: libc::mode_t,
+        status_flags: libc::c_long,
     }
 
     struct ChildPinnedPidNamespaceV1 {
@@ -2690,6 +2744,53 @@ mod platform {
                 (errno != 0).then_some(errno),
             ));
         }
+        if status == PROOF_STATUS_CLOSE_RANGE_OS_V1 {
+            if frame[FRAME_FLAGS_OFFSET_V1] != 0
+                || !(1..=MAX_LINUX_ERRNO_V1).contains(&errno)
+                || !identity_is_exact
+            {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            let reason = match errno {
+                libc::ENOSYS | libc::EINVAL => {
+                    IsolationQualificationReasonV1::KernelCapabilityUnavailable
+                }
+                libc::EPERM | libc::EACCES => IsolationQualificationReasonV1::AdministrativePolicy,
+                _ => IsolationQualificationReasonV1::Io,
+            };
+            return Err(failure(
+                RefusalCode::CloseRangeUnavailable,
+                IsolationQualificationStageV1::ChildDescriptorScrub,
+                reason,
+                Some(errno),
+            ));
+        }
+        if status == PROOF_STATUS_FD_SCRUB_V1 {
+            if frame[FRAME_FLAGS_OFFSET_V1] != 0
+                || !(0..=MAX_LINUX_ERRNO_V1).contains(&errno)
+                || !identity_is_exact
+            {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                RefusalCode::IsolationPreflightFailed,
+                IsolationQualificationStageV1::ChildDescriptorScrub,
+                if errno == 0 {
+                    IsolationQualificationReasonV1::ChildInvariantFailed
+                } else {
+                    IsolationQualificationReasonV1::Io
+                },
+                (errno != 0).then_some(errno),
+            ));
+        }
         if status != PROOF_STATUS_SUCCESS_V1 {
             let reason = match status {
                 PROOF_STATUS_OS_ERROR_V1 | PROOF_STATUS_INVARIANT_V1 => {
@@ -3281,11 +3382,64 @@ mod platform {
             }
         }
 
+        if report_write <= libc::STDERR_FILENO {
+            child_descriptor_fail_v1(
+                report_write,
+                &nonce,
+                ChildDescriptorFailureV1::Invariant,
+                deadline,
+            );
+        }
+        let report_identity = match child_report_descriptor_identity_v1(report_write) {
+            Ok(identity) => identity,
+            Err(error) => child_descriptor_fail_v1(report_write, &nonce, error, deadline),
+        };
+        let duplicate = unsafe {
+            libc::syscall(
+                libc::SYS_dup3,
+                report_write,
+                REPORT_DESCRIPTOR_V1,
+                libc::O_CLOEXEC,
+            )
+        };
+        if duplicate < 0 {
+            child_descriptor_fail_v1(
+                report_write,
+                &nonce,
+                child_descriptor_os_failure_v1(),
+                deadline,
+            );
+        }
+        if duplicate != libc::c_long::from(REPORT_DESCRIPTOR_V1) {
+            child_descriptor_fail_v1(
+                report_write,
+                &nonce,
+                ChildDescriptorFailureV1::Invariant,
+                deadline,
+            );
+        }
+        let report_write = REPORT_DESCRIPTOR_V1;
+        match child_report_descriptor_identity_v1(report_write) {
+            Ok(identity) if identity == report_identity => {}
+            Ok(_) => child_descriptor_fail_v1(
+                report_write,
+                &nonce,
+                ChildDescriptorFailureV1::Invariant,
+                deadline,
+            ),
+            Err(error) => child_descriptor_fail_v1(report_write, &nonce, error, deadline),
+        }
+        if let Err(error) = child_scrub_and_audit_descriptors_v1(&report_identity) {
+            child_descriptor_fail_v1(report_write, &nonce, error, deadline);
+        }
+
         let proof = child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
         if !child_write_frame(report_write, &proof, deadline) {
             child_exit(CHILD_EXIT_PROOF_FAILED_V1);
         }
-        let _ = child_close(report_write);
+        if !child_close(report_write) {
+            child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+        }
         child_exit(0)
     }
 
@@ -4082,6 +4236,262 @@ mod platform {
         }
     }
 
+    fn child_report_descriptor_identity_v1(
+        descriptor: RawFd,
+    ) -> Result<ChildReportDescriptorIdentityV1, ChildDescriptorFailureV1> {
+        if descriptor < 0 {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        let mut status = MaybeUninit::<libc::stat>::zeroed();
+        if unsafe { libc::syscall(libc::SYS_fstat, descriptor, status.as_mut_ptr()) } != 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        let status = unsafe { status.assume_init() };
+        let descriptor_flags =
+            unsafe { libc::syscall(libc::SYS_fcntl, descriptor, libc::F_GETFD, 0_u64) };
+        if descriptor_flags < 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        let status_flags =
+            unsafe { libc::syscall(libc::SYS_fcntl, descriptor, libc::F_GETFL, 0_u64) };
+        if status_flags < 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        if status.st_dev == 0
+            || status.st_ino == 0
+            || status.st_mode & libc::S_IFMT != libc::S_IFIFO
+            || descriptor_flags != libc::c_long::from(libc::FD_CLOEXEC)
+            || status_flags & libc::c_long::from(libc::O_ACCMODE)
+                != libc::c_long::from(libc::O_WRONLY)
+            || status_flags & libc::c_long::from(libc::O_NONBLOCK) == 0
+        {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        Ok(ChildReportDescriptorIdentityV1 {
+            device: status.st_dev,
+            inode: status.st_ino,
+            mode: status.st_mode,
+            status_flags,
+        })
+    }
+
+    fn child_scrub_and_audit_descriptors_v1(
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildDescriptorFailureV1> {
+        child_close_range_and_reauthenticate_v1(report_identity)?;
+
+        let how = OpenHowV1 {
+            flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH_V1 | RESOLVE_NO_MAGICLINKS_V1 | RESOLVE_NO_SYMLINKS_V1,
+        };
+        let audit_result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                PROC_FD_AUDIT_PATH_V1.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHowV1>(),
+            )
+        };
+        if audit_result < 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        if audit_result != libc::c_long::from(FD_AUDIT_DESCRIPTOR_V1) {
+            if let Ok(descriptor) = RawFd::try_from(audit_result)
+                && descriptor > FD_AUDIT_DESCRIPTOR_V1
+            {
+                let _ = child_close(descriptor);
+            }
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        child_verify_and_close_fd_audit_v1(FD_AUDIT_DESCRIPTOR_V1, report_identity)
+    }
+
+    fn child_close_range_and_reauthenticate_v1(
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildDescriptorFailureV1> {
+        let close_result = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                CLOSE_RANGE_FIRST_V1,
+                CLOSE_RANGE_LAST_V1,
+                libc::CLOSE_RANGE_UNSHARE,
+            )
+        };
+        if close_result < 0 {
+            let errno = child_errno();
+            return Err(if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+                ChildDescriptorFailureV1::CloseRange(errno)
+            } else {
+                ChildDescriptorFailureV1::Invariant
+            });
+        }
+        if close_result != 0
+            || child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1)? != *report_identity
+        {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        Ok(())
+    }
+
+    fn child_verify_and_close_fd_audit_v1(
+        audit_descriptor: RawFd,
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildDescriptorFailureV1> {
+        let descriptor_flags =
+            unsafe { libc::syscall(libc::SYS_fcntl, audit_descriptor, libc::F_GETFD, 0_u64) };
+        if descriptor_flags < 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        if descriptor_flags != libc::c_long::from(libc::FD_CLOEXEC) {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        let mut status = MaybeUninit::<libc::stat>::zeroed();
+        if unsafe { libc::syscall(libc::SYS_fstat, audit_descriptor, status.as_mut_ptr()) } != 0 {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        let status = unsafe { status.assume_init() };
+        if status.st_dev == 0
+            || status.st_ino == 0
+            || status.st_mode & libc::S_IFMT != libc::S_IFDIR
+        {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        let mut filesystem = MaybeUninit::<libc::statfs64>::zeroed();
+        if unsafe { libc::syscall(libc::SYS_fstatfs, audit_descriptor, filesystem.as_mut_ptr()) }
+            != 0
+        {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        if !child_procfs_statfs_matches_policy_v1(&unsafe { filesystem.assume_init() }) {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        child_finish_fd_audit_v1(audit_descriptor, report_identity)
+    }
+
+    fn child_finish_fd_audit_v1(
+        audit_descriptor: RawFd,
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildDescriptorFailureV1> {
+        if audit_descriptor != FD_AUDIT_DESCRIPTOR_V1 {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        let mut buffer = [0_u8; FD_AUDIT_BUFFER_BYTES_V1];
+        let mut seen = 0_u8;
+        let mut reached_eof = false;
+        for _ in 0..FD_AUDIT_MAX_GETDENTS_CALLS_V1 {
+            let count = unsafe {
+                libc::syscall(
+                    libc::SYS_getdents64,
+                    audit_descriptor,
+                    buffer.as_mut_ptr(),
+                    buffer.len(),
+                )
+            };
+            if count == 0 {
+                reached_eof = true;
+                break;
+            }
+            if count < 0 {
+                let errno = child_errno();
+                if errno == libc::EINTR {
+                    continue;
+                }
+                return Err(child_descriptor_failure_from_errno_v1(errno));
+            }
+            let Ok(count) = usize::try_from(count) else {
+                return Err(ChildDescriptorFailureV1::Invariant);
+            };
+            if count > buffer.len() || !child_parse_fd_audit_dirents_v1(&buffer[..count], &mut seen)
+            {
+                return Err(ChildDescriptorFailureV1::Invariant);
+            }
+        }
+        if !reached_eof || seen != FD_AUDIT_COMPLETE_MASK_V1 {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        if !child_close(audit_descriptor) {
+            return Err(child_descriptor_os_failure_v1());
+        }
+        let closed =
+            unsafe { libc::syscall(libc::SYS_fcntl, audit_descriptor, libc::F_GETFD, 0_u64) };
+        if closed >= 0 {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        let errno = child_errno();
+        if errno != libc::EBADF {
+            return Err(child_descriptor_failure_from_errno_v1(errno));
+        }
+        if child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1)? != *report_identity {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
+        Ok(())
+    }
+
+    fn child_parse_fd_audit_dirents_v1(bytes: &[u8], seen: &mut u8) -> bool {
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let remaining = &bytes[offset..];
+            if remaining.len() < DIRENT64_MIN_RECORD_BYTES_V1 {
+                return false;
+            }
+            let record_length = usize::from(u16::from_ne_bytes([remaining[16], remaining[17]]));
+            if record_length < DIRENT64_MIN_RECORD_BYTES_V1
+                || record_length % DIRENT64_ALIGNMENT_V1 != 0
+                || record_length > remaining.len()
+            {
+                return false;
+            }
+            let name_field = &remaining[DIRENT64_NAME_OFFSET_V1..record_length];
+            let Some(terminator) = name_field.iter().position(|byte| *byte == 0) else {
+                return false;
+            };
+            let bit = match &name_field[..terminator] {
+                b"." => FD_AUDIT_DOT_BIT_V1,
+                b".." => FD_AUDIT_DOT_DOT_BIT_V1,
+                b"0" => FD_AUDIT_ZERO_BIT_V1,
+                b"1" => FD_AUDIT_ONE_BIT_V1,
+                _ => return false,
+            };
+            if *seen & bit != 0 {
+                return false;
+            }
+            *seen |= bit;
+            let Some(next) = offset.checked_add(record_length) else {
+                return false;
+            };
+            offset = next;
+        }
+        true
+    }
+
+    fn child_descriptor_os_failure_v1() -> ChildDescriptorFailureV1 {
+        child_descriptor_failure_from_errno_v1(child_errno())
+    }
+
+    fn child_descriptor_failure_from_errno_v1(errno: i32) -> ChildDescriptorFailureV1 {
+        if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+            ChildDescriptorFailureV1::Os(errno)
+        } else {
+            ChildDescriptorFailureV1::Invariant
+        }
+    }
+
+    fn child_descriptor_fail_v1(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        failure: ChildDescriptorFailureV1,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let (status, errno) = match failure {
+            ChildDescriptorFailureV1::CloseRange(errno) => (PROOF_STATUS_CLOSE_RANGE_OS_V1, errno),
+            ChildDescriptorFailureV1::Os(errno) => (PROOF_STATUS_FD_SCRUB_V1, errno),
+            ChildDescriptorFailureV1::Invariant => (PROOF_STATUS_FD_SCRUB_V1, 0),
+        };
+        child_fail(report_write, nonce, status, errno, deadline)
+    }
+
     fn child_fail(
         report_write: RawFd,
         nonce: &[u8; NONCE_BYTES_V1],
@@ -4359,6 +4769,9 @@ mod platform {
     mod tests {
         use super::*;
 
+        const DISPOSABLE_FD_SCRUB_MAGIC_V1: &[u8; 8] = b"AGNFDT01";
+        const DISPOSABLE_FD_SCRUB_COMPLETE_V1: u8 = 1;
+
         fn test_pipe() -> (OwnedFd, OwnedFd) {
             create_pipe().unwrap_or_else(|_| panic!("nonblocking pipe fixture failed"))
         }
@@ -4426,6 +4839,153 @@ mod platform {
             let run = identity(1);
             let home = identity(2);
             child_scratch_identities_are_independent_v1(&tmp, &run, &home)
+        }
+
+        fn fd_audit_dirent(name: &[u8]) -> Vec<u8> {
+            let unaligned = DIRENT64_NAME_OFFSET_V1 + name.len() + 1;
+            let record_length =
+                (unaligned + DIRENT64_ALIGNMENT_V1 - 1) & !(DIRENT64_ALIGNMENT_V1 - 1);
+            let mut record = vec![0_u8; record_length];
+            record[16..18].copy_from_slice(&(record_length as u16).to_ne_bytes());
+            record[18] = libc::DT_LNK;
+            record[DIRENT64_NAME_OFFSET_V1..DIRENT64_NAME_OFFSET_V1 + name.len()]
+                .copy_from_slice(name);
+            record
+        }
+
+        fn fd_audit_chunk(names: &[&[u8]]) -> Vec<u8> {
+            let mut chunk = Vec::new();
+            for name in names {
+                chunk.extend_from_slice(&fd_audit_dirent(name));
+            }
+            chunk
+        }
+
+        fn disposable_proc_fd_path_v1(pid: libc::pid_t) -> Option<[u8; 32]> {
+            let pid = encode_pid_name(pid)?;
+            let prefix = b"proc/";
+            let suffix = b"/fd";
+            let length = prefix.len() + pid.as_bytes().len() + suffix.len();
+            let mut path = [0_u8; 32];
+            path[..prefix.len()].copy_from_slice(prefix);
+            path[prefix.len()..prefix.len() + pid.as_bytes().len()].copy_from_slice(pid.as_bytes());
+            path[prefix.len() + pid.as_bytes().len()..length].copy_from_slice(suffix);
+            Some(path)
+        }
+
+        fn disposable_fd_scrub_evidence_v1(nonce: &[u8; NONCE_BYTES_V1]) -> [u8; FRAME_BYTES_V1] {
+            let mut evidence = [0_u8; FRAME_BYTES_V1];
+            evidence[..DISPOSABLE_FD_SCRUB_MAGIC_V1.len()]
+                .copy_from_slice(DISPOSABLE_FD_SCRUB_MAGIC_V1);
+            evidence[8..8 + NONCE_BYTES_V1].copy_from_slice(nonce);
+            evidence[8 + NONCE_BYTES_V1] = DISPOSABLE_FD_SCRUB_COMPLETE_V1;
+            evidence
+        }
+
+        fn disposable_child_fd_audit_v1(
+            audit_descriptor: RawFd,
+            report_identity: &ChildReportDescriptorIdentityV1,
+        ) -> bool {
+            let mut filesystem = MaybeUninit::<libc::statfs64>::zeroed();
+            if unsafe {
+                libc::syscall(libc::SYS_fstatfs, audit_descriptor, filesystem.as_mut_ptr())
+            } != 0
+                || unsafe { filesystem.assume_init() }.f_type != PROC_SUPER_MAGIC_V1
+            {
+                return false;
+            }
+            child_finish_fd_audit_v1(audit_descriptor, report_identity).is_ok()
+        }
+
+        fn disposable_fd_scrub_child_v1(
+            report_write: RawFd,
+            nonce: &[u8; NONCE_BYTES_V1],
+            deadline: MonotonicDeadlineV1,
+        ) -> ! {
+            if report_write <= libc::STDERR_FILENO {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            let Ok(report_identity) = child_report_descriptor_identity_v1(report_write) else {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            };
+            let high_descriptor = unsafe {
+                libc::syscall(
+                    libc::SYS_fcntl,
+                    report_write,
+                    libc::F_DUPFD_CLOEXEC,
+                    127_i32,
+                )
+            };
+            let Ok(high_descriptor) = RawFd::try_from(high_descriptor) else {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            };
+            if high_descriptor < 127
+                || !matches!(
+                    child_report_descriptor_identity_v1(high_descriptor),
+                    Ok(identity) if identity == report_identity
+                )
+            {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_dup3,
+                    report_write,
+                    REPORT_DESCRIPTOR_V1,
+                    libc::O_CLOEXEC,
+                )
+            } != libc::c_long::from(REPORT_DESCRIPTOR_V1)
+                || !matches!(
+                    child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1),
+                    Ok(identity) if identity == report_identity
+                )
+                || child_close_range_and_reauthenticate_v1(&report_identity).is_err()
+            {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            let high_closed =
+                unsafe { libc::syscall(libc::SYS_fcntl, high_descriptor, libc::F_GETFD, 0_u64) };
+            if high_closed >= 0 || child_errno() != libc::EBADF {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            if unsafe { libc::syscall(libc::SYS_chdir, ROOT_PATH_V1.as_ptr()) } != 0 {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            let Ok(pid) = libc::pid_t::try_from(pid) else {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            };
+            let Some(path) = disposable_proc_fd_path_v1(pid) else {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            };
+            let how = OpenHowV1 {
+                flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    as u64,
+                mode: 0,
+                resolve: RESOLVE_BENEATH_V1 | RESOLVE_NO_MAGICLINKS_V1 | RESOLVE_NO_SYMLINKS_V1,
+            };
+            let audit_descriptor = unsafe {
+                libc::syscall(
+                    libc::SYS_openat2,
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    &how,
+                    std::mem::size_of::<OpenHowV1>(),
+                )
+            };
+            let Ok(audit_descriptor) = RawFd::try_from(audit_descriptor) else {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            };
+            if !disposable_child_fd_audit_v1(audit_descriptor, &report_identity) {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            let evidence = disposable_fd_scrub_evidence_v1(nonce);
+            if !child_write_frame(REPORT_DESCRIPTOR_V1, &evidence, deadline)
+                || !child_close(REPORT_DESCRIPTOR_V1)
+            {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+            child_exit(0)
         }
 
         #[test]
@@ -4583,6 +5143,162 @@ mod platform {
                 b"size=4194304,nr_inodes=1024,mode=0700,noswap\0"
             );
             assert_eq!(PROCFS_OPTIONS_V1.to_bytes_with_nul(), b"subset=pid\0");
+            assert_eq!(PROC_FD_AUDIT_PATH_V1.to_bytes_with_nul(), b"proc/1/fd\0");
+            assert_eq!(REPORT_DESCRIPTOR_V1, 0);
+            assert_eq!(FD_AUDIT_DESCRIPTOR_V1, 1);
+            assert_eq!(CLOSE_RANGE_FIRST_V1, 1);
+            assert_eq!(CLOSE_RANGE_LAST_V1, u32::MAX);
+            assert_eq!(libc::CLOSE_RANGE_UNSHARE, 2);
+            assert_eq!(FD_AUDIT_BUFFER_BYTES_V1, 256);
+            assert_eq!(FD_AUDIT_MAX_GETDENTS_CALLS_V1, 8);
+            assert_eq!(FD_AUDIT_COMPLETE_MASK_V1, 0b1111);
+            assert_eq!(PROOF_FLAGS_V1, 0x3f);
+        }
+
+        #[test]
+        fn fd_audit_dirent_parser_accepts_only_exact_bounded_inventory() {
+            let first = fd_audit_chunk(&[b"1", b"."]);
+            let second = fd_audit_chunk(&[b"0", b".."]);
+            let mut seen = 0_u8;
+            assert!(child_parse_fd_audit_dirents_v1(&first, &mut seen));
+            assert_ne!(seen, FD_AUDIT_COMPLETE_MASK_V1);
+            assert!(child_parse_fd_audit_dirents_v1(&second, &mut seen));
+            assert_eq!(seen, FD_AUDIT_COMPLETE_MASK_V1);
+
+            for name in [
+                b"2".as_slice(),
+                b"x".as_slice(),
+                b"00".as_slice(),
+                b"01".as_slice(),
+                b"".as_slice(),
+            ] {
+                assert!(!child_parse_fd_audit_dirents_v1(
+                    &fd_audit_dirent(name),
+                    &mut 0_u8,
+                ));
+            }
+            for duplicate in [b".".as_slice(), b"..".as_slice(), b"0".as_slice(), b"1"] {
+                assert!(!child_parse_fd_audit_dirents_v1(
+                    &fd_audit_chunk(&[duplicate, duplicate]),
+                    &mut 0_u8,
+                ));
+            }
+
+            let valid = fd_audit_dirent(b"0");
+            for header_length in 0..DIRENT64_MIN_RECORD_BYTES_V1 {
+                assert!(!child_parse_fd_audit_dirents_v1(
+                    &valid[..header_length],
+                    &mut 0_u8,
+                ));
+            }
+            let mut zero_record = valid.clone();
+            zero_record[16..18].copy_from_slice(&0_u16.to_ne_bytes());
+            let mut short_record = valid.clone();
+            short_record[16..18]
+                .copy_from_slice(&((DIRENT64_MIN_RECORD_BYTES_V1 - 1) as u16).to_ne_bytes());
+            let mut unaligned_record = valid.clone();
+            unaligned_record.resize(DIRENT64_MIN_RECORD_BYTES_V1 + DIRENT64_ALIGNMENT_V1, 0);
+            unaligned_record[16..18]
+                .copy_from_slice(&((DIRENT64_MIN_RECORD_BYTES_V1 + 1) as u16).to_ne_bytes());
+            let mut out_of_bounds_record = valid.clone();
+            out_of_bounds_record[16..18]
+                .copy_from_slice(&((valid.len() + DIRENT64_ALIGNMENT_V1) as u16).to_ne_bytes());
+            let mut unterminated_record = fd_audit_dirent(b"0");
+            unterminated_record[DIRENT64_NAME_OFFSET_V1..].fill(b'x');
+            let mut trailing_partial = fd_audit_dirent(b"0");
+            trailing_partial.push(0);
+            for malformed in [
+                zero_record,
+                short_record,
+                unaligned_record,
+                out_of_bounds_record,
+                unterminated_record,
+                trailing_partial,
+            ] {
+                assert!(!child_parse_fd_audit_dirents_v1(&malformed, &mut 0_u8,));
+            }
+
+            for missing in [
+                [b"..".as_slice(), b"0".as_slice(), b"1".as_slice()],
+                [b".".as_slice(), b"0".as_slice(), b"1".as_slice()],
+                [b".".as_slice(), b"..".as_slice(), b"1".as_slice()],
+                [b".".as_slice(), b"..".as_slice(), b"0".as_slice()],
+            ] {
+                let mut seen = 0_u8;
+                assert!(child_parse_fd_audit_dirents_v1(
+                    &fd_audit_chunk(&missing),
+                    &mut seen,
+                ));
+                assert_ne!(seen, FD_AUDIT_COMPLETE_MASK_V1);
+            }
+
+            let mut unknown_type = fd_audit_dirent(b"0");
+            unknown_type[18] = libc::DT_UNKNOWN;
+            let mut seen = 0_u8;
+            assert!(child_parse_fd_audit_dirents_v1(&unknown_type, &mut seen,));
+            assert_eq!(seen, FD_AUDIT_ZERO_BIT_V1);
+        }
+
+        #[test]
+        fn disposable_child_range_closes_sparse_fds_and_reports_exact_inventory() {
+            let (read, write) = test_pipe();
+            let report_write = unsafe {
+                libc::fcntl(
+                    write.as_raw_fd(),
+                    libc::F_DUPFD_CLOEXEC,
+                    libc::STDERR_FILENO + 1,
+                )
+            };
+            assert!(report_write > libc::STDERR_FILENO);
+            let report_write = unsafe { OwnedFd::from_raw_fd(report_write) };
+            drop(write);
+
+            let nonce = [0x9b_u8; NONCE_BYTES_V1];
+            let (deadline, hard_deadline) = probe_deadlines()
+                .unwrap_or_else(|_| panic!("disposable child deadlines were unavailable"));
+            let pid = unsafe { libc::fork() };
+            if pid == 0 {
+                disposable_fd_scrub_child_v1(report_write.as_raw_fd(), &nonce, deadline);
+            }
+            assert!(pid > 0, "fork for disposable descriptor child failed");
+            let mut child_guard = ProbeChildGuardV1 {
+                pid: Some(pid),
+                pidfd: None,
+                control_write: None,
+                report_read: None,
+                proc_directory: None,
+                child_namespaces: None,
+                deadline: hard_deadline,
+                reaped: false,
+            };
+            let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+            let pidfd_errno = (pidfd < 0).then(last_errno).flatten();
+            let Some(pidfd) = RawFd::try_from(pidfd).ok().filter(|pidfd| *pidfd >= 0) else {
+                let cleanup = child_guard.kill_and_reap();
+                assert!(cleanup.is_ok(), "pidfd failure also left cleanup uncertain");
+                panic!("pidfd_open failed for disposable child: {pidfd_errno:?}");
+            };
+            child_guard.pidfd = Some(unsafe { OwnedFd::from_raw_fd(pidfd) });
+            drop(report_write);
+
+            let mut frame = [0_u8; FRAME_BYTES_V1];
+            let received = child_read_frame_and_eof(read.as_raw_fd(), &mut frame, deadline);
+            if !received {
+                let cleanup = child_guard.kill_and_reap();
+                assert!(cleanup.is_ok(), "failed child cleanup was uncertain");
+                panic!("disposable descriptor child sent no exact test evidence");
+            }
+            if let Err(error) = child_guard.reap_success(deadline) {
+                let cleanup = child_guard.kill_and_reap();
+                assert!(cleanup.is_ok(), "terminal child cleanup was uncertain");
+                panic!(
+                    "disposable descriptor child was not a clean exit: {}/{}",
+                    error.stage(),
+                    error.reason(),
+                );
+            }
+            assert!(child_guard.reaped);
+            assert_eq!(frame, disposable_fd_scrub_evidence_v1(&nonce));
         }
 
         #[test]
@@ -4765,9 +5481,11 @@ mod platform {
             let frame =
                 child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
             assert!(verify_proof_frame(&frame, &nonce).is_ok());
-            let stale_root_only =
-                child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, 0b0000_1111, 0);
-            assert!(verify_proof_frame(&stale_root_only, &nonce).is_err());
+            for stale_flags in [0x0f, 0x1f] {
+                let stale =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, stale_flags, 0);
+                assert!(verify_proof_frame(&stale, &nonce).is_err());
+            }
 
             for offset in [
                 FRAME_STATUS_OFFSET_V1,
@@ -4907,6 +5625,137 @@ mod platform {
                     IsolationQualificationReasonV1::ProtocolFrameMismatch
                 );
                 assert!(!error.is_expected_unavailable());
+            }
+        }
+
+        #[test]
+        fn descriptor_scrub_failure_proofs_are_exact_and_fail_closed() {
+            let nonce = [0x6d_u8; NONCE_BYTES_V1];
+            for (errno, reason, expected_unavailable) in [
+                (
+                    libc::ENOSYS,
+                    IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                    true,
+                ),
+                (libc::EOPNOTSUPP, IsolationQualificationReasonV1::Io, false),
+                (
+                    libc::EINVAL,
+                    IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                    true,
+                ),
+                (
+                    libc::EPERM,
+                    IsolationQualificationReasonV1::AdministrativePolicy,
+                    true,
+                ),
+                (
+                    libc::EACCES,
+                    IsolationQualificationReasonV1::AdministrativePolicy,
+                    true,
+                ),
+                (libc::EMFILE, IsolationQualificationReasonV1::Io, false),
+                (libc::ENOMEM, IsolationQualificationReasonV1::Io, false),
+                (
+                    MAX_LINUX_ERRNO_V1,
+                    IsolationQualificationReasonV1::Io,
+                    false,
+                ),
+            ] {
+                let frame =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_CLOSE_RANGE_OS_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("close-range failure proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::CloseRangeUnavailable,
+                        IsolationQualificationStageV1::ChildDescriptorScrub,
+                        reason,
+                        Some(errno),
+                    )
+                );
+                assert_eq!(error.is_expected_unavailable(), expected_unavailable);
+            }
+
+            for (errno, reason) in [
+                (0, IsolationQualificationReasonV1::ChildInvariantFailed),
+                (libc::EIO, IsolationQualificationReasonV1::Io),
+                (MAX_LINUX_ERRNO_V1, IsolationQualificationReasonV1::Io),
+            ] {
+                let frame = child_encode_proof_frame(&nonce, PROOF_STATUS_FD_SCRUB_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("descriptor-scrub failure proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::IsolationPreflightFailed,
+                        IsolationQualificationStageV1::ChildDescriptorScrub,
+                        reason,
+                        (errno != 0).then_some(errno),
+                    )
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for frame in [
+                child_encode_proof_frame(&nonce, PROOF_STATUS_CLOSE_RANGE_OS_V1, 0, 0),
+                child_encode_proof_frame(&nonce, PROOF_STATUS_CLOSE_RANGE_OS_V1, 0, -1),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_CLOSE_RANGE_OS_V1,
+                    0,
+                    MAX_LINUX_ERRNO_V1 + 1,
+                ),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_CLOSE_RANGE_OS_V1,
+                    PROOF_FLAGS_V1,
+                    libc::ENOSYS,
+                ),
+                child_encode_proof_frame(&nonce, PROOF_STATUS_FD_SCRUB_V1, 0, -1),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_FD_SCRUB_V1,
+                    0,
+                    MAX_LINUX_ERRNO_V1 + 1,
+                ),
+                child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_FD_SCRUB_V1,
+                    PROOF_FLAGS_V1,
+                    libc::EIO,
+                ),
+            ] {
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("noncanonical descriptor failure proof was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for (status, errno) in [
+                (PROOF_STATUS_CLOSE_RANGE_OS_V1, libc::ENOSYS),
+                (PROOF_STATUS_FD_SCRUB_V1, libc::EIO),
+            ] {
+                for offset in [
+                    FRAME_PID_OFFSET_V1,
+                    FRAME_UID_OFFSET_V1,
+                    FRAME_EUID_OFFSET_V1,
+                    FRAME_GID_OFFSET_V1,
+                    FRAME_EGID_OFFSET_V1,
+                ] {
+                    let mut wrong_identity = child_encode_proof_frame(&nonce, status, 0, errno);
+                    wrong_identity[offset] ^= 1;
+                    let error = verify_proof_frame(&wrong_identity, &nonce)
+                        .expect_err("descriptor failure accepted a noncanonical identity");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                    assert!(!error.is_expected_unavailable());
+                }
             }
         }
 
