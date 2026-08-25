@@ -38,7 +38,8 @@ pub const EFFECT_IR_V2_MAX_CANONICAL_BYTES: u64 = 512 * 1024 * 1024;
 pub const EFFECT_IR_V2_MAX_COLLECTION_ITEMS: u64 = 10_000_000;
 pub const LINUX_PYTEST_V1_MAX_TRACE_EVENTS: u64 = 10_000_000;
 pub const LINUX_PYTEST_V1_MAX_TRACE_BYTES: u64 = 512 * 1024 * 1024;
-pub const LINUX_PYTEST_V1_MAX_DESCENDANT_TASKS: u64 = 256;
+/// Maximum task lifetimes in one trace, including the initial task.
+pub const LINUX_PYTEST_V1_MAX_TASK_LIFETIMES: u64 = 256;
 pub const LINUX_PYTEST_V1_MAX_STREAM_BYTES: u64 = 16 * 1024 * 1024;
 pub const LINUX_PYTEST_V1_MAX_SELECTORS: usize = 4_096;
 pub const LINUX_PYTEST_SHAPE_V1_SCHEMA: &str = "again.linux-pytest.shape.v1";
@@ -92,6 +93,8 @@ mod snapshot_verify;
     )
 )]
 mod trace_protocol;
+mod tracer_event_message;
+mod tracer_fork_decode;
 mod tracer_seccomp;
 mod tracer_syscall_info;
 mod tracer_task_state;
@@ -1022,7 +1025,7 @@ impl TraceCompletenessV2 {
             || self.counters.seccomp_trace_count > self.counters.syscall_event_count
             || self.counters.ptrace_event_count > LINUX_PYTEST_V1_MAX_TRACE_EVENTS
             || self.counters.trace_encoded_bytes > LINUX_PYTEST_V1_MAX_TRACE_BYTES
-            || self.counters.task_birth_count > LINUX_PYTEST_V1_MAX_DESCENDANT_TASKS
+            || self.counters.task_birth_count > LINUX_PYTEST_V1_MAX_TASK_LIFETIMES
             || self.counters.task_exec_count > self.counters.task_birth_count
             || self.counters.task_exit_count > self.counters.task_birth_count
             || self.counters.task_reap_count > self.counters.task_exit_count
@@ -2831,49 +2834,76 @@ impl StreamCaptureV2 {
 #[serde(transparent)]
 pub struct RawLinuxWaitStatusV1(pub u32);
 
+/// One exact final Linux wait termination shared by transport, lifecycle, and
+/// persisted-record validation. Keeping this vocabulary in the parent module
+/// prevents those three boundaries from accepting different status shapes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinuxWaitTerminationV1 {
+    Exited { code: u8 },
+    Signaled { signal: u8, core_dumped: bool },
+}
+
+impl LinuxWaitTerminationV1 {
+    const fn valid(self) -> bool {
+        match self {
+            Self::Exited { .. } => true,
+            Self::Signaled {
+                signal,
+                core_dumped,
+            } => {
+                signal >= 1
+                    && signal <= 64
+                    && (!core_dumped || matches!(signal, 3 | 4 | 5 | 6 | 7 | 8 | 11 | 24 | 25 | 31))
+            }
+        }
+    }
+}
+
 impl RawLinuxWaitStatusV1 {
     pub const fn exited(code: u8) -> Self {
         Self((code as u32) << 8)
     }
 
     pub const fn is_success(self) -> bool {
-        self.0 == 0
+        matches!(
+            self.termination(),
+            Some(LinuxWaitTerminationV1::Exited { code: 0 })
+        )
     }
 
     pub const fn exit_code(self) -> Option<u8> {
-        if self.0 <= u16::MAX as u32 && self.0 & 0xff == 0 {
-            Some(((self.0 >> 8) & 0xff) as u8)
-        } else {
-            None
+        match self.termination() {
+            Some(LinuxWaitTerminationV1::Exited { code }) => Some(code),
+            Some(LinuxWaitTerminationV1::Signaled { .. }) | None => None,
         }
     }
 
     pub const fn terminating_signal(self) -> Option<(u8, bool)> {
-        if self.0 > u16::MAX as u32 || self.0 & 0xff00 != 0 {
-            return None;
-        }
-        let low_byte = self.0 & 0xff;
-        let signal = low_byte & 0x7f;
-        if signal >= 1 && signal <= 64 {
-            Some((signal as u8, low_byte & 0x80 != 0))
-        } else {
-            None
+        match self.termination() {
+            Some(LinuxWaitTerminationV1::Signaled {
+                signal,
+                core_dumped,
+            }) => Some((signal, core_dumped)),
+            Some(LinuxWaitTerminationV1::Exited { .. }) | None => None,
         }
     }
 
     pub const fn is_final(self) -> bool {
-        if self.0 > u16::MAX as u32 {
-            return false;
+        self.termination().is_some()
+    }
+
+    const fn termination(self) -> Option<LinuxWaitTerminationV1> {
+        match tracer_wait_status::decode_linux_wait_status_x86_64_v1(self.0 as i32) {
+            Ok(tracer_wait_status::LinuxWaitStatusClassV1::Final(termination)) => Some(termination),
+            Ok(
+                tracer_wait_status::LinuxWaitStatusClassV1::SyscallEntryOrExitStop
+                | tracer_wait_status::LinuxWaitStatusClassV1::PtraceEvent(_)
+                | tracer_wait_status::LinuxWaitStatusClassV1::PtraceEventStopRequiringContext(_)
+                | tracer_wait_status::LinuxWaitStatusClassV1::EventZeroStopRequiringSiginfo(_)
+                | tracer_wait_status::LinuxWaitStatusClassV1::Continued,
+            )
+            | Err(_) => None,
         }
-        let low_byte = self.0 & 0xff;
-        if low_byte == 0 {
-            return true;
-        }
-        if self.0 == 0xffff || low_byte == 0x7f || self.0 & 0xff00 != 0 {
-            return false;
-        }
-        let signal = low_byte & 0x7f;
-        signal >= 1 && signal <= 64
     }
 }
 
@@ -4331,11 +4361,19 @@ mod tests {
             Err(RefusalCode::SelectorNonUtf8)
         );
 
-        for valid in [0x0000, 0x0100, 0x7f00, 0x0001, 0x0081, 0x0040] {
+        for valid in [0x0000, 0x0100, 0x7f00, 0x0001, 0x0040, 0x008b] {
             assert!(RawLinuxWaitStatusV1(valid).is_final(), "{valid:#x}");
         }
-        for invalid in [0x0080, 0x0101, 0x007f, 0xffff, 0x1_0000, 0x0041] {
+        for invalid in [0x0080, 0x0081, 0x0101, 0x007f, 0xffff, 0x1_0000, 0x0041] {
             assert!(!RawLinuxWaitStatusV1(invalid).is_final(), "{invalid:#x}");
+        }
+
+        for raw in 0_u32..=u32::from(u16::MAX) {
+            let expected = matches!(
+                tracer_wait_status::decode_linux_wait_status_x86_64_v1(raw as i32),
+                Ok(tracer_wait_status::LinuxWaitStatusClassV1::Final(_))
+            );
+            assert_eq!(RawLinuxWaitStatusV1(raw).is_final(), expected, "{raw:#x}");
         }
     }
 
@@ -4362,7 +4400,7 @@ mod tests {
         assert!(forged.validate().is_err());
 
         let mut forged = record();
-        forged.trace.counters.task_birth_count = LINUX_PYTEST_V1_MAX_DESCENDANT_TASKS + 1;
+        forged.trace.counters.task_birth_count = LINUX_PYTEST_V1_MAX_TASK_LIFETIMES + 1;
         assert!(forged.validate().is_err());
 
         let mut forged = record();

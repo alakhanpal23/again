@@ -5,7 +5,7 @@
 //! logical task IDs. This module records no `EffectIR`, creates no execution or
 //! reuse authority, and owns no descriptors.
 
-use super::LogicalTaskId;
+use super::{LinuxWaitTerminationV1, LogicalTaskId};
 
 pub(super) const TRACER_TASK_MAX_TASKS_V1: usize = 256;
 pub(super) const TRACER_TASK_CLONE_NR_X86_64_V1: u32 = 56;
@@ -17,11 +17,8 @@ pub(super) const TRACER_TASK_EXIT_GROUP_NR_X86_64_V1: u32 = 231;
 pub(super) const TRACER_TASK_EXECVEAT_NR_X86_64_V1: u32 = 322;
 pub(super) const TRACER_TASK_CLONE3_NR_X86_64_V1: u32 = 435;
 
-// The historical durable name says "descendants", but its value is the total
-// task ceiling including the initial task. Keep this transport bound identical.
 const _: () = assert!(TRACER_TASK_MAX_TASKS_V1 == 256);
-const _: () =
-    assert!(TRACER_TASK_MAX_TASKS_V1 as u64 == super::LINUX_PYTEST_V1_MAX_DESCENDANT_TASKS);
+const _: () = assert!(TRACER_TASK_MAX_TASKS_V1 as u64 == super::LINUX_PYTEST_V1_MAX_TASK_LIFETIMES);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum TracerTaskBirthKindV1 {
@@ -58,21 +55,6 @@ impl TracerTaskChildBirthKindV1 {
 pub(super) enum TracerTaskNoReturnKindV1 {
     Exit,
     ExitGroup,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum TracerTaskTerminationV1 {
-    Exited { code: u8 },
-    Signaled { signal: u8, core_dumped: bool },
-}
-
-impl TracerTaskTerminationV1 {
-    const fn valid(self) -> bool {
-        match self {
-            Self::Exited { .. } => true,
-            Self::Signaled { signal, .. } => signal >= 1 && signal <= 64,
-        }
-    }
 }
 
 /// One control or kernel-derived transition. The type intentionally has no
@@ -118,12 +100,12 @@ pub(super) enum TracerTaskObservationV1 {
     PtraceExitEvent {
         sequence: u64,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     },
     TerminalReap {
         sequence: u64,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     },
 }
 
@@ -169,13 +151,13 @@ pub(super) enum NormalizedTracerTaskEventV1 {
     PtraceExitEvent {
         transport_sequence: u64,
         logical_task_id: LogicalTaskId,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
         resolved_no_return: Option<TracerTaskNoReturnKindV1>,
     },
     TerminalReap {
         transport_sequence: u64,
         logical_task_id: LogicalTaskId,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     },
 }
 
@@ -240,12 +222,11 @@ struct TaskSlotV1 {
     raw_tid: i32,
     phase: TaskPhaseV1,
     pending_syscall: Option<u32>,
-    child_announcement_seen_for_pending: bool,
     child_ready_seen_for_pending: bool,
     pending_child_raw_tid: i32,
     exec_event_seen_for_pending: bool,
     exec_seen_ever: bool,
-    termination: Option<TracerTaskTerminationV1>,
+    termination: Option<LinuxWaitTerminationV1>,
 }
 
 impl TaskSlotV1 {
@@ -255,7 +236,6 @@ impl TaskSlotV1 {
         raw_tid: 0,
         phase: TaskPhaseV1::Unused,
         pending_syscall: None,
-        child_announcement_seen_for_pending: false,
         child_ready_seen_for_pending: false,
         pending_child_raw_tid: 0,
         exec_event_seen_for_pending: false,
@@ -607,7 +587,7 @@ impl TracerTaskStateRecorderV1 {
         if !Self::creation_syscall_permits(Some(creation_syscall), kind) {
             return Err(TracerTaskExecuteOnlyReasonV1::ChildAnnouncementSyscallMismatch);
         }
-        if self.tasks[parent_index].child_announcement_seen_for_pending {
+        if self.tasks[parent_index].pending_child_raw_tid != 0 {
             return Err(TracerTaskExecuteOnlyReasonV1::DuplicateChildAnnouncement);
         }
         if !matches!(kind, TracerTaskChildBirthKindV1::Clone)
@@ -627,7 +607,6 @@ impl TracerTaskStateRecorderV1 {
             kind,
             group_relation,
         });
-        self.tasks[parent_index].child_announcement_seen_for_pending = true;
         self.tasks[parent_index].pending_child_raw_tid = child_raw_tid;
         let next_counters = self
             .counters
@@ -676,8 +655,7 @@ impl TracerTaskStateRecorderV1 {
         if parent.phase != TaskPhaseV1::Running {
             return Err(TracerTaskExecuteOnlyReasonV1::ParentNotRunning);
         }
-        if !parent.child_announcement_seen_for_pending
-            || parent.pending_child_raw_tid != pending.raw_tid
+        if parent.pending_child_raw_tid != pending.raw_tid
             || !Self::creation_syscall_permits(parent.pending_syscall, announcement.kind)
         {
             return Err(TracerTaskExecuteOnlyReasonV1::ChildAnnouncementSyscallMismatch);
@@ -784,7 +762,6 @@ impl TracerTaskStateRecorderV1 {
             return Err(TracerTaskExecuteOnlyReasonV1::DuplicateSeccompEntry);
         }
         self.tasks[index].pending_syscall = Some(syscall_number);
-        self.tasks[index].child_announcement_seen_for_pending = false;
         self.tasks[index].child_ready_seen_for_pending = false;
         self.tasks[index].pending_child_raw_tid = 0;
         self.tasks[index].exec_event_seen_for_pending = false;
@@ -831,7 +808,7 @@ impl TracerTaskStateRecorderV1 {
             }
         }
         if Self::is_creation_syscall(syscall_number) {
-            let announced = self.tasks[index].child_announcement_seen_for_pending;
+            let announced = self.tasks[index].pending_child_raw_tid != 0;
             let ready = self.tasks[index].child_ready_seen_for_pending;
             match result {
                 -4095..=-1 if !announced => {}
@@ -846,7 +823,6 @@ impl TracerTaskStateRecorderV1 {
             }
         }
         self.tasks[index].pending_syscall = None;
-        self.tasks[index].child_announcement_seen_for_pending = false;
         self.tasks[index].child_ready_seen_for_pending = false;
         self.tasks[index].pending_child_raw_tid = 0;
         self.tasks[index].exec_event_seen_for_pending = false;
@@ -864,7 +840,7 @@ impl TracerTaskStateRecorderV1 {
         &mut self,
         sequence: u64,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     ) -> Result<
         (Option<NormalizedTracerTaskEventV1>, TracerTaskCountersV1),
         TracerTaskExecuteOnlyReasonV1,
@@ -883,7 +859,7 @@ impl TracerTaskStateRecorderV1 {
             }
         }
         let resolved_no_return = match termination {
-            TracerTaskTerminationV1::Exited { .. } => match self.tasks[index].pending_syscall {
+            LinuxWaitTerminationV1::Exited { .. } => match self.tasks[index].pending_syscall {
                 Some(TRACER_TASK_EXIT_NR_X86_64_V1) => Some(TracerTaskNoReturnKindV1::Exit),
                 Some(TRACER_TASK_EXIT_GROUP_NR_X86_64_V1) => {
                     Some(TracerTaskNoReturnKindV1::ExitGroup)
@@ -891,7 +867,7 @@ impl TracerTaskStateRecorderV1 {
                 None => return Err(TracerTaskExecuteOnlyReasonV1::NoReturnResolutionRequired),
                 Some(_) => return Err(TracerTaskExecuteOnlyReasonV1::OutstandingSyscall),
             },
-            TracerTaskTerminationV1::Signaled { .. } => {
+            LinuxWaitTerminationV1::Signaled { .. } => {
                 if self.tasks[index].pending_syscall.is_some() {
                     return Err(TracerTaskExecuteOnlyReasonV1::OutstandingSyscall);
                 }
@@ -899,7 +875,6 @@ impl TracerTaskStateRecorderV1 {
             }
         };
         self.tasks[index].pending_syscall = None;
-        self.tasks[index].child_announcement_seen_for_pending = false;
         self.tasks[index].child_ready_seen_for_pending = false;
         self.tasks[index].pending_child_raw_tid = 0;
         self.tasks[index].exec_event_seen_for_pending = false;
@@ -924,7 +899,7 @@ impl TracerTaskStateRecorderV1 {
         &mut self,
         sequence: u64,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     ) -> Result<
         (Option<NormalizedTracerTaskEventV1>, TracerTaskCountersV1),
         TracerTaskExecuteOnlyReasonV1,
@@ -949,7 +924,6 @@ impl TracerTaskStateRecorderV1 {
         self.tasks[index].phase = TaskPhaseV1::Reaped;
         self.tasks[index].raw_tid = 0;
         self.tasks[index].pending_syscall = None;
-        self.tasks[index].child_announcement_seen_for_pending = false;
         self.tasks[index].child_ready_seen_for_pending = false;
         self.tasks[index].pending_child_raw_tid = 0;
         self.tasks[index].exec_event_seen_for_pending = false;
@@ -989,7 +963,6 @@ impl TracerTaskStateRecorderV1 {
             raw_tid,
             phase: TaskPhaseV1::Running,
             pending_syscall: None,
-            child_announcement_seen_for_pending: false,
             child_ready_seen_for_pending: false,
             pending_child_raw_tid: 0,
             exec_event_seen_for_pending: false,
@@ -1302,7 +1275,7 @@ mod tests {
         recorder: &mut TracerTaskStateRecorderV1,
         sink: &mut FixedSinkV1<N>,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     ) -> NormalizedTracerTaskEventV1 {
         let index = sink.length;
         observe(
@@ -1321,7 +1294,7 @@ mod tests {
         recorder: &mut TracerTaskStateRecorderV1,
         sink: &mut FixedSinkV1<N>,
         raw_tid: i32,
-        termination: TracerTaskTerminationV1,
+        termination: LinuxWaitTerminationV1,
     ) {
         observe(
             recorder,
@@ -1347,7 +1320,7 @@ mod tests {
             TRACER_TASK_EXIT_NR_X86_64_V1
         };
         entry(recorder, sink, raw_tid, syscall_number);
-        let termination = TracerTaskTerminationV1::Exited { code };
+        let termination = LinuxWaitTerminationV1::Exited { code };
         let event = ptrace_exit(recorder, sink, raw_tid, termination);
         reap(recorder, sink, raw_tid, termination);
         event
@@ -1392,7 +1365,7 @@ mod tests {
             NormalizedTracerTaskEventV1::PtraceExitEvent {
                 transport_sequence: 5,
                 logical_task_id: LogicalTaskId(1),
-                termination: TracerTaskTerminationV1::Exited { code: 0 },
+                termination: LinuxWaitTerminationV1::Exited { code: 0 },
                 resolved_no_return: Some(TracerTaskNoReturnKindV1::ExitGroup),
             }
         );
@@ -2137,7 +2110,7 @@ mod tests {
                 &mut recorder,
                 &mut sink,
                 ROOT_TID,
-                TracerTaskTerminationV1::Exited { code: 0 },
+                LinuxWaitTerminationV1::Exited { code: 0 },
             );
             assert!(matches!(
                 event,
@@ -2150,7 +2123,7 @@ mod tests {
                 &mut recorder,
                 &mut sink,
                 ROOT_TID,
-                TracerTaskTerminationV1::Exited { code: 0 },
+                LinuxWaitTerminationV1::Exited { code: 0 },
             );
             let summary = recorder.complete().unwrap().summary();
             assert_eq!(summary.no_return_resolution_count, 1);
@@ -2186,7 +2159,7 @@ mod tests {
                 TracerTaskObservationV1::PtraceExitEvent {
                     sequence: missing.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Exited { code: 0 },
+                    termination: LinuxWaitTerminationV1::Exited { code: 0 },
                 },
                 &mut sink,
             ),
@@ -2202,7 +2175,7 @@ mod tests {
                 TracerTaskObservationV1::PtraceExitEvent {
                     sequence: wrong_pending.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Exited { code: 0 },
+                    termination: LinuxWaitTerminationV1::Exited { code: 0 },
                 },
                 &mut sink,
             ),
@@ -2215,8 +2188,8 @@ mod tests {
         let mut signaled = TracerTaskStateRecorderV1::new();
         let mut sink = FixedSinkV1::<8>::new();
         initial(&mut signaled, &mut sink);
-        let termination = TracerTaskTerminationV1::Signaled {
-            signal: 9,
+        let termination = LinuxWaitTerminationV1::Signaled {
+            signal: 11,
             core_dumped: true,
         };
         ptrace_exit(&mut signaled, &mut sink, ROOT_TID, termination);
@@ -2232,7 +2205,7 @@ mod tests {
                     TracerTaskObservationV1::PtraceExitEvent {
                         sequence: invalid.next_transport_sequence,
                         raw_tid: ROOT_TID,
-                        termination: TracerTaskTerminationV1::Signaled {
+                        termination: LinuxWaitTerminationV1::Signaled {
                             signal,
                             core_dumped: false,
                         },
@@ -2252,7 +2225,7 @@ mod tests {
                 TracerTaskObservationV1::PtraceExitEvent {
                     sequence: pending_signal.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Signaled {
+                    termination: LinuxWaitTerminationV1::Signaled {
                         signal: 9,
                         core_dumped: false,
                     },
@@ -2265,7 +2238,7 @@ mod tests {
         let mut mismatch = TracerTaskStateRecorderV1::new();
         let mut sink = FixedSinkV1::<8>::new();
         initial(&mut mismatch, &mut sink);
-        let expected = TracerTaskTerminationV1::Signaled {
+        let expected = LinuxWaitTerminationV1::Signaled {
             signal: 15,
             core_dumped: false,
         };
@@ -2275,8 +2248,8 @@ mod tests {
                 TracerTaskObservationV1::TerminalReap {
                     sequence: mismatch.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Signaled {
-                        signal: 15,
+                    termination: LinuxWaitTerminationV1::Signaled {
+                        signal: 11,
                         core_dumped: true,
                     },
                 },
@@ -2390,7 +2363,7 @@ mod tests {
                 TracerTaskObservationV1::TerminalReap {
                     sequence: reap_first.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Exited { code: 0 },
+                    termination: LinuxWaitTerminationV1::Exited { code: 0 },
                 },
                 &mut sink,
             ),
@@ -2410,14 +2383,14 @@ mod tests {
             &mut duplicate_exit,
             &mut sink,
             ROOT_TID,
-            TracerTaskTerminationV1::Exited { code: 0 },
+            LinuxWaitTerminationV1::Exited { code: 0 },
         );
         assert_eq!(
             duplicate_exit.observe(
                 TracerTaskObservationV1::PtraceExitEvent {
                     sequence: duplicate_exit.next_transport_sequence,
                     raw_tid: ROOT_TID,
-                    termination: TracerTaskTerminationV1::Exited { code: 0 },
+                    termination: LinuxWaitTerminationV1::Exited { code: 0 },
                 },
                 &mut sink,
             ),
@@ -2437,7 +2410,7 @@ mod tests {
             &mut late,
             &mut sink,
             ROOT_TID,
-            TracerTaskTerminationV1::Exited { code: 0 },
+            LinuxWaitTerminationV1::Exited { code: 0 },
         );
         assert_eq!(
             late.observe(
@@ -2535,7 +2508,7 @@ mod tests {
             &mut parent_not_running,
             &mut sink,
             ROOT_TID,
-            TracerTaskTerminationV1::Exited { code: 0 },
+            LinuxWaitTerminationV1::Exited { code: 0 },
         );
         assert_eq!(
             parent_not_running.observe(

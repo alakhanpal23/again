@@ -248,8 +248,7 @@ fn decode_seccomp_v1(
         return Err(PtraceSyscallInfoDecodeErrorV1::SeccompSyscallNumberNotCanonicalNative);
     }
 
-    let expected_cookie =
-        super::tracer_seccomp::TRACE_ALL_NATIVE_SECCOMP_POLICY_SUMMARY_V1.trace_cookie();
+    let expected_cookie = super::tracer_seccomp::trace_all_native_seccomp_cookie_spec_v1();
     if read_u32_le_v1(buffer, SECCOMP_RETURN_DATA_OFFSET_V1) != u32::from(expected_cookie) {
         return Err(PtraceSyscallInfoDecodeErrorV1::SeccompCookieMismatch);
     }
@@ -743,7 +742,7 @@ mod tests {
     }
 
     #[test]
-    fn seccomp_cookie_is_read_from_the_frozen_policy_summary_and_is_exact() {
+    fn seccomp_cookie_matches_the_frozen_policy_spec_exactly() {
         let expected_cookie =
             super::super::tracer_seccomp::TRACE_ALL_NATIVE_SECCOMP_POLICY_SUMMARY_V1.trace_cookie();
         assert_eq!(expected_cookie, 0xa731);

@@ -32,6 +32,16 @@ const TRACE_ALL_NATIVE_SECCOMP_CANONICAL_BYTE_COUNT_V1: usize =
     TRACE_ALL_NATIVE_SECCOMP_INSTRUCTION_COUNT_V1 * 8;
 const TRACE_ALL_NATIVE_SECCOMP_BYTES_FNV1A64_V1: u64 = 0x1fb7_ac42_7a7b_ad22;
 
+/// Frozen numeric compatibility value shared by the policy and its decoders.
+///
+/// Matching this value proves only that one kernel record has the expected
+/// schema tag. It does not prove that this filter was installed. The future
+/// connector must separately retain a sealed, runtime-issued installation
+/// token before any completed trace can gain authority.
+pub(super) const fn trace_all_native_seccomp_cookie_spec_v1() -> u16 {
+    TRACE_ALL_NATIVE_SECCOMP_COOKIE_V1
+}
+
 /// Linux `struct seccomp_data`, frozen here only for layout and BPF offsets.
 #[allow(dead_code)]
 #[repr(C)]
@@ -233,7 +243,7 @@ impl TraceAllNativeSeccompPolicySummaryV1 {
     }
 
     pub(super) const fn trace_cookie(&self) -> u16 {
-        TRACE_ALL_NATIVE_SECCOMP_COOKIE_V1
+        trace_all_native_seccomp_cookie_spec_v1()
     }
 
     pub(super) const fn allow_count(&self) -> u16 {

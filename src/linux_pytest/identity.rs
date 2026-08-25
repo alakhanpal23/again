@@ -1255,20 +1255,20 @@ fn decode_stream_state(bytes: &[u8]) -> Result<StreamStateClassV1, LinuxPytestCo
 }
 
 fn wait_class(value: RawLinuxWaitStatusV1) -> Result<WaitClassV1, LinuxPytestContractError> {
-    if !value.is_final() {
-        return Err(LinuxPytestContractError::MalformedRecord);
+    match value
+        .termination()
+        .ok_or(LinuxPytestContractError::MalformedRecord)?
+    {
+        super::LinuxWaitTerminationV1::Exited { code: 0 } => Ok(WaitClassV1::Success),
+        super::LinuxWaitTerminationV1::Exited { code } => Ok(WaitClassV1::Exited(code)),
+        super::LinuxWaitTerminationV1::Signaled {
+            signal,
+            core_dumped,
+        } => Ok(WaitClassV1::Signaled {
+            signal,
+            core_dumped,
+        }),
     }
-    if value.0 == 0 {
-        return Ok(WaitClassV1::Success);
-    }
-    let low = (value.0 & 0xff) as u8;
-    if low == 0 {
-        return Ok(WaitClassV1::Exited(((value.0 >> 8) & 0xff) as u8));
-    }
-    Ok(WaitClassV1::Signaled {
-        signal: low & 0x7f,
-        core_dumped: low & 0x80 != 0,
-    })
 }
 
 fn encode_wait_class(

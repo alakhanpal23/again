@@ -339,8 +339,9 @@ then becomes execute-only.
 
 All safety and storage limits are fixed profile inputs and therefore part of
 the profile digest. The initial values are 16 MiB per captured stream, 256
-descendant tasks, 10 million trace events, 512 MiB of trace encoding, and 15
-minutes of foreground or shadow wall time. Snapshot, branch, scratch, memory,
+total task lifetimes including the initial task, 10 million trace events,
+512 MiB of trace encoding, and 15 minutes of foreground or shadow wall time.
+Snapshot, branch, scratch, memory,
 open-file, and per-file limits are enforced by the smallest applicable tmpfs,
 rlimit, syscall counter, and supervisor budget and are serialized in the
 profile. Exceeding any limit terminates or finishes the foreground according
@@ -1090,7 +1091,9 @@ unreferenced V2 GC candidate or a non-hit row. Quarantine is monotonic. V2 GC re
 expired, terminal, unreachable V2 snapshots/jobs/records/blobs and never
 touches legacy CAS or the workspace.
 
-The implementation boundary is four narrow Rust interfaces:
+The implemented boundary has three narrow Rust interfaces. The production
+tracer connector is deliberately withheld until it can consume sealed runtime
+evidence rather than accepting a forgeable summary:
 
 ```text
 ProfileAdmission::parse_lexical(input) -> PytestAdmissionDraft | Refusal
@@ -1100,8 +1103,6 @@ ProfileAdmission::finalize_against_snapshot(draft, snapshot)
 SnapshotProvider::seal_validation_snapshot(draft, expected_shape,
                                              expected_closure)
   -> RevalidatedObservationClosureV1
-SandboxTracer::execute(prepared, mode) -> VerifiedExecutionRecordV2
-SandboxTracer::capability_probe(validation_snapshot, isolated_import_pytest)
 PromotionStore::record_primary / finish_shadow / fail_shadow /
                 lookup_promoted_by_shape(shape) / quarantine / expire
 ```
@@ -1110,19 +1111,21 @@ PromotionStore::record_primary / finish_shadow / fail_shadow /
 requires the store to return at most 64 rows in newest-promotion order with
 request-key tie breaking.
 
-`SandboxTracer` cannot accept raw arbitrary argv; it accepts only
-`PreparedPytest`, whose admission fields are private to the profile parser and
-whose sealed descriptors are live capabilities. The internal
-fixed capability probe is a separate closed enum variant. `SealedSnapshot`
-owns immutable directory descriptor capabilities rather than serializable or
-cloneable host path strings; diagnostic formatting redacts them. All
-cross-interface data structures have round-trip, unknown-version, unknown-bit,
-and canonical-hash tests before integration.
+There is intentionally no general `SandboxTracer` trait. A later private
+connector must consume `PreparedPytest` plus the same sealed isolation,
+installed-filter, lifecycle, stream, filesystem, bounds, and cleanup evidence
+that produced the record before it can bind a `VerifiedExecutionRecordV2`.
+Pure decoders and forgeable summaries cannot mint that completion token. The
+internal fixed capability probe remains a separate closed enum variant.
+`SealedSnapshot` owns immutable directory descriptor capabilities rather than
+serializable or cloneable host path strings; diagnostic formatting redacts
+them. All cross-interface data structures have round-trip, unknown-version,
+unknown-bit, and canonical-hash tests before integration.
 
 ## Parallel implementation plan
 
 The integration owner first freezes `PreparedPytest`, `SealedSnapshot`,
-`EffectRecordV2`, bitmap constants, reason codes, and the four trait method
+`EffectRecordV2`, bitmap constants, reason codes, and the stable trait method
 signatures. After that checkpoint, three implementers work in parallel without
 sharing mutable modules.
 
@@ -1143,7 +1146,8 @@ dirfd/path/fd models, filesystem observations/effects, logical metadata,
 time/random/PID brokers, scheduling classifier, canonical v2 codec, bitmap
 finalizer, and A/B comparison digest. Deliver syscall-level fixtures for every
 bitmap bit, including vDSO bypass and clone/clone3/fork/vfork/exec/exit. Expose
-only `SandboxTracer`; do not create mounts, parse public argv, or write SQLite.
+only a private, consuming connector completion token; do not create mounts,
+parse public argv, or write SQLite.
 
 ### Implementer C — admission, storage, worker, and measurement harness
 

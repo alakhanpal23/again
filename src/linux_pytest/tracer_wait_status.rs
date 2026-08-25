@@ -13,6 +13,8 @@
 //! an interrupt stop, and a seized group-stop. This decoder stores no task ID,
 //! event message, command, path, or pointer and grants no authority.
 
+use super::LinuxWaitTerminationV1;
+
 const LINUX_WAIT_LOW_BYTE_MASK_V1: u32 = 0x0000_00ff;
 const LINUX_WAIT_SIGNAL_MASK_V1: u8 = 0x7f;
 const LINUX_WAIT_CORE_FLAG_V1: u8 = 0x80;
@@ -21,20 +23,12 @@ const LINUX_WAIT_CONTINUED_V1: u32 = 0x0000_ffff;
 const LINUX_WAIT_EVENT_MASK_V1: u32 = 0xffff_0000;
 
 const LINUX_X86_64_MAX_SIGNAL_V1: u8 = 64;
-const LINUX_SIGQUIT_V1: u8 = 3;
-const LINUX_SIGILL_V1: u8 = 4;
 const LINUX_SIGTRAP_V1: u8 = 5;
-const LINUX_SIGABRT_V1: u8 = 6;
-const LINUX_SIGBUS_V1: u8 = 7;
-const LINUX_SIGFPE_V1: u8 = 8;
 const LINUX_SIGSEGV_V1: u8 = 11;
 const LINUX_SIGSTOP_V1: u8 = 19;
 const LINUX_SIGTSTP_V1: u8 = 20;
 const LINUX_SIGTTIN_V1: u8 = 21;
 const LINUX_SIGTTOU_V1: u8 = 22;
-const LINUX_SIGXCPU_V1: u8 = 24;
-const LINUX_SIGXFSZ_V1: u8 = 25;
-const LINUX_SIGSYS_V1: u8 = 31;
 const LINUX_TRACESYSGOOD_STOP_SIGNAL_V1: u8 = LINUX_SIGTRAP_V1 | 0x80;
 
 const LINUX_PTRACE_EVENT_FORK_V1: u16 = 1;
@@ -50,13 +44,6 @@ const _: () = assert!(LINUX_WAIT_STOP_LOW_BYTE_V1 == 0x7f);
 const _: () = assert!(LINUX_WAIT_CONTINUED_V1 == 0xffff);
 const _: () = assert!(LINUX_TRACESYSGOOD_STOP_SIGNAL_V1 == 0x85);
 const _: () = assert!(LINUX_PTRACE_EVENT_STOP_V1 == 128);
-
-/// A final wait result with all status-only ambiguity removed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum LinuxWaitTerminationV1 {
-    Exited { code: u8 },
-    Signaled { signal: u8, core_dumped: bool },
-}
 
 /// Ptrace events admitted by the first production tracer contract.
 ///
@@ -248,7 +235,13 @@ const fn decode_linux_terminal_signal_v1(
     }
 
     let core_dumped = low_byte & LINUX_WAIT_CORE_FLAG_V1 != 0;
-    if core_dumped && !is_x86_64_core_dump_signal_v1(signal) {
+    if core_dumped
+        && !(LinuxWaitTerminationV1::Signaled {
+            signal,
+            core_dumped,
+        })
+        .valid()
+    {
         return Err(LinuxWaitStatusDecodeErrorV1::CoreFlagForNonCoreDumpSignal { signal });
     }
 
@@ -332,22 +325,6 @@ const fn is_job_control_stop_signal_v1(signal: u8) -> bool {
     matches!(
         signal,
         LINUX_SIGSTOP_V1 | LINUX_SIGTSTP_V1 | LINUX_SIGTTIN_V1 | LINUX_SIGTTOU_V1
-    )
-}
-
-const fn is_x86_64_core_dump_signal_v1(signal: u8) -> bool {
-    matches!(
-        signal,
-        LINUX_SIGQUIT_V1
-            | LINUX_SIGILL_V1
-            | LINUX_SIGTRAP_V1
-            | LINUX_SIGABRT_V1
-            | LINUX_SIGBUS_V1
-            | LINUX_SIGFPE_V1
-            | LINUX_SIGSEGV_V1
-            | LINUX_SIGXCPU_V1
-            | LINUX_SIGXFSZ_V1
-            | LINUX_SIGSYS_V1
     )
 }
 
@@ -443,7 +420,11 @@ mod tests {
             ));
             assert_eq!(
                 decode_linux_wait_status_x86_64_v1(signal_status_v1(signal, true)).is_ok(),
-                is_x86_64_core_dump_signal_v1(signal)
+                LinuxWaitTerminationV1::Signaled {
+                    signal,
+                    core_dumped: true,
+                }
+                .valid()
             );
         }
     }
