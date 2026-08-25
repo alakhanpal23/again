@@ -172,17 +172,31 @@ ascending order, clears and scans the ambient set, zeros all six v3
 effective/permitted/inheritable words, and sets `no_new_privs`. It then
 independently rereads the six zero words, empty bounding and ambient sets with
 the same boundary, exact securebits, `no_new_privs == 1`, and the authenticated
-fd 0 identity. Only then can success mask `0x7F` be sent; the prior `0x3F`
-frame is stale. Canonical status 9 failures are always
-`isolation_preflight_failed` and never expected unavailability.
+fd 0 identity. That establishes capability bit-prefix `0x007F`, but the
+current terminal child does not emit success at that boundary: the following
+Landlock slice extends exact protocol-V2 success to `0x00FF`, making both the
+prior `0x003F` and `0x007F` frames stale. Canonical status 9 failures are
+always `isolation_preflight_failed` and never expected unavailability.
 
 This is source and adversarial-contract evidence until a qualifying runner
 executes the complete product child. Stock hosted Ubuntu still stops at its
 earlier exact UTS-policy refusal. The terminal slice grants no command,
 Python, isolation-session, execution, or reuse authority. Supplementary
 groups and inherited executable mappings remain, and `no_new_privs` does not
-block nested user namespaces; later attachment, Landlock, seccomp, tracer, and
+block nested user namespaces; production attachment, seccomp, tracer, and
 pre-exec audits remain mandatory.
+
+The next source slice extends the same fixed no-command child with a terminal
+Landlock diagnostic. It selects exactly ABI 6 or 7, applies exact handled
+filesystem/TCP/scope masks `0xFFFF`/`0x3`/`0x3`, grants only `tmp` `0x77BE` and
+`run/restricted` `0x17BE`, and runs fixed allow/deny filesystem and TCP
+canaries. Protocol V2 success is `0x00FF`; `0x007F` is stale. ABI 1–5 and a
+VERSION-query `ENOSYS`/`EOPNOTSUPP` are expected unavailability, while a newer
+ABI or any create/add/restrict/canary/cleanup failure is broken preflight. The
+scope mask and ABI-7 logging flag are accepted-policy evidence only: this one
+child does not prove cross-process scope behavior or inspect audit logs. Stock
+hosted Ubuntu still stops at the earlier UTS refusal, so this remains source
+and adversarial-contract evidence until a qualifying runner composes it.
 
 [Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
 passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
@@ -569,9 +583,12 @@ Landlock ABI 6 is the positive-profile floor:
 
 Handle every filesystem right through `TRUNCATE`, TCP bind/connect, device
 ioctl, and both abstract-Unix-socket/signal scopes, with no TCP allow rules.
-On the current ABI-7 target, also enable and commit the audited logging
-controls. Grant read/execute to runtime, ordinary writable-tree rights to the
-branch and scratch mounts, and no device-node creation. A read-only `.venv`
+On the current ABI-7 target, commit
+`LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF` by default, with no host audit
+emission. `NEW_EXEC_ON` and audit emission remain outside the current proof and
+require an explicit operator opt-in. Grant read/execute to runtime, ordinary
+writable-tree rights to the branch and scratch mounts, and no device-node
+creation. A read-only `.venv`
 mount remains mandatory because a broad ancestor Landlock grant cannot be
 narrowed by a descendant rule. See the
 [Linux 6.17 Landlock documentation](https://github.com/torvalds/linux/blob/v6.17/Documentation/userspace-api/landlock.rst).
@@ -602,7 +619,8 @@ After every namespace task is gone:
 | `close_range` is absent or fails | `close_range_unavailable` |
 | Seccomp query, install, TSYNC, or TRACE semantics fail | `seccomp_unavailable` |
 | Ptrace attach, options, event, or exact filter readback fails | `ptrace_unavailable` |
-| Landlock ABI is below 6 or functional enforcement fails | `landlock_unavailable` |
+| Landlock VERSION reports ABI 1–5, `ENOSYS`, or `EOPNOTSUPP` | `landlock_unavailable` |
+| Landlock VERSION reports ABI above 7, or create/add/restrict/canary/cleanup fails | `isolation_preflight_failed` |
 | Pre-exec FD, network, capability, namespace, or handoff audit differs | `isolation_preflight_failed` |
 | Required FIFO, socket, device, unreadable object, or external hardlink group | `snapshot_required_object_unsupported` |
 | Copy, hash, fsync, or atomic-publication construction failure | `snapshot_construction_failed` |
@@ -667,8 +685,10 @@ sleeps.
    null, zero, random, stat, mmap, and ioctl behavior. V1 authorizes no host
    device bind.
 7. **Landlock:** ABI 6 is mandatory so TCP, device-ioctl,
-   abstract-Unix-socket, and signal controls are present. ABI 7 audit controls
-   are enabled and committed when available.
+   abstract-Unix-socket, and signal controls are present. On ABI 7, the silent
+   default commits `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`; host audit
+   emission and `NEW_EXEC_ON` require explicit operator opt-in and remain
+   outside the current proof.
 8. **Tracer placement:** namespace PID 1 is the reaper/tracer and stays outside
    workload Landlock/seccomp. Child-user-namespace `CAP_SYS_ADMIN` permits
    `PTRACE_SECCOMP_GET_FILTER` without any host capability.

@@ -13,7 +13,12 @@
 //! then locks the classic root and UID capability semantics, drops the entire
 //! bounding capability set, clears the ambient, effective, permitted, and
 //! inheritable sets, sets `no_new_privs`, and independently reads every state
-//! back before reporting. The child already owns a private descriptor table,
+//! back. Finally, it reopens and authenticates only fixed private-root paths,
+//! installs a fixed deny-by-default Landlock policy, and exercises exact local
+//! filesystem and TCP denial canaries before reporting. The Landlock scope
+//! mask and ABI-7 audit flag are accepted-policy evidence only; this single
+//! terminal child does not functionally prove inter-process scope isolation or
+//! inspect host audit logs. The child already owns a private descriptor table,
 //! so this does not exercise the kernel's shared-table unshare path. A future
 //! seccomp slice must still prohibit nested-user-namespace creation; this
 //! terminal diagnostic does not claim that `no_new_privs` does so. Executable
@@ -27,7 +32,7 @@
 
 use super::RefusalCode;
 
-const PROTOCOL_VERSION_V1: u16 = 1;
+const PROTOCOL_VERSION_V2: u16 = 2;
 
 /// Completed, terminally reaped diagnostic evidence.
 ///
@@ -74,6 +79,7 @@ enum IsolationQualificationStageV1 {
     ChildMountRoot,
     ChildDescriptorScrub,
     ChildCapabilityDrop,
+    ChildLandlock,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -113,6 +119,7 @@ impl IsolationQualificationStageV1 {
             Self::ChildMountRoot => "child_mount_root",
             Self::ChildDescriptorScrub => "child_descriptor_scrub",
             Self::ChildCapabilityDrop => "child_capability_drop",
+            Self::ChildLandlock => "child_landlock",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -264,6 +271,17 @@ impl IsolationQualificationFailureV1 {
                 IsolationQualificationStageV1::ChildUtsConfiguration,
                 IsolationQualificationReasonV1::AdministrativePolicy,
                 Some(libc::EPERM),
+            )
+        ) {
+            return true;
+        }
+        if matches!(
+            (self.code, self.stage, self.reason, self.errno),
+            (
+                RefusalCode::LandlockUnavailable,
+                IsolationQualificationStageV1::ChildLandlock,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                None | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP),
             )
         ) {
             return true;
@@ -517,13 +535,16 @@ mod platform {
     const PROOF_STATUS_CLOSE_RANGE_OS_V1: u8 = 7;
     const PROOF_STATUS_FD_SCRUB_V1: u8 = 8;
     const PROOF_STATUS_CAPABILITY_DROP_V1: u8 = 9;
-    const PROOF_FLAGS_V1: u8 = 0b0111_1111;
+    const PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1: u8 = 10;
+    const PROOF_STATUS_LANDLOCK_BROKEN_V1: u8 = 11;
+    const PROOF_FLAGS_V1: u16 = 0x00ff;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
     const FRAME_PHASE_OFFSET_V1: usize = 10;
     const FRAME_STATUS_OFFSET_V1: usize = 11;
     const FRAME_FLAGS_OFFSET_V1: usize = 12;
+    const FRAME_FLAGS_END_V1: usize = 14;
     const FRAME_NONCE_OFFSET_V1: usize = 16;
     const FRAME_ERROR_OFFSET_V1: usize = 32;
     const FRAME_PID_OFFSET_V1: usize = 36;
@@ -629,6 +650,28 @@ mod platform {
         | libc::SECBIT_KEEP_CAPS_LOCKED
         | libc::SECBIT_NO_CAP_AMBIENT_RAISE
         | libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
+    const LANDLOCK_CREATE_RULESET_VERSION_V1: u32 = 1;
+    const LANDLOCK_RULE_PATH_BENEATH_V1: u32 = 1;
+    const LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1: u32 = 1;
+    const LANDLOCK_HANDLED_FS_V1: u64 = 0xffff;
+    const LANDLOCK_HANDLED_NET_V1: u64 = 0x3;
+    const LANDLOCK_SCOPED_V1: u64 = 0x3;
+    const LANDLOCK_TMP_ACCESS_V1: u64 = 0x77be;
+    const LANDLOCK_RESTRICTED_ACCESS_V1: u64 = 0x17be;
+    const LANDLOCK_MAX_TRACKED_FDS_V1: usize = 2;
+    const LANDLOCK_FIRST_TRANSIENT_FD_V1: RawFd = 2;
+    const WORKSPACE_FIXTURE_PATH_V1: &CStr = c"/workspace/input";
+    const WORKSPACE_PATH_V1: &CStr = c"/workspace";
+    const TMP_PREEXISTING_PATH_V1: &CStr = c"/tmp/preexisting";
+    const TMP_FROM_ITEM_PATH_V1: &CStr = c"/tmp/from/item";
+    const TMP_TO_ITEM_PATH_V1: &CStr = c"/tmp/to/item";
+    const TMP_NEW_PATH_V1: &CStr = c"/tmp/new";
+    const RUN_RESTRICTED_PATH_V1: &CStr = c"/run/restricted";
+    const RUN_RESTRICTED_RELATIVE_PATH_V1: &CStr = c"run/restricted";
+    const RUN_RESTRICTED_PREEXISTING_PATH_V1: &CStr = c"/run/restricted/preexisting";
+    const RUN_RESTRICTED_FROM_ITEM_PATH_V1: &CStr = c"/run/restricted/from/item";
+    const RUN_RESTRICTED_TO_ITEM_PATH_V1: &CStr = c"/run/restricted/to/item";
+    const LANDLOCK_CANARY_BYTES_V1: &[u8] = b"again-landlock";
     const MAX_LINUX_ERRNO_V1: i32 = 4_095;
 
     #[repr(C)]
@@ -669,7 +712,7 @@ mod platform {
         inheritable: u32,
     }
 
-    #[derive(PartialEq)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     struct ChildPathIdentityV1 {
         mount_id: u64,
         inode: u64,
@@ -678,6 +721,13 @@ mod platform {
         mode: u16,
         uid: u32,
         gid: u32,
+    }
+
+    struct ChildPrivateRootEvidenceV1 {
+        root: ChildPathIdentityV1,
+        tmp: ChildPathIdentityV1,
+        run: ChildPathIdentityV1,
+        proc: ChildPathIdentityV1,
     }
 
     enum ChildMountRootFailureV1 {
@@ -695,6 +745,46 @@ mod platform {
     enum ChildCapabilityFailureV1 {
         Os(i32),
         Invariant,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ChildLandlockFailureV1 {
+        Unavailable(i32),
+        Os(i32),
+        Invariant,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ChildLandlockPolicyV1 {
+        Abi6,
+        Abi7,
+    }
+
+    #[repr(C)]
+    struct LinuxLandlockRulesetAttrV1 {
+        handled_access_fs: u64,
+        handled_access_net: u64,
+        scoped: u64,
+    }
+
+    #[repr(C, packed)]
+    struct LinuxLandlockPathBeneathAttrV1 {
+        allowed_access: u64,
+        parent_fd: i32,
+    }
+
+    struct ChildLandlockTrackedFdsV1 {
+        audit_descriptor: RawFd,
+        descriptors: [RawFd; LANDLOCK_MAX_TRACKED_FDS_V1],
+    }
+
+    impl ChildLandlockTrackedFdsV1 {
+        const fn new() -> Self {
+            Self {
+                audit_descriptor: -1,
+                descriptors: [-1; LANDLOCK_MAX_TRACKED_FDS_V1],
+            }
+        }
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2668,7 +2758,7 @@ mod platform {
         let mut frame = [0_u8; FRAME_BYTES_V1];
         frame[FRAME_MAGIC_OFFSET_V1..FRAME_VERSION_OFFSET_V1].copy_from_slice(magic);
         frame[FRAME_VERSION_OFFSET_V1..FRAME_PHASE_OFFSET_V1]
-            .copy_from_slice(&PROTOCOL_VERSION_V1.to_le_bytes());
+            .copy_from_slice(&PROTOCOL_VERSION_V2.to_le_bytes());
         frame[FRAME_PHASE_OFFSET_V1] = phase;
         frame[FRAME_NONCE_OFFSET_V1..FRAME_ERROR_OFFSET_V1].copy_from_slice(nonce);
         frame
@@ -2686,7 +2776,7 @@ mod platform {
             frame[FRAME_VERSION_OFFSET_V1 + 1],
         ]);
         if &frame[FRAME_MAGIC_OFFSET_V1..FRAME_VERSION_OFFSET_V1] != magic
-            || version != PROTOCOL_VERSION_V1
+            || version != PROTOCOL_VERSION_V2
             || frame[FRAME_PHASE_OFFSET_V1] != phase
             || frame[FRAME_NONCE_OFFSET_V1..FRAME_ERROR_OFFSET_V1] != nonce[..]
         {
@@ -2706,8 +2796,8 @@ mod platform {
         let stage = IsolationQualificationStageV1::VerifyChildReady;
         verify_common_frame(frame, READY_MAGIC_V1, PHASE_READY_V1, nonce, stage)?;
         if frame[FRAME_STATUS_OFFSET_V1] != 0
-            || frame[FRAME_FLAGS_OFFSET_V1] != 0
-            || frame[13..FRAME_NONCE_OFFSET_V1]
+            || decode_u16(frame, FRAME_FLAGS_OFFSET_V1) != 0
+            || frame[FRAME_FLAGS_END_V1..FRAME_NONCE_OFFSET_V1]
                 .iter()
                 .any(|byte| *byte != 0)
             || frame[FRAME_ERROR_OFFSET_V1..].iter().any(|byte| *byte != 0)
@@ -2727,7 +2817,7 @@ mod platform {
     ) -> Result<(), IsolationQualificationFailureV1> {
         let stage = IsolationQualificationStageV1::VerifyChildProof;
         verify_common_frame(frame, PROOF_MAGIC_V1, PHASE_PROOF_V1, nonce, stage)?;
-        if frame[13..FRAME_NONCE_OFFSET_V1]
+        if frame[FRAME_FLAGS_END_V1..FRAME_NONCE_OFFSET_V1]
             .iter()
             .any(|byte| *byte != 0)
             || frame[FRAME_RESERVED_OFFSET_V1..]
@@ -2741,6 +2831,7 @@ mod platform {
             ));
         }
         let status = frame[FRAME_STATUS_OFFSET_V1];
+        let flags = decode_u16(frame, FRAME_FLAGS_OFFSET_V1);
         let errno = decode_i32(frame, FRAME_ERROR_OFFSET_V1);
         let identity_is_exact = decode_u32(frame, FRAME_PID_OFFSET_V1) == 1
             && decode_u32(frame, FRAME_UID_OFFSET_V1) == 0
@@ -2748,7 +2839,7 @@ mod platform {
             && decode_u32(frame, FRAME_GID_OFFSET_V1) == 0
             && decode_u32(frame, FRAME_EGID_OFFSET_V1) == 0;
         if status == PROOF_STATUS_UTS_CONFIGURATION_V1 {
-            if frame[FRAME_FLAGS_OFFSET_V1] != 0 || errno != libc::EPERM || !identity_is_exact {
+            if flags != 0 || errno != libc::EPERM || !identity_is_exact {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -2771,7 +2862,7 @@ mod platform {
                 PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1 => errno == 0,
                 _ => false,
             };
-            if frame[FRAME_FLAGS_OFFSET_V1] != 0 || !canonical_errno || !identity_is_exact {
+            if flags != 0 || !canonical_errno || !identity_is_exact {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -2790,10 +2881,7 @@ mod platform {
             ));
         }
         if status == PROOF_STATUS_CLOSE_RANGE_OS_V1 {
-            if frame[FRAME_FLAGS_OFFSET_V1] != 0
-                || !(1..=MAX_LINUX_ERRNO_V1).contains(&errno)
-                || !identity_is_exact
-            {
+            if flags != 0 || !(1..=MAX_LINUX_ERRNO_V1).contains(&errno) || !identity_is_exact {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -2816,12 +2904,11 @@ mod platform {
         }
         if matches!(
             status,
-            PROOF_STATUS_FD_SCRUB_V1 | PROOF_STATUS_CAPABILITY_DROP_V1
+            PROOF_STATUS_FD_SCRUB_V1
+                | PROOF_STATUS_CAPABILITY_DROP_V1
+                | PROOF_STATUS_LANDLOCK_BROKEN_V1
         ) {
-            if frame[FRAME_FLAGS_OFFSET_V1] != 0
-                || !(0..=MAX_LINUX_ERRNO_V1).contains(&errno)
-                || !identity_is_exact
-            {
+            if flags != 0 || !(0..=MAX_LINUX_ERRNO_V1).contains(&errno) || !identity_is_exact {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -2830,8 +2917,10 @@ mod platform {
             }
             let failure_stage = if status == PROOF_STATUS_FD_SCRUB_V1 {
                 IsolationQualificationStageV1::ChildDescriptorScrub
-            } else {
+            } else if status == PROOF_STATUS_CAPABILITY_DROP_V1 {
                 IsolationQualificationStageV1::ChildCapabilityDrop
+            } else {
+                IsolationQualificationStageV1::ChildLandlock
             };
             return Err(failure(
                 RefusalCode::IsolationPreflightFailed,
@@ -2841,6 +2930,23 @@ mod platform {
                 } else {
                     IsolationQualificationReasonV1::Io
                 },
+                (errno != 0).then_some(errno),
+            ));
+        }
+        if status == PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1 {
+            let canonical_unavailable =
+                errno == 0 || matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP);
+            if flags != 0 || !canonical_unavailable || !identity_is_exact {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                RefusalCode::LandlockUnavailable,
+                IsolationQualificationStageV1::ChildLandlock,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable,
                 (errno != 0).then_some(errno),
             ));
         }
@@ -2857,7 +2963,7 @@ mod platform {
                 (errno != 0).then_some(errno),
             ));
         }
-        if frame[FRAME_FLAGS_OFFSET_V1] != PROOF_FLAGS_V1 || errno != 0 || !identity_is_exact {
+        if flags != PROOF_FLAGS_V1 || errno != 0 || !identity_is_exact {
             return Err(protocol_failure(
                 stage,
                 IsolationQualificationReasonV1::ChildInvariantFailed,
@@ -2874,6 +2980,10 @@ mod platform {
             frame[offset + 2],
             frame[offset + 3],
         ])
+    }
+
+    fn decode_u16(frame: &[u8; FRAME_BYTES_V1], offset: usize) -> u16 {
+        u16::from_le_bytes([frame[offset], frame[offset + 1]])
     }
 
     fn decode_i32(frame: &[u8; FRAME_BYTES_V1], offset: usize) -> i32 {
@@ -3416,8 +3526,9 @@ mod platform {
             child_fail(report_write, &nonce, PROOF_STATUS_INVARIANT_V1, 0, deadline);
         }
 
-        if let Err(error) = child_enter_private_tmpfs_root_v1() {
-            match error {
+        let private_root = match child_enter_private_tmpfs_root_v1() {
+            Ok(evidence) => evidence,
+            Err(error) => match error {
                 ChildMountRootFailureV1::Os(errno) => child_fail(
                     report_write,
                     &nonce,
@@ -3432,8 +3543,8 @@ mod platform {
                     0,
                     deadline,
                 ),
-            }
-        }
+            },
+        };
 
         if report_write <= libc::STDERR_FILENO {
             child_descriptor_fail_v1(
@@ -3485,8 +3596,12 @@ mod platform {
         if let Err(error) = child_scrub_and_audit_descriptors_v1(&report_identity) {
             child_descriptor_fail_v1(report_write, &nonce, error, deadline);
         }
-        if let Err(error) = child_eliminate_capabilities_v1(&report_identity) {
-            child_capability_fail_v1(report_write, &nonce, error, deadline);
+        let capability = match child_eliminate_capabilities_v1(&report_identity) {
+            Ok(evidence) => evidence,
+            Err(error) => child_capability_fail_v1(report_write, &nonce, error, deadline),
+        };
+        if let Err(error) = child_enforce_landlock_v1(&private_root, capability, &report_identity) {
+            child_landlock_fail_v1(report_write, &nonce, error, deadline);
         }
 
         let proof = child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
@@ -3505,7 +3620,8 @@ mod platform {
     /// This is diagnostic path-and-mount evidence only. Inherited descriptors
     /// and old executable mappings are deliberately outside this slice, and
     /// this result can never authorize execution.
-    fn child_enter_private_tmpfs_root_v1() -> Result<(), ChildMountRootFailureV1> {
+    fn child_enter_private_tmpfs_root_v1()
+    -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
         let active_pid_namespace = child_pin_active_pid_namespace_v1()?;
         let old_root = child_open_absolute_root_v1()?;
         if unsafe {
@@ -3609,14 +3725,18 @@ mod platform {
         for name in ABSENT_ROOT_NAMES_V1 {
             child_require_absent_at_v1(pivoted_root, name)?;
         }
-        child_build_fixed_mount_layout_v1(pivoted_root, &pivoted_identity, &active_pid_namespace)?;
+        let evidence = child_build_fixed_mount_layout_v1(
+            pivoted_root,
+            &pivoted_identity,
+            &active_pid_namespace,
+        )?;
         let retained_root_closed = child_close_mount_fd_v1(new_root);
         let pivoted_root_closed = child_close_mount_fd_v1(pivoted_root);
         let active_pid_namespace_closed = child_close_mount_fd_v1(active_pid_namespace.descriptor);
         retained_root_closed?;
         pivoted_root_closed?;
         active_pid_namespace_closed?;
-        Ok(())
+        Ok(evidence)
     }
 
     fn child_open_absolute_root_v1() -> Result<RawFd, ChildMountRootFailureV1> {
@@ -3732,7 +3852,7 @@ mod platform {
         root: RawFd,
         root_identity: &ChildPathIdentityV1,
         active_pid_namespace: &ChildPinnedPidNamespaceV1,
-    ) -> Result<(), ChildMountRootFailureV1> {
+    ) -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
         let _ = unsafe { libc::syscall(libc::SYS_umask, 0_u32) };
 
         let workspace = child_create_directory_at_v1(root, WORKSPACE_NAME_V1, WORKSPACE_MODE_V1)?;
@@ -3799,7 +3919,13 @@ mod platform {
             &run_identity,
             &again_home_identity,
             &proc_identity,
-        )
+        )?;
+        Ok(ChildPrivateRootEvidenceV1 {
+            root: *root_identity,
+            tmp: tmp_identity,
+            run: run_identity,
+            proc: proc_identity,
+        })
     }
 
     fn child_create_directory_at_v1(
@@ -4336,6 +4462,11 @@ mod platform {
     ) -> Result<(), ChildDescriptorFailureV1> {
         child_close_range_and_reauthenticate_v1(report_identity)?;
 
+        let audit_descriptor = child_open_fd_audit_v1()?;
+        child_verify_and_close_fd_audit_v1(audit_descriptor, report_identity)
+    }
+
+    fn child_open_fd_audit_v1() -> Result<RawFd, ChildDescriptorFailureV1> {
         let how = OpenHowV1 {
             flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
             mode: 0,
@@ -4361,7 +4492,7 @@ mod platform {
             }
             return Err(ChildDescriptorFailureV1::Invariant);
         }
-        child_verify_and_close_fd_audit_v1(FD_AUDIT_DESCRIPTOR_V1, report_identity)
+        Ok(FD_AUDIT_DESCRIPTOR_V1)
     }
 
     fn child_close_range_and_reauthenticate_v1(
@@ -4395,6 +4526,16 @@ mod platform {
         audit_descriptor: RawFd,
         report_identity: &ChildReportDescriptorIdentityV1,
     ) -> Result<(), ChildDescriptorFailureV1> {
+        child_authenticate_fd_audit_v1(audit_descriptor)?;
+        child_finish_fd_audit_v1(audit_descriptor, report_identity)
+    }
+
+    fn child_authenticate_fd_audit_v1(
+        audit_descriptor: RawFd,
+    ) -> Result<(), ChildDescriptorFailureV1> {
+        if audit_descriptor != FD_AUDIT_DESCRIPTOR_V1 {
+            return Err(ChildDescriptorFailureV1::Invariant);
+        }
         let descriptor_flags =
             unsafe { libc::syscall(libc::SYS_fcntl, audit_descriptor, libc::F_GETFD, 0_u64) };
         if descriptor_flags < 0 {
@@ -4423,7 +4564,7 @@ mod platform {
         if !child_procfs_statfs_matches_policy_v1(&unsafe { filesystem.assume_init() }) {
             return Err(ChildDescriptorFailureV1::Invariant);
         }
-        child_finish_fd_audit_v1(audit_descriptor, report_identity)
+        Ok(())
     }
 
     fn child_finish_fd_audit_v1(
@@ -4524,7 +4665,7 @@ mod platform {
 
     fn child_eliminate_capabilities_v1(
         report_identity: &ChildReportDescriptorIdentityV1,
-    ) -> Result<(), ChildCapabilityFailureV1> {
+    ) -> Result<u32, ChildCapabilityFailureV1> {
         let initial_bounding = child_read_bounding_capabilities_v1()?;
         let Some(last_capability) = child_last_capability_v1(&initial_bounding) else {
             return Err(ChildCapabilityFailureV1::Invariant);
@@ -4544,6 +4685,14 @@ mod platform {
         child_clear_capability_sets_v1()?;
         child_set_no_new_privileges_v1()?;
 
+        child_verify_capability_elimination_v1(last_capability, report_identity)?;
+        Ok(last_capability)
+    }
+
+    fn child_verify_capability_elimination_v1(
+        last_capability: u32,
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
         let final_sets = child_read_capability_sets_v1()?;
         if !child_capability_sets_are_empty_v1(&final_sets) {
             return Err(ChildCapabilityFailureV1::Invariant);
@@ -4559,6 +4708,715 @@ mod platform {
         child_verify_securebits_v1()?;
         child_verify_no_new_privileges_v1()?;
         child_reauthenticate_capability_report_v1(report_identity)
+    }
+
+    fn child_enforce_landlock_v1(
+        private_root: &ChildPrivateRootEvidenceV1,
+        last_capability: u32,
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let mut tracked = ChildLandlockTrackedFdsV1::new();
+        let result = child_enforce_landlock_inner_v1(
+            private_root,
+            last_capability,
+            report_identity,
+            &mut tracked,
+        );
+        let cleanup = child_landlock_cleanup_fds_v1(&mut tracked, report_identity);
+        cleanup?;
+        result
+    }
+
+    fn child_enforce_landlock_inner_v1(
+        private_root: &ChildPrivateRootEvidenceV1,
+        last_capability: u32,
+        report_identity: &ChildReportDescriptorIdentityV1,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let audit_descriptor =
+            child_open_fd_audit_v1().map_err(child_landlock_from_descriptor_failure_v1)?;
+        tracked.audit_descriptor = audit_descriptor;
+        child_authenticate_fd_audit_v1(audit_descriptor)
+            .map_err(child_landlock_from_descriptor_failure_v1)?;
+
+        child_landlock_reopen_identity_v1(CURRENT_DIRECTORY_V1, &private_root.root, tracked)?;
+        child_landlock_reopen_identity_v1(TMP_NAME_V1, &private_root.tmp, tracked)?;
+        child_landlock_reopen_identity_v1(RUN_NAME_V1, &private_root.run, tracked)?;
+        child_landlock_reopen_identity_v1(PROC_NAME_V1, &private_root.proc, tracked)?;
+
+        let policy = child_landlock_query_policy_v1()?;
+        let restricted_identity = child_landlock_create_fixtures_v1(private_root, tracked)?;
+        let ruleset = child_landlock_create_ruleset_v1(tracked)?;
+        child_landlock_add_path_rule_v1(
+            ruleset,
+            TMP_NAME_V1,
+            LANDLOCK_TMP_ACCESS_V1,
+            &private_root.tmp,
+            tracked,
+        )?;
+        child_landlock_add_path_rule_v1(
+            ruleset,
+            RUN_RESTRICTED_RELATIVE_PATH_V1,
+            LANDLOCK_RESTRICTED_ACCESS_V1,
+            &restricted_identity,
+            tracked,
+        )?;
+        child_verify_capability_elimination_v1(last_capability, report_identity)
+            .map_err(child_landlock_from_capability_failure_v1)?;
+        child_landlock_restrict_self_v1(ruleset, policy)?;
+        child_landlock_close_tracked_fd_v1(tracked, ruleset)?;
+
+        child_landlock_run_canaries_v1(tracked)?;
+        if tracked
+            .descriptors
+            .iter()
+            .any(|descriptor| *descriptor != -1)
+        {
+            Err(ChildLandlockFailureV1::Invariant)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn child_landlock_query_policy_v1() -> Result<ChildLandlockPolicyV1, ChildLandlockFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<LinuxLandlockRulesetAttrV1>(),
+                0_usize,
+                LANDLOCK_CREATE_RULESET_VERSION_V1,
+            )
+        };
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_landlock_policy_from_version_result_v1(result, errno)
+    }
+
+    fn child_landlock_policy_from_version_result_v1(
+        result: libc::c_long,
+        errno: i32,
+    ) -> Result<ChildLandlockPolicyV1, ChildLandlockFailureV1> {
+        match result {
+            1..=5 if errno == 0 => Err(ChildLandlockFailureV1::Unavailable(0)),
+            6 if errno == 0 => Ok(ChildLandlockPolicyV1::Abi6),
+            7 if errno == 0 => Ok(ChildLandlockPolicyV1::Abi7),
+            -1 if matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP) => {
+                Err(ChildLandlockFailureV1::Unavailable(errno))
+            }
+            -1 => Err(child_landlock_failure_from_errno_v1(errno)),
+            _ => Err(ChildLandlockFailureV1::Invariant),
+        }
+    }
+
+    const fn child_landlock_restrict_flags_v1(policy: ChildLandlockPolicyV1) -> u32 {
+        match policy {
+            ChildLandlockPolicyV1::Abi6 => 0,
+            ChildLandlockPolicyV1::Abi7 => LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1,
+        }
+    }
+
+    fn child_landlock_reopen_identity_v1(
+        path: &CStr,
+        expected: &ChildPathIdentityV1,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let descriptor = child_landlock_open_fixed_directory_v1(path, tracked)?;
+        let observed =
+            child_path_identity_v1(descriptor).map_err(child_landlock_from_mount_failure_v1)?;
+        if observed != *expected {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        child_landlock_close_tracked_fd_v1(tracked, descriptor)
+    }
+
+    fn child_landlock_open_fixed_directory_v1(
+        path: &CStr,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<RawFd, ChildLandlockFailureV1> {
+        let how = OpenHowV1 {
+            flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+            mode: 0,
+            resolve: RESOLVE_BENEATH_V1 | RESOLVE_NO_MAGICLINKS_V1 | RESOLVE_NO_SYMLINKS_V1,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat2,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                &how,
+                std::mem::size_of::<OpenHowV1>(),
+            )
+        };
+        child_landlock_register_fd_result_v1(tracked, result)
+    }
+
+    fn child_landlock_create_fixtures_v1(
+        private_root: &ChildPrivateRootEvidenceV1,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<ChildPathIdentityV1, ChildLandlockFailureV1> {
+        child_landlock_require_zero_result_v1(unsafe {
+            libc::syscall(
+                libc::SYS_mkdirat,
+                libc::AT_FDCWD,
+                RUN_RESTRICTED_PATH_V1.as_ptr(),
+                0o700_u32,
+            )
+        })?;
+        for path in [
+            c"/tmp/from",
+            c"/tmp/to",
+            c"/run/restricted/from",
+            c"/run/restricted/to",
+        ] {
+            child_landlock_require_zero_result_v1(unsafe {
+                libc::syscall(libc::SYS_mkdirat, libc::AT_FDCWD, path.as_ptr(), 0o700_u32)
+            })?;
+        }
+        for path in [
+            WORKSPACE_FIXTURE_PATH_V1,
+            TMP_PREEXISTING_PATH_V1,
+            TMP_FROM_ITEM_PATH_V1,
+            RUN_RESTRICTED_PREEXISTING_PATH_V1,
+            RUN_RESTRICTED_FROM_ITEM_PATH_V1,
+        ] {
+            child_landlock_create_fixture_file_v1(path, tracked)?;
+        }
+
+        let restricted =
+            child_landlock_open_fixed_directory_v1(RUN_RESTRICTED_RELATIVE_PATH_V1, tracked)?;
+        let identity =
+            child_path_identity_v1(restricted).map_err(child_landlock_from_mount_failure_v1)?;
+        if u32::from(identity.mode) & libc::S_IFMT != libc::S_IFDIR
+            || u32::from(identity.mode) & 0o7777 != 0o700
+            || identity.uid != 0
+            || identity.gid != 0
+            || identity.mount_id != private_root.run.mount_id
+            || child_device_tuple_v1(&identity) != child_device_tuple_v1(&private_root.run)
+        {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        child_landlock_close_tracked_fd_v1(tracked, restricted)?;
+        Ok(identity)
+    }
+
+    fn child_landlock_create_fixture_file_v1(
+        path: &CStr,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let descriptor = child_landlock_open_tracked_v1(
+            path,
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+            tracked,
+        )?;
+        child_landlock_write_exact_v1(descriptor, LANDLOCK_CANARY_BYTES_V1)?;
+        child_landlock_close_tracked_fd_v1(tracked, descriptor)
+    }
+
+    fn child_landlock_create_ruleset_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<RawFd, ChildLandlockFailureV1> {
+        let attributes = LinuxLandlockRulesetAttrV1 {
+            handled_access_fs: LANDLOCK_HANDLED_FS_V1,
+            handled_access_net: LANDLOCK_HANDLED_NET_V1,
+            scoped: LANDLOCK_SCOPED_V1,
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attributes,
+                std::mem::size_of::<LinuxLandlockRulesetAttrV1>(),
+                0_u32,
+            )
+        };
+        child_landlock_register_fd_result_v1(tracked, result)
+    }
+
+    fn child_landlock_add_path_rule_v1(
+        ruleset: RawFd,
+        path: &CStr,
+        allowed_access: u64,
+        expected: &ChildPathIdentityV1,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let parent = child_landlock_open_fixed_directory_v1(path, tracked)?;
+        let observed =
+            child_path_identity_v1(parent).map_err(child_landlock_from_mount_failure_v1)?;
+        if observed != *expected {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        let attributes = LinuxLandlockPathBeneathAttrV1 {
+            allowed_access,
+            parent_fd: parent,
+        };
+        let add_result = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_add_rule,
+                ruleset,
+                LANDLOCK_RULE_PATH_BENEATH_V1,
+                &attributes,
+                0_u32,
+            )
+        };
+        child_landlock_require_zero_result_v1(add_result)?;
+        child_landlock_close_tracked_fd_v1(tracked, parent)
+    }
+
+    fn child_landlock_restrict_self_v1(
+        ruleset: RawFd,
+        policy: ChildLandlockPolicyV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_restrict_self,
+                ruleset,
+                child_landlock_restrict_flags_v1(policy),
+            )
+        };
+        child_landlock_require_zero_result_v1(result)
+    }
+
+    fn child_landlock_run_canaries_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        child_landlock_run_tmp_canaries_v1(tracked)?;
+        child_landlock_run_restricted_canaries_v1(tracked)?;
+        child_landlock_run_workspace_canaries_v1(tracked)?;
+        child_landlock_run_tcp_canaries_v1(tracked)
+    }
+
+    fn child_landlock_run_tmp_canaries_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let created = child_landlock_open_tracked_v1(
+            TMP_NEW_PATH_V1,
+            libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+            tracked,
+        )?;
+        child_landlock_write_exact_v1(created, LANDLOCK_CANARY_BYTES_V1)?;
+        child_landlock_require_zero_result_v1(unsafe {
+            libc::syscall(libc::SYS_ftruncate, created, 1_i64)
+        })?;
+        child_landlock_close_tracked_fd_v1(tracked, created)?;
+
+        let truncated = child_landlock_open_tracked_v1(
+            TMP_PREEXISTING_PATH_V1,
+            libc::O_WRONLY | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+            tracked,
+        )?;
+        child_landlock_require_zero_result_v1(unsafe {
+            libc::syscall(libc::SYS_ftruncate, truncated, 2_i64)
+        })?;
+        child_landlock_close_tracked_fd_v1(tracked, truncated)?;
+
+        child_landlock_require_zero_result_v1(unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                TMP_FROM_ITEM_PATH_V1.as_ptr(),
+                libc::AT_FDCWD,
+                TMP_TO_ITEM_PATH_V1.as_ptr(),
+                0_u32,
+            )
+        })
+    }
+
+    fn child_landlock_run_restricted_canaries_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let descriptor = child_landlock_open_tracked_v1(
+            RUN_RESTRICTED_PREEXISTING_PATH_V1,
+            libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+            tracked,
+        )?;
+        child_landlock_require_errno_result_v1(
+            unsafe { libc::syscall(libc::SYS_ftruncate, descriptor, 0_i64) },
+            libc::EACCES,
+        )?;
+        child_landlock_close_tracked_fd_v1(tracked, descriptor)?;
+        child_landlock_require_errno_result_v1(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    libc::AT_FDCWD,
+                    RUN_RESTRICTED_FROM_ITEM_PATH_V1.as_ptr(),
+                    libc::AT_FDCWD,
+                    RUN_RESTRICTED_TO_ITEM_PATH_V1.as_ptr(),
+                    0_u32,
+                )
+            },
+            libc::EXDEV,
+        )
+    }
+
+    fn child_landlock_run_workspace_canaries_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        child_landlock_require_open_errno_v1(
+            WORKSPACE_FIXTURE_PATH_V1,
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::EACCES,
+            tracked,
+        )?;
+        child_landlock_require_open_errno_v1(
+            WORKSPACE_PATH_V1,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::EACCES,
+            tracked,
+        )
+    }
+
+    fn child_landlock_run_tcp_canaries_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let bind_socket = child_landlock_open_tcp_socket_v1(tracked)?;
+        let bind_address = child_landlock_loopback_address_v1(0);
+        child_landlock_require_errno_result_v1(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_bind,
+                    bind_socket,
+                    &bind_address as *const libc::sockaddr_in,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            },
+            libc::EACCES,
+        )?;
+        child_landlock_close_tracked_fd_v1(tracked, bind_socket)?;
+
+        let connect_socket = child_landlock_open_tcp_socket_v1(tracked)?;
+        let connect_address = child_landlock_loopback_address_v1(1);
+        child_landlock_require_errno_result_v1(
+            unsafe {
+                libc::syscall(
+                    libc::SYS_connect,
+                    connect_socket,
+                    &connect_address as *const libc::sockaddr_in,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            },
+            libc::EACCES,
+        )?;
+        child_landlock_close_tracked_fd_v1(tracked, connect_socket)
+    }
+
+    fn child_landlock_open_tracked_v1(
+        path: &CStr,
+        flags: libc::c_int,
+        mode: libc::mode_t,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<RawFd, ChildLandlockFailureV1> {
+        let result =
+            unsafe { libc::syscall(libc::SYS_openat, libc::AT_FDCWD, path.as_ptr(), flags, mode) };
+        child_landlock_register_fd_result_v1(tracked, result)
+    }
+
+    fn child_landlock_require_open_errno_v1(
+        path: &CStr,
+        flags: libc::c_int,
+        expected_errno: i32,
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                flags,
+                0_u32,
+            )
+        };
+        if result == -1 {
+            return child_landlock_require_errno_result_v1(result, expected_errno);
+        }
+        child_landlock_register_fd_result_v1(tracked, result)?;
+        Err(ChildLandlockFailureV1::Invariant)
+    }
+
+    fn child_landlock_open_tcp_socket_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+    ) -> Result<RawFd, ChildLandlockFailureV1> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_socket,
+                libc::AF_INET,
+                libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                libc::IPPROTO_TCP,
+            )
+        };
+        child_landlock_register_fd_result_v1(tracked, result)
+    }
+
+    fn child_landlock_loopback_address_v1(port: u16) -> libc::sockaddr_in {
+        let mut address = unsafe { MaybeUninit::<libc::sockaddr_in>::zeroed().assume_init() };
+        address.sin_family = libc::AF_INET as libc::sa_family_t;
+        address.sin_port = port.to_be();
+        address.sin_addr = libc::in_addr {
+            s_addr: u32::from_be(0x7f00_0001),
+        };
+        address
+    }
+
+    fn child_landlock_require_errno_result_v1(
+        result: libc::c_long,
+        expected_errno: i32,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_landlock_require_errno_result_with_errno_v1(result, errno, expected_errno)
+    }
+
+    fn child_landlock_require_errno_result_with_errno_v1(
+        result: libc::c_long,
+        errno: i32,
+        expected_errno: i32,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        if !(1..=MAX_LINUX_ERRNO_V1).contains(&expected_errno) {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        match (result, errno) {
+            (-1, observed) if observed == expected_errno => Ok(()),
+            (-1, observed) => Err(child_landlock_failure_from_errno_v1(observed)),
+            _ => Err(ChildLandlockFailureV1::Invariant),
+        }
+    }
+
+    fn child_landlock_write_exact_v1(
+        descriptor: RawFd,
+        bytes: &[u8],
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let result =
+            unsafe { libc::syscall(libc::SYS_write, descriptor, bytes.as_ptr(), bytes.len()) };
+        if result == bytes.len() as libc::c_long {
+            Ok(())
+        } else if result == -1 {
+            Err(child_landlock_os_failure_v1())
+        } else {
+            Err(ChildLandlockFailureV1::Invariant)
+        }
+    }
+
+    fn child_landlock_register_fd_result_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+        result: libc::c_long,
+    ) -> Result<RawFd, ChildLandlockFailureV1> {
+        if result == -1 {
+            return Err(child_landlock_os_failure_v1());
+        }
+        let Ok(descriptor) = RawFd::try_from(result) else {
+            return Err(ChildLandlockFailureV1::Invariant);
+        };
+        let Some(index) = child_landlock_tracker_next_slot_v1(tracked) else {
+            if descriptor >= LANDLOCK_FIRST_TRANSIENT_FD_V1
+                && let Some(slot) = tracked.descriptors.iter_mut().find(|slot| **slot == -1)
+            {
+                *slot = descriptor;
+            } else if descriptor >= LANDLOCK_FIRST_TRANSIENT_FD_V1
+                && let Err(error) = child_landlock_close_untracked_fd_v1(descriptor)
+            {
+                return Err(error);
+            }
+            return Err(ChildLandlockFailureV1::Invariant);
+        };
+        if index == LANDLOCK_MAX_TRACKED_FDS_V1 {
+            return match child_landlock_close_untracked_fd_v1(descriptor) {
+                Ok(()) => Err(ChildLandlockFailureV1::Invariant),
+                Err(error) => Err(error),
+            };
+        }
+        let expected = LANDLOCK_FIRST_TRANSIENT_FD_V1 + index as RawFd;
+        let Some(slot) = tracked.descriptors.get_mut(index) else {
+            return Err(ChildLandlockFailureV1::Invariant);
+        };
+        if descriptor >= LANDLOCK_FIRST_TRANSIENT_FD_V1 {
+            *slot = descriptor;
+        }
+        if descriptor != expected {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        Ok(descriptor)
+    }
+
+    fn child_landlock_tracker_next_slot_v1(tracked: &ChildLandlockTrackedFdsV1) -> Option<usize> {
+        let mut next = LANDLOCK_MAX_TRACKED_FDS_V1;
+        let mut observed_empty = false;
+        for (index, descriptor) in tracked.descriptors.iter().copied().enumerate() {
+            if descriptor == -1 {
+                if !observed_empty {
+                    next = index;
+                }
+                observed_empty = true;
+            } else if observed_empty
+                || descriptor != LANDLOCK_FIRST_TRANSIENT_FD_V1 + index as RawFd
+            {
+                return None;
+            }
+        }
+        Some(next)
+    }
+
+    fn child_landlock_close_tracked_fd_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+        descriptor: RawFd,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let Some(slot) = tracked
+            .descriptors
+            .iter_mut()
+            .find(|slot| **slot == descriptor)
+        else {
+            return Err(ChildLandlockFailureV1::Invariant);
+        };
+        let result = child_landlock_close_known_fd_v1(descriptor, false);
+        if result.is_ok() {
+            *slot = -1;
+        }
+        result
+    }
+
+    fn child_landlock_close_untracked_fd_v1(
+        descriptor: RawFd,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        if descriptor < LANDLOCK_FIRST_TRANSIENT_FD_V1 {
+            return Err(ChildLandlockFailureV1::Invariant);
+        }
+        child_landlock_close_known_fd_v1(descriptor, false)
+    }
+
+    fn child_landlock_close_known_fd_v1(
+        descriptor: RawFd,
+        cleanup: bool,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let close_result = unsafe { libc::syscall(libc::SYS_close, descriptor) };
+        let close_errno = if close_result == -1 { child_errno() } else { 0 };
+        child_landlock_close_result_v1(close_result, close_errno, cleanup)
+    }
+
+    fn child_landlock_close_result_v1(
+        result: libc::c_long,
+        errno: i32,
+        cleanup: bool,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        match (result, errno) {
+            (0, _) | (-1, libc::EINTR) => Ok(()),
+            (-1, libc::EBADF) if cleanup => Ok(()),
+            (-1, errno) => Err(child_landlock_failure_from_errno_v1(errno)),
+            _ => Err(ChildLandlockFailureV1::Invariant),
+        }
+    }
+
+    fn child_landlock_cleanup_fds_v1(
+        tracked: &mut ChildLandlockTrackedFdsV1,
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let mut first_failure = child_landlock_tracker_next_slot_v1(tracked)
+            .is_none()
+            .then_some(ChildLandlockFailureV1::Invariant);
+        let mut index = 0_usize;
+        while index < LANDLOCK_MAX_TRACKED_FDS_V1 {
+            let descriptor = tracked.descriptors[index];
+            if descriptor >= LANDLOCK_FIRST_TRANSIENT_FD_V1 {
+                if let Err(error) = child_landlock_close_known_fd_v1(descriptor, true)
+                    && first_failure.is_none()
+                {
+                    first_failure = Some(error);
+                }
+            } else if descriptor != -1 && first_failure.is_none() {
+                first_failure = Some(ChildLandlockFailureV1::Invariant);
+            }
+            tracked.descriptors[index] = -1;
+            index += 1;
+        }
+        let exact_audit_ran = tracked.audit_descriptor == FD_AUDIT_DESCRIPTOR_V1;
+        if exact_audit_ran {
+            if let Err(error) = child_finish_fd_audit_v1(tracked.audit_descriptor, report_identity)
+                .map_err(child_landlock_from_descriptor_failure_v1)
+            {
+                if first_failure.is_none() {
+                    first_failure = Some(error);
+                }
+                if let Err(close_error) =
+                    child_landlock_close_known_fd_v1(tracked.audit_descriptor, true)
+                    && first_failure.is_none()
+                {
+                    first_failure = Some(close_error);
+                }
+            }
+        } else if tracked.audit_descriptor > REPORT_DESCRIPTOR_V1 {
+            if let Err(error) = child_landlock_close_known_fd_v1(tracked.audit_descriptor, true)
+                && first_failure.is_none()
+            {
+                first_failure = Some(error);
+            } else if first_failure.is_none() {
+                first_failure = Some(ChildLandlockFailureV1::Invariant);
+            }
+        } else if tracked.audit_descriptor != -1 && first_failure.is_none() {
+            first_failure = Some(ChildLandlockFailureV1::Invariant);
+        }
+        tracked.audit_descriptor = -1;
+        if !exact_audit_ran
+            && let Err(error) = child_reauthenticate_capability_report_v1(report_identity)
+                .map_err(child_landlock_from_capability_failure_v1)
+            && first_failure.is_none()
+        {
+            first_failure = Some(error);
+        }
+        match first_failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    fn child_landlock_require_zero_result_v1(
+        result: libc::c_long,
+    ) -> Result<(), ChildLandlockFailureV1> {
+        let errno = if result == -1 { child_errno() } else { 0 };
+        match (result, errno) {
+            (0, _) => Ok(()),
+            (-1, errno) => Err(child_landlock_failure_from_errno_v1(errno)),
+            _ => Err(ChildLandlockFailureV1::Invariant),
+        }
+    }
+
+    fn child_landlock_from_mount_failure_v1(
+        failure: ChildMountRootFailureV1,
+    ) -> ChildLandlockFailureV1 {
+        match failure {
+            ChildMountRootFailureV1::Os(errno) => child_landlock_failure_from_errno_v1(errno),
+            ChildMountRootFailureV1::Invariant => ChildLandlockFailureV1::Invariant,
+        }
+    }
+
+    fn child_landlock_from_descriptor_failure_v1(
+        failure: ChildDescriptorFailureV1,
+    ) -> ChildLandlockFailureV1 {
+        match failure {
+            ChildDescriptorFailureV1::CloseRange(errno) | ChildDescriptorFailureV1::Os(errno) => {
+                child_landlock_failure_from_errno_v1(errno)
+            }
+            ChildDescriptorFailureV1::Invariant => ChildLandlockFailureV1::Invariant,
+        }
+    }
+
+    fn child_landlock_from_capability_failure_v1(
+        failure: ChildCapabilityFailureV1,
+    ) -> ChildLandlockFailureV1 {
+        match failure {
+            ChildCapabilityFailureV1::Os(errno) => child_landlock_failure_from_errno_v1(errno),
+            ChildCapabilityFailureV1::Invariant => ChildLandlockFailureV1::Invariant,
+        }
+    }
+
+    fn child_landlock_os_failure_v1() -> ChildLandlockFailureV1 {
+        child_landlock_failure_from_errno_v1(child_errno())
+    }
+
+    fn child_landlock_failure_from_errno_v1(errno: i32) -> ChildLandlockFailureV1 {
+        if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+            ChildLandlockFailureV1::Os(errno)
+        } else {
+            ChildLandlockFailureV1::Invariant
+        }
     }
 
     fn child_read_bounding_capabilities_v1()
@@ -4914,6 +5772,22 @@ mod platform {
         )
     }
 
+    fn child_landlock_fail_v1(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        failure: ChildLandlockFailureV1,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let (status, errno) = match failure {
+            ChildLandlockFailureV1::Unavailable(errno) => {
+                (PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1, errno)
+            }
+            ChildLandlockFailureV1::Os(errno) => (PROOF_STATUS_LANDLOCK_BROKEN_V1, errno),
+            ChildLandlockFailureV1::Invariant => (PROOF_STATUS_LANDLOCK_BROKEN_V1, 0),
+        };
+        child_fail(report_write, nonce, status, errno, deadline)
+    }
+
     fn child_fail(
         report_write: RawFd,
         nonce: &[u8; NONCE_BYTES_V1],
@@ -4939,7 +5813,7 @@ mod platform {
                 frame.as_mut_ptr().add(FRAME_MAGIC_OFFSET_V1),
                 magic.len(),
             );
-            let version = PROTOCOL_VERSION_V1.to_le_bytes();
+            let version = PROTOCOL_VERSION_V2.to_le_bytes();
             std::ptr::copy_nonoverlapping(
                 version.as_ptr(),
                 frame.as_mut_ptr().add(FRAME_VERSION_OFFSET_V1),
@@ -4958,13 +5832,18 @@ mod platform {
     fn child_encode_proof_frame(
         nonce: &[u8; NONCE_BYTES_V1],
         status: u8,
-        flags: u8,
+        flags: u16,
         errno: i32,
     ) -> [u8; FRAME_BYTES_V1] {
         let mut frame = child_encode_common_frame(PROOF_MAGIC_V1, PHASE_PROOF_V1, nonce);
         unsafe {
             *frame.as_mut_ptr().add(FRAME_STATUS_OFFSET_V1) = status;
-            *frame.as_mut_ptr().add(FRAME_FLAGS_OFFSET_V1) = flags;
+            let flags = flags.to_le_bytes();
+            std::ptr::copy_nonoverlapping(
+                flags.as_ptr(),
+                frame.as_mut_ptr().add(FRAME_FLAGS_OFFSET_V1),
+                flags.len(),
+            );
             let error = errno.to_le_bytes();
             std::ptr::copy_nonoverlapping(
                 error.as_ptr(),
@@ -4992,12 +5871,14 @@ mod platform {
                 RELEASE_MAGIC_V1.len(),
             ) && child_bytes_equal(
                 frame.as_ptr().add(FRAME_VERSION_OFFSET_V1),
-                PROTOCOL_VERSION_V1.to_le_bytes().as_ptr(),
+                PROTOCOL_VERSION_V2.to_le_bytes().as_ptr(),
                 2,
             ) && *frame.as_ptr().add(FRAME_PHASE_OFFSET_V1) == PHASE_RELEASE_V1
                 && *frame.as_ptr().add(FRAME_STATUS_OFFSET_V1) == 0
-                && *frame.as_ptr().add(FRAME_FLAGS_OFFSET_V1) == 0
-                && child_all_zero(frame.as_ptr().add(13), FRAME_NONCE_OFFSET_V1 - 13)
+                && child_all_zero(
+                    frame.as_ptr().add(FRAME_FLAGS_OFFSET_V1),
+                    FRAME_NONCE_OFFSET_V1 - FRAME_FLAGS_OFFSET_V1,
+                )
                 && child_bytes_equal(
                     frame.as_ptr().add(FRAME_NONCE_OFFSET_V1),
                     nonce.as_ptr(),
@@ -5595,7 +6476,8 @@ mod platform {
             assert_eq!(FD_AUDIT_BUFFER_BYTES_V1, 256);
             assert_eq!(FD_AUDIT_MAX_GETDENTS_CALLS_V1, 8);
             assert_eq!(FD_AUDIT_COMPLETE_MASK_V1, 0b1111);
-            assert_eq!(PROOF_FLAGS_V1, 0x7f);
+            assert_eq!(PROTOCOL_VERSION_V2, 2);
+            assert_eq!(PROOF_FLAGS_V1, 0x00ff);
         }
 
         #[test]
@@ -5844,6 +6726,219 @@ mod platform {
         }
 
         #[test]
+        fn landlock_uapi_layout_and_policy_constants_are_exact() {
+            assert_eq!(std::mem::size_of::<LinuxLandlockRulesetAttrV1>(), 24);
+            assert_eq!(std::mem::align_of::<LinuxLandlockRulesetAttrV1>(), 8);
+            assert_eq!(
+                std::mem::offset_of!(LinuxLandlockRulesetAttrV1, handled_access_fs),
+                0
+            );
+            assert_eq!(
+                std::mem::offset_of!(LinuxLandlockRulesetAttrV1, handled_access_net),
+                8
+            );
+            assert_eq!(std::mem::offset_of!(LinuxLandlockRulesetAttrV1, scoped), 16);
+            assert_eq!(std::mem::size_of::<LinuxLandlockPathBeneathAttrV1>(), 12);
+            assert_eq!(std::mem::align_of::<LinuxLandlockPathBeneathAttrV1>(), 1);
+            assert_eq!(
+                std::mem::offset_of!(LinuxLandlockPathBeneathAttrV1, allowed_access),
+                0,
+            );
+            assert_eq!(
+                std::mem::offset_of!(LinuxLandlockPathBeneathAttrV1, parent_fd),
+                8,
+            );
+
+            let ruleset = LinuxLandlockRulesetAttrV1 {
+                handled_access_fs: LANDLOCK_HANDLED_FS_V1,
+                handled_access_net: LANDLOCK_HANDLED_NET_V1,
+                scoped: LANDLOCK_SCOPED_V1,
+            };
+            assert_eq!(ruleset.handled_access_fs, 0xffff);
+            assert_eq!(ruleset.handled_access_net, 0x3);
+            assert_eq!(ruleset.scoped, 0x3);
+            assert_eq!(LANDLOCK_CREATE_RULESET_VERSION_V1, 1);
+            assert_eq!(LANDLOCK_RULE_PATH_BENEATH_V1, 1);
+            assert_eq!(LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1, 1);
+            assert_eq!(
+                [
+                    (TMP_NAME_V1.to_bytes(), LANDLOCK_TMP_ACCESS_V1),
+                    (
+                        RUN_RESTRICTED_RELATIVE_PATH_V1.to_bytes(),
+                        LANDLOCK_RESTRICTED_ACCESS_V1,
+                    ),
+                ],
+                [
+                    (b"tmp".as_slice(), 0x77be),
+                    (b"run/restricted".as_slice(), 0x17be),
+                ],
+            );
+            assert_eq!(LANDLOCK_MAX_TRACKED_FDS_V1, 2);
+            assert_eq!(LANDLOCK_FIRST_TRANSIENT_FD_V1, 2);
+
+            let address = child_landlock_loopback_address_v1(0x1234);
+            assert_eq!(address.sin_family, libc::AF_INET as libc::sa_family_t);
+            assert_eq!(address.sin_port, 0x1234_u16.to_be());
+            assert_eq!(address.sin_addr.s_addr, u32::from_be(0x7f00_0001));
+            let port_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(address.sin_port).cast::<u8>(),
+                    std::mem::size_of::<u16>(),
+                )
+            };
+            let address_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(address.sin_addr.s_addr).cast::<u8>(),
+                    std::mem::size_of::<u32>(),
+                )
+            };
+            assert_eq!(port_bytes, [0x12, 0x34]);
+            assert_eq!(address_bytes, [127, 0, 0, 1]);
+            for port in [0, 1] {
+                let address = child_landlock_loopback_address_v1(port);
+                assert_eq!(u16::from_be(address.sin_port), port);
+                assert_eq!(u32::from_be(address.sin_addr.s_addr), 0x7f00_0001);
+            }
+        }
+
+        #[test]
+        fn landlock_version_results_select_only_abi_six_or_seven() {
+            for version in 1..=5 {
+                assert_eq!(
+                    child_landlock_policy_from_version_result_v1(version, 0),
+                    Err(ChildLandlockFailureV1::Unavailable(0)),
+                );
+            }
+            assert_eq!(
+                child_landlock_policy_from_version_result_v1(6, 0),
+                Ok(ChildLandlockPolicyV1::Abi6),
+            );
+            assert_eq!(
+                child_landlock_policy_from_version_result_v1(7, 0),
+                Ok(ChildLandlockPolicyV1::Abi7),
+            );
+            assert_eq!(
+                child_landlock_restrict_flags_v1(ChildLandlockPolicyV1::Abi6),
+                0
+            );
+            assert_eq!(
+                child_landlock_restrict_flags_v1(ChildLandlockPolicyV1::Abi7),
+                1
+            );
+
+            for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
+                assert_eq!(
+                    child_landlock_policy_from_version_result_v1(-1, errno),
+                    Err(ChildLandlockFailureV1::Unavailable(errno)),
+                );
+            }
+            for errno in [libc::EINVAL, libc::EPERM, libc::EACCES, MAX_LINUX_ERRNO_V1] {
+                assert_eq!(
+                    child_landlock_policy_from_version_result_v1(-1, errno),
+                    Err(ChildLandlockFailureV1::Os(errno)),
+                );
+            }
+            for (result, errno) in [
+                (0, 0),
+                (6, libc::EIO),
+                (7, libc::EIO),
+                (8, 0),
+                (libc::c_long::MAX, 0),
+                (-2, 0),
+                (-1, 0),
+                (-1, -1),
+                (-1, MAX_LINUX_ERRNO_V1 + 1),
+            ] {
+                assert_eq!(
+                    child_landlock_policy_from_version_result_v1(result, errno),
+                    Err(ChildLandlockFailureV1::Invariant),
+                );
+            }
+        }
+
+        #[test]
+        fn landlock_tracker_accepts_only_exact_contiguous_fd_slots() {
+            for (descriptors, next) in [([-1, -1], Some(0)), ([2, -1], Some(1)), ([2, 3], Some(2))]
+            {
+                let tracked = ChildLandlockTrackedFdsV1 {
+                    audit_descriptor: FD_AUDIT_DESCRIPTOR_V1,
+                    descriptors,
+                };
+                assert_eq!(child_landlock_tracker_next_slot_v1(&tracked), next);
+            }
+            for descriptors in [
+                [-2, -1],
+                [0, -1],
+                [1, -1],
+                [3, -1],
+                [-1, 3],
+                [2, 2],
+                [3, 2],
+                [2, 4],
+            ] {
+                let tracked = ChildLandlockTrackedFdsV1 {
+                    audit_descriptor: FD_AUDIT_DESCRIPTOR_V1,
+                    descriptors,
+                };
+                assert_eq!(child_landlock_tracker_next_slot_v1(&tracked), None);
+            }
+        }
+
+        #[test]
+        fn landlock_syscall_result_classifiers_are_exact() {
+            assert_eq!(
+                child_landlock_require_errno_result_with_errno_v1(-1, libc::EACCES, libc::EACCES),
+                Ok(()),
+            );
+            assert_eq!(
+                child_landlock_require_errno_result_with_errno_v1(-1, libc::EPERM, libc::EACCES),
+                Err(ChildLandlockFailureV1::Os(libc::EPERM)),
+            );
+            for (result, errno) in [(0, 0), (1, 0), (-2, libc::EACCES)] {
+                assert_eq!(
+                    child_landlock_require_errno_result_with_errno_v1(result, errno, libc::EACCES,),
+                    Err(ChildLandlockFailureV1::Invariant),
+                );
+            }
+            for errno in [-1, 0, MAX_LINUX_ERRNO_V1 + 1] {
+                assert_eq!(
+                    child_landlock_require_errno_result_with_errno_v1(-1, errno, libc::EACCES),
+                    Err(ChildLandlockFailureV1::Invariant),
+                );
+            }
+            for expected in [-1, 0, MAX_LINUX_ERRNO_V1 + 1] {
+                assert_eq!(
+                    child_landlock_require_errno_result_with_errno_v1(-1, expected, expected),
+                    Err(ChildLandlockFailureV1::Invariant),
+                );
+            }
+
+            assert_eq!(child_landlock_close_result_v1(0, libc::EIO, false), Ok(()));
+            assert_eq!(
+                child_landlock_close_result_v1(-1, libc::EINTR, false),
+                Ok(()),
+            );
+            assert_eq!(
+                child_landlock_close_result_v1(-1, libc::EBADF, false),
+                Err(ChildLandlockFailureV1::Os(libc::EBADF)),
+            );
+            assert_eq!(
+                child_landlock_close_result_v1(-1, libc::EBADF, true),
+                Ok(()),
+            );
+            assert_eq!(
+                child_landlock_close_result_v1(-1, libc::EIO, true),
+                Err(ChildLandlockFailureV1::Os(libc::EIO)),
+            );
+            for (result, errno) in [(1, 0), (-2, 0), (-1, 0), (-1, 4096)] {
+                assert_eq!(
+                    child_landlock_close_result_v1(result, errno, false),
+                    Err(ChildLandlockFailureV1::Invariant),
+                );
+            }
+        }
+
+        #[test]
         fn fd_audit_dirent_parser_accepts_only_exact_bounded_inventory() {
             let first = fd_audit_chunk(&[b"1", b"."]);
             let second = fd_audit_chunk(&[b"0", b".."]);
@@ -6083,7 +7178,11 @@ mod platform {
                 0,
                 FRAME_VERSION_OFFSET_V1,
                 FRAME_PHASE_OFFSET_V1,
+                FRAME_STATUS_OFFSET_V1,
+                FRAME_FLAGS_OFFSET_V1,
                 13,
+                14,
+                15,
                 31,
                 63,
             ] {
@@ -6104,7 +7203,11 @@ mod platform {
                 0,
                 FRAME_VERSION_OFFSET_V1,
                 FRAME_PHASE_OFFSET_V1,
+                FRAME_STATUS_OFFSET_V1,
+                FRAME_FLAGS_OFFSET_V1,
                 13,
+                14,
+                15,
                 32,
                 63,
             ] {
@@ -6172,7 +7275,16 @@ mod platform {
             let frame =
                 child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
             assert!(verify_proof_frame(&frame, &nonce).is_ok());
-            for stale_flags in [0x0f, 0x1f, 0x3f, 0xff] {
+            assert_eq!(
+                &frame[FRAME_FLAGS_OFFSET_V1..FRAME_FLAGS_END_V1],
+                &PROOF_FLAGS_V1.to_le_bytes(),
+            );
+            assert_eq!(&frame[FRAME_FLAGS_END_V1..FRAME_NONCE_OFFSET_V1], &[0, 0]);
+            let mut protocol_v1 = frame;
+            protocol_v1[FRAME_VERSION_OFFSET_V1..FRAME_PHASE_OFFSET_V1]
+                .copy_from_slice(&1_u16.to_le_bytes());
+            assert!(verify_proof_frame(&protocol_v1, &nonce).is_err());
+            for stale_flags in [0x000f, 0x001f, 0x003f, 0x007f, 0x01ff, u16::MAX] {
                 let stale =
                     child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, stale_flags, 0);
                 assert!(verify_proof_frame(&stale, &nonce).is_err());
@@ -6182,6 +7294,8 @@ mod platform {
                 FRAME_STATUS_OFFSET_V1,
                 FRAME_FLAGS_OFFSET_V1,
                 13,
+                14,
+                15,
                 FRAME_PID_OFFSET_V1,
                 FRAME_UID_OFFSET_V1,
                 FRAME_RESERVED_OFFSET_V1,
@@ -6487,7 +7601,7 @@ mod platform {
                 assert!(!error.is_expected_unavailable());
             }
 
-            for flags in [1, PROOF_FLAGS_V1, u8::MAX] {
+            for flags in [1, PROOF_FLAGS_V1, u16::MAX] {
                 let malformed = child_encode_proof_frame(
                     &nonce,
                     PROOF_STATUS_CAPABILITY_DROP_V1,
@@ -6539,6 +7653,153 @@ mod platform {
                 IsolationQualificationReasonV1::CleanupUncertain
             );
             assert!(!cleanup.is_expected_unavailable());
+        }
+
+        #[test]
+        fn landlock_failure_proofs_distinguish_unavailable_from_broken() {
+            let nonce = [0x4c_u8; NONCE_BYTES_V1];
+            for errno in [0, libc::ENOSYS, libc::EOPNOTSUPP] {
+                let frame = child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1,
+                    0,
+                    errno,
+                );
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("Landlock-unavailable proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::LandlockUnavailable,
+                        IsolationQualificationStageV1::ChildLandlock,
+                        IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                        (errno != 0).then_some(errno),
+                    )
+                );
+                assert!(error.is_expected_unavailable());
+            }
+
+            for errno in [
+                0,
+                libc::ENOSYS,
+                libc::EOPNOTSUPP,
+                libc::EPERM,
+                libc::EACCES,
+                libc::EIO,
+                MAX_LINUX_ERRNO_V1,
+            ] {
+                let frame =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_LANDLOCK_BROKEN_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("broken Landlock proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::IsolationPreflightFailed,
+                        IsolationQualificationStageV1::ChildLandlock,
+                        if errno == 0 {
+                            IsolationQualificationReasonV1::ChildInvariantFailed
+                        } else {
+                            IsolationQualificationReasonV1::Io
+                        },
+                        (errno != 0).then_some(errno),
+                    )
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for errno in [
+                libc::EINVAL,
+                libc::EPERM,
+                libc::EACCES,
+                libc::EIO,
+                MAX_LINUX_ERRNO_V1,
+                -1,
+                MAX_LINUX_ERRNO_V1 + 1,
+            ] {
+                let malformed = child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1,
+                    0,
+                    errno,
+                );
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("noncanonical Landlock-unavailable errno was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+            for errno in [-1, MAX_LINUX_ERRNO_V1 + 1] {
+                let malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_LANDLOCK_BROKEN_V1, 0, errno);
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("noncanonical broken-Landlock errno was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
+
+            for status in [
+                PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1,
+                PROOF_STATUS_LANDLOCK_BROKEN_V1,
+            ] {
+                let errno = if status == PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1 {
+                    libc::ENOSYS
+                } else {
+                    libc::EIO
+                };
+                for flags in [1_u16, 0x0100, u16::MAX] {
+                    let malformed = child_encode_proof_frame(&nonce, status, flags, errno);
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("Landlock failure accepted nonzero u16 flags");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+                for offset in [
+                    FRAME_PID_OFFSET_V1,
+                    FRAME_UID_OFFSET_V1,
+                    FRAME_EUID_OFFSET_V1,
+                    FRAME_GID_OFFSET_V1,
+                    FRAME_EGID_OFFSET_V1,
+                ] {
+                    let mut malformed = child_encode_proof_frame(&nonce, status, 0, errno);
+                    malformed[offset] ^= 1;
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("Landlock failure accepted a wrong identity");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+                for offset in [14, 15, FRAME_RESERVED_OFFSET_V1, FRAME_BYTES_V1 - 1] {
+                    let mut malformed = child_encode_proof_frame(&nonce, status, 0, errno);
+                    malformed[offset] = 1;
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("Landlock failure accepted reserved data");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+            }
+
+            let mut cleanup_overrides = verify_proof_frame(
+                &child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1,
+                    0,
+                    libc::ENOSYS,
+                ),
+                &nonce,
+            )
+            .expect_err("Landlock-unavailable proof was accepted as success");
+            cleanup_overrides.cleanup_complete = false;
+            assert!(!cleanup_overrides.is_expected_unavailable());
         }
 
         #[test]

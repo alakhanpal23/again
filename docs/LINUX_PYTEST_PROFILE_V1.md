@@ -542,25 +542,46 @@ Before success it independently requires all six words zero, the same empty
 bounding and ambient ranges, exact securebits `0xEF`, `no_new_privs == 1`, and
 the original authenticated fd 0 identity.
 
-Capability-drop OS and invariant failures share one canonical status 9 with
-zero flags and map to `isolation_preflight_failed` at
-`child_capability_drop`; none is expected unavailability. Success requires the
-new exact `0x7F` mask, so the prior `0x3F` frame is stale. A failure ends in a
-canonical report, fd close, and `_exit`; it cannot continue to a workload.
-This terminal diagnostic still does not prove a production tracer/workload
-split. In particular, `no_new_privs` does not prohibit a new nested user
-namespace, and the later seccomp policy must block `clone`, `clone3`,
-`unshare`, and `setns` escape forms before execution.
+Capability-drop OS and invariant failures share canonical status 9 with zero
+flags and map to `isolation_preflight_failed` at `child_capability_drop`; none
+is expected unavailability. The diagnostic then opens and authenticates fd 1
+from its fresh procfs, reopens only `.`, `tmp`, `run`, and `proc`, and requires
+their complete retained identities to match. Immediately before irreversible
+Landlock enforcement it independently rereads the empty capability sets,
+securebits, `no_new_privs`, and fd 0.
+
+The VERSION query admits exactly ABI 6 or 7. ABI 1–5 and VERSION-query
+`ENOSYS`/`EOPNOTSUPP` use canonical status 10 and map to expected
+`landlock_unavailable`. ABI above 7 and every later syscall, policy, canary, or
+cleanup failure use status 11 and map to non-expected
+`isolation_preflight_failed` at `child_landlock`. The ruleset handles exact
+filesystem, TCP, and scope masks `0xFFFF`, `0x3`, and `0x3`. It grants only
+`tmp` access `0x77BE` and `run/restricted` access `0x17BE`; workspace and TCP
+receive no rule. Fixed canaries require tmp create/write/truncate/rename
+success, restricted `ftruncate` `EACCES` and rename `EXDEV`, workspace file and
+directory read `EACCES`, and TCP bind/connect `EACCES`. ABI 6 uses restriction
+flags zero; ABI 7 uses exactly `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`.
+
+On success and every post-audit failure, cleanup attempts every tracked close
+and then uses fd 1 to require the exact `{0,1}` inventory, close and prove fd 1
+`EBADF`, and reauthenticate fd 0. Cleanup failure overrides an otherwise
+expected refusal. Protocol V2 success requires exact mask `0x00FF`; the prior
+`0x007F` capability frame is stale. This proves one fixed terminal policy's
+functional filesystem/TCP behavior and ABI-7 flag acceptance. It does not
+functionally prove signal or abstract-Unix scoping, inspect audit logs, or
+establish the production tracer/workload split. `no_new_privs` still does not
+prohibit a nested user namespace, so seccomp must block `clone`, `clone3`,
+`unshare`, and `setns` before execution.
 
 Stock hosted Ubuntu currently refuses at UTS configuration before reaching
-the root, layout, FD, or capability code, so no positive live evidence exists
-that those slices compose. The diagnostic makes no claim against malicious
-same-UID peers or host root. Its fresh procfs still exposes the diagnostic PID
-1's `exe`, `maps`, and `map_files` surfaces, inherited executable mappings and
+the root, layout, FD, capability, or Landlock code, so no positive live
+evidence exists that those slices compose. The diagnostic makes no claim
+against malicious same-UID peers or host root. Its fresh procfs still exposes
+PID 1's `exe`, `maps`, and `map_files`; inherited executable mappings and
 potentially authoritative supplementary groups remain, and nested user
 namespaces are not yet denied. It has no descriptor-selected workspace/runtime
-attachment, populated `/dev` endpoints, profile-owned stdio, Landlock,
-seccomp, command, Python, execution authority, or reuse authority.
+attachment, populated `/dev`, profile-owned stdio, seccomp, tracer, command,
+Python, execution authority, or reuse authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
@@ -626,8 +647,10 @@ After the private root is complete and before Python execs, the workload sets
 `no_new_privs` and installs a Landlock ruleset using every filesystem access
 right supported and tested by the selected ABI. ABI 6 is the minimum positive
 profile: it includes `REFER`, `TRUNCATE`, TCP bind/connect, device-ioctl
-control, and abstract-Unix-socket/signal scoping. ABI 7 audit controls are
-included and committed when the qualified tuple exposes them. The ruleset
+control, and abstract-Unix-socket/signal scoping. On ABI 7 the default commits
+`LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`, so it does not emit host audit
+records for the same executable. Audit emission and `NEW_EXEC_ON` are outside
+the current proof and require an explicit operator opt-in. The ruleset
 grants read/execute only to sealed runtime/input paths and write/create/remove
 only to the execution branch and bounded scratch mounts. Device ioctls and
 host-root traversal are not granted. No TCP allow rule exists, and abstract-
