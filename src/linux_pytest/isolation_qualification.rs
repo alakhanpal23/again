@@ -19,10 +19,14 @@
 //! mask and ABI-7 audit flag are accepted-policy evidence only; this single
 //! terminal child does not functionally prove inter-process scope isolation or
 //! inspect host audit logs. The child already owns a private descriptor table,
-//! so this does not exercise the kernel's shared-table unshare path. A future
-//! seccomp slice must still prohibit nested-user-namespace creation; this
-//! terminal diagnostic does not claim that `no_new_privs` does so. Executable
-//! mappings also remain outside this slice. It does not prove workload stdio,
+//! so this does not exercise the kernel's shared-table unshare path. After the
+//! Landlock proof has closed and audited every transient descriptor, the child
+//! installs one fixed TSYNC seccomp filter, verifies the attached filter state,
+//! and proves that six otherwise harmless syscall canaries receive the filter's
+//! private errno marker. The filter has only the terminal report path's bounded
+//! write, poll, monotonic-clock, state-readback, close, and exit surface. Wrong
+//! architectures and the x32 syscall bit are fatal. Executable mappings remain
+//! outside this slice. It does not prove workload stdio,
 //! descriptor-selected workspace/runtime mounts, populated `/dev` endpoints,
 //! or executable workload isolation. A completed marker is returned only
 //! after that direct child has exited and been reaped. A cleanup-uncertain
@@ -80,6 +84,7 @@ enum IsolationQualificationStageV1 {
     ChildDescriptorScrub,
     ChildCapabilityDrop,
     ChildLandlock,
+    ChildSeccomp,
     WaitForChild,
     ReapChild,
     Cleanup,
@@ -120,6 +125,7 @@ impl IsolationQualificationStageV1 {
             Self::ChildDescriptorScrub => "child_descriptor_scrub",
             Self::ChildCapabilityDrop => "child_capability_drop",
             Self::ChildLandlock => "child_landlock",
+            Self::ChildSeccomp => "child_seccomp",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
             Self::Cleanup => "cleanup",
@@ -271,6 +277,17 @@ impl IsolationQualificationFailureV1 {
                 IsolationQualificationStageV1::ChildUtsConfiguration,
                 IsolationQualificationReasonV1::AdministrativePolicy,
                 Some(libc::EPERM),
+            )
+        ) {
+            return true;
+        }
+        if matches!(
+            (self.code, self.stage, self.reason, self.errno),
+            (
+                RefusalCode::SeccompUnavailable,
+                IsolationQualificationStageV1::ChildSeccomp,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP),
             )
         ) {
             return true;
@@ -537,7 +554,9 @@ mod platform {
     const PROOF_STATUS_CAPABILITY_DROP_V1: u8 = 9;
     const PROOF_STATUS_LANDLOCK_UNAVAILABLE_V1: u8 = 10;
     const PROOF_STATUS_LANDLOCK_BROKEN_V1: u8 = 11;
-    const PROOF_FLAGS_V1: u16 = 0x00ff;
+    const PROOF_STATUS_SECCOMP_UNAVAILABLE_V1: u8 = 12;
+    const PROOF_STATUS_SECCOMP_BROKEN_V1: u8 = 13;
+    const PROOF_FLAGS_V1: u16 = 0x01ff;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -672,6 +691,45 @@ mod platform {
     const RUN_RESTRICTED_FROM_ITEM_PATH_V1: &CStr = c"/run/restricted/from/item";
     const RUN_RESTRICTED_TO_ITEM_PATH_V1: &CStr = c"/run/restricted/to/item";
     const LANDLOCK_CANARY_BYTES_V1: &[u8] = b"again-landlock";
+    const SECCOMP_SET_MODE_FILTER_V1: u32 = 1;
+    const SECCOMP_GET_ACTION_AVAIL_V1: u32 = 2;
+    const SECCOMP_FILTER_FLAG_TSYNC_V1: u32 = 1;
+    const SECCOMP_MODE_DISABLED_V1: libc::c_long = 0;
+    const SECCOMP_MODE_FILTER_V1: libc::c_long = 2;
+    const SECCOMP_RET_KILL_PROCESS_V1: u32 = 0x8000_0000;
+    const SECCOMP_RET_ERRNO_V1: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW_V1: u32 = 0x7fff_0000;
+    const SECCOMP_ERRNO_MARKER_V1: u16 = 0x05a5;
+    const SECCOMP_RET_MARKER_V1: u32 = SECCOMP_RET_ERRNO_V1 | SECCOMP_ERRNO_MARKER_V1 as u32;
+    const AUDIT_ARCH_X86_64_V1: u32 = 0xc000_003e;
+    const X32_SYSCALL_BIT_V1: u32 = 0x4000_0000;
+    const SECCOMP_DATA_NR_OFFSET_V1: u32 = 0;
+    const SECCOMP_DATA_ARCH_OFFSET_V1: u32 = 4;
+    const SECCOMP_DATA_ARGS_OFFSET_V1: u32 = 16;
+    const SECCOMP_DATA_ARG_STRIDE_V1: u32 = 8;
+    const SECCOMP_DATA_ARG_HIGH_OFFSET_V1: u32 = 4;
+    const SECCOMP_MAX_POLL_MILLISECONDS_V1: u32 = (PROBE_PROTOCOL_SECONDS_V1 as u32) * 1_000;
+    const SECCOMP_SYSCALL_WRITE_V1: u32 = 1;
+    const SECCOMP_SYSCALL_CLOSE_V1: u32 = 3;
+    const SECCOMP_SYSCALL_POLL_V1: u32 = 7;
+    const SECCOMP_SYSCALL_IOCTL_V1: u32 = 16;
+    const SECCOMP_SYSCALL_SOCKET_V1: u32 = 41;
+    const SECCOMP_SYSCALL_EXIT_V1: u32 = 60;
+    const SECCOMP_SYSCALL_PRCTL_V1: u32 = 157;
+    const SECCOMP_SYSCALL_CLOCK_GETTIME_V1: u32 = 228;
+    const SECCOMP_SYSCALL_OPENAT_V1: u32 = 257;
+    const SECCOMP_SYSCALL_UNSHARE_V1: u32 = 272;
+    const SECCOMP_SYSCALL_SETNS_V1: u32 = 308;
+    const SECCOMP_SYSCALL_CLONE3_V1: u32 = 435;
+    const SECCOMP_PR_GET_SECCOMP_V1: u32 = 21;
+    const SECCOMP_PR_GET_NO_NEW_PRIVS_V1: u32 = 39;
+    const SECCOMP_EXIT_SUCCESS_V1: u32 = 0;
+    const SECCOMP_EXIT_FAILURE_V1: u32 = CHILD_EXIT_PROOF_FAILED_V1 as u32;
+    const SECCOMP_BPF_LD_W_ABS_V1: u16 = 0x20;
+    const SECCOMP_BPF_JMP_JEQ_K_V1: u16 = 0x15;
+    const SECCOMP_BPF_JMP_JGT_K_V1: u16 = 0x25;
+    const SECCOMP_BPF_JMP_JSET_K_V1: u16 = 0x45;
+    const SECCOMP_BPF_RET_K_V1: u16 = 0x06;
     const MAX_LINUX_ERRNO_V1: i32 = 4_095;
 
     #[repr(C)]
@@ -760,6 +818,13 @@ mod platform {
         Abi7,
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ChildSeccompFailureV1 {
+        Unavailable(i32),
+        Os(i32),
+        Invariant,
+    }
+
     #[repr(C)]
     struct LinuxLandlockRulesetAttrV1 {
         handled_access_fs: u64,
@@ -772,6 +837,179 @@ mod platform {
         allowed_access: u64,
         parent_fd: i32,
     }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    struct LinuxSockFilterV1 {
+        code: u16,
+        jump_true: u8,
+        jump_false: u8,
+        operand: u32,
+    }
+
+    #[repr(C)]
+    struct LinuxSockFprogV1 {
+        length: u16,
+        filter: *const LinuxSockFilterV1,
+    }
+
+    #[cfg(test)]
+    #[repr(C)]
+    struct LinuxSeccompDataV1 {
+        syscall: i32,
+        architecture: u32,
+        instruction_pointer: u64,
+        arguments: [u64; 6],
+    }
+
+    const fn seccomp_statement_v1(code: u16, operand: u32) -> LinuxSockFilterV1 {
+        LinuxSockFilterV1 {
+            code,
+            jump_true: 0,
+            jump_false: 0,
+            operand,
+        }
+    }
+
+    const fn seccomp_jump_v1(
+        code: u16,
+        operand: u32,
+        jump_true: u8,
+        jump_false: u8,
+    ) -> LinuxSockFilterV1 {
+        LinuxSockFilterV1 {
+            code,
+            jump_true,
+            jump_false,
+            operand,
+        }
+    }
+
+    const fn seccomp_arg_low_offset_v1(index: u32) -> u32 {
+        SECCOMP_DATA_ARGS_OFFSET_V1 + index * SECCOMP_DATA_ARG_STRIDE_V1
+    }
+
+    const fn seccomp_arg_high_offset_v1(index: u32) -> u32 {
+        seccomp_arg_low_offset_v1(index) + SECCOMP_DATA_ARG_HIGH_OFFSET_V1
+    }
+
+    const SECCOMP_FILTER_INSTRUCTION_COUNT_V1: usize = 93;
+    static SECCOMP_FILTER_V1: [LinuxSockFilterV1; SECCOMP_FILTER_INSTRUCTION_COUNT_V1] = [
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, SECCOMP_DATA_ARCH_OFFSET_V1),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, AUDIT_ARCH_X86_64_V1, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_KILL_PROCESS_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, SECCOMP_DATA_NR_OFFSET_V1),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JSET_K_V1, X32_SYSCALL_BIT_V1, 0, 1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_KILL_PROCESS_V1),
+        // write(0, pointer, 64)
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_SYSCALL_WRITE_V1, 0, 13),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(2)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, FRAME_BYTES_V1 as u32, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(2)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        // poll(pointer, 1, 0..=8_000)
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_SYSCALL_POLL_V1, 0, 13),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(1)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 1, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(1)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(2)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(2)),
+        seccomp_jump_v1(
+            SECCOMP_BPF_JMP_JGT_K_V1,
+            SECCOMP_MAX_POLL_MILLISECONDS_V1,
+            0,
+            1,
+        ),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        // clock_gettime(CLOCK_MONOTONIC, pointer)
+        seccomp_jump_v1(
+            SECCOMP_BPF_JMP_JEQ_K_V1,
+            SECCOMP_SYSCALL_CLOCK_GETTIME_V1,
+            0,
+            7,
+        ),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, libc::CLOCK_MONOTONIC as u32, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        // prctl(PR_GET_SECCOMP | PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_SYSCALL_PRCTL_V1, 0, 32),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_PR_GET_SECCOMP_V1, 2, 0),
+        seccomp_jump_v1(
+            SECCOMP_BPF_JMP_JEQ_K_V1,
+            SECCOMP_PR_GET_NO_NEW_PRIVS_V1,
+            1,
+            0,
+        ),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(1)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(1)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(2)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(2)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(3)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(3)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(4)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(4)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        // close(0)
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_SYSCALL_CLOSE_V1, 0, 7),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        // exit(0 | 125)
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_SYSCALL_EXIT_V1, 0, 8),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_low_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_EXIT_SUCCESS_V1, 2, 0),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, SECCOMP_EXIT_FAILURE_V1, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_LD_W_ABS_V1, seccomp_arg_high_offset_v1(0)),
+        seccomp_jump_v1(SECCOMP_BPF_JMP_JEQ_K_V1, 0, 1, 0),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1),
+        seccomp_statement_v1(SECCOMP_BPF_RET_K_V1, SECCOMP_RET_MARKER_V1),
+    ];
 
     struct ChildLandlockTrackedFdsV1 {
         audit_descriptor: RawFd,
@@ -2907,6 +3145,7 @@ mod platform {
             PROOF_STATUS_FD_SCRUB_V1
                 | PROOF_STATUS_CAPABILITY_DROP_V1
                 | PROOF_STATUS_LANDLOCK_BROKEN_V1
+                | PROOF_STATUS_SECCOMP_BROKEN_V1
         ) {
             if flags != 0 || !(0..=MAX_LINUX_ERRNO_V1).contains(&errno) || !identity_is_exact {
                 return Err(protocol_failure(
@@ -2919,8 +3158,10 @@ mod platform {
                 IsolationQualificationStageV1::ChildDescriptorScrub
             } else if status == PROOF_STATUS_CAPABILITY_DROP_V1 {
                 IsolationQualificationStageV1::ChildCapabilityDrop
-            } else {
+            } else if status == PROOF_STATUS_LANDLOCK_BROKEN_V1 {
                 IsolationQualificationStageV1::ChildLandlock
+            } else {
+                IsolationQualificationStageV1::ChildSeccomp
             };
             return Err(failure(
                 RefusalCode::IsolationPreflightFailed,
@@ -2948,6 +3189,22 @@ mod platform {
                 IsolationQualificationStageV1::ChildLandlock,
                 IsolationQualificationReasonV1::KernelCapabilityUnavailable,
                 (errno != 0).then_some(errno),
+            ));
+        }
+        if status == PROOF_STATUS_SECCOMP_UNAVAILABLE_V1 {
+            let canonical_unavailable = matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP);
+            if flags != 0 || !canonical_unavailable || !identity_is_exact {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                RefusalCode::SeccompUnavailable,
+                IsolationQualificationStageV1::ChildSeccomp,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                Some(errno),
             ));
         }
         if status != PROOF_STATUS_SUCCESS_V1 {
@@ -3602,6 +3859,9 @@ mod platform {
         };
         if let Err(error) = child_enforce_landlock_v1(&private_root, capability, &report_identity) {
             child_landlock_fail_v1(report_write, &nonce, error, deadline);
+        }
+        if let Err(error) = child_enforce_seccomp_v1(&report_identity) {
+            child_seccomp_fail_v1(report_write, &nonce, error, deadline);
         }
 
         let proof = child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
@@ -5419,6 +5679,179 @@ mod platform {
         }
     }
 
+    fn child_enforce_seccomp_v1(
+        report_identity: &ChildReportDescriptorIdentityV1,
+    ) -> Result<(), ChildSeccompFailureV1> {
+        child_reauthenticate_capability_report_v1(report_identity)
+            .map_err(child_seccomp_from_capability_failure_v1)?;
+        child_verify_no_new_privileges_v1().map_err(child_seccomp_from_capability_failure_v1)?;
+        child_seccomp_require_preinstall_mode_v1()?;
+        child_seccomp_query_action_v1(SECCOMP_RET_ERRNO_V1)?;
+        child_seccomp_query_action_v1(SECCOMP_RET_KILL_PROCESS_V1)?;
+        child_seccomp_install_filter_v1()?;
+        child_seccomp_require_postinstall_state_v1()?;
+        child_seccomp_run_canaries_v1()
+    }
+
+    fn child_seccomp_require_preinstall_mode_v1() -> Result<(), ChildSeccompFailureV1> {
+        let result = child_seccomp_read_mode_v1();
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_seccomp_exact_result_with_errno_v1(result, errno, SECCOMP_MODE_DISABLED_V1)
+    }
+
+    fn child_seccomp_query_action_v1(action: u32) -> Result<(), ChildSeccompFailureV1> {
+        let mut observed = action;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_GET_ACTION_AVAIL_V1,
+                0_u32,
+                &mut observed,
+            )
+        };
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_seccomp_action_query_result_with_errno_v1(result, errno, observed, action)
+    }
+
+    fn child_seccomp_action_query_result_with_errno_v1(
+        result: libc::c_long,
+        errno: i32,
+        observed: u32,
+        expected: u32,
+    ) -> Result<(), ChildSeccompFailureV1> {
+        if observed != expected {
+            return Err(ChildSeccompFailureV1::Invariant);
+        }
+        match (result, errno) {
+            (0, _) => Ok(()),
+            (-1, libc::ENOSYS | libc::EOPNOTSUPP) => Err(ChildSeccompFailureV1::Unavailable(errno)),
+            (-1, errno) => Err(child_seccomp_failure_from_errno_v1(errno)),
+            _ => Err(ChildSeccompFailureV1::Invariant),
+        }
+    }
+
+    fn child_seccomp_install_filter_v1() -> Result<(), ChildSeccompFailureV1> {
+        let program = LinuxSockFprogV1 {
+            length: SECCOMP_FILTER_INSTRUCTION_COUNT_V1 as u16,
+            filter: SECCOMP_FILTER_V1.as_ptr(),
+        };
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_seccomp,
+                SECCOMP_SET_MODE_FILTER_V1,
+                SECCOMP_FILTER_FLAG_TSYNC_V1,
+                &program,
+            )
+        };
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_seccomp_exact_result_with_errno_v1(result, errno, 0)
+    }
+
+    fn child_seccomp_require_postinstall_state_v1() -> Result<(), ChildSeccompFailureV1> {
+        let mode = child_seccomp_read_mode_v1();
+        let mode_errno = if mode == -1 { child_errno() } else { 0 };
+        child_seccomp_exact_result_with_errno_v1(mode, mode_errno, SECCOMP_MODE_FILTER_V1)?;
+        let no_new_privileges = unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                u64::from(libc::PR_GET_NO_NEW_PRIVS as u32),
+                0_u64,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        };
+        let errno = if no_new_privileges == -1 {
+            child_errno()
+        } else {
+            0
+        };
+        child_seccomp_exact_result_with_errno_v1(no_new_privileges, errno, 1)
+    }
+
+    fn child_seccomp_read_mode_v1() -> libc::c_long {
+        unsafe {
+            libc::syscall(
+                libc::SYS_prctl,
+                u64::from(libc::PR_GET_SECCOMP as u32),
+                0_u64,
+                0_u64,
+                0_u64,
+                0_u64,
+            )
+        }
+    }
+
+    fn child_seccomp_run_canaries_v1() -> Result<(), ChildSeccompFailureV1> {
+        child_seccomp_require_marker_v1(unsafe { libc::syscall(libc::SYS_unshare, 0_u64) })?;
+        child_seccomp_require_marker_v1(unsafe { libc::syscall(libc::SYS_setns, -1_i32, 0_u64) })?;
+        child_seccomp_require_marker_v1(unsafe {
+            libc::syscall(libc::SYS_clone3, std::ptr::null::<CloneArgsV1>(), 0_usize)
+        })?;
+        child_seccomp_require_marker_v1(unsafe {
+            libc::syscall(libc::SYS_socket, -1_i32, 0_i32, 0_i32)
+        })?;
+        child_seccomp_require_marker_v1(unsafe {
+            libc::syscall(libc::SYS_ioctl, -1_i32, 0_u64, 0_u64)
+        })?;
+        child_seccomp_require_marker_v1(unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                std::ptr::null::<u8>(),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+                0_u32,
+            )
+        })
+    }
+
+    fn child_seccomp_require_marker_v1(result: libc::c_long) -> Result<(), ChildSeccompFailureV1> {
+        let errno = if result == -1 { child_errno() } else { 0 };
+        child_seccomp_marker_result_with_errno_v1(result, errno)
+    }
+
+    fn child_seccomp_marker_result_with_errno_v1(
+        result: libc::c_long,
+        errno: i32,
+    ) -> Result<(), ChildSeccompFailureV1> {
+        match (result, errno) {
+            (-1, errno) if errno == i32::from(SECCOMP_ERRNO_MARKER_V1) => Ok(()),
+            (-1, errno) => Err(child_seccomp_failure_from_errno_v1(errno)),
+            _ => Err(ChildSeccompFailureV1::Invariant),
+        }
+    }
+
+    fn child_seccomp_exact_result_with_errno_v1(
+        result: libc::c_long,
+        errno: i32,
+        expected: libc::c_long,
+    ) -> Result<(), ChildSeccompFailureV1> {
+        if result == expected {
+            return Ok(());
+        }
+        if result == -1 {
+            return Err(child_seccomp_failure_from_errno_v1(errno));
+        }
+        Err(ChildSeccompFailureV1::Invariant)
+    }
+
+    fn child_seccomp_from_capability_failure_v1(
+        failure: ChildCapabilityFailureV1,
+    ) -> ChildSeccompFailureV1 {
+        match failure {
+            ChildCapabilityFailureV1::Os(errno) => child_seccomp_failure_from_errno_v1(errno),
+            ChildCapabilityFailureV1::Invariant => ChildSeccompFailureV1::Invariant,
+        }
+    }
+
+    fn child_seccomp_failure_from_errno_v1(errno: i32) -> ChildSeccompFailureV1 {
+        if (1..=MAX_LINUX_ERRNO_V1).contains(&errno) {
+            ChildSeccompFailureV1::Os(errno)
+        } else {
+            ChildSeccompFailureV1::Invariant
+        }
+    }
+
     fn child_read_bounding_capabilities_v1()
     -> Result<[i8; CAPABILITY_SCAN_LENGTH_V1], ChildCapabilityFailureV1> {
         let mut scan = [CAPABILITY_SCAN_UNOBSERVED_V1; CAPABILITY_SCAN_LENGTH_V1];
@@ -5788,6 +6221,22 @@ mod platform {
         child_fail(report_write, nonce, status, errno, deadline)
     }
 
+    fn child_seccomp_fail_v1(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        failure: ChildSeccompFailureV1,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let (status, errno) = match failure {
+            ChildSeccompFailureV1::Unavailable(errno) => {
+                (PROOF_STATUS_SECCOMP_UNAVAILABLE_V1, errno)
+            }
+            ChildSeccompFailureV1::Os(errno) => (PROOF_STATUS_SECCOMP_BROKEN_V1, errno),
+            ChildSeccompFailureV1::Invariant => (PROOF_STATUS_SECCOMP_BROKEN_V1, 0),
+        };
+        child_fail(report_write, nonce, status, errno, deadline)
+    }
+
     fn child_fail(
         report_write: RawFd,
         nonce: &[u8; NONCE_BYTES_V1],
@@ -5986,8 +6435,14 @@ mod platform {
         deadline: MonotonicDeadlineV1,
     ) -> bool {
         loop {
-            let written =
-                unsafe { libc::syscall(libc::SYS_write, fd, frame.as_ptr(), FRAME_BYTES_V1) };
+            let written = unsafe {
+                libc::syscall(
+                    libc::SYS_write,
+                    u64::from(fd as u32),
+                    frame.as_ptr(),
+                    FRAME_BYTES_V1 as u64,
+                )
+            };
             if written == FRAME_BYTES_V1 as libc::c_long {
                 return true;
             }
@@ -6010,13 +6465,17 @@ mod platform {
                 Some(timeout) => timeout,
                 None => return false,
             };
+            let Ok(timeout) = u32::try_from(timeout) else {
+                return false;
+            };
             let mut descriptor = libc::pollfd {
                 fd,
                 events,
                 revents: 0,
             };
-            let result =
-                unsafe { libc::syscall(libc::SYS_poll, &mut descriptor, 1_usize, timeout) };
+            let result = unsafe {
+                libc::syscall(libc::SYS_poll, &mut descriptor, 1_u64, u64::from(timeout))
+            };
             if result > 0 {
                 return descriptor.revents & events != 0
                     && descriptor.revents & (libc::POLLERR | libc::POLLNVAL) == 0;
@@ -6035,7 +6494,7 @@ mod platform {
         if unsafe {
             libc::syscall(
                 libc::SYS_clock_gettime,
-                libc::CLOCK_MONOTONIC,
+                u64::from(libc::CLOCK_MONOTONIC as u32),
                 now.as_mut_ptr(),
             )
         } != 0
@@ -6053,7 +6512,7 @@ mod platform {
         if fd < 0 {
             return false;
         }
-        let result = unsafe { libc::syscall(libc::SYS_close, fd) };
+        let result = unsafe { libc::syscall(libc::SYS_close, u64::from(fd as u32)) };
         result == 0 || (result < 0 && child_errno() == libc::EINTR)
     }
 
@@ -6062,7 +6521,7 @@ mod platform {
     }
 
     fn child_exit(status: i32) -> ! {
-        unsafe { libc::syscall(libc::SYS_exit, status) };
+        unsafe { libc::syscall(libc::SYS_exit, u64::from(status as u32)) };
         loop {
             std::hint::spin_loop();
         }
@@ -6074,6 +6533,151 @@ mod platform {
 
         const DISPOSABLE_FD_SCRUB_MAGIC_V1: &[u8; 8] = b"AGNFDT01";
         const DISPOSABLE_FD_SCRUB_COMPLETE_V1: u8 = 1;
+
+        fn seccomp_filter_fingerprint_v1() -> u64 {
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+            for instruction in &SECCOMP_FILTER_V1 {
+                for byte in instruction
+                    .code
+                    .to_le_bytes()
+                    .into_iter()
+                    .chain([instruction.jump_true, instruction.jump_false])
+                    .chain(instruction.operand.to_le_bytes())
+                {
+                    hash ^= u64::from(byte);
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+            hash
+        }
+
+        fn seccomp_filter_is_structurally_valid_v1() -> bool {
+            let filter = &SECCOMP_FILTER_V1;
+            if filter.is_empty() || filter.len() > usize::from(u16::MAX) {
+                return false;
+            }
+            let mut reachable = vec![false; filter.len()];
+            let mut pending = vec![0_usize];
+            while let Some(program_counter) = pending.pop() {
+                let Some(instruction) = filter.get(program_counter).copied() else {
+                    return false;
+                };
+                if reachable[program_counter] {
+                    continue;
+                }
+                reachable[program_counter] = true;
+                match instruction.code {
+                    SECCOMP_BPF_LD_W_ABS_V1 => {
+                        if instruction.jump_true != 0
+                            || instruction.jump_false != 0
+                            || instruction.operand % 4 != 0
+                            || instruction.operand > 60
+                        {
+                            return false;
+                        }
+                        let Some(next) = program_counter.checked_add(1) else {
+                            return false;
+                        };
+                        if next >= filter.len() {
+                            return false;
+                        }
+                        pending.push(next);
+                    }
+                    SECCOMP_BPF_JMP_JEQ_K_V1
+                    | SECCOMP_BPF_JMP_JGT_K_V1
+                    | SECCOMP_BPF_JMP_JSET_K_V1 => {
+                        for jump in [instruction.jump_true, instruction.jump_false] {
+                            let Some(target) = program_counter
+                                .checked_add(1)
+                                .and_then(|next| next.checked_add(usize::from(jump)))
+                            else {
+                                return false;
+                            };
+                            if target >= filter.len() {
+                                return false;
+                            }
+                            pending.push(target);
+                        }
+                    }
+                    SECCOMP_BPF_RET_K_V1 => {
+                        if instruction.jump_true != 0
+                            || instruction.jump_false != 0
+                            || !matches!(
+                                instruction.operand,
+                                SECCOMP_RET_ALLOW_V1
+                                    | SECCOMP_RET_MARKER_V1
+                                    | SECCOMP_RET_KILL_PROCESS_V1
+                            )
+                        {
+                            return false;
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            reachable.into_iter().all(|seen| seen)
+        }
+
+        fn evaluate_seccomp_filter_v1(
+            architecture: u32,
+            syscall: u32,
+            arguments: [u64; 6],
+        ) -> Option<u32> {
+            let filter = &SECCOMP_FILTER_V1;
+            let mut accumulator = 0_u32;
+            let mut program_counter = 0_usize;
+            let mut steps = 0_usize;
+            while program_counter < filter.len() && steps <= filter.len() {
+                let instruction = filter[program_counter];
+                steps += 1;
+                match instruction.code {
+                    SECCOMP_BPF_LD_W_ABS_V1 => {
+                        accumulator = match instruction.operand {
+                            SECCOMP_DATA_NR_OFFSET_V1 => syscall,
+                            SECCOMP_DATA_ARCH_OFFSET_V1 => architecture,
+                            offset => {
+                                let relative = offset.checked_sub(SECCOMP_DATA_ARGS_OFFSET_V1)?;
+                                let argument =
+                                    usize::try_from(relative / SECCOMP_DATA_ARG_STRIDE_V1).ok()?;
+                                if argument >= arguments.len() {
+                                    return None;
+                                }
+                                let value = *arguments.get(argument)?;
+                                if relative % SECCOMP_DATA_ARG_STRIDE_V1 == 0 {
+                                    value as u32
+                                } else if relative % SECCOMP_DATA_ARG_STRIDE_V1
+                                    == SECCOMP_DATA_ARG_HIGH_OFFSET_V1
+                                {
+                                    (value >> 32) as u32
+                                } else {
+                                    return None;
+                                }
+                            }
+                        };
+                        program_counter += 1;
+                    }
+                    SECCOMP_BPF_JMP_JEQ_K_V1
+                    | SECCOMP_BPF_JMP_JGT_K_V1
+                    | SECCOMP_BPF_JMP_JSET_K_V1 => {
+                        let predicate = match instruction.code {
+                            SECCOMP_BPF_JMP_JEQ_K_V1 => accumulator == instruction.operand,
+                            SECCOMP_BPF_JMP_JGT_K_V1 => accumulator > instruction.operand,
+                            SECCOMP_BPF_JMP_JSET_K_V1 => accumulator & instruction.operand != 0,
+                            _ => return None,
+                        };
+                        let jump = if predicate {
+                            instruction.jump_true
+                        } else {
+                            instruction.jump_false
+                        };
+                        program_counter = program_counter.checked_add(1 + usize::from(jump))?;
+                    }
+                    SECCOMP_BPF_RET_K_V1 => return Some(instruction.operand),
+                    _ => return None,
+                }
+            }
+            None
+        }
 
         fn test_pipe() -> (OwnedFd, OwnedFd) {
             create_pipe().unwrap_or_else(|_| panic!("nonblocking pipe fixture failed"))
@@ -6477,7 +7081,7 @@ mod platform {
             assert_eq!(FD_AUDIT_MAX_GETDENTS_CALLS_V1, 8);
             assert_eq!(FD_AUDIT_COMPLETE_MASK_V1, 0b1111);
             assert_eq!(PROTOCOL_VERSION_V2, 2);
-            assert_eq!(PROOF_FLAGS_V1, 0x00ff);
+            assert_eq!(PROOF_FLAGS_V1, 0x01ff);
         }
 
         #[test]
@@ -6798,6 +7402,329 @@ mod platform {
                 let address = child_landlock_loopback_address_v1(port);
                 assert_eq!(u16::from_be(address.sin_port), port);
                 assert_eq!(u32::from_be(address.sin_addr.s_addr), 0x7f00_0001);
+            }
+        }
+
+        #[test]
+        fn seccomp_uapi_program_and_syscall_contract_are_exact() {
+            assert_eq!(std::mem::size_of::<LinuxSockFilterV1>(), 8);
+            assert_eq!(std::mem::align_of::<LinuxSockFilterV1>(), 4);
+            assert_eq!(std::mem::offset_of!(LinuxSockFilterV1, code), 0);
+            assert_eq!(std::mem::offset_of!(LinuxSockFilterV1, jump_true), 2);
+            assert_eq!(std::mem::offset_of!(LinuxSockFilterV1, jump_false), 3);
+            assert_eq!(std::mem::offset_of!(LinuxSockFilterV1, operand), 4);
+            assert_eq!(std::mem::size_of::<LinuxSockFprogV1>(), 16);
+            assert_eq!(std::mem::align_of::<LinuxSockFprogV1>(), 8);
+            assert_eq!(std::mem::offset_of!(LinuxSockFprogV1, length), 0);
+            assert_eq!(std::mem::offset_of!(LinuxSockFprogV1, filter), 8);
+            assert_eq!(std::mem::size_of::<LinuxSeccompDataV1>(), 64);
+            assert_eq!(std::mem::align_of::<LinuxSeccompDataV1>(), 8);
+            assert_eq!(std::mem::offset_of!(LinuxSeccompDataV1, syscall), 0);
+            assert_eq!(std::mem::offset_of!(LinuxSeccompDataV1, architecture), 4);
+            assert_eq!(
+                std::mem::offset_of!(LinuxSeccompDataV1, instruction_pointer),
+                8
+            );
+            assert_eq!(std::mem::offset_of!(LinuxSeccompDataV1, arguments), 16);
+            assert_eq!(SECCOMP_FILTER_INSTRUCTION_COUNT_V1, 93);
+            assert_eq!(SECCOMP_SET_MODE_FILTER_V1, 1);
+            assert_eq!(SECCOMP_GET_ACTION_AVAIL_V1, 2);
+            assert_eq!(SECCOMP_FILTER_FLAG_TSYNC_V1, 1);
+            assert_eq!(SECCOMP_RET_KILL_PROCESS_V1, 0x8000_0000);
+            assert_eq!(SECCOMP_RET_ERRNO_V1, 0x0005_0000);
+            assert_eq!(SECCOMP_RET_ALLOW_V1, 0x7fff_0000);
+            assert_eq!(SECCOMP_ERRNO_MARKER_V1, 0x05a5);
+            assert_eq!(SECCOMP_RET_MARKER_V1, 0x0005_05a5);
+            assert_eq!(AUDIT_ARCH_X86_64_V1, 0xc000_003e);
+            assert_eq!(X32_SYSCALL_BIT_V1, 0x4000_0000);
+            assert_eq!(SECCOMP_DATA_NR_OFFSET_V1, 0);
+            assert_eq!(SECCOMP_DATA_ARCH_OFFSET_V1, 4);
+            assert_eq!(SECCOMP_DATA_ARGS_OFFSET_V1, 16);
+            assert_eq!(SECCOMP_DATA_ARG_STRIDE_V1, 8);
+            assert_eq!(SECCOMP_DATA_ARG_HIGH_OFFSET_V1, 4);
+            assert_eq!(SECCOMP_MAX_POLL_MILLISECONDS_V1, 8_000);
+            assert_eq!(SECCOMP_PR_GET_SECCOMP_V1, libc::PR_GET_SECCOMP as u32);
+            assert_eq!(
+                SECCOMP_PR_GET_NO_NEW_PRIVS_V1,
+                libc::PR_GET_NO_NEW_PRIVS as u32
+            );
+            for (frozen, libc_number) in [
+                (SECCOMP_SYSCALL_WRITE_V1, libc::SYS_write),
+                (SECCOMP_SYSCALL_CLOSE_V1, libc::SYS_close),
+                (SECCOMP_SYSCALL_POLL_V1, libc::SYS_poll),
+                (SECCOMP_SYSCALL_IOCTL_V1, libc::SYS_ioctl),
+                (SECCOMP_SYSCALL_SOCKET_V1, libc::SYS_socket),
+                (SECCOMP_SYSCALL_EXIT_V1, libc::SYS_exit),
+                (SECCOMP_SYSCALL_PRCTL_V1, libc::SYS_prctl),
+                (SECCOMP_SYSCALL_CLOCK_GETTIME_V1, libc::SYS_clock_gettime),
+                (SECCOMP_SYSCALL_OPENAT_V1, libc::SYS_openat),
+                (SECCOMP_SYSCALL_UNSHARE_V1, libc::SYS_unshare),
+                (SECCOMP_SYSCALL_SETNS_V1, libc::SYS_setns),
+                (SECCOMP_SYSCALL_CLONE3_V1, libc::SYS_clone3),
+            ] {
+                assert_eq!(u64::from(frozen), libc_number as u64);
+            }
+            assert_eq!(SECCOMP_EXIT_SUCCESS_V1, 0);
+            assert_eq!(SECCOMP_EXIT_FAILURE_V1, 125);
+        }
+
+        #[test]
+        fn seccomp_filter_has_one_frozen_byte_sequence() {
+            assert_eq!(seccomp_filter_fingerprint_v1(), 0x1858_59bb_c152_5aac);
+            assert!(seccomp_filter_is_structurally_valid_v1());
+        }
+
+        #[test]
+        fn seccomp_filter_allows_only_the_terminal_proof_surface() {
+            let evaluate = |syscall, arguments| {
+                evaluate_seccomp_filter_v1(AUDIT_ARCH_X86_64_V1, syscall, arguments)
+                    .expect("fixed filter did not terminate")
+            };
+
+            let mut write = [0_u64; 6];
+            write[1] = 0x1234_5678_9abc_def0;
+            write[2] = FRAME_BYTES_V1 as u64;
+            assert_eq!(
+                evaluate(SECCOMP_SYSCALL_WRITE_V1, write),
+                SECCOMP_RET_ALLOW_V1
+            );
+            for (argument, value) in [
+                (0, 1),
+                (0, 1_u64 << 32),
+                (2, 63),
+                (2, (FRAME_BYTES_V1 as u64) | (1_u64 << 32)),
+            ] {
+                let mut changed = write;
+                changed[argument] = value;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_WRITE_V1, changed),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+
+            let mut poll = [0_u64; 6];
+            poll[0] = u64::MAX;
+            poll[1] = 1;
+            for timeout in [0, 1, SECCOMP_MAX_POLL_MILLISECONDS_V1 as u64] {
+                poll[2] = timeout;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_POLL_V1, poll),
+                    SECCOMP_RET_ALLOW_V1
+                );
+            }
+            for (argument, value) in [
+                (1, 0),
+                (1, 2),
+                (1, 1 | (1_u64 << 32)),
+                (2, u64::from(SECCOMP_MAX_POLL_MILLISECONDS_V1) + 1),
+                (2, 1_u64 << 32),
+            ] {
+                let mut changed = poll;
+                changed[argument] = value;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_POLL_V1, changed),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+
+            let mut clock = [0_u64; 6];
+            clock[0] = libc::CLOCK_MONOTONIC as u64;
+            clock[1] = u64::MAX;
+            assert_eq!(
+                evaluate(SECCOMP_SYSCALL_CLOCK_GETTIME_V1, clock),
+                SECCOMP_RET_ALLOW_V1
+            );
+            for clock_id in [0, 2, (libc::CLOCK_MONOTONIC as u64) | (1_u64 << 32)] {
+                clock[0] = clock_id;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_CLOCK_GETTIME_V1, clock),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+
+            for option in [SECCOMP_PR_GET_SECCOMP_V1, SECCOMP_PR_GET_NO_NEW_PRIVS_V1] {
+                let mut arguments = [0_u64; 6];
+                arguments[0] = u64::from(option);
+                arguments[5] = u64::MAX;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_PRCTL_V1, arguments),
+                    SECCOMP_RET_ALLOW_V1
+                );
+                for argument in 1..=4 {
+                    for value in [1, 1_u64 << 32] {
+                        let mut changed = arguments;
+                        changed[argument] = value;
+                        assert_eq!(
+                            evaluate(SECCOMP_SYSCALL_PRCTL_V1, changed),
+                            SECCOMP_RET_MARKER_V1
+                        );
+                    }
+                }
+            }
+            for option in [0, 1, u64::from(SECCOMP_PR_GET_SECCOMP_V1) | (1_u64 << 32)] {
+                let mut arguments = [0_u64; 6];
+                arguments[0] = option;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_PRCTL_V1, arguments),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+
+            assert_eq!(
+                evaluate(SECCOMP_SYSCALL_CLOSE_V1, [0; 6]),
+                SECCOMP_RET_ALLOW_V1
+            );
+            for descriptor in [1, 1_u64 << 32] {
+                let mut arguments = [0_u64; 6];
+                arguments[0] = descriptor;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_CLOSE_V1, arguments),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+
+            for status in [SECCOMP_EXIT_SUCCESS_V1, SECCOMP_EXIT_FAILURE_V1] {
+                let mut arguments = [0_u64; 6];
+                arguments[0] = u64::from(status);
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_EXIT_V1, arguments),
+                    SECCOMP_RET_ALLOW_V1
+                );
+            }
+            for status in [1, 124, 126, 1_u64 << 32] {
+                let mut arguments = [0_u64; 6];
+                arguments[0] = status;
+                assert_eq!(
+                    evaluate(SECCOMP_SYSCALL_EXIT_V1, arguments),
+                    SECCOMP_RET_MARKER_V1
+                );
+            }
+        }
+
+        #[test]
+        fn seccomp_filter_kills_wrong_abi_and_marks_every_canary() {
+            let evaluate = |architecture, syscall| {
+                evaluate_seccomp_filter_v1(architecture, syscall, [0_u64; 6])
+                    .expect("fixed filter did not terminate")
+            };
+            assert_eq!(
+                evaluate(AUDIT_ARCH_X86_64_V1 ^ 1, SECCOMP_SYSCALL_WRITE_V1),
+                SECCOMP_RET_KILL_PROCESS_V1
+            );
+            assert_eq!(
+                evaluate(
+                    AUDIT_ARCH_X86_64_V1,
+                    SECCOMP_SYSCALL_WRITE_V1 | X32_SYSCALL_BIT_V1,
+                ),
+                SECCOMP_RET_KILL_PROCESS_V1
+            );
+            for syscall in [
+                SECCOMP_SYSCALL_UNSHARE_V1,
+                SECCOMP_SYSCALL_SETNS_V1,
+                SECCOMP_SYSCALL_CLONE3_V1,
+                SECCOMP_SYSCALL_SOCKET_V1,
+                SECCOMP_SYSCALL_IOCTL_V1,
+                SECCOMP_SYSCALL_OPENAT_V1,
+                0,
+                u32::MAX & !X32_SYSCALL_BIT_V1,
+            ] {
+                assert_eq!(
+                    evaluate(AUDIT_ARCH_X86_64_V1, syscall),
+                    SECCOMP_RET_MARKER_V1,
+                    "syscall {syscall}",
+                );
+            }
+        }
+
+        #[test]
+        fn seccomp_result_classifiers_are_exact_and_do_not_launder_errors() {
+            for action in [SECCOMP_RET_ERRNO_V1, SECCOMP_RET_KILL_PROCESS_V1] {
+                assert_eq!(
+                    child_seccomp_action_query_result_with_errno_v1(0, libc::EIO, action, action),
+                    Ok(())
+                );
+                assert_eq!(
+                    child_seccomp_action_query_result_with_errno_v1(0, 0, action ^ 1, action),
+                    Err(ChildSeccompFailureV1::Invariant)
+                );
+                for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
+                    assert_eq!(
+                        child_seccomp_action_query_result_with_errno_v1(-1, errno, action, action,),
+                        Err(ChildSeccompFailureV1::Unavailable(errno))
+                    );
+                }
+                for errno in [libc::EINVAL, libc::EPERM, libc::EACCES, MAX_LINUX_ERRNO_V1] {
+                    assert_eq!(
+                        child_seccomp_action_query_result_with_errno_v1(-1, errno, action, action,),
+                        Err(ChildSeccompFailureV1::Os(errno))
+                    );
+                }
+                for (result, errno, observed) in [
+                    (1, 0, action),
+                    (-2, 0, action),
+                    (-1, 0, action),
+                    (-1, -1, action),
+                    (-1, MAX_LINUX_ERRNO_V1 + 1, action),
+                    (-1, libc::ENOSYS, action ^ 1),
+                ] {
+                    assert_eq!(
+                        child_seccomp_action_query_result_with_errno_v1(
+                            result, errno, observed, action,
+                        ),
+                        Err(ChildSeccompFailureV1::Invariant)
+                    );
+                }
+            }
+
+            for expected in [SECCOMP_MODE_DISABLED_V1, SECCOMP_MODE_FILTER_V1, 1] {
+                assert_eq!(
+                    child_seccomp_exact_result_with_errno_v1(expected, libc::EIO, expected),
+                    Ok(())
+                );
+                for positive in [1, 2, 42, libc::c_long::MAX] {
+                    if positive != expected {
+                        assert_eq!(
+                            child_seccomp_exact_result_with_errno_v1(positive, 0, expected),
+                            Err(ChildSeccompFailureV1::Invariant)
+                        );
+                    }
+                }
+                for errno in [
+                    libc::ENOSYS,
+                    libc::EOPNOTSUPP,
+                    libc::EINVAL,
+                    libc::EPERM,
+                    libc::EACCES,
+                ] {
+                    assert_eq!(
+                        child_seccomp_exact_result_with_errno_v1(-1, errno, expected),
+                        Err(ChildSeccompFailureV1::Os(errno))
+                    );
+                }
+            }
+
+            assert_eq!(
+                child_seccomp_marker_result_with_errno_v1(-1, i32::from(SECCOMP_ERRNO_MARKER_V1),),
+                Ok(())
+            );
+            for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, MAX_LINUX_ERRNO_V1] {
+                assert_eq!(
+                    child_seccomp_marker_result_with_errno_v1(-1, errno),
+                    Err(ChildSeccompFailureV1::Os(errno))
+                );
+            }
+            for (result, errno) in [
+                (0, i32::from(SECCOMP_ERRNO_MARKER_V1)),
+                (1, i32::from(SECCOMP_ERRNO_MARKER_V1)),
+                (-2, i32::from(SECCOMP_ERRNO_MARKER_V1)),
+                (-1, 0),
+                (-1, -1),
+                (-1, MAX_LINUX_ERRNO_V1 + 1),
+            ] {
+                assert_eq!(
+                    child_seccomp_marker_result_with_errno_v1(result, errno),
+                    Err(ChildSeccompFailureV1::Invariant)
+                );
             }
         }
 
@@ -7284,7 +8211,7 @@ mod platform {
             protocol_v1[FRAME_VERSION_OFFSET_V1..FRAME_PHASE_OFFSET_V1]
                 .copy_from_slice(&1_u16.to_le_bytes());
             assert!(verify_proof_frame(&protocol_v1, &nonce).is_err());
-            for stale_flags in [0x000f, 0x001f, 0x003f, 0x007f, 0x01ff, u16::MAX] {
+            for stale_flags in [0x000f, 0x001f, 0x003f, 0x007f, 0x00ff, 0x03ff, u16::MAX] {
                 let stale =
                     child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, stale_flags, 0);
                 assert!(verify_proof_frame(&stale, &nonce).is_err());
@@ -7798,6 +8725,147 @@ mod platform {
                 &nonce,
             )
             .expect_err("Landlock-unavailable proof was accepted as success");
+            cleanup_overrides.cleanup_complete = false;
+            assert!(!cleanup_overrides.is_expected_unavailable());
+        }
+
+        #[test]
+        fn seccomp_failure_proofs_distinguish_only_action_unavailability() {
+            let nonce = [0x5c_u8; NONCE_BYTES_V1];
+            for errno in [libc::ENOSYS, libc::EOPNOTSUPP] {
+                let frame =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_SECCOMP_UNAVAILABLE_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("seccomp-unavailable proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::SeccompUnavailable,
+                        IsolationQualificationStageV1::ChildSeccomp,
+                        IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+                        Some(errno),
+                    )
+                );
+                assert!(error.is_expected_unavailable());
+            }
+
+            for errno in [
+                0,
+                libc::ENOSYS,
+                libc::EOPNOTSUPP,
+                libc::EINVAL,
+                libc::EPERM,
+                libc::EACCES,
+                libc::EIO,
+                MAX_LINUX_ERRNO_V1,
+            ] {
+                let frame =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_SECCOMP_BROKEN_V1, 0, errno);
+                let error = verify_proof_frame(&frame, &nonce)
+                    .expect_err("broken-seccomp proof was accepted as success");
+                assert_eq!(
+                    (error.code, error.stage, error.reason, error.errno),
+                    (
+                        RefusalCode::IsolationPreflightFailed,
+                        IsolationQualificationStageV1::ChildSeccomp,
+                        if errno == 0 {
+                            IsolationQualificationReasonV1::ChildInvariantFailed
+                        } else {
+                            IsolationQualificationReasonV1::Io
+                        },
+                        (errno != 0).then_some(errno),
+                    )
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+
+            for errno in [
+                0,
+                libc::EINVAL,
+                libc::EPERM,
+                libc::EACCES,
+                libc::EIO,
+                MAX_LINUX_ERRNO_V1,
+                -1,
+                MAX_LINUX_ERRNO_V1 + 1,
+            ] {
+                let malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_SECCOMP_UNAVAILABLE_V1, 0, errno);
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("noncanonical seccomp-unavailable errno was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+                assert!(!error.is_expected_unavailable());
+            }
+            for errno in [-1, MAX_LINUX_ERRNO_V1 + 1] {
+                let malformed =
+                    child_encode_proof_frame(&nonce, PROOF_STATUS_SECCOMP_BROKEN_V1, 0, errno);
+                let error = verify_proof_frame(&malformed, &nonce)
+                    .expect_err("noncanonical broken-seccomp errno was accepted");
+                assert_eq!(
+                    error.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
+
+            for status in [
+                PROOF_STATUS_SECCOMP_UNAVAILABLE_V1,
+                PROOF_STATUS_SECCOMP_BROKEN_V1,
+            ] {
+                let errno = if status == PROOF_STATUS_SECCOMP_UNAVAILABLE_V1 {
+                    libc::ENOSYS
+                } else {
+                    libc::EIO
+                };
+                for flags in [1_u16, 0x0100, PROOF_FLAGS_V1, u16::MAX] {
+                    let malformed = child_encode_proof_frame(&nonce, status, flags, errno);
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("seccomp failure accepted nonzero u16 flags");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+                for offset in [
+                    FRAME_PID_OFFSET_V1,
+                    FRAME_UID_OFFSET_V1,
+                    FRAME_EUID_OFFSET_V1,
+                    FRAME_GID_OFFSET_V1,
+                    FRAME_EGID_OFFSET_V1,
+                ] {
+                    let mut malformed = child_encode_proof_frame(&nonce, status, 0, errno);
+                    malformed[offset] ^= 1;
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("seccomp failure accepted a wrong identity");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+                for offset in [14, 15, FRAME_RESERVED_OFFSET_V1, FRAME_BYTES_V1 - 1] {
+                    let mut malformed = child_encode_proof_frame(&nonce, status, 0, errno);
+                    malformed[offset] = 1;
+                    let error = verify_proof_frame(&malformed, &nonce)
+                        .expect_err("seccomp failure accepted reserved data");
+                    assert_eq!(
+                        error.reason,
+                        IsolationQualificationReasonV1::ProtocolFrameMismatch
+                    );
+                }
+            }
+
+            let mut cleanup_overrides = verify_proof_frame(
+                &child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_SECCOMP_UNAVAILABLE_V1,
+                    0,
+                    libc::ENOSYS,
+                ),
+                &nonce,
+            )
+            .expect_err("seccomp-unavailable proof was accepted as success");
             cleanup_overrides.cleanup_complete = false;
             assert!(!cleanup_overrides.is_expected_unavailable());
         }

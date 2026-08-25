@@ -10,10 +10,11 @@ are frozen separately in [the v1 wire contract](LINUX_PYTEST_WIRE_V1.md).
 The crate-private execution profile remains unreachable from the CLI and no
 concrete profile implementation exists; pytest execution and reuse are not
 implemented. A hidden, fixed, no-command diagnostic contains the implemented
-private-root, layout, scratch, and procfs slices described below. It remains
-non-qualifying and grants no execution authority; stock hosted Ubuntu refuses
-at UTS configuration before executing them, so they have no positive live
-runtime evidence. Descriptor-stable source enumeration, regular-file copying,
+private-root, layout, scratch, procfs, descriptor-scrub, capability-drop,
+Landlock, and terminal seccomp slices described below. It remains non-
+qualifying and grants no execution authority; stock hosted Ubuntu refuses at
+UTS configuration before executing them, so they have no positive live runtime
+evidence. Descriptor-stable source enumeration, regular-file copying,
 connector-owned charged materialization, identity-checked atomic publication,
 and one shared resource contract exist as internal leaves. A no-atime
 source-view qualification path is also implemented as a crate-private leaf,
@@ -565,23 +566,64 @@ flags zero; ABI 7 uses exactly `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`.
 On success and every post-audit failure, cleanup attempts every tracked close
 and then uses fd 1 to require the exact `{0,1}` inventory, close and prove fd 1
 `EBADF`, and reauthenticate fd 0. Cleanup failure overrides an otherwise
-expected refusal. Protocol V2 success requires exact mask `0x00FF`; the prior
-`0x007F` capability frame is stale. This proves one fixed terminal policy's
-functional filesystem/TCP behavior and ABI-7 flag acceptance. It does not
-functionally prove signal or abstract-Unix scoping, inspect audit logs, or
-establish the production tracer/workload split. `no_new_privs` still does not
-prohibit a nested user namespace, so seccomp must block `clone`, `clone3`,
-`unshare`, and `setns` before execution.
+expected refusal. This establishes one fixed Landlock policy's functional
+filesystem/TCP behavior and ABI-7 flag acceptance. It does not functionally
+prove signal or abstract-Unix scoping, inspect audit logs, or establish the
+production tracer/workload split.
+
+After Landlock has closed and audited its transient descriptors, the same
+fixed no-command child reauthenticates fd 0, independently rereads
+`no_new_privs == 1`, and requires inherited seccomp mode 0. It queries exact
+availability of the bare `SECCOMP_RET_ERRNO` and
+`SECCOMP_RET_KILL_PROCESS` actions, then makes one
+`seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC, ...)` call for a
+static 93-instruction x86_64 cBPF program and requires return 0. The child
+requires post-install seccomp mode 2 and `no_new_privs == 1`. Unit tests pin
+the program's exact byte fingerprint to `0x185859bbc1525aac`, prove every jump
+terminates, and reject wrong architecture and the x32 syscall bit with
+`KILL_PROCESS`.
+
+The filter is deny-by-default with private errno marker `0x05A5`. Its entire
+allowed terminal-report surface is:
+
+- `write(0, pointer, 64)`;
+- `poll(pointer, 1, timeout)` for `0 <= timeout <= 8000`;
+- `clock_gettime(CLOCK_MONOTONIC, pointer)`;
+- `prctl(PR_GET_SECCOMP, 0, 0, 0, 0)` or
+  `prctl(PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)`;
+- `close(0)`; and
+- raw `exit(0)` or `exit(125)`.
+
+The filter deliberately does not authenticate the pointer values, and for
+`prctl` it does not inspect the unused sixth syscall slot
+`seccomp_data.args[5]`. These are explicit nonclaims, not memory-integrity or
+full-register proofs. The child calls six otherwise harmless canaries and
+requires each to return the exact marker: `unshare(0)`,
+`setns(-1,0)`, `clone3(NULL,0)`, `socket(-1,0,0)`, `ioctl(-1,0,0)`, and
+`openat(AT_FDCWD,NULL,O_RDONLY|O_CLOEXEC,0)`.
+
+Only `ENOSYS` or `EOPNOTSUPP` from either action-availability query uses
+canonical status 12 and maps to expected `seccomp_unavailable` at
+`ChildSeccomp` (serialized `child_seccomp`). An inherited filter, action
+mutation, `EINVAL`, `EPERM`, `EACCES`, a positive `TSYNC` result,
+install/readback mismatch, canary mismatch, or an unexpected syscall-result
+shape uses status 13 and maps to non-expected `isolation_preflight_failed`;
+malformed proof frames are rejected separately at `verify_child_proof`.
+Protocol V2 encodes its version and flags as
+little-endian `u16`; success requires exact mask `0x01FF`. The Landlock-only
+`0x00FF` and capability-only `0x007F` frames are stale.
 
 Stock hosted Ubuntu currently refuses at UTS configuration before reaching
-the root, layout, FD, capability, or Landlock code, so no positive live
-evidence exists that those slices compose. The diagnostic makes no claim
-against malicious same-UID peers or host root. Its fresh procfs still exposes
-PID 1's `exe`, `maps`, and `map_files`; inherited executable mappings and
-potentially authoritative supplementary groups remain, and nested user
-namespaces are not yet denied. It has no descriptor-selected workspace/runtime
-attachment, populated `/dev`, profile-owned stdio, seccomp, tracer, command,
-Python, execution authority, or reuse authority.
+the root, layout, FD, capability, Landlock, or seccomp code, so no positive
+live evidence exists that those slices compose. The terminal diagnostic's
+filter denies its six namespace/descriptor/network canaries, but it grants no
+workload authority and is not the production tracer/workload filter. The
+diagnostic makes no claim against malicious same-UID peers or host root. Its
+fresh procfs still exposes PID 1's `exe`, `maps`, and `map_files`; inherited
+executable mappings and potentially authoritative supplementary groups remain.
+It has no descriptor-selected workspace/runtime attachment, populated `/dev`,
+profile-owned stdio, tracer, command, Python, execution authority, or reuse
+authority.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,

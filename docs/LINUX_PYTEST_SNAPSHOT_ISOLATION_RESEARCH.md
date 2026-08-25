@@ -183,11 +183,11 @@ executes the complete product child. Stock hosted Ubuntu still stops at its
 earlier exact UTS-policy refusal. The terminal slice grants no command,
 Python, isolation-session, execution, or reuse authority. Supplementary
 groups and inherited executable mappings remain, and `no_new_privs` does not
-block nested user namespaces; production attachment, seccomp, tracer, and
-pre-exec audits remain mandatory.
+block nested user namespaces; production attachment, workload seccomp/tracer,
+and pre-exec audits remain mandatory.
 
-The current source slice extends the same fixed no-command child with a terminal
-Landlock diagnostic. It selects exactly ABI 6 or 7, applies exact handled
+The Landlock source checkpoint extended the same fixed no-command child with a
+terminal Landlock diagnostic. It selects exactly ABI 6 or 7, applies exact handled
 filesystem/TCP/scope masks `0xFFFF`/`0x3`/`0x3`, grants only `tmp` `0x77BE` and
 `run/restricted` `0x17BE`, and runs fixed allow/deny filesystem and TCP
 canaries. Protocol V2 success is `0x00FF`; `0x007F` is stale. ABI 1–5 and a
@@ -212,6 +212,43 @@ SHA-256 values are respectively
 `7346fa492d952f85cb1b38e4c9a1497b60d09893f7bc3cefb6fe47bf9781ec34`.
 This is immutable compile, contract-test, and negative-lane evidence, not a
 positive live Landlock-enforcement or composed-isolation result.
+
+The current seccomp source, whose
+`src/linux_pytest/isolation_qualification.rs` SHA-256 is
+`8f05d4ad1bd97a7d4efd944dd816e5f141e43d710e6d9b353ccd607613b7de65`,
+extends that fixed child after Landlock cleanup without adding an input or
+command surface. It reauthenticates fd 0, rereads `no_new_privs == 1`, requires
+pre-install seccomp mode 0, and queries the bare `ERRNO` and `KILL_PROCESS`
+actions. It then installs exactly one static 93-instruction x86_64 cBPF program
+with `SECCOMP_FILTER_FLAG_TSYNC`, requires exact return 0, and verifies mode 2
+plus `no_new_privs == 1`. Unit tests freeze the program-byte fingerprint at
+`0x185859bbc1525aac`, prove that every jump terminates, and require wrong
+architecture or the x32 syscall bit to return `KILL_PROCESS`.
+
+The filter's default is private errno marker `0x05A5`. It allows only
+`write(0, pointer, 64)`, `poll(pointer, 1, 0..=8000)`,
+`clock_gettime(CLOCK_MONOTONIC, pointer)`, either
+`prctl(PR_GET_SECCOMP,0,0,0,0)` or
+`prctl(PR_GET_NO_NEW_PRIVS,0,0,0,0)`, `close(0)`, and raw `exit(0)` or
+`exit(125)`. Pointer values are not authenticated, and the filter deliberately
+does not inspect the unused sixth syscall slot `seccomp_data.args[5]` for
+`prctl`; these are explicit nonclaims. The child requires the exact marker from
+six otherwise harmless canaries: `unshare(0)`, `setns(-1,0)`,
+`clone3(NULL,0)`, `socket(-1,0,0)`, `ioctl(-1,0,0)`, and
+`openat(AT_FDCWD,NULL,O_RDONLY|O_CLOEXEC,0)`.
+
+Only action-query `ENOSYS`/`EOPNOTSUPP` becomes canonical status 12 and expected
+`seccomp_unavailable` at `ChildSeccomp` (serialized `child_seccomp`). Inherited
+filter mode, action mutation, install/readback/canary failure, positive
+`TSYNC`, `EINVAL`, `EPERM`, `EACCES`, and every other syscall error or internal
+invariant become status 13 and non-expected `isolation_preflight_failed`;
+malformed frames fail separately at proof verification. The 64-byte protocol
+V2 stores both version and flags as little-endian `u16`, and only exact success
+mask `0x01FF` is current;
+Landlock-only `0x00FF` is stale. This is source and adversarial-test evidence,
+not a positive live seccomp or composed-isolation result: stock hosted Ubuntu
+still returns the earlier exact UTS-policy refusal. There remains no workload,
+Python, tracer, execution, isolation-session, or reuse authority.
 
 [Actions run 32797272516](https://github.com/alakhanpal23/again/actions/runs/32797272516)
 passed that source checkpoint at commit `7a5eb4a`. Ubuntu executed the
@@ -632,7 +669,8 @@ After every namespace task is gone:
 | Required mount/PID/net/UTS/IPC namespace identity, child capability, or fixed UTS configuration fails | `required_namespace_failed` |
 | tmpfs, descriptor mount, procfs, pivot, or old-root detach fails | `mount_root_failed` |
 | `close_range` is absent or fails | `close_range_unavailable` |
-| Seccomp query, install, TSYNC, or TRACE semantics fail | `seccomp_unavailable` |
+| Fixed terminal diagnostic action query returns `ENOSYS` or `EOPNOTSUPP` | `seccomp_unavailable` |
+| Fixed terminal diagnostic inherits a filter, or action/install/TSYNC/readback/canary semantics differ | `isolation_preflight_failed` |
 | Ptrace attach, options, event, or exact filter readback fails | `ptrace_unavailable` |
 | Landlock VERSION reports ABI 1–5, `ENOSYS`, or `EOPNOTSUPP` | `landlock_unavailable` |
 | Landlock VERSION reports ABI above 7, or create/add/restrict/canary/cleanup fails | `isolation_preflight_failed` |
