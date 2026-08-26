@@ -287,11 +287,17 @@ fixture and exact argv while marking source, binary, and qualified-tuple
 provenance as caller-supplied and unverified. An offline verifier accepts only
 the exact five-member future evidence archive and checks canonical ZIP layout,
 schemas, hashes, streams, wait status, workspace stability, cleanup/reap
-claims, execute-only counters, and false authority fields. These tools and
-their adversarial suites are connected to hosted CI. They validate evidence
-shape and internal consistency only: neither tool executes pytest, verifies
-the producer's runtime observations, qualifies a tuple, or grants product
-authority. There is no production evidence producer yet.
+claims, execute-only counters, and false authority fields. A deterministic
+offline packager reads exactly those five bounded inputs without following
+links, writes and verifies a private `0600` staging archive, then publishes it
+under the requested name with an atomic no-replace link. Publication and
+cleanup ambiguity remain typed, and rejected bytes are never deliberately
+published under the final name. These tools and their adversarial suites are
+connected to hosted CI. They validate evidence shape and internal consistency
+only: none executes pytest, verifies the producer's runtime observations,
+qualifies a tuple, or grants product authority. There is no production
+evidence producer yet, and the packager does not protect against a malicious
+same-UID process that can race its output directory.
 
 The first acceptance fixture should use exactly one selector, such as
 `tests/test_smoke.py::test_smoke`. It must compose:
