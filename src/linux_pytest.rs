@@ -72,6 +72,7 @@ mod canonical;
 mod execute_only_admission;
 mod execute_only_isolation;
 mod execute_only_runtime;
+mod execute_only_seccomp;
 mod execute_only_stdio;
 mod identity;
 mod isolation_qualification;
