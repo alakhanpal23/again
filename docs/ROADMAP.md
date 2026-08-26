@@ -164,6 +164,20 @@ and a manual provisioned-runner workflow requires 100/100 exact samples and
 both orders. This does not close Gate 2: no qualifying runner is currently
 registered, so both live schedules and pinned 100/100 evidence remain required.
 
+The retained artifact must be verified offline before it is cited. The verifier
+accepts the downloaded ZIP, the independently recorded source SHA, and the
+independently recorded runner kernel release; it refuses ZIP prefixes, trailers,
+comments, extra fields, gaps, special entries, type-loose JSON, raw/validated
+drift, report drift, and any authority claim. Its canonical audit includes the
+archive SHA-256, member-manifest SHA-256, source SHA, kernel release, exact member
+and sample counts, and both observed delivery orders:
+
+```sh
+python3 -B scripts/verify_linux_supervisor_evidence.py ARTIFACT.zip \
+  --expected-source-sha SOURCE_SHA \
+  --expected-kernel-release KERNEL_RELEASE
+```
+
 Before wiring a candidate record, narrow the authority path so structurally
 valid synthetic values cannot bind a reusable execution record. Completion
 evidence must be linear, connector-issued, and consumed exactly once.
