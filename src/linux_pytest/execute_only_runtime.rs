@@ -22,7 +22,6 @@ use super::snapshot_manifest::{
 use super::snapshot_publish::VerifiedBoundNodeKindV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::{ExecutableChainDigest, FileContentDigest, NodeDigest};
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use std::fmt;
 
 const FIRST_EXECUTE_ONLY_EXECUTABLE_V1: &[u8] = b".venv/bin/python";
@@ -45,7 +44,22 @@ const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
+const PT_DYNAMIC: u32 = 2;
+const PT_INTERP: u32 = 3;
 const PF_X: u32 = 1;
+const ELF64_DYNAMIC_ENTRY_BYTES: usize = 16;
+const ELF64_MAX_DYNAMIC_BYTES: usize = 64 * 1024;
+const ELF64_MAX_DYNAMIC_ENTRIES: usize = ELF64_MAX_DYNAMIC_BYTES / ELF64_DYNAMIC_ENTRY_BYTES;
+const ELF64_MAX_INTERPRETER_BYTES: usize = 4096;
+const ELF64_MAX_STRING_TABLE_BYTES: usize = 1024 * 1024;
+const ELF64_MAX_NEEDED_NAMES: usize = 64;
+const ELF64_MAX_NEEDED_NAME_BYTES: usize = 255;
+const DT_NULL: u64 = 0;
+const DT_NEEDED: u64 = 1;
+const DT_STRTAB: u64 = 5;
+const DT_STRSZ: u64 = 10;
+const DT_RPATH: u64 = 15;
+const DT_RUNPATH: u64 = 29;
 
 /// Stable, payload-free refusals from the first runtime checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,8 +99,43 @@ pub(super) enum FirstExecuteOnlyRuntimeCheckpointRefusalV1 {
     ElfProgramHeader,
     ElfNoLoadSegment,
     ElfEntryPoint,
+    ElfInterpreter,
+    ElfDynamic,
+    ElfDynamicTag,
+    ElfStringTable,
+    ElfNeeded,
+    ElfRuntimeClosureLimit,
     CanonicalOverflow,
     MemoryBudget,
+}
+
+/// A linear, unresolved description of the runtime objects named by the
+/// descriptor-bound executable. Raw names are data only: a later checkpoint
+/// must consume this request and bind every object to published descriptors.
+/// This value cannot qualify loader search, a runtime forest, or execution.
+pub(super) struct RuntimeClosureRequestV1 {
+    interpreter: Vec<u8>,
+    needed: Vec<Vec<u8>>,
+}
+
+impl fmt::Debug for RuntimeClosureRequestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeClosureRequestV1")
+            .field("interpreter", &"<redacted-unresolved-path>")
+            .field("needed_count", &self.needed.len())
+            .field("resolution_authority", &false)
+            .finish()
+    }
+}
+
+impl Drop for RuntimeClosureRequestV1 {
+    fn drop(&mut self) {
+        self.interpreter.fill(0);
+        for name in &mut self.needed {
+            name.fill(0);
+        }
+    }
 }
 
 /// Opaque linear checkpoint for later Gate 3 composition. It retains the
@@ -96,6 +145,7 @@ pub(super) enum FirstExecuteOnlyRuntimeCheckpointRefusalV1 {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) struct FirstExecuteOnlyRuntimeCheckpointV1<'resources> {
     _evidence: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
+    _runtime_closure_request: RuntimeClosureRequestV1,
     _canonical_bytes: Box<[u8]>,
     chain_digest: ExecutableChainDigest,
     workspace_root_digest: NodeDigest,
@@ -162,7 +212,8 @@ pub(super) fn qualify_first_execute_only_runtime_checkpoint_v1<'resources>(
     if !terminal_is_logically_executable_v1(evidence.terminal_logical_mode()) {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::TerminalNotExecutable);
     }
-    validate_x86_64_elf_v1(evidence.executable_bytes())?;
+    let runtime_closure_request =
+        parse_runtime_closure_request_v1(evidence.executable_bytes(), evidence.runtime_memory())?;
 
     let canonical_bytes = encode_runtime_checkpoint_v1(&evidence)?;
     let chain_digest = ExecutableChainDigest::derive(
@@ -184,6 +235,7 @@ pub(super) fn qualify_first_execute_only_runtime_checkpoint_v1<'resources>(
     .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::CanonicalOverflow)?;
     Ok(FirstExecuteOnlyRuntimeCheckpointV1 {
         _evidence: evidence,
+        _runtime_closure_request: runtime_closure_request,
         _canonical_bytes: canonical_bytes.into_boxed_slice(),
         chain_digest,
         workspace_root_digest,
@@ -320,6 +372,347 @@ pub(super) fn validate_x86_64_elf_v1(
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEntryPoint);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct Elf64ProgramHeaderV1 {
+    kind: u32,
+    offset: u64,
+    virtual_address: u64,
+    file_size: u64,
+    memory_size: u64,
+    alignment: u64,
+}
+
+fn parse_program_header_v1(header: &[u8]) -> Elf64ProgramHeaderV1 {
+    Elf64ProgramHeaderV1 {
+        kind: u32::from_le_bytes(header[0..4].try_into().expect("bounded program header")),
+        offset: u64::from_le_bytes(header[8..16].try_into().expect("bounded program header")),
+        virtual_address: u64::from_le_bytes(
+            header[16..24].try_into().expect("bounded program header"),
+        ),
+        file_size: u64::from_le_bytes(header[32..40].try_into().expect("bounded program header")),
+        memory_size: u64::from_le_bytes(header[40..48].try_into().expect("bounded program header")),
+        alignment: u64::from_le_bytes(header[48..56].try_into().expect("bounded program header")),
+    }
+}
+
+fn program_headers_v1(bytes: &[u8]) -> Result<&[u8], FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    let offset = usize::try_from(u64::from_le_bytes(
+        bytes[32..40].try_into().expect("validated ELF header"),
+    ))
+    .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+    let count = usize::from(u16::from_le_bytes(
+        bytes[56..58].try_into().expect("validated ELF header"),
+    ));
+    let size = ELF64_PROGRAM_HEADER_BYTES
+        .checked_mul(count)
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+    let end = offset
+        .checked_add(size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+    Ok(&bytes[offset..end])
+}
+
+fn bounded_segment_file_range_v1(
+    segment: Elf64ProgramHeaderV1,
+    bytes: &[u8],
+    maximum: usize,
+    refusal: FirstExecuteOnlyRuntimeCheckpointRefusalV1,
+) -> Result<std::ops::Range<usize>, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    let size = usize::try_from(segment.file_size).map_err(|_| refusal)?;
+    if size == 0
+        || size > maximum
+        || segment.file_size > segment.memory_size
+        || !(segment.alignment == 0
+            || segment.alignment == 1
+            || segment.alignment.is_power_of_two())
+        || (segment.alignment > 1
+            && segment.virtual_address % segment.alignment != segment.offset % segment.alignment)
+    {
+        return Err(refusal);
+    }
+    segment
+        .virtual_address
+        .checked_add(segment.memory_size)
+        .filter(|end| *end < ELF64_USER_VIRTUAL_LIMIT)
+        .ok_or(refusal)?;
+    let start = usize::try_from(segment.offset).map_err(|_| refusal)?;
+    let end = start
+        .checked_add(size)
+        .filter(|end| *end <= bytes.len())
+        .ok_or(refusal)?;
+    Ok(start..end)
+}
+
+fn unique_load_file_range_v1(
+    bytes: &[u8],
+    headers: &[u8],
+    virtual_address: u64,
+    size: u64,
+) -> Result<std::ops::Range<usize>, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    let virtual_end = virtual_address
+        .checked_add(size)
+        .filter(|end| *end < ELF64_USER_VIRTUAL_LIMIT)
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+    let mut matched = None;
+    for raw in headers.chunks_exact(ELF64_PROGRAM_HEADER_BYTES) {
+        let load = parse_program_header_v1(raw);
+        if load.kind != PT_LOAD {
+            continue;
+        }
+        let file_backed_end = load
+            .virtual_address
+            .checked_add(load.file_size)
+            .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+        if virtual_address < load.virtual_address || virtual_end > file_backed_end {
+            continue;
+        }
+        let delta = virtual_address - load.virtual_address;
+        let file_start = load
+            .offset
+            .checked_add(delta)
+            .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+        let file_end = file_start
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len() as u64)
+            .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+        let candidate = usize::try_from(file_start)
+            .ok()
+            .zip(usize::try_from(file_end).ok())
+            .map(|(start, end)| start..end)
+            .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+        if matched.replace(candidate).is_some() {
+            return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable);
+        }
+    }
+    matched.ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)
+}
+
+fn canonical_interpreter_path_v1(
+    segment_bytes: &[u8],
+) -> Result<&[u8], FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    if segment_bytes.len() < 2
+        || segment_bytes.last() != Some(&0)
+        || segment_bytes[..segment_bytes.len() - 1].contains(&0)
+    {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter);
+    }
+    let path = &segment_bytes[..segment_bytes.len() - 1];
+    if path.first() != Some(&b'/') || path.last() == Some(&b'/') {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter);
+    }
+    for component in path[1..].split(|byte| *byte == b'/') {
+        if component.is_empty()
+            || component.len() > ELF64_MAX_NEEDED_NAME_BYTES
+            || component == b"."
+            || component == b".."
+        {
+            return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter);
+        }
+    }
+    Ok(path)
+}
+
+fn known_dynamic_tag_v1(tag: u64) -> bool {
+    matches!(
+        tag,
+        0..=30
+            | 32..=37
+            | 0x6fff_fef5
+            | 0x6fff_fff0
+            | 0x6fff_fff9..=0x6fff_ffff
+    )
+}
+
+fn dynamic_entries_v1(
+    bytes: &[u8],
+    range: std::ops::Range<usize>,
+) -> Result<&[u8], FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    let dynamic = &bytes[range];
+    if dynamic.is_empty()
+        || dynamic.len() > ELF64_MAX_DYNAMIC_BYTES
+        || dynamic.len() % ELF64_DYNAMIC_ENTRY_BYTES != 0
+        || dynamic.len() / ELF64_DYNAMIC_ENTRY_BYTES > ELF64_MAX_DYNAMIC_ENTRIES
+    {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic);
+    }
+    Ok(dynamic)
+}
+
+fn dynamic_tag_and_value_v1(entry: &[u8]) -> (u64, u64) {
+    (
+        u64::from_le_bytes(entry[0..8].try_into().expect("bounded dynamic entry")),
+        u64::from_le_bytes(entry[8..16].try_into().expect("bounded dynamic entry")),
+    )
+}
+
+fn needed_name_at_v1(
+    string_table: &[u8],
+    offset: usize,
+) -> Result<&[u8], FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    let tail = string_table
+        .get(offset..)
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded)?;
+    let end = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded)?;
+    let name = &tail[..end];
+    if name.is_empty()
+        || name.len() > ELF64_MAX_NEEDED_NAME_BYTES
+        || name.contains(&b'/')
+        || name.contains(&b'$')
+        || name == b"."
+        || name == b".."
+    {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded);
+    }
+    Ok(name)
+}
+
+fn parse_runtime_closure_request_v1(
+    bytes: &[u8],
+    memory: &super::snapshot_publish::RuntimeMemoryEscrowV1,
+) -> Result<RuntimeClosureRequestV1, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    validate_x86_64_elf_v1(bytes)?;
+    let headers = program_headers_v1(bytes)?;
+    let mut interpreter = None;
+    let mut dynamic = None;
+    for raw in headers.chunks_exact(ELF64_PROGRAM_HEADER_BYTES) {
+        let segment = parse_program_header_v1(raw);
+        match segment.kind {
+            PT_INTERP => {
+                if interpreter.replace(segment).is_some() {
+                    return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter);
+                }
+            }
+            PT_DYNAMIC => {
+                if dynamic.replace(segment).is_some() {
+                    return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic);
+                }
+            }
+            _ => {}
+        }
+    }
+    let interpreter =
+        interpreter.ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter)?;
+    let interpreter_range = bounded_segment_file_range_v1(
+        interpreter,
+        bytes,
+        ELF64_MAX_INTERPRETER_BYTES,
+        FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter,
+    )?;
+    let interpreter_path = canonical_interpreter_path_v1(&bytes[interpreter_range])?;
+
+    let dynamic = dynamic.ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic)?;
+    let dynamic_range = bounded_segment_file_range_v1(
+        dynamic,
+        bytes,
+        ELF64_MAX_DYNAMIC_BYTES,
+        FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic,
+    )?;
+    let translated_dynamic =
+        unique_load_file_range_v1(bytes, headers, dynamic.virtual_address, dynamic.file_size)
+            .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic)?;
+    if translated_dynamic != dynamic_range {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic);
+    }
+    let dynamic_entries = dynamic_entries_v1(bytes, dynamic_range)?;
+
+    let mut string_table_address = None;
+    let mut string_table_size = None;
+    let mut needed_count = 0usize;
+    let mut terminated = false;
+    let mut seen_singletons = [u64::MAX; 64];
+    let mut singleton_count = 0usize;
+    for entry in dynamic_entries.chunks_exact(ELF64_DYNAMIC_ENTRY_BYTES) {
+        let (tag, value) = dynamic_tag_and_value_v1(entry);
+        if tag == DT_NULL {
+            terminated = true;
+            continue;
+        }
+        if terminated || tag == DT_RPATH || tag == DT_RUNPATH || !known_dynamic_tag_v1(tag) {
+            return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag);
+        }
+        if tag != DT_NEEDED {
+            if seen_singletons[..singleton_count].contains(&tag)
+                || singleton_count == seen_singletons.len()
+            {
+                return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag);
+            }
+            seen_singletons[singleton_count] = tag;
+            singleton_count += 1;
+        }
+        match tag {
+            DT_NEEDED => {
+                needed_count = needed_count
+                    .checked_add(1)
+                    .filter(|count| *count <= ELF64_MAX_NEEDED_NAMES)
+                    .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfRuntimeClosureLimit)?;
+            }
+            DT_STRTAB => string_table_address = Some(value),
+            DT_STRSZ => string_table_size = Some(value),
+            _ => {}
+        }
+    }
+    if !terminated || needed_count == 0 {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic);
+    }
+    let string_table_address =
+        string_table_address.ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+    let string_table_size =
+        string_table_size.ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable)?;
+    let string_table_size_usize = usize::try_from(string_table_size)
+        .ok()
+        .filter(|size| *size != 0 && *size <= ELF64_MAX_STRING_TABLE_BYTES)
+        .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfRuntimeClosureLimit)?;
+    let string_table_range =
+        unique_load_file_range_v1(bytes, headers, string_table_address, string_table_size)?;
+    if string_table_range.len() != string_table_size_usize {
+        return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable);
+    }
+    let string_table = &bytes[string_table_range];
+
+    let mut needed_offsets = [0usize; ELF64_MAX_NEEDED_NAMES];
+    let mut needed_index = 0usize;
+    for entry in dynamic_entries.chunks_exact(ELF64_DYNAMIC_ENTRY_BYTES) {
+        let (tag, value) = dynamic_tag_and_value_v1(entry);
+        if tag != DT_NEEDED {
+            continue;
+        }
+        let offset = usize::try_from(value)
+            .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded)?;
+        let name = needed_name_at_v1(string_table, offset)?;
+        for previous_offset in &needed_offsets[..needed_index] {
+            if needed_name_at_v1(string_table, *previous_offset)? == name {
+                return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded);
+            }
+        }
+        needed_offsets[needed_index] = offset;
+        needed_index += 1;
+    }
+
+    let needed = memory
+        .try_vec_with_capacity(needed_count)
+        .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::MemoryBudget)?;
+    let interpreter = memory
+        .try_bytes_from_slice(interpreter_path)
+        .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::MemoryBudget)?;
+    let mut request = RuntimeClosureRequestV1 {
+        interpreter,
+        needed,
+    };
+    for offset in &needed_offsets[..needed_index] {
+        let name = needed_name_at_v1(string_table, *offset)?;
+        request.needed.push(
+            memory
+                .try_bytes_from_slice(name)
+                .map_err(|_| FirstExecuteOnlyRuntimeCheckpointRefusalV1::MemoryBudget)?,
+        );
+    }
+    Ok(request)
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -464,6 +857,11 @@ fn map_workspace_evidence_refusal_v1(
 mod tests {
     use super::*;
 
+    const RUNTIME_FIXTURE_BASE: u64 = 0x40_0000;
+    const RUNTIME_FIXTURE_INTERP_OFFSET: usize = 0x100;
+    const RUNTIME_FIXTURE_DYNAMIC_OFFSET: usize = 0x140;
+    const RUNTIME_FIXTURE_STRTAB_OFFSET: usize = 0x1a0;
+
     fn elf_fixture() -> Vec<u8> {
         let segment_offset = ELF64_HEADER_BYTES + ELF64_PROGRAM_HEADER_BYTES;
         let mut bytes = vec![0u8; segment_offset + 1];
@@ -511,6 +909,114 @@ mod tests {
         program[32..40].copy_from_slice(&file_size.to_le_bytes());
         program[40..48].copy_from_slice(&memory_size.to_le_bytes());
         program[48..56].copy_from_slice(&1u64.to_le_bytes());
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_program_header(
+        bytes: &mut [u8],
+        index: usize,
+        kind: u32,
+        flags: u32,
+        offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+        alignment: u64,
+    ) {
+        let start = ELF64_HEADER_BYTES + index * ELF64_PROGRAM_HEADER_BYTES;
+        let program = &mut bytes[start..start + ELF64_PROGRAM_HEADER_BYTES];
+        program[0..4].copy_from_slice(&kind.to_le_bytes());
+        program[4..8].copy_from_slice(&flags.to_le_bytes());
+        program[8..16].copy_from_slice(&offset.to_le_bytes());
+        program[16..24].copy_from_slice(&virtual_address.to_le_bytes());
+        program[32..40].copy_from_slice(&file_size.to_le_bytes());
+        program[40..48].copy_from_slice(&memory_size.to_le_bytes());
+        program[48..56].copy_from_slice(&alignment.to_le_bytes());
+    }
+
+    fn write_dynamic_entry(bytes: &mut [u8], index: usize, tag: u64, value: u64) {
+        let start = RUNTIME_FIXTURE_DYNAMIC_OFFSET + index * ELF64_DYNAMIC_ENTRY_BYTES;
+        bytes[start..start + 8].copy_from_slice(&tag.to_le_bytes());
+        bytes[start + 8..start + 16].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn runtime_closure_elf_fixture() -> Vec<u8> {
+        const INTERPRETER: &[u8] = b"/lib64/ld-linux-x86-64.so.2\0";
+        const STRING_TABLE: &[u8] = b"\0libc.so.6\0libm.so.6\0";
+        const FILE_BYTES: usize = 512;
+        const DYNAMIC_BYTES: usize = 5 * ELF64_DYNAMIC_ENTRY_BYTES;
+
+        let mut bytes = vec![0u8; FILE_BYTES];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = ELFCLASS64;
+        bytes[5] = ELFDATA2LSB;
+        bytes[6] = EV_CURRENT;
+        bytes[7] = ELFOSABI_SYSV;
+        bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
+        bytes[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&RUNTIME_FIXTURE_BASE.to_le_bytes());
+        bytes[32..40].copy_from_slice(&(ELF64_HEADER_BYTES as u64).to_le_bytes());
+        bytes[52..54].copy_from_slice(&(ELF64_HEADER_BYTES as u16).to_le_bytes());
+        bytes[54..56].copy_from_slice(&(ELF64_PROGRAM_HEADER_BYTES as u16).to_le_bytes());
+        bytes[56..58].copy_from_slice(&3u16.to_le_bytes());
+        write_program_header(
+            &mut bytes,
+            0,
+            PT_LOAD,
+            PF_X | 4,
+            0,
+            RUNTIME_FIXTURE_BASE,
+            FILE_BYTES as u64,
+            FILE_BYTES as u64,
+            ELF64_LOAD_PAGE_BYTES,
+        );
+        write_program_header(
+            &mut bytes,
+            1,
+            PT_INTERP,
+            4,
+            RUNTIME_FIXTURE_INTERP_OFFSET as u64,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_INTERP_OFFSET as u64,
+            INTERPRETER.len() as u64,
+            INTERPRETER.len() as u64,
+            1,
+        );
+        write_program_header(
+            &mut bytes,
+            2,
+            PT_DYNAMIC,
+            4,
+            RUNTIME_FIXTURE_DYNAMIC_OFFSET as u64,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_DYNAMIC_OFFSET as u64,
+            DYNAMIC_BYTES as u64,
+            DYNAMIC_BYTES as u64,
+            8,
+        );
+        bytes[RUNTIME_FIXTURE_INTERP_OFFSET..RUNTIME_FIXTURE_INTERP_OFFSET + INTERPRETER.len()]
+            .copy_from_slice(INTERPRETER);
+        bytes[RUNTIME_FIXTURE_STRTAB_OFFSET..RUNTIME_FIXTURE_STRTAB_OFFSET + STRING_TABLE.len()]
+            .copy_from_slice(STRING_TABLE);
+        write_dynamic_entry(&mut bytes, 0, DT_NEEDED, 1);
+        write_dynamic_entry(&mut bytes, 1, DT_NEEDED, 11);
+        write_dynamic_entry(
+            &mut bytes,
+            2,
+            DT_STRTAB,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_STRTAB_OFFSET as u64,
+        );
+        write_dynamic_entry(&mut bytes, 3, DT_STRSZ, STRING_TABLE.len() as u64);
+        write_dynamic_entry(&mut bytes, 4, DT_NULL, 0);
+        bytes
+    }
+
+    fn parse_runtime_fixture(
+        bytes: &[u8],
+    ) -> Result<RuntimeClosureRequestV1, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+        parse_runtime_closure_request_v1(
+            bytes,
+            &super::super::snapshot_publish::RuntimeMemoryEscrowV1::first_checkpoint(),
+        )
     }
 
     #[test]
@@ -623,6 +1129,406 @@ mod tests {
             ELF64_LOAD_PAGE_BYTES - 1,
         );
         assert_eq!(validate_x86_64_elf_v1(&span_boundary), Ok(()));
+    }
+
+    #[test]
+    fn runtime_closure_request_retains_only_unresolved_redacted_names() {
+        let request = parse_runtime_fixture(&runtime_closure_elf_fixture()).unwrap();
+        assert_eq!(&*request.interpreter, b"/lib64/ld-linux-x86-64.so.2");
+        assert_eq!(
+            request.needed.iter().map(Vec::as_slice).collect::<Vec<_>>(),
+            [b"libc.so.6".as_slice(), b"libm.so.6".as_slice()]
+        );
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("ld-linux"));
+        assert!(!debug.contains("libc"));
+        assert!(debug.contains("resolution_authority: false"));
+
+        trait AmbiguousIfClone<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        trait AmbiguousIfCopy<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+        impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+        <RuntimeClosureRequestV1 as AmbiguousIfClone<_>>::probe();
+        <RuntimeClosureRequestV1 as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<RuntimeClosureRequestV1>());
+    }
+
+    #[test]
+    fn interpreter_segment_is_unique_absolute_canonical_and_exact() {
+        let mut missing = runtime_closure_elf_fixture();
+        write_program_header(
+            &mut missing,
+            1,
+            4,
+            4,
+            RUNTIME_FIXTURE_INTERP_OFFSET as u64,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_INTERP_OFFSET as u64,
+            1,
+            1,
+            1,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&missing).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter
+        );
+
+        let mut duplicate = runtime_closure_elf_fixture();
+        let dynamic = parse_program_header_v1(
+            &duplicate[ELF64_HEADER_BYTES + 2 * ELF64_PROGRAM_HEADER_BYTES
+                ..ELF64_HEADER_BYTES + 3 * ELF64_PROGRAM_HEADER_BYTES],
+        );
+        write_program_header(
+            &mut duplicate,
+            2,
+            PT_INTERP,
+            4,
+            dynamic.offset,
+            dynamic.virtual_address,
+            dynamic.file_size,
+            dynamic.memory_size,
+            dynamic.alignment,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&duplicate).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter
+        );
+
+        for replacement in [
+            b"relative/ld.so\0".as_slice(),
+            b"/lib/../ld.so\0".as_slice(),
+            b"/lib//ld.so\0".as_slice(),
+            b"/lib/ld.so\0x".as_slice(),
+        ] {
+            let mut malformed = runtime_closure_elf_fixture();
+            malformed
+                [RUNTIME_FIXTURE_INTERP_OFFSET..RUNTIME_FIXTURE_INTERP_OFFSET + replacement.len()]
+                .copy_from_slice(replacement);
+            let start = ELF64_HEADER_BYTES + ELF64_PROGRAM_HEADER_BYTES;
+            malformed[start + 32..start + 40]
+                .copy_from_slice(&(replacement.len() as u64).to_le_bytes());
+            malformed[start + 40..start + 48]
+                .copy_from_slice(&(replacement.len() as u64).to_le_bytes());
+            assert_eq!(
+                parse_runtime_fixture(&malformed).unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter
+            );
+        }
+
+        let mut oversized = runtime_closure_elf_fixture();
+        let interpreter_header = ELF64_HEADER_BYTES + ELF64_PROGRAM_HEADER_BYTES;
+        let oversized_length = ELF64_MAX_INTERPRETER_BYTES as u64 + 1;
+        oversized[interpreter_header + 32..interpreter_header + 40]
+            .copy_from_slice(&oversized_length.to_le_bytes());
+        oversized[interpreter_header + 40..interpreter_header + 48]
+            .copy_from_slice(&oversized_length.to_le_bytes());
+        assert_eq!(
+            parse_runtime_fixture(&oversized).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter
+        );
+    }
+
+    #[test]
+    fn dynamic_table_rejects_duplicate_unknown_lookup_and_termination_ambiguity() {
+        let original = runtime_closure_elf_fixture();
+        let dynamic_start = ELF64_HEADER_BYTES + 2 * ELF64_PROGRAM_HEADER_BYTES;
+        let dynamic = parse_program_header_v1(
+            &original[dynamic_start..dynamic_start + ELF64_PROGRAM_HEADER_BYTES],
+        );
+        let interpreter_start = ELF64_HEADER_BYTES + ELF64_PROGRAM_HEADER_BYTES;
+        let interpreter = parse_program_header_v1(
+            &original[interpreter_start..interpreter_start + ELF64_PROGRAM_HEADER_BYTES],
+        );
+
+        let mut missing = original.clone();
+        write_program_header(
+            &mut missing,
+            2,
+            4,
+            4,
+            dynamic.offset,
+            dynamic.virtual_address,
+            dynamic.file_size,
+            dynamic.memory_size,
+            dynamic.alignment,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&missing).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+        );
+
+        let mut duplicate = original.clone();
+        write_program_header(
+            &mut duplicate,
+            1,
+            PT_DYNAMIC,
+            4,
+            interpreter.offset,
+            interpreter.virtual_address,
+            interpreter.file_size,
+            interpreter.memory_size,
+            interpreter.alignment,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&duplicate).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+        );
+
+        let mut outside_file = original.clone();
+        write_program_header(
+            &mut outside_file,
+            2,
+            PT_DYNAMIC,
+            4,
+            1000,
+            RUNTIME_FIXTURE_BASE + 1000,
+            dynamic.file_size,
+            dynamic.memory_size,
+            8,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&outside_file).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+        );
+
+        let mut ambiguous_load_mapping = original.clone();
+        let interpreter_size = usize::try_from(interpreter.file_size).unwrap();
+        let interpreter_bytes = ambiguous_load_mapping
+            [RUNTIME_FIXTURE_INTERP_OFFSET..RUNTIME_FIXTURE_INTERP_OFFSET + interpreter_size]
+            .to_vec();
+        const MOVED_INTERPRETER_OFFSET: usize = 448;
+        ambiguous_load_mapping
+            [MOVED_INTERPRETER_OFFSET..MOVED_INTERPRETER_OFFSET + interpreter_bytes.len()]
+            .copy_from_slice(&interpreter_bytes);
+        ambiguous_load_mapping[56..58].copy_from_slice(&4u16.to_le_bytes());
+        write_program_header(
+            &mut ambiguous_load_mapping,
+            1,
+            PT_INTERP,
+            4,
+            MOVED_INTERPRETER_OFFSET as u64,
+            RUNTIME_FIXTURE_BASE + MOVED_INTERPRETER_OFFSET as u64,
+            interpreter_bytes.len() as u64,
+            interpreter_bytes.len() as u64,
+            1,
+        );
+        let ambiguous_file_size = ambiguous_load_mapping.len() as u64;
+        write_program_header(
+            &mut ambiguous_load_mapping,
+            3,
+            PT_LOAD,
+            4,
+            0,
+            RUNTIME_FIXTURE_BASE,
+            ambiguous_file_size,
+            ambiguous_file_size,
+            ELF64_LOAD_PAGE_BYTES,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&ambiguous_load_mapping).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+        );
+
+        for tag in [DT_RPATH, DT_RUNPATH, 0x1234_5678] {
+            let mut malformed = runtime_closure_elf_fixture();
+            write_dynamic_entry(&mut malformed, 0, tag, 1);
+            assert_eq!(
+                parse_runtime_fixture(&malformed).unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag
+            );
+        }
+
+        let mut duplicate_strtab = runtime_closure_elf_fixture();
+        write_dynamic_entry(
+            &mut duplicate_strtab,
+            1,
+            DT_STRTAB,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_STRTAB_OFFSET as u64,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&duplicate_strtab).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag
+        );
+
+        for (index, replacement_tag) in [(2, 12), (3, 13)] {
+            let mut missing_required = runtime_closure_elf_fixture();
+            write_dynamic_entry(&mut missing_required, index, replacement_tag, 0);
+            assert_eq!(
+                parse_runtime_fixture(&missing_required).unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable
+            );
+        }
+
+        let mut non_null_after_terminator = runtime_closure_elf_fixture();
+        write_dynamic_entry(&mut non_null_after_terminator, 3, DT_NULL, 0);
+        write_dynamic_entry(&mut non_null_after_terminator, 4, DT_STRSZ, 21);
+        assert_eq!(
+            parse_runtime_fixture(&non_null_after_terminator).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag
+        );
+
+        let mut no_terminator = runtime_closure_elf_fixture();
+        write_dynamic_entry(&mut no_terminator, 4, 12, 0);
+        assert_eq!(
+            parse_runtime_fixture(&no_terminator).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+        );
+
+        let mut too_many_needed = runtime_closure_elf_fixture();
+        let entry_count = ELF64_MAX_NEEDED_NAMES + 4;
+        let dynamic_bytes = entry_count * ELF64_DYNAMIC_ENTRY_BYTES;
+        too_many_needed.resize(RUNTIME_FIXTURE_DYNAMIC_OFFSET + dynamic_bytes, 0);
+        let file_size = too_many_needed.len() as u64;
+        write_program_header(
+            &mut too_many_needed,
+            0,
+            PT_LOAD,
+            PF_X | 4,
+            0,
+            RUNTIME_FIXTURE_BASE,
+            file_size,
+            file_size,
+            ELF64_LOAD_PAGE_BYTES,
+        );
+        write_program_header(
+            &mut too_many_needed,
+            2,
+            PT_DYNAMIC,
+            4,
+            RUNTIME_FIXTURE_DYNAMIC_OFFSET as u64,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_DYNAMIC_OFFSET as u64,
+            dynamic_bytes as u64,
+            dynamic_bytes as u64,
+            8,
+        );
+        for index in 0..=ELF64_MAX_NEEDED_NAMES {
+            write_dynamic_entry(&mut too_many_needed, index, DT_NEEDED, 1);
+        }
+        write_dynamic_entry(
+            &mut too_many_needed,
+            ELF64_MAX_NEEDED_NAMES + 1,
+            DT_STRTAB,
+            RUNTIME_FIXTURE_BASE + RUNTIME_FIXTURE_STRTAB_OFFSET as u64,
+        );
+        write_dynamic_entry(
+            &mut too_many_needed,
+            ELF64_MAX_NEEDED_NAMES + 2,
+            DT_STRSZ,
+            21,
+        );
+        write_dynamic_entry(&mut too_many_needed, ELF64_MAX_NEEDED_NAMES + 3, DT_NULL, 0);
+        assert_eq!(
+            parse_runtime_fixture(&too_many_needed).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfRuntimeClosureLimit
+        );
+    }
+
+    #[test]
+    fn string_table_translation_and_needed_names_are_bounded_unambiguous_and_ordered() {
+        let mut outside_load = runtime_closure_elf_fixture();
+        write_dynamic_entry(&mut outside_load, 2, DT_STRTAB, RUNTIME_FIXTURE_BASE + 4096);
+        assert_eq!(
+            parse_runtime_fixture(&outside_load).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfStringTable
+        );
+
+        let mut oversized = runtime_closure_elf_fixture();
+        write_dynamic_entry(
+            &mut oversized,
+            3,
+            DT_STRSZ,
+            ELF64_MAX_STRING_TABLE_BYTES as u64 + 1,
+        );
+        assert_eq!(
+            parse_runtime_fixture(&oversized).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfRuntimeClosureLimit
+        );
+
+        let mut duplicate_name = runtime_closure_elf_fixture();
+        write_dynamic_entry(&mut duplicate_name, 1, DT_NEEDED, 1);
+        assert_eq!(
+            parse_runtime_fixture(&duplicate_name).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded
+        );
+
+        for (offset, replacement) in [
+            (99u64, None),
+            (1, Some(b"lib/escape\0".as_slice())),
+            (1, Some(b"$ORIGIN\0".as_slice())),
+            (1, Some(b".\0".as_slice())),
+        ] {
+            let mut malformed = runtime_closure_elf_fixture();
+            write_dynamic_entry(&mut malformed, 0, DT_NEEDED, offset);
+            if let Some(replacement) = replacement {
+                malformed[RUNTIME_FIXTURE_STRTAB_OFFSET + 1
+                    ..RUNTIME_FIXTURE_STRTAB_OFFSET + 1 + replacement.len()]
+                    .copy_from_slice(replacement);
+            }
+            assert_eq!(
+                parse_runtime_fixture(&malformed).unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded
+            );
+        }
+
+        let mut unterminated = runtime_closure_elf_fixture();
+        write_dynamic_entry(&mut unterminated, 3, DT_STRSZ, 10);
+        assert_eq!(
+            parse_runtime_fixture(&unterminated).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded
+        );
+
+        let mut overlong_name = runtime_closure_elf_fixture();
+        let string_table_size = ELF64_MAX_NEEDED_NAME_BYTES + 3;
+        let needed_end = RUNTIME_FIXTURE_STRTAB_OFFSET + string_table_size;
+        overlong_name.resize(needed_end, 0);
+        overlong_name[RUNTIME_FIXTURE_STRTAB_OFFSET + 1
+            ..RUNTIME_FIXTURE_STRTAB_OFFSET + 2 + ELF64_MAX_NEEDED_NAME_BYTES]
+            .fill(b'a');
+        let file_size = overlong_name.len() as u64;
+        write_program_header(
+            &mut overlong_name,
+            0,
+            PT_LOAD,
+            PF_X | 4,
+            0,
+            RUNTIME_FIXTURE_BASE,
+            file_size,
+            file_size,
+            ELF64_LOAD_PAGE_BYTES,
+        );
+        write_dynamic_entry(&mut overlong_name, 1, DT_NEEDED, 1);
+        write_dynamic_entry(&mut overlong_name, 3, DT_STRSZ, string_table_size as u64);
+        assert_eq!(
+            parse_runtime_fixture(&overlong_name).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNeeded
+        );
+
+        let memory = super::super::snapshot_publish::RuntimeMemoryEscrowV1::with_limit_for_test(1);
+        assert_eq!(
+            parse_runtime_closure_request_v1(&runtime_closure_elf_fixture(), &memory).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::MemoryBudget
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn real_system_python_parses_only_to_an_unresolved_request() {
+        let Some(path) = ["/usr/bin/python3", "/usr/local/bin/python3"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).is_file())
+        else {
+            return;
+        };
+        let bytes = std::fs::read(path).unwrap();
+        let request = parse_runtime_fixture(&bytes).unwrap();
+        assert!(request.interpreter.starts_with(b"/"));
+        assert!(!request.needed.is_empty());
+        assert!(format!("{request:?}").contains("resolution_authority: false"));
     }
 
     #[test]

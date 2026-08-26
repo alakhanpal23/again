@@ -120,6 +120,13 @@ impl RuntimeMemoryEscrowV1 {
         }
     }
 
+    #[cfg(test)]
+    pub(super) const fn with_limit_for_test(bytes: usize) -> Self {
+        Self {
+            remaining: Cell::new(bytes),
+        }
+    }
+
     fn charge(&self, bytes: usize) -> Result<(), BoundRegularReadRefusalV1> {
         let remaining = self
             .remaining
