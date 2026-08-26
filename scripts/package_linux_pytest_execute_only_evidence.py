@@ -387,7 +387,9 @@ def _unlink_created_file(
     except OSError:
         return False
     if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != identity:
-        return False
+        # A competing object is not ours to remove. The created identity is no
+        # longer present at this name, so cleanup of this name is complete.
+        return True
     try:
         os.unlink(name, dir_fd=directory_fd)
     except OSError:
@@ -414,7 +416,11 @@ def _create_staging_file(directory_fd: int) -> tuple[str, int, tuple[int, int]]:
         | getattr(os, "O_NOFOLLOW", 0)
     )
     for _ in range(MAX_STAGING_CREATE_ATTEMPTS):
-        name = f".again-evidence-stage-{secrets.token_hex(STAGING_TOKEN_BYTES)}.tmp"
+        try:
+            token = secrets.token_hex(STAGING_TOKEN_BYTES)
+        except (OSError, RuntimeError) as error:
+            raise AssemblyRefusal("staging_entropy_unavailable") from error
+        name = f".again-evidence-stage-{token}.tmp"
         try:
             descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
         except FileExistsError:
@@ -522,6 +528,26 @@ def _cleanup_failed_assembly(
     return complete
 
 
+def _reconcile_link_effect(
+    directory_fd: int,
+    output_name: str,
+    created_identity: tuple[int, int],
+) -> tuple[int, int] | None:
+    """Return cleanup ownership only when link may have installed our inode."""
+
+    try:
+        current = os.stat(output_name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        # A later cleanup attempt must retry the identity check. It will remove
+        # only created_identity and preserve any competing object.
+        return created_identity
+    if stat.S_ISREG(current.st_mode) and (current.st_dev, current.st_ino) == created_identity:
+        return created_identity
+    return None
+
+
 def package_evidence(
     input_directory: os.PathLike[str] | str,
     output_directory: os.PathLike[str] | str,
@@ -627,10 +653,16 @@ def package_evidence(
                 follow_symlinks=False,
             )
         except FileExistsError as error:
+            final_identity = _reconcile_link_effect(
+                output_fd, output_name, created_identity
+            )
             raise AssemblyRefusal("output_exists") from error
         except (NotImplementedError, TypeError) as error:
             raise AssemblyRefusal("publication_unsupported") from error
         except OSError as error:
+            final_identity = _reconcile_link_effect(
+                output_fd, output_name, created_identity
+            )
             if error.errno in {errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}:
                 raise AssemblyRefusal("publication_unsupported") from error
             raise AssemblyRefusal("publication_failed") from error
@@ -782,7 +814,11 @@ def main(argv: list[str] | None = None) -> int:
             expectations,
         )
     except AssemblyRefusal as refusal:
-        print(f"error: evidence assembly refused: {refusal.code}", file=sys.stderr)
+        cleanup = "true" if refusal.cleanup_complete else "false"
+        print(
+            f"error: evidence assembly refused: {refusal.code}; cleanup_complete={cleanup}",
+            file=sys.stderr,
+        )
         return 1
     print(json.dumps(audit, sort_keys=True, separators=(",", ":")))
     return 0

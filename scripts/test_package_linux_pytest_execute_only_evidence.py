@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import copy
+import errno
 import hashlib
 import io
 import json
@@ -444,6 +445,42 @@ class EvidenceAssemblerTests(unittest.TestCase):
         self.assertEqual((self.outputs / "evidence.zip").read_bytes(), b"racing publisher")
         self.assertEqual(self.staging_paths(), [])
 
+    def test_link_effect_then_error_removes_only_created_publication(self) -> None:
+        real_link = assembler.os.link
+        for error_number in (errno.EINTR, errno.EIO):
+            with self.subTest(error_number=error_number):
+                linked = False
+
+                def linking_then_failing(source: str, destination: str, **kwargs) -> None:
+                    nonlocal linked
+                    real_link(source, destination, **kwargs)
+                    linked = True
+                    raise OSError(error_number, "injected post-link failure")
+
+                with mock.patch.object(
+                    assembler.os, "link", side_effect=linking_then_failing
+                ):
+                    with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                        self.package()
+                self.assertTrue(linked)
+                self.assertEqual(refused.exception.code, "publication_failed")
+                self.assertTrue(refused.exception.cleanup_complete)
+                self.assert_no_output()
+                self.assertEqual(self.staging_paths(), [])
+
+    def test_entropy_failure_is_a_stable_clean_refusal(self) -> None:
+        with mock.patch.object(
+            assembler.secrets,
+            "token_hex",
+            side_effect=OSError("injected entropy failure"),
+        ):
+            with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                self.package()
+        self.assertEqual(refused.exception.code, "staging_entropy_unavailable")
+        self.assertTrue(refused.exception.cleanup_complete)
+        self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
+
     def test_close_failure_preserves_verifier_code_and_marks_cleanup_uncertain(self) -> None:
         real_close = assembler.os.close
         real_fstat = assembler.os.fstat
@@ -618,7 +655,27 @@ class EvidenceAssemblerTests(unittest.TestCase):
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
             self.assertEqual(assembler.main(arguments), 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("output_exists", stderr.getvalue())
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: evidence assembly refused: output_exists; cleanup_complete=true\n",
+        )
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.object(
+            assembler,
+            "package_evidence",
+            side_effect=assembler.AssemblyRefusal(
+                "injected_cleanup_uncertainty", cleanup_complete=False
+            ),
+        ), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            self.assertEqual(assembler.main(arguments), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "error: evidence assembly refused: injected_cleanup_uncertainty; "
+            "cleanup_complete=false\n",
+        )
 
 
 def dataclass_values(expectations: assembler.IndependentExpectations) -> dict[str, str]:
