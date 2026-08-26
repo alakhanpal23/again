@@ -1,36 +1,39 @@
-//! Gate 3 descriptor-selected Python executable and runtime-forest checkpoints.
+//! Gate 3 descriptor-selected Python executable and runtime inventory checkpoints.
 //!
 //! This is intentionally narrower than a runtime closure. It consumes the
 //! connector-issued workspace binding, resolves the fixed executable beneath
 //! that bound snapshot, cross-checks every observed node against the charged
 //! canonical manifest, and validates the snapshotted terminal bytes as an
-//! executable x86_64 ELF. A second, still non-authoritative checkpoint can
-//! resolve the canonical `PT_INTERP` and ordered `DT_NEEDED` closure beneath
-//! separately supplied published workspace/runtime root descriptors. It never
-//! consults an ambient pathname. Neither checkpoint qualifies the virtual
-//! environment, pytest, isolation, execution, a cache candidate, or reuse.
+//! executable x86_64 ELF. A second, still non-authoritative checkpoint records
+//! one bounded structural inventory from `PT_INTERP` and ordered `DT_NEEDED`
+//! names beneath connector-published workspace/runtime trees. Its fixed search
+//! candidates are not Linux loader semantics and it cannot support execution.
+//! It never consults an ambient pathname. Neither checkpoint qualifies the
+//! loader, virtual environment, pytest, isolation, execution, a candidate, or
+//! reuse.
 //!
 //! The v1 host threat model excludes a malicious same-UID peer and host root.
 //! Descriptor-relative pre/open/post checks detect ordinary drift, but are not
 //! claimed to withstand a hostile peer that can mutate and restore the tree.
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::ExecutableChainDigest;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
+    FirstExecuteOnlyPublishedRuntimeTreeV1, FirstExecuteOnlyRuntimeInventoryObjectV1,
     FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1, FirstExecuteOnlyWorkspaceRuntimeEvidenceV1,
     FirstExecuteOnlyWorkspaceTreeBindingV1,
     consume_first_execute_only_workspace_runtime_evidence_v1,
+    read_first_execute_only_runtime_inventory_object_v1,
+    read_first_execute_only_workspace_inventory_object_v1,
+    revalidate_first_execute_only_runtime_inventory_object_v1,
+    revalidate_first_execute_only_workspace_inventory_object_v1,
 };
 use super::snapshot_publish::RuntimeMemoryEscrowV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::VerifiedBoundNodeKindV1;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_tree::{SOURCE_TREE_REQUESTED_STATX_MASK_V1, SourceStatxV1};
-use super::{Blake3Digest, FileContentDigest};
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::{ExecutableChainDigest, NodeDigest};
+use super::{Blake3Digest, FileContentDigest, NodeDigest};
 use std::fmt;
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use std::os::fd::BorrowedFd;
 
 const FIRST_EXECUTE_ONLY_EXECUTABLE_V1: &[u8] = b".venv/bin/python";
 const FIRST_EXECUTE_ONLY_RUNTIME_CHECKPOINT_DOMAIN_V1: &str =
@@ -38,17 +41,20 @@ const FIRST_EXECUTE_ONLY_RUNTIME_CHECKPOINT_DOMAIN_V1: &str =
 const RUNTIME_CHECKPOINT_MAGIC_V1: &[u8; 8] = b"AGRTCP01";
 const RUNTIME_CLOSURE_NONCLAIMS_V1: &[u8] =
     b"PT_INTERP,DT_NEEDED,runtime-forest,venv,pytest:unqualified";
-const RUNTIME_FOREST_DOMAIN_V1: &str = "again execute-only runtime forest evidence v1";
-const RUNTIME_FOREST_MAGIC_V1: &[u8; 8] = b"AGRTFR01";
+const RUNTIME_FOREST_DOMAIN_V1: &str = "again execute-only runtime structural inventory v1";
+const RUNTIME_FOREST_MAGIC_V1: &[u8; 8] = b"AGRTSI01";
 const RUNTIME_FOREST_NONCLAIMS_V1: &[u8] =
-    b"venv,pytest,isolation,execution,profile,candidate,replay,reuse:unauthorized";
+    b"linux-loader,venv,pytest,isolation,execution,profile,candidate,replay,reuse:unauthorized";
 const RUNTIME_FOREST_MAX_NODES_V1: usize = 128;
 const RUNTIME_FOREST_MAX_DEPTH_V1: u16 = 32;
 const RUNTIME_FOREST_MAX_EDGES_V1: usize = RUNTIME_FOREST_MAX_NODES_V1 * ELF64_MAX_NEEDED_NAMES;
 const RUNTIME_FOREST_NODE_MAX_BYTES_V1: u32 = 16 * 1024 * 1024;
 const RUNTIME_FOREST_TOTAL_MAX_BYTES_V1: u64 = 64 * 1024 * 1024;
 const RUNTIME_FOREST_MAX_COMPONENTS_V1: usize = 64;
-const RUNTIME_FOREST_OPERATION_LIMIT_V1: u32 = 262_144;
+const RUNTIME_FOREST_LOOKUP_ATTEMPT_LIMIT_V1: u32 = 262_144;
+// These are deliberately only deterministic structural-inventory candidates.
+// They do not model ld.so cache, environment, preload, RUNPATH/RPATH,
+// glibc-hwcaps, or platform-specific loader search order.
 const RUNTIME_FOREST_SEARCH_DIRECTORIES_V1: [&[u8]; 6] = [
     b"lib64",
     b"usr/lib64",
@@ -67,6 +73,7 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
 const ELFOSABI_SYSV: u8 = 0;
+const ELFOSABI_LINUX: u8 = 3;
 const ET_EXEC: u16 = 2;
 const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
@@ -306,6 +313,13 @@ const fn terminal_is_logically_executable_v1(mode: u32) -> bool {
 pub(super) fn validate_x86_64_elf_v1(
     bytes: &[u8],
 ) -> Result<(), FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
+    validate_x86_64_elf_role_v1(bytes, true)
+}
+
+fn validate_x86_64_elf_role_v1(
+    bytes: &[u8],
+    require_executable_entry: bool,
+) -> Result<(), FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
     if bytes.len() < ELF64_HEADER_BYTES {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfTooSmall);
     }
@@ -323,7 +337,7 @@ pub(super) fn validate_x86_64_elf_v1(
     {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfVersion);
     }
-    if bytes[7] != ELFOSABI_SYSV || bytes[8] != 0 {
+    if (bytes[7] != ELFOSABI_SYSV && bytes[7] != ELFOSABI_LINUX) || bytes[8] != 0 {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfOsAbi);
     }
     let elf_type = u16::from_le_bytes(bytes[16..18].try_into().expect("bounded ELF header"));
@@ -466,7 +480,7 @@ pub(super) fn validate_x86_64_elf_v1(
     if !has_load {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNoLoadSegment);
     }
-    if !entry_is_executable {
+    if require_executable_entry && !entry_is_executable {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEntryPoint);
     }
     Ok(())
@@ -682,7 +696,7 @@ fn parse_runtime_object_request_v1(
     memory: &RuntimeMemoryEscrowV1,
     is_executable: bool,
 ) -> Result<RuntimeClosureRequestV1, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
-    validate_x86_64_elf_v1(bytes)?;
+    validate_x86_64_elf_role_v1(bytes, is_executable)?;
     let headers = program_headers_v1(bytes)?;
     let mut interpreter = None;
     let mut dynamic = None;
@@ -984,11 +998,15 @@ enum RuntimeForestReadRefusalV1 {
     OperationBudget,
     Io,
     MemoryBudget,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    Checkpoint(FirstExecuteOnlyRuntimeCheckpointRefusalV1),
 }
 
 struct RuntimeForestObservedObjectV1 {
     identity: [u8; 102],
     bytes: Vec<u8>,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    publication: Option<FirstExecuteOnlyRuntimeInventoryObjectV1>,
 }
 
 impl Drop for RuntimeForestObservedObjectV1 {
@@ -1004,7 +1022,7 @@ struct RuntimeForestOperationBudgetV1 {
 impl RuntimeForestOperationBudgetV1 {
     const fn new() -> Self {
         Self {
-            remaining: RUNTIME_FOREST_OPERATION_LIMIT_V1,
+            remaining: RUNTIME_FOREST_LOOKUP_ATTEMPT_LIMIT_V1,
         }
     }
 
@@ -1017,7 +1035,7 @@ impl RuntimeForestOperationBudgetV1 {
     }
 
     const fn consumed(&self) -> u32 {
-        RUNTIME_FOREST_OPERATION_LIMIT_V1 - self.remaining
+        RUNTIME_FOREST_LOOKUP_ATTEMPT_LIMIT_V1 - self.remaining
     }
 }
 
@@ -1030,6 +1048,25 @@ trait RuntimeForestReaderV1 {
         memory: &RuntimeMemoryEscrowV1,
         operations: &mut RuntimeForestOperationBudgetV1,
     ) -> Result<RuntimeForestObservedObjectV1, RuntimeForestReadRefusalV1>;
+
+    fn revalidate_all(
+        &mut self,
+        _nodes: &[RuntimeForestNodeV1],
+    ) -> Result<(), RuntimeForestReadRefusalV1> {
+        Ok(())
+    }
+
+    fn root_binding(&self) -> Option<RuntimeForestRootBindingV1> {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeForestRootBindingV1 {
+    workspace_digest: NodeDigest,
+    workspace_statx: [u8; 102],
+    runtime_digest: NodeDigest,
+    runtime_statx: [u8; 102],
 }
 
 struct RuntimeForestNodeV1 {
@@ -1039,6 +1076,8 @@ struct RuntimeForestNodeV1 {
     content_digest: Blake3Digest,
     depth: u16,
     request: RuntimeClosureRequestV1,
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    publication: Option<FirstExecuteOnlyRuntimeInventoryObjectV1>,
 }
 
 impl Drop for RuntimeForestNodeV1 {
@@ -1060,7 +1099,7 @@ struct RuntimeForestPlanV1 {
     canonical_bytes: Box<[u8]>,
     digest: Blake3Digest,
     total_bytes: u64,
-    operation_count: u32,
+    lookup_attempt_count: u32,
 }
 
 impl fmt::Debug for RuntimeForestPlanV1 {
@@ -1070,7 +1109,7 @@ impl fmt::Debug for RuntimeForestPlanV1 {
             .field("node_count", &self.nodes.len())
             .field("edge_count", &self.edges.len())
             .field("total_bytes", &self.total_bytes)
-            .field("operation_count", &self.operation_count)
+            .field("lookup_attempt_count", &self.lookup_attempt_count)
             .field("paths", &"<redacted>")
             .field("authority", &false)
             .finish()
@@ -1103,6 +1142,8 @@ fn map_runtime_forest_read_refusal_v1(
         RuntimeForestReadRefusalV1::MemoryBudget => {
             FirstExecuteOnlyRuntimeCheckpointRefusalV1::MemoryBudget
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        RuntimeForestReadRefusalV1::Checkpoint(refusal) => refusal,
     }
 }
 
@@ -1245,7 +1286,7 @@ struct RuntimeForestNodeInputV1 {
 
 fn push_runtime_forest_node_v1(
     nodes: &mut Vec<RuntimeForestNodeV1>,
-    input: RuntimeForestNodeInputV1,
+    #[allow(unused_mut)] mut input: RuntimeForestNodeInputV1,
     memory: &RuntimeMemoryEscrowV1,
     total_bytes: &mut u64,
 ) -> Result<usize, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
@@ -1262,6 +1303,8 @@ fn push_runtime_forest_node_v1(
         "again runtime forest object content v1",
         &[&input.observed.bytes],
     );
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    let publication = input.observed.publication.take();
     let index = nodes.len();
     nodes.push(RuntimeForestNodeV1 {
         root: input.root,
@@ -1270,6 +1313,8 @@ fn push_runtime_forest_node_v1(
         content_digest,
         depth: input.depth,
         request,
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        publication,
     });
     Ok(index)
 }
@@ -1322,6 +1367,7 @@ fn encode_runtime_forest_v1(
     nodes: &[RuntimeForestNodeV1],
     edges: &[RuntimeForestEdgeV1],
     total_bytes: u64,
+    roots: Option<RuntimeForestRootBindingV1>,
     memory: &RuntimeMemoryEscrowV1,
 ) -> Result<Vec<u8>, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
     let mut output = runtime_vec_v1(memory, RUNTIME_FOREST_MAGIC_V1.len())?;
@@ -1346,6 +1392,14 @@ fn encode_runtime_forest_v1(
             .to_be_bytes(),
     )?;
     push_canonical_field_v1(memory, &mut output, 4, &total_bytes.to_be_bytes())?;
+    if let Some(roots) = roots {
+        push_canonical_field_v1(memory, &mut output, 5, roots.workspace_digest.as_bytes())?;
+        push_canonical_field_v1(memory, &mut output, 6, &roots.workspace_statx)?;
+        push_canonical_field_v1(memory, &mut output, 7, roots.runtime_digest.as_bytes())?;
+        push_canonical_field_v1(memory, &mut output, 8, &roots.runtime_statx)?;
+    } else {
+        push_canonical_field_v1(memory, &mut output, 5, b"pure-test-no-publication")?;
+    }
     for (index, node) in nodes.iter().enumerate() {
         let mut encoded = runtime_vec_v1(memory, 0)?;
         push_canonical_field_v1(
@@ -1518,11 +1572,15 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
         cursor += 1;
     }
     verify_runtime_forest_acyclic_v1(&nodes, &edges, memory)?;
-    let operation_count = operations.consumed();
-    // Retry and missing-candidate operation counts are retained as bounded
-    // evidence, but excluded from the semantic digest so transient `EAGAIN`
-    // retries cannot perturb an otherwise identical forest.
-    let canonical = encode_runtime_forest_v1(&nodes, &edges, total_bytes, memory)?;
+    reader
+        .revalidate_all(&nodes)
+        .map_err(map_runtime_forest_read_refusal_v1)?;
+    let lookup_attempt_count = operations.consumed();
+    // Candidate lookup attempts are retained as bounded diagnostics but are
+    // excluded from the semantic digest. Syscall retry ceilings belong to the
+    // publication leaf and are not misreported as this high-level count.
+    let canonical =
+        encode_runtime_forest_v1(&nodes, &edges, total_bytes, reader.root_binding(), memory)?;
     let digest = Blake3Digest::derive(RUNTIME_FOREST_DOMAIN_V1, &[&canonical]);
     Ok(RuntimeForestPlanV1 {
         nodes,
@@ -1530,47 +1588,24 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
         canonical_bytes: canonical.into_boxed_slice(),
         digest,
         total_bytes,
-        operation_count,
+        lookup_attempt_count,
     })
 }
 
-/// Descriptor borrows held by the future connector while it consumes the
-/// first runtime checkpoint. Construction proves no immutability on its own;
-/// the forest leaf revalidates every object and remains non-authoritative.
+/// Opaque record of one bounded structural inventory beneath two exact
+/// connector publications. It is not a Linux loader proof and cannot be
+/// consumed to execute anything. Private pins are retained only for the final
+/// stability pass and lifetime coupling; no descriptor/path/byte accessor is
+/// exposed.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) struct PublishedRuntimeForestRootsV1<'roots> {
-    workspace: BorrowedFd<'roots>,
-    runtime: BorrowedFd<'roots>,
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl<'roots> PublishedRuntimeForestRootsV1<'roots> {
-    pub(super) const fn from_connector_owned_roots(
-        workspace: BorrowedFd<'roots>,
-        runtime: BorrowedFd<'roots>,
-    ) -> Self {
-        Self { workspace, runtime }
-    }
-}
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl fmt::Debug for PublishedRuntimeForestRootsV1<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PublishedRuntimeForestRootsV1(<redacted-descriptors>)")
-    }
-}
-
-/// Opaque immutable evidence that the exact root executable's bounded loader
-/// forest was observed beneath connector-selected descriptors. It deliberately
-/// carries no descriptor/path/byte accessor and grants no authority.
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) struct FirstExecuteOnlyRuntimeForestEvidenceV1<'resources> {
+pub(super) struct FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources> {
     _checkpoint: FirstExecuteOnlyRuntimeCheckpointV1<'resources>,
+    _runtime_publication: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
     plan: RuntimeForestPlanV1,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl FirstExecuteOnlyRuntimeForestEvidenceV1<'_> {
+impl FirstExecuteOnlyRuntimeStructuralInventoryV1<'_> {
     pub(super) const fn digest(&self) -> Blake3Digest {
         self.plan.digest
     }
@@ -1587,8 +1622,12 @@ impl FirstExecuteOnlyRuntimeForestEvidenceV1<'_> {
         self.plan.total_bytes
     }
 
-    pub(super) const fn operation_count(&self) -> u32 {
-        self.plan.operation_count
+    pub(super) const fn lookup_attempt_count(&self) -> u32 {
+        self.plan.lookup_attempt_count
+    }
+
+    pub(super) const fn loader_authority(&self) -> bool {
+        false
     }
 
     pub(super) const fn execution_authority(&self) -> bool {
@@ -1621,10 +1660,10 @@ impl FirstExecuteOnlyRuntimeForestEvidenceV1<'_> {
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl fmt::Debug for FirstExecuteOnlyRuntimeForestEvidenceV1<'_> {
+impl fmt::Debug for FirstExecuteOnlyRuntimeStructuralInventoryV1<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("FirstExecuteOnlyRuntimeForestEvidenceV1")
+            .debug_struct("FirstExecuteOnlyRuntimeStructuralInventoryV1")
             .field("plan", &self.plan)
             .field("canonical", &"<redacted>")
             .field("authority", &false)
@@ -1632,20 +1671,25 @@ impl fmt::Debug for FirstExecuteOnlyRuntimeForestEvidenceV1<'_> {
     }
 }
 
-/// Later connector seam: consume the descriptor-bound executable checkpoint
-/// and two still-live published-root borrows into non-authoritative forest
-/// evidence. The descriptors never enter the result.
+/// Consume the descriptor-bound executable checkpoint and one actual runtime
+/// publication into a non-authoritative structural inventory. This function
+/// does not model ld.so search, cache, preload, environment, RUNPATH/RPATH, or
+/// glibc-hwcaps semantics and therefore cannot produce loader proof.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) fn qualify_first_execute_only_runtime_forest_v1<'resources>(
+pub(super) fn inventory_first_execute_only_runtime_structure_v1<'resources>(
     checkpoint: FirstExecuteOnlyRuntimeCheckpointV1<'resources>,
-    roots: PublishedRuntimeForestRootsV1<'_>,
+    runtime_publication: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
 ) -> Result<
-    FirstExecuteOnlyRuntimeForestEvidenceV1<'resources>,
+    FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
     FirstExecuteOnlyRuntimeCheckpointRefusalV1,
 > {
     runtime_forest_platform_support_v1()?;
-    let mut reader = linux_runtime_forest::LinuxRuntimeForestReaderV1::new(roots);
     let plan = {
+        let mut reader = PublishedRuntimeInventoryReaderV1 {
+            workspace: &checkpoint._evidence,
+            runtime: &runtime_publication,
+            pinned_fds: 0,
+        };
         let expected_content = checkpoint.terminal_content_digest;
         let expected_request = (
             checkpoint._runtime_closure_request.interpreter.as_slice(),
@@ -1658,331 +1702,101 @@ pub(super) fn qualify_first_execute_only_runtime_forest_v1<'resources>(
             checkpoint._evidence.runtime_memory(),
         )?
     };
-    Ok(FirstExecuteOnlyRuntimeForestEvidenceV1 {
+    Ok(FirstExecuteOnlyRuntimeStructuralInventoryV1 {
         _checkpoint: checkpoint,
+        _runtime_publication: runtime_publication,
         plan,
     })
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-mod linux_runtime_forest {
-    use super::*;
-    use std::ffi::CStr;
-    use std::mem::{self, MaybeUninit};
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+struct PublishedRuntimeInventoryReaderV1<'borrow, 'resources> {
+    workspace: &'borrow FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
+    runtime: &'borrow FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
+    pinned_fds: usize,
+}
 
-    const RESOLVE_NO_XDEV: u64 = 0x01;
-    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-    const RESOLVE_BENEATH: u64 = 0x08;
-    const RUNTIME_RESOLVE_V1: u64 = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV;
-    const AT_EMPTY_PATH: i32 = 0x1000;
-    const OPENAT2_ATTEMPTS_V1: u8 = 4;
-
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    struct OpenHowV1 {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
-
-    pub(super) struct LinuxRuntimeForestReaderV1<'roots> {
-        roots: PublishedRuntimeForestRootsV1<'roots>,
-        workspace_identity: Option<[u8; 102]>,
-        runtime_identity: Option<[u8; 102]>,
-    }
-
-    impl<'roots> LinuxRuntimeForestReaderV1<'roots> {
-        pub(super) const fn new(roots: PublishedRuntimeForestRootsV1<'roots>) -> Self {
-            Self {
-                roots,
-                workspace_identity: None,
-                runtime_identity: None,
-            }
-        }
-
-        fn root(&self, root: RuntimeForestRootV1) -> BorrowedFd<'roots> {
-            match root {
-                RuntimeForestRootV1::Workspace => self.roots.workspace,
-                RuntimeForestRootV1::Runtime => self.roots.runtime,
-            }
-        }
-    }
-
-    impl RuntimeForestReaderV1 for LinuxRuntimeForestReaderV1<'_> {
-        fn read_object(
-            &mut self,
-            root: RuntimeForestRootV1,
-            path: &[u8],
-            byte_ceiling: u32,
-            memory: &RuntimeMemoryEscrowV1,
-            operations: &mut RuntimeForestOperationBudgetV1,
-        ) -> Result<RuntimeForestObservedObjectV1, RuntimeForestReadRefusalV1> {
-            let root_fd = self.root(root);
-            let before = statx_fd_v1(root_fd, operations)?.commitment_bytes_v1();
-            let expected = match root {
-                RuntimeForestRootV1::Workspace => &mut self.workspace_identity,
-                RuntimeForestRootV1::Runtime => &mut self.runtime_identity,
-            };
-            if expected.is_some_and(|expected| expected != before) {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            expected.get_or_insert(before);
-            let result =
-                read_descriptor_relative_object_v1(root_fd, path, byte_ceiling, memory, operations);
-            let after = statx_fd_v1(root_fd, operations)?.commitment_bytes_v1();
-            if after != before {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            result
-        }
-    }
-
-    fn component_cstr_v1<'storage>(
-        component: &[u8],
-        storage: &'storage mut [u8; 256],
-    ) -> &'storage CStr {
-        debug_assert!(!component.is_empty() && component.len() < storage.len());
-        storage.fill(0);
-        storage[..component.len()].copy_from_slice(component);
-        CStr::from_bytes_until_nul(storage).expect("validated component has stack terminator")
-    }
-
-    fn statx_fd_v1(
-        fd: BorrowedFd<'_>,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<SourceStatxV1, RuntimeForestReadRefusalV1> {
-        statx_v1(fd, c"", AT_EMPTY_PATH, operations)
-    }
-
-    fn statx_name_v1(
-        parent: BorrowedFd<'_>,
-        name: &CStr,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<SourceStatxV1, RuntimeForestReadRefusalV1> {
-        statx_v1(parent, name, libc::AT_SYMLINK_NOFOLLOW, operations)
-    }
-
-    fn statx_v1(
-        parent: BorrowedFd<'_>,
-        name: &CStr,
-        flags: i32,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<SourceStatxV1, RuntimeForestReadRefusalV1> {
-        operations.charge()?;
-        let mut raw = MaybeUninit::<libc::statx>::zeroed();
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_statx,
-                parent.as_raw_fd(),
-                name.as_ptr(),
-                flags,
-                SOURCE_TREE_REQUESTED_STATX_MASK_V1,
-                raw.as_mut_ptr(),
-            )
-        };
-        if result != 0 {
-            let error = std::io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::ENOENT) => RuntimeForestReadRefusalV1::Missing,
-                Some(libc::ELOOP) => RuntimeForestReadRefusalV1::Symlink,
-                _ => RuntimeForestReadRefusalV1::Io,
-            });
-        }
-        let raw = unsafe { raw.assume_init() };
-        SourceStatxV1::from_linux_statx_v1(&raw).map_err(|_| RuntimeForestReadRefusalV1::Io)
-    }
-
-    fn openat2_component_v1(
-        parent: BorrowedFd<'_>,
-        name: &CStr,
-        flags: i32,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<OwnedFd, RuntimeForestReadRefusalV1> {
-        let how = OpenHowV1 {
-            flags: flags as u64,
-            mode: 0,
-            resolve: RUNTIME_RESOLVE_V1,
-        };
-        for attempt in 0..OPENAT2_ATTEMPTS_V1 {
-            operations.charge()?;
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_openat2,
-                    parent.as_raw_fd(),
-                    name.as_ptr(),
-                    &how,
-                    mem::size_of::<OpenHowV1>(),
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl RuntimeForestReaderV1 for PublishedRuntimeInventoryReaderV1<'_, '_> {
+    fn read_object(
+        &mut self,
+        root: RuntimeForestRootV1,
+        path: &[u8],
+        byte_ceiling: u32,
+        memory: &RuntimeMemoryEscrowV1,
+        _operations: &mut RuntimeForestOperationBudgetV1,
+    ) -> Result<RuntimeForestObservedObjectV1, RuntimeForestReadRefusalV1> {
+        let publication = match root {
+            RuntimeForestRootV1::Workspace => {
+                read_first_execute_only_workspace_inventory_object_v1(
+                    self.workspace,
+                    path,
+                    byte_ceiling,
                 )
-            };
-            if result >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(result as RawFd) });
             }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EAGAIN) if attempt + 1 < OPENAT2_ATTEMPTS_V1 => continue,
-                Some(libc::ENOENT) => return Err(RuntimeForestReadRefusalV1::Missing),
-                Some(libc::ELOOP) => return Err(RuntimeForestReadRefusalV1::Symlink),
-                _ => return Err(RuntimeForestReadRefusalV1::Io),
-            }
+            RuntimeForestRootV1::Runtime => read_first_execute_only_runtime_inventory_object_v1(
+                self.runtime,
+                path,
+                byte_ceiling,
+                memory,
+            ),
         }
-        Err(RuntimeForestReadRefusalV1::Io)
+        .map_err(|refusal| {
+            RuntimeForestReadRefusalV1::Checkpoint(map_workspace_evidence_refusal_v1(refusal))
+        })?;
+        self.pinned_fds = self
+            .pinned_fds
+            .checked_add(publication.pinned_fd_count())
+            .filter(|count| {
+                *count <= RUNTIME_FOREST_MAX_NODES_V1 * (RUNTIME_FOREST_MAX_COMPONENTS_V1 + 1)
+            })
+            .ok_or(RuntimeForestReadRefusalV1::OperationBudget)?;
+        Ok(RuntimeForestObservedObjectV1 {
+            identity: *publication.terminal_identity(),
+            bytes: memory
+                .try_bytes_from_slice(publication.bytes())
+                .map_err(|_| RuntimeForestReadRefusalV1::MemoryBudget)?,
+            publication: Some(publication),
+        })
     }
 
-    fn revalidate_ancestors_v1(
-        root: BorrowedFd<'_>,
-        root_identity: &[u8; 102],
-        ancestors: &[(OwnedFd, [u8; 102])],
-        operations: &mut RuntimeForestOperationBudgetV1,
+    fn revalidate_all(
+        &mut self,
+        nodes: &[RuntimeForestNodeV1],
     ) -> Result<(), RuntimeForestReadRefusalV1> {
-        if statx_fd_v1(root, operations)?.commitment_bytes_v1() != *root_identity {
-            return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-        }
-        for (fd, identity) in ancestors {
-            if statx_fd_v1(fd.as_fd(), operations)?.commitment_bytes_v1() != *identity {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
+        for node in nodes {
+            let publication = node
+                .publication
+                .as_ref()
+                .ok_or(RuntimeForestReadRefusalV1::IdentityDrift)?;
+            let result = match node.root {
+                RuntimeForestRootV1::Workspace => {
+                    revalidate_first_execute_only_workspace_inventory_object_v1(
+                        self.workspace,
+                        publication,
+                    )
+                }
+                RuntimeForestRootV1::Runtime => {
+                    revalidate_first_execute_only_runtime_inventory_object_v1(
+                        self.runtime,
+                        publication,
+                    )
+                }
+            };
+            result.map_err(|refusal| {
+                RuntimeForestReadRefusalV1::Checkpoint(map_workspace_evidence_refusal_v1(refusal))
+            })?;
         }
         Ok(())
     }
 
-    fn pread_exact_v1(
-        fd: BorrowedFd<'_>,
-        size: usize,
-        memory: &RuntimeMemoryEscrowV1,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<Vec<u8>, RuntimeForestReadRefusalV1> {
-        let mut bytes = memory
-            .try_vec_with_capacity(size)
-            .map_err(|_| RuntimeForestReadRefusalV1::MemoryBudget)?;
-        bytes.resize(size, 0);
-        let mut offset = 0usize;
-        while offset < size {
-            operations.charge()?;
-            let count = unsafe {
-                libc::pread(
-                    fd.as_raw_fd(),
-                    bytes[offset..].as_mut_ptr().cast(),
-                    size - offset,
-                    offset as libc::off_t,
-                )
-            };
-            if count < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                bytes.fill(0);
-                return Err(RuntimeForestReadRefusalV1::Io);
-            }
-            if count == 0 {
-                bytes.fill(0);
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            offset = offset
-                .checked_add(usize::try_from(count).map_err(|_| RuntimeForestReadRefusalV1::Io)?)
-                .ok_or(RuntimeForestReadRefusalV1::Io)?;
-        }
-        operations.charge()?;
-        let mut extra = 0u8;
-        let count = unsafe {
-            libc::pread(
-                fd.as_raw_fd(),
-                (&mut extra as *mut u8).cast(),
-                1,
-                size as libc::off_t,
-            )
-        };
-        if count < 0 {
-            bytes.fill(0);
-            return Err(RuntimeForestReadRefusalV1::Io);
-        }
-        if count != 0 {
-            bytes.fill(0);
-            return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-        }
-        Ok(bytes)
-    }
-
-    fn read_descriptor_relative_object_v1(
-        root: BorrowedFd<'_>,
-        path: &[u8],
-        byte_ceiling: u32,
-        memory: &RuntimeMemoryEscrowV1,
-        operations: &mut RuntimeForestOperationBudgetV1,
-    ) -> Result<RuntimeForestObservedObjectV1, RuntimeForestReadRefusalV1> {
-        validate_runtime_forest_relative_path_v1(path)
-            .map_err(|_| RuntimeForestReadRefusalV1::Io)?;
-        let root_before = statx_fd_v1(root, operations)?;
-        if root_before.mode() & libc::S_IFMT != libc::S_IFDIR {
-            return Err(RuntimeForestReadRefusalV1::NodeType);
-        }
-        let root_identity = root_before.commitment_bytes_v1();
-        let component_count = path.split(|byte| *byte == b'/').count();
-        let mut ancestors = memory
-            .try_vec_with_capacity(component_count.saturating_sub(1))
-            .map_err(|_| RuntimeForestReadRefusalV1::MemoryBudget)?;
-        let mut parent = root;
-        for (index, component) in path.split(|byte| *byte == b'/').enumerate() {
-            let terminal = index + 1 == component_count;
-            revalidate_ancestors_v1(root, &root_identity, &ancestors, operations)?;
-            let mut name_storage = [0u8; 256];
-            let name = component_cstr_v1(component, &mut name_storage);
-            let before = statx_name_v1(parent, name, operations)?;
-            let kind = before.mode() & libc::S_IFMT;
-            if kind == libc::S_IFLNK {
-                return Err(RuntimeForestReadRefusalV1::Symlink);
-            }
-            let path_fd = openat2_component_v1(
-                parent,
-                name,
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                operations,
-            )?;
-            let opened = statx_fd_v1(path_fd.as_fd(), operations)?;
-            if before.commitment_bytes_v1() != opened.commitment_bytes_v1() {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            if !terminal {
-                if kind != libc::S_IFDIR {
-                    return Err(RuntimeForestReadRefusalV1::NodeType);
-                }
-                ancestors.push((path_fd, before.commitment_bytes_v1()));
-                parent = ancestors.last().expect("just pushed ancestor").0.as_fd();
-                continue;
-            }
-            if kind != libc::S_IFREG || before.nlink() != 1 {
-                return Err(RuntimeForestReadRefusalV1::NodeType);
-            }
-            let size = usize::try_from(before.size())
-                .map_err(|_| RuntimeForestReadRefusalV1::ByteLimit)?;
-            if size > byte_ceiling as usize {
-                return Err(RuntimeForestReadRefusalV1::ByteLimit);
-            }
-            let read_fd = openat2_component_v1(
-                parent,
-                name,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC,
-                operations,
-            )?;
-            let read_opened = statx_fd_v1(read_fd.as_fd(), operations)?;
-            if before.commitment_bytes_v1() != read_opened.commitment_bytes_v1() {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            let bytes = pread_exact_v1(read_fd.as_fd(), size, memory, operations)?;
-            if statx_fd_v1(read_fd.as_fd(), operations)?.commitment_bytes_v1()
-                != before.commitment_bytes_v1()
-                || statx_name_v1(parent, name, operations)?.commitment_bytes_v1()
-                    != before.commitment_bytes_v1()
-            {
-                return Err(RuntimeForestReadRefusalV1::IdentityDrift);
-            }
-            revalidate_ancestors_v1(root, &root_identity, &ancestors, operations)?;
-            return Ok(RuntimeForestObservedObjectV1 {
-                identity: before.commitment_bytes_v1(),
-                bytes,
-            });
-        }
-        Err(RuntimeForestReadRefusalV1::Io)
+    fn root_binding(&self) -> Option<RuntimeForestRootBindingV1> {
+        Some(RuntimeForestRootBindingV1 {
+            workspace_digest: self.workspace.workspace_root_digest(),
+            workspace_statx: *self.workspace.workspace_root_statx_commitment(),
+            runtime_digest: self.runtime.root_digest(),
+            runtime_statx: *self.runtime.root_statx_commitment(),
+        })
     }
 }
 
@@ -2193,7 +2007,12 @@ mod tests {
         bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
         bytes[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
         bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        bytes[24..32].copy_from_slice(&(RUNTIME_FIXTURE_BASE + 0x100).to_le_bytes());
+        let entry = if interpreter.is_some() {
+            RUNTIME_FIXTURE_BASE + 0x100
+        } else {
+            0
+        };
+        bytes[24..32].copy_from_slice(&entry.to_le_bytes());
         bytes[32..40].copy_from_slice(&(ELF64_HEADER_BYTES as u64).to_le_bytes());
         bytes[52..54].copy_from_slice(&(ELF64_HEADER_BYTES as u16).to_le_bytes());
         bytes[54..56].copy_from_slice(&(ELF64_PROGRAM_HEADER_BYTES as u16).to_le_bytes());
@@ -2275,6 +2094,7 @@ mod tests {
         entries: Vec<FakeForestEntryV1>,
         calls: usize,
         drift_on_call: Option<usize>,
+        drift_on_final_revalidate: bool,
     }
 
     impl RuntimeForestReaderV1 for FakeForestReaderV1 {
@@ -2303,7 +2123,20 @@ mod tests {
                 bytes: memory
                     .try_bytes_from_slice(&entry.bytes)
                     .map_err(|_| RuntimeForestReadRefusalV1::MemoryBudget)?,
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                publication: None,
             })
+        }
+
+        fn revalidate_all(
+            &mut self,
+            _nodes: &[RuntimeForestNodeV1],
+        ) -> Result<(), RuntimeForestReadRefusalV1> {
+            if self.drift_on_final_revalidate {
+                Err(RuntimeForestReadRefusalV1::IdentityDrift)
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -2368,6 +2201,7 @@ mod tests {
             entries,
             calls: 0,
             drift_on_call: None,
+            drift_on_final_revalidate: false,
         };
         build_runtime_forest_plan_v1(
             &mut reader,
@@ -2398,7 +2232,7 @@ mod tests {
         assert_eq!(plan.edges.len(), 5);
         assert_eq!(plan.edges[0].ordinal, 0);
         assert!(plan.total_bytes > 0);
-        assert!(plan.operation_count > 0);
+        assert!(plan.lookup_attempt_count > 0);
         assert!(!plan.canonical_bytes.is_empty());
     }
 
@@ -2416,6 +2250,73 @@ mod tests {
             .unwrap();
         libdl.identity[101] ^= 1;
         let changed = build_representative_forest(changed).unwrap();
+        assert_ne!(first.digest, changed.digest);
+    }
+
+    #[test]
+    fn structural_inventory_digest_binds_both_publication_roots() {
+        struct RootBoundReaderV1 {
+            inner: FakeForestReaderV1,
+            marker: u8,
+        }
+        impl RuntimeForestReaderV1 for RootBoundReaderV1 {
+            fn read_object(
+                &mut self,
+                root: RuntimeForestRootV1,
+                path: &[u8],
+                byte_ceiling: u32,
+                memory: &RuntimeMemoryEscrowV1,
+                operations: &mut RuntimeForestOperationBudgetV1,
+            ) -> Result<RuntimeForestObservedObjectV1, RuntimeForestReadRefusalV1> {
+                self.inner
+                    .read_object(root, path, byte_ceiling, memory, operations)
+            }
+
+            fn revalidate_all(
+                &mut self,
+                nodes: &[RuntimeForestNodeV1],
+            ) -> Result<(), RuntimeForestReadRefusalV1> {
+                self.inner.revalidate_all(nodes)
+            }
+
+            fn root_binding(&self) -> Option<RuntimeForestRootBindingV1> {
+                Some(RuntimeForestRootBindingV1 {
+                    workspace_digest: NodeDigest::derive(
+                        "again structural inventory test workspace root v1",
+                        &[&[self.marker]],
+                    ),
+                    workspace_statx: [self.marker; 102],
+                    runtime_digest: NodeDigest::derive(
+                        "again structural inventory test runtime root v1",
+                        &[&[self.marker.wrapping_add(1)]],
+                    ),
+                    runtime_statx: [self.marker.wrapping_add(1); 102],
+                })
+            }
+        }
+
+        let build = |marker| {
+            let mut reader = RootBoundReaderV1 {
+                inner: FakeForestReaderV1 {
+                    entries: representative_forest_entries(),
+                    calls: 0,
+                    drift_on_call: None,
+                    drift_on_final_revalidate: false,
+                },
+                marker,
+            };
+            build_runtime_forest_plan_v1(
+                &mut reader,
+                None,
+                None,
+                &RuntimeMemoryEscrowV1::first_checkpoint(),
+            )
+            .unwrap()
+        };
+        let first = build(7);
+        let same = build(7);
+        let changed = build(8);
+        assert_eq!(first.digest, same.digest);
         assert_ne!(first.digest, changed.digest);
     }
 
@@ -2442,6 +2343,7 @@ mod tests {
             entries: representative_forest_entries(),
             calls: 0,
             drift_on_call: None,
+            drift_on_final_revalidate: false,
         });
         let charged = build_runtime_forest_plan_v1(
             &mut charged,
@@ -2450,7 +2352,7 @@ mod tests {
             &RuntimeMemoryEscrowV1::first_checkpoint(),
         )
         .unwrap();
-        assert!(charged.operation_count > ordinary.operation_count);
+        assert!(charged.lookup_attempt_count > ordinary.lookup_attempt_count);
         assert_eq!(charged.digest, ordinary.digest);
         assert_eq!(charged.canonical_bytes, ordinary.canonical_bytes);
     }
@@ -2516,6 +2418,7 @@ mod tests {
                 entries: representative_forest_entries(),
                 calls: 0,
                 drift_on_call: Some(drift_on_call),
+                drift_on_final_revalidate: false,
             };
             assert_eq!(
                 build_runtime_forest_plan_v1(
@@ -2528,6 +2431,23 @@ mod tests {
                 FirstExecuteOnlyRuntimeCheckpointRefusalV1::IdentityDrift
             );
         }
+
+        let mut reader = FakeForestReaderV1 {
+            entries: representative_forest_entries(),
+            calls: 0,
+            drift_on_call: None,
+            drift_on_final_revalidate: true,
+        };
+        assert_eq!(
+            build_runtime_forest_plan_v1(
+                &mut reader,
+                None,
+                None,
+                &RuntimeMemoryEscrowV1::first_checkpoint(),
+            )
+            .unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::IdentityDrift
+        );
     }
 
     #[test]
@@ -2684,6 +2604,7 @@ mod tests {
             entries: entries.clone(),
             calls: 0,
             drift_on_call: None,
+            drift_on_final_revalidate: false,
         };
         assert!(
             build_runtime_forest_plan_v1(
@@ -2699,6 +2620,7 @@ mod tests {
             entries,
             calls: 0,
             drift_on_call: None,
+            drift_on_final_revalidate: false,
         };
         assert_eq!(
             build_runtime_forest_plan_v1(
@@ -2715,87 +2637,47 @@ mod tests {
         );
     }
 
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    #[test]
-    fn live_runtime_forest_uses_only_root_descriptors_and_rejects_symlinks() {
-        use std::os::fd::AsFd;
-        use std::os::unix::fs::symlink;
-
-        let temporary = tempfile::tempdir().unwrap();
-        let workspace = temporary.path().join("workspace");
-        let runtime = temporary.path().join("runtime");
-        std::fs::create_dir_all(workspace.join(".venv/bin")).unwrap();
-        std::fs::create_dir_all(runtime.join("lib64")).unwrap();
-        std::fs::write(
-            workspace.join(".venv/bin/python"),
-            forest_elf_fixture(
-                Some(b"/lib64/ld-linux-x86-64.so.2"),
-                &[b"libc.so.6", b"libm.so.6"],
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            runtime.join("lib64/ld-linux-x86-64.so.2"),
-            forest_elf_fixture(None, &[]),
-        )
-        .unwrap();
-        std::fs::write(
-            runtime.join("lib64/libc.so.6"),
-            forest_elf_fixture(None, &[b"libdl.so.2"]),
-        )
-        .unwrap();
-        std::fs::write(
-            runtime.join("lib64/libm.so.6"),
-            forest_elf_fixture(None, &[b"libc.so.6"]),
-        )
-        .unwrap();
-        std::fs::write(
-            runtime.join("lib64/libdl.so.2"),
-            forest_elf_fixture(None, &[]),
-        )
-        .unwrap();
-        let workspace_fd = std::fs::File::open(&workspace).unwrap();
-        let runtime_fd = std::fs::File::open(&runtime).unwrap();
-        let roots = PublishedRuntimeForestRootsV1::from_connector_owned_roots(
-            workspace_fd.as_fd(),
-            runtime_fd.as_fd(),
-        );
-        let mut reader = linux_runtime_forest::LinuxRuntimeForestReaderV1::new(roots);
-        let plan = build_runtime_forest_plan_v1(
-            &mut reader,
-            None,
-            None,
-            &RuntimeMemoryEscrowV1::first_checkpoint(),
-        )
-        .unwrap();
-        assert_eq!(plan.nodes.len(), 5);
-        assert!(plan.operation_count > 20);
-
-        std::fs::remove_file(runtime.join("lib64/libm.so.6")).unwrap();
-        symlink("libc.so.6", runtime.join("lib64/libm.so.6")).unwrap();
-        let roots = PublishedRuntimeForestRootsV1::from_connector_owned_roots(
-            workspace_fd.as_fd(),
-            runtime_fd.as_fd(),
-        );
-        let mut reader = linux_runtime_forest::LinuxRuntimeForestReaderV1::new(roots);
-        assert_eq!(
-            build_runtime_forest_plan_v1(
-                &mut reader,
-                None,
-                None,
-                &RuntimeMemoryEscrowV1::first_checkpoint(),
-            )
-            .unwrap_err(),
-            FirstExecuteOnlyRuntimeCheckpointRefusalV1::RuntimeForestSymlink
-        );
-    }
-
     #[test]
     fn bounded_x86_64_elf_with_loadable_executable_segment_is_accepted() {
         assert_eq!(validate_x86_64_elf_v1(&elf_fixture()), Ok(()));
         let mut executable = elf_fixture();
         executable[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
         assert_eq!(validate_x86_64_elf_v1(&executable), Ok(()));
+    }
+
+    #[test]
+    fn shared_objects_and_interpreters_may_have_zero_entry_but_root_may_not() {
+        let object = forest_elf_fixture(None, &[]);
+        assert_eq!(&object[24..32], &0u64.to_le_bytes());
+        assert_eq!(validate_x86_64_elf_role_v1(&object, false), Ok(()));
+        assert_eq!(
+            validate_x86_64_elf_role_v1(&object, true),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEntryPoint)
+        );
+        assert!(build_representative_forest(representative_forest_entries()).is_ok());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn representative_system_interpreter_and_dso_pass_object_role_validation() {
+        let mut checked = 0usize;
+        for path in [
+            "/lib64/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+            "/lib/x86_64-linux-gnu/libc.so.6",
+            "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        ] {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            validate_x86_64_elf_role_v1(&bytes, false)
+                .unwrap_or_else(|error| panic!("representative ELF {path} refused: {error:?}"));
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected an interpreter and DSO fixture on Linux x86_64"
+        );
     }
 
     #[test]
@@ -3375,7 +3257,7 @@ mod tests {
                 FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEndianness,
             ),
             (6, 0, FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfVersion),
-            (7, 3, FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfOsAbi),
+            (7, 2, FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfOsAbi),
             (16, 0, FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfType),
             (
                 18,
@@ -3440,7 +3322,7 @@ mod tests {
         assert_eq!(FIRST_EXECUTE_ONLY_EXECUTABLE_V1, b".venv/bin/python");
         assert!(RUNTIME_CLOSURE_NONCLAIMS_V1.starts_with(b"PT_INTERP,DT_NEEDED"));
         assert!(RUNTIME_CLOSURE_NONCLAIMS_V1.ends_with(b"pytest:unqualified"));
-        assert!(RUNTIME_FOREST_NONCLAIMS_V1.starts_with(b"venv,pytest,isolation"));
+        assert!(RUNTIME_FOREST_NONCLAIMS_V1.starts_with(b"linux-loader,venv,pytest,isolation"));
         assert!(RUNTIME_FOREST_NONCLAIMS_V1.ends_with(b"reuse:unauthorized"));
         assert_eq!(
             runtime_forest_platform_support_v1().is_ok(),
@@ -3476,10 +3358,10 @@ mod tests {
         assert!(std::mem::needs_drop::<
             FirstExecuteOnlyRuntimeCheckpointV1<'static>,
         >());
-        <FirstExecuteOnlyRuntimeForestEvidenceV1<'static> as AmbiguousIfClone<_>>::probe();
-        <FirstExecuteOnlyRuntimeForestEvidenceV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<
-            FirstExecuteOnlyRuntimeForestEvidenceV1<'static>,
+            FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
         >());
     }
 }

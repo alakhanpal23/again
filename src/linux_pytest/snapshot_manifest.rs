@@ -40,8 +40,8 @@ use super::snapshot_publish::{
     BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, RuntimeMemoryEscrowV1,
     SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
     ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
-    read_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
-    validate_snapshot_final_name,
+    read_bound_regular_bytes_v1, revalidate_bound_regular_bytes_v1,
+    seal_publish_and_bind_snapshot_child_at, validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
@@ -261,6 +261,81 @@ pub(super) struct FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources> {
     runtime_memory: RuntimeMemoryEscrowV1,
 }
 
+/// Linear designation of an actually connector-published canonical tree as
+/// the runtime-side input to the non-authoritative structural inventory.
+/// Construction consumes the publication token; no descriptor-based relabel
+/// operation exists.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyPublishedRuntimeTreeV1<'resources> {
+    tree: PublishedCanonicalTreeV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FirstExecuteOnlyPublishedRuntimeTreeV1<'_> {
+    pub(super) const fn root_digest(&self) -> NodeDigest {
+        self.tree.manifest.root_digest()
+    }
+
+    pub(super) const fn root_statx_commitment(&self) -> &[u8; 102] {
+        self.tree.manifest.destination_root_statx_commitment_v1()
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyPublishedRuntimeTreeV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("FirstExecuteOnlyPublishedRuntimeTreeV1(<opaque-publication>)")
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum FirstExecuteOnlyInventoryRootV1 {
+    Workspace,
+    Runtime,
+}
+
+/// One manifest-reconciled object plus every descriptor pin required for a
+/// final whole-inventory stability pass. Bytes and descriptors never escape.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyRuntimeInventoryObjectV1 {
+    root: FirstExecuteOnlyInventoryRootV1,
+    verified: VerifiedBoundRegularBytesV1,
+    manifest_root_digest: NodeDigest,
+    manifest_root_statx_commitment: [u8; 102],
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FirstExecuteOnlyRuntimeInventoryObjectV1 {
+    pub(super) fn bytes(&self) -> &[u8] {
+        self.verified.bytes()
+    }
+
+    pub(super) fn terminal_identity(&self) -> &[u8; 102] {
+        self.verified
+            .nodes()
+            .last()
+            .expect("reconciled object has a terminal node")
+            .statx_commitment()
+    }
+
+    pub(super) fn pinned_fd_count(&self) -> usize {
+        self.verified.pinned_fd_count()
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyRuntimeInventoryObjectV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyRuntimeInventoryObjectV1")
+            .field("bytes", &"<redacted>")
+            .field("descriptors", &"<redacted>")
+            .field("authority", &false)
+            .finish()
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_> {
     pub(super) fn executable_bytes(&self) -> &[u8] {
@@ -455,6 +530,201 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
         terminal_logical_mode,
         runtime_memory,
     })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn read_first_execute_only_workspace_inventory_object_v1(
+    evidence: &FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_>,
+    path: &[u8],
+    byte_ceiling: u32,
+) -> Result<
+    FirstExecuteOnlyRuntimeInventoryObjectV1,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+> {
+    read_first_execute_only_inventory_object_v1(
+        &evidence.binding.workspace,
+        FirstExecuteOnlyInventoryRootV1::Workspace,
+        path,
+        byte_ceiling,
+        &evidence.runtime_memory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn read_first_execute_only_runtime_inventory_object_v1(
+    runtime: &FirstExecuteOnlyPublishedRuntimeTreeV1<'_>,
+    path: &[u8],
+    byte_ceiling: u32,
+    memory: &RuntimeMemoryEscrowV1,
+) -> Result<
+    FirstExecuteOnlyRuntimeInventoryObjectV1,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+> {
+    read_first_execute_only_inventory_object_v1(
+        &runtime.tree,
+        FirstExecuteOnlyInventoryRootV1::Runtime,
+        path,
+        byte_ceiling,
+        memory,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn read_first_execute_only_inventory_object_v1(
+    tree: &PublishedCanonicalTreeV1<'_>,
+    root_tag: FirstExecuteOnlyInventoryRootV1,
+    path: &[u8],
+    byte_ceiling: u32,
+    memory: &RuntimeMemoryEscrowV1,
+) -> Result<
+    FirstExecuteOnlyRuntimeInventoryObjectV1,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+> {
+    let path = ValidatedBoundRelativePathV1::parse_with_memory(path, memory)
+        .map_err(map_bound_regular_refusal_v1)?;
+    let verified = read_bound_regular_bytes_v1(&tree.physical, &path, byte_ceiling, memory)
+        .map_err(map_bound_regular_refusal_v1)?;
+    let manifest_root_statx_commitment = *tree.manifest.destination_root_statx_commitment_v1();
+    if verified.root_statx_commitment() != &manifest_root_statx_commitment {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestRootMismatch);
+    }
+    let root = unique_charged_manifest_entry_v1(&tree.manifest, b"")?;
+    if root.node_digest != tree.manifest.root_digest()
+        || !charged_manifest_entry_digest_consistent_v1(root)
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
+    }
+    if !matches!(&root.payload, ChargedManifestPayloadV1::Directory { .. })
+        || !live_manifest_metadata_matches_v1(
+            root,
+            verified.root_live_statx(),
+            verified.root_live_statx(),
+        )
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestMetadataMismatch);
+    }
+
+    let mut terminal = None;
+    for observed in verified.nodes() {
+        // The structural inventory deliberately refuses even authenticated
+        // symlinks: every retained object must be pinned through one exact
+        // component chain with no alternate spelling.
+        if observed.kind() == VerifiedBoundNodeKindV1::Symlink {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::SymlinkTarget);
+        }
+        let entry = unique_charged_manifest_entry_v1(&tree.manifest, observed.normalized_path())?;
+        let manifest_kind = match &entry.payload {
+            ChargedManifestPayloadV1::Directory { .. } => VerifiedBoundNodeKindV1::Directory,
+            ChargedManifestPayloadV1::Regular { .. } => VerifiedBoundNodeKindV1::Regular,
+            ChargedManifestPayloadV1::Symlink { .. } => VerifiedBoundNodeKindV1::Symlink,
+        };
+        if manifest_kind != observed.kind() {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestKindMismatch);
+        }
+        if !charged_manifest_entry_digest_consistent_v1(entry) {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
+        }
+        if !live_manifest_metadata_matches_v1(
+            entry,
+            observed.live_statx(),
+            verified.root_live_statx(),
+        ) {
+            return Err(
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestMetadataMismatch,
+            );
+        }
+        if observed.kind() == VerifiedBoundNodeKindV1::Regular {
+            let ChargedManifestPayloadV1::Regular { content_digest, .. } = &entry.payload else {
+                unreachable!("kind checked above")
+            };
+            if *content_digest != verified.content_digest()
+                || entry.metadata.size
+                    != u64::try_from(verified.bytes().len()).expect("bounded bytes fit u64")
+            {
+                return Err(
+                    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestContentMismatch,
+                );
+            }
+            if terminal
+                .replace((entry.node_digest, entry.metadata.mode))
+                .is_some()
+            {
+                return Err(
+                    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeAmbiguous,
+                );
+            }
+        }
+    }
+    terminal.ok_or(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeMissing)?;
+    Ok(FirstExecuteOnlyRuntimeInventoryObjectV1 {
+        root: root_tag,
+        verified,
+        manifest_root_digest: tree.manifest.root_digest(),
+        manifest_root_statx_commitment,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn unique_charged_manifest_entry_v1<'tree, 'resources>(
+    manifest: &'tree ChargedTreeManifestV1<'resources>,
+    path: &[u8],
+) -> Result<
+    &'tree ChargedManifestEntryV1<'resources>,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+> {
+    let mut matches = manifest
+        .entries
+        .as_slice()
+        .iter()
+        .filter(|entry| entry.relative_path == path);
+    let entry = matches
+        .next()
+        .ok_or(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeMissing)?;
+    if matches.next().is_some() {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeAmbiguous);
+    }
+    Ok(entry)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn revalidate_first_execute_only_inventory_object_v1(
+    tree: &PublishedCanonicalTreeV1<'_>,
+    root_tag: FirstExecuteOnlyInventoryRootV1,
+    object: &FirstExecuteOnlyRuntimeInventoryObjectV1,
+) -> Result<(), FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1> {
+    if object.root != root_tag
+        || object.manifest_root_digest != tree.manifest.root_digest()
+        || object.manifest_root_statx_commitment
+            != *tree.manifest.destination_root_statx_commitment_v1()
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestRootMismatch);
+    }
+    revalidate_bound_regular_bytes_v1(&tree.physical, &object.verified)
+        .map_err(map_bound_regular_refusal_v1)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn revalidate_first_execute_only_workspace_inventory_object_v1(
+    evidence: &FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_>,
+    object: &FirstExecuteOnlyRuntimeInventoryObjectV1,
+) -> Result<(), FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1> {
+    revalidate_first_execute_only_inventory_object_v1(
+        &evidence.binding.workspace,
+        FirstExecuteOnlyInventoryRootV1::Workspace,
+        object,
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn revalidate_first_execute_only_runtime_inventory_object_v1(
+    runtime: &FirstExecuteOnlyPublishedRuntimeTreeV1<'_>,
+    object: &FirstExecuteOnlyRuntimeInventoryObjectV1,
+) -> Result<(), FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1> {
+    revalidate_first_execute_only_inventory_object_v1(
+        &runtime.tree,
+        FirstExecuteOnlyInventoryRootV1::Runtime,
+        object,
+    )
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -1090,6 +1360,38 @@ impl SnapshotConnectorV1 {
             |manifest| validate_first_execute_only_workspace_manifest_v1(&lexical, manifest),
         )?;
         Ok(FirstExecuteOnlyWorkspaceTreeBindingV1 { lexical, workspace })
+    }
+
+    /// Dedicated linear issuer for the separately published tree used only as
+    /// an input to the Gate 3 structural inventory. Unlike a descriptor
+    /// relabel, this runs the complete four-view materialize/verify/publish/
+    /// bind pipeline and returns no generic publication token to its caller.
+    /// It still grants neither loader nor execution authority.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn materialize_first_execute_only_runtime_inventory_tree_and_publish_at<
+        'resources,
+    >(
+        &'resources self,
+        publication_parent: BorrowedFd<'resources>,
+        staging_name: &CStr,
+        final_name: &CStr,
+        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
+        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<
+        FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
+        SnapshotPublishedCanonicalTreeErrorV1,
+    > {
+        self.materialize_workspace_tree_and_publish_with_validation_at(
+            publication_parent,
+            staging_name,
+            final_name,
+            source_s1_view,
+            source_s2_view,
+            root_name,
+            |_| Ok(()),
+        )
+        .map(|tree| FirstExecuteOnlyPublishedRuntimeTreeV1 { tree })
     }
 
     #[allow(clippy::too_many_arguments)]
