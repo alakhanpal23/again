@@ -794,6 +794,36 @@ impl ProfileOwnedStdioSessionV1<LinuxProfileStdioSyscallsV1> {
 }
 
 #[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ParentStdioDrainV1<LinuxProfileStdioSyscallsV1> {
+    /// Discard the fork-local copies of the parent-only endpoints before the
+    /// child continues. `fork` duplicates descriptors even though the Rust
+    /// values were split linearly before it, so leaving these copies open can
+    /// suppress stdin EOF and stdout/stderr EOF in the real parent.
+    fn discard_fork_copy_in_child_v1(mut self) -> Result<(), i32> {
+        let mut first_errno = None;
+        for descriptor in &mut self.descriptors {
+            if let Some(descriptor) = descriptor.take()
+                // SAFETY: close is an async-signal/fork-safe syscall and this
+                // branch owns only its fork-local descriptor-table copies.
+                && unsafe { libc::syscall(libc::SYS_close, descriptor.raw) } != 0
+            {
+                first_errno.get_or_insert_with(child_errno_v1);
+            }
+        }
+        // The child exits without unwinding. Avoid dropping the syscall owner
+        // and Arc after fork; their memory is reclaimed by `_exit`.
+        std::mem::forget(self);
+        first_errno.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
     target_env = "gnu",
@@ -3249,6 +3279,9 @@ mod tests {
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork disposable stdio child");
         if child == 0 {
+            if parent.discard_fork_copy_in_child_v1().is_err() {
+                unsafe { libc::_exit(118) }
+            }
             for (source, target) in [
                 (protocol_report.as_raw_fd(), 3),
                 (protocol_control.as_raw_fd(), 4),
