@@ -273,6 +273,8 @@ jobs:
       - run: cargo +1.88.0 test --locked --all-features
       - name: Test the offline Linux supervisor evidence verifier
         run: python3 -B -m unittest scripts/test_verify_linux_supervisor_evidence.py
+      - name: Test the offline Linux pytest execute-only evidence verifier
+        run: python3 -B -m unittest scripts/test_verify_linux_pytest_execute_only_evidence.py
       - name: Test the Linux supervisor qualification harness
         if: runner.os == 'Linux'
         run: scripts/test_linux_supervisor_qualification.sh
