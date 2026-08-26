@@ -775,7 +775,7 @@ After every namespace task is gone:
 | Fixed terminal diagnostic inherits a filter, or action/install/TSYNC/readback/canary semantics differ | `isolation_preflight_failed` |
 | Ptrace attach, options, event, or exact filter readback fails | `ptrace_unavailable` |
 | Landlock VERSION reports ABI 1–5, `ENOSYS`, or `EOPNOTSUPP` | `landlock_unavailable` |
-| Landlock VERSION reports ABI above 7, or create/add/restrict/canary/cleanup fails | `isolation_preflight_failed` |
+| Landlock VERSION is malformed, or create/add/restrict/canary/cleanup fails | `isolation_preflight_failed` |
 | Pre-exec FD, network, capability, namespace, or handoff audit differs | `isolation_preflight_failed` |
 | Required FIFO, socket, device, unreadable object, or external hardlink group | `snapshot_required_object_unsupported` |
 | Copy, hash, fsync, or atomic-publication construction failure | `snapshot_construction_failed` |
@@ -840,10 +840,10 @@ sleeps.
    null, zero, random, stat, mmap, and ioctl behavior. V1 authorizes no host
    device bind.
 7. **Landlock:** ABI 6 is mandatory so TCP, device-ioctl,
-   abstract-Unix-socket, and signal controls are present. On ABI 7, the silent
-   default commits `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`; host audit
-   emission and `NEW_EXEC_ON` require explicit operator opt-in and remain
-   outside the current proof.
+   abstract-Unix-socket, and signal controls are present. ABI 7 and newer use
+   the stable tested prefix and commit `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`;
+   host audit emission, newer rights, and `NEW_EXEC_ON` require explicit operator
+   opt-in and remain outside the current proof.
 8. **Tracer placement:** namespace PID 1 is the reaper/tracer and stays outside
    workload Landlock/seccomp. Child-user-namespace `CAP_SYS_ADMIN` permits
    `PTRACE_SECCOMP_GET_FILTER` without any host capability.

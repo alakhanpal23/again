@@ -555,25 +555,26 @@ their complete retained identities to match. Immediately before irreversible
 Landlock enforcement it independently rereads the empty capability sets,
 securebits, `no_new_privs`, and fd 0.
 
-The VERSION query admits exactly ABI 6 or 7. ABI 1–5 and VERSION-query
-`ENOSYS`/`EOPNOTSUPP` use canonical status 10 and map to expected
-`landlock_unavailable`. ABI above 7 and every later syscall, policy, canary, or
-cleanup failure use status 11 and map to non-expected
-`isolation_preflight_failed` at `child_landlock`. The ruleset handles exact
+The VERSION query admits ABI 6 or the stable ABI-7-or-newer ruleset prefix.
+ABI 1–5 and VERSION-query `ENOSYS`/`EOPNOTSUPP` use canonical status 10 and
+map to expected `landlock_unavailable`. A malformed version result and every
+later syscall, policy, canary, or cleanup failure use status 11 and map to
+non-expected `isolation_preflight_failed` at `child_landlock`. The ruleset handles exact
 filesystem, TCP, and scope masks `0xFFFF`, `0x3`, and `0x3`. It grants only
 `tmp` access `0x77BE` and `run/restricted` access `0x17BE`; workspace and TCP
 receive no rule. Fixed canaries require tmp create/write/truncate/rename
 success, restricted `ftruncate` `EACCES` and rename `EXDEV`, workspace file and
 directory read `EACCES`, and TCP bind/connect `EACCES`. ABI 6 uses restriction
-flags zero; ABI 7 uses exactly `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`.
+flags zero; ABI 7 and newer use exactly
+`LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF` and claim no newer rights.
 
 On success and every post-audit failure, cleanup attempts every tracked close
 and then uses fd 1 to require the exact `{0,1}` inventory, close and prove fd 1
 `EBADF`, and reauthenticate fd 0. Cleanup failure overrides an otherwise
 expected refusal. This establishes one fixed Landlock policy's functional
-filesystem/TCP behavior and ABI-7 flag acceptance. It does not functionally
-prove signal or abstract-Unix scoping, inspect audit logs, or establish the
-production tracer/workload split.
+filesystem/TCP behavior and ABI-7-or-newer flag acceptance. It does not
+functionally prove signal or abstract-Unix scoping, inspect audit logs, or
+establish the production tracer/workload split.
 
 After Landlock has closed and audited its transient descriptors, the same
 fixed no-command child reauthenticates fd 0, independently rereads
@@ -749,8 +750,8 @@ After the private root is complete and before Python execs, the workload sets
 `no_new_privs` and installs a Landlock ruleset using every filesystem access
 right supported and tested by the selected ABI. ABI 6 is the minimum positive
 profile: it includes `REFER`, `TRUNCATE`, TCP bind/connect, device-ioctl
-control, and abstract-Unix-socket/signal scoping. On ABI 7 the default commits
-`LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`, so it does not emit host audit
+control, and abstract-Unix-socket/signal scoping. On ABI 7 and newer the default
+commits `LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF`, so it does not emit host audit
 records for the same executable. Audit emission and `NEW_EXEC_ON` are outside
 the current proof and require an explicit operator opt-in. The ruleset
 grants read/execute only to sealed runtime/input paths and write/create/remove
@@ -763,8 +764,8 @@ Landlock is additive defense, not the observation proof. It does not mediate
 every metadata read or every possible effect, and descriptors opened before a
 ruleset retain important rights. The tmpfs/pivoted root, immutable copies, fd
 scrub, network namespace, seccomp policy, and complete trace remain mandatory.
-An unavailable or untested Landlock ABI disables the profile rather than
-silently removing this layer.
+An unavailable ABI disables the profile rather than silently removing this
+layer. Newer ABIs use only the tested stable prefix and gain no implicit rights.
 
 ## Seccomp and ptrace for every descendant
 

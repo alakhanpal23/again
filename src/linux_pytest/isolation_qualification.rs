@@ -16,15 +16,16 @@
 //! back. Finally, it reopens and authenticates only fixed private-root paths,
 //! installs a fixed deny-by-default Landlock policy, and exercises exact local
 //! filesystem and TCP denial canaries before reporting. The Landlock scope
-//! mask and ABI-7 audit flag are accepted-policy evidence only; this single
-//! terminal child does not functionally prove inter-process scope isolation or
-//! inspect host audit logs. The child already owns a private descriptor table,
-//! so this does not exercise the kernel's shared-table unshare path. After the
-//! Landlock proof has closed and audited every transient descriptor, the child
-//! installs one fixed TSYNC seccomp filter, verifies the attached filter state,
-//! and proves that six otherwise harmless syscall canaries receive the filter's
-//! private errno marker. The filter has only the terminal report path's bounded
-//! write, poll, monotonic-clock, state-readback, close, and exit surface. Wrong
+//! mask and ABI-7-or-newer audit flag are accepted-policy evidence only; this
+//! single terminal child does not functionally prove inter-process scope
+//! isolation or inspect host audit logs. The child already owns a private
+//! descriptor table, so this does not exercise the kernel's shared-table
+//! unshare path. After the Landlock proof has closed and audited every transient
+//! descriptor, the child installs one fixed TSYNC seccomp filter, verifies the
+//! attached filter state, and proves that six otherwise harmless syscall
+//! canaries receive the filter's private errno marker. The filter has only the
+//! terminal report path's bounded write, poll, monotonic-clock, state-readback,
+//! close, and exit surface. Wrong
 //! architectures and the x32 syscall bit are fatal. Executable mappings remain
 //! outside this slice. It does not prove workload stdio,
 //! descriptor-selected workspace/runtime mounts, populated `/dev` endpoints,
@@ -671,7 +672,10 @@ mod platform {
         | libc::SECBIT_NO_CAP_AMBIENT_RAISE_LOCKED;
     const LANDLOCK_CREATE_RULESET_VERSION_V1: u32 = 1;
     const LANDLOCK_RULE_PATH_BENEATH_V1: u32 = 1;
+    // ABI 7 introduced this stable bit assignment; ABI 8 added TSYNC at bit 3.
     const LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1: u32 = 1;
+    // The VERSION query returns a positive kernel `int`, surfaced as `c_long`.
+    const LANDLOCK_ABI_MAX_V1: libc::c_long = i32::MAX as libc::c_long;
     const LANDLOCK_HANDLED_FS_V1: u64 = 0xffff;
     const LANDLOCK_HANDLED_NET_V1: u64 = 0x3;
     const LANDLOCK_SCOPED_V1: u64 = 0x3;
@@ -815,7 +819,7 @@ mod platform {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum ChildLandlockPolicyV1 {
         Abi6,
-        Abi7,
+        Abi7OrNewer,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5058,7 +5062,7 @@ mod platform {
         match result {
             1..=5 if errno == 0 => Err(ChildLandlockFailureV1::Unavailable(0)),
             6 if errno == 0 => Ok(ChildLandlockPolicyV1::Abi6),
-            7 if errno == 0 => Ok(ChildLandlockPolicyV1::Abi7),
+            7..=LANDLOCK_ABI_MAX_V1 if errno == 0 => Ok(ChildLandlockPolicyV1::Abi7OrNewer),
             -1 if matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP) => {
                 Err(ChildLandlockFailureV1::Unavailable(errno))
             }
@@ -5070,7 +5074,7 @@ mod platform {
     const fn child_landlock_restrict_flags_v1(policy: ChildLandlockPolicyV1) -> u32 {
         match policy {
             ChildLandlockPolicyV1::Abi6 => 0,
-            ChildLandlockPolicyV1::Abi7 => LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1,
+            ChildLandlockPolicyV1::Abi7OrNewer => LANDLOCK_RESTRICT_SELF_LOG_SAME_EXEC_OFF_V1,
         }
     }
 
@@ -7729,7 +7733,7 @@ mod platform {
         }
 
         #[test]
-        fn landlock_version_results_select_only_abi_six_or_seven() {
+        fn landlock_version_results_accept_abi_six_and_compatible_newer_prefixes() {
             for version in 1..=5 {
                 assert_eq!(
                     child_landlock_policy_from_version_result_v1(version, 0),
@@ -7742,14 +7746,24 @@ mod platform {
             );
             assert_eq!(
                 child_landlock_policy_from_version_result_v1(7, 0),
-                Ok(ChildLandlockPolicyV1::Abi7),
+                Ok(ChildLandlockPolicyV1::Abi7OrNewer),
+            );
+            for version in [8, 9, 10, LANDLOCK_ABI_MAX_V1] {
+                assert_eq!(
+                    child_landlock_policy_from_version_result_v1(version, 0),
+                    Ok(ChildLandlockPolicyV1::Abi7OrNewer),
+                );
+            }
+            assert_eq!(
+                child_landlock_policy_from_version_result_v1(libc::c_long::MAX, 0),
+                Err(ChildLandlockFailureV1::Invariant),
             );
             assert_eq!(
                 child_landlock_restrict_flags_v1(ChildLandlockPolicyV1::Abi6),
                 0
             );
             assert_eq!(
-                child_landlock_restrict_flags_v1(ChildLandlockPolicyV1::Abi7),
+                child_landlock_restrict_flags_v1(ChildLandlockPolicyV1::Abi7OrNewer),
                 1
             );
 
@@ -7769,8 +7783,6 @@ mod platform {
                 (0, 0),
                 (6, libc::EIO),
                 (7, libc::EIO),
-                (8, 0),
-                (libc::c_long::MAX, 0),
                 (-2, 0),
                 (-1, 0),
                 (-1, -1),
