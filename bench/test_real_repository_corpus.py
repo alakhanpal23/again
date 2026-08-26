@@ -393,8 +393,116 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             },
         )
         self.assertEqual(removed, sorted(hostile))
+        self.assertEqual(
+            corpus.subprocess_boundary_record(),
+            {
+                "network_sandbox": False,
+                "fresh_socket_creation_blocked": False,
+                "ambient_inherited_descriptors_closed": True,
+                "descendant_sentinel": "bounded_best_effort",
+                "trusted_argv_only": True,
+            },
+        )
 
-    def test_subprocess_closes_network_fds_bounds_output_and_cleans_process_tree(self) -> None:
+    def test_binary_is_pinned_and_rejects_changes_links_sparse_and_oversize(self) -> None:
+        source = self.root / "again"
+        source.write_bytes(b"#!/bin/sh\nprintf 'trusted\\n'\n")
+        source.chmod(0o700)
+        pinned = corpus.pin_again_binary(source, self.root / "private")
+        self.assertEqual(pinned.sha256, corpus.sha256_file(source))
+        self.assertEqual(pinned.sha256, corpus.sha256_file(pinned.executable))
+        self.assertEqual(pinned.size, source.stat().st_size)
+
+        source.write_bytes(b"#!/bin/sh\nprintf 'hostile\\n'\n")
+        source.chmod(0o700)
+        completed = corpus.run_bounded(
+            (str(pinned.executable),),
+            cwd=self.root,
+            environment={"PATH": "/usr/bin:/bin"},
+            timeout_seconds=5.0,
+            stream_limit_bytes=1024,
+        )
+        self.assertEqual(completed.stdout, b"trusted\n")
+        with self.assertRaises(corpus.HarnessRefusal) as changed:
+            corpus.verify_binary_source_unchanged(pinned)
+        self.assertEqual(changed.exception.code, "binary_changed")
+
+        hardlinked = self.root / "hardlinked"
+        hardlinked.write_bytes(b"#!/bin/sh\nexit 0\n")
+        hardlinked.chmod(0o700)
+        os.link(hardlinked, self.root / "hardlinked-alias")
+        with self.assertRaises(corpus.HarnessRefusal) as hardlink:
+            corpus.pin_again_binary(hardlinked, self.root / "hardlink-private")
+        self.assertEqual(hardlink.exception.code, "binary_hardlinked")
+
+        oversized = self.root / "oversized"
+        oversized.write_bytes(b"#!/bin/sh\nexit 0\n")
+        oversized.chmod(0o700)
+        with self.assertRaises(corpus.HarnessRefusal) as size:
+            corpus.pin_again_binary(
+                oversized,
+                self.root / "oversized-private",
+                corpus.Limits(max_binary_bytes=4),
+            )
+        self.assertEqual(size.exception.code, "binary_oversized")
+
+        with mock.patch.object(corpus, "is_sparse", return_value=True):
+            with self.assertRaises(corpus.HarnessRefusal) as sparse:
+                corpus.pin_again_binary(
+                    oversized,
+                    self.root / "sparse-private",
+                )
+        self.assertEqual(sparse.exception.code, "binary_sparse")
+
+        if hasattr(os, "mkfifo"):
+            special = self.root / "special-binary"
+            os.mkfifo(special)
+            with self.assertRaises(corpus.HarnessRefusal) as special_error:
+                corpus.pin_again_binary(
+                    special,
+                    self.root / "special-private",
+                )
+            self.assertEqual(special_error.exception.code, "binary_path_unsafe")
+
+    def test_binary_pin_rejects_parent_symlink_and_copy_time_swap(self) -> None:
+        real = self.root / "real"
+        real.mkdir()
+        source = real / "again"
+        source.write_bytes(b"#!/bin/sh\nprintf 'trusted\\n'\n")
+        source.chmod(0o700)
+        linked_parent = self.root / "linked-parent"
+        linked_parent.symlink_to(real, target_is_directory=True)
+        with self.assertRaises(corpus.HarnessRefusal) as symlink:
+            corpus.pin_again_binary(
+                linked_parent / "again",
+                self.root / "symlink-private",
+            )
+        self.assertEqual(symlink.exception.code, "binary_path_unsafe")
+
+        saved = real / "again-saved"
+        hostile = real / "again-hostile"
+        hostile.write_bytes(b"#!/bin/sh\nprintf 'hostile\\n'\n")
+        hostile.chmod(0o700)
+
+        def swap() -> None:
+            source.rename(saved)
+            hostile.rename(source)
+
+        try:
+            with self.assertRaises(corpus.HarnessRefusal) as changed:
+                corpus.pin_again_binary(
+                    source,
+                    self.root / "swap-private",
+                    after_copy=swap,
+                )
+            self.assertEqual(changed.exception.code, "binary_changed")
+        finally:
+            if source.exists():
+                source.rename(hostile)
+            if saved.exists():
+                saved.rename(source)
+
+    def test_subprocess_closes_inherited_fds_bounds_output_and_rejects_descendants(self) -> None:
         environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
         left, right = socket.socketpair()
         try:
@@ -430,20 +538,27 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             )
         self.assertEqual(output_bound.exception.code, "stream_limit_exceeded")
 
-        tree = corpus.run_bounded(
-            (
-                sys.executable,
-                "-c",
-                "import subprocess,sys\n"
-                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
-                "print(child.pid, flush=True)",
-            ),
-            cwd=self.root,
-            environment=environment,
-            timeout_seconds=5.0,
-            stream_limit_bytes=1024,
+        pid_path = self.root / "descendant.pid"
+        with self.assertRaises(corpus.HarnessRefusal) as descendant_error:
+            corpus.run_bounded(
+                (
+                    sys.executable,
+                    "-c",
+                    "import pathlib,subprocess,sys\n"
+                    "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid))",
+                    str(pid_path),
+                ),
+                cwd=self.root,
+                environment=environment,
+                timeout_seconds=5.0,
+                stream_limit_bytes=1024,
+            )
+        self.assertIn(
+            descendant_error.exception.code,
+            {"unexpected_descendant", "process_tree_cleanup_failed"},
         )
-        descendant = int(tree.stdout)
+        descendant = int(pid_path.read_text())
         deadline = time.monotonic() + 2.0
         while True:
             try:
@@ -464,6 +579,34 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             )
         self.assertEqual(timeout.exception.code, "command_timeout")
 
+    def test_detached_sentinel_holder_is_typed_non_containment(self) -> None:
+        environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+        pid_path = self.root / "detached.pid"
+        with self.assertRaises(corpus.HarnessRefusal) as escaped:
+            corpus.run_bounded(
+                (
+                    sys.executable,
+                    "-c",
+                    "import pathlib,subprocess,sys\n"
+                    "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
+                    "start_new_session=True,close_fds=False)\n"
+                    "pathlib.Path(sys.argv[1]).write_text(str(child.pid))",
+                    str(pid_path),
+                ),
+                cwd=self.root,
+                environment=environment,
+                timeout_seconds=5.0,
+                stream_limit_bytes=1024,
+            )
+        self.assertEqual(escaped.exception.code, "process_session_escape_detected")
+        detached = int(pid_path.read_text())
+        try:
+            os.kill(detached, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            os.kill(detached, 9)
+
     def test_non_pass_report_is_typed_and_non_authoritative(self) -> None:
         binary = self.root / "again"
         binary.write_bytes(b"binary")
@@ -479,10 +622,17 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             repository_logical_bytes=0,
             selected=(),
         )
+        pinned = corpus.PinnedBinary(
+            source=binary,
+            executable=binary,
+            sha256=corpus.sha256_file(binary),
+            size=binary.stat().st_size,
+            source_fingerprint=corpus._stat_fingerprint(binary.stat()),
+        )
         report = corpus.build_non_pass_report(
             code="unsupported_host_profile",
             detail="unsupported host",
-            binary=binary,
+            binary=pinned,
             snapshots=[snapshot],
             removed_inputs=[],
         )

@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """Validate Again against copied tracked inputs from four real repositories.
 
-The harness never clones, downloads, or executes source-repository code. It
-reads explicit local Git worktrees, copies two deterministic tracked regular
-files per language into private temporary workspaces, and exercises only the
-fixed read-only command corpus declared below.
+The harness itself has no clone, download, or network-client code path and
+never executes source-repository code. It reads explicit local Git worktrees,
+copies two deterministic tracked regular files per language into private
+temporary workspaces, and exercises only the fixed read-only command corpus
+declared below through a private pinned copy of the supplied Again binary.
+
+This is not a network or hostile-process sandbox. Inherited descriptors are
+closed except for one harness-owned descendant sentinel, and surviving
+sentinel holders fail the run, but a hostile executable can deliberately close
+that sentinel or create a separately contained process. The evidence therefore
+depends on the closed trusted argv corpus and the exact pinned Again bytes.
 """
 
 from __future__ import annotations
@@ -19,6 +26,7 @@ import pathlib
 import platform
 import re
 import resource
+import select
 import signal
 import stat
 import statistics
@@ -31,7 +39,7 @@ from typing import Any
 
 
 SCHEMA = "again.real-repository-corpus.v1"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 COMMAND_CORPUS_VERSION = "strict-read-real-repositories.v1"
 LANGUAGE_SUFFIXES: dict[str, tuple[str, ...]] = {
     "rust": (".rs",),
@@ -47,6 +55,7 @@ LANGUAGE_ARGUMENTS: tuple[tuple[str, str], ...] = (
 )
 HEX_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+PROCESS_SESSION_DRAIN_TIMEOUT_SECONDS = 0.25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,6 +65,7 @@ class Limits:
     max_status_bytes: int = 4 * 1024 * 1024
     max_repository_logical_bytes: int = 8 * 1024 * 1024 * 1024
     max_selected_file_bytes: int = 8 * 1024 * 1024
+    max_binary_bytes: int = 256 * 1024 * 1024
     selected_files: int = 2
     stream_bytes: int = 16 * 1024 * 1024
     timeout_seconds: float = 60.0
@@ -113,6 +123,15 @@ class RepositorySnapshot:
 
 
 @dataclasses.dataclass(frozen=True)
+class PinnedBinary:
+    source: pathlib.Path
+    executable: pathlib.Path
+    sha256: str
+    size: int
+    source_fingerprint: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class CommandSpec:
     command_id: str
     argv: tuple[str, ...]
@@ -154,11 +173,12 @@ def _process_group_exists(process_group: int) -> bool:
     return True
 
 
-def _cleanup_process_group(process: subprocess.Popen[bytes]) -> None:
-    """Kill and boundedly verify every process left in the owned session."""
+def _cleanup_process_group(process: subprocess.Popen[bytes]) -> bool:
+    """Kill the owned process group and report whether a survivor was present."""
 
     process_group = process.pid
-    if _process_group_exists(process_group):
+    survivor_present = _process_group_exists(process_group)
+    if survivor_present:
         try:
             os.killpg(process_group, signal.SIGKILL)
         except ProcessLookupError:
@@ -179,6 +199,14 @@ def _cleanup_process_group(process: subprocess.Popen[bytes]) -> None:
                 f"owned process group {process_group} survived SIGKILL",
             )
         time.sleep(0.01)
+    return survivor_present
+
+
+def _sentinel_reached_eof(descriptor: int) -> bool:
+    readable, _writable, _exceptional = select.select(
+        [descriptor], [], [], PROCESS_SESSION_DRAIN_TIMEOUT_SECONDS
+    )
+    return bool(readable) and os.read(descriptor, 1) == b""
 
 
 def run_bounded(
@@ -195,29 +223,57 @@ def run_bounded(
         raise ValueError("process bounds must be nonnegative and timeout must be positive")
 
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        sentinel_read, sentinel_write = os.pipe()
         started = time.perf_counter_ns()
-        process = subprocess.Popen(
-            list(argv),
-            cwd=cwd,
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout_file,
-            stderr=stderr_file,
-            close_fds=True,
-            start_new_session=True,
-            preexec_fn=_file_limit_setter(stream_limit_bytes + 1),
-        )
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                cwd=cwd,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                close_fds=True,
+                pass_fds=(sentinel_write,),
+                start_new_session=True,
+                preexec_fn=_file_limit_setter(stream_limit_bytes + 1),
+            )
+        except BaseException:
+            os.close(sentinel_read)
+            os.close(sentinel_write)
+            raise
+        os.close(sentinel_write)
+        timeout_error: subprocess.TimeoutExpired | None = None
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as error:
-            _cleanup_process_group(process)
+            timeout_error = error
+            returncode = -signal.SIGKILL
+        except BaseException:
+            try:
+                _cleanup_process_group(process)
+            finally:
+                os.close(sentinel_read)
+            raise
+        try:
+            survivor_present = _cleanup_process_group(process)
+            sentinel_closed = _sentinel_reached_eof(sentinel_read)
+        finally:
+            os.close(sentinel_read)
+        if not sentinel_closed:
+            raise HarnessRefusal(
+                "process_session_escape_detected",
+                f"a descendant retained the harness sentinel after command exit: {argv!r}",
+            )
+        if timeout_error is not None:
             raise HarnessRefusal(
                 "command_timeout", f"command exceeded {timeout_seconds:g}s: {argv!r}"
-            ) from error
-        except BaseException:
-            _cleanup_process_group(process)
-            raise
-        _cleanup_process_group(process)
+            ) from timeout_error
+        if survivor_present:
+            raise HarnessRefusal(
+                "unexpected_descendant",
+                f"a descendant outlived the command leader: {argv!r}",
+            )
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         stdout_bytes = os.fstat(stdout_file.fileno()).st_size
         stderr_bytes = os.fstat(stderr_file.fileno()).st_size
@@ -487,6 +543,146 @@ def _sha256_descriptor(descriptor: int, limit_bytes: int) -> tuple[str, int]:
             raise HarnessRefusal("selected_input_oversized", "selected input grew while reading")
         digest.update(block)
     return digest.hexdigest(), total
+
+
+def _open_absolute_regular_no_follow(path: pathlib.Path, label: str) -> int:
+    try:
+        relative = path.relative_to("/").as_posix()
+    except ValueError as error:
+        raise HarnessRefusal("path_not_absolute", f"{label} must be an absolute path") from error
+    try:
+        return _open_tracked_regular(pathlib.Path("/"), relative)
+    except HarnessRefusal as error:
+        raise HarnessRefusal(
+            "binary_path_unsafe",
+            f"{label} must have a no-follow regular-file path: {path}",
+        ) from error
+
+
+def _validate_binary_metadata(metadata: os.stat_result, limits: Limits) -> None:
+    if not stat.S_ISREG(metadata.st_mode):
+        raise HarnessRefusal("binary_not_regular", "Again binary is not a regular file")
+    if metadata.st_nlink != 1:
+        raise HarnessRefusal("binary_hardlinked", "Again binary must have one link")
+    if metadata.st_mode & 0o111 == 0:
+        raise HarnessRefusal("binary_not_executable", "Again binary is not executable")
+    if metadata.st_size == 0 or metadata.st_size > limits.max_binary_bytes:
+        raise HarnessRefusal("binary_oversized", "Again binary has an unsupported byte size")
+    if is_sparse(metadata):
+        raise HarnessRefusal("binary_sparse", "Again binary must not be sparse")
+
+
+def _write_all(descriptor: int, value: bytes) -> None:
+    offset = 0
+    while offset < len(value):
+        written = os.write(descriptor, value[offset:])
+        if written <= 0:
+            raise HarnessRefusal("binary_copy_failed", "short write while pinning Again binary")
+        offset += written
+
+
+def pin_again_binary(
+    source: pathlib.Path,
+    private_directory: pathlib.Path,
+    limits: Limits = DEFAULT_LIMITS,
+    *,
+    after_copy: Callable[[], None] | None = None,
+) -> PinnedBinary:
+    """Copy one stable no-follow executable into private harness ownership."""
+
+    private_directory.mkdir(mode=0o700)
+    destination = private_directory / "again"
+    source_descriptor = _open_absolute_regular_no_follow(source, "--binary")
+    destination_descriptor: int | None = None
+    try:
+        before = os.fstat(source_descriptor)
+        _validate_binary_metadata(before, limits)
+        try:
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o700,
+            )
+        except OSError as error:
+            raise HarnessRefusal("binary_copy_failed", "cannot create pinned Again binary") from error
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            block = os.read(
+                source_descriptor,
+                min(1024 * 1024, limits.max_binary_bytes + 1 - total),
+            )
+            if not block:
+                break
+            total += len(block)
+            if total > limits.max_binary_bytes:
+                raise HarnessRefusal("binary_oversized", "Again binary grew while pinning")
+            _write_all(destination_descriptor, block)
+            digest.update(block)
+        os.fchmod(destination_descriptor, 0o500)
+        os.fsync(destination_descriptor)
+        after = os.fstat(source_descriptor)
+    finally:
+        os.close(source_descriptor)
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+
+    if _stat_fingerprint(before) != _stat_fingerprint(after) or total != before.st_size:
+        raise HarnessRefusal("binary_changed", "Again binary changed while being pinned")
+    if after_copy is not None:
+        after_copy()
+
+    observed_descriptor = _open_absolute_regular_no_follow(source, "--binary")
+    try:
+        observed = os.fstat(observed_descriptor)
+        _validate_binary_metadata(observed, limits)
+        observed_digest, observed_size = _sha256_descriptor(
+            observed_descriptor, limits.max_binary_bytes
+        )
+    finally:
+        os.close(observed_descriptor)
+    pinned_digest = sha256_file(destination)
+    pinned = destination.stat()
+    if (
+        _stat_fingerprint(observed) != _stat_fingerprint(before)
+        or observed_size != total
+        or observed_digest != digest.hexdigest()
+        or pinned_digest != digest.hexdigest()
+        or pinned.st_size != total
+        or pinned.st_nlink != 1
+        or not stat.S_ISREG(pinned.st_mode)
+        or pinned.st_mode & 0o111 == 0
+    ):
+        raise HarnessRefusal("binary_changed", "Again binary changed during stable pinning")
+    return PinnedBinary(
+        source=source,
+        executable=destination,
+        sha256=digest.hexdigest(),
+        size=total,
+        source_fingerprint=_stat_fingerprint(before),
+    )
+
+
+def verify_binary_source_unchanged(
+    binary: PinnedBinary, limits: Limits = DEFAULT_LIMITS
+) -> None:
+    descriptor = _open_absolute_regular_no_follow(binary.source, "--binary")
+    try:
+        metadata = os.fstat(descriptor)
+        _validate_binary_metadata(metadata, limits)
+        digest, size = _sha256_descriptor(descriptor, limits.max_binary_bytes)
+    finally:
+        os.close(descriptor)
+    if (
+        _stat_fingerprint(metadata) != binary.source_fingerprint
+        or digest != binary.sha256
+        or size != binary.size
+    ):
+        raise HarnessRefusal("binary_changed", "Again binary changed during the corpus")
 
 
 def _tracked_worktree_digest(
@@ -1071,6 +1267,16 @@ def host_record() -> dict[str, str]:
     }
 
 
+def subprocess_boundary_record() -> dict[str, Any]:
+    return {
+        "network_sandbox": False,
+        "fresh_socket_creation_blocked": False,
+        "ambient_inherited_descriptors_closed": True,
+        "descendant_sentinel": "bounded_best_effort",
+        "trusted_argv_only": True,
+    }
+
+
 def canonical_json_bytes(report: dict[str, Any]) -> bytes:
     return (
         json.dumps(report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True)
@@ -1099,7 +1305,7 @@ def build_non_pass_report(
     *,
     code: str,
     detail: str,
-    binary: pathlib.Path,
+    binary: PinnedBinary,
     snapshots: Sequence[RepositorySnapshot],
     removed_inputs: Sequence[str],
 ) -> dict[str, Any]:
@@ -1113,8 +1319,10 @@ def build_non_pass_report(
             "detail_sha256": sha256_bytes(detail.encode("utf-8", errors="replace")),
         },
         "provenance": {
-            "binary": str(binary),
-            "binary_sha256": sha256_file(binary),
+            "binary": str(binary.source),
+            "binary_execution": "private_no_follow_copy",
+            "binary_sha256": binary.sha256,
+            "binary_bytes": binary.size,
             "harness_sha256": sha256_file(pathlib.Path(__file__).resolve()),
             "platform": host_record(),
             "unmodeled_inputs_removed": list(removed_inputs),
@@ -1195,7 +1403,7 @@ def _require_absolute_file(path: pathlib.Path, label: str, *, executable: bool) 
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
-    binary = _require_absolute_file(arguments.binary, "--binary", executable=True)
+    binary_source = _require_absolute_file(arguments.binary, "--binary", executable=True)
     output = arguments.json_out
 
     snapshots: list[RepositorySnapshot] = []
@@ -1209,12 +1417,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = require_new_output_path(output, source_roots)
 
     harness = pathlib.Path(__file__).resolve()
-    binary_before = (sha256_file(binary), _stat_fingerprint(binary.stat()))
     harness_before = (sha256_file(harness), _stat_fingerprint(harness.stat()))
     all_removed: set[str] = set()
     reports: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="again-real-repository-corpus-") as temporary:
         temporary_root = pathlib.Path(temporary)
+        binary = pin_again_binary(binary_source, temporary_root / "pinned-binary")
         home = temporary_root / "home"
         home.mkdir(mode=0o700)
         control_workspace = temporary_root / "control-workspace"
@@ -1224,12 +1432,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         control_environment, removed = sanitized_environment(control_state, home)
         all_removed.update(removed)
         doctor_completed = run_bounded(
-            (str(binary), "doctor", "--json"),
+            (str(binary.executable), "doctor", "--json"),
             cwd=control_workspace,
             environment=control_environment,
             timeout_seconds=DEFAULT_LIMITS.timeout_seconds,
             stream_limit_bytes=DEFAULT_LIMITS.stream_bytes,
         )
+        verify_binary_source_unchanged(binary)
         if doctor_completed.returncode != 0:
             report = build_non_pass_report(
                 code="again_doctor_failed",
@@ -1271,12 +1480,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             environment, removed = sanitized_environment(state, home)
             all_removed.update(removed)
             reports.append(
-                run_repository_corpus(binary, snapshot, workspace, environment)
+                run_repository_corpus(binary.executable, snapshot, workspace, environment)
             )
 
-    binary_after = (sha256_file(binary), _stat_fingerprint(binary.stat()))
-    if binary_after != binary_before:
-        raise HarnessRefusal("binary_changed", "Again binary changed during the corpus")
+    verify_binary_source_unchanged(binary)
     harness_after = (sha256_file(harness), _stat_fingerprint(harness.stat()))
     if harness_after != harness_before:
         raise HarnessRefusal("harness_changed", "harness changed during the corpus")
@@ -1295,6 +1502,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "again_total_process_invocations": 173,
             "mutation_invalidations": 4,
             "claim": "explicit narrow read-only product path over copied tracked real-repository inputs",
+            "subprocess_boundary": subprocess_boundary_record(),
         },
         "limits": dataclasses.asdict(DEFAULT_LIMITS),
         "correctness": {
@@ -1307,8 +1515,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         "repositories": reports,
         "provenance": {
-            "binary": str(binary),
-            "binary_sha256": binary_before[0],
+            "binary": str(binary.source),
+            "binary_execution": "private_no_follow_copy",
+            "binary_sha256": binary.sha256,
+            "binary_bytes": binary.size,
             "harness_sha256": harness_before[0],
             "platform": host_record(),
             "unmodeled_inputs_removed": sorted(all_removed),
