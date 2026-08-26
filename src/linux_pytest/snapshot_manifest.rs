@@ -1851,7 +1851,7 @@ mod tests {
             64 * 1024,
             64 * 1024,
             1024 * 1024,
-            NonZeroU64::new(1024 * 1024).unwrap(),
+            NonZeroU64::new(8 * 1024 * 1024).unwrap(),
             persistent_manifest_heap_bytes,
             1024 * 1024,
             NonZeroU64::new(1_000_000).unwrap(),
@@ -3377,7 +3377,7 @@ mod tests {
         assert!(resources.persistent_manifest_heap_live_for_test() > 0);
         assert_eq!(
             resources.retained_view_heap_live_for_test(),
-            2 * 1024 * 1024
+            2 * resources.policy().max_retained_view_bytes().get()
         );
         drop(charged);
         assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
