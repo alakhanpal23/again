@@ -77,11 +77,20 @@ impl IsolationChildContinuationFailureV1 {
 ///
 /// # Safety
 ///
-/// Implementations run after `clone3` in namespace PID 1. They must use only
-/// async-signal-safe/raw-syscall operations, must not unwind or allocate, and
-/// may report `PlacedAndAuthenticated` only after atomically placing and
-/// authenticating descriptors 0, 1, and 2. The brand cannot be constructed by
-/// the parent, so this trait grants no parent-side descriptor authority.
+/// `clone3` creates one fork-local copy of the value in each process. Dropping
+/// the parent's copy immediately after clone, consuming the child's copy in
+/// namespace PID 1, and dropping any child remainder on every return path must
+/// all be async-signal/fork-safe: no allocation, unwinding, locks, libc cleanup
+/// wrappers, or non-raw-syscall destruction is permitted.
+///
+/// The value may own only resources intended for the child half of the
+/// handoff. It must not own or close the parent's cleanup authority, pidfd,
+/// namespace/proc pins, control writer, report reader, or any endpoint shared
+/// with the parent guard. In particular, implementing this trait never grants
+/// parent-side child setup or cleanup authority. The child operation itself
+/// must use only async-signal-safe raw syscalls and may report
+/// `PlacedAndAuthenticated` only after atomically placing and authenticating
+/// descriptors 0, 1, and 2. The brand cannot be constructed by the parent.
 pub(super) unsafe trait IsolationChildContinuationV1: Sized {
     fn continue_in_child_v1(
         self,
@@ -91,8 +100,10 @@ pub(super) unsafe trait IsolationChildContinuationV1: Sized {
 
 struct CloseInheritedStdioV1;
 
-// SAFETY: this fixed continuation performs only raw close syscalls, does not
-// allocate or unwind, and authenticates closure with F_GETFD/EBADF.
+// SAFETY: this fixed zero-sized continuation owns no endpoint or cleanup
+// resource and has trivial fork-local destruction. Child consumption performs
+// only raw close/fcntl syscalls, does not allocate or unwind, and authenticates
+// closure with F_GETFD/EBADF.
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",

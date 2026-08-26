@@ -311,9 +311,10 @@ mod tests {
 
     struct SiblingOwnedStdioPlacementV1;
 
-    // SAFETY: this compile-only sibling shape performs no operation. A real
-    // stdio implementation must satisfy the stronger raw-syscall contract on
-    // `IsolationChildContinuationV1` before reporting placement.
+    // SAFETY: this compile-only sibling shape owns no resources, has trivial
+    // fork-local Drop, and performs no operation. A real stdio implementation
+    // must own only child-half endpoints and satisfy the stronger raw-syscall
+    // consumption/Drop contract before reporting placement.
     unsafe impl isolation_qualification::IsolationChildContinuationV1 for SiblingOwnedStdioPlacementV1 {
         fn continue_in_child_v1(
             self,
@@ -402,6 +403,7 @@ mod tests {
     )))]
     #[test]
     fn sibling_child_continuation_composes_without_parent_resource_access() {
+        assert!(!std::mem::needs_drop::<SiblingOwnedStdioPlacementV1>());
         let error =
             begin_blocked_execute_only_isolation_with_child_v1(SiblingOwnedStdioPlacementV1)
                 .unwrap_err();
