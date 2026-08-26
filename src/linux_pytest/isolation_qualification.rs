@@ -48,6 +48,97 @@ pub(super) struct CompletedRootlessNamespaceProbeV1 {
     _private: (),
 }
 
+/// Unforgeable evidence that a continuation is running in the authenticated
+/// namespace child after the release frame. The constructor remains private to
+/// this module; a sibling such as the stdio owner may only consume it when the
+/// isolation child invokes that sibling's implementation.
+pub(super) struct IsolationChildOnlyBrandV1 {
+    _private: (),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IsolationChildStdioStateV1 {
+    Closed,
+    PlacedAndAuthenticated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct IsolationChildContinuationFailureV1 {
+    errno: Option<i32>,
+}
+
+impl IsolationChildContinuationFailureV1 {
+    pub(super) const fn new(errno: Option<i32>) -> Self {
+        Self { errno }
+    }
+}
+
+/// Child-only, one-shot composition seam for the profile-owned stdio module.
+///
+/// # Safety
+///
+/// Implementations run after `clone3` in namespace PID 1. They must use only
+/// async-signal-safe/raw-syscall operations, must not unwind or allocate, and
+/// may report `PlacedAndAuthenticated` only after atomically placing and
+/// authenticating descriptors 0, 1, and 2. The brand cannot be constructed by
+/// the parent, so this trait grants no parent-side descriptor authority.
+pub(super) unsafe trait IsolationChildContinuationV1: Sized {
+    fn continue_in_child_v1(
+        self,
+        brand: IsolationChildOnlyBrandV1,
+    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1>;
+}
+
+struct CloseInheritedStdioV1;
+
+// SAFETY: this fixed continuation performs only raw close syscalls, does not
+// allocate or unwind, and authenticates closure with F_GETFD/EBADF.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
+    fn continue_in_child_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
+        for descriptor in [libc::STDIN_FILENO, libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+            let closed = unsafe { libc::syscall(libc::SYS_close, descriptor) };
+            if closed != 0 {
+                let errno = unsafe { *libc::__errno_location() };
+                if errno != libc::EBADF && errno != libc::EINTR {
+                    return Err(IsolationChildContinuationFailureV1::new(Some(errno)));
+                }
+            }
+            if unsafe { libc::syscall(libc::SYS_fcntl, descriptor, libc::F_GETFD, 0) } >= 0
+                || unsafe { *libc::__errno_location() } != libc::EBADF
+            {
+                return Err(IsolationChildContinuationFailureV1::new(Some(libc::EIO)));
+            }
+        }
+        Ok(IsolationChildStdioStateV1::Closed)
+    }
+}
+
+// SAFETY: unsupported platform leaves never invoke this continuation; their
+// bootstrap rejects before creating a child.
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+)))]
+unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
+    fn continue_in_child_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
+        Err(IsolationChildContinuationFailureV1::new(None))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IsolationQualificationStageV1 {
     #[cfg_attr(
@@ -92,7 +183,6 @@ enum IsolationQualificationStageV1 {
     ChildSeccomp,
     WaitForChild,
     ReapChild,
-    Cleanup,
 }
 
 impl IsolationQualificationStageV1 {
@@ -136,7 +226,6 @@ impl IsolationQualificationStageV1 {
             Self::ChildSeccomp => "child_seccomp",
             Self::WaitForChild => "wait_for_child",
             Self::ReapChild => "reap_child",
-            Self::Cleanup => "cleanup",
         }
     }
 }
@@ -182,7 +271,6 @@ enum IsolationQualificationReasonV1 {
     ChildSignaled,
     ChildExitMismatch,
     WaitFailed,
-    CleanupUncertain,
 }
 
 impl IsolationQualificationReasonV1 {
@@ -215,7 +303,6 @@ impl IsolationQualificationReasonV1 {
             Self::ChildSignaled => "child_signaled",
             Self::ChildExitMismatch => "child_exit_mismatch",
             Self::WaitFailed => "wait_failed",
-            Self::CleanupUncertain => "cleanup_uncertain",
         }
     }
 }
@@ -226,6 +313,7 @@ pub(super) struct IsolationQualificationFailureV1 {
     reason: IsolationQualificationReasonV1,
     errno: Option<i32>,
     cleanup_complete: bool,
+    cleanup_errno: Option<i32>,
 }
 
 impl IsolationQualificationFailureV1 {
@@ -241,17 +329,16 @@ impl IsolationQualificationFailureV1 {
             reason,
             errno,
             cleanup_complete: true,
+            cleanup_errno: None,
         }
     }
 
-    fn cleanup_uncertain(errno: Option<i32>) -> Self {
-        Self {
-            code: RefusalCode::IsolationPreflightFailed,
-            stage: IsolationQualificationStageV1::Cleanup,
-            reason: IsolationQualificationReasonV1::CleanupUncertain,
-            errno,
-            cleanup_complete: false,
+    fn with_cleanup_uncertain(mut self, errno: Option<i32>) -> Self {
+        self.cleanup_complete = false;
+        if self.cleanup_errno.is_none() {
+            self.cleanup_errno = errno.or(Some(libc::EIO));
         }
+        self
     }
 
     pub(super) const fn code(&self) -> RefusalCode {
@@ -272,6 +359,10 @@ impl IsolationQualificationFailureV1 {
 
     pub(super) const fn cleanup_complete(&self) -> bool {
         self.cleanup_complete
+    }
+
+    pub(super) const fn cleanup_errno(&self) -> Option<i32> {
+        self.cleanup_errno
     }
 
     pub(super) const fn is_expected_unavailable(&self) -> bool {
@@ -412,7 +503,15 @@ impl BlockedRootlessNamespaceBootstrapV1 {
 
 pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
 -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
-    platform::begin_blocked_rootless_namespace_bootstrap_v1()
+    begin_blocked_rootless_namespace_bootstrap_with_child_v1(CloseInheritedStdioV1)
+}
+
+pub(super) fn begin_blocked_rootless_namespace_bootstrap_with_child_v1<
+    C: IsolationChildContinuationV1,
+>(
+    continuation: C,
+) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    platform::begin_blocked_rootless_namespace_bootstrap_v1(continuation)
         .map(|inner| BlockedRootlessNamespaceBootstrapV1 { _inner: inner })
 }
 
@@ -523,8 +622,9 @@ mod platform {
         }
     }
 
-    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
-    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
+        _continuation: C,
+    ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
         Err(IsolationQualificationFailureV1::new(
             RefusalCode::UnsupportedOs,
             IsolationQualificationStageV1::Platform,
@@ -591,7 +691,7 @@ mod contract_tests {
     }
 
     #[test]
-    fn cleanup_uncertainty_overrides_public_classification() {
+    fn cleanup_uncertainty_preserves_primary_failure_and_changes_classification() {
         let prior = IsolationQualificationFailureV1::new(
             RefusalCode::UserNamespaceUnavailable,
             IsolationQualificationStageV1::CloneNamespaces,
@@ -601,10 +701,12 @@ mod contract_tests {
         assert!(prior.is_expected_unavailable());
         assert!(prior.cleanup_complete());
 
-        let cleanup = IsolationQualificationFailureV1::cleanup_uncertain(Some(110));
-        assert_eq!(cleanup.code(), RefusalCode::IsolationPreflightFailed);
-        assert_eq!(cleanup.stage(), "cleanup");
-        assert_eq!(cleanup.reason(), "cleanup_uncertain");
+        let cleanup = prior.with_cleanup_uncertain(Some(110));
+        assert_eq!(cleanup.code(), RefusalCode::UserNamespaceUnavailable);
+        assert_eq!(cleanup.stage(), "clone_namespaces");
+        assert_eq!(cleanup.reason(), "administrative_policy");
+        assert_eq!(cleanup.errno(), Some(1));
+        assert_eq!(cleanup.cleanup_errno(), Some(110));
         assert!(!cleanup.cleanup_complete());
         assert!(!cleanup.is_expected_unavailable());
     }
@@ -742,9 +844,11 @@ mod platform {
     const REPORT_DESCRIPTOR_V1: RawFd = 0;
     const FD_AUDIT_DESCRIPTOR_V1: RawFd = 1;
     const CLOSE_RANGE_FIRST_V1: u32 = 1;
-    const ISOLATION_CONTROL_DESCRIPTOR_V1: RawFd = 1;
-    const ISOLATION_FD_AUDIT_DESCRIPTOR_V1: RawFd = 2;
-    const ISOLATION_CLOSE_RANGE_FIRST_V1: u32 = 2;
+    const ISOLATION_REPORT_DESCRIPTOR_V1: RawFd = 3;
+    const ISOLATION_CONTROL_DESCRIPTOR_V1: RawFd = 4;
+    const ISOLATION_PLACED_FD_AUDIT_DESCRIPTOR_V1: RawFd = 5;
+    const ISOLATION_CLOSED_FD_AUDIT_DESCRIPTOR_V1: RawFd = 0;
+    const ISOLATION_CLOSE_RANGE_FIRST_V1: u32 = 5;
     const CLOSE_RANGE_LAST_V1: u32 = u32::MAX;
     const FD_AUDIT_BUFFER_BYTES_V1: usize = 256;
     const FD_AUDIT_MAX_GETDENTS_CALLS_V1: usize = 8;
@@ -756,12 +860,88 @@ mod platform {
     const FD_AUDIT_ZERO_BIT_V1: u8 = 1 << 2;
     const FD_AUDIT_ONE_BIT_V1: u8 = 1 << 3;
     const FD_AUDIT_TWO_BIT_V1: u8 = 1 << 4;
+    const FD_AUDIT_THREE_BIT_V1: u8 = 1 << 5;
+    const FD_AUDIT_FOUR_BIT_V1: u8 = 1 << 6;
+    const FD_AUDIT_FIVE_BIT_V1: u8 = 1 << 7;
     const FD_AUDIT_COMPLETE_MASK_V1: u8 =
         FD_AUDIT_DOT_BIT_V1 | FD_AUDIT_DOT_DOT_BIT_V1 | FD_AUDIT_ZERO_BIT_V1 | FD_AUDIT_ONE_BIT_V1;
-    const ISOLATION_FD_AUDIT_COMPLETE_MASK_V1: u8 = FD_AUDIT_COMPLETE_MASK_V1 | FD_AUDIT_TWO_BIT_V1;
+    const ISOLATION_CLOSED_FD_AUDIT_COMPLETE_MASK_V1: u8 = FD_AUDIT_DOT_BIT_V1
+        | FD_AUDIT_DOT_DOT_BIT_V1
+        | FD_AUDIT_ZERO_BIT_V1
+        | FD_AUDIT_THREE_BIT_V1
+        | FD_AUDIT_FOUR_BIT_V1;
+    const ISOLATION_PLACED_FD_AUDIT_COMPLETE_MASK_V1: u8 = FD_AUDIT_COMPLETE_MASK_V1
+        | FD_AUDIT_TWO_BIT_V1
+        | FD_AUDIT_THREE_BIT_V1
+        | FD_AUDIT_FOUR_BIT_V1
+        | FD_AUDIT_FIVE_BIT_V1;
     const LINUX_CAPABILITY_VERSION_3_V1: u32 = 0x2008_0522;
     const CAPABILITY_SCAN_MAX_V1: u32 = 64;
     const CAPABILITY_SCAN_LENGTH_V1: usize = CAPABILITY_SCAN_MAX_V1 as usize + 1;
+
+    /// Operation identifiers for the production syscall seams. A plan with no
+    /// selected operation is the production path; tests may select exactly one
+    /// boundary and force its wrapper to fail before issuing that syscall.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum IsolationOperationV1 {
+        AuthenticatedRelease,
+        ClearSupplementaryGroups,
+        AuthenticateSupplementaryGroups,
+        UtsHostname,
+        PrivateMountPropagation,
+        RootTmpfsMount,
+        PivotRoot,
+        DetachOldRoot,
+        MountDescriptorClose,
+        UmaskRestore,
+        ScratchTmpMount,
+        ScratchRunMount,
+        ScratchHomeMount,
+        ProcMount,
+        ReportDup3,
+        ControlDup3,
+        CloseRange,
+        FdAudit,
+        SetResGid,
+        SetResUid,
+        CredentialReadback,
+        Securebits,
+        BoundingCapabilities,
+        AmbientCapabilities,
+        CapabilitySets,
+        NoNewPrivileges,
+        ChildContinuation,
+        ReadyWrite,
+        WaitPidfd,
+        PidfdKill,
+        PidKill,
+        ReapPidfd,
+        ReapPid,
+        FinalEchildAudit,
+        CloseControl,
+        CloseReport,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct IsolationOperationPlanV1 {
+        fail: Option<IsolationOperationV1>,
+    }
+
+    impl IsolationOperationPlanV1 {
+        const fn fail(operation: IsolationOperationV1) -> Self {
+            Self {
+                fail: Some(operation),
+            }
+        }
+
+        fn check(self, operation: IsolationOperationV1) -> Result<(), i32> {
+            if self.fail == Some(operation) {
+                Err(libc::EIO)
+            } else {
+                Ok(())
+            }
+        }
+    }
     const CAPABILITY_MINIMUM_LAST_V1: u32 = 40;
     const CAP_SETPCAP_V1: u32 = 8;
     const CAPABILITY_SCAN_UNOBSERVED_V1: i8 = -2;
@@ -895,6 +1075,16 @@ mod platform {
         tmp: ChildPathIdentityV1,
         run: ChildPathIdentityV1,
         proc: ChildPathIdentityV1,
+    }
+
+    struct ChildScratchMountSpecV1<'a> {
+        parent: RawFd,
+        pre_target: RawFd,
+        name: &'a CStr,
+        absolute_path: &'a CStr,
+        mode: libc::mode_t,
+        options: &'a CStr,
+        operation: IsolationOperationV1,
     }
 
     enum ChildMountRootFailureV1 {
@@ -1266,6 +1456,15 @@ mod platform {
         report_write: OwnedFd,
     }
 
+    #[derive(Clone, Copy)]
+    struct ChildEntryDescriptorsV1 {
+        control_read: RawFd,
+        control_write: RawFd,
+        report_read: RawFd,
+        report_write: RawFd,
+        inherited_parent_fds: [RawFd; 8],
+    }
+
     struct ProbeChildGuardV1 {
         pid: Option<libc::pid_t>,
         pidfd: Option<OwnedFd>,
@@ -1276,6 +1475,7 @@ mod platform {
         deadline: MonotonicDeadlineV1,
         refresh_deadline_on_cleanup: bool,
         reaped: bool,
+        operations: IsolationOperationPlanV1,
     }
 
     impl ProbeChildGuardV1 {
@@ -1285,12 +1485,28 @@ mod platform {
         ) -> IsolationQualificationFailureV1 {
             match self.kill_and_reap() {
                 Ok(()) => failure,
-                Err(errno) => IsolationQualificationFailureV1::cleanup_uncertain(errno),
+                Err(errno) => failure.with_cleanup_uncertain(errno),
             }
         }
 
         fn kill_and_reap(&mut self) -> Result<(), Option<i32>> {
+            let mut close_errno = None;
+            if self
+                .operations
+                .check(IsolationOperationV1::CloseControl)
+                .is_err()
+            {
+                close_errno = Some(libc::EIO);
+            }
             self.control_write.take();
+            if self
+                .operations
+                .check(IsolationOperationV1::CloseReport)
+                .is_err()
+                && close_errno.is_none()
+            {
+                close_errno = Some(libc::EIO);
+            }
             self.report_read.take();
             if self.reaped {
                 return Ok(());
@@ -1304,17 +1520,30 @@ mod platform {
             let mut signal_errno = None;
             let mut needs_pid_fallback = pid_signal_fallback_required(self.pidfd.is_some(), None);
             if let Some(pidfd) = self.pidfd.as_ref() {
-                let signal_result = unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        pidfd.as_raw_fd(),
-                        libc::SIGKILL,
-                        std::ptr::null::<libc::siginfo_t>(),
-                        0_u32,
-                    )
+                let signal_result = if self
+                    .operations
+                    .check(IsolationOperationV1::PidfdKill)
+                    .is_err()
+                {
+                    -1
+                } else {
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_pidfd_send_signal,
+                            pidfd.as_raw_fd(),
+                            libc::SIGKILL,
+                            std::ptr::null::<libc::siginfo_t>(),
+                            0_u32,
+                        )
+                    }
                 };
                 if signal_result != 0 {
-                    signal_errno = last_errno();
+                    signal_errno = if self.operations.fail == Some(IsolationOperationV1::PidfdKill)
+                    {
+                        Some(libc::EIO)
+                    } else {
+                        last_errno()
+                    };
                     needs_pid_fallback = pid_signal_fallback_required(true, signal_errno);
                 }
             }
@@ -1325,15 +1554,23 @@ mod platform {
                 let Some(pid) = positive_direct_pid(self.pid) else {
                     return Err(signal_errno.or(Some(libc::EINVAL)));
                 };
-                if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 {
+                let injected = self
+                    .operations
+                    .check(IsolationOperationV1::PidKill)
+                    .is_err();
+                // Even when the seam reports failure, issue the fallback kill:
+                // a test fault must not manufacture a leaked namespace tree.
+                if unsafe { libc::kill(pid, libc::SIGKILL) } != 0 || injected {
                     let errno = last_errno();
-                    if errno != Some(libc::ESRCH) {
+                    if injected {
+                        signal_errno = Some(libc::EIO);
+                    } else if errno != Some(libc::ESRCH) {
                         signal_errno = errno.or(signal_errno);
                     }
                 }
             }
             let reap_result = self.reap_bounded();
-            merge_cleanup_results(signal_errno, reap_result)
+            merge_cleanup_results(signal_errno.or(close_errno), reap_result)
         }
 
         fn reap_bounded(&mut self) -> Result<(), Option<i32>> {
@@ -1341,7 +1578,19 @@ mod platform {
                 return Ok(());
             }
             if let Some(pidfd) = self.pidfd.as_ref().map(|fd| fd.as_raw_fd()) {
-                let wait_error = wait_pidfd_terminal(pidfd, self.deadline).err();
+                let wait_error = if self
+                    .operations
+                    .check(IsolationOperationV1::WaitPidfd)
+                    .is_err()
+                {
+                    Some(protocol_failure(
+                        IsolationQualificationStageV1::WaitForChild,
+                        IsolationQualificationReasonV1::WaitFailed,
+                        Some(libc::EIO),
+                    ))
+                } else {
+                    wait_pidfd_terminal(pidfd, self.deadline).err()
+                };
                 match self.reap_pidfd(pidfd) {
                     Ok(_) => return Ok(()),
                     Err(pidfd_reap_error) => {
@@ -1361,6 +1610,10 @@ mod platform {
             let Some(pid) = positive_direct_pid(self.pid) else {
                 return Err(Some(libc::EINVAL));
             };
+            let injected_reap_failure = self
+                .operations
+                .check(IsolationOperationV1::ReapPid)
+                .is_err();
             loop {
                 let mut status = 0_i32;
                 let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -1369,6 +1622,21 @@ mod platform {
                         return Err(Some(libc::ECHILD));
                     }
                     self.reaped = true;
+                    if self
+                        .operations
+                        .check(IsolationOperationV1::FinalEchildAudit)
+                        .is_err()
+                    {
+                        let mut final_status = 0_i32;
+                        if unsafe { libc::waitpid(pid, &mut final_status, libc::WNOHANG) } != -1
+                            || last_errno() != Some(libc::ECHILD)
+                        {
+                            return Err(Some(libc::EIO));
+                        }
+                    }
+                    if injected_reap_failure {
+                        return Err(Some(libc::EIO));
+                    }
                     return Ok(());
                 }
                 if waited < 0 {
@@ -1435,6 +1703,13 @@ mod platform {
         }
 
         fn reap_pidfd(&mut self, pidfd: RawFd) -> Result<ChildTerminalV1, Option<i32>> {
+            if self
+                .operations
+                .check(IsolationOperationV1::ReapPidfd)
+                .is_err()
+            {
+                return Err(Some(libc::EIO));
+            }
             let mut information = MaybeUninit::<libc::siginfo_t>::zeroed();
             let result = unsafe {
                 libc::waitid(
@@ -1527,8 +1802,19 @@ mod platform {
         _nonce: [u8; NONCE_BYTES_V1],
     }
 
-    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
-    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
+        continuation: C,
+    ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+        begin_blocked_rootless_namespace_bootstrap_with_plan_v1(
+            continuation,
+            IsolationOperationPlanV1::default(),
+        )
+    }
+
+    fn begin_blocked_rootless_namespace_bootstrap_with_plan_v1<C: IsolationChildContinuationV1>(
+        continuation: C,
+        operations: IsolationOperationPlanV1,
+    ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
         let proc_root = pin_proc_root()?;
         let host_pid = unsafe { libc::getpid() };
         verify_proc_self_target(proc_root.as_raw_fd(), host_pid)?;
@@ -1542,7 +1828,10 @@ mod platform {
         verify_signal_dispositions()?;
         let (deadline, cleanup_deadline) = probe_deadlines()?;
         let credentials = host_credentials(self_proc.as_raw_fd())?;
-        let supplementary_groups = capture_supplementary_groups()?;
+        // Bound the inherited set before cloning. The child must clear and
+        // authenticate it before the parent irreversibly writes
+        // `setgroups=deny` and the gid map.
+        let _host_supplementary_groups = capture_supplementary_groups()?;
         let parent_namespaces = NamespaceFdSetV1::open_at(
             self_proc.as_raw_fd(),
             IsolationQualificationStageV1::ParentNamespaces,
@@ -1556,6 +1845,7 @@ mod platform {
         let channels = create_channels()?;
         deadline.ensure_open(IsolationQualificationStageV1::CloneNamespaces)?;
 
+        let mut continuation = Some(continuation);
         let mut pidfd_raw = -1_i32;
         let mut arguments = CloneArgsV1 {
             flags: (libc::CLONE_NEWUSER
@@ -1578,16 +1868,28 @@ mod platform {
             )
         };
         if clone_result == 0 {
+            let child_continuation = match continuation.take() {
+                Some(continuation) => continuation,
+                None => child_exit(CHILD_EXIT_PROOF_FAILED_V1),
+            };
             child_entry_v1(
-                channels.control_read.as_raw_fd(),
-                channels.control_write.as_raw_fd(),
-                channels.report_read.as_raw_fd(),
-                channels.report_write.as_raw_fd(),
-                inherited_parent_fds,
+                ChildEntryDescriptorsV1 {
+                    control_read: channels.control_read.as_raw_fd(),
+                    control_write: channels.control_write.as_raw_fd(),
+                    report_read: channels.report_read.as_raw_fd(),
+                    report_write: channels.report_write.as_raw_fd(),
+                    inherited_parent_fds,
+                },
                 nonce,
                 deadline,
+                child_continuation,
+                operations,
             );
         }
+        // The parent never receives the child-only brand and immediately
+        // destroys its fork-local copy of the continuation. Only the guard
+        // below retains process-tree cleanup ownership.
+        drop(continuation);
         if clone_result < 0 {
             return Err(clone_failure(last_errno()));
         }
@@ -1606,6 +1908,7 @@ mod platform {
             deadline: cleanup_deadline,
             refresh_deadline_on_cleanup: false,
             reaped: false,
+            operations,
         };
         drop(channels.control_read);
         drop(channels.report_write);
@@ -1662,7 +1965,7 @@ mod platform {
             false,
             IsolationQualificationStageV1::ReceiveChildReady,
         ));
-        guarded!(verify_ready_frame(&ready, &nonce));
+        guarded!(verify_ready_or_failure_frame(&ready, &nonce));
         guarded!(verify_no_pending_report_byte(
             report_fd,
             child_pidfd,
@@ -1683,6 +1986,12 @@ mod platform {
             IsolationQualificationStageV1::OpenChildProc,
         ));
 
+        // The namespace child performs setgroups(0, NULL) while that syscall
+        // is still permitted. Authenticate the empty result from the pinned
+        // proc view before denying all later setgroups calls and installing
+        // the gid map.
+        guarded!(verify_child_groups(proc_fd, &[], deadline));
+
         guarded!(write_and_verify_id_map(
             proc_fd,
             c"uid_map",
@@ -1700,11 +2009,7 @@ mod platform {
             IsolationQualificationStageV1::VerifyGidMap,
             deadline,
         ));
-        guarded!(verify_child_groups_and_capabilities(
-            proc_fd,
-            &supplementary_groups,
-            deadline,
-        ));
+        guarded!(verify_child_groups_and_capabilities(proc_fd, &[], deadline,));
 
         let child_namespaces = guarded!(NamespaceFdSetV1::open_at(
             proc_fd,
@@ -1726,7 +2031,7 @@ mod platform {
 
     pub(super) fn qualify_rootless_namespace_tuple_v1()
     -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
-        begin_blocked_rootless_namespace_bootstrap_v1()?.complete_diagnostic()
+        begin_blocked_rootless_namespace_bootstrap_v1(CloseInheritedStdioV1)?.complete_diagnostic()
     }
 
     impl BlockedRootlessNamespaceBootstrapV1 {
@@ -1768,6 +2073,19 @@ mod platform {
                 PHASE_ISOLATION_RELEASE_V1,
                 &nonce,
             );
+            if self
+                .guard
+                .operations
+                .check(IsolationOperationV1::AuthenticatedRelease)
+                .is_err()
+            {
+                let error = protocol_failure(
+                    IsolationQualificationStageV1::SendControl,
+                    IsolationQualificationReasonV1::Io,
+                    Some(libc::EIO),
+                );
+                return Err(self.guard.refuse(error));
+            }
             guarded!(write_parent_frame(
                 control_fd,
                 child_pidfd,
@@ -3088,6 +3406,25 @@ mod platform {
         expected_groups: &[u32],
         deadline: MonotonicDeadlineV1,
     ) -> Result<(), IsolationQualificationFailureV1> {
+        verify_child_groups(proc_directory, expected_groups, deadline)?;
+        deadline.ensure_open(IsolationQualificationStageV1::VerifyChildCapabilities)?;
+        let status = read_bounded_file_at(proc_directory, c"status", MAX_PROC_STATUS_BYTES_V1)
+            .map_err(|error| {
+                failure(
+                    RefusalCode::IsolationPreflightFailed,
+                    IsolationQualificationStageV1::VerifyChildCapabilities,
+                    IsolationQualificationReasonV1::Io,
+                    error.raw_os_error(),
+                )
+            })?;
+        verify_child_sys_admin_capability(&status)
+    }
+
+    fn verify_child_groups(
+        proc_directory: RawFd,
+        expected_groups: &[u32],
+        deadline: MonotonicDeadlineV1,
+    ) -> Result<(), IsolationQualificationFailureV1> {
         deadline.ensure_open(IsolationQualificationStageV1::VerifyChildGroups)?;
         let status = read_bounded_file_at(proc_directory, c"status", MAX_PROC_STATUS_BYTES_V1)
             .map_err(|error| {
@@ -3107,8 +3444,6 @@ mod platform {
                 None,
             ));
         }
-        deadline.ensure_open(IsolationQualificationStageV1::VerifyChildCapabilities)?;
-        verify_child_sys_admin_capability(&status)?;
         Ok(())
     }
 
@@ -3287,6 +3622,16 @@ mod platform {
         Ok(())
     }
 
+    fn verify_ready_or_failure_frame(
+        frame: &[u8; FRAME_BYTES_V1],
+        nonce: &[u8; NONCE_BYTES_V1],
+    ) -> Result<(), IsolationQualificationFailureV1> {
+        if &frame[FRAME_MAGIC_OFFSET_V1..FRAME_VERSION_OFFSET_V1] == PROOF_MAGIC_V1 {
+            return verify_proof_frame(frame, nonce);
+        }
+        verify_ready_frame(frame, nonce)
+    }
+
     fn verify_proof_frame(
         frame: &[u8; FRAME_BYTES_V1],
         nonce: &[u8; NONCE_BYTES_V1],
@@ -3315,7 +3660,7 @@ mod platform {
             && decode_u32(frame, FRAME_GID_OFFSET_V1) == 0
             && decode_u32(frame, FRAME_EGID_OFFSET_V1) == 0;
         if status == PROOF_STATUS_UTS_CONFIGURATION_V1 {
-            if flags != 0 || errno != libc::EPERM || !identity_is_exact {
+            if flags != 0 || !(1..=MAX_LINUX_ERRNO_V1).contains(&errno) || !identity_is_exact {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -3325,7 +3670,11 @@ mod platform {
             return Err(failure(
                 RefusalCode::RequiredNamespaceFailed,
                 IsolationQualificationStageV1::ChildUtsConfiguration,
-                IsolationQualificationReasonV1::AdministrativePolicy,
+                if errno == libc::EPERM {
+                    IsolationQualificationReasonV1::AdministrativePolicy
+                } else {
+                    IsolationQualificationReasonV1::Io
+                },
                 Some(errno),
             ));
         }
@@ -3901,15 +4250,20 @@ mod platform {
         io::Error::last_os_error().raw_os_error()
     }
 
-    fn child_entry_v1(
-        control_read: RawFd,
-        control_write: RawFd,
-        report_read: RawFd,
-        report_write: RawFd,
-        inherited_parent_fds: [RawFd; 8],
+    fn child_entry_v1<C: IsolationChildContinuationV1>(
+        descriptors: ChildEntryDescriptorsV1,
         nonce: [u8; NONCE_BYTES_V1],
         deadline: MonotonicDeadlineV1,
+        continuation: C,
+        operations: IsolationOperationPlanV1,
     ) -> ! {
+        let ChildEntryDescriptorsV1 {
+            control_read,
+            control_write,
+            report_read,
+            report_write,
+            inherited_parent_fds,
+        } = descriptors;
         // This branch must never unwind or run Rust destructors. Every exit
         // below reaches the raw `_exit` syscall.
         let control_write_closed = child_close(control_write);
@@ -3951,6 +4305,13 @@ mod platform {
                 child_errno(),
                 deadline,
             );
+        }
+
+        // This must happen before the parent writes `setgroups=deny`. GID
+        // normalization does not clear supplementary groups, and after the
+        // deny handshake the child can no longer repair an inherited set.
+        if let Err(error) = child_clear_and_verify_supplementary_groups_v1(operations) {
+            child_credential_fail_v1(report_write, &nonce, error, deadline);
         }
 
         let ready = child_encode_common_frame(READY_MAGIC_V1, PHASE_READY_V1, &nonce);
@@ -4030,6 +4391,15 @@ mod platform {
             child_fail(report_write, &nonce, PROOF_STATUS_INVARIANT_V1, 0, deadline);
         }
 
+        if operations.check(IsolationOperationV1::UtsHostname).is_err() {
+            child_fail(
+                report_write,
+                &nonce,
+                PROOF_STATUS_UTS_CONFIGURATION_V1,
+                libc::EIO,
+                deadline,
+            );
+        }
         if unsafe {
             libc::syscall(
                 libc::SYS_sethostname,
@@ -4095,7 +4465,7 @@ mod platform {
             child_fail(report_write, &nonce, PROOF_STATUS_INVARIANT_V1, 0, deadline);
         }
 
-        let private_root = match child_enter_private_tmpfs_root_v1() {
+        let private_root = match child_enter_private_tmpfs_root_v1(operations) {
             Ok(evidence) => evidence,
             Err(error) => match error {
                 ChildMountRootFailureV1::Os(errno) => child_fail(
@@ -4116,7 +4486,14 @@ mod platform {
         };
 
         if isolation_continuation {
-            child_enter_isolation_ready_hold_v1(control_read, report_write, &nonce, deadline);
+            child_enter_isolation_ready_hold_v1(
+                control_read,
+                report_write,
+                &nonce,
+                deadline,
+                continuation,
+                operations,
+            );
         }
 
         if report_write <= libc::STDERR_FILENO {
@@ -4169,7 +4546,11 @@ mod platform {
         if let Err(error) = child_scrub_and_audit_descriptors_v1(&report_identity) {
             child_descriptor_fail_v1(report_write, &nonce, error, deadline);
         }
-        let capability = match child_eliminate_capabilities_v1(&report_identity) {
+        let capability = match child_eliminate_capabilities_v1(
+            report_write,
+            &report_identity,
+            IsolationOperationPlanV1::default(),
+        ) {
             Ok(evidence) => evidence,
             Err(error) => child_capability_fail_v1(report_write, &nonce, error, deadline),
         };
@@ -4190,14 +4571,16 @@ mod platform {
         child_exit(0)
     }
 
-    fn child_enter_isolation_ready_hold_v1(
+    fn child_enter_isolation_ready_hold_v1<C: IsolationChildContinuationV1>(
         control_read: RawFd,
         report_write: RawFd,
         nonce: &[u8; NONCE_BYTES_V1],
         deadline: MonotonicDeadlineV1,
+        continuation: C,
+        operations: IsolationOperationPlanV1,
     ) -> ! {
-        if control_read <= libc::STDERR_FILENO
-            || report_write <= libc::STDERR_FILENO
+        if control_read <= ISOLATION_CONTROL_DESCRIPTOR_V1
+            || report_write <= ISOLATION_CONTROL_DESCRIPTOR_V1
             || control_read == report_write
         {
             child_descriptor_fail_v1(
@@ -4215,19 +4598,35 @@ mod platform {
             Ok(identity) => identity,
             Err(error) => child_descriptor_fail_v1(report_write, nonce, error, deadline),
         };
+        if operations.check(IsolationOperationV1::ReportDup3).is_err() {
+            child_descriptor_fail_v1(
+                report_write,
+                nonce,
+                ChildDescriptorFailureV1::Os(libc::EIO),
+                deadline,
+            );
+        }
         if unsafe {
             libc::syscall(
                 libc::SYS_dup3,
                 report_write,
-                REPORT_DESCRIPTOR_V1,
+                ISOLATION_REPORT_DESCRIPTOR_V1,
                 libc::O_CLOEXEC,
             )
-        } != libc::c_long::from(REPORT_DESCRIPTOR_V1)
+        } != libc::c_long::from(ISOLATION_REPORT_DESCRIPTOR_V1)
         {
             child_descriptor_fail_v1(
                 report_write,
                 nonce,
                 child_descriptor_os_failure_v1(),
+                deadline,
+            );
+        }
+        if operations.check(IsolationOperationV1::ControlDup3).is_err() {
+            child_descriptor_fail_v1(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                ChildDescriptorFailureV1::Os(libc::EIO),
                 deadline,
             );
         }
@@ -4241,43 +4640,74 @@ mod platform {
         } != libc::c_long::from(ISOLATION_CONTROL_DESCRIPTOR_V1)
         {
             child_descriptor_fail_v1(
-                REPORT_DESCRIPTOR_V1,
+                ISOLATION_REPORT_DESCRIPTOR_V1,
                 nonce,
                 child_descriptor_os_failure_v1(),
                 deadline,
             );
         }
         if !matches!(
-            child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1),
+            child_report_descriptor_identity_v1(ISOLATION_REPORT_DESCRIPTOR_V1),
             Ok(identity) if identity == report_identity
         ) || !matches!(
             child_control_descriptor_identity_v1(ISOLATION_CONTROL_DESCRIPTOR_V1),
             Ok(identity) if identity == control_identity
         ) {
             child_descriptor_fail_v1(
-                REPORT_DESCRIPTOR_V1,
+                ISOLATION_REPORT_DESCRIPTOR_V1,
                 nonce,
                 ChildDescriptorFailureV1::Invariant,
                 deadline,
             );
         }
-        if let Err(error) =
-            child_scrub_and_audit_isolation_descriptors_v1(&report_identity, &control_identity)
+        if let Err(error) = child_normalize_and_verify_credentials_v1(operations) {
+            child_credential_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
+        }
+        if let Err(error) = child_eliminate_capabilities_v1(
+            ISOLATION_REPORT_DESCRIPTOR_V1,
+            &report_identity,
+            operations,
+        ) {
+            child_capability_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
+        }
+        if operations
+            .check(IsolationOperationV1::ChildContinuation)
+            .is_err()
         {
-            child_descriptor_fail_v1(REPORT_DESCRIPTOR_V1, nonce, error, deadline);
+            child_descriptor_fail_v1(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                ChildDescriptorFailureV1::Os(libc::EIO),
+                deadline,
+            );
         }
-        if let Err(error) = child_normalize_and_verify_credentials_v1() {
-            child_credential_fail_v1(REPORT_DESCRIPTOR_V1, nonce, error, deadline);
-        }
-        if let Err(error) = child_eliminate_capabilities_v1(&report_identity) {
-            child_capability_fail_v1(REPORT_DESCRIPTOR_V1, nonce, error, deadline);
+        let stdio_state =
+            match continuation.continue_in_child_v1(IsolationChildOnlyBrandV1 { _private: () }) {
+                Ok(state) => state,
+                Err(error) => child_descriptor_fail_v1(
+                    ISOLATION_REPORT_DESCRIPTOR_V1,
+                    nonce,
+                    error
+                        .errno
+                        .map(ChildDescriptorFailureV1::Os)
+                        .unwrap_or(ChildDescriptorFailureV1::Invariant),
+                    deadline,
+                ),
+            };
+        if let Err(error) = child_scrub_and_audit_isolation_descriptors_v1(
+            &report_identity,
+            &control_identity,
+            stdio_state,
+            operations,
+        ) {
+            child_descriptor_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
         }
         if !matches!(
             child_control_descriptor_identity_v1(ISOLATION_CONTROL_DESCRIPTOR_V1),
             Ok(identity) if identity == control_identity
         ) {
             child_descriptor_fail_v1(
-                REPORT_DESCRIPTOR_V1,
+                ISOLATION_REPORT_DESCRIPTOR_V1,
                 nonce,
                 ChildDescriptorFailureV1::Invariant,
                 deadline,
@@ -4290,7 +4720,15 @@ mod platform {
             nonce,
             ISOLATION_READY_FLAGS_V1,
         );
-        if !child_write_frame(REPORT_DESCRIPTOR_V1, &ready, deadline) {
+        if operations.check(IsolationOperationV1::ReadyWrite).is_err() {
+            child_descriptor_fail_v1(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                ChildDescriptorFailureV1::Os(libc::EIO),
+                deadline,
+            );
+        }
+        if !child_write_frame(ISOLATION_REPORT_DESCRIPTOR_V1, &ready, deadline) {
             child_exit(CHILD_EXIT_PROOF_FAILED_V1);
         }
 
@@ -4310,12 +4748,12 @@ mod platform {
             };
             if read == 0 {
                 let _ = child_close(ISOLATION_CONTROL_DESCRIPTOR_V1);
-                let _ = child_close(REPORT_DESCRIPTOR_V1);
+                let _ = child_close(ISOLATION_REPORT_DESCRIPTOR_V1);
                 child_exit(0);
             }
             if read > 0 {
                 child_fail(
-                    REPORT_DESCRIPTOR_V1,
+                    ISOLATION_REPORT_DESCRIPTOR_V1,
                     nonce,
                     PROOF_STATUS_PROTOCOL_V1,
                     libc::EPROTO,
@@ -4333,7 +4771,7 @@ mod platform {
                 )
             {
                 child_fail(
-                    REPORT_DESCRIPTOR_V1,
+                    ISOLATION_REPORT_DESCRIPTOR_V1,
                     nonce,
                     PROOF_STATUS_PROTOCOL_V1,
                     errno,
@@ -4349,10 +4787,14 @@ mod platform {
     /// This is diagnostic path-and-mount evidence only. Inherited descriptors
     /// and old executable mappings are deliberately outside this slice, and
     /// this result can never authorize execution.
-    fn child_enter_private_tmpfs_root_v1()
-    -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
+    fn child_enter_private_tmpfs_root_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
         let active_pid_namespace = child_pin_active_pid_namespace_v1()?;
         let old_root = child_open_absolute_root_v1()?;
+        operations
+            .check(IsolationOperationV1::PrivateMountPropagation)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_mount,
@@ -4370,6 +4812,9 @@ mod platform {
         let old_target = child_open_root_target_at_v1(old_root)?;
         let old_target_identity = child_path_identity_v1(old_target)?;
 
+        operations
+            .check(IsolationOperationV1::RootTmpfsMount)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_mount,
@@ -4393,11 +4838,17 @@ mod platform {
         if unsafe { libc::syscall(libc::SYS_fchdir, new_root) } != 0 {
             return Err(child_mount_os_failure_v1());
         }
+        operations
+            .check(IsolationOperationV1::MountDescriptorClose)
+            .map_err(ChildMountRootFailureV1::Os)?;
         let old_target_closed = child_close_mount_fd_v1(old_target);
         let old_root_closed = child_close_mount_fd_v1(old_root);
         old_target_closed?;
         old_root_closed?;
 
+        operations
+            .check(IsolationOperationV1::PivotRoot)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_mkdirat,
@@ -4409,6 +4860,9 @@ mod platform {
         {
             return Err(child_mount_os_failure_v1());
         }
+        operations
+            .check(IsolationOperationV1::DetachOldRoot)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_pivot_root,
@@ -4458,6 +4912,7 @@ mod platform {
             pivoted_root,
             &pivoted_identity,
             &active_pid_namespace,
+            operations,
         )?;
         let retained_root_closed = child_close_mount_fd_v1(new_root);
         let pivoted_root_closed = child_close_mount_fd_v1(pivoted_root);
@@ -4581,6 +5036,7 @@ mod platform {
         root: RawFd,
         root_identity: &ChildPathIdentityV1,
         active_pid_namespace: &ChildPinnedPidNamespaceV1,
+        operations: IsolationOperationPlanV1,
     ) -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
         let _ = unsafe { libc::syscall(libc::SYS_umask, 0_u32) };
 
@@ -4598,6 +5054,9 @@ mod platform {
         workspace_closed?;
         dev_closed?;
 
+        operations
+            .check(IsolationOperationV1::UmaskRestore)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe { libc::syscall(libc::SYS_umask, 0o077_u32) } != 0
             || unsafe { libc::syscall(libc::SYS_umask, 0o077_u32) } != 0o077
         {
@@ -4605,31 +5064,43 @@ mod platform {
         }
 
         let tmp_identity = child_mount_scratch_v1(
-            root,
-            tmp_target,
-            TMP_NAME_V1,
-            TMP_PATH_V1,
-            TMP_MODE_V1,
-            TMP_TMPFS_OPTIONS_V1,
+            ChildScratchMountSpecV1 {
+                parent: root,
+                pre_target: tmp_target,
+                name: TMP_NAME_V1,
+                absolute_path: TMP_PATH_V1,
+                mode: TMP_MODE_V1,
+                options: TMP_TMPFS_OPTIONS_V1,
+                operation: IsolationOperationV1::ScratchTmpMount,
+            },
             root_identity,
+            operations,
         )?;
         let run_identity = child_mount_scratch_v1(
-            root,
-            run_target,
-            RUN_NAME_V1,
-            RUN_PATH_V1,
-            RUN_MODE_V1,
-            RUN_TMPFS_OPTIONS_V1,
+            ChildScratchMountSpecV1 {
+                parent: root,
+                pre_target: run_target,
+                name: RUN_NAME_V1,
+                absolute_path: RUN_PATH_V1,
+                mode: RUN_MODE_V1,
+                options: RUN_TMPFS_OPTIONS_V1,
+                operation: IsolationOperationV1::ScratchRunMount,
+            },
             root_identity,
+            operations,
         )?;
         let again_home_identity = child_mount_scratch_v1(
-            home,
-            again_home_target,
-            AGAIN_NAME_V1,
-            AGAIN_HOME_PATH_V1,
-            AGAIN_HOME_MODE_V1,
-            AGAIN_HOME_TMPFS_OPTIONS_V1,
+            ChildScratchMountSpecV1 {
+                parent: home,
+                pre_target: again_home_target,
+                name: AGAIN_NAME_V1,
+                absolute_path: AGAIN_HOME_PATH_V1,
+                mode: AGAIN_HOME_MODE_V1,
+                options: AGAIN_HOME_TMPFS_OPTIONS_V1,
+                operation: IsolationOperationV1::ScratchHomeMount,
+            },
             root_identity,
+            operations,
         )?;
         child_close_mount_fd_v1(home)?;
         if !child_scratch_identities_are_independent_v1(
@@ -4640,8 +5111,13 @@ mod platform {
             return Err(ChildMountRootFailureV1::Invariant);
         }
 
-        let proc_identity =
-            child_mount_procfs_v1(root, proc_target, root_identity, active_pid_namespace)?;
+        let proc_identity = child_mount_procfs_v1(
+            root,
+            proc_target,
+            root_identity,
+            active_pid_namespace,
+            operations,
+        )?;
         child_verify_final_mount_layout_v1(
             root_identity,
             &tmp_identity,
@@ -4721,40 +5197,39 @@ mod platform {
     }
 
     fn child_mount_scratch_v1(
-        parent: RawFd,
-        pre_target: RawFd,
-        name: &CStr,
-        absolute_path: &CStr,
-        mode: libc::mode_t,
-        options: &CStr,
+        spec: ChildScratchMountSpecV1<'_>,
         root_identity: &ChildPathIdentityV1,
+        operations: IsolationOperationPlanV1,
     ) -> Result<ChildPathIdentityV1, ChildMountRootFailureV1> {
-        let pre_identity = child_path_identity_v1(pre_target)?;
-        if !child_directory_matches_root_v1(&pre_identity, root_identity, mode) {
+        let pre_identity = child_path_identity_v1(spec.pre_target)?;
+        if !child_directory_matches_root_v1(&pre_identity, root_identity, spec.mode) {
             return Err(ChildMountRootFailureV1::Invariant);
         }
+        operations
+            .check(spec.operation)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_mount,
                 ROOT_TMPFS_TYPE_V1.as_ptr(),
-                absolute_path.as_ptr(),
+                spec.absolute_path.as_ptr(),
                 ROOT_TMPFS_TYPE_V1.as_ptr(),
                 SCRATCH_MOUNT_FLAGS_V1,
-                options.as_ptr(),
+                spec.options.as_ptr(),
             )
         } != 0
         {
             return Err(child_mount_os_failure_v1());
         }
-        let mounted = child_open_mounted_directory_at_v1(parent, name)?;
+        let mounted = child_open_mounted_directory_at_v1(spec.parent, spec.name)?;
         let identity = child_path_identity_v1(mounted)?;
         if identity.mount_id == pre_identity.mount_id
             || child_device_tuple_v1(&identity) == child_device_tuple_v1(&pre_identity)
-            || !child_scratch_matches_policy_v1(mounted, &identity, mode)?
+            || !child_scratch_matches_policy_v1(mounted, &identity, spec.mode)?
         {
             return Err(ChildMountRootFailureV1::Invariant);
         }
-        let pre_target_closed = child_close_mount_fd_v1(pre_target);
+        let pre_target_closed = child_close_mount_fd_v1(spec.pre_target);
         let mounted_closed = child_close_mount_fd_v1(mounted);
         pre_target_closed?;
         mounted_closed?;
@@ -4823,11 +5298,15 @@ mod platform {
         pre_target: RawFd,
         root_identity: &ChildPathIdentityV1,
         active_pid_namespace: &ChildPinnedPidNamespaceV1,
+        operations: IsolationOperationPlanV1,
     ) -> Result<ChildPathIdentityV1, ChildMountRootFailureV1> {
         let pre_identity = child_path_identity_v1(pre_target)?;
         if !child_directory_matches_root_v1(&pre_identity, root_identity, PROC_MODE_V1) {
             return Err(ChildMountRootFailureV1::Invariant);
         }
+        operations
+            .check(IsolationOperationV1::ProcMount)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_mount,
@@ -5211,7 +5690,12 @@ mod platform {
     fn child_scrub_and_audit_isolation_descriptors_v1(
         report_identity: &ChildReportDescriptorIdentityV1,
         control_identity: &ChildReportDescriptorIdentityV1,
+        stdio_state: IsolationChildStdioStateV1,
+        operations: IsolationOperationPlanV1,
     ) -> Result<(), ChildDescriptorFailureV1> {
+        operations
+            .check(IsolationOperationV1::CloseRange)
+            .map_err(ChildDescriptorFailureV1::Os)?;
         let close_result = unsafe {
             libc::syscall(
                 libc::SYS_close_range,
@@ -5230,7 +5714,7 @@ mod platform {
         }
         if close_result != 0
             || !matches!(
-                child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1),
+                child_report_descriptor_identity_v1(ISOLATION_REPORT_DESCRIPTOR_V1),
                 Ok(identity) if identity == *report_identity
             )
             || !matches!(
@@ -5240,9 +5724,28 @@ mod platform {
         {
             return Err(ChildDescriptorFailureV1::Invariant);
         }
-        let audit_descriptor = child_open_fd_audit_at_v1(ISOLATION_FD_AUDIT_DESCRIPTOR_V1)?;
+        operations
+            .check(IsolationOperationV1::FdAudit)
+            .map_err(ChildDescriptorFailureV1::Os)?;
+        let (expected_audit_descriptor, expected_mask) = match stdio_state {
+            IsolationChildStdioStateV1::Closed => (
+                ISOLATION_CLOSED_FD_AUDIT_DESCRIPTOR_V1,
+                ISOLATION_CLOSED_FD_AUDIT_COMPLETE_MASK_V1,
+            ),
+            IsolationChildStdioStateV1::PlacedAndAuthenticated => (
+                ISOLATION_PLACED_FD_AUDIT_DESCRIPTOR_V1,
+                ISOLATION_PLACED_FD_AUDIT_COMPLETE_MASK_V1,
+            ),
+        };
+        let audit_descriptor = child_open_fd_audit_at_v1(expected_audit_descriptor)?;
         child_authenticate_fd_audit_at_v1(audit_descriptor)?;
-        child_finish_isolation_fd_audit_v1(audit_descriptor, report_identity, control_identity)
+        child_finish_isolation_fd_audit_v1(
+            audit_descriptor,
+            expected_audit_descriptor,
+            expected_mask,
+            report_identity,
+            control_identity,
+        )
     }
 
     fn child_open_fd_audit_v1() -> Result<RawFd, ChildDescriptorFailureV1> {
@@ -5422,10 +5925,12 @@ mod platform {
 
     fn child_finish_isolation_fd_audit_v1(
         audit_descriptor: RawFd,
+        expected_audit_descriptor: RawFd,
+        expected_mask: u8,
         report_identity: &ChildReportDescriptorIdentityV1,
         control_identity: &ChildReportDescriptorIdentityV1,
     ) -> Result<(), ChildDescriptorFailureV1> {
-        if audit_descriptor != ISOLATION_FD_AUDIT_DESCRIPTOR_V1 {
+        if audit_descriptor != expected_audit_descriptor {
             return Err(ChildDescriptorFailureV1::Invariant);
         }
         let mut buffer = [0_u8; FD_AUDIT_BUFFER_BYTES_V1];
@@ -5459,7 +5964,7 @@ mod platform {
                 return Err(ChildDescriptorFailureV1::Invariant);
             }
         }
-        if !reached_eof || seen != ISOLATION_FD_AUDIT_COMPLETE_MASK_V1 {
+        if !reached_eof || seen != expected_mask {
             return Err(ChildDescriptorFailureV1::Invariant);
         }
         if !child_close(audit_descriptor) {
@@ -5468,7 +5973,7 @@ mod platform {
         if unsafe { libc::syscall(libc::SYS_fcntl, audit_descriptor, libc::F_GETFD, 0_u64) } >= 0
             || child_errno() != libc::EBADF
             || !matches!(
-                child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1),
+                child_report_descriptor_identity_v1(ISOLATION_REPORT_DESCRIPTOR_V1),
                 Ok(identity) if identity == *report_identity
             )
             || !matches!(
@@ -5505,6 +6010,9 @@ mod platform {
                 b"0" => FD_AUDIT_ZERO_BIT_V1,
                 b"1" => FD_AUDIT_ONE_BIT_V1,
                 b"2" => FD_AUDIT_TWO_BIT_V1,
+                b"3" => FD_AUDIT_THREE_BIT_V1,
+                b"4" => FD_AUDIT_FOUR_BIT_V1,
+                b"5" => FD_AUDIT_FIVE_BIT_V1,
                 _ => return false,
             };
             if *seen & bit != 0 {
@@ -5519,11 +6027,23 @@ mod platform {
         true
     }
 
-    fn child_normalize_and_verify_credentials_v1() -> Result<(), ChildCapabilityFailureV1> {
+    fn child_normalize_and_verify_credentials_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::SetResGid)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let set_gid = unsafe { libc::syscall(libc::SYS_setresgid, 0_u32, 0_u32, 0_u32) };
         child_require_exact_zero_capability_result_v1(set_gid)?;
+        operations
+            .check(IsolationOperationV1::SetResUid)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let set_uid = unsafe { libc::syscall(libc::SYS_setresuid, 0_u32, 0_u32, 0_u32) };
         child_require_exact_zero_capability_result_v1(set_uid)?;
+
+        operations
+            .check(IsolationOperationV1::CredentialReadback)
+            .map_err(ChildCapabilityFailureV1::Os)?;
 
         let mut real_uid = u32::MAX;
         let mut effective_uid = u32::MAX;
@@ -5557,8 +6077,37 @@ mod platform {
         Ok(())
     }
 
+    fn child_clear_and_verify_supplementary_groups_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::ClearSupplementaryGroups)
+            .map_err(ChildCapabilityFailureV1::Os)?;
+        let cleared = unsafe {
+            libc::syscall(
+                libc::SYS_setgroups,
+                0_usize,
+                std::ptr::null::<libc::gid_t>(),
+            )
+        };
+        child_require_exact_zero_capability_result_v1(cleared)?;
+        operations
+            .check(IsolationOperationV1::AuthenticateSupplementaryGroups)
+            .map_err(ChildCapabilityFailureV1::Os)?;
+        let count = unsafe {
+            libc::syscall(
+                libc::SYS_getgroups,
+                0_usize,
+                std::ptr::null_mut::<libc::gid_t>(),
+            )
+        };
+        child_require_exact_capability_value_v1(count, 0)
+    }
+
     fn child_eliminate_capabilities_v1(
+        report_descriptor: RawFd,
         report_identity: &ChildReportDescriptorIdentityV1,
+        operations: IsolationOperationPlanV1,
     ) -> Result<u32, ChildCapabilityFailureV1> {
         let initial_bounding = child_read_bounding_capabilities_v1()?;
         let Some(last_capability) = child_last_capability_v1(&initial_bounding) else {
@@ -5569,22 +6118,27 @@ mod platform {
             return Err(ChildCapabilityFailureV1::Invariant);
         }
 
-        child_set_and_verify_securebits_v1()?;
-        child_drop_bounding_capabilities_v1(last_capability)?;
-        child_clear_ambient_capabilities_v1()?;
+        child_set_and_verify_securebits_v1(operations)?;
+        child_drop_bounding_capabilities_v1(last_capability, operations)?;
+        child_clear_ambient_capabilities_v1(operations)?;
         let cleared_ambient = child_read_ambient_capabilities_v1()?;
         if !child_empty_capability_scan_matches_v1(&cleared_ambient, last_capability) {
             return Err(ChildCapabilityFailureV1::Invariant);
         }
-        child_clear_capability_sets_v1()?;
-        child_set_no_new_privileges_v1()?;
+        child_clear_capability_sets_v1(operations)?;
+        child_set_no_new_privileges_v1(operations)?;
 
-        child_verify_capability_elimination_v1(last_capability, report_identity)?;
+        child_verify_capability_elimination_v1(
+            last_capability,
+            report_descriptor,
+            report_identity,
+        )?;
         Ok(last_capability)
     }
 
     fn child_verify_capability_elimination_v1(
         last_capability: u32,
+        report_descriptor: RawFd,
         report_identity: &ChildReportDescriptorIdentityV1,
     ) -> Result<(), ChildCapabilityFailureV1> {
         let final_sets = child_read_capability_sets_v1()?;
@@ -5601,7 +6155,7 @@ mod platform {
         }
         child_verify_securebits_v1()?;
         child_verify_no_new_privileges_v1()?;
-        child_reauthenticate_capability_report_v1(report_identity)
+        child_reauthenticate_capability_report_v1(report_descriptor, report_identity)
     }
 
     fn child_enforce_landlock_v1(
@@ -5655,8 +6209,12 @@ mod platform {
             &restricted_identity,
             tracked,
         )?;
-        child_verify_capability_elimination_v1(last_capability, report_identity)
-            .map_err(child_landlock_from_capability_failure_v1)?;
+        child_verify_capability_elimination_v1(
+            last_capability,
+            REPORT_DESCRIPTOR_V1,
+            report_identity,
+        )
+        .map_err(child_landlock_from_capability_failure_v1)?;
         child_landlock_restrict_self_v1(ruleset, policy)?;
         child_landlock_close_tracked_fd_v1(tracked, ruleset)?;
 
@@ -6249,8 +6807,9 @@ mod platform {
         }
         tracked.audit_descriptor = -1;
         if !exact_audit_ran
-            && let Err(error) = child_reauthenticate_capability_report_v1(report_identity)
-                .map_err(child_landlock_from_capability_failure_v1)
+            && let Err(error) =
+                child_reauthenticate_capability_report_v1(REPORT_DESCRIPTOR_V1, report_identity)
+                    .map_err(child_landlock_from_capability_failure_v1)
             && first_failure.is_none()
         {
             first_failure = Some(error);
@@ -6316,7 +6875,7 @@ mod platform {
     fn child_enforce_seccomp_v1(
         report_identity: &ChildReportDescriptorIdentityV1,
     ) -> Result<(), ChildSeccompFailureV1> {
-        child_reauthenticate_capability_report_v1(report_identity)
+        child_reauthenticate_capability_report_v1(REPORT_DESCRIPTOR_V1, report_identity)
             .map_err(child_seccomp_from_capability_failure_v1)?;
         child_verify_no_new_privileges_v1().map_err(child_seccomp_from_capability_failure_v1)?;
         child_seccomp_require_preinstall_mode_v1()?;
@@ -6639,7 +7198,12 @@ mod platform {
             .all(|word| word.effective == 0 && word.permitted == 0 && word.inheritable == 0)
     }
 
-    fn child_set_and_verify_securebits_v1() -> Result<(), ChildCapabilityFailureV1> {
+    fn child_set_and_verify_securebits_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::Securebits)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let result = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -6673,7 +7237,11 @@ mod platform {
 
     fn child_drop_bounding_capabilities_v1(
         last_capability: u32,
+        operations: IsolationOperationPlanV1,
     ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::BoundingCapabilities)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let mut capability = 0_u32;
         while capability <= last_capability {
             let result = unsafe {
@@ -6692,7 +7260,12 @@ mod platform {
         Ok(())
     }
 
-    fn child_clear_ambient_capabilities_v1() -> Result<(), ChildCapabilityFailureV1> {
+    fn child_clear_ambient_capabilities_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::AmbientCapabilities)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let result = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -6706,7 +7279,12 @@ mod platform {
         child_require_exact_zero_capability_result_v1(result)
     }
 
-    fn child_clear_capability_sets_v1() -> Result<(), ChildCapabilityFailureV1> {
+    fn child_clear_capability_sets_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::CapabilitySets)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let mut header = LinuxCapabilityHeaderV1 {
             version: LINUX_CAPABILITY_VERSION_3_V1,
             pid: 0,
@@ -6720,7 +7298,12 @@ mod platform {
         Ok(())
     }
 
-    fn child_set_no_new_privileges_v1() -> Result<(), ChildCapabilityFailureV1> {
+    fn child_set_no_new_privileges_v1(
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildCapabilityFailureV1> {
+        operations
+            .check(IsolationOperationV1::NoNewPrivileges)
+            .map_err(ChildCapabilityFailureV1::Os)?;
         let result = unsafe {
             libc::syscall(
                 libc::SYS_prctl,
@@ -6749,9 +7332,10 @@ mod platform {
     }
 
     fn child_reauthenticate_capability_report_v1(
+        report_descriptor: RawFd,
         expected: &ChildReportDescriptorIdentityV1,
     ) -> Result<(), ChildCapabilityFailureV1> {
-        match child_report_descriptor_identity_v1(REPORT_DESCRIPTOR_V1) {
+        match child_report_descriptor_identity_v1(report_descriptor) {
             Ok(observed) if observed == *expected => Ok(()),
             Ok(_) | Err(ChildDescriptorFailureV1::Invariant) => {
                 Err(ChildCapabilityFailureV1::Invariant)
@@ -7265,47 +7849,6 @@ mod platform {
         const DISPOSABLE_FD_SCRUB_MAGIC_V1: &[u8; 8] = b"AGNFDT01";
         const DISPOSABLE_FD_SCRUB_COMPLETE_V1: u8 = 1;
 
-        #[derive(Clone, Copy, Debug)]
-        enum IsolationReadyInjectedOperationV1 {
-            AuthenticatedRelease,
-            UtsHostname,
-            PrivateMountRoot,
-            ScratchTmp,
-            ScratchRun,
-            ScratchHome,
-            PrivateProcfs,
-            ReportFdMove,
-            ControlFdMove,
-            CloseRange,
-            FdAudit,
-            SetResGid,
-            SetResUid,
-            CredentialReadback,
-            CapabilityDropAndNoNewPrivs,
-            ReadyReport,
-        }
-
-        impl IsolationReadyInjectedOperationV1 {
-            const ALL: [Self; 16] = [
-                Self::AuthenticatedRelease,
-                Self::UtsHostname,
-                Self::PrivateMountRoot,
-                Self::ScratchTmp,
-                Self::ScratchRun,
-                Self::ScratchHome,
-                Self::PrivateProcfs,
-                Self::ReportFdMove,
-                Self::ControlFdMove,
-                Self::CloseRange,
-                Self::FdAudit,
-                Self::SetResGid,
-                Self::SetResUid,
-                Self::CredentialReadback,
-                Self::CapabilityDropAndNoNewPrivs,
-                Self::ReadyReport,
-            ];
-        }
-
         fn seccomp_filter_fingerprint_v1() -> u64 {
             let mut hash = 0xcbf2_9ce4_8422_2325_u64;
             for instruction in &SECCOMP_FILTER_V1 {
@@ -7722,6 +8265,7 @@ mod platform {
 
         #[test]
         fn groups_parser_rejects_bad_or_duplicate_fields() {
+            assert_eq!(parse_status_groups(b"Groups:\t\n").ok(), Some(Vec::new()));
             assert_eq!(
                 parse_status_groups(b"Name:\tx\nGroups:\t9 2 7\n").ok(),
                 Some(vec![2, 7, 9])
@@ -8655,8 +9199,15 @@ mod platform {
             assert!(child_parse_fd_audit_dirents_v1(&second, &mut seen));
             assert_eq!(seen, FD_AUDIT_COMPLETE_MASK_V1);
 
+            let mut isolation_seen = 0_u8;
+            assert!(child_parse_fd_audit_dirents_v1(
+                &fd_audit_chunk(&[b"0", b"1", b"2", b"3", b"4", b"5", b".", b".."]),
+                &mut isolation_seen,
+            ));
+            assert_eq!(isolation_seen, ISOLATION_PLACED_FD_AUDIT_COMPLETE_MASK_V1);
+
             for name in [
-                b"2".as_slice(),
+                b"6".as_slice(),
                 b"x".as_slice(),
                 b"00".as_slice(),
                 b"01".as_slice(),
@@ -8764,6 +9315,7 @@ mod platform {
                 deadline: hard_deadline,
                 refresh_deadline_on_cleanup: false,
                 reaped: false,
+                operations: IsolationOperationPlanV1::default(),
             };
             let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
             let pidfd_errno = (pidfd < 0).then(last_errno).flatten();
@@ -9112,6 +9664,15 @@ mod platform {
             );
             assert!(uts_error.is_expected_unavailable());
 
+            let uts_io = verify_proof_frame(
+                &child_encode_proof_frame(&nonce, PROOF_STATUS_UTS_CONFIGURATION_V1, 0, libc::EIO),
+                &nonce,
+            )
+            .expect_err("UTS I/O failure proof was accepted");
+            assert_eq!(uts_io.reason, IsolationQualificationReasonV1::Io);
+            assert_eq!(uts_io.errno, Some(libc::EIO));
+            assert!(!uts_io.is_expected_unavailable());
+
             let mut identity = valid_uts;
             identity[FRAME_PID_OFFSET_V1] = 2;
             for frame in [
@@ -9121,12 +9682,7 @@ mod platform {
                     PROOF_FLAGS_V1,
                     libc::EPERM,
                 ),
-                child_encode_proof_frame(
-                    &nonce,
-                    PROOF_STATUS_UTS_CONFIGURATION_V1,
-                    0,
-                    libc::EACCES,
-                ),
+                child_encode_proof_frame(&nonce, PROOF_STATUS_UTS_CONFIGURATION_V1, 0, 0),
                 child_encode_proof_frame(&nonce, 0xff, 0, libc::EPERM),
                 identity,
             ] {
@@ -9421,12 +9977,20 @@ mod platform {
                 );
             }
 
-            let cleanup = IsolationQualificationFailureV1::cleanup_uncertain(Some(libc::EIO));
-            assert_eq!(cleanup.stage, IsolationQualificationStageV1::Cleanup);
+            let cleanup = failure(
+                RefusalCode::IsolationPreflightFailed,
+                IsolationQualificationStageV1::ChildCapabilityDrop,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EPERM),
+            )
+            .with_cleanup_uncertain(Some(libc::EIO));
             assert_eq!(
-                cleanup.reason,
-                IsolationQualificationReasonV1::CleanupUncertain
+                cleanup.stage,
+                IsolationQualificationStageV1::ChildCapabilityDrop
             );
+            assert_eq!(cleanup.reason, IsolationQualificationReasonV1::Io);
+            assert_eq!(cleanup.errno, Some(libc::EPERM));
+            assert_eq!(cleanup.cleanup_errno(), Some(libc::EIO));
             assert!(!cleanup.is_expected_unavailable());
         }
 
@@ -9815,8 +10379,14 @@ mod platform {
         }
 
         #[test]
-        fn every_isolation_checkpoint_injection_reaps_its_child() {
-            for operation in IsolationReadyInjectedOperationV1::ALL {
+        fn cleanup_syscall_injection_uses_real_children_and_preserves_primary_error() {
+            for operation in [
+                IsolationOperationV1::CloseControl,
+                IsolationOperationV1::CloseReport,
+                IsolationOperationV1::PidKill,
+                IsolationOperationV1::ReapPid,
+                IsolationOperationV1::FinalEchildAudit,
+            ] {
                 let pid = unsafe { libc::fork() };
                 assert!(pid >= 0, "fork failed for {operation:?}");
                 if pid == 0 {
@@ -9824,9 +10394,73 @@ mod platform {
                         unsafe { libc::syscall(libc::SYS_pause) };
                     }
                 }
+                let (control_read, control_write) = test_pipe();
+                let (report_read, report_write) = test_pipe();
+                drop(control_read);
+                drop(report_write);
                 let guard = ProbeChildGuardV1 {
                     pid: Some(pid),
                     pidfd: None,
+                    control_write: Some(control_write),
+                    report_read: Some(report_read),
+                    proc_directory: None,
+                    child_namespaces: None,
+                    deadline: test_deadline(),
+                    refresh_deadline_on_cleanup: false,
+                    reaped: false,
+                    operations: IsolationOperationPlanV1::fail(operation),
+                };
+                let injected = failure(
+                    RefusalCode::IsolationPreflightFailed,
+                    IsolationQualificationStageV1::SendControl,
+                    IsolationQualificationReasonV1::Io,
+                    Some(libc::EPERM),
+                );
+                let observed = guard.refuse(injected);
+                assert_eq!(
+                    (observed.stage, observed.reason, observed.errno,),
+                    (
+                        IsolationQualificationStageV1::SendControl,
+                        IsolationQualificationReasonV1::Io,
+                        Some(libc::EPERM),
+                    ),
+                    "cleanup replaced the primary failure for {operation:?}"
+                );
+                if operation == IsolationOperationV1::ReapPid {
+                    assert!(!observed.cleanup_complete());
+                    assert_eq!(observed.cleanup_errno(), Some(libc::EIO));
+                } else {
+                    assert!(observed.cleanup_complete(), "{operation:?}");
+                    assert_eq!(observed.cleanup_errno(), None);
+                }
+                let mut status = 0_i32;
+                assert_eq!(
+                    unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                    -1
+                );
+                assert_eq!(last_errno(), Some(libc::ECHILD));
+            }
+        }
+
+        #[test]
+        fn pidfd_wait_kill_and_reap_injection_falls_back_and_reaps_exact_child() {
+            for operation in [
+                IsolationOperationV1::PidfdKill,
+                IsolationOperationV1::WaitPidfd,
+                IsolationOperationV1::ReapPidfd,
+            ] {
+                let pid = unsafe { libc::fork() };
+                assert!(pid >= 0, "fork failed for {operation:?}");
+                if pid == 0 {
+                    loop {
+                        unsafe { libc::syscall(libc::SYS_pause) };
+                    }
+                }
+                let pidfd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+                assert!(pidfd >= 0, "pidfd_open failed for {operation:?}");
+                let guard = ProbeChildGuardV1 {
+                    pid: Some(pid),
+                    pidfd: Some(unsafe { OwnedFd::from_raw_fd(pidfd as RawFd) }),
                     control_write: None,
                     report_read: None,
                     proc_directory: None,
@@ -9834,53 +10468,73 @@ mod platform {
                     deadline: test_deadline(),
                     refresh_deadline_on_cleanup: false,
                     reaped: false,
+                    operations: IsolationOperationPlanV1::fail(operation),
                 };
-                let injected = failure(
+                let primary = failure(
                     RefusalCode::IsolationPreflightFailed,
-                    match operation {
-                        IsolationReadyInjectedOperationV1::AuthenticatedRelease
-                        | IsolationReadyInjectedOperationV1::ReadyReport => {
-                            IsolationQualificationStageV1::SendControl
-                        }
-                        IsolationReadyInjectedOperationV1::UtsHostname => {
-                            IsolationQualificationStageV1::ChildUtsConfiguration
-                        }
-                        IsolationReadyInjectedOperationV1::PrivateMountRoot
-                        | IsolationReadyInjectedOperationV1::ScratchTmp
-                        | IsolationReadyInjectedOperationV1::ScratchRun
-                        | IsolationReadyInjectedOperationV1::ScratchHome
-                        | IsolationReadyInjectedOperationV1::PrivateProcfs => {
-                            IsolationQualificationStageV1::ChildMountRoot
-                        }
-                        IsolationReadyInjectedOperationV1::ReportFdMove
-                        | IsolationReadyInjectedOperationV1::ControlFdMove
-                        | IsolationReadyInjectedOperationV1::CloseRange
-                        | IsolationReadyInjectedOperationV1::FdAudit => {
-                            IsolationQualificationStageV1::ChildDescriptorScrub
-                        }
-                        IsolationReadyInjectedOperationV1::SetResGid
-                        | IsolationReadyInjectedOperationV1::SetResUid
-                        | IsolationReadyInjectedOperationV1::CredentialReadback => {
-                            IsolationQualificationStageV1::ChildCredentialNormalization
-                        }
-                        IsolationReadyInjectedOperationV1::CapabilityDropAndNoNewPrivs => {
-                            IsolationQualificationStageV1::ChildCapabilityDrop
-                        }
-                    },
+                    IsolationQualificationStageV1::ReceiveIsolationReady,
                     IsolationQualificationReasonV1::Io,
-                    Some(libc::EIO),
+                    Some(libc::EPERM),
                 );
-                let observed = guard.refuse(injected);
-                assert!(
-                    observed.cleanup_complete(),
-                    "cleanup uncertain for {operation:?}"
-                );
+                let observed = guard.refuse(primary);
+                assert_eq!(observed.errno(), Some(libc::EPERM));
+                assert!(observed.cleanup_complete(), "{operation:?}");
                 let mut status = 0_i32;
                 assert_eq!(
                     unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
                     -1
                 );
                 assert_eq!(last_errno(), Some(libc::ECHILD));
+            }
+        }
+
+        #[test]
+        #[ignore = "requires the provisioned rootless namespace tuple and a single-threaded test process"]
+        fn provisioned_live_fault_matrix_enters_real_partial_isolation_states_and_reaps() {
+            let operations = [
+                IsolationOperationV1::ClearSupplementaryGroups,
+                IsolationOperationV1::AuthenticateSupplementaryGroups,
+                IsolationOperationV1::AuthenticatedRelease,
+                IsolationOperationV1::UtsHostname,
+                IsolationOperationV1::PrivateMountPropagation,
+                IsolationOperationV1::RootTmpfsMount,
+                IsolationOperationV1::MountDescriptorClose,
+                IsolationOperationV1::PivotRoot,
+                IsolationOperationV1::DetachOldRoot,
+                IsolationOperationV1::UmaskRestore,
+                IsolationOperationV1::ScratchTmpMount,
+                IsolationOperationV1::ScratchRunMount,
+                IsolationOperationV1::ScratchHomeMount,
+                IsolationOperationV1::ProcMount,
+                IsolationOperationV1::ReportDup3,
+                IsolationOperationV1::ControlDup3,
+                IsolationOperationV1::SetResGid,
+                IsolationOperationV1::SetResUid,
+                IsolationOperationV1::CredentialReadback,
+                IsolationOperationV1::Securebits,
+                IsolationOperationV1::BoundingCapabilities,
+                IsolationOperationV1::AmbientCapabilities,
+                IsolationOperationV1::CapabilitySets,
+                IsolationOperationV1::NoNewPrivileges,
+                IsolationOperationV1::ChildContinuation,
+                IsolationOperationV1::CloseRange,
+                IsolationOperationV1::FdAudit,
+                IsolationOperationV1::ReadyWrite,
+            ];
+            for operation in operations {
+                let plan = IsolationOperationPlanV1::fail(operation);
+                let observed = match begin_blocked_rootless_namespace_bootstrap_with_plan_v1(
+                    CloseInheritedStdioV1,
+                    plan,
+                ) {
+                    Ok(blocked) => match blocked.continue_to_isolation_ready_v1() {
+                        Ok(_) => panic!("injected live operation unexpectedly succeeded"),
+                        Err(failure) => failure,
+                    },
+                    Err(failure) => failure,
+                };
+                assert_eq!(observed.errno(), Some(libc::EIO), "{operation:?}");
+                assert!(observed.cleanup_complete(), "{operation:?}");
             }
         }
 
@@ -9923,8 +10577,9 @@ mod platform {
         }
     }
 
-    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
-    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
+        _continuation: C,
+    ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
         Err(IsolationQualificationFailureV1::new(
             RefusalCode::UnsupportedArchitecture,
             IsolationQualificationStageV1::Platform,
@@ -9973,8 +10628,9 @@ mod platform {
         }
     }
 
-    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
-    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
+        _continuation: C,
+    ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
         Err(IsolationQualificationFailureV1::new(
             RefusalCode::RequiredKernelCapabilityMissing,
             IsolationQualificationStageV1::Platform,

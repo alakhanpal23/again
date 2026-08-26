@@ -4,18 +4,20 @@
 //! bootstrap, retains the child behind an authenticated release, and offers
 //! one consuming continuation to a non-authoritative isolation checkpoint.
 //! That continuation fixes the UTS identity, enters the bounded private mount
-//! topology, retains only authenticated control/report descriptors at stdio
-//! numbers, normalizes credentials, clears capabilities, and sets and verifies
-//! `no_new_privs`. The child then blocks again while the opaque permit owns
+//! topology, normalizes credentials, clears capabilities, sets and verifies
+//! `no_new_privs`, and invokes a pre-clone, child-branded one-shot seam through
+//! which the sibling stdio owner can place descriptors 0/1/2. The isolation
+//! leaf then scrubs all non-stdio descriptors except fixed authenticated
+//! control/report channels and blocks again while the opaque permit owns
 //! bounded kill-and-reap cleanup.
 //! The extracted value also retains the diagnostic's dedicated-single-task
 //! precondition and fixed protocol/cleanup deadlines; it is a short-lived
 //! handoff, not a general process-hosting API.
 //!
 //! Consequently these values are namespace-bootstrap evidence only. They
-//! accept no command, path, environment, descriptor, or callback and grant no
-//! isolation-session, profile, execution, candidate, replay, hit, or reuse
-//! authority.
+//! accept no command, path, environment, or parent-side descriptor callback
+//! and grant no isolation-session, profile, execution, candidate, replay, hit,
+//! or reuse authority.
 
 #![allow(
     dead_code,
@@ -26,8 +28,8 @@ use std::fmt;
 
 use super::RefusalCode;
 use super::isolation_qualification::{
-    self, BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1,
-    IsolationReadyRootlessNamespaceV1,
+    self, BlockedRootlessNamespaceBootstrapV1, IsolationChildContinuationV1,
+    IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -99,10 +101,8 @@ impl BlockedIsolationStateV1 {
 /// Typed refusal from construction of the blocked namespace handoff.
 ///
 /// This preserves the diagnostic's existing refusal contract while projecting
-/// cleanup completeness and cleanup errno into separate fields. If the old
-/// diagnostic reports cleanup uncertainty, it has already replaced the first
-/// operational failure with its cleanup failure; recovering both errors
-/// requires the later per-leaf cleanup refactor documented above.
+/// the first operational failure independently from cleanup completeness and
+/// cleanup errno.
 pub(super) struct BlockedExecuteOnlyIsolationFailureV1 {
     code: RefusalCode,
     stage: &'static str,
@@ -115,14 +115,13 @@ pub(super) struct BlockedExecuteOnlyIsolationFailureV1 {
 impl BlockedExecuteOnlyIsolationFailureV1 {
     fn from_qualification(failure: IsolationQualificationFailureV1) -> Self {
         let cleanup_complete = failure.cleanup_complete();
-        let observed_errno = failure.errno();
         Self {
             code: failure.code(),
             stage: failure.stage(),
             reason: failure.reason(),
-            primary_errno: cleanup_complete.then_some(observed_errno).flatten(),
+            primary_errno: failure.errno(),
             cleanup_complete,
-            cleanup_errno: (!cleanup_complete).then_some(observed_errno).flatten(),
+            cleanup_errno: failure.cleanup_errno(),
         }
     }
 
@@ -222,6 +221,29 @@ impl fmt::Debug for FirstExecuteOnlyIsolationReadyPermitV1 {
 
 pub(super) fn begin_blocked_execute_only_isolation_v1()
 -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
+    finish_blocked_execute_only_isolation_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_v1(),
+    )
+}
+
+/// Compose one sibling-owned continuation into namespace PID 1 before clone.
+/// The parent drops its fork-local copy immediately and retains only cleanup
+/// ownership.
+pub(super) fn begin_blocked_execute_only_isolation_with_child_v1<
+    C: IsolationChildContinuationV1,
+>(
+    continuation: C,
+) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
+    finish_blocked_execute_only_isolation_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_child_v1(
+            continuation,
+        ),
+    )
+}
+
+fn finish_blocked_execute_only_isolation_v1(
+    live: Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1>,
+) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
     let mut state = BlockedIsolationStateV1::new();
     state
         .advance(
@@ -229,8 +251,7 @@ pub(super) fn begin_blocked_execute_only_isolation_v1()
             BlockedIsolationPhaseV1::NamespaceBootstrap,
         )
         .expect("fixed initial transition is valid");
-    let live = isolation_qualification::begin_blocked_rootless_namespace_bootstrap_v1()
-        .map_err(BlockedExecuteOnlyIsolationFailureV1::from_qualification)?;
+    let live = live.map_err(BlockedExecuteOnlyIsolationFailureV1::from_qualification)?;
     state
         .advance(
             BlockedIsolationPhaseV1::NamespaceBootstrap,
@@ -287,6 +308,23 @@ impl BlockedExecuteOnlyIsolationContinuationPermitV1 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SiblingOwnedStdioPlacementV1;
+
+    // SAFETY: this compile-only sibling shape performs no operation. A real
+    // stdio implementation must satisfy the stronger raw-syscall contract on
+    // `IsolationChildContinuationV1` before reporting placement.
+    unsafe impl isolation_qualification::IsolationChildContinuationV1 for SiblingOwnedStdioPlacementV1 {
+        fn continue_in_child_v1(
+            self,
+            _brand: isolation_qualification::IsolationChildOnlyBrandV1,
+        ) -> Result<
+            isolation_qualification::IsolationChildStdioStateV1,
+            isolation_qualification::IsolationChildContinuationFailureV1,
+        > {
+            Ok(isolation_qualification::IsolationChildStdioStateV1::PlacedAndAuthenticated)
+        }
+    }
 
     #[test]
     fn state_machine_is_monotonic_and_poison_preserves_first_failure() {
@@ -354,6 +392,21 @@ mod tests {
         <BlockedExecuteOnlyIsolationContinuationPermitV1 as AmbiguousIfCopy<_>>::probe();
         <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfClone<_>>::probe();
         <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfCopy<_>>::probe();
+    }
+
+    #[cfg(not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    )))]
+    #[test]
+    fn sibling_child_continuation_composes_without_parent_resource_access() {
+        let error =
+            begin_blocked_execute_only_isolation_with_child_v1(SiblingOwnedStdioPlacementV1)
+                .unwrap_err();
+        assert_eq!(error.stage(), "platform");
+        assert!(error.cleanup_complete());
     }
 
     #[cfg(not(all(
