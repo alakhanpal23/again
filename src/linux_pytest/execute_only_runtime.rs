@@ -34,6 +34,9 @@ const RUNTIME_CLOSURE_NONCLAIMS_V1: &[u8] =
 const ELF64_HEADER_BYTES: usize = 64;
 const ELF64_PROGRAM_HEADER_BYTES: usize = 56;
 const ELF64_MAX_PROGRAM_HEADERS: usize = 1024;
+const ELF64_LOAD_PAGE_BYTES: u64 = 4096;
+const ELF64_USER_VIRTUAL_LIMIT: u64 = 1 << 47;
+const ELF64_MAX_MAPPING_SPAN: u64 = 4 * 1024 * 1024 * 1024;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 const EV_CURRENT: u8 = 1;
@@ -257,6 +260,9 @@ pub(super) fn validate_x86_64_elf_v1(
     let entry = u64::from_le_bytes(bytes[24..32].try_into().expect("bounded ELF header"));
     let mut has_load = false;
     let mut entry_is_executable = false;
+    let mut previous_load_virtual_address = None;
+    let mut first_load_page = None;
+    let mut maximum_load_page_end = 0u64;
     for header in bytes[program_offset..table_end].chunks_exact(program_entry_size) {
         if u32::from_le_bytes(header[0..4].try_into().expect("bounded program header")) != PT_LOAD {
             continue;
@@ -272,17 +278,34 @@ pub(super) fn validate_x86_64_elf_v1(
             u64::from_le_bytes(header[40..48].try_into().expect("bounded program header"));
         let alignment =
             u64::from_le_bytes(header[48..56].try_into().expect("bounded program header"));
-        let file_end = offset
+        offset
             .checked_add(file_size)
             .filter(|end| *end <= bytes.len() as u64)
             .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
         let memory_end = virtual_address
             .checked_add(memory_size)
             .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+        let load_page = virtual_address & !(ELF64_LOAD_PAGE_BYTES - 1);
+        let load_page_end = memory_end
+            .checked_add(ELF64_LOAD_PAGE_BYTES - 1)
+            .map(|end| end & !(ELF64_LOAD_PAGE_BYTES - 1))
+            .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
         if file_size > memory_size
             || !(alignment == 0 || alignment == 1 || alignment.is_power_of_two())
             || (alignment > 1 && virtual_address % alignment != offset % alignment)
-            || file_end < offset
+            || virtual_address % ELF64_LOAD_PAGE_BYTES != offset % ELF64_LOAD_PAGE_BYTES
+            || virtual_address >= ELF64_USER_VIRTUAL_LIMIT
+            || memory_end >= ELF64_USER_VIRTUAL_LIMIT
+            || previous_load_virtual_address.is_some_and(|previous| virtual_address < previous)
+        {
+            return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader);
+        }
+        previous_load_virtual_address = Some(virtual_address);
+        let first_page = *first_load_page.get_or_insert(load_page);
+        maximum_load_page_end = maximum_load_page_end.max(load_page_end);
+        if maximum_load_page_end
+            .checked_sub(first_page)
+            .is_none_or(|span| span > ELF64_MAX_MAPPING_SPAN)
         {
             return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader);
         }
@@ -470,6 +493,26 @@ mod tests {
         bytes
     }
 
+    fn append_second_load(
+        bytes: &mut Vec<u8>,
+        offset: u64,
+        virtual_address: u64,
+        file_size: u64,
+        memory_size: u64,
+    ) {
+        let second_start = ELF64_HEADER_BYTES + ELF64_PROGRAM_HEADER_BYTES;
+        bytes.resize(ELF64_HEADER_BYTES + 2 * ELF64_PROGRAM_HEADER_BYTES, 0);
+        bytes[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let program = &mut bytes[second_start..second_start + ELF64_PROGRAM_HEADER_BYTES];
+        program[0..4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        program[4..8].copy_from_slice(&4u32.to_le_bytes());
+        program[8..16].copy_from_slice(&offset.to_le_bytes());
+        program[16..24].copy_from_slice(&virtual_address.to_le_bytes());
+        program[32..40].copy_from_slice(&file_size.to_le_bytes());
+        program[40..48].copy_from_slice(&memory_size.to_le_bytes());
+        program[48..56].copy_from_slice(&1u64.to_le_bytes());
+    }
+
     #[test]
     fn bounded_x86_64_elf_with_loadable_executable_segment_is_accepted() {
         assert_eq!(validate_x86_64_elf_v1(&elf_fixture()), Ok(()));
@@ -511,6 +554,75 @@ mod tests {
             validate_x86_64_elf_v1(&outside_file),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
         );
+    }
+
+    #[test]
+    fn load_layout_rejects_page_address_order_and_span_violations() {
+        let mut page_incongruent = elf_fixture();
+        page_incongruent[24..32].copy_from_slice(&0x40_0079u64.to_le_bytes());
+        page_incongruent[ELF64_HEADER_BYTES + 16..ELF64_HEADER_BYTES + 24]
+            .copy_from_slice(&0x40_0079u64.to_le_bytes());
+        assert_eq!(
+            validate_x86_64_elf_v1(&page_incongruent),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
+
+        for invalid_address in [ELF64_USER_VIRTUAL_LIMIT, 1u64 << 63] {
+            let mut high = elf_fixture();
+            high[24..32].copy_from_slice(&invalid_address.to_le_bytes());
+            let program = &mut high[ELF64_HEADER_BYTES..];
+            program[8..16].copy_from_slice(&0u64.to_le_bytes());
+            program[16..24].copy_from_slice(&invalid_address.to_le_bytes());
+            assert_eq!(
+                validate_x86_64_elf_v1(&high),
+                Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+            );
+        }
+
+        let mut descending = elf_fixture();
+        descending[24..32].copy_from_slice(&0x50_0078u64.to_le_bytes());
+        descending[ELF64_HEADER_BYTES + 16..ELF64_HEADER_BYTES + 24]
+            .copy_from_slice(&0x50_0078u64.to_le_bytes());
+        append_second_load(&mut descending, 0, 0x40_0000, 0, 1);
+        assert_eq!(
+            validate_x86_64_elf_v1(&descending),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
+
+        let mut excessive_span = elf_fixture();
+        append_second_load(
+            &mut excessive_span,
+            0,
+            0x40_0000 + ELF64_MAX_MAPPING_SPAN,
+            0,
+            1,
+        );
+        assert_eq!(
+            validate_x86_64_elf_v1(&excessive_span),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
+    }
+
+    #[test]
+    fn load_layout_accepts_exact_address_and_mapping_span_boundaries() {
+        let mut address_boundary = elf_fixture();
+        let highest_page = ELF64_USER_VIRTUAL_LIMIT - ELF64_LOAD_PAGE_BYTES;
+        address_boundary[24..32].copy_from_slice(&highest_page.to_le_bytes());
+        let program = &mut address_boundary[ELF64_HEADER_BYTES..];
+        program[8..16].copy_from_slice(&0u64.to_le_bytes());
+        program[16..24].copy_from_slice(&highest_page.to_le_bytes());
+        program[40..48].copy_from_slice(&(ELF64_LOAD_PAGE_BYTES - 1).to_le_bytes());
+        assert_eq!(validate_x86_64_elf_v1(&address_boundary), Ok(()));
+
+        let mut span_boundary = elf_fixture();
+        append_second_load(
+            &mut span_boundary,
+            0,
+            0x40_0000 + ELF64_MAX_MAPPING_SPAN - ELF64_LOAD_PAGE_BYTES,
+            0,
+            ELF64_LOAD_PAGE_BYTES - 1,
+        );
+        assert_eq!(validate_x86_64_elf_v1(&span_boundary), Ok(()));
     }
 
     #[test]
