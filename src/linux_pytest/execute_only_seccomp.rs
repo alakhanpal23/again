@@ -2,9 +2,10 @@
 //! `.venv/bin/python -I -m pytest tests/test_smoke.py::test_smoke`.
 //!
 //! The frozen plan and pure verifier accept no command, path, environment,
-//! descriptor, PID, or callback. A crate-private connector submodule may issue
-//! the opaque witness only after operating on its own stopped disposable child,
-//! reading the exact filter back, and terminally reaping that child. Required
+//! descriptor, PID, or callback. A crate-private connector submodule may return
+//! a completed diagnostic probe only after operating on its own stopped
+//! disposable child, reading the exact filter back, and terminally reaping that
+//! child. Required
 //! native x86_64 workload
 //! syscalls, including sigreturn and exit control calls, route to
 //! `SECCOMP_RET_TRACE`. Wrong audit architectures, x32-tagged calls, and every
@@ -14,8 +15,10 @@
 //! fatal rather than being added speculatively.
 //!
 //! The pure transcript verifier below is not kernel evidence and cannot issue a
-//! witness. The connector-owned stopped-child permit is the only production
-//! issuance path, remains diagnostic, and grants no execution authority.
+//! witness. The connector-owned stopped-child permit returns only a completed
+//! disposable probe; production issuance of a live-child witness remains
+//! impossible until a future connector retains the stopped child and cleanup
+//! owner.
 
 #![allow(
     dead_code,
@@ -31,7 +34,8 @@ mod connector;
     reason = "the sibling main connector has not yet consumed this crate-private checkpoint"
 )]
 pub(in crate::linux_pytest) use connector::{
-    WorkloadSeccompConnectorFailureV1, qualify_stopped_workload_filter_live_v1,
+    CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1,
+    qualify_stopped_workload_filter_live_v1,
 };
 
 const SECCOMP_DATA_NR_OFFSET_V1: u32 = 0;
@@ -917,10 +921,11 @@ struct InstalledFilterEvidenceV1<'program> {
     readback: &'program [WorkloadSockFilterV1],
 }
 
-/// Opaque linear proof shape issued only by the stopped-child kernel connector.
+/// Opaque linear proof shape reserved for a future live-child kernel connector.
 ///
-/// It contains no PID, descriptor, path, command, program bytes, or execution
-/// permit.
+/// No production function can construct this value. It contains no PID,
+/// descriptor, path, command, program bytes, or execution permit. A completed
+/// disposable probe is intentionally not convertible to this type.
 #[must_use = "an installed workload filter witness must be consumed by future connector composition"]
 pub(super) struct InstalledWorkloadSeccompWitnessV1 {
     _seal: InstalledWitnessSealV1,

@@ -1,8 +1,9 @@
 //! Stopped-child installer/readback checkpoint for the frozen workload filter.
 //!
 //! The live entry point creates only a disposable diagnostic child. The child
-//! never accepts or executes a command. A witness is returned only after exact
-//! kernel readback, terminal reap, final `ECHILD`, and signal-mask restoration.
+//! never accepts or executes a command. A completed, non-authoritative probe is
+//! returned only after exact kernel readback, this process's terminal reap,
+//! final `ECHILD`, and signal-mask restoration. It is not a live-child witness.
 
 use core::fmt;
 
@@ -97,6 +98,58 @@ impl fmt::Debug for WorkloadSeccompConnectorFailureV1 {
             .field("kernel_payload", &"<redacted>")
             .field("execution_authority", &false)
             .finish()
+    }
+}
+
+/// Opaque result of a fully closed disposable-child diagnostic.
+///
+/// The child and cleanup owner no longer exist when this value is returned, so
+/// it cannot satisfy any API that requires a live installed-filter witness.
+#[must_use = "a completed disposable workload-filter probe is diagnostic evidence only"]
+pub(in crate::linux_pytest) struct CompletedDisposableWorkloadFilterProbeV1 {
+    policy_digest: [u8; 32],
+    instruction_count: u16,
+}
+
+impl CompletedDisposableWorkloadFilterProbeV1 {
+    pub(in crate::linux_pytest) const fn policy_digest_blake3(&self) -> &[u8; 32] {
+        &self.policy_digest
+    }
+
+    pub(in crate::linux_pytest) const fn instruction_count(&self) -> u16 {
+        self.instruction_count
+    }
+
+    pub(in crate::linux_pytest) const fn live_child_authority(&self) -> bool {
+        false
+    }
+
+    pub(in crate::linux_pytest) const fn execution_authority(&self) -> bool {
+        false
+    }
+
+    pub(in crate::linux_pytest) const fn candidate_or_reuse_authority(&self) -> bool {
+        false
+    }
+}
+
+impl fmt::Debug for CompletedDisposableWorkloadFilterProbeV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletedDisposableWorkloadFilterProbeV1")
+            .field("evidence", &"<redacted-completed-kernel-readback>")
+            .field("instruction_count", &self.instruction_count)
+            .field("live_child_authority", &false)
+            .field("execution_authority", &false)
+            .field("candidate_or_reuse_authority", &false)
+            .finish()
+    }
+}
+
+impl Drop for CompletedDisposableWorkloadFilterProbeV1 {
+    fn drop(&mut self) {
+        self.policy_digest.fill(0);
+        self.instruction_count = 0;
     }
 }
 
@@ -306,7 +359,7 @@ fn observe_exact_v1(
 fn drive_stopped_child_v1(
     _permit: StoppedChildPermitV1,
     operations: &mut impl StoppedChildOperationsV1,
-) -> Result<InstalledWorkloadSeccompWitnessV1, WorkloadSeccompConnectorFailureV1> {
+) -> Result<CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1> {
     let result = (|| {
         observe_exact_v1(operations, ConnectorOperationV1::SignalBlock, 0)?;
         observe_exact_v1(
@@ -392,9 +445,9 @@ fn drive_stopped_child_v1(
                 WorkloadSeccompConnectorReasonV1::FilterMismatch,
             )
         })?;
-        Ok(InstalledWorkloadSeccompWitnessV1 {
-            _seal: InstalledWitnessSealV1,
+        Ok(CompletedDisposableWorkloadFilterProbeV1 {
             policy_digest: workload_policy_digest_blake3_v1(),
+            instruction_count: WORKLOAD_FILTER_INSTRUCTION_COUNT_V1 as u16,
         })
     })();
 
@@ -415,7 +468,7 @@ fn drive_stopped_child_v1(
     target_pointer_width = "64"
 )))]
 pub(in crate::linux_pytest) fn qualify_stopped_workload_filter_live_v1()
--> Result<InstalledWorkloadSeccompWitnessV1, WorkloadSeccompConnectorFailureV1> {
+-> Result<CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1> {
     Err(WorkloadSeccompConnectorFailureV1::new(
         WorkloadSeccompConnectorStageV1::SpawnChild,
         WorkloadSeccompConnectorReasonV1::UnsupportedTarget,
@@ -710,12 +763,7 @@ mod platform {
                 if waited < 0 {
                     let error = last_errno_v1();
                     if error == libc::ECHILD {
-                        self.reaped = true;
-                        return if cleanup {
-                            Ok(0)
-                        } else {
-                            Err(OperationErrorV1::ReapingOwnershipLost)
-                        };
+                        return Err(OperationErrorV1::ReapingOwnershipLost);
                     }
                     return Err(OperationErrorV1::Failed);
                 }
@@ -992,6 +1040,26 @@ mod platform {
     }
 
     #[cfg(test)]
+    pub(super) fn test_competing_reaper_cleanup_uncertainty_v1() -> bool {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return false;
+        }
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+            return false;
+        }
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        operations.child = Some(child);
+        operations.kill().is_ok()
+            && operations.reap(true) == Err(OperationErrorV1::ReapingOwnershipLost)
+            && operations.prove_echild().is_ok()
+    }
+
+    #[cfg(test)]
     static AMBIENT_HANDLER_CALLS_V1: AtomicI32 = AtomicI32::new(0);
 
     #[cfg(test)]
@@ -1042,7 +1110,7 @@ mod platform {
     }
 
     pub(in crate::linux_pytest) fn qualify_stopped_workload_filter_live_v1()
-    -> Result<InstalledWorkloadSeccompWitnessV1, WorkloadSeccompConnectorFailureV1> {
+    -> Result<CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1> {
         let mut operations = LiveStoppedChildOperationsV1::new();
         drive_stopped_child_v1(
             StoppedChildPermitV1 {
@@ -1070,7 +1138,8 @@ mod tests {
         cleanup_failure: Option<ConnectorOperationV1>,
         operations: Vec<ConnectorOperationV1>,
         mutate_readback: bool,
-        failure_error: OperationErrorV1,
+        forward_error: OperationErrorV1,
+        cleanup_error: OperationErrorV1,
         observed_override: Option<(ConnectorOperationV1, i64)>,
     }
 
@@ -1081,7 +1150,8 @@ mod tests {
                 cleanup_failure: None,
                 operations: Vec::new(),
                 mutate_readback: false,
-                failure_error: OperationErrorV1::Failed,
+                forward_error: OperationErrorV1::Failed,
+                cleanup_error: OperationErrorV1::Failed,
                 observed_override: None,
             }
         }
@@ -1107,8 +1177,11 @@ mod tests {
             readback: Option<&mut [WorkloadSockFilterV1]>,
         ) -> Result<i64, OperationErrorV1> {
             self.operations.push(operation);
-            if self.forward_failure == Some(operation) || self.cleanup_failure == Some(operation) {
-                return Err(self.failure_error);
+            if self.forward_failure == Some(operation) {
+                return Err(self.forward_error);
+            }
+            if self.cleanup_failure == Some(operation) {
+                return Err(self.cleanup_error);
             }
             if operation == ConnectorOperationV1::PtraceReadbackInstructions {
                 let output = readback.ok_or(OperationErrorV1::Failed)?;
@@ -1131,15 +1204,21 @@ mod tests {
     }
 
     #[test]
-    fn injected_success_issues_only_a_redacted_non_authoritative_witness() {
+    fn injected_success_returns_only_a_redacted_completed_disposable_probe() {
         let mut operations = InjectedOperationsV1::clean();
-        let witness = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap();
+        let probe = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap();
         assert_eq!(
-            witness.policy_digest_blake3(),
+            probe.policy_digest_blake3(),
             &workload_policy_digest_blake3_v1()
         );
-        assert!(!witness.execution_authority());
-        assert!(format!("{witness:?}").contains("<redacted-kernel-readback>"));
+        assert_eq!(
+            usize::from(probe.instruction_count()),
+            WORKLOAD_FILTER_INSTRUCTION_COUNT_V1
+        );
+        assert!(!probe.live_child_authority());
+        assert!(!probe.execution_authority());
+        assert!(!probe.candidate_or_reuse_authority());
+        assert!(format!("{probe:?}").contains("<redacted-completed-kernel-readback>"));
         assert!(
             !operations
                 .operations
@@ -1198,10 +1277,34 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_echild_never_proves_cleanup_and_preserves_the_first_forward_failure() {
+        let mut operations = InjectedOperationsV1 {
+            forward_failure: Some(ConnectorOperationV1::WaitInitialStop),
+            cleanup_failure: Some(ConnectorOperationV1::CleanupReap),
+            cleanup_error: OperationErrorV1::ReapingOwnershipLost,
+            ..InjectedOperationsV1::clean()
+        };
+        let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
+        assert_eq!(
+            failure.stage(),
+            WorkloadSeccompConnectorStageV1::WaitInitialStop
+        );
+        assert_eq!(
+            failure.reason(),
+            WorkloadSeccompConnectorReasonV1::KernelOperation
+        );
+        assert!(!failure.cleanup_complete());
+        assert_eq!(
+            &operations.operations[operations.operations.len() - CLEANUP_OPERATIONS_V1.len()..],
+            &CLEANUP_OPERATIONS_V1
+        );
+    }
+
+    #[test]
     fn injected_kernel_policy_refusal_is_typed_and_still_cleans() {
         let mut operations = InjectedOperationsV1 {
             forward_failure: Some(ConnectorOperationV1::InstallTsyncFilter),
-            failure_error: OperationErrorV1::Unsupported,
+            forward_error: OperationErrorV1::Unsupported,
             ..InjectedOperationsV1::clean()
         };
         let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
@@ -1226,7 +1329,7 @@ mod tests {
         ] {
             let mut operations = InjectedOperationsV1 {
                 forward_failure: Some(operation),
-                failure_error: OperationErrorV1::Unsupported,
+                forward_error: OperationErrorV1::Unsupported,
                 ..InjectedOperationsV1::clean()
             };
             let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
@@ -1239,10 +1342,10 @@ mod tests {
     }
 
     #[test]
-    fn forward_echild_is_reaping_ownership_loss_and_never_issues_a_witness() {
+    fn forward_echild_is_reaping_ownership_loss_and_never_returns_a_probe() {
         let mut operations = InjectedOperationsV1 {
             forward_failure: Some(ConnectorOperationV1::ReapChild),
-            failure_error: OperationErrorV1::ReapingOwnershipLost,
+            forward_error: OperationErrorV1::ReapingOwnershipLost,
             ..InjectedOperationsV1::clean()
         };
         let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
@@ -1258,7 +1361,7 @@ mod tests {
     fn changed_pending_signal_state_is_a_typed_fail_closed_result() {
         let mut operations = InjectedOperationsV1 {
             forward_failure: Some(ConnectorOperationV1::VerifyPendingSignals),
-            failure_error: OperationErrorV1::SignalStateChanged,
+            forward_error: OperationErrorV1::SignalStateChanged,
             ..InjectedOperationsV1::clean()
         };
         let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
@@ -1310,7 +1413,7 @@ mod tests {
     }
 
     #[test]
-    fn readback_mutation_refuses_and_cleans_without_issuing_a_witness() {
+    fn readback_mutation_refuses_and_cleans_without_returning_a_probe() {
         let mut operations = InjectedOperationsV1 {
             mutate_readback: true,
             ..InjectedOperationsV1::clean()
@@ -1330,8 +1433,10 @@ mod tests {
     #[test]
     fn unsupported_target_or_live_policy_is_a_typed_non_pass() {
         match qualify_stopped_workload_filter_live_v1() {
-            Ok(witness) => {
-                assert!(!witness.execution_authority());
+            Ok(probe) => {
+                assert!(!probe.live_child_authority());
+                assert!(!probe.execution_authority());
+                assert!(!probe.candidate_or_reuse_authority());
             }
             Err(failure) => {
                 assert!(matches!(
@@ -1347,7 +1452,7 @@ mod tests {
     }
 
     #[test]
-    fn connector_permit_and_witness_are_linear_and_non_clone() {
+    fn connector_permit_and_completed_probe_are_linear_and_non_clone() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
         }
@@ -1362,8 +1467,12 @@ mod tests {
 
         <StoppedChildPermitV1 as AmbiguousIfClone<_>>::probe();
         <StoppedChildPermitV1 as AmbiguousIfCopy<_>>::probe();
-        <InstalledWorkloadSeccompWitnessV1 as AmbiguousIfClone<_>>::probe();
-        <InstalledWorkloadSeccompWitnessV1 as AmbiguousIfCopy<_>>::probe();
+        <CompletedDisposableWorkloadFilterProbeV1 as AmbiguousIfClone<_>>::probe();
+        <CompletedDisposableWorkloadFilterProbeV1 as AmbiguousIfCopy<_>>::probe();
+        assert_ne!(
+            core::any::TypeId::of::<CompletedDisposableWorkloadFilterProbeV1>(),
+            core::any::TypeId::of::<InstalledWorkloadSeccompWitnessV1>()
+        );
     }
 
     #[cfg(all(
@@ -1405,6 +1514,17 @@ mod tests {
     #[test]
     fn live_competing_reaper_is_not_accepted_as_forward_reap_evidence() {
         assert_isolated_linux_case_v1(platform::test_competing_reaper_refusal_v1);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_esrch_then_echild_is_cleanup_uncertainty_not_cleanup_proof() {
+        assert_isolated_linux_case_v1(platform::test_competing_reaper_cleanup_uncertainty_v1);
     }
 
     #[cfg(all(
