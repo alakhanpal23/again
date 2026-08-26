@@ -245,14 +245,32 @@ status, incomplete cleanup/reap, nonzero candidate/shadow/promotion/replay
 counts, or any authority claim. The oracle deliberately does not execute
 pytest, dereference its qualified-tuple reference, or independently bind the
 caller-reported binary/source hashes and cleanup booleans; even its consistent
-outcome grants no pass, qualification, execution, or reuse authority. No CLI,
-isolation, tracer, or stdio path consumes this scaffold yet. A dedicated
+outcome grants no pass, qualification, execution, or reuse authority. No CLI
+or tracer path consumes this scaffold yet. A dedicated
 connector transition can now consume the lexical proof while compiling the
 four-view workspace tree, verify the fixed selector's regular-file type,
 length, single-link manifest topology, and content digest before publication
-escrow or rename, and return one opaque linear workspace-tree binding. Nothing calls that
-transition yet; it covers neither the runtime tree nor executable resolution
-and exposes no descriptor, execution, candidate, or reuse authority.
+escrow or rename, and return one opaque linear workspace-tree binding.
+
+That binding can now be consumed by a descriptor-bound runtime checkpoint for
+`.venv/bin/python`. It pins and revalidates each ancestor and symlink, checks
+live metadata against the charged manifest, uses one fallible aggregate memory
+escrow, and validates a conservative kernel-loadable x86_64 ELF `PT_LOAD`
+envelope. It deliberately does not yet qualify `PT_INTERP`, `DT_NEEDED`, the
+runtime forest, the virtual environment, or pytest.
+
+Two additional linear components are present but not yet connected. The stdio
+owner builds EOF stdin and bounded exact stdout/stderr capture with hashes,
+finite polling, cancellation, and cleanup-aware failure reporting; its
+production child-placement and nonblocking presenter seams remain closed. The
+isolation owner keeps namespace PID 1 behind an authenticated release, clears
+supplementary groups before mapping, constructs the private root and bounded
+scratch/procfs topology, scrubs descriptors, normalizes credentials, removes
+capabilities, verifies `no_new_privs`, and can invoke one unforgeable child-side
+continuation while the parent retains kill/reap ownership. It does not yet
+attach workspace/runtime descriptors, stdio, Landlock, workload seccomp, or
+the tracer. No component accepts a command or grants execution, profile,
+candidate, replay, hit, or reuse authority.
 
 A separate bounded reference snapshot oracle records the fixed workspace
 fixture and exact argv while marking source, binary, and qualified-tuple
