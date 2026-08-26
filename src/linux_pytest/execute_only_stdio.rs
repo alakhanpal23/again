@@ -198,7 +198,7 @@ enum CallErrorV1 {
 struct DescriptorFactsV1 {
     device: u64,
     inode: u64,
-    mode: u32,
+    mode: libc::mode_t,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -437,7 +437,7 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
             }
         };
         let expected_nonblocking = matches!(role, FdRoleV1::ParentStdout | FdRoleV1::ParentStderr);
-        if facts.mode & libc::S_IFMT as u32 != libc::S_IFIFO as u32
+        if facts.mode & libc::S_IFMT != libc::S_IFIFO
             || fd_flags & libc::FD_CLOEXEC == 0
             || status & libc::O_ACCMODE != expected_access
             || (status & libc::O_NONBLOCK != 0) != expected_nonblocking
@@ -1490,7 +1490,7 @@ mod tests {
                     facts: DescriptorFactsV1 {
                         device: 7,
                         inode: fd as u64,
-                        mode: libc::S_IFIFO as u32,
+                        mode: libc::S_IFIFO,
                     },
                     fd_flags: libc::FD_CLOEXEC,
                     status_flags: libc::O_RDONLY | libc::O_NONBLOCK,
@@ -1524,7 +1524,7 @@ mod tests {
             let facts = DescriptorFactsV1 {
                 device: 7,
                 inode: state.next_inode,
-                mode: libc::S_IFIFO as u32,
+                mode: libc::S_IFIFO,
             };
             state.next_inode += 1;
             state.open.insert(
@@ -2484,7 +2484,7 @@ mod tests {
             } else {
                 libc::O_WRONLY
             };
-            if facts[index].mode & libc::S_IFMT as u32 != libc::S_IFIFO as u32
+            if facts[index].mode & libc::S_IFMT != libc::S_IFIFO
                 || fd_flags != 0
                 || status_flags < 0
                 || status_flags & libc::O_ACCMODE != expected_access
