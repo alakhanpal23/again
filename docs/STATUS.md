@@ -113,8 +113,11 @@ the product route accepts no command or Python workload.
   transcript contract require a fresh provisioned qualification.
 - **Execute before reusing:** compose one exact pytest
   selector through snapshot, isolation, tracing, stdio, and cleanup as an
-  execute-only foreground run. Candidate construction, shadow, promotion, and
-  hit authority are later independent gates.
+  execute-only foreground run. The first lexical proof can now bind linearly to
+  connector-produced workspace-tree evidence after exact selector-byte checks,
+  but no orchestrator consumes it and runtime/isolation/execution remain open.
+  Candidate construction, shadow, promotion, and hit authority are later
+  independent gates.
 
 The dependency order and exit criteria are normative in
 [ROADMAP.md](ROADMAP.md). Terminal ownership and validation levels are in

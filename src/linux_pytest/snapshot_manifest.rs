@@ -18,6 +18,9 @@
 //! reject such a plan before result construction.
 
 use super::canonical;
+use super::execute_only_admission::{
+    FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1, FirstExecuteOnlyLexicalAdmissionV1,
+};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_connector::{
     SnapshotChargedErrorV1, SnapshotConnectorV1, SnapshotPipelineFourViewErrorV1,
@@ -47,8 +50,9 @@ use super::snapshot_tree::{
 };
 use super::snapshot_verify::StableManifestProjectionV1;
 use super::{
-    ChildCommitmentV1, HardlinkGroupDigest, LinuxPytestContractError, ManifestEntryKindV1,
-    NodeDigest, TimespecV1, TreeRoleV1, XattrV1,
+    ChildCommitmentV1, FILE_CONTENT_DOMAIN, FileContentDigest, HardlinkGroupDigest,
+    LinuxPytestContractError, ManifestEntryKindV1, NodeDigest, RefusalCode, TimespecV1, TreeRoleV1,
+    XattrV1,
 };
 #[cfg(test)]
 use super::{
@@ -156,12 +160,89 @@ impl fmt::Debug for PublishedCanonicalTreeV1<'_> {
     }
 }
 
+/// Linear Gate 3 binding between the exact lexical fixture and one
+/// connector-published workspace tree.
+///
+/// This is only workspace-tree evidence. It deliberately exposes neither the
+/// published descriptors nor canonical manifest bytes, and it cannot be
+/// converted into a sealed runtime snapshot, execution request, candidate, or
+/// reuse authority. Runtime-tree and isolation composition remain separate
+/// future gates.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyWorkspaceTreeBindingV1<'resources> {
+    lexical: FirstExecuteOnlyLexicalAdmissionV1,
+    workspace: PublishedCanonicalTreeV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyWorkspaceTreeBindingV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyWorkspaceTreeBindingV1")
+            .field("lexical", &"<opaque-fixed-fixture-proof>")
+            .field("workspace", &"<opaque-connector-evidence>")
+            .finish()
+    }
+}
+
+fn validate_first_execute_only_workspace_manifest_v1(
+    lexical: &FirstExecuteOnlyLexicalAdmissionV1,
+    manifest: &ChargedTreeManifestV1<'_>,
+) -> Result<(), RefusalCode> {
+    let mut matches = manifest
+        .entries
+        .as_slice()
+        .iter()
+        .filter(|entry| entry.relative_path == lexical.selector().path());
+    let selector = matches.next().ok_or(RefusalCode::SelectorTargetMissing)?;
+    if matches.next().is_some() {
+        return Err(RefusalCode::SnapshotConstructionFailed);
+    }
+    let ChargedManifestPayloadV1::Regular {
+        content_digest,
+        data_extents: _,
+    } = &selector.payload
+    else {
+        return Err(RefusalCode::SelectorTargetType);
+    };
+    let expected_content =
+        FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1]);
+    if selector.metadata.size
+        != u64::try_from(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len())
+            .expect("fixed fixture length fits u64")
+        || selector.metadata.nlink != 1
+        || selector.hardlink_group.is_some()
+        || *content_digest != expected_content
+    {
+        return Err(RefusalCode::SnapshotConstructionFailed);
+    }
+    Ok(())
+}
+
+/// Preserve the ordering boundary between canonical manifest validation and
+/// every irreversible publication operation. The manifest is consumed on
+/// success and dropped on refusal, releasing its charged containers and both
+/// retained-view leases before the caller observes the error.
+fn consume_manifest_after_validation_v1<'resources, T, V, C>(
+    manifest: ChargedTreeManifestV1<'resources>,
+    validate: V,
+    consume: C,
+) -> Result<T, RefusalCode>
+where
+    V: FnOnce(&ChargedTreeManifestV1<'_>) -> Result<(), RefusalCode>,
+    C: FnOnce(ChargedTreeManifestV1<'resources>) -> T,
+{
+    validate(&manifest)?;
+    Ok(consume(manifest))
+}
+
 /// Failures before publication retain their original typed cause. A bind
 /// failure is distinct because its final name is already durable and must
 /// never be treated as removable or safely retried.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) enum SnapshotPublishedCanonicalTreeErrorV1 {
     RootNameMismatch,
+    FirstExecuteOnlyAdmission(RefusalCode),
     FourView(SnapshotPipelineFourViewErrorV1),
     Manifest(SnapshotManifestCompileErrorV1),
     Finalization(SnapshotChargedErrorV1<SnapshotPublishErrorV1>),
@@ -173,6 +254,10 @@ impl fmt::Debug for SnapshotPublishedCanonicalTreeErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::RootNameMismatch => formatter.write_str("RootNameMismatch"),
+            Self::FirstExecuteOnlyAdmission(code) => formatter
+                .debug_tuple("FirstExecuteOnlyAdmission")
+                .field(code)
+                .finish(),
             Self::FourView(error) => formatter.debug_tuple("FourView").field(error).finish(),
             Self::Manifest(error) => formatter.debug_tuple("Manifest").field(error).finish(),
             Self::Finalization(error) => {
@@ -592,6 +677,61 @@ impl SnapshotConnectorV1 {
         source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
         root_name: &CStr,
     ) -> Result<PublishedCanonicalTreeV1<'resources>, SnapshotPublishedCanonicalTreeErrorV1> {
+        self.materialize_workspace_tree_and_publish_with_validation_at(
+            publication_parent,
+            staging_name,
+            final_name,
+            source_s1_view,
+            source_s2_view,
+            root_name,
+            |_| Ok(()),
+        )
+    }
+
+    /// Gate 3 workspace-only composition. The fixed selector bytes are checked
+    /// after four-view verification and canonical compilation but before
+    /// publication escrow or rename. Success remains non-authoritative and has
+    /// no execution consumer.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn materialize_first_execute_only_workspace_tree_and_publish_at<'resources>(
+        &'resources self,
+        lexical: FirstExecuteOnlyLexicalAdmissionV1,
+        publication_parent: BorrowedFd<'resources>,
+        staging_name: &CStr,
+        final_name: &CStr,
+        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
+        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+    ) -> Result<
+        FirstExecuteOnlyWorkspaceTreeBindingV1<'resources>,
+        SnapshotPublishedCanonicalTreeErrorV1,
+    > {
+        let workspace = self.materialize_workspace_tree_and_publish_with_validation_at(
+            publication_parent,
+            staging_name,
+            final_name,
+            source_s1_view,
+            source_s2_view,
+            root_name,
+            |manifest| validate_first_execute_only_workspace_manifest_v1(&lexical, manifest),
+        )?;
+        Ok(FirstExecuteOnlyWorkspaceTreeBindingV1 { lexical, workspace })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_workspace_tree_and_publish_with_validation_at<'resources, V>(
+        &'resources self,
+        publication_parent: BorrowedFd<'resources>,
+        staging_name: &CStr,
+        final_name: &CStr,
+        source_s1_view: QualifiedNoAtimeSourceViewV1<'_>,
+        source_s2_view: QualifiedNoAtimeSourceViewV1<'_>,
+        root_name: &CStr,
+        validate_manifest: V,
+    ) -> Result<PublishedCanonicalTreeV1<'resources>, SnapshotPublishedCanonicalTreeErrorV1>
+    where
+        V: FnOnce(&ChargedTreeManifestV1<'_>) -> Result<(), RefusalCode>,
+    {
         validate_snapshot_final_name(staging_name, final_name).map_err(|error| {
             SnapshotPublishedCanonicalTreeErrorV1::Finalization(SnapshotChargedErrorV1::Leaf(error))
         })?;
@@ -611,30 +751,32 @@ impl SnapshotConnectorV1 {
         if manifest.root_name() != root_name.to_bytes() {
             return Err(SnapshotPublishedCanonicalTreeErrorV1::RootNameMismatch);
         }
+        consume_manifest_after_validation_v1(manifest, validate_manifest, |manifest| {
+            let reservation = staged
+                .reserve_published_child_bind_attempts()
+                .map_err(|error| {
+                    SnapshotPublishedCanonicalTreeErrorV1::Finalization(
+                        SnapshotChargedErrorV1::Resource(error),
+                    )
+                })?;
+            let prepared = SnapshotPreparedPublishedChildBindV1 {
+                reservation,
+                root_name,
+                manifest: &manifest,
+            };
+            let physical = seal_publish_and_bind_snapshot_child_at(staged, final_name, prepared)
+                .map_err(|error| match error {
+                    SnapshotPublishAndBindErrorV1::Finalization(error) => {
+                        SnapshotPublishedCanonicalTreeErrorV1::Finalization(error)
+                    }
+                    SnapshotPublishAndBindErrorV1::PublishedChildBind(error) => {
+                        SnapshotPublishedCanonicalTreeErrorV1::PublishedChildBind(error)
+                    }
+                })?;
 
-        let reservation = staged
-            .reserve_published_child_bind_attempts()
-            .map_err(|error| {
-                SnapshotPublishedCanonicalTreeErrorV1::Finalization(
-                    SnapshotChargedErrorV1::Resource(error),
-                )
-            })?;
-        let prepared = SnapshotPreparedPublishedChildBindV1 {
-            reservation,
-            root_name,
-            manifest: &manifest,
-        };
-        let physical = seal_publish_and_bind_snapshot_child_at(staged, final_name, prepared)
-            .map_err(|error| match error {
-                SnapshotPublishAndBindErrorV1::Finalization(error) => {
-                    SnapshotPublishedCanonicalTreeErrorV1::Finalization(error)
-                }
-                SnapshotPublishAndBindErrorV1::PublishedChildBind(error) => {
-                    SnapshotPublishedCanonicalTreeErrorV1::PublishedChildBind(error)
-                }
-            })?;
-
-        Ok(PublishedCanonicalTreeV1 { physical, manifest })
+            Ok(PublishedCanonicalTreeV1 { physical, manifest })
+        })
+        .map_err(SnapshotPublishedCanonicalTreeErrorV1::FirstExecuteOnlyAdmission)?
     }
 }
 
@@ -1160,7 +1302,7 @@ mod tests {
     use crate::linux_pytest::snapshot_verify::{
         DestinationPhysicalIdentityV1, StableManifestProjectionV1, begin_four_view_comparison,
     };
-    use crate::linux_pytest::{ExtentV1, FILE_CONTENT_DOMAIN, FileContentDigest, TimespecV1};
+    use crate::linux_pytest::{ExtentV1, TimespecV1};
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 
     const S_IFDIR: u32 = 0o040_000;
@@ -1677,6 +1819,82 @@ mod tests {
         (plan(true), plan(false))
     }
 
+    fn first_execute_only_fixture(contents: &[u8]) -> (SourceTreePlanV1, SourceTreePlanV1) {
+        let plan = |source| {
+            let size = u64::try_from(contents.len()).unwrap();
+            let selector = SourceTreeEntryV1::unchecked_for_test(
+                b"tests/test_smoke.py",
+                b"test_smoke.py",
+                Some(1),
+                statx(
+                    source,
+                    3,
+                    S_IFREG | if source { 0o644 } else { 0o444 },
+                    1,
+                    size,
+                    5,
+                    6,
+                    if source { 7 } else { 700 },
+                    None,
+                ),
+                Vec::new(),
+                SourcePlanPayloadV1::Regular {
+                    evidence: SourceRegularEvidenceV1::checked(
+                        FileContentDigest::derive(FILE_CONTENT_DOMAIN, &[contents]),
+                        (size != 0)
+                            .then_some(ExtentV1 {
+                                offset: 0,
+                                length: size,
+                            })
+                            .into_iter()
+                            .collect(),
+                        size,
+                    )
+                    .unwrap(),
+                },
+                None,
+            );
+            SourceTreePlanV1::unchecked_for_test(
+                b"source-root",
+                vec![
+                    directory_entry(source, b"", b"source-root", None, 1, vec![1]),
+                    directory_entry(source, b"tests", b"tests", Some(0), 2, vec![2]),
+                    selector,
+                ],
+                Vec::new(),
+                false,
+            )
+        };
+        (plan(true), plan(false))
+    }
+
+    fn validate_first_execute_only_fixture(contents: &[u8]) -> Result<(), RefusalCode> {
+        let resources = manifest_resources(1024 * 1024);
+        let (source_s1, destination_d1) = first_execute_only_fixture(contents);
+        let (source_s2, destination_d2) = first_execute_only_fixture(contents);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let manifest = compile_charged(&resources, stable).unwrap();
+        let lexical = first_execute_only_lexical();
+        validate_first_execute_only_workspace_manifest_v1(&lexical, &manifest)
+    }
+
+    fn first_execute_only_lexical() -> FirstExecuteOnlyLexicalAdmissionV1 {
+        let argv = [
+            b".venv/bin/python".as_slice(),
+            b"-I",
+            b"-m",
+            b"pytest",
+            b"tests/test_smoke.py::test_smoke",
+        ];
+        super::super::execute_only_admission::parse_first_execute_only_argv_v1(&argv).unwrap()
+    }
+
     fn nested_xattr_fixture(seed: u8) -> (SourceTreePlanV1, SourceTreePlanV1) {
         let plan = |source| {
             let regular = regular_entry(source, b"dir/file", b"file", 1, 3, 1, seed, None);
@@ -1786,6 +2004,123 @@ mod tests {
         };
         assert_eq!(root[0].node_digest, entries[1].node_digest);
         assert_eq!(compiled.root_digest, entries[0].node_digest);
+    }
+
+    #[test]
+    fn first_execute_only_workspace_manifest_binds_exact_fixture_bytes() {
+        assert_eq!(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len(), 96);
+        assert_eq!(
+            validate_first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn first_execute_only_workspace_manifest_rejects_missing_or_changed_selector() {
+        let changed = FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, byte)| if index == 0 { byte ^ 1 } else { byte })
+            .collect::<Vec<_>>();
+        assert_eq!(changed.len(), FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len());
+        assert_eq!(
+            validate_first_execute_only_fixture(&changed),
+            Err(RefusalCode::SnapshotConstructionFailed)
+        );
+        assert_eq!(
+            validate_first_execute_only_fixture(
+                &FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1
+                    [..FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len() - 1]
+            ),
+            Err(RefusalCode::SnapshotConstructionFailed)
+        );
+
+        let resources = manifest_resources(1024 * 1024);
+        let (source_s1, destination_d1) = nested_fixture(0x41);
+        let (source_s2, destination_d2) = nested_fixture(0x41);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let manifest = compile_charged(&resources, stable).unwrap();
+        let lexical = first_execute_only_lexical();
+        assert_eq!(
+            validate_first_execute_only_workspace_manifest_v1(&lexical, &manifest),
+            Err(RefusalCode::SelectorTargetMissing)
+        );
+    }
+
+    #[test]
+    fn first_execute_only_refusal_drops_manifest_before_publication_continuation() {
+        let resources = manifest_resources(1024 * 1024);
+        let changed = FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, byte)| if index == 0 { byte ^ 1 } else { byte })
+            .collect::<Vec<_>>();
+        let (source_s1, destination_d1) = first_execute_only_fixture(&changed);
+        let (source_s2, destination_d2) = first_execute_only_fixture(&changed);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let manifest = compile_charged(&resources, stable).unwrap();
+        assert!(resources.persistent_manifest_heap_live_for_test() > 0);
+        assert!(resources.retained_view_heap_live_for_test() > 0);
+
+        let lexical = first_execute_only_lexical();
+        let publication_entered = std::cell::Cell::new(false);
+        let result = consume_manifest_after_validation_v1(
+            manifest,
+            |manifest| validate_first_execute_only_workspace_manifest_v1(&lexical, manifest),
+            |_| publication_entered.set(true),
+        );
+        assert_eq!(result, Err(RefusalCode::SnapshotConstructionFailed));
+        assert!(!publication_entered.get());
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[test]
+    fn first_execute_only_success_consumes_manifest_once_and_releases_on_drop() {
+        let resources = manifest_resources(1024 * 1024);
+        let (source_s1, destination_d1) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let (source_s2, destination_d2) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let manifest = compile_charged(&resources, stable).unwrap();
+        let expected_root = manifest.root_digest();
+        let lexical = first_execute_only_lexical();
+        let continuation_calls = std::cell::Cell::new(0u8);
+        let result = consume_manifest_after_validation_v1(
+            manifest,
+            |manifest| validate_first_execute_only_workspace_manifest_v1(&lexical, manifest),
+            |manifest| {
+                continuation_calls.set(continuation_calls.get() + 1);
+                assert!(resources.persistent_manifest_heap_live_for_test() > 0);
+                assert!(resources.retained_view_heap_live_for_test() > 0);
+                manifest.root_digest()
+            },
+        );
+        assert_eq!(result, Ok(expected_root));
+        assert_eq!(continuation_calls.get(), 1);
+        assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
+        assert_eq!(resources.retained_view_heap_live_for_test(), 0);
     }
 
     #[test]
@@ -2457,10 +2792,15 @@ mod tests {
             <SnapshotPreparedPublishedChildBindV1<'static, 'static> as AmbiguousIfCopy<_>>::probe();
             <PublishedCanonicalTreeV1<'static> as AmbiguousIfClone<_>>::probe();
             <PublishedCanonicalTreeV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <FirstExecuteOnlyWorkspaceTreeBindingV1<'static> as AmbiguousIfClone<_>>::probe();
+            <FirstExecuteOnlyWorkspaceTreeBindingV1<'static> as AmbiguousIfCopy<_>>::probe();
             assert!(std::mem::needs_drop::<
                 SnapshotPreparedPublishedChildBindV1<'static, 'static>,
             >());
             assert!(std::mem::needs_drop::<PublishedCanonicalTreeV1<'static>>());
+            assert!(std::mem::needs_drop::<
+                FirstExecuteOnlyWorkspaceTreeBindingV1<'static>,
+            >());
         }
 
         let resources = manifest_resources(4 * 1024 * 1024);

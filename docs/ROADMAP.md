@@ -235,7 +235,14 @@ counts, or any authority claim. The oracle deliberately does not execute
 pytest, dereference its qualified-tuple reference, or independently bind the
 caller-reported binary/source hashes and cleanup booleans; even its consistent
 outcome grants no pass, qualification, execution, or reuse authority. No CLI,
-snapshot, isolation, tracer, or stdio path consumes this scaffold yet.
+isolation, tracer, or stdio path consumes this scaffold yet. A dedicated
+connector transition can now consume the lexical proof while compiling the
+four-view workspace tree, verify the fixed selector's regular-file type,
+length, single-link manifest topology, and content digest before publication
+escrow or rename,
+and return one opaque linear workspace-tree binding. Nothing calls that
+transition yet; it covers neither the runtime tree nor executable resolution
+and exposes no descriptor, execution, candidate, or reuse authority.
 
 The first acceptance fixture should use exactly one selector, such as
 `tests/test_smoke.py::test_smoke`. It must compose:

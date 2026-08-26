@@ -11,6 +11,8 @@ const PYTEST_PREFIX_V1: [&[u8]; 4] = [b".venv/bin/python", b"-I", b"-m", b"pytes
 const FIRST_EXECUTE_ONLY_SELECTOR_V1: &[u8] = b"tests/test_smoke.py::test_smoke";
 const FIRST_EXECUTE_ONLY_ARGC_V1: usize = PYTEST_PREFIX_V1.len() + 1;
 const FIRST_EXECUTE_ONLY_SELECTOR_MAX_BYTES_V1: usize = FIRST_EXECUTE_ONLY_SELECTOR_V1.len();
+pub(super) const FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1: &[u8] =
+    include_bytes!("../../bench/fixtures/linux_pytest_execute_only_v1/tests/test_smoke.py");
 
 /// Non-authoritative lexical proof for the first execute-only fixture.
 ///
@@ -25,10 +27,6 @@ pub(super) struct FirstExecuteOnlyLexicalAdmissionV1 {
 impl FirstExecuteOnlyLexicalAdmissionV1 {
     pub(super) fn selector(&self) -> &PytestSelectorV1 {
         &self.selector
-    }
-
-    pub(super) fn into_selector(self) -> PytestSelectorV1 {
-        self.selector
     }
 }
 
@@ -88,7 +86,7 @@ mod tests {
         assert_eq!(parsed.selector().raw(), FIRST_EXECUTE_ONLY_SELECTOR_V1);
         assert_eq!(parsed.selector().path(), b"tests/test_smoke.py");
         assert_eq!(parsed.selector().nodes(), &[b"test_smoke".to_vec()]);
-        assert_eq!(parsed.into_selector().raw(), FIRST_EXECUTE_ONLY_SELECTOR_V1);
+        assert_eq!(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len(), 96);
     }
 
     #[test]
