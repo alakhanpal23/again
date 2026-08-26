@@ -22,6 +22,7 @@ import stat
 import struct
 import sys
 import zipfile
+import zlib
 
 
 REPORT_MEMBER = "report.json"
@@ -287,7 +288,10 @@ def _validate_member_metadata(info: zipfile.ZipInfo) -> None:
     if info.create_system == 3:
         regular = stat.S_ISREG(mode)
     elif info.create_system == 0:
-        regular = True
+        # DOS metadata has no Unix file type.  Permit its permission bits, but
+        # reject a contradictory Unix type encoding rather than letting two
+        # ZIP consumers assign different meanings to the same member.
+        regular = stat.S_IFMT(mode) == 0
     else:
         regular = False
     if not regular:
@@ -334,11 +338,48 @@ def _validate_data_descriptor(
         raise EvidenceError(f"ZIP data descriptor mismatch: {info.filename}")
 
 
+def _decode_exact_member_payload(
+    archive_bytes: bytes,
+    data_start: int,
+    info: zipfile.ZipInfo,
+) -> bytes:
+    compressed = _require_slice(
+        archive_bytes,
+        data_start,
+        info.compress_size,
+        f"compressed member data for {info.filename}",
+    )
+    if info.compress_type == zipfile.ZIP_STORED:
+        if info.compress_size != info.file_size:
+            raise EvidenceError(f"stored ZIP member size mismatch: {info.filename}")
+        decoded = compressed
+    elif info.compress_type == zipfile.ZIP_DEFLATED:
+        decoder = zlib.decompressobj(-zlib.MAX_WBITS)
+        try:
+            decoded = decoder.decompress(compressed, info.file_size + 1)
+        except zlib.error as error:
+            raise EvidenceError(f"invalid raw DEFLATE stream: {info.filename}") from error
+        if (
+            not decoder.eof
+            or decoder.unused_data
+            or decoder.unconsumed_tail
+            or len(decoded) != info.file_size
+        ):
+            raise EvidenceError(
+                f"DEFLATE stream does not consume exactly one member: {info.filename}"
+            )
+    else:  # _validate_member_metadata rejects this before layout validation.
+        raise EvidenceError(f"unsupported compression method: {info.filename}")
+    if len(decoded) != info.file_size:
+        raise EvidenceError(f"independent member size mismatch: {info.filename}")
+    return decoded
+
+
 def _validate_exact_zip_layout(
     archive_bytes: bytes,
     evidence: zipfile.ZipFile,
     infos: list[zipfile.ZipInfo],
-) -> None:
+) -> dict[str, bytes]:
     """Reject hidden prefixes, trailers, gaps, comments, and extra fields."""
     if evidence.comment != b"" or len(archive_bytes) < END_OF_CENTRAL_DIRECTORY.size:
         raise EvidenceError("ZIP comment or truncated end record")
@@ -367,6 +408,41 @@ def _validate_exact_zip_layout(
     if central_offset != evidence.start_dir or central_offset + central_size != eocd_offset:
         raise EvidenceError("ZIP central directory does not cover the archive exactly")
 
+    central_by_local_offset: dict[int, tuple[int, ...]] = {}
+    cursor = evidence.start_dir
+    for info in infos:
+        fixed = _require_slice(
+            archive_bytes,
+            cursor,
+            CENTRAL_DIRECTORY_HEADER.size,
+            f"central header for {info.filename}",
+        )
+        central = CENTRAL_DIRECTORY_HEADER.unpack(fixed)
+        if central[0] != CENTRAL_DIRECTORY_HEADER_SIGNATURE:
+            raise EvidenceError(f"invalid ZIP central header: {info.filename}")
+        name_size, extra_size, comment_size = central[10:13]
+        disk_start = central[13]
+        local_offset = central[16]
+        name_start = cursor + CENTRAL_DIRECTORY_HEADER.size
+        name = _require_slice(archive_bytes, name_start, name_size, "central member name")
+        try:
+            expected_name = info.orig_filename.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise EvidenceError(f"non-UTF-8 ZIP member name: {info.orig_filename}") from error
+        if name != expected_name or local_offset != info.header_offset:
+            raise EvidenceError(f"ZIP central member mismatch: {info.filename}")
+        if extra_size != 0 or comment_size != 0:
+            raise EvidenceError(f"ZIP central extras/comments unsupported: {info.filename}")
+        if disk_start != 0:
+            raise EvidenceError(f"multi-disk ZIP member is unsupported: {info.filename}")
+        if local_offset in central_by_local_offset:
+            raise EvidenceError(f"duplicate ZIP local header offset: {info.filename}")
+        central_by_local_offset[local_offset] = central
+        cursor = name_start + name_size
+    if cursor != eocd_offset:
+        raise EvidenceError("ZIP contains a hidden trailer or central-directory gap")
+
+    independent_contents: dict[str, bytes] = {}
     ordered = sorted(infos, key=lambda info: info.header_offset)
     if not ordered or ordered[0].header_offset != 0:
         raise EvidenceError("ZIP contains a hidden prefix")
@@ -380,8 +456,11 @@ def _validate_exact_zip_layout(
         local = LOCAL_FILE_HEADER.unpack(fixed)
         if local[0] != LOCAL_FILE_HEADER_SIGNATURE:
             raise EvidenceError(f"invalid ZIP local header: {info.filename}")
+        central = central_by_local_offset[info.header_offset]
+        local_version = local[1]
         local_flags = local[2]
         local_compression = local[3]
+        local_time, local_date = local[4:6]
         local_crc, local_compressed_size, local_file_size = local[6:9]
         name_size, extra_size = local[9:11]
         name_start = info.header_offset + LOCAL_FILE_HEADER.size
@@ -394,7 +473,15 @@ def _validate_exact_zip_layout(
             raise EvidenceError(f"non-UTF-8 ZIP member name: {info.orig_filename}") from error
         if name != expected_name:
             raise EvidenceError(f"ZIP local member name mismatch: {info.filename}")
-        if local_flags != info.flag_bits or local_compression != info.compress_type:
+        if (
+            local_version != central[2]
+            or local_flags != central[3]
+            or local_compression != central[4]
+            or local_time != central[5]
+            or local_date != central[6]
+            or local_flags != info.flag_bits
+            or local_compression != info.compress_type
+        ):
             raise EvidenceError(f"ZIP local metadata mismatch: {info.filename}")
         data_start = name_start + name_size
         data_end = data_start + info.compress_size
@@ -403,7 +490,9 @@ def _validate_exact_zip_layout(
             if index + 1 < len(ordered)
             else evidence.start_dir
         )
-        _require_slice(archive_bytes, data_start, info.compress_size, "compressed member data")
+        independent_contents[info.filename] = _decode_exact_member_payload(
+            archive_bytes, data_start, info
+        )
         if local_flags & 0x08:
             if (local_crc, local_compressed_size, local_file_size) != (0, 0, 0):
                 raise EvidenceError(f"non-canonical deferred ZIP sizes: {info.filename}")
@@ -418,28 +507,7 @@ def _validate_exact_zip_layout(
             if data_end != next_offset:
                 raise EvidenceError(f"unreferenced bytes after ZIP member: {info.filename}")
 
-    cursor = evidence.start_dir
-    for info in infos:
-        fixed = _require_slice(
-            archive_bytes,
-            cursor,
-            CENTRAL_DIRECTORY_HEADER.size,
-            f"central header for {info.filename}",
-        )
-        central = CENTRAL_DIRECTORY_HEADER.unpack(fixed)
-        if central[0] != CENTRAL_DIRECTORY_HEADER_SIGNATURE:
-            raise EvidenceError(f"invalid ZIP central header: {info.filename}")
-        name_size, extra_size, comment_size = central[10:13]
-        local_offset = central[16]
-        name_start = cursor + CENTRAL_DIRECTORY_HEADER.size
-        name = _require_slice(archive_bytes, name_start, name_size, "central member name")
-        if name != info.orig_filename.encode("utf-8") or local_offset != info.header_offset:
-            raise EvidenceError(f"ZIP central member mismatch: {info.filename}")
-        if extra_size != 0 or comment_size != 0:
-            raise EvidenceError(f"ZIP central extras/comments unsupported: {info.filename}")
-        cursor = name_start + name_size
-    if cursor != eocd_offset:
-        raise EvidenceError("ZIP contains a hidden trailer or central-directory gap")
+    return independent_contents
 
 
 def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
@@ -487,14 +555,13 @@ def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
                 raise EvidenceError("archive contains duplicate member names")
             if set(names) != EXPECTED_MEMBERS:
                 raise EvidenceError("archive member set does not match the exact allowlist")
-            _validate_exact_zip_layout(archive_bytes, evidence, infos)
-
             total_size = 0
             for info in infos:
                 _validate_member_metadata(info)
                 total_size += info.file_size
                 if total_size > MAX_TOTAL_UNCOMPRESSED_BYTES:
                     raise EvidenceError("archive uncompressed size exceeds the total limit")
+            independent_contents = _validate_exact_zip_layout(archive_bytes, evidence, infos)
             for info in infos:
                 limit = _member_limit(info.filename)
                 with evidence.open(info, "r") as member:
@@ -503,6 +570,8 @@ def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
                         raise EvidenceError(f"oversized decompressed member: {info.filename}")
                 if len(data) != info.file_size or len(data) > limit:
                     raise EvidenceError(f"member size mismatch: {info.filename}")
+                if data != independent_contents[info.filename]:
+                    raise EvidenceError(f"independent member decode mismatch: {info.filename}")
                 contents[info.filename] = data
     except (OSError, zipfile.BadZipFile, RuntimeError, NotImplementedError) as error:
         raise EvidenceError(f"invalid ZIP archive: {error}") from error

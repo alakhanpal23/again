@@ -160,14 +160,16 @@ def write_zip(
     members: dict[str, bytes],
     *,
     special: dict[str, int] | None = None,
+    create_system: dict[str, int] | None = None,
+    compression: int = zipfile.ZIP_DEFLATED,
     duplicate: tuple[str, bytes] | None = None,
 ) -> None:
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(path, "w", compression=compression) as archive:
         for name, data in members.items():
             info = zipfile.ZipInfo(name)
-            info.create_system = 3
+            info.create_system = create_system.get(name, 3) if create_system else 3
             info.external_attr = (stat.S_IFREG | 0o600) << 16
-            info.compress_type = zipfile.ZIP_DEFLATED
+            info.compress_type = compression
             if special and name in special:
                 info.external_attr = special[name] << 16
             archive.writestr(info, data)
@@ -175,6 +177,74 @@ def write_zip(
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", UserWarning)
                 archive.writestr(duplicate[0], duplicate[1])
+
+
+def append_hidden_byte_to_last_member(path: Path) -> None:
+    raw = bytearray(path.read_bytes())
+    with zipfile.ZipFile(path, "r") as archive:
+        infos = archive.infolist()
+        last = max(infos, key=lambda info: info.header_offset)
+        central_offset = archive.start_dir
+
+    central_cursor = central_offset
+    last_central_offset = None
+    for info in infos:
+        central = verifier.CENTRAL_DIRECTORY_HEADER.unpack_from(raw, central_cursor)
+        name_size, extra_size, comment_size = central[10:13]
+        if info.filename == last.filename:
+            last_central_offset = central_cursor
+        central_cursor += (
+            verifier.CENTRAL_DIRECTORY_HEADER.size
+            + name_size
+            + extra_size
+            + comment_size
+        )
+    if last_central_offset is None:
+        raise AssertionError("last member must have a central header")
+
+    local = list(verifier.LOCAL_FILE_HEADER.unpack_from(raw, last.header_offset))
+    name_size, extra_size = local[9:11]
+    data_end = (
+        last.header_offset
+        + verifier.LOCAL_FILE_HEADER.size
+        + name_size
+        + extra_size
+        + last.compress_size
+    )
+    if data_end != central_offset:
+        raise AssertionError("test ZIP must place the last payload before the central directory")
+    raw[data_end:data_end] = b"X"
+    local[7] += 1
+    verifier.LOCAL_FILE_HEADER.pack_into(raw, last.header_offset, *local)
+
+    shifted_central_offset = last_central_offset + 1
+    central = list(verifier.CENTRAL_DIRECTORY_HEADER.unpack_from(raw, shifted_central_offset))
+    central[8] += 1
+    verifier.CENTRAL_DIRECTORY_HEADER.pack_into(raw, shifted_central_offset, *central)
+
+    eocd_offset = len(raw) - verifier.END_OF_CENTRAL_DIRECTORY.size
+    eocd = list(verifier.END_OF_CENTRAL_DIRECTORY.unpack_from(raw, eocd_offset))
+    eocd[6] += 1
+    verifier.END_OF_CENTRAL_DIRECTORY.pack_into(raw, eocd_offset, *eocd)
+    path.write_bytes(raw)
+
+
+def set_first_central_disk_start(path: Path, disk_start: int) -> None:
+    raw = bytearray(path.read_bytes())
+    with zipfile.ZipFile(path, "r") as archive:
+        central_offset = archive.start_dir
+    central = list(verifier.CENTRAL_DIRECTORY_HEADER.unpack_from(raw, central_offset))
+    central[13] = disk_start
+    verifier.CENTRAL_DIRECTORY_HEADER.pack_into(raw, central_offset, *central)
+    path.write_bytes(raw)
+
+
+def change_first_local_metadata(path: Path, field: int) -> None:
+    raw = bytearray(path.read_bytes())
+    local = list(verifier.LOCAL_FILE_HEADER.unpack_from(raw, 0))
+    local[field] ^= 1
+    verifier.LOCAL_FILE_HEADER.pack_into(raw, 0, *local)
+    path.write_bytes(raw)
 
 
 class ExecuteOnlyEvidenceVerifierTests(unittest.TestCase):
@@ -185,6 +255,9 @@ class ExecuteOnlyEvidenceVerifierTests(unittest.TestCase):
 
     def verify(self, members: dict[str, bytes] | None = None) -> dict[str, object]:
         write_zip(self.archive, valid_members() if members is None else members)
+        return self.verify_current_archive()
+
+    def verify_current_archive(self) -> dict[str, object]:
         return verifier.verify_archive(
             self.archive,
             SOURCE_COMMIT,
@@ -196,6 +269,9 @@ class ExecuteOnlyEvidenceVerifierTests(unittest.TestCase):
 
     def assert_rejected(self, members: dict[str, bytes]) -> None:
         write_zip(self.archive, members)
+        self.assert_current_archive_rejected()
+
+    def assert_current_archive_rejected(self) -> None:
         with self.assertRaises(verifier.EvidenceError):
             verifier.verify_archive(
                 self.archive,
@@ -342,6 +418,50 @@ class ExecuteOnlyEvidenceVerifierTests(unittest.TestCase):
                         TUPLE_REFERENCE,
                         TUPLE_SHA256,
                     )
+
+    def test_hidden_bytes_inside_stored_and_deflated_members_are_rejected(self) -> None:
+        for compression in [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED]:
+            with self.subTest(compression=compression):
+                write_zip(self.archive, valid_members(), compression=compression)
+                self.verify_current_archive()
+                append_hidden_byte_to_last_member(self.archive)
+                self.assert_current_archive_rejected()
+
+    def test_dos_origin_rejects_every_unix_file_type_encoding(self) -> None:
+        for mode in [
+            stat.S_IFREG | 0o600,
+            stat.S_IFLNK | 0o777,
+            stat.S_IFIFO | 0o600,
+            stat.S_IFDIR | 0o700,
+        ]:
+            with self.subTest(mode=mode):
+                write_zip(
+                    self.archive,
+                    valid_members(),
+                    special={verifier.STDOUT_MEMBER: mode},
+                    create_system={verifier.STDOUT_MEMBER: 0},
+                )
+                self.assert_current_archive_rejected()
+
+        write_zip(
+            self.archive,
+            valid_members(),
+            special={verifier.STDOUT_MEMBER: 0o600},
+            create_system={verifier.STDOUT_MEMBER: 0},
+        )
+        self.verify_current_archive()
+
+    def test_nonzero_central_member_disk_start_is_rejected(self) -> None:
+        write_zip(self.archive, valid_members())
+        set_first_central_disk_start(self.archive, 1)
+        self.assert_current_archive_rejected()
+
+    def test_local_version_time_and_date_must_match_central_metadata(self) -> None:
+        for field in [1, 4, 5]:
+            with self.subTest(field=field):
+                write_zip(self.archive, valid_members())
+                change_first_local_metadata(self.archive, field)
+                self.assert_current_archive_rejected()
 
     def test_malformed_duplicate_key_trailing_and_non_object_json_are_rejected(self) -> None:
         for name in [
