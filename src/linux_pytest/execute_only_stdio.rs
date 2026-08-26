@@ -1116,6 +1116,8 @@ fn child_errno_v1() -> i32 {
     target_pointer_width = "64"
 ))]
 unsafe impl IsolationChildContinuationV1 for ProfileStdioIsolationChildV1 {
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+
     fn continue_in_child_v1(
         self,
         _brand: IsolationChildOnlyBrandV1,
