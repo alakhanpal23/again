@@ -279,7 +279,9 @@ impl FixedTwoTaskSupervisorFailureV1 {
     const fn with_cleanup(mut self, cleanup_complete: bool, cleanup_errno: Option<i32>) -> Self {
         if !cleanup_complete {
             self.cleanup_complete = false;
-            self.cleanup_errno = cleanup_errno;
+            if self.cleanup_errno.is_none() {
+                self.cleanup_errno = cleanup_errno;
+            }
         }
         self
     }
@@ -826,6 +828,13 @@ mod platform {
             if self.nested_tid == Some(raw_tid) {
                 self.nested_reaped = true;
             }
+            if self.pending_nested_stop_tid == Some(raw_tid) {
+                // A wait-proven but not yet event-message-correlated child is
+                // still cleanup authority for that exact lifetime. Retire the
+                // raw identity only after consuming its terminal wait so a
+                // later cleanup pass cannot target a reused TID.
+                self.pending_nested_stop_tid = None;
+            }
         }
 
         fn prove_final_echild(&mut self) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
@@ -884,7 +893,11 @@ mod platform {
                         return (false, first_errno);
                     };
                     if wait_status_is_ptrace_stop_v1(status) {
-                        let _ = kill_tid_v1(faults, raw_tid);
+                        if let Err(errno) = kill_tid_v1(faults, raw_tid) {
+                            if errno != libc::ESRCH {
+                                first_errno.get_or_insert(errno);
+                            }
+                        }
                         if let Err(errno) = ptrace_call_v1(
                             faults,
                             ConnectorKernelOperationV1::PtraceCleanupResume,
@@ -922,6 +935,11 @@ mod platform {
                 }
                 match deadline.expired() {
                     Ok(false) => {
+                        // Keep retrying every lifetime-bound task while the
+                        // bounded drain is live. In particular, child-stop-first
+                        // cleanup must not discard its only safe identity after
+                        // one failed kill/resume pair.
+                        self.kill_known(&mut first_errno, faults);
                         if let Err(errno) = wait_backoff_v1() {
                             return (false, first_errno.or(Some(errno)));
                         }
@@ -953,7 +971,7 @@ mod platform {
                     faults,
                 );
             }
-            if let Some(raw_tid) = self.pending_nested_stop_tid.take() {
+            if let Some(raw_tid) = self.pending_nested_stop_tid {
                 if let Err(errno) = kill_tid_v1(faults, raw_tid) {
                     if errno != libc::ESRCH {
                         first_errno.get_or_insert(errno);
@@ -1057,8 +1075,25 @@ mod platform {
             }
         };
 
-        let fork_delivery_order = tree.fork_delivery_order.ok_or_else(planner_failure_v1)?;
-        tree.close_success()?;
+        let fork_delivery_order = match tree.fork_delivery_order {
+            Some(order) => order,
+            None => {
+                return Err(finish_failed_run_v1(
+                    planner_failure_v1(),
+                    &mut tree,
+                    &signal_state,
+                    faults,
+                ));
+            }
+        };
+        if let Err(first) = tree.close_success() {
+            return Err(finish_failed_run_v1(
+                first,
+                &mut tree,
+                &signal_state,
+                faults,
+            ));
+        }
         signal_state
             .verify(faults)
             .map_err(|failure| failure.with_cleanup(false, None))?;
@@ -2764,6 +2799,91 @@ mod platform {
         }
 
         #[test]
+        fn child_stop_first_cleanup_retries_without_discarding_wait_authority() {
+            let mut tree = inert_tree_v1();
+            tree.disarmed = false;
+            tree.pending_nested_stop_tid = Some(20);
+            let mut faults = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                ),
+                (
+                    ConnectorKernelOperationV1::PtraceCleanupResume,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::PtraceCleanupResume,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::ECHILD),
+                ),
+            ]);
+
+            assert_eq!(tree.cleanup(&mut faults), (false, Some(libc::EIO)));
+            assert!(tree.final_echild);
+            assert!(tree.disarmed);
+            faults.assert_consumed();
+        }
+
+        #[test]
+        fn child_stop_first_terminal_wait_retires_raw_cleanup_identity() {
+            let mut tree = inert_tree_v1();
+            tree.disarmed = false;
+            tree.pending_nested_stop_tid = Some(20);
+            let mut faults = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::PtraceCleanupResume,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Return(20),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::ECHILD),
+                ),
+            ]);
+
+            assert_eq!(tree.cleanup(&mut faults), (true, None));
+            assert!(tree.pending_nested_stop_tid.is_none());
+            assert!(tree.final_echild);
+            assert!(tree.disarmed);
+            faults.assert_consumed();
+        }
+
+        #[test]
         fn every_cleanup_kernel_operation_has_an_injected_failure_boundary() {
             let descriptor: OwnedFd = fs::File::open("/dev/null").unwrap().into();
             let mut pidfd_failure = ScriptedFaultsV1::one(
@@ -2859,6 +2979,23 @@ mod tests {
         assert!(!first.cleanup_complete());
         assert_eq!(first.cleanup_errno(), Some(libc::ETIMEDOUT));
         assert!(!first.is_expected_unavailable());
+    }
+
+    #[test]
+    fn later_cleanup_annotation_never_replaces_the_first_cleanup_errno() {
+        let first = FixedTwoTaskSupervisorFailureV1::new(
+            RefusalCode::IsolationPreflightFailed,
+            FixedTwoTaskSupervisorStageV1::ProcessMemory,
+            FixedTwoTaskSupervisorReasonV1::ShortIo,
+            Some(libc::EFAULT),
+            true,
+        )
+        .with_cleanup(false, Some(libc::EIO))
+        .with_cleanup(false, Some(libc::ETIMEDOUT));
+
+        assert_eq!(first.stage(), "process_memory");
+        assert_eq!(first.errno(), Some(libc::EFAULT));
+        assert_eq!(first.cleanup_errno(), Some(libc::EIO));
     }
 
     #[test]
