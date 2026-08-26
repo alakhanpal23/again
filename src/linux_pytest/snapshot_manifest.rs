@@ -29,26 +29,29 @@ use super::snapshot_connector::{
     SnapshotManifestCompilationSessionV1, consume_stable_manifest_projection,
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_materialize::projected_materialized_permissions;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::SnapshotPublishedChildBindReservationV1;
 use super::snapshot_policy::{
     SnapshotManifestCompilationVecV1, SnapshotPipelineResourceErrorV1, SnapshotRetainedViewLeaseV1,
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
-    BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, SnapshotPublishAndBindErrorV1,
-    SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1, ValidatedBoundRelativePathV1,
-    VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1, read_bound_regular_bytes_v1,
-    seal_publish_and_bind_snapshot_child_at, validate_snapshot_final_name,
+    BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, RuntimeMemoryEscrowV1,
+    SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
+    ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
+    read_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
+    validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
     bound_published_snapshot_directory_fd, bound_published_snapshot_root_fd,
 };
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_tree::QualifiedNoAtimeSourceViewV1;
 use super::snapshot_tree::{
     CapturedXattrValueV1, SourcePlanPayloadV1, SourceTreeEntryV1, SourceTreePlanV1,
 };
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_tree::{QualifiedNoAtimeSourceViewV1, SourceNodeKindV1};
 use super::snapshot_verify::StableManifestProjectionV1;
 use super::{
     ChildCommitmentV1, FILE_CONTENT_DOMAIN, FileContentDigest, HardlinkGroupDigest,
@@ -197,9 +200,11 @@ pub(super) enum FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1 {
     ByteLimit,
     ShortRead,
     Io,
+    MemoryBudget,
     ManifestNodeMissing,
     ManifestNodeAmbiguous,
     ManifestKindMismatch,
+    ManifestMetadataMismatch,
     ManifestSymlinkMismatch,
     ManifestContentMismatch,
     ManifestDigestMismatch,
@@ -253,6 +258,7 @@ pub(super) struct FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources> {
     nodes: Vec<FirstExecuteOnlyRuntimeNodeBindingV1>,
     terminal_node_digest: NodeDigest,
     terminal_logical_mode: u32,
+    runtime_memory: RuntimeMemoryEscrowV1,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -288,6 +294,10 @@ impl FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_> {
     pub(super) const fn terminal_logical_mode(&self) -> u32 {
         self.terminal_logical_mode
     }
+
+    pub(super) const fn runtime_memory(&self) -> &RuntimeMemoryEscrowV1 {
+        &self.runtime_memory
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -311,12 +321,17 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
     FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
     FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
 > {
-    let path = ValidatedBoundRelativePathV1::parse(FIRST_EXECUTE_ONLY_EXECUTABLE_V1)
-        .map_err(map_bound_regular_refusal_v1)?;
+    let runtime_memory = RuntimeMemoryEscrowV1::first_checkpoint();
+    let path = ValidatedBoundRelativePathV1::parse_with_memory(
+        FIRST_EXECUTE_ONLY_EXECUTABLE_V1,
+        &runtime_memory,
+    )
+    .map_err(map_bound_regular_refusal_v1)?;
     let verified = read_bound_regular_bytes_v1(
         &binding.workspace.physical,
         &path,
         FIRST_EXECUTE_ONLY_EXECUTABLE_MAX_BYTES_V1,
+        &runtime_memory,
     )
     .map_err(map_bound_regular_refusal_v1)?;
     if verified.root_statx_commitment()
@@ -343,8 +358,19 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
     {
         return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
     }
+    if !matches!(&root.payload, ChargedManifestPayloadV1::Directory { .. })
+        || !live_manifest_metadata_matches_v1(
+            root,
+            verified.root_live_statx(),
+            verified.root_live_statx(),
+        )
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestMetadataMismatch);
+    }
 
-    let mut nodes = Vec::with_capacity(verified.nodes().len());
+    let mut nodes = runtime_memory
+        .try_vec_with_capacity(verified.nodes().len())
+        .map_err(map_bound_regular_refusal_v1)?;
     let mut terminal = None;
     for observed in verified.nodes() {
         let mut matches = binding
@@ -371,6 +397,15 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
         if !charged_manifest_entry_digest_consistent_v1(entry) {
             return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
         }
+        if !live_manifest_metadata_matches_v1(
+            entry,
+            observed.live_statx(),
+            verified.root_live_statx(),
+        ) {
+            return Err(
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestMetadataMismatch,
+            );
+        }
         if let ChargedManifestPayloadV1::Symlink { target } = &entry.payload
             && observed.symlink_target() != Some(target.as_slice())
         {
@@ -391,8 +426,19 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
             terminal = Some((entry.node_digest, entry.metadata.mode));
         }
         nodes.push(FirstExecuteOnlyRuntimeNodeBindingV1 {
-            normalized_path: observed.normalized_path().into(),
-            normalized_next_path: observed.normalized_next_path().map(Into::into),
+            normalized_path: runtime_memory
+                .try_bytes_from_slice(observed.normalized_path())
+                .map_err(map_bound_regular_refusal_v1)?
+                .into_boxed_slice(),
+            normalized_next_path: observed
+                .normalized_next_path()
+                .map(|path| {
+                    runtime_memory
+                        .try_bytes_from_slice(path)
+                        .map(Vec::into_boxed_slice)
+                })
+                .transpose()
+                .map_err(map_bound_regular_refusal_v1)?,
             kind: observed.kind(),
             statx_commitment: *observed.statx_commitment(),
             node_digest: entry.node_digest,
@@ -407,7 +453,36 @@ pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resource
         nodes,
         terminal_node_digest,
         terminal_logical_mode,
+        runtime_memory,
     })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn live_manifest_metadata_matches_v1(
+    entry: &ChargedManifestEntryV1<'_>,
+    live: &super::snapshot_tree::SourceStatxV1,
+    physical_root: &super::snapshot_tree::SourceStatxV1,
+) -> bool {
+    let kind = match &entry.payload {
+        ChargedManifestPayloadV1::Directory { .. } => SourceNodeKindV1::Directory,
+        ChargedManifestPayloadV1::Regular { .. } => SourceNodeKindV1::Regular,
+        ChargedManifestPayloadV1::Symlink { .. } => SourceNodeKindV1::Symlink,
+    };
+    let expected_type = match kind {
+        SourceNodeKindV1::Directory => libc::S_IFDIR,
+        SourceNodeKindV1::Regular => libc::S_IFREG,
+        SourceNodeKindV1::Symlink => libc::S_IFLNK,
+    };
+    let permission_match = projected_materialized_permissions(entry.metadata.mode, kind)
+        .is_none_or(|permissions| live.mode() & 0o7777 == permissions);
+    live.mode() & libc::S_IFMT == expected_type
+        && permission_match
+        && live.uid() == physical_root.uid()
+        && live.gid() == physical_root.gid()
+        && live.nlink() == entry.metadata.nlink
+        && (kind == SourceNodeKindV1::Directory || live.size() == entry.metadata.size)
+        && live.atime() == &entry.metadata.atime
+        && live.mtime() == &entry.metadata.mtime
 }
 
 #[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
@@ -467,6 +542,9 @@ fn map_bound_regular_refusal_v1(
             FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ShortRead
         }
         BoundRegularReadRefusalV1::Io => FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+        BoundRegularReadRefusalV1::MemoryBudget => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MemoryBudget
+        }
     }
 }
 
@@ -1584,6 +1662,8 @@ fn compile_hardlink_group_digests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::linux_pytest::snapshot_connector::connect_snapshot_pipeline;
     use crate::linux_pytest::snapshot_connector::{
         manifest_compilation_session_for_test, mint_destination_witness_bytes_for_test,
         retain_tree_plan_for_test,
@@ -1599,7 +1679,13 @@ mod tests {
         DestinationPhysicalIdentityV1, StableManifestProjectionV1, begin_four_view_comparison,
     };
     use crate::linux_pytest::{ExtentV1, TimespecV1};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::fs::{self, File};
     use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::fd::AsFd;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::unix::fs::PermissionsExt;
 
     const S_IFDIR: u32 = 0o040_000;
     const S_IFREG: u32 = 0o100_000;
@@ -2178,6 +2264,153 @@ mod tests {
         let manifest = compile_charged(&resources, stable).unwrap();
         let lexical = first_execute_only_lexical();
         validate_first_execute_only_workspace_manifest_v1(&lexical, &manifest)
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn live_manifest_metadata_requires_projected_permissions_and_stable_fields() {
+        let resources = manifest_resources(1024 * 1024);
+        let (source_s1, destination_d1) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let (source_s2, destination_d2) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let manifest = compile_charged(&resources, stable).unwrap();
+        let selector = manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.relative_path == b"tests/test_smoke.py")
+            .unwrap();
+        let physical_root = statx(false, 90, S_IFDIR | 0o555, 2, 8_192, 1, 2, 300, None);
+        let matching = statx(
+            false,
+            91,
+            S_IFREG | 0o444,
+            1,
+            FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len() as u64,
+            5,
+            6,
+            700,
+            None,
+        );
+        assert!(live_manifest_metadata_matches_v1(
+            selector,
+            &matching,
+            &physical_root
+        ));
+
+        let chmod_drift = statx(
+            false,
+            91,
+            S_IFREG | 0o400,
+            1,
+            FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len() as u64,
+            5,
+            6,
+            701,
+            None,
+        );
+        assert!(!live_manifest_metadata_matches_v1(
+            selector,
+            &chmod_drift,
+            &physical_root
+        ));
+        let timestamp_drift = statx(
+            false,
+            91,
+            S_IFREG | 0o444,
+            1,
+            FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1.len() as u64,
+            5,
+            60,
+            702,
+            None,
+        );
+        assert!(!live_manifest_metadata_matches_v1(
+            selector,
+            &timestamp_drift,
+            &physical_root
+        ));
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn real_elf_materializes_publishes_and_reaches_non_authoritative_runtime_checkpoint() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir_all(source.path().join(".venv/bin")).unwrap();
+        fs::create_dir_all(source.path().join("tests")).unwrap();
+        fs::copy("/bin/true", source.path().join(".venv/bin/python")).unwrap();
+        fs::set_permissions(
+            source.path().join(".venv/bin/python"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            source.path().join("tests/test_smoke.py"),
+            FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1,
+        )
+        .unwrap();
+        let source_fd = File::open(source.path()).unwrap();
+
+        let publication = tempfile::tempdir().unwrap();
+        let publication_fd = File::open(publication.path()).unwrap();
+        let connector = connect_snapshot_pipeline(manifest_resources(8 * 1024 * 1024)).unwrap();
+        let lexical = first_execute_only_lexical();
+        let source_s1 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_fd.as_fd(),
+            )
+        };
+        let source_s2 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                source_fd.as_fd(),
+            )
+        };
+        let binding = connector
+            .materialize_first_execute_only_workspace_tree_and_publish_at(
+                lexical,
+                publication_fd.as_fd(),
+                c".again-snapshot-stage-11111111111111111111111111111111",
+                c"snapshot-final",
+                source_s1,
+                source_s2,
+                c"root",
+            )
+            .unwrap();
+        let checkpoint =
+            crate::linux_pytest::execute_only_runtime::qualify_first_execute_only_runtime_checkpoint_v1(
+                binding,
+            )
+            .unwrap();
+        assert!(checkpoint.node_count() >= 3);
+        assert_eq!(checkpoint.symlink_hop_count(), 0);
+        assert_ne!(checkpoint.chain_digest().as_bytes(), &[0; 32]);
+        drop(checkpoint);
+
+        make_tree_owner_writable_for_cleanup(publication.path());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn make_tree_owner_writable_for_cleanup(path: &std::path::Path) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if !metadata.is_dir() {
+            return;
+        }
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            make_tree_owner_writable_for_cleanup(&entry.path());
+        }
     }
 
     fn first_execute_only_lexical() -> FirstExecuteOnlyLexicalAdmissionV1 {

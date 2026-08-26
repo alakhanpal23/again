@@ -21,6 +21,7 @@
 //! identity leaves the private stage for explicit scavenging rather than
 //! risking deletion of a replacement object.
 
+use std::cell::Cell;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
@@ -37,7 +38,8 @@ use super::snapshot_policy::{
     SnapshotPublishedChildBindReservationV1,
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_tree::{SOURCE_TREE_REQUESTED_STATX_MASK_V1, SourceStatxV1};
+use super::snapshot_tree::SOURCE_TREE_REQUESTED_STATX_MASK_V1;
+use super::snapshot_tree::SourceStatxV1;
 use super::{Blake3Digest, FileContentDigest};
 
 const STAGING_NAME_PREFIX: &[u8] = b".again-snapshot-stage-";
@@ -79,6 +81,7 @@ const BOUND_REGULAR_MAX_BYTES_V1: u32 = 16 * 1024 * 1024;
 const BOUND_REGULAR_MAX_OBSERVED_NODES_V1: usize =
     BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 * (BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 + 1);
 const BOUND_REGULAR_IDENTITY_DOMAIN_V1: &str = "again bound published regular identity v1";
+const RUNTIME_MEMORY_LIMIT_V1: usize = 128 * 1024 * 1024;
 
 /// Stable, payload-free refusals from the operation-specific published-child
 /// reader. These values are diagnostic only and never grant execution.
@@ -99,7 +102,82 @@ pub(super) enum BoundRegularReadRefusalV1 {
     ByteLimit,
     ShortRead,
     Io,
+    MemoryBudget,
     UnsupportedPlatform,
+}
+
+/// One non-clonable aggregate budget for every runtime-resolution allocation.
+/// It is retained through canonical checkpoint construction so no phase can
+/// restart the allowance. Allocation is always fallible and charged first.
+pub(super) struct RuntimeMemoryEscrowV1 {
+    remaining: Cell<usize>,
+}
+
+impl RuntimeMemoryEscrowV1 {
+    pub(super) const fn first_checkpoint() -> Self {
+        Self {
+            remaining: Cell::new(RUNTIME_MEMORY_LIMIT_V1),
+        }
+    }
+
+    fn charge(&self, bytes: usize) -> Result<(), BoundRegularReadRefusalV1> {
+        let remaining = self
+            .remaining
+            .get()
+            .checked_sub(bytes)
+            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+        self.remaining.set(remaining);
+        Ok(())
+    }
+
+    pub(super) fn try_vec_with_capacity<T>(
+        &self,
+        capacity: usize,
+    ) -> Result<Vec<T>, BoundRegularReadRefusalV1> {
+        let bytes = capacity
+            .checked_mul(std::mem::size_of::<T>())
+            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+        self.charge(bytes)?;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(capacity)
+            .map_err(|_| BoundRegularReadRefusalV1::MemoryBudget)?;
+        Ok(output)
+    }
+
+    pub(super) fn try_bytes_from_slice(
+        &self,
+        value: &[u8],
+    ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
+        let mut output = self.try_vec_with_capacity(value.len())?;
+        output.extend_from_slice(value);
+        Ok(output)
+    }
+
+    pub(super) fn try_extend_bytes(
+        &self,
+        output: &mut Vec<u8>,
+        value: &[u8],
+    ) -> Result<(), BoundRegularReadRefusalV1> {
+        if output.capacity() - output.len() < value.len() {
+            let additional = value.len() - (output.capacity() - output.len());
+            self.charge(additional)?;
+            output
+                .try_reserve_exact(additional)
+                .map_err(|_| BoundRegularReadRefusalV1::MemoryBudget)?;
+        }
+        output.extend_from_slice(value);
+        Ok(())
+    }
+}
+
+impl fmt::Debug for RuntimeMemoryEscrowV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RuntimeMemoryEscrowV1")
+            .field("remaining", &"<redacted-budget>")
+            .finish()
+    }
 }
 
 /// A relative raw-byte path admitted for one descriptor-relative read.
@@ -110,6 +188,15 @@ impl ValidatedBoundRelativePathV1 {
     pub(super) fn parse(path: &[u8]) -> Result<Self, BoundRegularReadRefusalV1> {
         validate_bound_components_v1(path)?;
         Ok(Self(path.into()))
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    pub(super) fn parse_with_memory(
+        path: &[u8],
+        memory: &RuntimeMemoryEscrowV1,
+    ) -> Result<Self, BoundRegularReadRefusalV1> {
+        validate_bound_components_v1(path)?;
+        Ok(Self(memory.try_bytes_from_slice(path)?.into_boxed_slice()))
     }
 
     fn as_bytes(&self) -> &[u8] {
@@ -138,6 +225,7 @@ pub(super) struct VerifiedBoundPathNodeV1 {
     statx_commitment: [u8; 102],
     symlink_target: Option<Box<[u8]>>,
     normalized_next_path: Option<Box<[u8]>>,
+    live_statx: SourceStatxV1,
 }
 
 impl VerifiedBoundPathNodeV1 {
@@ -160,6 +248,10 @@ impl VerifiedBoundPathNodeV1 {
     pub(super) fn normalized_next_path(&self) -> Option<&[u8]> {
         self.normalized_next_path.as_deref()
     }
+
+    pub(super) const fn live_statx(&self) -> &SourceStatxV1 {
+        &self.live_statx
+    }
 }
 
 impl fmt::Debug for VerifiedBoundPathNodeV1 {
@@ -179,6 +271,7 @@ pub(super) struct VerifiedBoundRegularBytesV1 {
     bytes: Vec<u8>,
     nodes: Vec<VerifiedBoundPathNodeV1>,
     root_statx_commitment: [u8; 102],
+    root_live_statx: SourceStatxV1,
     terminal_identity_digest: Blake3Digest,
     content_digest: FileContentDigest,
 }
@@ -194,6 +287,10 @@ impl VerifiedBoundRegularBytesV1 {
 
     pub(super) const fn root_statx_commitment(&self) -> &[u8; 102] {
         &self.root_statx_commitment
+    }
+
+    pub(super) const fn root_live_statx(&self) -> &SourceStatxV1 {
+        &self.root_live_statx
     }
 
     pub(super) const fn terminal_identity_digest(&self) -> Blake3Digest {
@@ -244,8 +341,10 @@ fn validate_bound_components_v1(path: &[u8]) -> Result<(), BoundRegularReadRefus
 fn read_exact_bound_regular_size_v1<R: std::io::Read>(
     reader: &mut R,
     size: usize,
+    memory: &RuntimeMemoryEscrowV1,
 ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
-    let mut bytes = vec![0u8; size];
+    let mut bytes = memory.try_vec_with_capacity(size)?;
+    bytes.resize(size, 0);
     if let Err(error) = reader.read_exact(&mut bytes) {
         bytes.fill(0);
         return Err(match error.kind() {
@@ -272,11 +371,12 @@ pub(super) fn read_bound_regular_bytes_v1(
     bound: &BoundPublishedSnapshotChildV1,
     path: &ValidatedBoundRelativePathV1,
     byte_ceiling: u32,
+    memory: &RuntimeMemoryEscrowV1,
 ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
     if byte_ceiling == 0 || byte_ceiling > BOUND_REGULAR_MAX_BYTES_V1 {
         return Err(BoundRegularReadRefusalV1::InvalidByteCeiling);
     }
-    platform::read_bound_regular_bytes_v1(bound, path.as_bytes(), byte_ceiling)
+    platform::read_bound_regular_bytes_v1(bound, path.as_bytes(), byte_ceiling, memory)
 }
 
 const fn cleanup_fd_peak(max_cleanup_depth: u16) -> u32 {
@@ -800,7 +900,6 @@ pub(super) fn create_staged_snapshot_directory_at<'parent>(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
-    use std::collections::VecDeque;
     use std::ffi::CString;
     use std::mem::{self, MaybeUninit};
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
@@ -1328,10 +1427,49 @@ mod platform {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum BoundReadStageV1 {
+        AfterComponentOpen,
+        AfterDirectoryRecorded,
+        BeforeSymlinkRead,
+        BeforeFinalRecheck,
+    }
+
+    trait BoundReadHookV1 {
+        fn checkpoint(&mut self, _stage: BoundReadStageV1) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct KernelBoundReadHookV1;
+    impl BoundReadHookV1 for KernelBoundReadHookV1 {}
+
+    struct BoundAncestorV1 {
+        fd: OwnedFd,
+        expected: [u8; 102],
+    }
+
     pub(super) fn read_bound_regular_bytes_v1(
         bound: &BoundPublishedSnapshotChildV1,
         path: &[u8],
         byte_ceiling: u32,
+        memory: &RuntimeMemoryEscrowV1,
+    ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
+        read_bound_regular_bytes_with_hook_v1(
+            bound,
+            path,
+            byte_ceiling,
+            memory,
+            &mut KernelBoundReadHookV1,
+        )
+    }
+
+    fn read_bound_regular_bytes_with_hook_v1<H: BoundReadHookV1>(
+        bound: &BoundPublishedSnapshotChildV1,
+        path: &[u8],
+        byte_ceiling: u32,
+        memory: &RuntimeMemoryEscrowV1,
+        hook: &mut H,
     ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
         let published_before = node_statx_v1(bound.published.as_fd())?;
         let root_before = node_statx_v1(bound.root.as_fd())?;
@@ -1341,38 +1479,60 @@ mod platform {
             return Err(BoundRegularReadRefusalV1::IdentityDrift);
         }
         let root_commitment = root_before.commitment_bytes_v1();
-        let initial = split_bound_path_v1(path)?;
-        let mut pending = VecDeque::from(initial.clone());
-        let mut resolved_prefix = Vec::<Vec<u8>>::new();
-        let mut directory: Option<OwnedFd> = None;
-        let mut nodes = Vec::<VerifiedBoundPathNodeV1>::new();
-        let mut normalized_paths = vec![join_bound_components_v1(&initial)?];
+        let initial = split_bound_path_v1(path, memory)?;
+        let initial_path = join_bound_components_v1(&initial, memory)?;
+        let mut pending = initial;
+        let mut resolved_prefix =
+            memory.try_vec_with_capacity(BOUND_REGULAR_PATH_MAX_COMPONENTS_V1)?;
+        let mut ancestors = memory.try_vec_with_capacity(BOUND_REGULAR_PATH_MAX_COMPONENTS_V1)?;
+        let mut nodes = memory.try_vec_with_capacity(BOUND_REGULAR_MAX_OBSERVED_NODES_V1)?;
+        let mut normalized_paths =
+            memory.try_vec_with_capacity(BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 + 1)?;
+        normalized_paths.push(initial_path);
+        let mut visited_symlink_identities =
+            memory.try_vec_with_capacity(BOUND_REGULAR_SYMLINK_MAX_HOPS_V1)?;
         let mut symlink_hops = 0usize;
 
         loop {
-            let component = pending
-                .front()
-                .ok_or(BoundRegularReadRefusalV1::InvalidPath)?
-                .clone();
-            let component_name = CString::new(component.clone())
-                .map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
-            let parent = directory
-                .as_ref()
-                .map_or(bound.root.as_fd(), std::os::fd::AsFd::as_fd);
-            let parent_before = node_statx_v1(parent)?;
+            let component = memory.try_bytes_from_slice(
+                pending
+                    .first()
+                    .ok_or(BoundRegularReadRefusalV1::InvalidPath)?,
+            )?;
+            let name_capacity = component
+                .len()
+                .checked_add(1)
+                .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+            let mut component_name_bytes = memory.try_vec_with_capacity(name_capacity)?;
+            component_name_bytes.extend_from_slice(&component);
+            component_name_bytes.push(0);
+            let component_name =
+                unsafe { CString::from_vec_with_nul_unchecked(component_name_bytes) };
+            revalidate_bound_ancestors_v1(bound, root_commitment, &ancestors)?;
+            let parent = ancestors
+                .last()
+                .map_or(bound.root.as_fd(), |ancestor: &BoundAncestorV1| {
+                    ancestor.fd.as_fd()
+                });
             let path_fd = open_bound_component_v1(
                 parent,
                 &component_name,
                 libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             )?;
-            let parent_after = node_statx_v1(parent)?;
-            if parent_before.commitment_bytes_v1() != parent_after.commitment_bytes_v1() {
-                return Err(BoundRegularReadRefusalV1::IdentityDrift);
-            }
+            hook.checkpoint(BoundReadStageV1::AfterComponentOpen)
+                .map_err(map_bound_io_v1)?;
+            revalidate_bound_ancestors_v1(bound, root_commitment, &ancestors)?;
             let before = node_statx_v1(path_fd.as_fd())?;
-            let mut observed_path_components = resolved_prefix.clone();
-            observed_path_components.push(component.clone());
-            let observed_path = join_bound_components_v1(&observed_path_components)?;
+            let mut observed_path_components = clone_bound_components_v1(
+                &resolved_prefix,
+                resolved_prefix
+                    .len()
+                    .checked_add(1)
+                    .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?,
+                memory,
+            )?;
+            observed_path_components.push(memory.try_bytes_from_slice(&component)?);
+            let observed_path = join_bound_components_v1(&observed_path_components, memory)?;
             let mode_type = before.mode() & libc::S_IFMT;
 
             if mode_type == libc::S_IFLNK {
@@ -1382,27 +1542,50 @@ mod platform {
                 if symlink_hops > BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 {
                     return Err(BoundRegularReadRefusalV1::SymlinkLimit);
                 }
-                let target = read_bound_link_v1(parent, &component_name)?;
+                let mut identity = [0u8; 24];
+                identity.copy_from_slice(&before.commitment_bytes_v1()[1..25]);
+                if visited_symlink_identities.contains(&identity) {
+                    return Err(BoundRegularReadRefusalV1::SymlinkCycle);
+                }
+                visited_symlink_identities.push(identity);
+                hook.checkpoint(BoundReadStageV1::BeforeSymlinkRead)
+                    .map_err(map_bound_io_v1)?;
+                let target = read_bound_link_v1(path_fd.as_fd(), memory)?;
                 let after = node_statx_v1(path_fd.as_fd())?;
                 if before.commitment_bytes_v1() != after.commitment_bytes_v1() {
                     return Err(BoundRegularReadRefusalV1::IdentityDrift);
                 }
-                let target_components = split_bound_path_v1(&target)
-                    .map_err(|_| BoundRegularReadRefusalV1::SymlinkTargetInvalid)?;
-                let mut next = resolved_prefix.clone();
-                next.extend(target_components);
-                next.extend(pending.iter().skip(1).cloned());
-                if next.len() > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
+                revalidate_bound_ancestors_v1(bound, root_commitment, &ancestors)?;
+                let target_components = split_bound_path_v1(&target, memory).map_err(|error| {
+                    if error == BoundRegularReadRefusalV1::MemoryBudget {
+                        error
+                    } else {
+                        BoundRegularReadRefusalV1::SymlinkTargetInvalid
+                    }
+                })?;
+                let next_count = resolved_prefix
+                    .len()
+                    .checked_add(target_components.len())
+                    .and_then(|count| count.checked_add(pending.len().saturating_sub(1)))
+                    .ok_or(BoundRegularReadRefusalV1::ComponentLimit)?;
+                if next_count > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
                     return Err(BoundRegularReadRefusalV1::ComponentLimit);
                 }
-                let normalized_next = join_bound_components_v1(&next)?;
+                let mut next = clone_bound_components_v1(&resolved_prefix, next_count, memory)?;
+                for target_component in target_components {
+                    next.push(target_component);
+                }
+                for remaining in pending.iter().skip(1) {
+                    next.push(memory.try_bytes_from_slice(remaining)?);
+                }
+                let normalized_next = join_bound_components_v1(&next, memory)?;
                 if normalized_paths
                     .iter()
                     .any(|existing| existing.as_slice() == normalized_next.as_slice())
                 {
                     return Err(BoundRegularReadRefusalV1::SymlinkCycle);
                 }
-                normalized_paths.push(normalized_next.clone());
+                normalized_paths.push(memory.try_bytes_from_slice(&normalized_next)?);
                 push_unique_bound_node_v1(
                     &mut nodes,
                     VerifiedBoundPathNodeV1 {
@@ -1411,11 +1594,12 @@ mod platform {
                         statx_commitment: before.commitment_bytes_v1(),
                         symlink_target: Some(target.into_boxed_slice()),
                         normalized_next_path: Some(normalized_next.into_boxed_slice()),
+                        live_statx: before,
                     },
                 )?;
-                pending = next.into();
+                pending = next;
                 resolved_prefix.clear();
-                directory = None;
+                ancestors.clear();
                 continue;
             }
 
@@ -1429,11 +1613,17 @@ mod platform {
                         statx_commitment: before.commitment_bytes_v1(),
                         symlink_target: None,
                         normalized_next_path: None,
+                        live_statx: before.clone(),
                     },
                 )?;
                 resolved_prefix.push(component);
-                pending.pop_front();
-                directory = Some(path_fd);
+                pending.remove(0);
+                ancestors.push(BoundAncestorV1 {
+                    fd: path_fd,
+                    expected: before.commitment_bytes_v1(),
+                });
+                hook.checkpoint(BoundReadStageV1::AfterDirectoryRecorded)
+                    .map_err(map_bound_io_v1)?;
                 continue;
             }
             if mode_type != libc::S_IFREG || !terminal {
@@ -1458,7 +1648,7 @@ mod platform {
                 return Err(BoundRegularReadRefusalV1::ByteLimit);
             }
             let mut file = std::fs::File::from(read_fd);
-            let mut bytes = read_exact_bound_regular_size_v1(&mut file, size)?;
+            let mut bytes = read_exact_bound_regular_size_v1(&mut file, size, memory)?;
             let after = node_statx_v1(file.as_fd())?;
             if opened.commitment_bytes_v1() != after.commitment_bytes_v1() {
                 bytes.fill(0);
@@ -1473,8 +1663,12 @@ mod platform {
                     statx_commitment: terminal_commitment,
                     symlink_target: None,
                     normalized_next_path: None,
+                    live_statx: opened.clone(),
                 },
             )?;
+            hook.checkpoint(BoundReadStageV1::BeforeFinalRecheck)
+                .map_err(map_bound_io_v1)?;
+            revalidate_bound_ancestors_v1(bound, root_commitment, &ancestors)?;
             let root_after = node_statx_v1(bound.root.as_fd())?;
             let published_after = node_statx_v1(bound.published.as_fd())?;
             if root_commitment != root_after.commitment_bytes_v1()
@@ -1493,21 +1687,59 @@ mod platform {
                 bytes,
                 nodes,
                 root_statx_commitment: root_commitment,
+                root_live_statx: root_before,
                 content_digest,
             });
         }
     }
 
-    fn split_bound_path_v1(path: &[u8]) -> Result<Vec<Vec<u8>>, BoundRegularReadRefusalV1> {
+    fn revalidate_bound_ancestors_v1(
+        bound: &BoundPublishedSnapshotChildV1,
+        root_commitment: [u8; 102],
+        ancestors: &[BoundAncestorV1],
+    ) -> Result<(), BoundRegularReadRefusalV1> {
+        if node_statx_v1(bound.root.as_fd())?.commitment_bytes_v1() != root_commitment {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        for ancestor in ancestors {
+            if node_statx_v1(ancestor.fd.as_fd())?.commitment_bytes_v1() != ancestor.expected {
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+        }
+        Ok(())
+    }
+
+    fn split_bound_path_v1(
+        path: &[u8],
+        memory: &RuntimeMemoryEscrowV1,
+    ) -> Result<Vec<Vec<u8>>, BoundRegularReadRefusalV1> {
         validate_bound_components_v1(path)?;
-        Ok(path
-            .split(|byte| *byte == b'/')
-            .map(<[u8]>::to_vec)
-            .collect())
+        let count = path.split(|byte| *byte == b'/').count();
+        let mut output = memory.try_vec_with_capacity(count)?;
+        for component in path.split(|byte| *byte == b'/') {
+            output.push(memory.try_bytes_from_slice(component)?);
+        }
+        Ok(output)
+    }
+
+    fn clone_bound_components_v1(
+        components: &[Vec<u8>],
+        capacity: usize,
+        memory: &RuntimeMemoryEscrowV1,
+    ) -> Result<Vec<Vec<u8>>, BoundRegularReadRefusalV1> {
+        if capacity < components.len() || capacity > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
+            return Err(BoundRegularReadRefusalV1::ComponentLimit);
+        }
+        let mut output = memory.try_vec_with_capacity(capacity)?;
+        for component in components {
+            output.push(memory.try_bytes_from_slice(component)?);
+        }
+        Ok(output)
     }
 
     fn join_bound_components_v1(
         components: &[Vec<u8>],
+        memory: &RuntimeMemoryEscrowV1,
     ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
         if components.is_empty() || components.len() > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
             return Err(BoundRegularReadRefusalV1::ComponentLimit);
@@ -1518,7 +1750,7 @@ mod platform {
                 total.checked_add(component.len())
             })
             .ok_or(BoundRegularReadRefusalV1::ComponentLimit)?;
-        let mut joined = Vec::with_capacity(length);
+        let mut joined = memory.try_vec_with_capacity(length)?;
         for (index, component) in components.iter().enumerate() {
             if index != 0 {
                 joined.push(b'/');
@@ -1561,14 +1793,15 @@ mod platform {
     }
 
     fn read_bound_link_v1(
-        parent: BorrowedFd<'_>,
-        name: &CStr,
+        symlink: BorrowedFd<'_>,
+        memory: &RuntimeMemoryEscrowV1,
     ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
-        let mut target = vec![0u8; BOUND_REGULAR_TARGET_MAX_BYTES_V1 + 1];
+        let mut target = memory.try_vec_with_capacity(BOUND_REGULAR_TARGET_MAX_BYTES_V1 + 1)?;
+        target.resize(BOUND_REGULAR_TARGET_MAX_BYTES_V1 + 1, 0);
         let count = unsafe {
             libc::readlinkat(
-                parent.as_raw_fd(),
-                name.as_ptr(),
+                symlink.as_raw_fd(),
+                c"".as_ptr(),
                 target.as_mut_ptr().cast(),
                 target.len(),
             )
@@ -4918,6 +5151,48 @@ mod platform {
             assert!(fixture.final_path().join("root").is_dir());
         }
 
+        fn read_bound_for_test(
+            bound: &BoundPublishedSnapshotChildV1,
+            path: &ValidatedBoundRelativePathV1,
+            ceiling: u32,
+        ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
+            super::super::read_bound_regular_bytes_v1(
+                bound,
+                path,
+                ceiling,
+                &RuntimeMemoryEscrowV1::first_checkpoint(),
+            )
+        }
+
+        struct TestBoundReadHookV1<F>(F);
+
+        impl<F> BoundReadHookV1 for TestBoundReadHookV1<F>
+        where
+            F: FnMut(BoundReadStageV1) -> io::Result<()>,
+        {
+            fn checkpoint(&mut self, stage: BoundReadStageV1) -> io::Result<()> {
+                (self.0)(stage)
+            }
+        }
+
+        fn read_bound_with_hook_for_test<F>(
+            bound: &BoundPublishedSnapshotChildV1,
+            path: &ValidatedBoundRelativePathV1,
+            ceiling: u32,
+            hook: F,
+        ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1>
+        where
+            F: FnMut(BoundReadStageV1) -> io::Result<()>,
+        {
+            super::read_bound_regular_bytes_with_hook_v1(
+                bound,
+                path.as_bytes(),
+                ceiling,
+                &RuntimeMemoryEscrowV1::first_checkpoint(),
+                &mut TestBoundReadHookV1(hook),
+            )
+        }
+
         #[test]
         fn bound_regular_reader_accepts_direct_and_relative_symlink_terminal_bytes() {
             let direct_fixture = Fixture::new();
@@ -4926,8 +5201,7 @@ mod platform {
                 fs::write(root.join(".venv/bin/python"), b"direct").unwrap();
             });
             let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
-            let direct_bytes =
-                super::super::read_bound_regular_bytes_v1(&direct, &path, 6).unwrap();
+            let direct_bytes = read_bound_for_test(&direct, &path, 6).unwrap();
             assert_eq!(direct_bytes.bytes(), b"direct");
             assert_eq!(
                 direct_bytes.nodes().last().unwrap().kind(),
@@ -4940,8 +5214,7 @@ mod platform {
                 fs::write(root.join(".venv/bin/python-real"), b"linked").unwrap();
                 symlink("python-real", root.join(".venv/bin/python")).unwrap();
             });
-            let linked_bytes =
-                super::super::read_bound_regular_bytes_v1(&linked, &path, 6).unwrap();
+            let linked_bytes = read_bound_for_test(&linked, &path, 6).unwrap();
             assert_eq!(linked_bytes.bytes(), b"linked");
             let symlink = linked_bytes
                 .nodes()
@@ -4984,10 +5257,7 @@ mod platform {
                         symlink(target, bin.join(name)).unwrap();
                     }
                 });
-                assert_eq!(
-                    super::super::read_bound_regular_bytes_v1(&bound, &path, 1).map(|_| ()),
-                    expected
-                );
+                assert_eq!(read_bound_for_test(&bound, &path, 1).map(|_| ()), expected);
             }
         }
 
@@ -5005,7 +5275,7 @@ mod platform {
                     symlink(target, root.join(".venv/bin/python")).unwrap();
                 });
                 assert_eq!(
-                    super::super::read_bound_regular_bytes_v1(&bound, &path, 64).unwrap_err(),
+                    read_bound_for_test(&bound, &path, 64).unwrap_err(),
                     expected
                 );
             }
@@ -5015,7 +5285,7 @@ mod platform {
                 fs::create_dir_all(root.join(".venv/bin")).unwrap();
             });
             assert_eq!(
-                super::super::read_bound_regular_bytes_v1(&missing, &path, 64).unwrap_err(),
+                read_bound_for_test(&missing, &path, 64).unwrap_err(),
                 BoundRegularReadRefusalV1::MissingNode
             );
 
@@ -5025,7 +5295,7 @@ mod platform {
                 std::os::unix::net::UnixListener::bind(root.join(".venv/bin/python")).unwrap();
             });
             assert_eq!(
-                super::super::read_bound_regular_bytes_v1(&special, &path, 64).unwrap_err(),
+                read_bound_for_test(&special, &path, 64).unwrap_err(),
                 BoundRegularReadRefusalV1::NodeType
             );
 
@@ -5035,12 +5305,95 @@ mod platform {
                 fs::write(root.join(".venv/bin/python"), [0u8; 65]).unwrap();
             });
             assert_eq!(
-                super::super::read_bound_regular_bytes_v1(&large, &path, 64).unwrap_err(),
+                read_bound_for_test(&large, &path, 64).unwrap_err(),
                 BoundRegularReadRefusalV1::ByteLimit
             );
             assert_eq!(
-                super::super::read_bound_regular_bytes_v1(&large, &path, 0).unwrap_err(),
+                read_bound_for_test(&large, &path, 0).unwrap_err(),
                 BoundRegularReadRefusalV1::InvalidByteCeiling
+            );
+        }
+
+        #[test]
+        fn bound_regular_reader_classifies_expanding_self_reference_as_cycle() {
+            let fixture = Fixture::new();
+            let bound = publish_bound_tree(&fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                symlink("python/tail", root.join(".venv/bin/python")).unwrap();
+            });
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            assert_eq!(
+                read_bound_for_test(&bound, &path, 64).unwrap_err(),
+                BoundRegularReadRefusalV1::SymlinkCycle
+            );
+        }
+
+        #[test]
+        fn bound_regular_reader_revalidates_every_pinned_ancestor() {
+            let fixture = Fixture::new();
+            let bound = publish_bound_tree(&fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python"), b"python").unwrap();
+            });
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            let ancestor = fixture.final_path().join("root/.venv");
+            let mut mutated = false;
+            let result = read_bound_with_hook_for_test(&bound, &path, 6, |stage| {
+                if !mutated && stage == BoundReadStageV1::AfterDirectoryRecorded {
+                    fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o700))?;
+                    mutated = true;
+                }
+                Ok(())
+            });
+            assert!(mutated);
+            assert_eq!(
+                result.unwrap_err(),
+                BoundRegularReadRefusalV1::IdentityDrift
+            );
+        }
+
+        #[test]
+        fn bound_regular_reader_reads_symlink_through_pinned_fd_and_detects_parent_drift() {
+            let fixture = Fixture::new();
+            let bound = publish_bound_tree(&fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/first"), b"first!").unwrap();
+                fs::write(root.join(".venv/bin/second"), b"second").unwrap();
+                symlink("first", root.join(".venv/bin/python")).unwrap();
+            });
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            let symlink_path = fixture.final_path().join("root/.venv/bin/python");
+            let mut replaced = false;
+            let result = read_bound_with_hook_for_test(&bound, &path, 6, |stage| {
+                if !replaced && stage == BoundReadStageV1::BeforeSymlinkRead {
+                    fs::remove_file(&symlink_path)?;
+                    symlink("second", &symlink_path)?;
+                    replaced = true;
+                }
+                Ok(())
+            });
+            assert!(replaced);
+            assert_eq!(
+                result.unwrap_err(),
+                BoundRegularReadRefusalV1::IdentityDrift
+            );
+        }
+
+        #[test]
+        fn published_real_x86_64_elf_round_trips_through_bound_reader() {
+            let executable = fs::read("/bin/true").unwrap();
+            let ceiling = u32::try_from(executable.len()).unwrap();
+            let fixture = Fixture::new();
+            let bound = publish_bound_tree(&fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python"), &executable).unwrap();
+            });
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            let observed = read_bound_for_test(&bound, &path, ceiling).unwrap();
+            assert_eq!(observed.bytes(), executable);
+            assert_eq!(
+                crate::linux_pytest::execute_only_runtime::validate_x86_64_elf_v1(observed.bytes()),
+                Ok(())
             );
         }
 
@@ -5057,7 +5410,7 @@ mod platform {
             )
             .unwrap();
             let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
-            let observed = super::super::read_bound_regular_bytes_v1(&bound, &path, 6).unwrap();
+            let observed = read_bound_for_test(&bound, &path, 6).unwrap();
             assert_eq!(observed.bytes(), b"after!");
             assert_ne!(
                 observed.content_digest(),
@@ -5471,6 +5824,7 @@ mod platform {
         _bound: &BoundPublishedSnapshotChildV1,
         _path: &[u8],
         _byte_ceiling: u32,
+        _memory: &RuntimeMemoryEscrowV1,
     ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
         Err(BoundRegularReadRefusalV1::UnsupportedPlatform)
     }
@@ -5757,10 +6111,35 @@ mod portable_tests {
         <VerifiedBoundRegularBytesV1 as AmbiguousIfClone<_>>::probe();
         <VerifiedBoundRegularBytesV1 as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<VerifiedBoundRegularBytesV1>());
+        let root_live_statx = SourceStatxV1::for_test(
+            1,
+            1,
+            1,
+            1,
+            u32::from(libc::S_IFDIR) | 0o500,
+            1,
+            1,
+            1,
+            0,
+            super::super::TimespecV1 {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            super::super::TimespecV1 {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            super::super::TimespecV1 {
+                seconds: 0,
+                nanoseconds: 0,
+            },
+            None,
+        );
         let value = VerifiedBoundRegularBytesV1 {
             bytes: b"secret".to_vec(),
             nodes: Vec::new(),
             root_statx_commitment: [0; 102],
+            root_live_statx,
             terminal_identity_digest: Blake3Digest::derive(
                 BOUND_REGULAR_IDENTITY_DOMAIN_V1,
                 &[b"identity"],
@@ -5777,21 +6156,51 @@ mod portable_tests {
 
     #[test]
     fn bounded_regular_read_distinguishes_exact_short_and_growth() {
+        let memory = RuntimeMemoryEscrowV1::first_checkpoint();
         assert_eq!(
-            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"exact"), 5).unwrap(),
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"exact"), 5, &memory).unwrap(),
             b"exact"
         );
         assert_eq!(
-            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"short"), 6).unwrap_err(),
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"short"), 6, &memory)
+                .unwrap_err(),
             BoundRegularReadRefusalV1::ShortRead
         );
         assert_eq!(
-            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"growth"), 5).unwrap_err(),
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"growth"), 5, &memory)
+                .unwrap_err(),
             BoundRegularReadRefusalV1::SizeMismatch
         );
         assert_eq!(
-            read_exact_bound_regular_size_v1(&mut io::Cursor::new(Vec::<u8>::new()), 0).unwrap(),
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(Vec::<u8>::new()), 0, &memory,)
+                .unwrap(),
             Vec::<u8>::new()
         );
+    }
+
+    #[test]
+    fn runtime_memory_escrow_is_aggregate_fallible_and_linear() {
+        trait AmbiguousIfClone<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        trait AmbiguousIfCopy<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+        impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+        <RuntimeMemoryEscrowV1 as AmbiguousIfClone<_>>::probe();
+        <RuntimeMemoryEscrowV1 as AmbiguousIfCopy<_>>::probe();
+
+        let memory = RuntimeMemoryEscrowV1 {
+            remaining: Cell::new(4),
+        };
+        assert_eq!(memory.try_bytes_from_slice(b"four").unwrap(), b"four");
+        assert_eq!(
+            memory.try_bytes_from_slice(b"x").unwrap_err(),
+            BoundRegularReadRefusalV1::MemoryBudget
+        );
+        assert!(format!("{memory:?}").contains("redacted-budget"));
     }
 }
