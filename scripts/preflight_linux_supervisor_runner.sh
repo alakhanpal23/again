@@ -6,6 +6,23 @@ fail() {
   exit 1
 }
 
+has_one_exact_enabled_option() {
+  local option=$1
+  awk -v option="$option" '
+    $0 == option "=y" {
+      enabled += 1
+      declarations += 1
+      next
+    }
+    index($0, option "=") == 1 || $0 == "# " option " is not set" {
+      declarations += 1
+    }
+    END {
+      exit !(enabled == 1 && declarations == 1)
+    }
+  '
+}
+
 kernel_name=
 kernel_machine=
 kernel_release=
@@ -48,7 +65,7 @@ esac
 required_kernel_options=(CONFIG_SECCOMP_FILTER CONFIG_CHECKPOINT_RESTORE)
 if [[ -r "$proc_config" ]]; then
   for option in "${required_kernel_options[@]}"; do
-    if ! gzip -cd -- "$proc_config" | grep -Fx "${option}=y" > /dev/null; then
+    if ! gzip -cd -- "$proc_config" | has_one_exact_enabled_option "$option"; then
       fail "the running kernel does not expose ${option}=y in /proc/config.gz"
     fi
   done
@@ -58,7 +75,7 @@ else
   [[ -r "$boot_config" ]] ||
     fail 'the running kernel configuration is not readable from procfs or /boot'
   for option in "${required_kernel_options[@]}"; do
-    if ! grep -Fqx "${option}=y" "$boot_config"; then
+    if ! has_one_exact_enabled_option "$option" < "$boot_config"; then
       fail "the running kernel does not expose ${option}=y in its /boot configuration"
     fi
   done
@@ -69,10 +86,14 @@ fi
 cap_eff=$(awk '
   $1 == "CapEff:" {
     count += 1
-    value = $2
+    if (NF != 2) {
+      malformed = 1
+    } else {
+      value = $2
+    }
   }
   END {
-    if (count != 1) {
+    if (count != 1 || malformed) {
       exit 1
     }
     print value

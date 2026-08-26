@@ -88,6 +88,16 @@ missing_checkpoint=$(new_fixture missing-checkpoint)
 printf 'CONFIG_SECCOMP_FILTER=y\n' > "$missing_checkpoint/boot/config-6.17.0-again"
 expect_failure "$missing_checkpoint" 'CONFIG_CHECKPOINT_RESTORE=y'
 
+duplicate_seccomp=$(new_fixture duplicate-seccomp)
+printf 'CONFIG_SECCOMP_FILTER=y\nCONFIG_SECCOMP_FILTER=n\nCONFIG_CHECKPOINT_RESTORE=y\n' |
+  gzip -c > "$duplicate_seccomp/proc/config.gz"
+expect_failure "$duplicate_seccomp" 'CONFIG_SECCOMP_FILTER=y'
+
+duplicate_checkpoint=$(new_fixture duplicate-checkpoint)
+printf 'CONFIG_SECCOMP_FILTER=y\nCONFIG_CHECKPOINT_RESTORE=y\nCONFIG_CHECKPOINT_RESTORE=y\n' \
+  > "$duplicate_checkpoint/boot/config-6.17.0-again"
+expect_failure "$duplicate_checkpoint" 'CONFIG_CHECKPOINT_RESTORE=y'
+
 missing_capability=$(new_fixture missing-capability)
 write_gzip_config "$missing_capability"
 printf 'Name:\ttest\nCapEff:\t0000000000000000\n' > "$missing_capability/proc/self/status"
@@ -103,6 +113,11 @@ malformed_capability=$(new_fixture malformed-capability)
 write_gzip_config "$malformed_capability"
 printf 'CapEff:\tnot-hex\n' > "$malformed_capability/proc/self/status"
 expect_failure "$malformed_capability" 'CapEff value is malformed'
+
+trailing_capability=$(new_fixture trailing-capability)
+write_gzip_config "$trailing_capability"
+printf 'CapEff:\t0000000000200000 trailing\n' > "$trailing_capability/proc/self/status"
+expect_failure "$trailing_capability" 'no canonical CapEff row'
 
 wide_capability=$(new_fixture wide-capability)
 write_gzip_config "$wide_capability"
