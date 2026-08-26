@@ -5193,6 +5193,36 @@ mod platform {
             )
         }
 
+        fn symlink_with_stable_test_atime(target: &str, link: &Path) {
+            symlink(target, link).unwrap();
+            let path = CString::new(link.as_os_str().as_bytes()).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap();
+            let times = [
+                libc::timespec {
+                    tv_sec: i64::try_from(now.as_secs()).unwrap() + 3_600,
+                    tv_nsec: libc::c_long::from(now.subsec_nanos()),
+                },
+                libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: libc::UTIME_OMIT,
+                },
+            ];
+            assert_eq!(
+                unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        path.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                },
+                0,
+                "symlink atime fixture must emulate the qualified no-atime view"
+            );
+        }
+
         #[test]
         fn bound_regular_reader_accepts_direct_and_relative_symlink_terminal_bytes() {
             let direct_fixture = Fixture::new();
@@ -5212,7 +5242,7 @@ mod platform {
             let linked = publish_bound_tree(&link_fixture, |root| {
                 fs::create_dir_all(root.join(".venv/bin")).unwrap();
                 fs::write(root.join(".venv/bin/python-real"), b"linked").unwrap();
-                symlink("python-real", root.join(".venv/bin/python")).unwrap();
+                symlink_with_stable_test_atime("python-real", &root.join(".venv/bin/python"));
             });
             let linked_bytes = read_bound_for_test(&linked, &path, 6).unwrap();
             assert_eq!(linked_bytes.bytes(), b"linked");
@@ -5254,7 +5284,7 @@ mod platform {
                         } else {
                             format!("link-{}", index + 1)
                         };
-                        symlink(target, bin.join(name)).unwrap();
+                        symlink_with_stable_test_atime(&target, &bin.join(name));
                     }
                 });
                 assert_eq!(read_bound_for_test(&bound, &path, 1).map(|_| ()), expected);
@@ -5272,7 +5302,7 @@ mod platform {
                 let fixture = Fixture::new();
                 let bound = publish_bound_tree(&fixture, |root| {
                     fs::create_dir_all(root.join(".venv/bin")).unwrap();
-                    symlink(target, root.join(".venv/bin/python")).unwrap();
+                    symlink_with_stable_test_atime(target, &root.join(".venv/bin/python"));
                 });
                 assert_eq!(
                     read_bound_for_test(&bound, &path, 64).unwrap_err(),
@@ -5319,7 +5349,7 @@ mod platform {
             let fixture = Fixture::new();
             let bound = publish_bound_tree(&fixture, |root| {
                 fs::create_dir_all(root.join(".venv/bin")).unwrap();
-                symlink("python/tail", root.join(".venv/bin/python")).unwrap();
+                symlink_with_stable_test_atime("python/tail", &root.join(".venv/bin/python"));
             });
             let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
             assert_eq!(
