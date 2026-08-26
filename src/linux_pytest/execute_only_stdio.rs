@@ -1,17 +1,14 @@
-//! Gate 3 profile-owned stdio and exact foreground delivery boundary.
+//! Gate 3 profile-owned stdio and exact foreground capture boundary.
 //!
-//! This module owns only live descriptors, bounded stream capture, and
-//! presentation. Its values cannot grant execution, candidate, or reuse
-//! authority, and no code here executes a workload.
+//! This module owns only live descriptors and bounded stream capture. Its
+//! values cannot grant execution, candidate, or reuse authority, and no code
+//! here executes a workload.
 //!
-//! The synchronous sink loop remains private test scaffolding: an arbitrary
-//! Rust callback cannot be proven nonblocking, so no sibling can compose it
-//! while the drain owns kernel cleanup. Likewise, child descriptor placement
-//! requires a sealed authorization implemented only for a test token here.
-//! The eventual isolation connector must supply its concrete child-only token
-//! by an implementation in this module, and a separate reviewed nonblocking
-//! presenter must replace the private sink loop, before those paths become
-//! production callable.
+//! Capture is a fixed nonblocking parent operation with no caller callback;
+//! captured bytes become inspectable only after both read ends reached EOF and
+//! were closed. Child descriptor placement is a linear continuation consumed
+//! only by the authenticated namespace child. It owns no parent endpoint and
+//! deliberately preserves isolation's protocol descriptors 3 and 4.
 
 #![allow(
     dead_code,
@@ -28,6 +25,17 @@ use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::isolation_qualification::{
+    IsolationChildContinuationFailureV1, IsolationChildContinuationV1, IsolationChildOnlyBrandV1,
+    IsolationChildStdioStateV1,
+};
 
 const STREAM_CAPTURE_LIMIT_V1: usize = super::LINUX_PYTEST_V1_MAX_STREAM_BYTES as usize;
 const DRAIN_BUFFER_BYTES_V1: usize = 64 * 1024;
@@ -70,6 +78,7 @@ enum StdioOperationV1 {
     FcntlGetFd(FdRoleV1),
     FcntlGetFl(FdRoleV1),
     FcntlSetFl(FdRoleV1),
+    FcntlDupMin(FdRoleV1),
     Authenticate(FdRoleV1),
     Close(FdRoleV1),
     Dup3(FdRoleV1),
@@ -233,6 +242,12 @@ trait ProfileStdioSyscallsV1 {
     fn fcntl_getfd(&mut self, fd: RawFd, role: FdRoleV1) -> Result<i32, i32>;
     fn fcntl_getfl(&mut self, fd: RawFd, role: FdRoleV1) -> Result<i32, i32>;
     fn fcntl_setfl(&mut self, fd: RawFd, role: FdRoleV1, flags: i32) -> Result<(), i32>;
+    fn fcntl_dupfd_cloexec(
+        &mut self,
+        fd: RawFd,
+        role: FdRoleV1,
+        minimum: RawFd,
+    ) -> Result<RawFd, i32>;
     fn close(&mut self, fd: RawFd, role: FdRoleV1) -> Result<(), i32>;
     fn dup3(&mut self, old: RawFd, new: RawFd, role: FdRoleV1) -> Result<(), i32>;
     fn close_range_unshare(&mut self, first: u32, last: u32) -> Result<(), i32>;
@@ -249,14 +264,6 @@ trait ProfileStdioSyscallsV1 {
         buffer: &mut [u8],
     ) -> Result<ReadResultV1, CallErrorV1>;
 }
-
-/// Sealed child-only placement brand.
-///
-/// There is deliberately no production implementation in this checkpoint.
-/// Once the isolation connector's opaque child-only token is present, this
-/// module can implement the brand for that concrete type without exposing a
-/// synthetic constructor or raw descriptor.
-trait BlockedChildStdioPlacementAuthorizationV1 {}
 
 struct TrackedFdV1 {
     raw: RawFd,
@@ -322,6 +329,7 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
             FdRoleV1::ParentStderr,
             FdRoleV1::ChildStderr,
         )?;
+        self.relocate_isolation_protocol_collisions()?;
         if self
             .descriptors
             .iter()
@@ -357,8 +365,48 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
         ] {
             self.authenticate(role)?;
         }
-        self.authenticate_independent_pipes()?;
-        self.close_required(FdRoleV1::StdinEofWriter)
+        self.authenticate_independent_pipes()
+    }
+
+    fn relocate_isolation_protocol_collisions(&mut self) -> Result<(), ProfileStdioFailureV1> {
+        for index in 0..self.descriptors.len() {
+            let Some((raw, role)) = self.descriptors[index]
+                .as_ref()
+                .map(|descriptor| (descriptor.raw, descriptor.role))
+            else {
+                continue;
+            };
+            if raw > 4 {
+                continue;
+            }
+            let replacement = self
+                .syscalls_mut()
+                .fcntl_dupfd_cloexec(raw, role, 5)
+                .map_err(|errno| {
+                    ProfileStdioFailureV1::syscall(StdioOperationV1::FcntlDupMin(role), errno)
+                })?;
+            if replacement < 5
+                || self
+                    .descriptors
+                    .iter()
+                    .flatten()
+                    .any(|descriptor| descriptor.raw == replacement)
+            {
+                let _ = self.syscalls_mut().close(replacement, role);
+                return Err(ProfileStdioFailureV1::contract(
+                    StdioOperationV1::FcntlDupMin(role),
+                ));
+            }
+            self.descriptors[index] = Some(TrackedFdV1 {
+                raw: replacement,
+                role,
+            });
+            self.syscalls_mut().close(raw, role).map_err(|errno| {
+                ProfileStdioFailureV1::syscall(StdioOperationV1::Close(role), errno)
+                    .with_cleanup(false)
+            })?;
+        }
+        Ok(())
     }
 
     fn add_pipe(
@@ -538,6 +586,7 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
             FdRoleV1::ChildStdin,
             FdRoleV1::ChildStdout,
             FdRoleV1::ChildStderr,
+            FdRoleV1::StdinEofWriter,
         ] {
             if let Err(first) = self.close_required(role) {
                 let cleanup = self.cleanup_all();
@@ -552,7 +601,7 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
             .expect("parent drain consumes the syscall owner exactly once");
         Ok(ParentStdioDrainV1 {
             syscalls: Some(syscalls),
-            descriptors: [Some(stdout), Some(stderr)],
+            descriptors: [None, Some(stdout), Some(stderr)],
             control: Arc::new(ProfileStdioDrainControlStateV1 {
                 cancelled: AtomicBool::new(false),
             }),
@@ -560,9 +609,9 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
         })
     }
 
-    pub(super) fn prepare_blocked_child<A: BlockedChildStdioPlacementAuthorizationV1>(
+    #[cfg(test)]
+    fn prepare_blocked_child_for_test(
         mut self,
-        _authorization: A,
     ) -> Result<BlockedChildStdioHandoffV1<S>, ProfileStdioFailureV1> {
         let placements = [
             (
@@ -602,7 +651,7 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
                 return Err(first.with_cleanup(cleanup));
             }
         }
-        if let Err(errno) = self.syscalls_mut().close_range_unshare(3, u32::MAX) {
+        if let Err(errno) = self.syscalls_mut().close_range_unshare(5, u32::MAX) {
             let first = ProfileStdioFailureV1::syscall(StdioOperationV1::CloseRange, errno);
             let cleanup = self.cleanup_placed_and_owned(&placed);
             return Err(first.with_cleanup(cleanup));
@@ -675,6 +724,407 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
     }
 }
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ProfileOwnedStdioSessionV1<LinuxProfileStdioSyscallsV1> {
+    /// Split ownership before `clone3`: the parent receives only its EOF and
+    /// capture endpoints, while the child continuation receives only the three
+    /// pipe endpoints that must become descriptors 0, 1, and 2.
+    pub(super) fn split_for_isolation_v1(
+        mut self,
+    ) -> Result<
+        (
+            ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>,
+            ProfileStdioIsolationChildV1,
+        ),
+        ProfileStdioFailureV1,
+    > {
+        for role in [
+            FdRoleV1::ChildStdin,
+            FdRoleV1::ChildStdout,
+            FdRoleV1::ChildStderr,
+        ] {
+            if self.raw(role)? <= 4 {
+                return Err(ProfileStdioFailureV1::contract(
+                    StdioOperationV1::Authenticate(role),
+                ));
+            }
+        }
+
+        let child_facts = [
+            self.facts(FdRoleV1::ChildStdin)?,
+            self.facts(FdRoleV1::ChildStdout)?,
+            self.facts(FdRoleV1::ChildStderr)?,
+        ];
+        let child = [
+            self.take(FdRoleV1::ChildStdin)?,
+            self.take(FdRoleV1::ChildStdout)?,
+            self.take(FdRoleV1::ChildStderr)?,
+        ];
+        let eof_writer = self.take(FdRoleV1::StdinEofWriter)?;
+        let stdout = self.take(FdRoleV1::ParentStdout)?;
+        let stderr = self.take(FdRoleV1::ParentStderr)?;
+        let syscalls = self
+            .syscalls
+            .take()
+            .expect("pre-clone split consumes the syscall owner exactly once");
+        let parent = ParentStdioDrainV1 {
+            syscalls: Some(syscalls),
+            descriptors: [Some(eof_writer), Some(stdout), Some(stderr)],
+            control: Arc::new(ProfileStdioDrainControlStateV1 {
+                cancelled: AtomicBool::new(false),
+            }),
+            cancellation_issued: false,
+        };
+        let child = ProfileStdioIsolationChildV1 {
+            descriptors: [
+                ForkSafeChildFdV1::new(child[0].raw),
+                ForkSafeChildFdV1::new(child[1].raw),
+                ForkSafeChildFdV1::new(child[2].raw),
+            ],
+            expected: child_facts,
+            fault: ChildStdioFaultPlanV1::none(),
+        };
+        Ok((parent, child))
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+struct ForkSafeChildFdV1 {
+    raw: RawFd,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ForkSafeChildFdV1 {
+    const fn new(raw: RawFd) -> Self {
+        Self { raw }
+    }
+
+    fn take(&mut self) -> RawFd {
+        std::mem::replace(&mut self.raw, -1)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl Drop for ForkSafeChildFdV1 {
+    fn drop(&mut self) {
+        if self.raw > 4 {
+            // SAFETY: a direct close syscall is async-signal/fork-safe and this
+            // value owns only its child-half endpoint.
+            unsafe {
+                libc::syscall(libc::SYS_close, self.raw);
+            }
+            self.raw = -1;
+        }
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChildStdioRawOperationV1 {
+    SourceFstat(FdRoleV1),
+    SourceGetFd(FdRoleV1),
+    SourceGetFl(FdRoleV1),
+    Dup3(FdRoleV1),
+    PlacedFstat(FdRoleV1),
+    PlacedGetFd(FdRoleV1),
+    PlacedGetFl(FdRoleV1),
+    CloseSource(FdRoleV1),
+    ClosePlaced(FdRoleV1),
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+#[derive(Clone, Copy)]
+struct ChildStdioFaultPlanV1 {
+    primary: Option<ChildStdioRawOperationV1>,
+    cleanup: Option<ChildStdioRawOperationV1>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ChildStdioFaultPlanV1 {
+    const fn none() -> Self {
+        Self {
+            primary: None,
+            cleanup: None,
+        }
+    }
+
+    fn check(&mut self, operation: ChildStdioRawOperationV1) -> Result<(), i32> {
+        if self.primary == Some(operation) {
+            self.primary = None;
+            return Err(libc::EIO);
+        }
+        if self.cleanup == Some(operation) {
+            self.cleanup = None;
+            return Err(libc::EBUSY);
+        }
+        Ok(())
+    }
+}
+
+/// Linear child-half stdio continuation. It has no raw descriptor accessor and
+/// owns no parent cleanup endpoint or isolation protocol endpoint.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) struct ProfileStdioIsolationChildV1 {
+    descriptors: [ForkSafeChildFdV1; 3],
+    expected: [DescriptorFactsV1; 3],
+    fault: ChildStdioFaultPlanV1,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl fmt::Debug for ProfileStdioIsolationChildV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProfileStdioIsolationChildV1")
+            .field("descriptors", &"<child-half-fds>")
+            .field("authority", &"<none>")
+            .finish()
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ProfileStdioIsolationChildV1 {
+    fn continue_raw_v1(mut self) -> Result<IsolationChildStdioStateV1, i32> {
+        let roles = [
+            (
+                FdRoleV1::ChildStdin,
+                FdRoleV1::PlacedStdin,
+                libc::STDIN_FILENO,
+            ),
+            (
+                FdRoleV1::ChildStdout,
+                FdRoleV1::PlacedStdout,
+                libc::STDOUT_FILENO,
+            ),
+            (
+                FdRoleV1::ChildStderr,
+                FdRoleV1::PlacedStderr,
+                libc::STDERR_FILENO,
+            ),
+        ];
+        let mut placed = [false; 3];
+        let result = (|| {
+            for (index, (source_role, placed_role, target)) in roles.into_iter().enumerate() {
+                let source = self.descriptors[index].raw;
+                if source <= 4 {
+                    return Err(libc::EINVAL);
+                }
+                let source_facts = child_fstat_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::SourceFstat(source_role),
+                    source,
+                )?;
+                let source_fd_flags = child_fcntl_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::SourceGetFd(source_role),
+                    source,
+                    libc::F_GETFD,
+                )?;
+                let source_status = child_fcntl_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::SourceGetFl(source_role),
+                    source,
+                    libc::F_GETFL,
+                )?;
+                let expected_access = if index == 0 {
+                    libc::O_RDONLY
+                } else {
+                    libc::O_WRONLY
+                };
+                if source_facts != self.expected[index]
+                    || source_facts.mode & libc::S_IFMT != libc::S_IFIFO
+                    || source_fd_flags & libc::FD_CLOEXEC == 0
+                    || source_status & libc::O_ACCMODE != expected_access
+                    || source_status & libc::O_NONBLOCK != 0
+                {
+                    return Err(libc::EIO);
+                }
+                self.fault
+                    .check(ChildStdioRawOperationV1::Dup3(placed_role))?;
+                // SAFETY: direct dup3 is async-signal/fork-safe. Sources are
+                // authenticated child-half fds >4 and targets are exactly 0/1/2.
+                if unsafe { libc::syscall(libc::SYS_dup3, source, target, 0) }
+                    != libc::c_long::from(target)
+                {
+                    return Err(child_errno_v1());
+                }
+                placed[index] = true;
+                let placed_facts = child_fstat_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::PlacedFstat(placed_role),
+                    target,
+                )?;
+                let placed_fd_flags = child_fcntl_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::PlacedGetFd(placed_role),
+                    target,
+                    libc::F_GETFD,
+                )?;
+                let placed_status = child_fcntl_v1(
+                    &mut self.fault,
+                    ChildStdioRawOperationV1::PlacedGetFl(placed_role),
+                    target,
+                    libc::F_GETFL,
+                )?;
+                if placed_facts != self.expected[index]
+                    || placed_fd_flags != 0
+                    || placed_status & libc::O_ACCMODE != expected_access
+                    || placed_status & libc::O_NONBLOCK != 0
+                {
+                    return Err(libc::EIO);
+                }
+                self.fault
+                    .check(ChildStdioRawOperationV1::CloseSource(source_role))?;
+                if unsafe { libc::syscall(libc::SYS_close, source) } != 0 {
+                    return Err(child_errno_v1());
+                }
+                self.descriptors[index].take();
+            }
+            Ok(IsolationChildStdioStateV1::PlacedAndAuthenticated)
+        })();
+
+        if let Err(primary) = result {
+            for (index, (_, placed_role, target)) in roles.into_iter().enumerate() {
+                if placed[index]
+                    && self
+                        .fault
+                        .check(ChildStdioRawOperationV1::ClosePlaced(placed_role))
+                        .is_ok()
+                {
+                    unsafe {
+                        libc::syscall(libc::SYS_close, target);
+                    }
+                }
+            }
+            return Err(primary);
+        }
+        Ok(IsolationChildStdioStateV1::PlacedAndAuthenticated)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+fn child_fstat_v1(
+    fault: &mut ChildStdioFaultPlanV1,
+    operation: ChildStdioRawOperationV1,
+    descriptor: RawFd,
+) -> Result<DescriptorFactsV1, i32> {
+    fault.check(operation)?;
+    let mut value = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::syscall(libc::SYS_fstat, descriptor, value.as_mut_ptr()) } != 0 {
+        return Err(child_errno_v1());
+    }
+    let value = unsafe { value.assume_init() };
+    Ok(DescriptorFactsV1 {
+        device: value.st_dev,
+        inode: value.st_ino,
+        mode: value.st_mode,
+    })
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+fn child_fcntl_v1(
+    fault: &mut ChildStdioFaultPlanV1,
+    operation: ChildStdioRawOperationV1,
+    descriptor: RawFd,
+    command: i32,
+) -> Result<i32, i32> {
+    fault.check(operation)?;
+    let result = unsafe { libc::syscall(libc::SYS_fcntl, descriptor, command, 0) };
+    if result < 0 {
+        Err(child_errno_v1())
+    } else {
+        Ok(result as i32)
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+fn child_errno_v1() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+// SAFETY: this value owns only three child pipe endpoints above descriptor 4.
+// Its fork-local Drop and child consumption use direct syscalls only, without
+// allocation, locks, unwinding, libc cleanup wrappers, or parent authority.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildContinuationV1 for ProfileStdioIsolationChildV1 {
+    fn continue_in_child_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
+        self.continue_raw_v1()
+            .map_err(|errno| IsolationChildContinuationFailureV1::new(Some(errno)))
+    }
+}
+
 pub(super) struct BlockedChildStdioHandoffV1<S: ProfileStdioSyscallsV1> {
     syscalls: Option<S>,
     descriptors: [Option<TrackedFdV1>; 3],
@@ -701,10 +1151,35 @@ impl<S: ProfileStdioSyscallsV1> Drop for BlockedChildStdioHandoffV1<S> {
     }
 }
 
+#[cfg(test)]
 trait ProfileStreamSinkV1 {
     /// Returns the exact prefix length delivered by this call. An error means
     /// no bytes from that individual call were delivered.
     fn write_stream(&mut self, stream: ProfileStreamV1, bytes: &[u8]) -> Result<usize, ()>;
+}
+
+enum DrainPresentationV1<'a> {
+    CaptureOnly(std::marker::PhantomData<&'a ()>),
+    #[cfg(test)]
+    TestSink(&'a mut dyn ProfileStreamSinkV1),
+}
+
+impl DrainPresentationV1<'_> {
+    fn write_stream(&mut self, _stream: ProfileStreamV1, bytes: &[u8]) -> Result<usize, ()> {
+        match self {
+            Self::CaptureOnly(_) => Ok(bytes.len()),
+            #[cfg(test)]
+            Self::TestSink(sink) => sink.write_stream(_stream, bytes),
+        }
+    }
+
+    const fn records_delivery(&self) -> bool {
+        match self {
+            Self::CaptureOnly(_) => false,
+            #[cfg(test)]
+            Self::TestSink(_) => true,
+        }
+    }
 }
 
 struct StreamAccumulatorV1 {
@@ -769,6 +1244,7 @@ impl StreamAccumulatorV1 {
             delivered_bytes: self.delivered_bytes,
             streaming_hash: *self.hasher.finalize().as_bytes(),
             capture_complete: self.capture_complete && self.eof,
+            eof_observed: self.eof,
         }
     }
 }
@@ -780,6 +1256,7 @@ pub(super) struct ProfileStreamCaptureV1 {
     delivered_bytes: u64,
     streaming_hash: [u8; 32],
     capture_complete: bool,
+    eof_observed: bool,
 }
 
 impl ProfileStreamCaptureV1 {
@@ -806,6 +1283,10 @@ impl ProfileStreamCaptureV1 {
     pub(super) const fn capture_complete(&self) -> bool {
         self.capture_complete
     }
+
+    pub(super) const fn eof_observed(&self) -> bool {
+        self.eof_observed
+    }
 }
 
 impl fmt::Debug for ProfileStreamCaptureV1 {
@@ -818,6 +1299,7 @@ impl fmt::Debug for ProfileStreamCaptureV1 {
             .field("delivered_bytes", &self.delivered_bytes)
             .field("streaming_hash", &"<redacted-digest>")
             .field("capture_complete", &self.capture_complete)
+            .field("eof_observed", &self.eof_observed)
             .finish()
     }
 }
@@ -899,7 +1381,7 @@ impl ProfileStdioDrainCancellationV1 {
 
 pub(super) struct ParentStdioDrainV1<S: ProfileStdioSyscallsV1> {
     syscalls: Option<S>,
-    descriptors: [Option<TrackedFdV1>; 2],
+    descriptors: [Option<TrackedFdV1>; 3],
     control: Arc<ProfileStdioDrainControlStateV1>,
     cancellation_issued: bool,
 }
@@ -933,6 +1415,22 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         })
     }
 
+    /// Drain both nonblocking capture pipes to exact EOF. No caller code runs
+    /// while this value owns cleanup; the returned bytes may be presented only
+    /// after this method has closed all parent stdio descriptors.
+    pub(super) fn drain_capture_v1(
+        mut self,
+    ) -> Result<ProfileStdioDrainReportV1, ProfileStdioFailureV1> {
+        let deadline = Instant::now()
+            .checked_add(DRAIN_DEADLINE_V1)
+            .ok_or_else(ProfileStdioFailureV1::deadline)?;
+        self.drain_until(
+            &mut DrainPresentationV1::CaptureOnly(std::marker::PhantomData),
+            deadline,
+        )
+    }
+
+    #[cfg(test)]
     fn drain<Sink: ProfileStreamSinkV1>(
         mut self,
         sink: &mut Sink,
@@ -940,14 +1438,28 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         let deadline = Instant::now()
             .checked_add(DRAIN_DEADLINE_V1)
             .ok_or_else(ProfileStdioFailureV1::deadline)?;
-        self.drain_until(sink, deadline)
+        self.drain_until(&mut DrainPresentationV1::TestSink(sink), deadline)
     }
 
-    fn drain_until<Sink: ProfileStreamSinkV1>(
+    fn drain_until(
         &mut self,
-        sink: &mut Sink,
+        presentation: &mut DrainPresentationV1<'_>,
         deadline: Instant,
     ) -> Result<ProfileStdioDrainReportV1, ProfileStdioFailureV1> {
+        if self.raw_optional(FdRoleV1::StdinEofWriter).is_some() {
+            let descriptor = self.take(FdRoleV1::StdinEofWriter)?;
+            if let Err(errno) = self
+                .syscalls_mut()
+                .close(descriptor.raw, FdRoleV1::StdinEofWriter)
+            {
+                let _cleanup = self.cleanup_all();
+                return Err(ProfileStdioFailureV1::syscall(
+                    StdioOperationV1::Close(FdRoleV1::StdinEofWriter),
+                    errno,
+                )
+                .with_cleanup(false));
+            }
+        }
         let mut stdout = StreamAccumulatorV1::new(ProfileStreamV1::Stdout);
         let mut stderr = StreamAccumulatorV1::new(ProfileStreamV1::Stderr);
         let mut presentation_failure = None;
@@ -1000,7 +1512,7 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                 acted = true;
                 self.drain_ready_stream(
                     &mut stdout,
-                    sink,
+                    presentation,
                     &mut presentation_failure,
                     &mut first_close_failure,
                     &mut cleanup_complete,
@@ -1012,7 +1524,7 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                 acted = true;
                 self.drain_ready_stream(
                     &mut stderr,
-                    sink,
+                    presentation,
                     &mut presentation_failure,
                     &mut first_close_failure,
                     &mut cleanup_complete,
@@ -1040,10 +1552,10 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn drain_ready_stream<Sink: ProfileStreamSinkV1>(
+    fn drain_ready_stream(
         &mut self,
         accumulator: &mut StreamAccumulatorV1,
-        sink: &mut Sink,
+        presentation: &mut DrainPresentationV1<'_>,
         presentation_failure: &mut Option<PresentationFailureV1>,
         first_close_failure: &mut Option<ProfileStdioFailureV1>,
         cleanup_complete: &mut bool,
@@ -1087,9 +1599,11 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                                 );
                                 return Err(failure);
                             }
-                            match sink.write_stream(accumulator.stream, remaining) {
+                            match presentation.write_stream(accumulator.stream, remaining) {
                                 Ok(delivered) if delivered > 0 && delivered <= remaining.len() => {
-                                    if let Err(new) = accumulator.delivered(delivered) {
+                                    if presentation.records_delivery()
+                                        && let Err(new) = accumulator.delivered(delivered)
+                                    {
                                         let failure = self.finalize_failure(
                                             new,
                                             first_close_failure,
@@ -1278,6 +1792,15 @@ impl ProfileStdioSyscallsV1 for LinuxProfileStdioSyscallsV1 {
         let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
         (result == 0).then_some(()).ok_or_else(last_errno)
     }
+    fn fcntl_dupfd_cloexec(
+        &mut self,
+        fd: RawFd,
+        _role: FdRoleV1,
+        minimum: RawFd,
+    ) -> Result<RawFd, i32> {
+        let result = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, minimum) };
+        (result >= minimum).then_some(result).ok_or_else(last_errno)
+    }
     fn close(&mut self, fd: RawFd, _role: FdRoleV1) -> Result<(), i32> {
         let result = unsafe { libc::close(fd) };
         (result == 0).then_some(()).ok_or_else(last_errno)
@@ -1432,14 +1955,6 @@ mod tests {
         os::fd::{AsRawFd, FromRawFd, OwnedFd},
     };
 
-    struct TestBlockedChildStdioPlacementAuthorizationV1;
-
-    impl BlockedChildStdioPlacementAuthorizationV1 for TestBlockedChildStdioPlacementAuthorizationV1 {}
-
-    const fn test_child_placement_authorization() -> TestBlockedChildStdioPlacementAuthorizationV1 {
-        TestBlockedChildStdioPlacementAuthorizationV1
-    }
-
     #[derive(Clone, Debug)]
     struct FakeDescriptorV1 {
         facts: DescriptorFactsV1,
@@ -1587,6 +2102,21 @@ mod tests {
             Ok(())
         }
 
+        fn fcntl_dupfd_cloexec(
+            &mut self,
+            fd: RawFd,
+            role: FdRoleV1,
+            minimum: RawFd,
+        ) -> Result<RawFd, i32> {
+            let mut state = self.0.borrow_mut();
+            state.record(StdioOperationV1::FcntlDupMin(role))?;
+            let descriptor = state.open.get(&fd).cloned().ok_or(libc::EBADF)?;
+            let replacement = state.next_fd.max(minimum);
+            state.next_fd = replacement + 1;
+            state.open.insert(replacement, descriptor);
+            Ok(replacement)
+        }
+
         fn close(&mut self, fd: RawFd, role: FdRoleV1) -> Result<(), i32> {
             let mut state = self.0.borrow_mut();
             let result = state.record(StdioOperationV1::Close(role));
@@ -1607,7 +2137,7 @@ mod tests {
         fn close_range_unshare(&mut self, first: u32, last: u32) -> Result<(), i32> {
             let mut state = self.0.borrow_mut();
             state.record(StdioOperationV1::CloseRange)?;
-            assert_eq!((first, last), (3, u32::MAX));
+            assert_eq!((first, last), (5, u32::MAX));
             state.open.retain(|fd, _| (*fd as u32) < first);
             Ok(())
         }
@@ -1729,6 +2259,7 @@ mod tests {
             ParentStdioDrainV1 {
                 syscalls: Some(syscalls),
                 descriptors: [
+                    None,
                     Some(TrackedFdV1 {
                         raw: 20,
                         role: FdRoleV1::ParentStdout,
@@ -1838,8 +2369,12 @@ mod tests {
     #[test]
     fn fixed_deadline_failure_is_typed_and_cleans_without_polling() {
         let (mut parent, state) = fake_parent();
+        let mut sink = CollectSinkV1::default();
         let error = parent
-            .drain_until(&mut CollectSinkV1::default(), Instant::now())
+            .drain_until(
+                &mut DrainPresentationV1::TestSink(&mut sink),
+                Instant::now(),
+            )
             .expect_err("expired deadline");
         assert_eq!(error.reason(), "stdio_drain_deadline_exceeded");
         assert_eq!(error.first_operation, StdioOperationV1::Control);
@@ -2097,12 +2632,6 @@ mod tests {
                 .iter()
                 .any(|op| matches!(op, StdioOperationV1::FcntlSetFl(_)))
         );
-        assert!(
-            baseline
-                .iter()
-                .any(|op| matches!(op, StdioOperationV1::Close(_)))
-        );
-
         for (offset, expected) in baseline.iter().copied().enumerate() {
             let (syscalls, state) = FakeSyscallsV1::new();
             state.borrow_mut().fail_at = Some(offset + 1);
@@ -2114,6 +2643,41 @@ mod tests {
                 "leaked at call {}",
                 offset + 1
             );
+        }
+    }
+
+    #[test]
+    fn construction_relocates_every_protocol_descriptor_above_four() {
+        let (syscalls, state) = FakeSyscallsV1::new();
+        state.borrow_mut().next_fd = 3;
+        let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("relocated construct");
+        assert!(state.borrow().open.keys().all(|descriptor| *descriptor > 4));
+        assert!(
+            state
+                .borrow()
+                .calls
+                .iter()
+                .any(|operation| matches!(operation, StdioOperationV1::FcntlDupMin(_)))
+        );
+        drop(session);
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
+    fn relocation_injection_preserves_first_error_and_closes_every_tracked_copy() {
+        let (syscalls, state) = FakeSyscallsV1::new();
+        state.borrow_mut().next_fd = 3;
+        let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("baseline relocation");
+        let baseline = state.borrow().calls.clone();
+        drop(session);
+        for (offset, expected) in baseline.iter().copied().enumerate() {
+            let (syscalls, state) = FakeSyscallsV1::new();
+            state.borrow_mut().next_fd = 3;
+            state.borrow_mut().fail_at = Some(offset + 1);
+            let failure = ProfileOwnedStdioSessionV1::construct(syscalls)
+                .expect_err("injected relocation/construction call");
+            assert_eq!(failure.first_operation, expected, "call {}", offset + 1);
+            assert!(state.borrow().open.is_empty(), "call {} leaked", offset + 1);
         }
     }
 
@@ -2160,7 +2724,7 @@ mod tests {
 
     #[test]
     fn parent_transition_injection_closes_every_known_descriptor() {
-        for transition_call in 1..=3 {
+        for transition_call in 1..=4 {
             let (syscalls, state) = FakeSyscallsV1::new();
             let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("construct");
             let start = state.borrow().calls.len();
@@ -2176,9 +2740,7 @@ mod tests {
         let (syscalls, state) = FakeSyscallsV1::new();
         let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("construct");
         let start = state.borrow().calls.len();
-        let handoff = session
-            .prepare_blocked_child(test_child_placement_authorization())
-            .expect("prepare");
+        let handoff = session.prepare_blocked_child_for_test().expect("prepare");
         let baseline = state.borrow().calls[start..].to_vec();
         assert_eq!(
             state.borrow().open.keys().copied().collect::<Vec<_>>(),
@@ -2211,7 +2773,7 @@ mod tests {
             let start = state.borrow().calls.len();
             state.borrow_mut().fail_at = Some(start + offset + 1);
             let error = session
-                .prepare_blocked_child(test_child_placement_authorization())
+                .prepare_blocked_child_for_test()
                 .expect_err("injected child preparation call");
             assert_eq!(error.first_operation, expected, "call {}", offset + 1);
             assert!(
@@ -2241,7 +2803,7 @@ mod tests {
             .additional_failures
             .push(start + second_dup_offset + 2);
         let error = session
-            .prepare_blocked_child(test_child_placement_authorization())
+            .prepare_blocked_child_for_test()
             .expect_err("dup3 and cleanup failure");
         assert_eq!(
             error.first_operation,
@@ -2263,7 +2825,7 @@ mod tests {
         let start = state.borrow().calls.len();
         state.borrow_mut().fail_at = Some(start + close_range_offset + 1);
         let error = session
-            .prepare_blocked_child(test_child_placement_authorization())
+            .prepare_blocked_child_for_test()
             .expect_err("close_range unavailable");
         assert_eq!(error.first_operation, StdioOperationV1::CloseRange);
         assert_eq!(error.errno, Some(libc::EIO));
@@ -2281,6 +2843,34 @@ mod tests {
         let calls = state.borrow().calls[start..].to_vec();
         assert!(state.borrow().open.is_empty());
         calls
+    }
+
+    #[test]
+    fn production_capture_api_returns_exact_eof_evidence_without_a_callback() {
+        let (parent, state) = fake_parent();
+        {
+            let mut state = state.borrow_mut();
+            state.polls.push_back(Ok(ready(readable(), readable())));
+            state
+                .stdout_reads
+                .push_back(FakeReadV1::Data(b"out".to_vec()));
+            state.stdout_reads.push_back(FakeReadV1::Eof);
+            state
+                .stderr_reads
+                .push_back(FakeReadV1::Data(b"err".to_vec()));
+            state.stderr_reads.push_back(FakeReadV1::Eof);
+        }
+        let report = parent.drain_capture_v1().expect("exact capture");
+        assert_eq!(report.stdout().captured(), b"out");
+        assert_eq!(report.stderr().captured(), b"err");
+        assert_eq!(report.stdout().drained_bytes(), 3);
+        assert_eq!(report.stderr().drained_bytes(), 3);
+        assert_eq!(report.stdout().delivered_bytes(), 0);
+        assert_eq!(report.stderr().delivered_bytes(), 0);
+        assert!(report.stdout().eof_observed());
+        assert!(report.stderr().eof_observed());
+        assert!(report.capture_complete());
+        assert!(state.borrow().open.is_empty());
     }
 
     #[test]
@@ -2439,6 +3029,18 @@ mod tests {
         assert_not_copy::<ParentStdioDrainV1<FakeSyscallsV1>>();
         assert_not_clone::<ProfileStdioDrainCancellationV1>();
         assert_not_copy::<ProfileStdioDrainCancellationV1>();
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_pointer_width = "64"
+        ))]
+        {
+            assert_not_clone::<ProfileStdioIsolationChildV1>();
+            assert_not_copy::<ProfileStdioIsolationChildV1>();
+            assert_not_clone::<ForkSafeChildFdV1>();
+            assert_not_copy::<ForkSafeChildFdV1>();
+        }
     }
 
     #[cfg(not(all(
@@ -2496,8 +3098,8 @@ mod tests {
         if facts[0] == facts[1] || facts[0] == facts[2] || facts[1] == facts[2] {
             return false;
         }
-        for fd in [3, high_descriptor] {
-            if unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1 || last_errno() != libc::EBADF {
+        for fd in [3, 4, high_descriptor] {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
                 return false;
             }
         }
@@ -2551,41 +3153,123 @@ mod tests {
         target_env = "gnu",
         target_pointer_width = "64"
     ))]
-    #[test]
-    fn linux_live_forked_child_places_exact_stdio_closes_range_and_parent_reaps() {
+    fn assert_child_fault_is_reaped(
+        primary: ChildStdioRawOperationV1,
+        cleanup: Option<ChildStdioRawOperationV1>,
+    ) {
         let session = open_profile_owned_stdio_v1().expect("live pipe construction");
-        let null = File::open("/dev/null").expect("open fixed descriptor seed");
-        let high_raw = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 127) };
+        let (parent, mut child_half) = session
+            .split_for_isolation_v1()
+            .expect("pre-clone linear split");
+        child_half.fault = ChildStdioFaultPlanV1 {
+            primary: Some(primary),
+            cleanup,
+        };
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork disposable fault child");
+        if child == 0 {
+            let status = match child_half.continue_raw_v1() {
+                Err(libc::EIO) => 0,
+                Err(libc::EBUSY) => 121,
+                Err(_) => 122,
+                Ok(_) => 123,
+            };
+            unsafe { libc::_exit(status) }
+        }
+        drop(child_half);
+        let report = parent
+            .drain_capture_v1()
+            .expect("fault child closes every pipe copy on exit");
+        assert!(report.capture_complete());
+        assert_eq!(report.stdout.drained_bytes(), 0);
+        assert_eq!(report.stderr.drained_bytes(), 0);
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(last_errno(), libc::ECHILD);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn linux_child_operation_injection_reaps_every_partial_placement_and_preserves_first_error() {
+        for (source, placed) in [
+            (FdRoleV1::ChildStdin, FdRoleV1::PlacedStdin),
+            (FdRoleV1::ChildStdout, FdRoleV1::PlacedStdout),
+            (FdRoleV1::ChildStderr, FdRoleV1::PlacedStderr),
+        ] {
+            for operation in [
+                ChildStdioRawOperationV1::SourceFstat(source),
+                ChildStdioRawOperationV1::SourceGetFd(source),
+                ChildStdioRawOperationV1::SourceGetFl(source),
+                ChildStdioRawOperationV1::Dup3(placed),
+                ChildStdioRawOperationV1::PlacedFstat(placed),
+                ChildStdioRawOperationV1::PlacedGetFd(placed),
+                ChildStdioRawOperationV1::PlacedGetFl(placed),
+                ChildStdioRawOperationV1::CloseSource(source),
+            ] {
+                assert_child_fault_is_reaped(operation, None);
+            }
+        }
+        assert_child_fault_is_reaped(
+            ChildStdioRawOperationV1::PlacedFstat(FdRoleV1::PlacedStdin),
+            Some(ChildStdioRawOperationV1::ClosePlaced(FdRoleV1::PlacedStdin)),
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn linux_live_preclone_split_places_stdio_preserves_protocol_fds_and_parent_reaps() {
+        let session = open_profile_owned_stdio_v1().expect("live pipe construction");
+        let (parent, child_half) = session
+            .split_for_isolation_v1()
+            .expect("pre-clone linear split");
+        let protocol_report = File::open("/dev/null").expect("reserve report descriptor");
+        let protocol_control = File::open("/dev/null").expect("reserve control descriptor");
+        let high_raw =
+            unsafe { libc::fcntl(protocol_report.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 127) };
         assert!(high_raw >= 127, "seed one sparse inherited descriptor");
         let high = unsafe { OwnedFd::from_raw_fd(high_raw) };
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork disposable stdio child");
         if child == 0 {
-            let handoff = match session.prepare_blocked_child(test_child_placement_authorization())
-            {
-                Ok(handoff) => handoff,
-                Err(error) => {
-                    let status = match (error.first_operation, error.errno) {
-                        (StdioOperationV1::CloseRange, Some(libc::ENOSYS)) => 122,
-                        (StdioOperationV1::CloseRange, _) => 123,
-                        (StdioOperationV1::Dup3(_), _) => 124,
-                        _ => 120,
-                    };
-                    unsafe { libc::_exit(status) }
+            for (source, target) in [
+                (protocol_report.as_raw_fd(), 3),
+                (protocol_control.as_raw_fd(), 4),
+            ] {
+                if source != target
+                    && unsafe { libc::syscall(libc::SYS_dup3, source, target, libc::O_CLOEXEC) }
+                        != i64::from(target)
+                {
+                    unsafe { libc::_exit(119) }
                 }
-            };
+            }
+            if child_half.continue_raw_v1().is_err() {
+                unsafe { libc::_exit(120) }
+            }
             let valid = live_child_descriptor_contract(high_raw);
-            drop(handoff);
             unsafe { libc::_exit(if valid { 0 } else { 121 }) };
         }
 
+        drop(child_half);
         drop(high);
-        drop(null);
-        let parent = session
-            .into_parent_drain()
-            .expect("parent ownership transition");
-        let mut sink = CollectSinkV1::default();
-        let drain = parent.drain(&mut sink);
+        drop(protocol_control);
+        drop(protocol_report);
+        let drain = parent.drain_capture_v1();
         let mut status = 0_i32;
         let waited = loop {
             let result = unsafe { libc::waitpid(child, &mut status, 0) };
@@ -2603,21 +3287,17 @@ mod tests {
         );
         assert_eq!(last_errno(), libc::ECHILD);
         let report = drain.expect("parent drains both live child streams to EOF");
-        assert_eq!(sink.stdout, b"live-stdout\n");
-        assert_eq!(sink.stderr, b"live-stderr\n");
-        assert_eq!(report.stdout.captured(), sink.stdout);
-        assert_eq!(report.stderr.captured(), sink.stderr);
-        assert_eq!(report.stdout.drained_bytes(), sink.stdout.len() as u64);
-        assert_eq!(report.stderr.drained_bytes(), sink.stderr.len() as u64);
-        assert_eq!(report.stdout.delivered_bytes(), sink.stdout.len() as u64);
-        assert_eq!(report.stderr.delivered_bytes(), sink.stderr.len() as u64);
+        assert_eq!(report.stdout.captured(), b"live-stdout\n");
+        assert_eq!(report.stderr.captured(), b"live-stderr\n");
+        assert_eq!(report.stdout.drained_bytes(), 12);
+        assert_eq!(report.stderr.drained_bytes(), 12);
         assert_eq!(
             report.stdout.streaming_hash(),
-            &expected_live_stream_hash(ProfileStreamV1::Stdout, &sink.stdout)
+            &expected_live_stream_hash(ProfileStreamV1::Stdout, b"live-stdout\n")
         );
         assert_eq!(
             report.stderr.streaming_hash(),
-            &expected_live_stream_hash(ProfileStreamV1::Stderr, &sink.stderr)
+            &expected_live_stream_hash(ProfileStreamV1::Stderr, b"live-stderr\n")
         );
         assert!(report.capture_complete());
         assert!(!report.requires_execute_only_classification());

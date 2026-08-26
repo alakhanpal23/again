@@ -474,4 +474,33 @@ mod tests {
         );
         drop(ready);
     }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    #[ignore = "requires the provisioned rootless namespace tuple and a single-threaded test process"]
+    fn provisioned_live_stdio_child_half_composes_through_isolation_pid_one() {
+        let session = super::super::execute_only_stdio::open_profile_owned_stdio_v1()
+            .expect("profile stdio pipes");
+        let (parent_capture, child_stdio) = session
+            .split_for_isolation_v1()
+            .expect("pre-clone linear split");
+        let blocked = begin_blocked_execute_only_isolation_with_child_v1(child_stdio)
+            .expect("authenticated child consumes only the stdio child half");
+        let ready = blocked
+            .into_continuation_permit()
+            .continue_to_isolation_ready_v1()
+            .expect("stdio placement preserves protocol descriptors 3 and 4");
+        drop(ready);
+        let capture = parent_capture
+            .drain_capture_v1()
+            .expect("isolation cleanup closes child writers and exposes exact EOF");
+        assert!(capture.capture_complete());
+        assert_eq!(capture.stdout().drained_bytes(), 0);
+        assert_eq!(capture.stderr().drained_bytes(), 0);
+    }
 }
