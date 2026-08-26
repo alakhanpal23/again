@@ -1,0 +1,54 @@
+name: linux-supervisor-qualification
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-supervisor-qualification-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: Pinned provisioned Linux supervisor 100-sample qualification
+    runs-on: [self-hosted, linux, x64, again-linux-pytest-v1]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --component clippy
+      - name: Require the provisioned kernel contract
+        shell: bash
+        run: |
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          if test -r /proc/config.gz; then
+            zgrep -q '^CONFIG_SECCOMP_FILTER=y$' /proc/config.gz
+            zgrep -q '^CONFIG_CHECKPOINT_RESTORE=y$' /proc/config.gz
+          else
+            kernel_config="/boot/config-$(uname -r)"
+            test -r "${kernel_config}"
+            grep -q '^CONFIG_SECCOMP_FILTER=y$' "${kernel_config}"
+            grep -q '^CONFIG_CHECKPOINT_RESTORE=y$' "${kernel_config}"
+          fi
+          cap_eff=$(awk '/^CapEff:/ { print $2 }' /proc/self/status)
+          test -n "${cap_eff}"
+          test $((16#${cap_eff} & 16#200000)) -ne 0
+      - name: Strict Linux source validation
+        run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
+      - name: Build the fixed diagnostic
+        run: cargo +1.88.0 build --locked --bin again
+      - name: Require 100 samples and both kernel fork-delivery orders
+        run: scripts/qualify_linux_supervisor.sh
+      - name: Upload exact qualification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-supervisor-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.sha }}
+          path: linux-supervisor-qualification/
+          if-no-files-found: error
+          retention-days: 30

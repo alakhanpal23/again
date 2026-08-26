@@ -29,8 +29,24 @@ impl TracerSupervisorCleanupCompletionPermitV1 {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::linux_pytest) enum FixedTwoTaskForkDeliveryOrderV1 {
+    ParentEventFirst,
+    ChildStopFirst,
+}
+
+impl FixedTwoTaskForkDeliveryOrderV1 {
+    pub(in crate::linux_pytest) const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParentEventFirst => "parent_event_first",
+            Self::ChildStopFirst => "child_stop_first",
+        }
+    }
+}
+
 /// Opaque success for the fixed no-command two-task probe.
 pub(in crate::linux_pytest) struct CompletedFixedTwoTaskSupervisorProbeV1 {
+    fork_delivery_order: FixedTwoTaskForkDeliveryOrderV1,
     task_count: u16,
     accepted_transition_count: u64,
     fork_birth_count: u64,
@@ -42,6 +58,10 @@ pub(in crate::linux_pytest) struct CompletedFixedTwoTaskSupervisorProbeV1 {
 }
 
 impl CompletedFixedTwoTaskSupervisorProbeV1 {
+    pub(in crate::linux_pytest) const fn fork_delivery_order(&self) -> &'static str {
+        self.fork_delivery_order.as_str()
+    }
+
     pub(in crate::linux_pytest) const fn task_count(&self) -> u16 {
         self.task_count
     }
@@ -377,6 +397,67 @@ mod platform {
     const SECCOMP_RET_TRACE_V1: u32 = 0x7ff0_0000;
     const PR_SET_NO_NEW_PRIVS_V1: i64 = 38;
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ConnectorKernelOperationV1 {
+        WaitRun,
+        WaitCleanup,
+        PtraceSeize,
+        PtraceFilterCount,
+        PtraceFilterRead,
+        PtraceEventMessage,
+        PtraceSyscallInfo,
+        PtraceResumeContinue,
+        PtraceResumeSyscall,
+        PtraceCleanupResume,
+        ProcessMemoryRead,
+        KillPidfd,
+        KillTid,
+        SignalMaskRead,
+        SignalActionRead,
+        SignalPendingRead,
+    }
+
+    #[derive(Clone, Copy)]
+    enum InjectedKernelResultV1 {
+        Return(i64),
+        Errno(i32),
+    }
+
+    trait ConnectorFaultInjectorV1 {
+        fn take(&mut self, operation: ConnectorKernelOperationV1)
+        -> Option<InjectedKernelResultV1>;
+    }
+
+    struct NoConnectorFaultsV1;
+
+    impl ConnectorFaultInjectorV1 for NoConnectorFaultsV1 {
+        fn take(
+            &mut self,
+            _operation: ConnectorKernelOperationV1,
+        ) -> Option<InjectedKernelResultV1> {
+            None
+        }
+    }
+
+    fn connector_kernel_call_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        operation: ConnectorKernelOperationV1,
+        call: impl FnOnce() -> i64,
+    ) -> Result<i64, i32> {
+        match faults.take(operation) {
+            Some(InjectedKernelResultV1::Return(value)) => Ok(value),
+            Some(InjectedKernelResultV1::Errno(errno)) => Err(errno),
+            None => {
+                let result = call();
+                if result < 0 {
+                    Err(last_errno_v1())
+                } else {
+                    Ok(result)
+                }
+            }
+        }
+    }
+
     #[repr(C)]
     #[derive(Default)]
     struct CloneArgsV1 {
@@ -464,8 +545,10 @@ mod platform {
     }
 
     impl SignalStateSnapshotV1 {
-        fn capture() -> Result<Self, FixedTwoTaskSupervisorFailureV1> {
-            let mask = current_signal_mask_v1()?;
+        fn capture(
+            faults: &mut impl ConnectorFaultInjectorV1,
+        ) -> Result<Self, FixedTwoTaskSupervisorFailureV1> {
+            let mask = current_signal_mask_v1(faults)?;
             let blocked = unsafe { libc::sigismember(&mask, libc::SIGCHLD) };
             if blocked != 0 {
                 return Err(failure_v1(
@@ -478,13 +561,23 @@ mod platform {
                     (blocked < 0).then(last_errno_v1),
                 ));
             }
-            require_no_pending_sigchld_v1()?;
+            require_no_pending_sigchld_v1(faults)?;
             let mut action = MaybeUninit::<libc::sigaction>::zeroed();
-            if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), action.as_mut_ptr()) } != 0 {
+            if let Err(errno) = connector_kernel_call_v1(
+                faults,
+                ConnectorKernelOperationV1::SignalActionRead,
+                || unsafe {
+                    i64::from(libc::sigaction(
+                        libc::SIGCHLD,
+                        ptr::null(),
+                        action.as_mut_ptr(),
+                    ))
+                },
+            ) {
                 return Err(failure_v1(
                     FixedTwoTaskSupervisorStageV1::SignalState,
                     FixedTwoTaskSupervisorReasonV1::Io,
-                    Some(last_errno_v1()),
+                    Some(errno),
                 ));
             }
             let action = unsafe { action.assume_init() };
@@ -500,8 +593,11 @@ mod platform {
             Ok(Self { mask, action })
         }
 
-        fn verify(&self) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
-            let observed_mask = current_signal_mask_v1()?;
+        fn verify(
+            &self,
+            faults: &mut impl ConnectorFaultInjectorV1,
+        ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+            let observed_mask = current_signal_mask_v1(faults)?;
             for signal in 1..=64 {
                 let expected = unsafe { libc::sigismember(&self.mask, signal) };
                 let observed = unsafe { libc::sigismember(&observed_mask, signal) };
@@ -514,13 +610,21 @@ mod platform {
                 }
             }
             let mut observed_action = MaybeUninit::<libc::sigaction>::zeroed();
-            if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), observed_action.as_mut_ptr()) }
-                != 0
-            {
+            if let Err(errno) = connector_kernel_call_v1(
+                faults,
+                ConnectorKernelOperationV1::SignalActionRead,
+                || unsafe {
+                    i64::from(libc::sigaction(
+                        libc::SIGCHLD,
+                        ptr::null(),
+                        observed_action.as_mut_ptr(),
+                    ))
+                },
+            ) {
                 return Err(failure_v1(
                     FixedTwoTaskSupervisorStageV1::SignalState,
                     FixedTwoTaskSupervisorReasonV1::Io,
-                    Some(last_errno_v1()),
+                    Some(errno),
                 ));
             }
             let observed_action = unsafe { observed_action.assume_init() };
@@ -538,7 +642,7 @@ mod platform {
                     None,
                 ));
             }
-            require_no_pending_sigchld_v1()
+            require_no_pending_sigchld_v1(faults)
         }
     }
 
@@ -590,6 +694,7 @@ mod platform {
         nested_announced_tid: Option<i32>,
         pending_nested_stop_tid: Option<i32>,
         nested_tid: Option<i32>,
+        fork_delivery_order: Option<FixedTwoTaskForkDeliveryOrderV1>,
         nested_pidfd: Option<OwnedFd>,
         root_reaped: bool,
         nested_reaped: bool,
@@ -615,6 +720,11 @@ mod platform {
                     None,
                 ));
             }
+            self.record_fork_delivery_order(if self.pending_nested_stop_tid == Some(raw_tid) {
+                FixedTwoTaskForkDeliveryOrderV1::ChildStopFirst
+            } else {
+                FixedTwoTaskForkDeliveryOrderV1::ParentEventFirst
+            })?;
             self.nested_announced_tid = Some(raw_tid);
             if self.pending_nested_stop_tid == Some(raw_tid) {
                 self.bind_nested_tid(raw_tid)?;
@@ -643,6 +753,11 @@ mod platform {
                 // waitpid has already consumed.
                 self.pending_nested_stop_tid = Some(raw_tid);
             }
+            self.record_fork_delivery_order(if self.nested_announced_tid == Some(raw_tid) {
+                FixedTwoTaskForkDeliveryOrderV1::ParentEventFirst
+            } else {
+                FixedTwoTaskForkDeliveryOrderV1::ChildStopFirst
+            })?;
             if self.pending_nested_stop_tid != Some(raw_tid)
                 || self
                     .nested_announced_tid
@@ -658,6 +773,24 @@ mod platform {
                 self.bind_nested_tid(raw_tid)?;
             }
             Ok(())
+        }
+
+        fn record_fork_delivery_order(
+            &mut self,
+            observed: FixedTwoTaskForkDeliveryOrderV1,
+        ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+            match self.fork_delivery_order {
+                None => {
+                    self.fork_delivery_order = Some(observed);
+                    Ok(())
+                }
+                Some(existing) if existing == observed => Ok(()),
+                Some(_) => Err(failure_v1(
+                    FixedTwoTaskSupervisorStageV1::WaitEvent,
+                    FixedTwoTaskSupervisorReasonV1::UnexpectedLifecycleEvent,
+                    None,
+                )),
+            }
         }
 
         fn bind_nested_tid(&mut self, raw_tid: i32) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
@@ -721,13 +854,13 @@ mod platform {
             Ok(())
         }
 
-        fn cleanup(&mut self) -> (bool, Option<i32>) {
+        fn cleanup(&mut self, faults: &mut impl ConnectorFaultInjectorV1) -> (bool, Option<i32>) {
             let deadline = match MonotonicDeadlineV1::after(CLEANUP_SECONDS_V1) {
                 Ok(deadline) => deadline,
                 Err(failure) => return (false, failure.errno()),
             };
             let mut first_errno = None;
-            self.kill_known(&mut first_errno);
+            self.kill_known(&mut first_errno, faults);
             let mut attempts = 0_usize;
             loop {
                 if attempts >= MAX_WAIT_ATTEMPTS_V1 {
@@ -735,15 +868,31 @@ mod platform {
                 }
                 attempts += 1;
                 let mut status = 0_i32;
-                let result =
-                    unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1) };
+                let result = match connector_kernel_call_v1(
+                    faults,
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    || unsafe {
+                        i64::from(libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1))
+                    },
+                ) {
+                    Ok(result) => result,
+                    Err(errno) => -i64::from(errno),
+                };
                 if result > 0 {
-                    let raw_tid = result;
+                    let Ok(raw_tid) = i32::try_from(result) else {
+                        first_errno.get_or_insert(libc::EPROTO);
+                        return (false, first_errno);
+                    };
                     if wait_status_is_ptrace_stop_v1(status) {
-                        let _ = unsafe { libc::kill(raw_tid, libc::SIGKILL) };
-                        if let Err(errno) =
-                            ptrace_call_v1(PTRACE_CONT_V1, raw_tid, 0, libc::SIGKILL as u64)
-                        {
+                        let _ = kill_tid_v1(faults, raw_tid);
+                        if let Err(errno) = ptrace_call_v1(
+                            faults,
+                            ConnectorKernelOperationV1::PtraceCleanupResume,
+                            PTRACE_CONT_V1,
+                            raw_tid,
+                            0,
+                            libc::SIGKILL as u64,
+                        ) {
                             if !matches!(errno, libc::ESRCH | libc::ECHILD) {
                                 first_errno.get_or_insert(errno);
                             }
@@ -753,11 +902,11 @@ mod platform {
                     } else {
                         first_errno.get_or_insert(libc::EPROTO);
                     }
-                    self.kill_known(&mut first_errno);
+                    self.kill_known(&mut first_errno, faults);
                     continue;
                 }
                 if result < 0 {
-                    let errno = last_errno_v1();
+                    let errno = i32::try_from(-result).unwrap_or(libc::EIO);
                     if errno == libc::EINTR {
                         continue;
                     }
@@ -783,12 +932,17 @@ mod platform {
             }
         }
 
-        fn kill_known(&mut self, first_errno: &mut Option<i32>) {
+        fn kill_known(
+            &mut self,
+            first_errno: &mut Option<i32>,
+            faults: &mut impl ConnectorFaultInjectorV1,
+        ) {
             self.kill_bound_task(
                 self.root_tid,
                 self.root_pidfd.as_ref(),
                 self.root_reaped,
                 first_errno,
+                faults,
             );
             if let Some(raw_tid) = self.nested_tid {
                 self.kill_bound_task(
@@ -796,17 +950,23 @@ mod platform {
                     self.nested_pidfd.as_ref(),
                     self.nested_reaped,
                     first_errno,
+                    faults,
                 );
             }
             if let Some(raw_tid) = self.pending_nested_stop_tid.take() {
-                if unsafe { libc::kill(raw_tid, libc::SIGKILL) } != 0 {
-                    let errno = last_errno_v1();
+                if let Err(errno) = kill_tid_v1(faults, raw_tid) {
                     if errno != libc::ESRCH {
                         first_errno.get_or_insert(errno);
                     }
                 }
-                if let Err(errno) = ptrace_call_v1(PTRACE_CONT_V1, raw_tid, 0, libc::SIGKILL as u64)
-                {
+                if let Err(errno) = ptrace_call_v1(
+                    faults,
+                    ConnectorKernelOperationV1::PtraceCleanupResume,
+                    PTRACE_CONT_V1,
+                    raw_tid,
+                    0,
+                    libc::SIGKILL as u64,
+                ) {
                     if !matches!(errno, libc::ESRCH | libc::ECHILD) {
                         first_errno.get_or_insert(errno);
                     }
@@ -820,30 +980,20 @@ mod platform {
             descriptor: Option<&OwnedFd>,
             reaped: bool,
             first_errno: &mut Option<i32>,
+            faults: &mut impl ConnectorFaultInjectorV1,
         ) {
             if reaped {
                 return;
             }
             if let Some(descriptor) = descriptor {
-                let result = unsafe {
-                    libc::syscall(
-                        libc::SYS_pidfd_send_signal,
-                        descriptor.as_raw_fd(),
-                        libc::SIGKILL,
-                        ptr::null::<libc::siginfo_t>(),
-                        0_u32,
-                    )
-                };
-                if result < 0 {
-                    let errno = last_errno_v1();
+                if let Err(errno) = pidfd_kill_v1(faults, descriptor) {
                     if !matches!(errno, libc::ESRCH | libc::ECHILD) {
                         first_errno.get_or_insert(errno);
                     }
                 }
                 return;
             }
-            if unsafe { libc::kill(raw_tid, libc::SIGKILL) } != 0 {
-                let errno = last_errno_v1();
+            if let Err(errno) = kill_tid_v1(faults, raw_tid) {
                 if errno != libc::ESRCH {
                     first_errno.get_or_insert(errno);
                 }
@@ -859,24 +1009,30 @@ mod platform {
         fn drop(&mut self) {
             if !self.disarmed {
                 let mut ignored = None;
-                self.kill_known(&mut ignored);
+                self.kill_known(&mut ignored, &mut NoConnectorFaultsV1);
             }
         }
     }
 
     pub(super) fn qualify_fixed_two_task_supervisor_v1()
     -> Result<CompletedFixedTwoTaskSupervisorProbeV1, FixedTwoTaskSupervisorFailureV1> {
+        qualify_fixed_two_task_supervisor_with_faults_v1(&mut NoConnectorFaultsV1)
+    }
+
+    fn qualify_fixed_two_task_supervisor_with_faults_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+    ) -> Result<CompletedFixedTwoTaskSupervisorProbeV1, FixedTwoTaskSupervisorFailureV1> {
         require_dedicated_helper_v1()?;
         require_no_loader_injection_v1()?;
         require_seccomp_actions_v1()?;
-        let signal_state = SignalStateSnapshotV1::capture()?;
+        let signal_state = SignalStateSnapshotV1::capture(faults)?;
         let release = ReleaseChannelV1::create()?;
-        let mut tree = clone_root_v1(release.read.as_raw_fd(), release.write.as_raw_fd())?;
+        let mut tree = clone_root_v1(faults, release.read.as_raw_fd(), release.write.as_raw_fd())?;
         drop(release.read);
         let mut release_write = Some(release.write);
 
         let outcome = (|| {
-            seize_root_v1(tree.root_tid)?;
+            seize_root_v1(faults, tree.root_tid)?;
             release_root_v1(release_write.take().ok_or_else(|| {
                 failure_v1(
                     FixedTwoTaskSupervisorStageV1::ReleaseRoot,
@@ -885,25 +1041,26 @@ mod platform {
                 )
             })?)?;
             let deadline = MonotonicDeadlineV1::after(RUN_SECONDS_V1)?;
-            drive_supervisor_v1(&mut tree, deadline)
+            drive_supervisor_v1(faults, &mut tree, deadline)
         })();
         drop(release_write);
 
         let supervisor = match outcome {
             Ok(supervisor) => supervisor,
             Err(first) => {
-                let (tree_clean, cleanup_errno) = tree.cleanup();
-                let signal_failure = signal_state.verify().err();
-                let signal_clean = signal_failure.is_none();
-                let cleanup_errno = cleanup_errno
-                    .or_else(|| signal_failure.as_ref().and_then(|failure| failure.errno()));
-                return Err(first.with_cleanup(tree_clean && signal_clean, cleanup_errno));
+                return Err(finish_failed_run_v1(
+                    first,
+                    &mut tree,
+                    &signal_state,
+                    faults,
+                ));
             }
         };
 
+        let fork_delivery_order = tree.fork_delivery_order.ok_or_else(planner_failure_v1)?;
         tree.close_success()?;
         signal_state
-            .verify()
+            .verify(faults)
             .map_err(|failure| failure.with_cleanup(false, None))?;
         let completed = supervisor
             .complete(TracerSupervisorCleanupCompletionPermitV1(()))
@@ -914,14 +1071,29 @@ mod platform {
                     None,
                 )
             })?;
-        fixed_completion_v1(completed)
+        fixed_completion_v1(completed, fork_delivery_order)
+    }
+
+    fn finish_failed_run_v1(
+        first: FixedTwoTaskSupervisorFailureV1,
+        tree: &mut TaskTreeGuardV1,
+        signal_state: &SignalStateSnapshotV1,
+        faults: &mut impl ConnectorFaultInjectorV1,
+    ) -> FixedTwoTaskSupervisorFailureV1 {
+        let (tree_clean, cleanup_errno) = tree.cleanup(faults);
+        let signal_failure = signal_state.verify(faults).err();
+        let signal_clean = signal_failure.is_none();
+        let cleanup_errno =
+            cleanup_errno.or_else(|| signal_failure.as_ref().and_then(|failure| failure.errno()));
+        first.with_cleanup(tree_clean && signal_clean, cleanup_errno)
     }
 
     fn drive_supervisor_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         tree: &mut TaskTreeGuardV1,
         deadline: MonotonicDeadlineV1,
     ) -> Result<TracerSupervisorStateV1, FixedTwoTaskSupervisorFailureV1> {
-        let (initial_tid, initial_status) = wait_any_v1(deadline)?.ok_or_else(|| {
+        let (initial_tid, initial_status) = wait_any_v1(faults, deadline)?.ok_or_else(|| {
             failure_v1(
                 FixedTwoTaskSupervisorStageV1::WaitEvent,
                 FixedTwoTaskSupervisorReasonV1::UnexpectedLifecycleEvent,
@@ -935,7 +1107,7 @@ mod platform {
                 None,
             ));
         }
-        prove_installed_filter_v1(tree.root_tid)?;
+        prove_installed_filter_v1(faults, tree.root_tid)?;
         let mut sink = FixedEventSinkV1::new();
         let mut supervisor = TracerSupervisorStateV1::begin(
             TracerSupervisorIssuerPermitV1(()),
@@ -951,7 +1123,7 @@ mod platform {
             intent = match intent {
                 TracerSupervisorIntentV1::ReadEventMessage(token) => {
                     let event = token.event();
-                    let message = read_event_message_v1(token.raw_tid())?;
+                    let message = read_event_message_v1(faults, token.raw_tid())?;
                     if event == LinuxPtraceEventV1::Fork {
                         let child_tid = i32::try_from(message)
                             .ok()
@@ -971,7 +1143,7 @@ mod platform {
                 }
                 TracerSupervisorIntentV1::ReadSyscallInfo(token) => {
                     let mut buffer = [0_u8; 84];
-                    let count = read_syscall_info_v1(token.raw_tid(), &mut buffer)?;
+                    let count = read_syscall_info_v1(faults, token.raw_tid(), &mut buffer)?;
                     supervisor
                         .accept_syscall_info(token, count, &buffer, &mut sink)
                         .map_err(|_| planner_failure_v1())?
@@ -988,6 +1160,7 @@ mod platform {
                     )?;
                     let mut buffer = [0_u8; CLONE3_ARGS_BUFFER_BYTES_V1];
                     let copied = read_process_memory_v1(
+                        faults,
                         token.raw_tid(),
                         token.address(),
                         token.byte_count(),
@@ -1005,12 +1178,12 @@ mod platform {
                         .map_err(|_| planner_failure_v1())?
                 }
                 TracerSupervisorIntentV1::Resume(resume) => {
-                    resume_task_v1(resume.raw_tid(), resume.request())?;
+                    resume_task_v1(faults, resume.raw_tid(), resume.request())?;
                     supervisor
                         .confirm_resume_succeeded(resume)
                         .map_err(|_| planner_failure_v1())?
                 }
-                TracerSupervisorIntentV1::WaitForNextStop => match wait_any_v1(deadline)? {
+                TracerSupervisorIntentV1::WaitForNextStop => match wait_any_v1(faults, deadline)? {
                     Some((raw_tid, status)) => {
                         if wait_status_is_ptrace_stop_v1(status) {
                             tree.record_ptrace_stop(raw_tid)?;
@@ -1038,6 +1211,7 @@ mod platform {
 
     fn fixed_completion_v1(
         completed: CompletedTracerSupervisorStateV1,
+        fork_delivery_order: FixedTwoTaskForkDeliveryOrderV1,
     ) -> Result<CompletedFixedTwoTaskSupervisorProbeV1, FixedTwoTaskSupervisorFailureV1> {
         let summary = completed.summary();
         if summary.task_count != 2
@@ -1058,6 +1232,7 @@ mod platform {
             return Err(planner_failure_v1());
         }
         Ok(CompletedFixedTwoTaskSupervisorProbeV1 {
+            fork_delivery_order,
             task_count: summary.task_count,
             accepted_transition_count: summary.accepted_transition_count,
             fork_birth_count: summary.fork_birth_count,
@@ -1070,6 +1245,7 @@ mod platform {
     }
 
     fn clone_root_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         release_read: RawFd,
         release_write: RawFd,
     ) -> Result<TaskTreeGuardV1, FixedTwoTaskSupervisorFailureV1> {
@@ -1117,7 +1293,7 @@ mod platform {
                     FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
                     None,
                 );
-                let (cleanup_complete, cleanup_errno) = cleanup_unidentified_root_v1(pidfd);
+                let (cleanup_complete, cleanup_errno) = cleanup_unidentified_root_v1(faults, pidfd);
                 first.with_cleanup(cleanup_complete, cleanup_errno)
             })?;
         let root_pidfd = (pidfd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(pidfd) });
@@ -1127,6 +1303,7 @@ mod platform {
             nested_announced_tid: None,
             pending_nested_stop_tid: None,
             nested_tid: None,
+            fork_delivery_order: None,
             nested_pidfd: None,
             root_reaped: false,
             nested_reaped: false,
@@ -1146,28 +1323,21 @@ mod platform {
         match validation {
             Ok(()) => Ok(tree),
             Err(first) => {
-                let (cleanup_complete, cleanup_errno) = tree.cleanup();
+                let (cleanup_complete, cleanup_errno) = tree.cleanup(faults);
                 Err(first.with_cleanup(cleanup_complete, cleanup_errno))
             }
         }
     }
 
-    fn cleanup_unidentified_root_v1(pidfd: RawFd) -> (bool, Option<i32>) {
+    fn cleanup_unidentified_root_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        pidfd: RawFd,
+    ) -> (bool, Option<i32>) {
         if pidfd < 0 {
             return (false, None);
         }
         let descriptor = unsafe { OwnedFd::from_raw_fd(pidfd) };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                descriptor.as_raw_fd(),
-                libc::SIGKILL,
-                ptr::null::<libc::siginfo_t>(),
-                0_u32,
-            )
-        };
-        if result < 0 {
-            let errno = last_errno_v1();
+        if let Err(errno) = pidfd_kill_v1(faults, &descriptor) {
             if errno != libc::ESRCH {
                 return (false, Some(errno));
             }
@@ -1178,12 +1348,21 @@ mod platform {
         };
         for _ in 0..MAX_WAIT_ATTEMPTS_V1 {
             let mut status = 0_i32;
-            let waited = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1) };
+            let waited = match connector_kernel_call_v1(
+                faults,
+                ConnectorKernelOperationV1::WaitCleanup,
+                || unsafe {
+                    i64::from(libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1))
+                },
+            ) {
+                Ok(result) => result,
+                Err(errno) => -i64::from(errno),
+            };
             if waited > 0 {
                 continue;
             }
             if waited < 0 {
-                let errno = last_errno_v1();
+                let errno = i32::try_from(-waited).unwrap_or(libc::EIO);
                 if errno == libc::EINTR {
                     continue;
                 }
@@ -1356,8 +1535,18 @@ mod platform {
         result
     }
 
-    fn seize_root_v1(root_tid: i32) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
-        match ptrace_call_v1(PTRACE_SEIZE_V1, root_tid, 0, PTRACE_OPTIONS_V1) {
+    fn seize_root_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        root_tid: i32,
+    ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+        match ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceSeize,
+            PTRACE_SEIZE_V1,
+            root_tid,
+            0,
+            PTRACE_OPTIONS_V1,
+        ) {
             Ok(0) => Ok(()),
             Ok(_) => Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::PtraceSeize,
@@ -1397,6 +1586,7 @@ mod platform {
     }
 
     fn wait_any_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         deadline: MonotonicDeadlineV1,
     ) -> Result<Option<(i32, i32)>, FixedTwoTaskSupervisorFailureV1> {
         let mut attempts = 0_usize;
@@ -1410,12 +1600,30 @@ mod platform {
             }
             attempts += 1;
             let mut status = 0_i32;
-            let result = unsafe { libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1) };
+            let result = match connector_kernel_call_v1(
+                faults,
+                ConnectorKernelOperationV1::WaitRun,
+                || unsafe {
+                    i64::from(libc::waitpid(-1, &mut status, libc::WNOHANG | WAIT_WALL_V1))
+                },
+            ) {
+                Ok(result) => result,
+                Err(errno) => -i64::from(errno),
+            };
             if result > 0 {
-                return Ok(Some((result, status)));
+                return Ok(Some((
+                    i32::try_from(result).map_err(|_| {
+                        failure_v1(
+                            FixedTwoTaskSupervisorStageV1::WaitEvent,
+                            FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
+                            None,
+                        )
+                    })?,
+                    status,
+                )));
             }
             if result < 0 {
-                let errno = last_errno_v1();
+                let errno = i32::try_from(-result).unwrap_or(libc::EIO);
                 if errno == libc::EINTR {
                     continue;
                 }
@@ -1451,13 +1659,21 @@ mod platform {
         }
     }
 
-    fn prove_installed_filter_v1(raw_tid: i32) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+    fn prove_installed_filter_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        raw_tid: i32,
+    ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
         let program = trace_all_native_seccomp_program_v1(FutureTracerSeccompConnectorPermitV1(()));
         let expected = program.instructions();
-        let count =
-            ptrace_call_v1(PTRACE_SECCOMP_GET_FILTER_V1, raw_tid, 0, 0).map_err(|errno| {
-                ptrace_failure_v1(FixedTwoTaskSupervisorStageV1::FilterWitness, errno)
-            })?;
+        let count = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceFilterCount,
+            PTRACE_SECCOMP_GET_FILTER_V1,
+            raw_tid,
+            0,
+            0,
+        )
+        .map_err(|errno| ptrace_failure_v1(FixedTwoTaskSupervisorStageV1::FilterWitness, errno))?;
         if usize::try_from(count).ok() != Some(expected.len()) {
             return Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::FilterWitness,
@@ -1472,6 +1688,8 @@ mod platform {
             operand: 0,
         }; super::super::TRACE_ALL_NATIVE_SECCOMP_INSTRUCTION_COUNT_V1];
         let read = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceFilterRead,
             PTRACE_SECCOMP_GET_FILTER_V1,
             raw_tid,
             0,
@@ -1488,9 +1706,14 @@ mod platform {
         Ok(())
     }
 
-    fn read_event_message_v1(raw_tid: i32) -> Result<u64, FixedTwoTaskSupervisorFailureV1> {
+    fn read_event_message_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        raw_tid: i32,
+    ) -> Result<u64, FixedTwoTaskSupervisorFailureV1> {
         let mut message = u64::MAX;
         let result = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceEventMessage,
             PTRACE_GETEVENTMSG_V1,
             raw_tid,
             0,
@@ -1508,10 +1731,13 @@ mod platform {
     }
 
     fn read_syscall_info_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         raw_tid: i32,
         buffer: &mut [u8; 84],
     ) -> Result<usize, FixedTwoTaskSupervisorFailureV1> {
         let result = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceSyscallInfo,
             PTRACE_GET_SYSCALL_INFO_V1,
             raw_tid,
             buffer.len() as u64,
@@ -1528,14 +1754,21 @@ mod platform {
     }
 
     fn resume_task_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         raw_tid: i32,
         request: TracerSupervisorResumeRequestV1,
     ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
-        let request = match request {
-            TracerSupervisorResumeRequestV1::Continue => PTRACE_CONT_V1,
-            TracerSupervisorResumeRequestV1::Syscall => PTRACE_SYSCALL_V1,
+        let (operation, request) = match request {
+            TracerSupervisorResumeRequestV1::Continue => (
+                ConnectorKernelOperationV1::PtraceResumeContinue,
+                PTRACE_CONT_V1,
+            ),
+            TracerSupervisorResumeRequestV1::Syscall => (
+                ConnectorKernelOperationV1::PtraceResumeSyscall,
+                PTRACE_SYSCALL_V1,
+            ),
         };
-        match ptrace_call_v1(request, raw_tid, 0, 0) {
+        match ptrace_call_v1(faults, operation, request, raw_tid, 0, 0) {
             Ok(0) => Ok(()),
             Ok(_) => Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::Resume,
@@ -1695,6 +1928,7 @@ mod platform {
     }
 
     fn read_process_memory_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
         raw_tid: i32,
         address: u64,
         byte_count: usize,
@@ -1708,20 +1942,22 @@ mod platform {
             iov_base: address as *mut libc::c_void,
             iov_len: byte_count,
         };
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_process_vm_readv,
-                raw_tid,
-                &mut local,
-                1_u64,
-                &mut remote,
-                1_u64,
-                0_u64,
-            )
-        };
-        if result < 0 {
-            return Err(process_memory_failure_v1(last_errno_v1()));
-        }
+        let result = connector_kernel_call_v1(
+            faults,
+            ConnectorKernelOperationV1::ProcessMemoryRead,
+            || unsafe {
+                libc::syscall(
+                    libc::SYS_process_vm_readv,
+                    raw_tid,
+                    &mut local,
+                    1_u64,
+                    &mut remote,
+                    1_u64,
+                    0_u64,
+                )
+            },
+        )
+        .map_err(process_memory_failure_v1)?;
         let copied = usize::try_from(result).map_err(|_| {
             failure_v1(
                 FixedTwoTaskSupervisorStageV1::ProcessMemory,
@@ -1740,12 +1976,14 @@ mod platform {
     }
 
     fn ptrace_call_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        operation: ConnectorKernelOperationV1,
         request: u64,
         raw_tid: i32,
         address: u64,
         data: u64,
     ) -> Result<libc::c_long, i32> {
-        let result = unsafe {
+        connector_kernel_call_v1(faults, operation, || unsafe {
             libc::syscall(
                 libc::SYS_ptrace,
                 request,
@@ -1755,12 +1993,31 @@ mod platform {
                 0_u64,
                 0_u64,
             )
-        };
-        if result < 0 {
-            Err(last_errno_v1())
-        } else {
-            Ok(result)
-        }
+        })
+        .map(|result| result as libc::c_long)
+    }
+
+    fn pidfd_kill_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        descriptor: &OwnedFd,
+    ) -> Result<(), i32> {
+        connector_kernel_call_v1(faults, ConnectorKernelOperationV1::KillPidfd, || unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                descriptor.as_raw_fd(),
+                libc::SIGKILL,
+                ptr::null::<libc::siginfo_t>(),
+                0_u32,
+            )
+        })
+        .and_then(|result| (result == 0).then_some(()).ok_or(libc::EPROTO))
+    }
+
+    fn kill_tid_v1(faults: &mut impl ConnectorFaultInjectorV1, raw_tid: i32) -> Result<(), i32> {
+        connector_kernel_call_v1(faults, ConnectorKernelOperationV1::KillTid, || unsafe {
+            i64::from(libc::kill(raw_tid, libc::SIGKILL))
+        })
+        .and_then(|result| (result == 0).then_some(()).ok_or(libc::EPROTO))
     }
 
     fn require_dedicated_helper_v1() -> Result<(), FixedTwoTaskSupervisorFailureV1> {
@@ -1954,10 +2211,19 @@ mod platform {
         Ok(())
     }
 
-    fn current_signal_mask_v1() -> Result<libc::sigset_t, FixedTwoTaskSupervisorFailureV1> {
-        let mut mask = MaybeUninit::<libc::sigset_t>::uninit();
-        let result =
-            unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, ptr::null(), mask.as_mut_ptr()) };
+    fn current_signal_mask_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+    ) -> Result<libc::sigset_t, FixedTwoTaskSupervisorFailureV1> {
+        let mut mask = MaybeUninit::<libc::sigset_t>::zeroed();
+        let result = match faults.take(ConnectorKernelOperationV1::SignalMaskRead) {
+            Some(InjectedKernelResultV1::Return(value)) => {
+                i32::try_from(value).unwrap_or(libc::EIO)
+            }
+            Some(InjectedKernelResultV1::Errno(errno)) => errno,
+            None => unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, ptr::null(), mask.as_mut_ptr())
+            },
+        };
         if result != 0 {
             return Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::SignalState,
@@ -1989,13 +2255,19 @@ mod platform {
         Ok(true)
     }
 
-    fn require_no_pending_sigchld_v1() -> Result<(), FixedTwoTaskSupervisorFailureV1> {
-        let mut pending = MaybeUninit::<libc::sigset_t>::uninit();
-        if unsafe { libc::sigpending(pending.as_mut_ptr()) } != 0 {
+    fn require_no_pending_sigchld_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+    ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+        let mut pending = MaybeUninit::<libc::sigset_t>::zeroed();
+        if let Err(errno) = connector_kernel_call_v1(
+            faults,
+            ConnectorKernelOperationV1::SignalPendingRead,
+            || unsafe { i64::from(libc::sigpending(pending.as_mut_ptr())) },
+        ) {
             return Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::SignalState,
                 FixedTwoTaskSupervisorReasonV1::Io,
-                Some(last_errno_v1()),
+                Some(errno),
             ));
         }
         let pending = unsafe { pending.assume_init() };
@@ -2149,6 +2421,42 @@ mod platform {
     mod tests {
         use super::*;
 
+        struct ScriptedFaultsV1 {
+            script: Vec<(ConnectorKernelOperationV1, InjectedKernelResultV1)>,
+            cursor: usize,
+        }
+
+        impl ScriptedFaultsV1 {
+            fn one(operation: ConnectorKernelOperationV1, result: InjectedKernelResultV1) -> Self {
+                Self {
+                    script: vec![(operation, result)],
+                    cursor: 0,
+                }
+            }
+
+            fn new(script: Vec<(ConnectorKernelOperationV1, InjectedKernelResultV1)>) -> Self {
+                Self { script, cursor: 0 }
+            }
+
+            fn assert_consumed(&self) {
+                assert_eq!(self.cursor, self.script.len());
+            }
+        }
+
+        impl ConnectorFaultInjectorV1 for ScriptedFaultsV1 {
+            fn take(
+                &mut self,
+                operation: ConnectorKernelOperationV1,
+            ) -> Option<InjectedKernelResultV1> {
+                let (expected, result) = *self.script.get(self.cursor)?;
+                if expected != operation {
+                    return None;
+                }
+                self.cursor += 1;
+                Some(result)
+            }
+        }
+
         fn inert_tree_v1() -> TaskTreeGuardV1 {
             TaskTreeGuardV1 {
                 root_tid: 10,
@@ -2156,12 +2464,42 @@ mod platform {
                 nested_announced_tid: None,
                 pending_nested_stop_tid: None,
                 nested_tid: None,
+                fork_delivery_order: None,
                 nested_pidfd: None,
                 root_reaped: false,
                 nested_reaped: false,
                 final_echild: false,
                 disarmed: true,
             }
+        }
+
+        fn assert_forward_failure_cleans_tree_v1(first: FixedTwoTaskSupervisorFailureV1) {
+            let expected = (first.stage(), first.reason(), first.errno());
+            let signal_state = SignalStateSnapshotV1::capture(&mut NoConnectorFaultsV1)
+                .ok()
+                .expect("signal snapshot");
+            let mut tree = inert_tree_v1();
+            tree.disarmed = false;
+            let mut cleanup = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::ECHILD),
+                ),
+            ]);
+            let completed = finish_failed_run_v1(first, &mut tree, &signal_state, &mut cleanup);
+            assert_eq!(
+                (completed.stage(), completed.reason(), completed.errno()),
+                expected
+            );
+            assert!(completed.cleanup_complete());
+            assert_eq!(completed.cleanup_errno(), None);
+            assert!(tree.final_echild);
+            assert!(tree.disarmed);
+            cleanup.assert_consumed();
         }
 
         #[test]
@@ -2176,6 +2514,27 @@ mod platform {
             assert_eq!(tree.nested_announced_tid, Some(20));
             assert_eq!(tree.pending_nested_stop_tid, Some(21));
             assert!(tree.nested_tid.is_none());
+        }
+
+        #[test]
+        fn both_fork_delivery_orders_are_classified_without_kernel_identity() {
+            let mut parent_first = inert_tree_v1();
+            assert!(parent_first.record_nested_announcement(20).is_ok());
+            assert_eq!(
+                parent_first
+                    .fork_delivery_order
+                    .map(FixedTwoTaskForkDeliveryOrderV1::as_str),
+                Some("parent_event_first")
+            );
+
+            let mut child_first = inert_tree_v1();
+            assert!(child_first.record_ptrace_stop(20).is_ok());
+            assert_eq!(
+                child_first
+                    .fork_delivery_order
+                    .map(FixedTwoTaskForkDeliveryOrderV1::as_str),
+                Some("child_stop_first")
+            );
         }
 
         #[test]
@@ -2219,6 +2578,260 @@ mod platform {
                 assert_eq!(failure.stage(), "process_memory");
                 assert_eq!(failure.reason(), reason);
                 assert_eq!(failure.errno(), Some(errno));
+            }
+        }
+
+        #[test]
+        fn every_forward_kernel_operation_has_an_injected_failure_boundary() {
+            let deadline = MonotonicDeadlineV1::after(1)
+                .ok()
+                .expect("monotonic deadline");
+            let mut wait = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::WaitRun,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            let failure = wait_any_v1(&mut wait, deadline).unwrap_err();
+            assert_eq!((failure.stage(), failure.reason()), ("wait_event", "io"));
+            wait.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut seize = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::PtraceSeize,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            let failure = seize_root_v1(&mut seize, 1).unwrap_err();
+            assert_eq!((failure.stage(), failure.reason()), ("ptrace_seize", "io"));
+            seize.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut filter_count = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::PtraceFilterCount,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            let failure = prove_installed_filter_v1(&mut filter_count, 1).unwrap_err();
+            assert_eq!(
+                (failure.stage(), failure.reason()),
+                ("filter_witness", "io")
+            );
+            filter_count.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut filter_read = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::PtraceFilterCount,
+                    InjectedKernelResultV1::Return(
+                        super::super::super::TRACE_ALL_NATIVE_SECCOMP_INSTRUCTION_COUNT_V1 as i64,
+                    ),
+                ),
+                (
+                    ConnectorKernelOperationV1::PtraceFilterRead,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                ),
+            ]);
+            let failure = prove_installed_filter_v1(&mut filter_read, 1).unwrap_err();
+            assert_eq!(
+                (failure.stage(), failure.reason()),
+                ("filter_witness", "io")
+            );
+            filter_read.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut event = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::PtraceEventMessage,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            let failure = read_event_message_v1(&mut event, 1).unwrap_err();
+            assert_eq!((failure.stage(), failure.reason()), ("event_message", "io"));
+            event.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut syscall = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::PtraceSyscallInfo,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            let failure = read_syscall_info_v1(&mut syscall, 1, &mut [0_u8; 84]).unwrap_err();
+            assert_eq!((failure.stage(), failure.reason()), ("syscall_info", "io"));
+            syscall.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            for (request, operation) in [
+                (
+                    TracerSupervisorResumeRequestV1::Continue,
+                    ConnectorKernelOperationV1::PtraceResumeContinue,
+                ),
+                (
+                    TracerSupervisorResumeRequestV1::Syscall,
+                    ConnectorKernelOperationV1::PtraceResumeSyscall,
+                ),
+            ] {
+                let mut resume =
+                    ScriptedFaultsV1::one(operation, InjectedKernelResultV1::Errno(libc::EIO));
+                let failure = resume_task_v1(&mut resume, 1, request).unwrap_err();
+                assert_eq!((failure.stage(), failure.reason()), ("resume", "io"));
+                resume.assert_consumed();
+                assert_forward_failure_cleans_tree_v1(failure);
+            }
+
+            let mut memory = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::ProcessMemoryRead,
+                InjectedKernelResultV1::Errno(libc::EFAULT),
+            );
+            let failure = read_process_memory_v1(
+                &mut memory,
+                1,
+                1,
+                CLONE3_ARGS_BUFFER_BYTES_V1,
+                &mut [0_u8; CLONE3_ARGS_BUFFER_BYTES_V1],
+            )
+            .unwrap_err();
+            assert_eq!(
+                (failure.stage(), failure.reason()),
+                ("process_memory", "private_range_unproven")
+            );
+            memory.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+        }
+
+        #[test]
+        fn cleanup_fault_matrix_drains_or_reports_uncertainty_without_losing_first_error() {
+            let mut tree = inert_tree_v1();
+            tree.disarmed = false;
+            tree.nested_tid = Some(20);
+            let root_pidfd: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+            let nested_pidfd: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+            let root_descriptor = root_pidfd.as_raw_fd();
+            let nested_descriptor = nested_pidfd.as_raw_fd();
+            tree.root_pidfd = Some(root_pidfd);
+            tree.nested_pidfd = Some(nested_pidfd);
+            let mut clean = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillPidfd,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillPidfd,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::ECHILD),
+                ),
+            ]);
+            assert_eq!(tree.cleanup(&mut clean), (true, None));
+            assert!(tree.final_echild);
+            assert!(tree.disarmed);
+            assert!(tree.root_pidfd.is_none());
+            assert!(tree.nested_pidfd.is_none());
+            assert_eq!(unsafe { libc::fcntl(root_descriptor, libc::F_GETFD) }, -1);
+            assert_eq!(last_errno_v1(), libc::EBADF);
+            assert_eq!(unsafe { libc::fcntl(nested_descriptor, libc::F_GETFD) }, -1);
+            assert_eq!(last_errno_v1(), libc::EBADF);
+            clean.assert_consumed();
+
+            let mut uncertain_tree = inert_tree_v1();
+            uncertain_tree.nested_tid = Some(20);
+            let mut kill_failure = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                ),
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::ECHILD),
+                ),
+            ]);
+            assert_eq!(
+                uncertain_tree.cleanup(&mut kill_failure),
+                (false, Some(libc::EIO))
+            );
+            assert!(uncertain_tree.final_echild);
+            kill_failure.assert_consumed();
+
+            let first = failure_v1(
+                FixedTwoTaskSupervisorStageV1::ProcessMemory,
+                FixedTwoTaskSupervisorReasonV1::ShortIo,
+                Some(libc::EFAULT),
+            )
+            .with_cleanup(false, Some(libc::EIO));
+            assert_eq!(first.stage(), "process_memory");
+            assert_eq!(first.reason(), "short_io");
+            assert_eq!(first.errno(), Some(libc::EFAULT));
+            assert_eq!(first.cleanup_errno(), Some(libc::EIO));
+        }
+
+        #[test]
+        fn every_cleanup_kernel_operation_has_an_injected_failure_boundary() {
+            let descriptor: OwnedFd = fs::File::open("/dev/null").unwrap().into();
+            let mut pidfd_failure = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::KillPidfd,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            assert_eq!(
+                pidfd_kill_v1(&mut pidfd_failure, &descriptor),
+                Err(libc::EIO)
+            );
+            pidfd_failure.assert_consumed();
+
+            let mut tid_failure = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::KillTid,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            assert_eq!(kill_tid_v1(&mut tid_failure, 1), Err(libc::EIO));
+            tid_failure.assert_consumed();
+
+            let mut cleanup_resume_failure = ScriptedFaultsV1::one(
+                ConnectorKernelOperationV1::PtraceCleanupResume,
+                InjectedKernelResultV1::Errno(libc::EIO),
+            );
+            assert_eq!(
+                ptrace_call_v1(
+                    &mut cleanup_resume_failure,
+                    ConnectorKernelOperationV1::PtraceCleanupResume,
+                    PTRACE_CONT_V1,
+                    1,
+                    0,
+                    libc::SIGKILL as u64,
+                ),
+                Err(libc::EIO)
+            );
+            cleanup_resume_failure.assert_consumed();
+
+            let mut tree = inert_tree_v1();
+            let mut reap_failure = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::KillTid,
+                    InjectedKernelResultV1::Return(0),
+                ),
+                (
+                    ConnectorKernelOperationV1::WaitCleanup,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                ),
+            ]);
+            assert_eq!(tree.cleanup(&mut reap_failure), (false, Some(libc::EIO)));
+            assert!(!tree.final_echild);
+            reap_failure.assert_consumed();
+        }
+
+        #[test]
+        fn signal_preservation_checks_have_independent_fault_boundaries() {
+            let snapshot = SignalStateSnapshotV1::capture(&mut NoConnectorFaultsV1)
+                .ok()
+                .expect("signal snapshot");
+            for operation in [
+                ConnectorKernelOperationV1::SignalMaskRead,
+                ConnectorKernelOperationV1::SignalActionRead,
+                ConnectorKernelOperationV1::SignalPendingRead,
+            ] {
+                let mut faults =
+                    ScriptedFaultsV1::one(operation, InjectedKernelResultV1::Errno(libc::EIO));
+                let failure = snapshot.verify(&mut faults).unwrap_err();
+                assert_eq!((failure.stage(), failure.reason()), ("signal_state", "io"));
+                assert_eq!(failure.errno(), Some(libc::EIO));
+                faults.assert_consumed();
             }
         }
     }

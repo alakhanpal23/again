@@ -321,9 +321,14 @@ fn supervisor_tree_probe_is_closed_redacted_and_non_authoritative() {
         Some(0) => {
             assert_eq!(report["status"], "completed");
             assert!(report["refusal"].is_null());
+            assert!(matches!(
+                report["result"]["fork_delivery_order"].as_str(),
+                Some("parent_event_first" | "child_stop_first")
+            ));
             assert_eq!(
                 report["result"],
                 json!({
+                    "fork_delivery_order": report["result"]["fork_delivery_order"].as_str().unwrap(),
                     "task_count": 2,
                     "accepted_transition_count": 11,
                     "fork_birth_count": 1,
@@ -341,15 +346,45 @@ fn supervisor_tree_probe_is_closed_redacted_and_non_authoritative() {
             assert!(report["result"].is_null());
             assert_eq!(report["refusal"]["cleanup_complete"], true);
             assert_eq!(report["refusal"]["cleanup_errno"], Value::Null);
-            if cfg!(target_os = "linux") {
+            if cfg!(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu",
+                target_pointer_width = "64"
+            )) {
+                let code = report["refusal"]["code"].as_str().unwrap();
+                let stage = report["refusal"]["stage"].as_str().unwrap();
+                let reason = report["refusal"]["reason"].as_str().unwrap();
+                let errno = report["refusal"]["errno"].as_i64().unwrap();
+                assert!(
+                    (code == "seccomp_unavailable"
+                        && stage == "seccomp_actions"
+                        && reason == "kernel_capability_unavailable"
+                        && matches!(errno, 22 | 38 | 95))
+                        || (code == "ptrace_unavailable"
+                            && stage == "clone_root"
+                            && reason == "kernel_capability_unavailable"
+                            && matches!(errno, 38 | 95))
+                        || (code == "ptrace_unavailable"
+                            && matches!(
+                                stage,
+                                "ptrace_seize" | "filter_witness" | "process_memory"
+                            )
+                            && reason == "administrative_policy"
+                            && matches!(errno, 1 | 13)),
+                    "unexpected supported-platform refusal: {report}"
+                );
+            } else if cfg!(target_os = "linux") {
                 assert_eq!(report["refusal"]["code"], "unsupported_architecture");
                 assert_eq!(report["refusal"]["reason"], "unsupported_architecture");
+                assert_eq!(report["refusal"]["stage"], "platform");
+                assert_eq!(report["refusal"]["errno"], Value::Null);
             } else {
                 assert_eq!(report["refusal"]["code"], "unsupported_os");
                 assert_eq!(report["refusal"]["reason"], "unsupported_platform");
+                assert_eq!(report["refusal"]["stage"], "platform");
+                assert_eq!(report["refusal"]["errno"], Value::Null);
             }
-            assert_eq!(report["refusal"]["stage"], "platform");
-            assert_eq!(report["refusal"]["errno"], Value::Null);
         }
         status => panic!("probe returned broken status {status:?}: {report}"),
     }

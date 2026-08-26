@@ -190,6 +190,7 @@ pub(crate) fn diagnose_fixed_ptrace_transport_v1() -> FixedPtraceTransportProbeD
 /// authority.
 pub(crate) enum FixedTwoTaskSupervisorProbeDiagnosticV1 {
     Completed {
+        fork_delivery_order: &'static str,
         task_count: u16,
         accepted_transition_count: u64,
         fork_birth_count: u64,
@@ -214,6 +215,7 @@ pub(crate) enum FixedTwoTaskSupervisorProbeDiagnosticV1 {
 pub(crate) fn diagnose_fixed_two_task_supervisor_v1() -> FixedTwoTaskSupervisorProbeDiagnosticV1 {
     match tracer_seccomp::qualify_fixed_two_task_supervisor_v1() {
         Ok(completed) => FixedTwoTaskSupervisorProbeDiagnosticV1::Completed {
+            fork_delivery_order: completed.fork_delivery_order(),
             task_count: completed.task_count(),
             accepted_transition_count: completed.accepted_transition_count(),
             fork_birth_count: completed.fork_birth_count(),

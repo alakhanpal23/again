@@ -369,6 +369,7 @@ struct FixedSupervisorTreeProbeScope {
 
 #[derive(Serialize)]
 struct FixedSupervisorTreeProbeResult {
+    fork_delivery_order: &'static str,
     task_count: u16,
     accepted_transition_count: u64,
     fork_birth_count: u64,
@@ -561,6 +562,7 @@ fn linux_pytest_supervisor_tree_probe_v1() -> Result<i32> {
     };
     let (report, exit_code) = match crate::linux_pytest::diagnose_fixed_two_task_supervisor_v1() {
         FixedTwoTaskSupervisorProbeDiagnosticV1::Completed {
+            fork_delivery_order,
             task_count,
             accepted_transition_count,
             fork_birth_count,
@@ -576,6 +578,7 @@ fn linux_pytest_supervisor_tree_probe_v1() -> Result<i32> {
                 scope,
                 status: "completed",
                 result: Some(FixedSupervisorTreeProbeResult {
+                    fork_delivery_order,
                     task_count,
                     accepted_transition_count,
                     fork_birth_count,

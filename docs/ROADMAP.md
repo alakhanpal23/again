@@ -153,9 +153,16 @@ capture, event/stop identity correlation before pidfd authority, full-tree
 drain, final `ECHILD`, and consuming completion. A wait-returned stopped tracee
 is retained for cleanup before event-message correlation, including on a
 mismatch. Bounded proc/environment reads, bounded wait backoff, and typed
-seccomp/process-memory refusals are also implemented. This does not close Gate
-2: the connector-level fault matrix, both live kernel schedules, final strict
-post-hardening Linux validation, and pinned 100/100 evidence remain required.
+seccomp/process-memory refusals are also implemented. The connector now routes
+run/cleanup waits, every ptrace exchange, stopped-memory reads, both resume
+modes, PID/pidfd termination, and signal-state verification through private
+test-only fault seams. Linux tests require each forward failure to preserve its
+typed first error while the complete tree reaches final `ECHILD`; cleanup-path
+faults retain the first cleanup errno and refuse completion. The completed
+diagnostic redacts the observed parent-event-first or child-stop-first order,
+and a manual provisioned-runner workflow requires 100/100 exact samples and
+both orders. This does not close Gate 2: no qualifying runner is currently
+registered, so both live schedules and pinned 100/100 evidence remain required.
 
 Before wiring a candidate record, narrow the authority path so structurally
 valid synthetic values cannot bind a reusable execution record. Completion
