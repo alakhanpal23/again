@@ -1,14 +1,13 @@
 //! Gate 3 namespace and blocked pre-exec handoff boundary.
 //!
-//! The current milestone is intentionally smaller than the final isolation
-//! session. It reuses the diagnostic's production clone/map/pin bootstrap and
-//! returns while the child is blocked on its authenticated release frame. The
-//! child has fresh user, mount, PID, network, UTS, and IPC namespaces, but has
-//! not crossed the release boundary that configures UTS, mounts the private
-//! root/scratch/procfs topology, scrubs descriptors, or eliminates
-//! capabilities. Extracting that post-release protocol without duplicating the
-//! diagnostic's raw syscall implementation requires a later descriptor/control
-//! refactor with per-leaf injected failures.
+//! The current milestone reuses the diagnostic's production clone/map/pin
+//! bootstrap, retains the child behind an authenticated release, and offers
+//! one consuming continuation to a non-authoritative isolation checkpoint.
+//! That continuation fixes the UTS identity, enters the bounded private mount
+//! topology, retains only authenticated control/report descriptors at stdio
+//! numbers, normalizes credentials, clears capabilities, and sets and verifies
+//! `no_new_privs`. The child then blocks again while the opaque permit owns
+//! bounded kill-and-reap cleanup.
 //! The extracted value also retains the diagnostic's dedicated-single-task
 //! precondition and fixed protocol/cleanup deadlines; it is a short-lived
 //! handoff, not a general process-hosting API.
@@ -28,6 +27,7 @@ use std::fmt;
 use super::RefusalCode;
 use super::isolation_qualification::{
     self, BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1,
+    IsolationReadyRootlessNamespaceV1,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +36,8 @@ enum BlockedIsolationPhaseV1 {
     NamespaceBootstrap,
     NamespaceBlocked,
     ContinuationIssued,
+    IsolationConfiguring,
+    IsolationReady,
     Poisoned,
 }
 
@@ -185,7 +187,7 @@ impl fmt::Debug for BlockedExecuteOnlyIsolationV1 {
 /// checkpoint. Dropping it closes control/report/namespace descriptors and
 /// performs the existing bounded kill-and-reap cleanup.
 pub(super) struct BlockedExecuteOnlyIsolationContinuationPermitV1 {
-    _live: BlockedRootlessNamespaceBootstrapV1,
+    live: BlockedRootlessNamespaceBootstrapV1,
     state: BlockedIsolationStateV1,
 }
 
@@ -193,7 +195,26 @@ impl fmt::Debug for BlockedExecuteOnlyIsolationContinuationPermitV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("BlockedExecuteOnlyIsolationContinuationPermitV1")
-            .field("state", &"continuation-issued-no-operation")
+            .field("state", &"continuation-issued")
+            .field("live", &"<opaque-cleanup-owned>")
+            .finish()
+    }
+}
+
+/// Opaque, linear, cleanup-owning isolation checkpoint.
+///
+/// It carries no command, PID, descriptor, or execution accessor and is not a
+/// profile, candidate, replay, hit, or reuse authority.
+pub(super) struct FirstExecuteOnlyIsolationReadyPermitV1 {
+    _live: IsolationReadyRootlessNamespaceV1,
+    state: BlockedIsolationStateV1,
+}
+
+impl fmt::Debug for FirstExecuteOnlyIsolationReadyPermitV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyIsolationReadyPermitV1")
+            .field("state", &"isolation-ready-non-authoritative")
             .field("live", &"<opaque-cleanup-owned>")
             .finish()
     }
@@ -230,9 +251,36 @@ impl BlockedExecuteOnlyIsolationV1 {
             )
             .expect("only a successfully blocked value can issue the permit");
         BlockedExecuteOnlyIsolationContinuationPermitV1 {
-            _live: self.live,
+            live: self.live,
             state: self.state,
         }
+    }
+}
+
+impl BlockedExecuteOnlyIsolationContinuationPermitV1 {
+    pub(super) fn continue_to_isolation_ready_v1(
+        mut self,
+    ) -> Result<FirstExecuteOnlyIsolationReadyPermitV1, BlockedExecuteOnlyIsolationFailureV1> {
+        self.state
+            .advance(
+                BlockedIsolationPhaseV1::ContinuationIssued,
+                BlockedIsolationPhaseV1::IsolationConfiguring,
+            )
+            .expect("only the linear continuation can cross the release boundary");
+        let live = self
+            .live
+            .continue_to_isolation_ready_v1()
+            .map_err(BlockedExecuteOnlyIsolationFailureV1::from_qualification)?;
+        self.state
+            .advance(
+                BlockedIsolationPhaseV1::IsolationConfiguring,
+                BlockedIsolationPhaseV1::IsolationReady,
+            )
+            .expect("a verified child checkpoint has not poisoned its wrapper");
+        Ok(FirstExecuteOnlyIsolationReadyPermitV1 {
+            _live: live,
+            state: self.state,
+        })
     }
 }
 
@@ -304,6 +352,8 @@ mod tests {
         <BlockedExecuteOnlyIsolationV1 as AmbiguousIfCopy<_>>::probe();
         <BlockedExecuteOnlyIsolationContinuationPermitV1 as AmbiguousIfClone<_>>::probe();
         <BlockedExecuteOnlyIsolationContinuationPermitV1 as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfCopy<_>>::probe();
     }
 
     #[cfg(not(all(
@@ -349,7 +399,7 @@ mod tests {
     ))]
     #[test]
     #[ignore = "requires the provisioned rootless namespace tuple and a single-threaded test process"]
-    fn provisioned_live_bootstrap_reaches_blocked_handoff_and_drop_cleans() {
+    fn provisioned_live_bootstrap_reaches_isolation_ready_and_drop_cleans() {
         let blocked = begin_blocked_execute_only_isolation_v1()
             .expect("provisioned tuple must produce a live blocked bootstrap");
         let debug = format!("{blocked:?}");
@@ -357,6 +407,14 @@ mod tests {
             debug,
             "BlockedExecuteOnlyIsolationV1 { state: \"namespace-bootstrap-blocked\", live: \"<opaque-cleanup-owned>\" }"
         );
-        drop(blocked.into_continuation_permit());
+        let ready = blocked
+            .into_continuation_permit()
+            .continue_to_isolation_ready_v1()
+            .expect("provisioned tuple must reach the fixed isolation checkpoint");
+        assert_eq!(
+            format!("{ready:?}"),
+            "FirstExecuteOnlyIsolationReadyPermitV1 { state: \"isolation-ready-non-authoritative\", live: \"<opaque-cleanup-owned>\" }"
+        );
+        drop(ready);
     }
 }
