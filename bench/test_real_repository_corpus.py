@@ -538,6 +538,22 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             )
         self.assertEqual(output_bound.exception.code, "stream_limit_exceeded")
 
+        unrelated_output = self.root / "child-output.bin"
+        completed = corpus.run_bounded(
+            (
+                sys.executable,
+                "-c",
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_bytes(b'x' * 4096); print('ok')",
+                str(unrelated_output),
+            ),
+            cwd=self.root,
+            environment=environment,
+            timeout_seconds=5.0,
+            stream_limit_bytes=128,
+        )
+        self.assertEqual(completed.stdout, b"ok\n")
+        self.assertEqual(unrelated_output.stat().st_size, 4096)
+
         pid_path = self.root / "descendant.pid"
         with self.assertRaises(corpus.HarnessRefusal) as descendant_error:
             corpus.run_bounded(

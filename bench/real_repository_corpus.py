@@ -25,8 +25,8 @@ import os
 import pathlib
 import platform
 import re
-import resource
 import select
+import selectors
 import signal
 import stat
 import statistics
@@ -56,6 +56,8 @@ LANGUAGE_ARGUMENTS: tuple[tuple[str, str], ...] = (
 HEX_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
 PROCESS_SESSION_DRAIN_TIMEOUT_SECONDS = 0.25
+PROCESS_CAPTURE_POLL_SECONDS = 0.05
+PROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,17 +151,6 @@ def sha256_file(path: pathlib.Path) -> str:
     return digest.hexdigest()
 
 
-def _file_limit_setter(limit_bytes: int) -> Callable[[], None]:
-    def apply() -> None:
-        _soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
-        effective = limit_bytes
-        if hard != resource.RLIM_INFINITY:
-            effective = min(effective, hard)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (effective, hard))
-
-    return apply
-
-
 def _process_group_exists(process_group: int) -> bool:
     try:
         os.killpg(process_group, 0)
@@ -209,6 +200,51 @@ def _sentinel_reached_eof(descriptor: int) -> bool:
     return bool(readable) and os.read(descriptor, 1) == b""
 
 
+def _capture_ready_streams(
+    stream_selector: selectors.BaseSelector,
+    buffers: dict[int, bytearray],
+    stream_limit_bytes: int,
+    timeout_seconds: float,
+) -> bool:
+    """Capture ready pipe bytes and report whether either bound was exceeded."""
+
+    for key, _mask in stream_selector.select(timeout_seconds):
+        descriptor = key.fd
+        while True:
+            try:
+                retained_room = stream_limit_bytes + 1 - len(buffers[descriptor])
+                chunk = os.read(
+                    descriptor,
+                    min(PROCESS_CAPTURE_CHUNK_BYTES, max(1, retained_room)),
+                )
+            except BlockingIOError:
+                break
+            if not chunk:
+                stream_selector.unregister(descriptor)
+                break
+            buffers[descriptor].extend(chunk)
+            if len(buffers[descriptor]) > stream_limit_bytes:
+                return True
+    return False
+
+
+def _discard_ready_streams(
+    stream_selector: selectors.BaseSelector, timeout_seconds: float
+) -> None:
+    """Drain killed-process pipes without retaining bytes beyond the evidence cap."""
+
+    for key, _mask in stream_selector.select(timeout_seconds):
+        descriptor = key.fd
+        while True:
+            try:
+                chunk = os.read(descriptor, PROCESS_CAPTURE_CHUNK_BYTES)
+            except BlockingIOError:
+                break
+            if not chunk:
+                stream_selector.unregister(descriptor)
+                break
+
+
 def run_bounded(
     argv: Sequence[str],
     *,
@@ -222,75 +258,102 @@ def run_bounded(
     if timeout_seconds <= 0 or stream_limit_bytes < 0:
         raise ValueError("process bounds must be nonnegative and timeout must be positive")
 
-    with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-        sentinel_read, sentinel_write = os.pipe()
-        started = time.perf_counter_ns()
-        try:
-            process = subprocess.Popen(
-                list(argv),
-                cwd=cwd,
-                env=environment,
-                stdin=subprocess.DEVNULL,
-                stdout=stdout_file,
-                stderr=stderr_file,
-                close_fds=True,
-                pass_fds=(sentinel_write,),
-                start_new_session=True,
-                preexec_fn=_file_limit_setter(stream_limit_bytes + 1),
-            )
-        except BaseException:
-            os.close(sentinel_read)
-            os.close(sentinel_write)
-            raise
-        os.close(sentinel_write)
-        timeout_error: subprocess.TimeoutExpired | None = None
-        try:
-            returncode = process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired as error:
-            timeout_error = error
-            returncode = -signal.SIGKILL
-        except BaseException:
-            try:
-                _cleanup_process_group(process)
-            finally:
-                os.close(sentinel_read)
-            raise
-        try:
-            survivor_present = _cleanup_process_group(process)
-            sentinel_closed = _sentinel_reached_eof(sentinel_read)
-        finally:
-            os.close(sentinel_read)
-        if not sentinel_closed:
-            raise HarnessRefusal(
-                "process_session_escape_detected",
-                f"a descendant retained the harness sentinel after command exit: {argv!r}",
-            )
-        if timeout_error is not None:
-            raise HarnessRefusal(
-                "command_timeout", f"command exceeded {timeout_seconds:g}s: {argv!r}"
-            ) from timeout_error
-        if survivor_present:
-            raise HarnessRefusal(
-                "unexpected_descendant",
-                f"a descendant outlived the command leader: {argv!r}",
-            )
-        elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
-        stdout_bytes = os.fstat(stdout_file.fileno()).st_size
-        stderr_bytes = os.fstat(stderr_file.fileno()).st_size
-        if stdout_bytes > stream_limit_bytes or stderr_bytes > stream_limit_bytes:
-            raise HarnessRefusal(
-                "stream_limit_exceeded",
-                f"command exceeded the {stream_limit_bytes}-byte stream limit: {argv!r}",
-            )
-        stdout_file.seek(0)
-        stderr_file.seek(0)
-        return Completed(
-            argv=tuple(argv),
-            returncode=returncode,
-            stdout=stdout_file.read(),
-            stderr=stderr_file.read(),
-            elapsed_ms=elapsed_ms,
+    sentinel_read, sentinel_write = os.pipe()
+    started = time.perf_counter_ns()
+    try:
+        process = subprocess.Popen(
+            list(argv),
+            cwd=cwd,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            close_fds=True,
+            pass_fds=(sentinel_write,),
+            start_new_session=True,
         )
+    except BaseException:
+        os.close(sentinel_read)
+        os.close(sentinel_write)
+        raise
+    os.close(sentinel_write)
+    assert process.stdout is not None and process.stderr is not None
+    streams = (process.stdout, process.stderr)
+    stream_selector = selectors.DefaultSelector()
+    buffers: dict[int, bytearray] = {}
+    for stream in streams:
+        descriptor = stream.fileno()
+        os.set_blocking(descriptor, False)
+        buffers[descriptor] = bytearray()
+        stream_selector.register(descriptor, selectors.EVENT_READ)
+    stdout_descriptor, stderr_descriptor = (stream.fileno() for stream in streams)
+
+    deadline = time.monotonic() + timeout_seconds
+    timed_out = False
+    stream_limit_exceeded = False
+    try:
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            if _capture_ready_streams(
+                stream_selector,
+                buffers,
+                stream_limit_bytes,
+                min(PROCESS_CAPTURE_POLL_SECONDS, remaining),
+            ):
+                stream_limit_exceeded = True
+                break
+
+        survivor_present = _cleanup_process_group(process)
+        drain_deadline = time.monotonic() + PROCESS_SESSION_DRAIN_TIMEOUT_SECONDS
+        while stream_selector.get_map() and time.monotonic() < drain_deadline:
+            remaining = max(0.0, drain_deadline - time.monotonic())
+            if stream_limit_exceeded:
+                _discard_ready_streams(stream_selector, remaining)
+            elif _capture_ready_streams(
+                stream_selector, buffers, stream_limit_bytes, remaining
+            ):
+                stream_limit_exceeded = True
+        streams_closed = not stream_selector.get_map()
+        sentinel_closed = _sentinel_reached_eof(sentinel_read)
+    except BaseException:
+        _cleanup_process_group(process)
+        raise
+    finally:
+        stream_selector.close()
+        for stream in streams:
+            stream.close()
+        os.close(sentinel_read)
+
+    if not sentinel_closed or not streams_closed:
+        raise HarnessRefusal(
+            "process_session_escape_detected",
+            f"a descendant retained a harness channel after command exit: {argv!r}",
+        )
+    if timed_out:
+        raise HarnessRefusal(
+            "command_timeout", f"command exceeded {timeout_seconds:g}s: {argv!r}"
+        )
+    if stream_limit_exceeded:
+        raise HarnessRefusal(
+            "stream_limit_exceeded",
+            f"command exceeded the {stream_limit_bytes}-byte stream limit: {argv!r}",
+        )
+    if survivor_present:
+        raise HarnessRefusal(
+            "unexpected_descendant",
+            f"a descendant outlived the command leader: {argv!r}",
+        )
+    elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
+    return Completed(
+        argv=tuple(argv),
+        returncode=process.returncode,
+        stdout=bytes(buffers[stdout_descriptor]),
+        stderr=bytes(buffers[stderr_descriptor]),
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def _git_environment() -> dict[str, str]:
