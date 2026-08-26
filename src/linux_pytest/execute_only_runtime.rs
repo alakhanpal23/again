@@ -383,15 +383,23 @@ pub(super) fn validate_x86_64_elf_v1(
             let previous_memory_end = previous_virtual_address
                 .checked_add(previous_memory_size)
                 .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+            let previous_load_page = previous_virtual_address & !(ELF64_LOAD_PAGE_BYTES - 1);
+            let previous_load_page_end = previous_memory_end
+                .checked_add(ELF64_LOAD_PAGE_BYTES - 1)
+                .map(|end| end & !(ELF64_LOAD_PAGE_BYTES - 1))
+                .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
             let file_overlap = file_size != 0
                 && previous_file_size != 0
                 && offset < previous_file_end
                 && previous_offset < file_end;
-            let virtual_overlap = memory_size != 0
+            // Linux maps PT_LOAD at page granularity. Byte-disjoint segments
+            // that share a page can still replace that page's bias or final
+            // permissions, so byte-range overlap alone is not sufficient.
+            let virtual_page_overlap = memory_size != 0
                 && previous_memory_size != 0
-                && virtual_address < previous_memory_end
-                && previous_virtual_address < memory_end;
-            if file_overlap || virtual_overlap {
+                && load_page < previous_load_page_end
+                && previous_load_page < load_page_end;
+            if file_overlap || virtual_page_overlap {
                 return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader);
             }
         }
@@ -1170,6 +1178,21 @@ mod tests {
             validate_x86_64_elf_v1(&file_overlap),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
         );
+
+        let mut later_permission_removal = elf_fixture();
+        append_second_load(&mut later_permission_removal, 121, 0x40_0079, 0, 1);
+        assert_eq!(
+            validate_x86_64_elf_v1(&later_permission_removal),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
+
+        let mut differing_page_bias = elf_fixture();
+        append_second_load(&mut differing_page_bias, 0x1079, 0x40_0079, 0, 1);
+        differing_page_bias.resize(0x1079, 0);
+        assert_eq!(
+            validate_x86_64_elf_v1(&differing_page_bias),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
     }
 
     #[test]
@@ -1193,9 +1216,9 @@ mod tests {
         );
         assert_eq!(validate_x86_64_elf_v1(&span_boundary), Ok(()));
 
-        let mut adjacent_ranges = elf_fixture();
-        append_second_load(&mut adjacent_ranges, 121, 0x40_0079, 0, 1);
-        assert_eq!(validate_x86_64_elf_v1(&adjacent_ranges), Ok(()));
+        let mut page_disjoint_adjacency = elf_fixture();
+        append_second_load(&mut page_disjoint_adjacency, 0, 0x40_1000, 0, 1);
+        assert_eq!(validate_x86_64_elf_v1(&page_disjoint_adjacency), Ok(()));
 
         let mut adjacent_file = elf_fixture();
         append_second_load(&mut adjacent_file, 121, 0x50_0079, 1, 1);
