@@ -36,6 +36,7 @@
 //! authority.
 
 use super::RefusalCode;
+use std::fmt;
 
 const PROTOCOL_VERSION_V2: u16 = 2;
 
@@ -353,6 +354,33 @@ pub(super) fn qualify_rootless_namespace_tuple_v1()
     platform::qualify_rootless_namespace_tuple_v1()
 }
 
+/// Live, cleanup-owning namespace bootstrap stopped on the diagnostic's
+/// authenticated release frame after ID-map and namespace-pin verification.
+///
+/// This is deliberately weaker than an isolation session: the child has not
+/// configured its private root, mounted scratch/procfs, scrubbed descriptors,
+/// or eliminated capabilities. It exists only as the smallest safe reusable
+/// extraction from the fixed diagnostic and exposes no PID or descriptor.
+pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
+    _inner: platform::BlockedRootlessNamespaceBootstrapV1,
+}
+
+impl fmt::Debug for BlockedRootlessNamespaceBootstrapV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BlockedRootlessNamespaceBootstrapV1")
+            .field("state", &"blocked-before-release")
+            .field("resources", &"<opaque-cleanup-owned>")
+            .finish()
+    }
+}
+
+pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
+-> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    platform::begin_blocked_rootless_namespace_bootstrap_v1()
+        .map(|inner| BlockedRootlessNamespaceBootstrapV1 { _inner: inner })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IdMapTupleV1 {
     inside: u32,
@@ -438,6 +466,20 @@ fn parse_ascii_u32_field_v1(field: &[u8]) -> Option<u32> {
 #[cfg(not(target_os = "linux"))]
 mod platform {
     use super::*;
+
+    pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
+        _private: (),
+    }
+
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
+    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+        Err(IsolationQualificationFailureV1::new(
+            RefusalCode::UnsupportedOs,
+            IsolationQualificationStageV1::Platform,
+            IsolationQualificationReasonV1::UnsupportedPlatform,
+            None,
+        ))
+    }
 
     pub(super) fn qualify_rootless_namespace_tuple_v1()
     -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
@@ -1404,8 +1446,14 @@ mod platform {
         }
     }
 
-    pub(super) fn qualify_rootless_namespace_tuple_v1()
-    -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
+    pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
+        guard: ProbeChildGuardV1,
+        deadline: MonotonicDeadlineV1,
+        nonce: [u8; NONCE_BYTES_V1],
+    }
+
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
+    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
         let proc_root = pin_proc_root()?;
         let host_pid = unsafe { libc::getpid() };
         verify_proc_self_target(proc_root.as_raw_fd(), host_pid)?;
@@ -1593,34 +1641,79 @@ mod platform {
         ));
         guard.child_namespaces = Some(child_namespaces);
 
-        let release = encode_common_frame(RELEASE_MAGIC_V1, PHASE_RELEASE_V1, &nonce);
-        let control_fd = guarded!(retained_fd(
-            &guard.control_write,
-            IsolationQualificationStageV1::SendControl,
-        ));
-        guarded!(write_parent_frame(
-            control_fd,
-            child_pidfd,
-            &release,
+        Ok(BlockedRootlessNamespaceBootstrapV1 {
+            guard,
             deadline,
-        ));
-        guard.control_write.take();
+            nonce,
+        })
+    }
 
-        let proof = guarded!(read_parent_frame(
-            report_fd,
-            child_pidfd,
-            deadline,
-            true,
-            IsolationQualificationStageV1::ReceiveChildProof,
-        ));
-        guarded!(expect_report_eof(report_fd, child_pidfd, deadline,));
-        guard.report_read.take();
-        guarded!(verify_proof_frame(&proof, &nonce));
-        if let Err(error) = guard.reap_success(deadline) {
-            return Err(guard.refuse(error));
+    pub(super) fn qualify_rootless_namespace_tuple_v1()
+    -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
+        begin_blocked_rootless_namespace_bootstrap_v1()?.complete_diagnostic()
+    }
+
+    impl BlockedRootlessNamespaceBootstrapV1 {
+        fn complete_diagnostic(
+            mut self,
+        ) -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
+            let deadline = self.deadline;
+            let nonce = self.nonce;
+            macro_rules! guarded {
+                ($expression:expr) => {
+                    match $expression {
+                        Ok(value) => value,
+                        Err(error) => return Err(self.guard.refuse(error)),
+                    }
+                };
+            }
+
+            let child_pidfd = match self.guard.pidfd.as_ref() {
+                Some(pidfd) => pidfd.as_raw_fd(),
+                None => {
+                    let error = failure(
+                        RefusalCode::RequiredNamespaceFailed,
+                        IsolationQualificationStageV1::SendControl,
+                        IsolationQualificationReasonV1::MalformedKernelResponse,
+                        None,
+                    );
+                    return Err(self.guard.refuse(error));
+                }
+            };
+            let report_fd = guarded!(retained_fd(
+                &self.guard.report_read,
+                IsolationQualificationStageV1::ReceiveChildProof,
+            ));
+
+            let release = encode_common_frame(RELEASE_MAGIC_V1, PHASE_RELEASE_V1, &nonce);
+            let control_fd = guarded!(retained_fd(
+                &self.guard.control_write,
+                IsolationQualificationStageV1::SendControl,
+            ));
+            guarded!(write_parent_frame(
+                control_fd,
+                child_pidfd,
+                &release,
+                deadline,
+            ));
+            self.guard.control_write.take();
+
+            let proof = guarded!(read_parent_frame(
+                report_fd,
+                child_pidfd,
+                deadline,
+                true,
+                IsolationQualificationStageV1::ReceiveChildProof,
+            ));
+            guarded!(expect_report_eof(report_fd, child_pidfd, deadline,));
+            self.guard.report_read.take();
+            guarded!(verify_proof_frame(&proof, &nonce));
+            if let Err(error) = self.guard.reap_success(deadline) {
+                return Err(self.guard.refuse(error));
+            }
+
+            Ok(CompletedRootlessNamespaceProbeV1 { _private: () })
         }
-
-        Ok(CompletedRootlessNamespaceProbeV1 { _private: () })
     }
 
     fn failure(
@@ -8996,6 +9089,20 @@ mod platform {
 mod platform {
     use super::*;
 
+    pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
+        _private: (),
+    }
+
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
+    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+        Err(IsolationQualificationFailureV1::new(
+            RefusalCode::UnsupportedArchitecture,
+            IsolationQualificationStageV1::Platform,
+            IsolationQualificationReasonV1::UnsupportedArchitecture,
+            None,
+        ))
+    }
+
     pub(super) fn qualify_rootless_namespace_tuple_v1()
     -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
         Err(IsolationQualificationFailureV1::new(
@@ -9014,6 +9121,20 @@ mod platform {
 ))]
 mod platform {
     use super::*;
+
+    pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
+        _private: (),
+    }
+
+    pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
+    -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+        Err(IsolationQualificationFailureV1::new(
+            RefusalCode::RequiredKernelCapabilityMissing,
+            IsolationQualificationStageV1::Platform,
+            IsolationQualificationReasonV1::UnsupportedEnvironment,
+            None,
+        ))
+    }
 
     pub(super) fn qualify_rootless_namespace_tuple_v1()
     -> Result<CompletedRootlessNamespaceProbeV1, IsolationQualificationFailureV1> {
