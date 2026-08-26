@@ -751,17 +751,15 @@ pub(super) enum WorkloadSeccompOperationV1 {
     ReadNoNewPrivileges,
     ReadInitialSeccompMode,
     InstallTsyncFilter,
-    ReadInstalledSeccompMode,
     PtraceReadbackCount,
     PtraceReadbackInstructions,
 }
 
-const WORKLOAD_SECCOMP_OPERATIONS_V1: [WorkloadSeccompOperationV1; 7] = [
+const WORKLOAD_SECCOMP_OPERATIONS_V1: [WorkloadSeccompOperationV1; 6] = [
     WorkloadSeccompOperationV1::VerifySingleTask,
     WorkloadSeccompOperationV1::ReadNoNewPrivileges,
     WorkloadSeccompOperationV1::ReadInitialSeccompMode,
     WorkloadSeccompOperationV1::InstallTsyncFilter,
-    WorkloadSeccompOperationV1::ReadInstalledSeccompMode,
     WorkloadSeccompOperationV1::PtraceReadbackCount,
     WorkloadSeccompOperationV1::PtraceReadbackInstructions,
 ];
@@ -772,7 +770,6 @@ const SECCOMP_FILTER_FLAG_TSYNC_V1: u32 = 1;
 const PTRACE_SECCOMP_GET_FILTER_V1: u32 = 0x420c;
 const PTRACE_SECCOMP_FILTER_INDEX_V1: u64 = 0;
 const SECCOMP_MODE_DISABLED_V1: u8 = 0;
-const SECCOMP_MODE_FILTER_V1: u8 = 2;
 
 /// Borrowed static plan. It is policy data, never proof of installation.
 pub(super) struct WorkloadSeccompPlanV1 {
@@ -784,7 +781,7 @@ impl WorkloadSeccompPlanV1 {
         "x86_64-execute-only-pytest-workload-seccomp-v1"
     }
 
-    pub(super) const fn operations(&self) -> &'static [WorkloadSeccompOperationV1; 7] {
+    pub(super) const fn operations(&self) -> &'static [WorkloadSeccompOperationV1; 6] {
         &WORKLOAD_SECCOMP_OPERATIONS_V1
     }
 
@@ -904,7 +901,6 @@ enum InstalledWitnessRefusalV1 {
     NoNewPrivileges,
     InitialSeccompMode,
     InstallResult,
-    InstalledSeccompMode,
     ReadbackCount,
     ClaimedPolicyDigest,
     Filter(FilterVerificationRefusalV1),
@@ -916,7 +912,6 @@ struct InstalledFilterEvidenceV1<'program> {
     no_new_privileges: u8,
     initial_seccomp_mode: u8,
     install_result: i64,
-    installed_seccomp_mode: u8,
     readback_count: usize,
     claimed_policy_digest: [u8; 32],
     readback: &'program [WorkloadSockFilterV1],
@@ -979,9 +974,6 @@ fn verify_installed_transcript_v1(
     }
     if evidence.install_result != 0 {
         return Err(InstalledWitnessRefusalV1::InstallResult);
-    }
-    if evidence.installed_seccomp_mode != SECCOMP_MODE_FILTER_V1 {
-        return Err(InstalledWitnessRefusalV1::InstalledSeccompMode);
     }
     if evidence.readback_count != WORKLOAD_FILTER_INSTRUCTION_COUNT_V1
         || evidence.readback.len() != evidence.readback_count
@@ -1147,7 +1139,6 @@ mod tests {
             no_new_privileges: 1,
             initial_seccomp_mode: SECCOMP_MODE_DISABLED_V1,
             install_result: 0,
-            installed_seccomp_mode: SECCOMP_MODE_FILTER_V1,
             readback_count: WORKLOAD_FILTER_INSTRUCTION_COUNT_V1,
             claimed_policy_digest: workload_policy_digest_blake3_v1(),
             readback: program,
@@ -1171,6 +1162,7 @@ mod tests {
 
         let plan = &FIRST_EXECUTE_ONLY_WORKLOAD_SECCOMP_PLAN_V1;
         assert_eq!(plan.operations(), &WORKLOAD_SECCOMP_OPERATIONS_V1);
+        assert!(!format!("{:?}", plan.operations()).contains("InstalledSeccompMode"));
         assert_eq!(plan.no_new_privileges_read_operation(), 39);
         assert_eq!(plan.seccomp_mode_read_operation(), 21);
         assert_eq!(plan.seccomp_install_operation(), 1);
@@ -1450,7 +1442,7 @@ mod tests {
         assert!(!debug.contains(&format!("{WORKLOAD_FILTER_FNV1A64_V1:x}")));
 
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
-        evidence.completed_operations = &WORKLOAD_SECCOMP_OPERATIONS_V1[..6];
+        evidence.completed_operations = &WORKLOAD_SECCOMP_OPERATIONS_V1[..5];
         assert_eq!(
             issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::OperationSequence
@@ -1486,12 +1478,6 @@ mod tests {
         assert_eq!(
             issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::InstallResult
-        );
-        let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
-        evidence.installed_seccomp_mode = 0;
-        assert_eq!(
-            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
-            InstalledWitnessRefusalV1::InstalledSeccompMode
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.readback_count -= 1;
