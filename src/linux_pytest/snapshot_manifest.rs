@@ -2343,16 +2343,17 @@ mod tests {
     #[test]
     fn real_elf_materializes_publishes_and_reaches_non_authoritative_runtime_checkpoint() {
         let source = tempfile::tempdir().unwrap();
-        fs::create_dir_all(source.path().join(".venv/bin")).unwrap();
-        fs::create_dir_all(source.path().join("tests")).unwrap();
-        fs::copy("/bin/true", source.path().join(".venv/bin/python")).unwrap();
+        let source_root = source.path().join("root");
+        fs::create_dir_all(source_root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(source_root.join("tests")).unwrap();
+        fs::copy("/bin/true", source_root.join(".venv/bin/python")).unwrap();
         fs::set_permissions(
-            source.path().join(".venv/bin/python"),
+            source_root.join(".venv/bin/python"),
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
         fs::write(
-            source.path().join("tests/test_smoke.py"),
+            source_root.join("tests/test_smoke.py"),
             FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1,
         )
         .unwrap();
