@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Bounded reference oracle for the fixed Gate 3 snapshot fixture.
 
-The oracle reads a closed fixture tree, one regular binary, one local
-qualified-tuple reference, and a strict JSON request.  It never executes the
-binary or pytest, accesses a network, follows a symlink, or writes into an
-input tree.  Its output is deterministic diagnostic data only and cannot grant
-pass, qualification, execution, or reuse authority.
+The oracle reads a closed fixture tree, one caller-selected regular binary, one
+caller-selected qualified-tuple file, and a strict JSON request.  Binary/source
+and tuple-reference provenance is explicitly unverified; only the observed
+content is checked.  The oracle never executes the binary or pytest, accesses a
+network, follows a symlink, or writes into a defined input tree.  Its output is
+deterministic diagnostic data only and cannot grant pass, qualification,
+execution, or reuse authority.
 """
 
 from __future__ import annotations
@@ -25,10 +27,10 @@ from typing import Any, Iterable
 
 
 FIXTURE_SCHEMA = "again.linux-pytest.execute-only-fixture.v1"
-REQUEST_SCHEMA = "again.linux-pytest.execute-only-snapshot-request.v1"
-EVIDENCE_SCHEMA = "again.linux-pytest.execute-only-snapshot-evidence.v1"
+REQUEST_SCHEMA = "again.linux-pytest.execute-only-snapshot-request.v2"
+EVIDENCE_SCHEMA = "again.linux-pytest.execute-only-snapshot-evidence.v2"
 QUALIFIED_TUPLE_SCHEMA = "again.linux-pytest.qualified-tuple-evidence.v1"
-ORACLE_ID = "gate3-fixed-snapshot-reference-v1"
+ORACLE_ID = "gate3-fixed-snapshot-reference-v2"
 
 SELECTOR = "tests/test_smoke.py::test_smoke"
 FIXTURE_PATH = "tests/test_smoke.py"
@@ -62,6 +64,14 @@ MAX_QUALIFIED_TUPLE_BYTES = 1024 * 1024
 MAX_OUTPUT_BYTES = 64 * 1024
 MAX_REFERENCE_BYTES = 1024
 READ_CHUNK_BYTES = 64 * 1024
+MAX_FILESYSTEM_PATH_BYTES = 4096
+MAX_FILESYSTEM_PATH_COMPONENTS = 128
+MAX_DIRECTORY_NAME_BYTES = 255
+MAX_JSON_DEPTH = 64
+MAX_JSON_NODES = 8192
+
+CALLER_SUPPLIED_UNVERIFIED = "caller-supplied-unverified"
+ARGV_BINARY_RELATION_UNVERIFIED = "not-bound-to-caller-supplied-binary-input"
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -104,11 +114,24 @@ class StableInput:
 
 
 @dataclasses.dataclass(frozen=True)
+class StablePathInput:
+    value: bytes
+    file_identity: tuple[int, int]
+    parent_identity: tuple[int, int]
+
+
+@dataclasses.dataclass(frozen=True)
 class FixtureObservation:
     manifest: StableInput
     selector: StableInput
     root_identity: tuple[int, int]
     tests_identity: tuple[int, int]
+
+
+@dataclasses.dataclass(frozen=True)
+class SnapshotBuild:
+    evidence: bytes
+    input_directory_identities: tuple[tuple[int, int], ...]
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -131,14 +154,42 @@ def _duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _reject_json_constant(_: str) -> None:
+    raise SnapshotRefusal("json_nonfinite_number")
+
+
+def _validate_json_bounds(value: Any) -> None:
+    pending: list[tuple[Any, int]] = [(value, 1)]
+    observed = 0
+    while pending:
+        current, depth = pending.pop()
+        observed += 1
+        if observed > MAX_JSON_NODES:
+            raise SnapshotRefusal("json_nodes_oversized")
+        if depth > MAX_JSON_DEPTH:
+            raise SnapshotRefusal("json_depth_oversized")
+        if type(current) is dict:
+            pending.extend((child, depth + 1) for child in current.values())
+        elif type(current) is list:
+            pending.extend((child, depth + 1) for child in current)
+
+
 def decode_strict_json(raw: bytes, *, malformed_code: str) -> Any:
     if type(raw) is not bytes:
         raise SnapshotRefusal("input_bytes_required")
     try:
         text = raw.decode("utf-8", errors="strict")
-        return json.loads(text, object_pairs_hook=_duplicate_keys)
+        value = json.loads(
+            text,
+            object_pairs_hook=_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+        _validate_json_bounds(value)
+        return value
     except SnapshotRefusal:
         raise
+    except RecursionError as error:
+        raise SnapshotRefusal("json_depth_oversized") from error
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise SnapshotRefusal(malformed_code) from error
 
@@ -191,21 +242,23 @@ def _new_false_authority() -> dict[str, bool]:
 
 
 def _reject_nested_authority_claims(value: Any) -> None:
-    if type(value) is dict:
-        for key, child in value.items():
-            normalized = key.lower()
-            authority_leaf = (
-                normalized in AUTHORITY_FIELDS
-                or normalized.endswith("_authority")
-                or normalized.endswith("_authority_claimed")
-                or normalized.endswith("_claimed")
-            )
-            if authority_leaf and (type(child) is not bool or child is not False):
-                raise SnapshotRefusal("qualified_tuple_authority_claimed")
-            _reject_nested_authority_claims(child)
-    elif type(value) is list:
-        for child in value:
-            _reject_nested_authority_claims(child)
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if type(current) is dict:
+            for key, child in current.items():
+                normalized = key.lower()
+                authority_leaf = (
+                    normalized in AUTHORITY_FIELDS
+                    or normalized.endswith("_authority")
+                    or normalized.endswith("_authority_claimed")
+                    or normalized.endswith("_claimed")
+                )
+                if authority_leaf and (type(child) is not bool or child is not False):
+                    raise SnapshotRefusal("qualified_tuple_authority_claimed")
+                pending.append(child)
+        elif type(current) is list:
+            pending.extend(current)
 
 
 def validate_request(raw: bytes) -> dict[str, Any]:
@@ -241,29 +294,28 @@ def validate_request(raw: bytes) -> dict[str, Any]:
     ):
         raise SnapshotRefusal("fixture_identity_mismatch")
 
-    _exact_keys(request["binary"], {"path", "sha256"}, "binary_binding_malformed")
-    _require_canonical_relative_path(
-        request["binary"]["path"], exact=BINARY_ARGV_PATH
-    )
-    if not _is_sha256(request["binary"]["sha256"]):
+    _exact_keys(request["binary"], {"content_sha256"}, "binary_binding_malformed")
+    if not _is_sha256(request["binary"]["content_sha256"]):
         raise SnapshotRefusal("binary_sha256_malformed")
 
-    _exact_keys(request["source"], {"git_sha"}, "source_binding_malformed")
-    if not _is_git_sha(request["source"]["git_sha"]):
+    _exact_keys(
+        request["source"], {"caller_reported_git_sha"}, "source_binding_malformed"
+    )
+    if not _is_git_sha(request["source"]["caller_reported_git_sha"]):
         raise SnapshotRefusal("source_git_sha_malformed")
 
     _exact_keys(
         request["qualified_tuple"],
-        {"schema", "reference", "sha256"},
+        {"schema", "caller_reported_reference", "content_sha256"},
         "qualified_tuple_binding_malformed",
     )
     if request["qualified_tuple"]["schema"] != QUALIFIED_TUPLE_SCHEMA:
         raise SnapshotRefusal("qualified_tuple_schema_mismatch")
     _require_canonical_relative_path(
-        request["qualified_tuple"]["reference"],
+        request["qualified_tuple"]["caller_reported_reference"],
         exact=QUALIFIED_TUPLE_REFERENCE,
     )
-    if not _is_sha256(request["qualified_tuple"]["sha256"]):
+    if not _is_sha256(request["qualified_tuple"]["content_sha256"]):
         raise SnapshotRefusal("qualified_tuple_sha256_malformed")
     _false_authority(request["authority"])
     return request
@@ -286,12 +338,36 @@ def _path_components(path: os.PathLike[str] | str) -> tuple[bool, tuple[str, ...
     raw = os.fspath(path)
     if type(raw) is not str or not raw or "\x00" in raw:
         raise SnapshotRefusal("path_malformed")
+    try:
+        encoded = os.fsencode(raw)
+    except UnicodeEncodeError as error:
+        raise SnapshotRefusal("path_malformed") from error
     pure = pathlib.PurePath(raw)
     absolute = pure.is_absolute()
     parts = pure.parts[1:] if absolute else pure.parts
-    if not parts or any(part in {"", ".", "..", "/"} for part in parts):
+    if (
+        not parts
+        or len(encoded) > MAX_FILESYSTEM_PATH_BYTES
+        or len(parts) > MAX_FILESYSTEM_PATH_COMPONENTS
+        or any(part in {"", ".", "..", "/"} for part in parts)
+        or any(len(os.fsencode(part)) > MAX_DIRECTORY_NAME_BYTES for part in parts)
+    ):
         raise SnapshotRefusal("path_escape")
     return absolute, tuple(parts)
+
+
+def _lexical_absolute_path(path: os.PathLike[str] | str) -> pathlib.PurePath:
+    if os.fspath(path) == ".":
+        return pathlib.PurePath(os.getcwd())
+    absolute, parts = _path_components(path)
+    root = pathlib.PurePath("/") if absolute else pathlib.PurePath(os.getcwd())
+    return root.joinpath(*parts)
+
+
+def _lexical_parent_path(path: os.PathLike[str] | str) -> pathlib.PurePath:
+    absolute, parts = _path_components(path)
+    root = pathlib.PurePath("/") if absolute else pathlib.PurePath(os.getcwd())
+    return root.joinpath(*parts[:-1])
 
 
 def _open_directory_no_follow(path: os.PathLike[str] | str) -> int:
@@ -407,6 +483,12 @@ def _read_stable_regular_at(
 
 
 def _read_stable_path(path: os.PathLike[str] | str, *, limit: int) -> bytes:
+    return _read_stable_path_input(path, limit=limit).value
+
+
+def _read_stable_path_input(
+    path: os.PathLike[str] | str, *, limit: int
+) -> StablePathInput:
     absolute, parts = _path_components(path)
     if not parts:
         raise SnapshotRefusal("path_malformed")
@@ -416,20 +498,38 @@ def _read_stable_path(path: os.PathLike[str] | str, *, limit: int) -> bytes:
         parent /= part
     directory_fd = _open_directory_no_follow(parent)
     try:
-        return _read_stable_regular_at(directory_fd, name, limit=limit)
+        parent_metadata = os.fstat(directory_fd)
+        value = _read_stable_regular_at(directory_fd, name, limit=limit)
+        try:
+            file_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError as error:
+            raise SnapshotRefusal("input_changed") from error
+        return StablePathInput(
+            value=value,
+            file_identity=(file_metadata.st_dev, file_metadata.st_ino),
+            parent_identity=(parent_metadata.st_dev, parent_metadata.st_ino),
+        )
     finally:
         os.close(directory_fd)
 
 
-def _scan_names(directory_fd: int) -> list[str]:
+def _scan_names(directory_fd: int, *, max_entries: int) -> list[str]:
+    names: list[str] = []
+    name_bytes = 0
     try:
         with os.scandir(directory_fd) as entries:
-            names = sorted(entry.name for entry in entries)
+            for entry in entries:
+                name = entry.name
+                if type(name) is not str:
+                    raise SnapshotRefusal("fixture_entry_name_malformed")
+                encoded = os.fsencode(name)
+                name_bytes += len(encoded)
+                names.append(name)
+                if len(names) > max_entries or name_bytes > MAX_REFERENCE_BYTES:
+                    raise SnapshotRefusal("fixture_inputs_mismatch")
     except OSError as error:
         raise SnapshotRefusal("fixture_unavailable") from error
-    if any(type(name) is not str for name in names):
-        raise SnapshotRefusal("fixture_entry_name_malformed")
-    return names
+    return sorted(names)
 
 
 def validate_fixture(
@@ -440,7 +540,7 @@ def validate_fixture(
         root_before = os.fstat(root_fd)
         if not stat.S_ISDIR(root_before.st_mode):
             raise SnapshotRefusal("fixture_not_directory")
-        if _scan_names(root_fd) != ["manifest.json", "tests"]:
+        if _scan_names(root_fd, max_entries=2) != ["manifest.json", "tests"]:
             raise SnapshotRefusal("fixture_inputs_mismatch")
         try:
             tests_fd = os.open("tests", _directory_flags(), dir_fd=root_fd)
@@ -450,7 +550,7 @@ def validate_fixture(
             tests_before = os.fstat(tests_fd)
             if not stat.S_ISDIR(tests_before.st_mode):
                 raise SnapshotRefusal("fixture_not_directory")
-            if _scan_names(tests_fd) != ["test_smoke.py"]:
+            if _scan_names(tests_fd, max_entries=1) != ["test_smoke.py"]:
                 raise SnapshotRefusal("fixture_inputs_mismatch")
             fixture_raw = _read_stable_regular_at(
                 tests_fd, "test_smoke.py", limit=MAX_FIXTURE_BYTES
@@ -500,41 +600,66 @@ def build_snapshot_evidence(
     fixture_root: os.PathLike[str] | str,
     binary_path: os.PathLike[str] | str,
     qualified_tuple_path: os.PathLike[str] | str,
-    expected_source_git_sha: str,
 ) -> bytes:
     """Return canonical non-authoritative evidence after stable input reads."""
 
-    request = validate_request(request_raw)
-    if not _is_git_sha(expected_source_git_sha):
-        raise SnapshotRefusal("expected_source_git_sha_malformed")
-    if request["source"]["git_sha"] != expected_source_git_sha:
-        raise SnapshotRefusal("source_git_sha_mismatch")
+    return _build_snapshot_evidence(
+        request_raw,
+        fixture_root=fixture_root,
+        binary_path=binary_path,
+        qualified_tuple_path=qualified_tuple_path,
+    ).evidence
 
+
+def _build_snapshot_evidence(
+    request_raw: bytes,
+    *,
+    fixture_root: os.PathLike[str] | str,
+    binary_path: os.PathLike[str] | str,
+    qualified_tuple_path: os.PathLike[str] | str,
+) -> SnapshotBuild:
+    request = validate_request(request_raw)
     fixture = validate_fixture(fixture_root)
-    binary = _read_stable_path(binary_path, limit=MAX_BINARY_BYTES)
-    binary_sha256 = sha256_bytes(binary)
-    if request["binary"]["sha256"] != binary_sha256:
+    binary = _read_stable_path_input(binary_path, limit=MAX_BINARY_BYTES)
+    binary_sha256 = sha256_bytes(binary.value)
+    if request["binary"]["content_sha256"] != binary_sha256:
         raise SnapshotRefusal("binary_sha256_mismatch")
 
-    qualified_tuple = _read_stable_path(
+    qualified_tuple = _read_stable_path_input(
         qualified_tuple_path, limit=MAX_QUALIFIED_TUPLE_BYTES
     )
     tuple_value = decode_strict_json(
-        qualified_tuple, malformed_code="qualified_tuple_json_malformed"
+        qualified_tuple.value, malformed_code="qualified_tuple_json_malformed"
     )
     if type(tuple_value) is not dict or tuple_value.get("schema") != QUALIFIED_TUPLE_SCHEMA:
         raise SnapshotRefusal("qualified_tuple_schema_mismatch")
     _reject_nested_authority_claims(tuple_value)
-    tuple_sha256 = sha256_bytes(qualified_tuple)
-    if request["qualified_tuple"]["sha256"] != tuple_sha256:
+    tuple_sha256 = sha256_bytes(qualified_tuple.value)
+    if request["qualified_tuple"]["content_sha256"] != tuple_sha256:
         raise SnapshotRefusal("qualified_tuple_sha256_mismatch")
 
     bindings = {
         "argv": list(EXACT_ARGV),
+        "argv_binary_relation": ARGV_BINARY_RELATION_UNVERIFIED,
         "fixture": dict(EXPECTED_FIXTURE_IDENTITY),
-        "binary": {"path": BINARY_ARGV_PATH, "length": len(binary), "sha256": binary_sha256},
-        "source": {"git_sha": expected_source_git_sha},
-        "qualified_tuple": dict(request["qualified_tuple"]),
+        "binary_input": {
+            "length": len(binary.value),
+            "sha256": binary_sha256,
+            "provenance": CALLER_SUPPLIED_UNVERIFIED,
+        },
+        "source_input": {
+            "caller_reported_git_sha": request["source"]["caller_reported_git_sha"],
+            "provenance": CALLER_SUPPLIED_UNVERIFIED,
+        },
+        "qualified_tuple_input": {
+            "schema": QUALIFIED_TUPLE_SCHEMA,
+            "caller_reported_reference": request["qualified_tuple"][
+                "caller_reported_reference"
+            ],
+            "length": len(qualified_tuple.value),
+            "sha256": tuple_sha256,
+            "provenance": CALLER_SUPPLIED_UNVERIFIED,
+        },
     }
     snapshot = {
         "input_count": 3,
@@ -558,7 +683,15 @@ def build_snapshot_evidence(
     rendered = canonical_json_bytes(evidence)
     if len(rendered) > MAX_OUTPUT_BYTES:
         raise SnapshotRefusal("output_oversized")
-    return rendered
+    return SnapshotBuild(
+        evidence=rendered,
+        input_directory_identities=(
+            fixture.root_identity,
+            fixture.tests_identity,
+            binary.parent_identity,
+            qualified_tuple.parent_identity,
+        ),
+    )
 
 
 def write_exclusive(
@@ -567,19 +700,32 @@ def write_exclusive(
     value: bytes,
     *,
     forbidden_directory_identities: Iterable[tuple[int, int]] = (),
+    forbidden_directory_paths: Iterable[os.PathLike[str] | str] = (),
+    forbidden_tree_roots: Iterable[os.PathLike[str] | str] = (),
 ) -> None:
-    """Create one output atomically enough to refuse every overwrite attempt."""
+    """Create one output without replacing a pre-existing or raced-in name."""
 
     _require_canonical_relative_path(output_name)
     if "/" in output_name or not output_name.endswith(".json"):
         raise SnapshotRefusal("output_name_malformed")
     if type(value) is not bytes or len(value) > MAX_OUTPUT_BYTES:
         raise SnapshotRefusal("output_oversized")
+    output_lexical = _lexical_absolute_path(output_directory)
+    if any(
+        output_lexical == _lexical_absolute_path(forbidden)
+        for forbidden in forbidden_directory_paths
+    ):
+        raise SnapshotRefusal("source_mutation_forbidden")
+    for forbidden_root in forbidden_tree_roots:
+        root_lexical = _lexical_absolute_path(forbidden_root)
+        if output_lexical == root_lexical or root_lexical in output_lexical.parents:
+            raise SnapshotRefusal("source_mutation_forbidden")
     directory_fd = _open_directory_no_follow(output_directory)
     descriptor: int | None = None
-    created = False
+    created_identity: tuple[int, int] | None = None
     try:
         metadata = os.fstat(directory_fd)
+        directory_identity = (metadata.st_dev, metadata.st_ino)
         if (metadata.st_dev, metadata.st_ino) in set(forbidden_directory_identities):
             raise SnapshotRefusal("source_mutation_forbidden")
         flags = (
@@ -591,27 +737,48 @@ def write_exclusive(
         )
         try:
             descriptor = os.open(output_name, flags, 0o600, dir_fd=directory_fd)
-            created = True
+            created_metadata = os.fstat(descriptor)
+            created_identity = (created_metadata.st_dev, created_metadata.st_ino)
         except FileExistsError as error:
             raise SnapshotRefusal("output_exists") from error
         except OSError as error:
             raise SnapshotRefusal("output_unavailable") from error
         offset = 0
         while offset < len(value):
-            written = os.write(descriptor, value[offset:])
+            try:
+                written = os.write(descriptor, value[offset:])
+            except OSError as error:
+                raise SnapshotRefusal("output_write_failed") from error
             if written <= 0:
                 raise SnapshotRefusal("output_write_failed")
             offset += written
-        os.fsync(descriptor)
+        try:
+            os.fsync(descriptor)
+        except OSError as error:
+            raise SnapshotRefusal("output_fsync_failed") from error
+        _require_output_name_identity(
+            directory_fd, output_name, descriptor, created_identity, len(value)
+        )
+        try:
+            os.fsync(directory_fd)
+        except OSError as error:
+            raise SnapshotRefusal("output_directory_fsync_failed") from error
+        verification_fd = _open_directory_no_follow(output_directory)
+        try:
+            verified_directory = os.fstat(verification_fd)
+            if (verified_directory.st_dev, verified_directory.st_ino) != directory_identity:
+                raise SnapshotRefusal("output_directory_changed")
+        finally:
+            os.close(verification_fd)
+        _require_output_name_identity(
+            directory_fd, output_name, descriptor, created_identity, len(value)
+        )
     except BaseException:
         if descriptor is not None:
             os.close(descriptor)
             descriptor = None
-        if created:
-            try:
-                os.unlink(output_name, dir_fd=directory_fd)
-            except OSError:
-                pass
+        if created_identity is not None:
+            _unlink_if_same_identity(directory_fd, output_name, created_identity)
         raise
     finally:
         if descriptor is not None:
@@ -619,10 +786,46 @@ def write_exclusive(
         os.close(directory_fd)
 
 
+def _require_output_name_identity(
+    directory_fd: int,
+    output_name: str,
+    descriptor: int,
+    created_identity: tuple[int, int],
+    expected_size: int,
+) -> None:
+    try:
+        opened = os.fstat(descriptor)
+        visible = os.stat(output_name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError as error:
+        raise SnapshotRefusal("output_changed") from error
+    if (
+        (opened.st_dev, opened.st_ino) != created_identity
+        or (visible.st_dev, visible.st_ino) != created_identity
+        or not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(visible.st_mode)
+        or opened.st_nlink != 1
+        or visible.st_nlink != 1
+        or opened.st_size != expected_size
+        or visible.st_size != expected_size
+    ):
+        raise SnapshotRefusal("output_changed")
+
+
+def _unlink_if_same_identity(
+    directory_fd: int, output_name: str, created_identity: tuple[int, int]
+) -> None:
+    try:
+        visible = os.stat(output_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (visible.st_dev, visible.st_ino) == created_identity:
+            os.unlink(output_name, dir_fd=directory_fd)
+    except OSError:
+        pass
+
+
 def build_request_for_test(
     *,
     binary_sha256: str,
-    source_git_sha: str,
+    caller_reported_source_git_sha: str,
     qualified_tuple_sha256: str,
 ) -> dict[str, Any]:
     """Construct deterministic synthetic input; this is never evidence."""
@@ -631,12 +834,12 @@ def build_request_for_test(
         "schema": REQUEST_SCHEMA,
         "argv": list(EXACT_ARGV),
         "fixture": dict(EXPECTED_FIXTURE_IDENTITY),
-        "binary": {"path": BINARY_ARGV_PATH, "sha256": binary_sha256},
-        "source": {"git_sha": source_git_sha},
+        "binary": {"content_sha256": binary_sha256},
+        "source": {"caller_reported_git_sha": caller_reported_source_git_sha},
         "qualified_tuple": {
             "schema": QUALIFIED_TUPLE_SCHEMA,
-            "reference": QUALIFIED_TUPLE_REFERENCE,
-            "sha256": qualified_tuple_sha256,
+            "caller_reported_reference": QUALIFIED_TUPLE_REFERENCE,
+            "content_sha256": qualified_tuple_sha256,
         },
         "authority": _new_false_authority(),
     }
@@ -648,7 +851,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixture-root", required=True, type=pathlib.Path)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--qualified-tuple", required=True, type=pathlib.Path)
-    parser.add_argument("--expected-source-git-sha", required=True)
     parser.add_argument("--output-directory", required=True, type=pathlib.Path)
     parser.add_argument("--output-name", default="snapshot-evidence.json")
     return parser
@@ -657,20 +859,27 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = _parser().parse_args(argv)
     try:
-        request_raw = _read_stable_path(arguments.request, limit=MAX_REQUEST_BYTES)
-        fixture = validate_fixture(arguments.fixture_root)
-        evidence = build_snapshot_evidence(
-            request_raw,
+        request = _read_stable_path_input(arguments.request, limit=MAX_REQUEST_BYTES)
+        built = _build_snapshot_evidence(
+            request.value,
             fixture_root=arguments.fixture_root,
             binary_path=arguments.binary,
             qualified_tuple_path=arguments.qualified_tuple,
-            expected_source_git_sha=arguments.expected_source_git_sha,
         )
         write_exclusive(
             arguments.output_directory,
             arguments.output_name,
-            evidence,
-            forbidden_directory_identities=(fixture.root_identity, fixture.tests_identity),
+            built.evidence,
+            forbidden_directory_identities=(
+                request.parent_identity,
+                *built.input_directory_identities,
+            ),
+            forbidden_directory_paths=(
+                _lexical_parent_path(arguments.request),
+                _lexical_parent_path(arguments.binary),
+                _lexical_parent_path(arguments.qualified_tuple),
+            ),
+            forbidden_tree_roots=(arguments.fixture_root,),
         )
     except SnapshotRefusal as refusal:
         print(f"snapshot oracle refused: {refusal.code}", file=sys.stderr)
