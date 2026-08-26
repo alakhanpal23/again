@@ -128,6 +128,10 @@ granting workload, Python, EffectIR, profile, execution, or reuse authority.
 
 **Entry gate:** Gate 0. Gate 1 is an independent branch.
 
+**Status:** closed for the fixed, command-free transport proof at source
+`3d1fb201507a43b830d5ce341b2253957634016d`; this is not profile, execution, or
+reuse qualification.
+
 The first executable artifact is a hidden, fixed, no-command two-task probe. A
 parent performs exact 88-byte `clone3(SIGCHLD)` and parent and child raw-exit.
 The connector must:
@@ -159,10 +163,18 @@ modes, PID/pidfd termination, and signal-state verification through private
 test-only fault seams. Linux tests require each forward failure to preserve its
 typed first error while the complete tree reaches final `ECHILD`; cleanup-path
 faults retain the first cleanup errno and refuse completion. The completed
-diagnostic redacts the observed parent-event-first or child-stop-first order,
-and a manual provisioned-runner workflow requires 100/100 exact samples and
-both orders. This does not close Gate 2: no qualifying runner is currently
-registered, so both live schedules and pinned 100/100 evidence remain required.
+diagnostic redacts the observed parent-event-first or child-stop-first order.
+Provisioned
+[`run 32965300493`](https://github.com/alakhanpal23/again/actions/runs/32965300493)
+passed 100/100 at the exact source checkpoint above on Linux x86_64 kernel
+`6.8.0-134-generic`, with 99 parent-event-first and 1 child-stop-first sample.
+The offline verifier accepted artifact `9605461989` with 302 members, archive
+SHA-256
+`43f3be33e9d92e28198ccab64deab1db6533c6a66c0ed7d1523f6fde4f371dfa`,
+and member-manifest SHA-256
+`4cb7287d6940b43a9720b10b82f90518b32abd319b3c9343df69c42ab20cf3ae`.
+The ephemeral runner was evidence infrastructure only and need not remain
+registered after the run.
 
 The retained artifact must be verified offline before it is cited. The verifier
 accepts the downloaded ZIP, the independently recorded source SHA, and the
