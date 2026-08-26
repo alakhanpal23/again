@@ -46,6 +46,7 @@ LANGUAGE_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("typescript", "--typescript-repo"),
 )
 HEX_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -85,6 +86,7 @@ class TrackedEntry:
     mode: str
     object_id: str
     path: str
+    path_bytes: bytes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,6 +141,46 @@ def _file_limit_setter(limit_bytes: int) -> Callable[[], None]:
     return apply
 
 
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError as error:
+        raise HarnessRefusal(
+            "process_tree_cleanup_failed",
+            f"cannot inspect owned process group {process_group}",
+        ) from error
+    return True
+
+
+def _cleanup_process_group(process: subprocess.Popen[bytes]) -> None:
+    """Kill and boundedly verify every process left in the owned session."""
+
+    process_group = process.pid
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise HarnessRefusal(
+            "process_tree_cleanup_failed",
+            f"process-group leader {process.pid} did not reap after SIGKILL",
+        ) from error
+
+    deadline = time.monotonic() + PROCESS_GROUP_CLEANUP_TIMEOUT_SECONDS
+    while _process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            raise HarnessRefusal(
+                "process_tree_cleanup_failed",
+                f"owned process group {process_group} survived SIGKILL",
+            )
+        time.sleep(0.01)
+
+
 def run_bounded(
     argv: Sequence[str],
     *,
@@ -149,6 +191,9 @@ def run_bounded(
 ) -> Completed:
     """Run a noninteractive process with bounded captured streams."""
 
+    if timeout_seconds <= 0 or stream_limit_bytes < 0:
+        raise ValueError("process bounds must be nonnegative and timeout must be positive")
+
     with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
         started = time.perf_counter_ns()
         process = subprocess.Popen(
@@ -158,17 +203,21 @@ def run_bounded(
             stdin=subprocess.DEVNULL,
             stdout=stdout_file,
             stderr=stderr_file,
+            close_fds=True,
             start_new_session=True,
             preexec_fn=_file_limit_setter(stream_limit_bytes + 1),
         )
         try:
             returncode = process.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as error:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+            _cleanup_process_group(process)
             raise HarnessRefusal(
                 "command_timeout", f"command exceeded {timeout_seconds:g}s: {argv!r}"
             ) from error
+        except BaseException:
+            _cleanup_process_group(process)
+            raise
+        _cleanup_process_group(process)
         elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
         stdout_bytes = os.fstat(stdout_file.fileno()).st_size
         stderr_bytes = os.fstat(stderr_file.fileno()).st_size
@@ -234,12 +283,12 @@ def require_absolute_directory(path: pathlib.Path, label: str) -> pathlib.Path:
         raise HarnessRefusal("path_not_canonical", f"{label} must be canonical and symlink-free")
     if not resolved.is_dir():
         raise HarnessRefusal("path_not_directory", f"{label} is not a directory")
-    top_level = run_git(
+    prefix = run_git(
         resolved,
-        ("rev-parse", "--show-toplevel"),
+        ("rev-parse", "--show-prefix"),
         limit_bytes=4096,
-    ).decode("utf-8", errors="strict").strip()
-    if pathlib.Path(top_level).resolve(strict=True) != resolved:
+    )
+    if prefix != b"\n":
         raise HarnessRefusal("not_repository_root", f"{label} must name the Git worktree root")
     return resolved
 
@@ -253,7 +302,7 @@ def parse_tracked_manifest(raw: bytes, limits: Limits) -> tuple[TrackedEntry, ..
     if len(records) > limits.max_tracked_files:
         raise HarnessRefusal("repository_oversized", "tracked file count exceeds its bound")
     entries: list[TrackedEntry] = []
-    seen: set[str] = set()
+    seen: set[bytes] = set()
     for record in records:
         try:
             header, raw_path = record.split(b"\t", 1)
@@ -261,24 +310,31 @@ def parse_tracked_manifest(raw: bytes, limits: Limits) -> tuple[TrackedEntry, ..
             mode = mode_bytes.decode("ascii")
             object_id = object_bytes.decode("ascii")
             stage = stage_bytes.decode("ascii")
-            path = raw_path.decode("utf-8", errors="strict")
+            path = os.fsdecode(raw_path)
         except (ValueError, UnicodeDecodeError) as error:
             raise HarnessRefusal("tracked_manifest_malformed", "malformed tracked entry") from error
         path_parts = pathlib.PurePosixPath(path).parts
         if (
-            not path
+            not raw_path
             or pathlib.PurePosixPath(path).is_absolute()
             or ".." in path_parts
             or any(part.lower() == ".git" for part in path_parts)
             or stage != "0"
             or not HEX_OBJECT_RE.fullmatch(object_id)
             or mode not in {"100644", "100755", "120000", "160000"}
-            or path in seen
+            or raw_path in seen
         ):
             raise HarnessRefusal("tracked_manifest_malformed", f"unsafe tracked entry: {path!r}")
-        seen.add(path)
-        entries.append(TrackedEntry(mode=mode, object_id=object_id, path=path))
-    return tuple(sorted(entries, key=lambda entry: entry.path.encode("utf-8")))
+        if os.fsencode(path) != raw_path:
+            raise HarnessRefusal(
+                "tracked_filename_unsupported",
+                "tracked filename is not losslessly representable on this host",
+            )
+        seen.add(raw_path)
+        entries.append(
+            TrackedEntry(mode=mode, object_id=object_id, path=path, path_bytes=raw_path)
+        )
+    return tuple(sorted(entries, key=lambda entry: entry.path_bytes))
 
 
 def _stat_fingerprint(metadata: os.stat_result) -> tuple[int, ...]:
@@ -298,17 +354,139 @@ def is_sparse(metadata: os.stat_result) -> bool:
     return metadata.st_size > 0 and blocks is not None and blocks * 512 < metadata.st_size
 
 
-def _require_no_symlink_components(root: pathlib.Path, relative: str) -> pathlib.Path:
-    current = root
-    for component in pathlib.PurePosixPath(relative).parts:
-        current = current / component
+def _directory_open_flags() -> int:
+    required = getattr(os, "O_DIRECTORY", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if required is None or nofollow is None:
+        raise HarnessRefusal(
+            "descriptor_walk_unsupported",
+            "host lacks O_DIRECTORY or O_NOFOLLOW for source-safe inspection",
+        )
+    return os.O_RDONLY | required | nofollow | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_parent_directory(root: pathlib.Path, relative: str) -> tuple[int, str]:
+    parts = pathlib.PurePosixPath(relative).parts
+    if not parts:
+        raise HarnessRefusal("tracked_manifest_malformed", "tracked path has no components")
+    try:
+        current = os.open(root, _directory_open_flags())
+    except OSError as error:
+        raise HarnessRefusal(
+            "selected_input_unavailable", f"source root unavailable for {relative}"
+        ) from error
+    try:
+        for component in parts[:-1]:
+            try:
+                metadata = os.stat(component, dir_fd=current, follow_symlinks=False)
+            except OSError as error:
+                raise HarnessRefusal(
+                    "selected_input_unavailable",
+                    f"selected input parent unavailable: {relative}",
+                ) from error
+            if stat.S_ISLNK(metadata.st_mode):
+                raise HarnessRefusal(
+                    "selected_input_symlink",
+                    f"selected input parent is a symlink: {relative}",
+                )
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise HarnessRefusal(
+                    "selected_input_unavailable",
+                    f"selected input parent is not a directory: {relative}",
+                )
+            try:
+                following = os.open(component, _directory_open_flags(), dir_fd=current)
+            except OSError as error:
+                raise HarnessRefusal(
+                    "selected_input_unavailable",
+                    f"selected input parent changed: {relative}",
+                ) from error
+            os.close(current)
+            current = following
+        return current, parts[-1]
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _lstat_tracked_path(root: pathlib.Path, relative: str) -> os.stat_result | None:
+    try:
+        parent, name = _open_parent_directory(root, relative)
+    except HarnessRefusal as error:
+        if error.code == "selected_input_unavailable":
+            return None
+        raise
+    try:
         try:
-            metadata = current.lstat()
+            return os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
         except OSError as error:
-            raise HarnessRefusal("selected_input_unavailable", f"selected input unavailable: {relative}") from error
+            raise HarnessRefusal(
+                "tracked_input_unavailable", f"tracked input unavailable: {relative}"
+            ) from error
+    finally:
+        os.close(parent)
+
+
+def _open_tracked_regular(root: pathlib.Path, relative: str) -> int:
+    parent, name = _open_parent_directory(root, relative)
+    try:
+        try:
+            metadata = os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except OSError as error:
+            raise HarnessRefusal(
+                "selected_input_unavailable", f"selected input unavailable: {relative}"
+            ) from error
         if stat.S_ISLNK(metadata.st_mode):
-            raise HarnessRefusal("selected_input_symlink", f"selected input uses a symlink: {relative}")
-    return current
+            raise HarnessRefusal(
+                "selected_input_symlink", f"selected input is a symlink: {relative}"
+            )
+        if not stat.S_ISREG(metadata.st_mode):
+            raise HarnessRefusal(
+                "selected_input_special", f"selected input is not regular: {relative}"
+            )
+        flags = (
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(name, flags, dir_fd=parent)
+        except OSError as error:
+            raise HarnessRefusal(
+                "selected_input_unavailable", f"selected input changed: {relative}"
+            ) from error
+        try:
+            opened = os.fstat(descriptor)
+        except OSError:
+            os.close(descriptor)
+            raise
+        if not stat.S_ISREG(opened.st_mode) or _stat_fingerprint(opened) != _stat_fingerprint(
+            metadata
+        ):
+            os.close(descriptor)
+            raise HarnessRefusal(
+                "selected_input_unavailable", f"selected input changed: {relative}"
+            )
+        return descriptor
+    finally:
+        os.close(parent)
+
+
+def _sha256_descriptor(descriptor: int, limit_bytes: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        block = os.read(descriptor, min(1024 * 1024, limit_bytes + 1 - total))
+        if not block:
+            break
+        total += len(block)
+        if total > limit_bytes:
+            raise HarnessRefusal("selected_input_oversized", "selected input grew while reading")
+        digest.update(block)
+    return digest.hexdigest(), total
 
 
 def _tracked_worktree_digest(
@@ -317,12 +495,10 @@ def _tracked_worktree_digest(
     digest = hashlib.sha256()
     logical_bytes = 0
     for entry in entries:
-        path = root.joinpath(*pathlib.PurePosixPath(entry.path).parts)
-        digest.update(entry.path.encode("utf-8"))
+        digest.update(entry.path_bytes)
         digest.update(b"\0")
-        try:
-            metadata = path.lstat()
-        except FileNotFoundError:
+        metadata = _lstat_tracked_path(root, entry.path)
+        if metadata is None:
             digest.update(b"missing\0")
             continue
         fingerprint = _stat_fingerprint(metadata)
@@ -379,21 +555,33 @@ def _selected_files(
             raise HarnessRefusal("selected_input_symlink", f"tracked symlink selected: {entry.path}")
         if entry.mode not in {"100644", "100755"}:
             raise HarnessRefusal("selected_input_special", f"non-regular input selected: {entry.path}")
-        source = _require_no_symlink_components(root, entry.path)
-        metadata = source.lstat()
-        if not stat.S_ISREG(metadata.st_mode):
-            raise HarnessRefusal("selected_input_special", f"non-regular input selected: {entry.path}")
-        if metadata.st_size == 0:
-            raise HarnessRefusal("selected_input_empty", f"empty input selected: {entry.path}")
-        if metadata.st_size > limits.max_selected_file_bytes:
-            raise HarnessRefusal("selected_input_oversized", f"selected input is too large: {entry.path}")
-        if is_sparse(metadata):
-            raise HarnessRefusal("selected_input_sparse", f"sparse input selected: {entry.path}")
+        descriptor = _open_tracked_regular(root, entry.path)
+        try:
+            metadata = os.fstat(descriptor)
+            if metadata.st_size == 0:
+                raise HarnessRefusal("selected_input_empty", f"empty input selected: {entry.path}")
+            if metadata.st_size > limits.max_selected_file_bytes:
+                raise HarnessRefusal(
+                    "selected_input_oversized", f"selected input is too large: {entry.path}"
+                )
+            if is_sparse(metadata):
+                raise HarnessRefusal(
+                    "selected_input_sparse", f"sparse input selected: {entry.path}"
+                )
+            digest, size = _sha256_descriptor(descriptor, limits.max_selected_file_bytes)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+        if _stat_fingerprint(after) != _stat_fingerprint(metadata) or size != metadata.st_size:
+            raise HarnessRefusal(
+                "source_changed_during_inspection",
+                f"selected source changed while hashing: {entry.path}",
+            )
         selected.append(
             SelectedFile(
                 path=entry.path,
-                size=metadata.st_size,
-                sha256=sha256_file(source),
+                size=size,
+                sha256=digest,
                 executable=entry.mode == "100755",
                 stat_fingerprint=_stat_fingerprint(metadata),
             )
@@ -450,13 +638,15 @@ def copy_selected_files(
     workspace.mkdir(mode=0o700)
     (workspace / ".git").mkdir(mode=0o700)
     copied: list[SelectedFile] = []
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    cloexec = getattr(os, "O_CLOEXEC", 0)
     for index, expected in enumerate(snapshot.selected):
-        source = _require_no_symlink_components(snapshot.root, expected.path)
         destination = workspace.joinpath(*pathlib.PurePosixPath(expected.path).parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(source, os.O_RDONLY | nofollow | cloexec)
+        try:
+            descriptor = _open_tracked_regular(snapshot.root, expected.path)
+        except HarnessRefusal as error:
+            raise HarnessRefusal(
+                "source_changed_during_copy", f"selected source changed: {expected.path}"
+            ) from error
         try:
             before = os.fstat(descriptor)
             if (
@@ -488,7 +678,16 @@ def copy_selected_files(
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
-        observed_path = source.lstat()
+        try:
+            observed_descriptor = _open_tracked_regular(snapshot.root, expected.path)
+        except HarnessRefusal as error:
+            raise HarnessRefusal(
+                "source_changed_during_copy", f"selected source changed: {expected.path}"
+            ) from error
+        try:
+            observed_path = os.fstat(observed_descriptor)
+        finally:
+            os.close(observed_descriptor)
         if (
             _stat_fingerprint(before) != _stat_fingerprint(after)
             or _stat_fingerprint(after) != _stat_fingerprint(observed_path)
@@ -873,7 +1072,10 @@ def host_record() -> dict[str, str]:
 
 
 def canonical_json_bytes(report: dict[str, Any]) -> bytes:
-    return (json.dumps(report, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return (
+        json.dumps(report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
 
 
 def write_json_exclusive(path: pathlib.Path, report: dict[str, Any]) -> None:

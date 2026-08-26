@@ -6,10 +6,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import pathlib
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -86,6 +88,57 @@ class RealRepositoryCorpusTests(unittest.TestCase):
         self.assertEqual(commands[3].command_id, "file0-wc-bytes")
         self.assertEqual(commands[-1].argv, ("wc", "-c", "--", "src/m.rs"))
         self.assertEqual(commands, corpus.build_command_corpus(snapshot.selected))
+
+    def test_nul_manifest_supports_non_utf8_and_newline_filenames(self) -> None:
+        object_id = b"1" * 40
+        raw_paths = (b"a-\xff.py", b"b\nname.py")
+        manifest = b"".join(
+            b"100644 " + object_id + b" 0\t" + path + b"\0" for path in raw_paths
+        )
+        entries = corpus.parse_tracked_manifest(manifest, corpus.DEFAULT_LIMITS)
+
+        self.assertEqual([entry.path_bytes for entry in entries], list(raw_paths))
+        self.assertEqual([os.fsencode(entry.path) for entry in entries], list(raw_paths))
+        escaped = corpus.canonical_json_bytes({"path": entries[0].path})
+        self.assertIn(b"\\udcff", escaped)
+
+        fixture = self.repository()
+        root_bytes = os.fsencode(fixture.root)
+        materialized_paths = (b"a.py", b"b\nname.py")
+        for raw_path, contents in zip(materialized_paths, (b"ordinary\n", b"newline\n")):
+            descriptor = os.open(root_bytes + b"/" + raw_path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                os.write(descriptor, contents)
+            finally:
+                os.close(descriptor)
+        fixture.commit()
+        snapshot = corpus.inspect_repository(fixture.root, "python")
+        self.assertEqual(
+            [os.fsencode(selected.path) for selected in snapshot.selected],
+            list(materialized_paths),
+        )
+        workspace = self.root / "raw-name-workspace"
+        corpus.copy_selected_files(snapshot, workspace)
+        for selected, contents in zip(snapshot.selected, (b"ordinary\n", b"newline\n")):
+            self.assertEqual((workspace / selected.path).read_bytes(), contents)
+        corpus.canonical_json_bytes(corpus.snapshot_record(snapshot, source_copy_verification="ok"))
+
+    def test_submodule_selected_by_suffix_is_typed_unsupported(self) -> None:
+        fixture = self.repository()
+        fixture.write("a.rs", b"a\n")
+        fixture.write("b.rs", b"b\n")
+        commit = fixture.commit()
+        fixture.git(
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"160000,{commit},0-submodule.rs",
+        )
+        fixture.git("commit", "-q", "-m", "gitlink")
+
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.inspect_repository(fixture.root, "rust")
+        self.assertEqual(refused.exception.code, "selected_input_special")
 
     def test_option_like_inputs_are_delimited_and_execute_as_files(self) -> None:
         fixture = self.repository()
@@ -189,16 +242,49 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             self.assertEqual(special_error.exception.code, "selected_input_special")
 
         sparse_repo = self.repository("sparse")
-        sparse = sparse_repo.root / "a.ts"
-        with sparse.open("wb") as output:
-            output.seek(2 * 1024 * 1024)
-            output.write(b"x")
+        sparse_repo.write("a.ts", b"a\n")
         sparse_repo.write("b.ts", b"b\n")
         sparse_repo.commit()
-        if corpus.is_sparse(sparse.stat()):
+        with mock.patch.object(corpus, "is_sparse", return_value=True):
             with self.assertRaises(corpus.HarnessRefusal) as sparse_error:
                 corpus.inspect_repository(sparse_repo.root, "typescript")
             self.assertEqual(sparse_error.exception.code, "selected_input_sparse")
+
+    def test_intermediate_symlinks_and_copy_time_parent_swaps_are_rejected(self) -> None:
+        escaped = self.repository("escaped")
+        escaped.write("src/a.rs", b"alpha\n")
+        escaped.write("src/b.rs", b"beta\n")
+        escaped.commit()
+        original = escaped.root / "src"
+        original.rename(escaped.root / "src-original")
+        os.symlink(self.root, original)
+        with self.assertRaises(corpus.HarnessRefusal) as symlink:
+            corpus.inspect_repository(escaped.root, "rust")
+        self.assertEqual(symlink.exception.code, "selected_input_symlink")
+
+        changed = self.repository("changed-parent")
+        changed.write("src/a.rs", b"alpha\n")
+        changed.write("src/b.rs", b"beta\n")
+        changed.commit()
+        snapshot = corpus.inspect_repository(changed.root, "rust")
+        source_parent = changed.root / "src"
+        replacement = self.root / "replacement"
+        replacement.mkdir()
+        (replacement / "a.rs").write_bytes(b"alpha\n")
+        (replacement / "b.rs").write_bytes(b"beta\n")
+
+        def swap_parent(_relative: str, index: int) -> None:
+            if index == 0:
+                source_parent.rename(changed.root / "src-original")
+                os.symlink(replacement, source_parent)
+
+        with self.assertRaises(corpus.HarnessRefusal) as source_changed:
+            corpus.copy_selected_files(
+                snapshot,
+                self.root / "changed-parent-workspace",
+                after_copy=swap_parent,
+            )
+        self.assertEqual(source_changed.exception.code, "source_changed_during_copy")
 
     def test_copy_detects_selected_source_change_and_never_follows_it(self) -> None:
         fixture = self.repository()
@@ -307,6 +393,76 @@ class RealRepositoryCorpusTests(unittest.TestCase):
             },
         )
         self.assertEqual(removed, sorted(hostile))
+
+    def test_subprocess_closes_network_fds_bounds_output_and_cleans_process_tree(self) -> None:
+        environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+        left, right = socket.socketpair()
+        try:
+            right.set_inheritable(True)
+            completed = corpus.run_bounded(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os,sys\n"
+                    "try: os.fstat(int(sys.argv[1]))\n"
+                    "except OSError: print('closed')\n"
+                    "else: print('inherited')",
+                    str(right.fileno()),
+                ),
+                cwd=self.root,
+                environment=environment,
+                timeout_seconds=5.0,
+                stream_limit_bytes=1024,
+            )
+        finally:
+            left.close()
+            right.close()
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout, b"closed\n")
+
+        with self.assertRaises(corpus.HarnessRefusal) as output_bound:
+            corpus.run_bounded(
+                (sys.executable, "-c", "import os; os.write(1, b'x' * 4096)"),
+                cwd=self.root,
+                environment=environment,
+                timeout_seconds=5.0,
+                stream_limit_bytes=128,
+            )
+        self.assertEqual(output_bound.exception.code, "stream_limit_exceeded")
+
+        tree = corpus.run_bounded(
+            (
+                sys.executable,
+                "-c",
+                "import subprocess,sys\n"
+                "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])\n"
+                "print(child.pid, flush=True)",
+            ),
+            cwd=self.root,
+            environment=environment,
+            timeout_seconds=5.0,
+            stream_limit_bytes=1024,
+        )
+        descendant = int(tree.stdout)
+        deadline = time.monotonic() + 2.0
+        while True:
+            try:
+                os.kill(descendant, 0)
+            except ProcessLookupError:
+                break
+            if time.monotonic() >= deadline:
+                self.fail(f"descendant {descendant} survived process-group cleanup")
+            time.sleep(0.01)
+
+        with self.assertRaises(corpus.HarnessRefusal) as timeout:
+            corpus.run_bounded(
+                (sys.executable, "-c", "import time; time.sleep(60)"),
+                cwd=self.root,
+                environment=environment,
+                timeout_seconds=0.05,
+                stream_limit_bytes=1024,
+            )
+        self.assertEqual(timeout.exception.code, "command_timeout")
 
     def test_non_pass_report_is_typed_and_non_authoritative(self) -> None:
         binary = self.root / "again"
