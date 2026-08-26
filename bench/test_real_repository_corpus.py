@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("real_repository_corpus.py")
@@ -81,10 +82,30 @@ class RealRepositoryCorpusTests(unittest.TestCase):
         self.assertEqual([item.path for item in snapshot.selected], ["src/a.rs", "src/m.rs"])
         commands = corpus.build_command_corpus(snapshot.selected)
         self.assertEqual(len(commands), 10)
-        self.assertEqual(commands[0].argv, ("cat", "src/a.rs"))
+        self.assertEqual(commands[0].argv, ("cat", "--", "src/a.rs"))
         self.assertEqual(commands[3].command_id, "file0-wc-bytes")
-        self.assertEqual(commands[-1].argv, ("wc", "-c", "src/m.rs"))
+        self.assertEqual(commands[-1].argv, ("wc", "-c", "--", "src/m.rs"))
         self.assertEqual(commands, corpus.build_command_corpus(snapshot.selected))
+
+    def test_option_like_inputs_are_delimited_and_execute_as_files(self) -> None:
+        fixture = self.repository()
+        fixture.write("-a.rs", b"alpha\n")
+        fixture.write("-b.rs", b"beta\n")
+        fixture.commit()
+        snapshot = corpus.inspect_repository(fixture.root, "rust")
+        workspace = self.root / "workspace"
+        corpus.copy_selected_files(snapshot, workspace)
+        environment = {"LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+        for command in corpus.build_command_corpus(snapshot.selected):
+            self.assertIn("--", command.argv)
+            completed = corpus.run_bounded(
+                command.argv,
+                cwd=workspace,
+                environment=environment,
+                timeout_seconds=5.0,
+                stream_limit_bytes=1024 * 1024,
+            )
+            self.assertEqual(completed.returncode, 0, command.command_id)
 
     def test_repository_count_and_byte_bounds_fail_closed(self) -> None:
         fixture = self.repository()
@@ -125,6 +146,26 @@ class RealRepositoryCorpusTests(unittest.TestCase):
         self.assertNotEqual(dirty.dirty_status_sha256, clean.dirty_status_sha256)
         self.assertEqual(dirty.tracked_manifest_sha256, manifest_before)
         self.assertEqual(second.read_bytes(), b"print('b')\n")
+
+    def test_git_inspection_ignores_inherited_repository_overrides(self) -> None:
+        requested = self.repository("requested")
+        requested.write("a.py", b"print('requested a')\n")
+        requested.write("b.py", b"print('requested b')\n")
+        requested_sha = requested.commit()
+        other = self.repository("other")
+        other.write("a.py", b"print('other a')\n")
+        other.write("b.py", b"print('other b')\n")
+        other.commit()
+
+        hostile = {
+            "GIT_DIR": str(other.root / ".git"),
+            "GIT_INDEX_FILE": str(other.root / ".git" / "index"),
+            "GIT_WORK_TREE": str(other.root),
+        }
+        with mock.patch.dict(os.environ, hostile, clear=False):
+            snapshot = corpus.inspect_repository(requested.root, "python")
+        self.assertEqual(snapshot.git_sha, requested_sha)
+        self.assertEqual([item.path for item in snapshot.selected], ["a.py", "b.py"])
 
     def test_selected_symlink_special_and_sparse_inputs_are_rejected(self) -> None:
         symlink_repo = self.repository("symlink")
@@ -220,6 +261,52 @@ class RealRepositoryCorpusTests(unittest.TestCase):
         with self.assertRaises(corpus.HarnessRefusal) as existing:
             corpus.write_json_exclusive(output, right)
         self.assertEqual(existing.exception.code, "output_exists")
+
+    def test_output_path_cannot_mutate_a_source_repository(self) -> None:
+        fixture = self.repository()
+        fixture.write("a.rs", b"a\n")
+        fixture.write("b.rs", b"b\n")
+        fixture.commit()
+        direct = fixture.root / "evidence.json"
+        nested = fixture.root / "new" / "evidence.json"
+        for output in (direct, nested):
+            with self.assertRaises(corpus.HarnessRefusal) as refused:
+                corpus.require_new_output_path(output, [fixture.root])
+            self.assertEqual(refused.exception.code, "output_inside_source")
+            self.assertFalse(output.exists())
+        outside = self.root / "evidence.json"
+        self.assertEqual(
+            corpus.require_new_output_path(outside, [fixture.root]), outside
+        )
+
+    def test_repository_roots_must_be_distinct(self) -> None:
+        fixture = self.repository()
+        with self.assertRaises(corpus.HarnessRefusal) as duplicate:
+            corpus.require_distinct_repository_roots([fixture.root, fixture.root])
+        self.assertEqual(duplicate.exception.code, "duplicate_repository_root")
+
+    def test_command_environment_is_closed_and_records_removed_inputs(self) -> None:
+        state = self.root / "state"
+        home = self.root / "home"
+        hostile = {
+            "AGAIN_FULL": "1",
+            "GIT_DIR": "/tmp/foreign.git",
+            "GREP_OPTIONS": "-f /tmp/patterns",
+            "RIPGREP_CONFIG_PATH": "/tmp/ripgreprc",
+        }
+        with mock.patch.dict(os.environ, hostile, clear=True):
+            environment, removed = corpus.sanitized_environment(state, home)
+        self.assertEqual(
+            environment,
+            {
+                "AGAIN_HOME": str(state),
+                "HOME": str(home),
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/bin:/bin",
+            },
+        )
+        self.assertEqual(removed, sorted(hostile))
 
     def test_non_pass_report_is_typed_and_non_authoritative(self) -> None:
         binary = self.root / "again"

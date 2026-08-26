@@ -45,21 +45,6 @@ LANGUAGE_ARGUMENTS: tuple[tuple[str, str], ...] = (
     ("go", "--go-repo"),
     ("typescript", "--typescript-repo"),
 )
-DENIED_ENVIRONMENT_NAMES = {
-    "ASAN_OPTIONS",
-    "GCONV_PATH",
-    "LOCPATH",
-    "LSAN_OPTIONS",
-    "MSAN_OPTIONS",
-    "NLSPATH",
-    "PATH_LOCALE",
-    "TERMCAP",
-    "TERMINFO",
-    "TERMINFO_DIRS",
-    "TSAN_OPTIONS",
-    "TZDIR",
-    "UBSAN_OPTIONS",
-}
 HEX_OBJECT_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
@@ -204,13 +189,16 @@ def run_bounded(
 
 
 def _git_environment() -> dict[str, str]:
-    environment = dict(os.environ)
-    environment["GIT_CONFIG_GLOBAL"] = os.devnull
-    environment["GIT_CONFIG_NOSYSTEM"] = "1"
-    environment["GIT_CONFIG_SYSTEM"] = os.devnull
-    environment["GIT_OPTIONAL_LOCKS"] = "0"
-    environment["LC_ALL"] = "C"
-    return environment
+    return {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
 
 
 def run_git(
@@ -532,40 +520,29 @@ def build_command_corpus(selected: Sequence[SelectedFile]) -> tuple[CommandSpec,
         raise ValueError("the v1 corpus requires exactly two selected inputs")
     first, second = (item.path for item in selected)
     return (
-        CommandSpec("file0-cat", ("cat", first)),
-        CommandSpec("file0-head-lines", ("head", "-n", "20", first)),
-        CommandSpec("file0-tail-lines", ("tail", "-n", "20", first)),
-        CommandSpec("file0-wc-bytes", ("wc", "-c", first)),
-        CommandSpec("file0-wc-lines", ("wc", "-l", first)),
-        CommandSpec("file0-grep-lines", ("grep", "-n", "", first)),
-        CommandSpec("file1-cat", ("cat", second)),
-        CommandSpec("file1-head-bytes", ("head", "-c", "512", second)),
-        CommandSpec("file1-tail-bytes", ("tail", "-c", "512", second)),
-        CommandSpec("file1-wc-bytes", ("wc", "-c", second)),
+        CommandSpec("file0-cat", ("cat", "--", first)),
+        CommandSpec("file0-head-lines", ("head", "-n", "20", "--", first)),
+        CommandSpec("file0-tail-lines", ("tail", "-n", "20", "--", first)),
+        CommandSpec("file0-wc-bytes", ("wc", "-c", "--", first)),
+        CommandSpec("file0-wc-lines", ("wc", "-l", "--", first)),
+        CommandSpec("file0-grep-lines", ("grep", "-n", "--", "", first)),
+        CommandSpec("file1-cat", ("cat", "--", second)),
+        CommandSpec("file1-head-bytes", ("head", "-c", "512", "--", second)),
+        CommandSpec("file1-tail-bytes", ("tail", "-c", "512", "--", second)),
+        CommandSpec("file1-wc-bytes", ("wc", "-c", "--", second)),
     )
 
 
 def sanitized_environment(state: pathlib.Path, home: pathlib.Path) -> tuple[dict[str, str], list[str]]:
-    environment = dict(os.environ)
-    removed: list[str] = []
-    for name in list(environment):
-        if (
-            name.startswith(("DYLD_", "LD_", "Malloc", "MALLOC_"))
-            or name in DENIED_ENVIRONMENT_NAMES
-        ):
-            removed.append(name)
-            environment.pop(name)
-    environment.update(
-        {
-            "AGAIN_HOME": str(state),
-            "HOME": str(home),
-            "LANG": "C",
-            "LC_ALL": "C",
-            "PATH": "/usr/bin:/bin",
-        }
-    )
-    environment.pop("AGAIN_FULL", None)
-    return environment, sorted(removed)
+    removed = sorted(os.environ)
+    environment = {
+        "AGAIN_HOME": str(state),
+        "HOME": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    return environment, removed
 
 
 def stream_record(completed: Completed) -> dict[str, Any]:
@@ -958,6 +935,48 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def require_distinct_repository_roots(roots: Sequence[pathlib.Path]) -> None:
+    if len(set(roots)) != len(roots):
+        raise HarnessRefusal(
+            "duplicate_repository_root",
+            "each language must use a distinct real repository root",
+        )
+
+
+def require_new_output_path(
+    path: pathlib.Path, source_roots: Sequence[pathlib.Path]
+) -> pathlib.Path:
+    if not path.is_absolute():
+        raise HarnessRefusal("path_not_absolute", "--json-out must be an absolute path")
+    try:
+        resolved = path.resolve(strict=False)
+    except (OSError, RuntimeError) as error:
+        raise HarnessRefusal(
+            "output_path_unavailable", f"--json-out cannot be resolved: {error}"
+        ) from error
+    if resolved != path:
+        raise HarnessRefusal(
+            "path_not_canonical", "--json-out must be canonical and symlink-free"
+        )
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise HarnessRefusal(
+            "output_path_unavailable", f"--json-out is unavailable: {error}"
+        ) from error
+    else:
+        raise HarnessRefusal("output_exists", f"refusing to overwrite {path}")
+    for root in source_roots:
+        if resolved == root or root in resolved.parents:
+            raise HarnessRefusal(
+                "output_inside_source",
+                f"--json-out must not write inside source repository {root}",
+            )
+    return resolved
+
+
 def _require_absolute_file(path: pathlib.Path, label: str, *, executable: bool) -> pathlib.Path:
     if not path.is_absolute():
         raise HarnessRefusal("path_not_absolute", f"{label} must be an absolute path")
@@ -976,19 +995,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     arguments = parse_args(argv)
     binary = _require_absolute_file(arguments.binary, "--binary", executable=True)
     output = arguments.json_out
-    if output is not None:
-        if not output.is_absolute():
-            raise SystemExit("--json-out must be absolute")
-        if output.exists():
-            raise SystemExit(f"refusing to overwrite {output}")
 
     snapshots: list[RepositorySnapshot] = []
     for language, argument in LANGUAGE_ARGUMENTS:
         raw_root = getattr(arguments, argument.removeprefix("--").replace("-", "_"))
         root = require_absolute_directory(raw_root, argument)
         snapshots.append(inspect_repository(root, language))
+    source_roots = [snapshot.root for snapshot in snapshots]
+    require_distinct_repository_roots(source_roots)
+    if output is not None:
+        output = require_new_output_path(output, source_roots)
 
+    harness = pathlib.Path(__file__).resolve()
     binary_before = (sha256_file(binary), _stat_fingerprint(binary.stat()))
+    harness_before = (sha256_file(harness), _stat_fingerprint(harness.stat()))
     all_removed: set[str] = set()
     reports: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="again-real-repository-corpus-") as temporary:
@@ -1055,6 +1075,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     binary_after = (sha256_file(binary), _stat_fingerprint(binary.stat()))
     if binary_after != binary_before:
         raise HarnessRefusal("binary_changed", "Again binary changed during the corpus")
+    harness_after = (sha256_file(harness), _stat_fingerprint(harness.stat()))
+    if harness_after != harness_before:
+        raise HarnessRefusal("harness_changed", "harness changed during the corpus")
     report = {
         "schema": SCHEMA,
         "harness_version": HARNESS_VERSION,
@@ -1065,7 +1088,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "repositories": 4,
             "commands_per_repository": 10,
             "native_invocations": 44,
-            "again_invocations": 84,
+            "again_run_invocations": 84,
+            "again_support_invocations": 89,
+            "again_total_process_invocations": 173,
             "mutation_invalidations": 4,
             "claim": "explicit narrow read-only product path over copied tracked real-repository inputs",
         },
@@ -1076,17 +1101,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "every_cold_run_executed": True,
             "every_warm_run_replayed_full": True,
             "every_mutation_forced_execution": True,
-            "source_repositories_unchanged_during_copy": True,
+            "tracked_source_state_unchanged_during_copy": True,
         },
         "repositories": reports,
         "provenance": {
             "binary": str(binary),
             "binary_sha256": binary_before[0],
-            "harness_sha256": sha256_file(pathlib.Path(__file__).resolve()),
+            "harness_sha256": harness_before[0],
             "platform": host_record(),
             "unmodeled_inputs_removed": sorted(all_removed),
             "repositories": [
-                snapshot_record(snapshot, source_copy_verification="verified_unchanged")
+                snapshot_record(
+                    snapshot,
+                    source_copy_verification="tracked_state_verified_unchanged",
+                )
                 for snapshot in snapshots
             ],
         },
