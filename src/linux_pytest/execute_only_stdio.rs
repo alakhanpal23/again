@@ -3,6 +3,15 @@
 //! This module owns only live descriptors, bounded stream capture, and
 //! presentation. Its values cannot grant execution, candidate, or reuse
 //! authority, and no code here executes a workload.
+//!
+//! The synchronous sink loop remains private test scaffolding: an arbitrary
+//! Rust callback cannot be proven nonblocking, so no sibling can compose it
+//! while the drain owns kernel cleanup. Likewise, child descriptor placement
+//! requires a sealed authorization implemented only for a test token here.
+//! The eventual isolation connector must supply its concrete child-only token
+//! by an implementation in this module, and a separate reviewed nonblocking
+//! presenter must replace the private sink loop, before those paths become
+//! production callable.
 
 #![allow(
     dead_code,
@@ -16,10 +25,15 @@
 
 use std::fmt;
 use std::os::fd::RawFd;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 const STREAM_CAPTURE_LIMIT_V1: usize = super::LINUX_PYTEST_V1_MAX_STREAM_BYTES as usize;
 const DRAIN_BUFFER_BYTES_V1: usize = 64 * 1024;
 const MAX_READS_PER_STREAM_TURN_V1: usize = 16;
+const DRAIN_POLL_SLICE_V1: Duration = Duration::from_millis(25);
+const DRAIN_DEADLINE_V1: Duration = Duration::from_secs(15 * 60);
 const STREAM_HASH_DOMAIN_V1: &str = "again linux pytest foreground stream v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +76,7 @@ enum StdioOperationV1 {
     CloseRange,
     Poll,
     Read(ProfileStreamV1),
+    Control,
     Protocol,
 }
 
@@ -71,6 +86,8 @@ enum StdioFailureReasonV1 {
     Syscall,
     DescriptorContract,
     DrainProtocol,
+    DrainCancelled,
+    DrainDeadline,
 }
 
 #[derive(Eq, PartialEq)]
@@ -118,12 +135,32 @@ impl ProfileStdioFailureV1 {
         }
     }
 
+    const fn cancelled() -> Self {
+        Self {
+            reason: StdioFailureReasonV1::DrainCancelled,
+            first_operation: StdioOperationV1::Control,
+            errno: None,
+            cleanup_complete: true,
+        }
+    }
+
+    const fn deadline() -> Self {
+        Self {
+            reason: StdioFailureReasonV1::DrainDeadline,
+            first_operation: StdioOperationV1::Control,
+            errno: Some(libc::ETIMEDOUT),
+            cleanup_complete: true,
+        }
+    }
+
     pub(super) const fn reason(&self) -> &'static str {
         match self.reason {
             StdioFailureReasonV1::Unsupported => "unsupported_platform",
             StdioFailureReasonV1::Syscall => "stdio_syscall_failed",
             StdioFailureReasonV1::DescriptorContract => "descriptor_contract_mismatch",
             StdioFailureReasonV1::DrainProtocol => "drain_protocol_mismatch",
+            StdioFailureReasonV1::DrainCancelled => "stdio_drain_cancelled",
+            StdioFailureReasonV1::DrainDeadline => "stdio_drain_deadline_exceeded",
         }
     }
 
@@ -152,6 +189,7 @@ impl fmt::Debug for ProfileStdioFailureV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CallErrorV1 {
     Interrupted,
+    TimedOut,
     WouldBlock,
     Errno(i32),
 }
@@ -202,6 +240,7 @@ trait ProfileStdioSyscallsV1 {
         &mut self,
         stdout: Option<RawFd>,
         stderr: Option<RawFd>,
+        timeout_millis: i32,
     ) -> Result<PollInterestResultV1, CallErrorV1>;
     fn read(
         &mut self,
@@ -210,6 +249,14 @@ trait ProfileStdioSyscallsV1 {
         buffer: &mut [u8],
     ) -> Result<ReadResultV1, CallErrorV1>;
 }
+
+/// Sealed child-only placement brand.
+///
+/// There is deliberately no production implementation in this checkpoint.
+/// Once the isolation connector's opaque child-only token is present, this
+/// module can implement the brand for that concrete type without exposing a
+/// synthetic constructor or raw descriptor.
+trait BlockedChildStdioPlacementAuthorizationV1 {}
 
 struct TrackedFdV1 {
     raw: RawFd,
@@ -506,11 +553,16 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
         Ok(ParentStdioDrainV1 {
             syscalls: Some(syscalls),
             descriptors: [Some(stdout), Some(stderr)],
+            control: Arc::new(ProfileStdioDrainControlStateV1 {
+                cancelled: AtomicBool::new(false),
+            }),
+            cancellation_issued: false,
         })
     }
 
-    pub(super) fn prepare_blocked_child(
+    pub(super) fn prepare_blocked_child<A: BlockedChildStdioPlacementAuthorizationV1>(
         mut self,
+        _authorization: A,
     ) -> Result<BlockedChildStdioHandoffV1<S>, ProfileStdioFailureV1> {
         let placements = [
             (
@@ -649,7 +701,7 @@ impl<S: ProfileStdioSyscallsV1> Drop for BlockedChildStdioHandoffV1<S> {
     }
 }
 
-pub(super) trait ProfileStreamSinkV1 {
+trait ProfileStreamSinkV1 {
     /// Returns the exact prefix length delivered by this call. An error means
     /// no bytes from that individual call were delivered.
     fn write_stream(&mut self, stream: ProfileStreamV1, bytes: &[u8]) -> Result<usize, ()>;
@@ -816,9 +868,40 @@ impl fmt::Debug for ProfileStdioDrainReportV1 {
     }
 }
 
+struct ProfileStdioDrainControlStateV1 {
+    cancelled: AtomicBool,
+}
+
+/// One opaque cancellation signal for the foreground drain.
+///
+/// Cancellation only asks the drain owner to close its two read endpoints and
+/// return a typed failure. It exposes no descriptor, signal, process, command,
+/// execution, candidate, or reuse authority.
+pub(super) struct ProfileStdioDrainCancellationV1 {
+    state: Arc<ProfileStdioDrainControlStateV1>,
+}
+
+impl fmt::Debug for ProfileStdioDrainCancellationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProfileStdioDrainCancellationV1")
+            .field("control", &"<opaque-cancel-only>")
+            .field("authority", &"<none>")
+            .finish()
+    }
+}
+
+impl ProfileStdioDrainCancellationV1 {
+    pub(super) fn cancel(self) {
+        self.state.cancelled.store(true, Ordering::Release);
+    }
+}
+
 pub(super) struct ParentStdioDrainV1<S: ProfileStdioSyscallsV1> {
     syscalls: Option<S>,
     descriptors: [Option<TrackedFdV1>; 2],
+    control: Arc<ProfileStdioDrainControlStateV1>,
+    cancellation_issued: bool,
 }
 
 impl<S: ProfileStdioSyscallsV1> fmt::Debug for ParentStdioDrainV1<S> {
@@ -826,6 +909,7 @@ impl<S: ProfileStdioSyscallsV1> fmt::Debug for ParentStdioDrainV1<S> {
         formatter
             .debug_struct("ParentStdioDrainV1")
             .field("descriptors", &"<parent-read-fds>")
+            .field("control", &"<opaque-bounded-control>")
             .finish()
     }
 }
@@ -837,9 +921,32 @@ impl<S: ProfileStdioSyscallsV1> Drop for ParentStdioDrainV1<S> {
 }
 
 impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
-    pub(super) fn drain<Sink: ProfileStreamSinkV1>(
+    /// Issue the drain's only cancellation signal before moving the drain to
+    /// its foreground owner.
+    pub(super) fn take_cancellation(&mut self) -> Option<ProfileStdioDrainCancellationV1> {
+        if self.cancellation_issued {
+            return None;
+        }
+        self.cancellation_issued = true;
+        Some(ProfileStdioDrainCancellationV1 {
+            state: Arc::clone(&self.control),
+        })
+    }
+
+    fn drain<Sink: ProfileStreamSinkV1>(
         mut self,
         sink: &mut Sink,
+    ) -> Result<ProfileStdioDrainReportV1, ProfileStdioFailureV1> {
+        let deadline = Instant::now()
+            .checked_add(DRAIN_DEADLINE_V1)
+            .ok_or_else(ProfileStdioFailureV1::deadline)?;
+        self.drain_until(sink, deadline)
+    }
+
+    fn drain_until<Sink: ProfileStreamSinkV1>(
+        &mut self,
+        sink: &mut Sink,
+        deadline: Instant,
     ) -> Result<ProfileStdioDrainReportV1, ProfileStdioFailureV1> {
         let mut stdout = StreamAccumulatorV1::new(ProfileStreamV1::Stdout);
         let mut stderr = StreamAccumulatorV1::new(ProfileStreamV1::Stderr);
@@ -848,11 +955,21 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         let mut cleanup_complete = true;
         let mut buffer = [0u8; DRAIN_BUFFER_BYTES_V1];
         while !stdout.eof || !stderr.eof {
+            if let Some(new) = self.control_failure(deadline) {
+                let failure =
+                    self.finalize_failure(new, &mut first_close_failure, cleanup_complete);
+                return Err(failure);
+            }
             let stdout_fd = self.raw_optional(FdRoleV1::ParentStdout);
             let stderr_fd = self.raw_optional(FdRoleV1::ParentStderr);
-            let readiness = match self.syscalls_mut().poll(stdout_fd, stderr_fd) {
+            let timeout_millis = poll_timeout_millis_v1(deadline);
+            let readiness = match self
+                .syscalls_mut()
+                .poll(stdout_fd, stderr_fd, timeout_millis)
+            {
                 Ok(readiness) => readiness,
                 Err(CallErrorV1::Interrupted) => continue,
+                Err(CallErrorV1::TimedOut) => continue,
                 Err(CallErrorV1::Errno(errno)) => {
                     let failure = self.finalize_failure(
                         ProfileStdioFailureV1::syscall(StdioOperationV1::Poll, errno),
@@ -888,6 +1005,7 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                     &mut first_close_failure,
                     &mut cleanup_complete,
                     &mut buffer,
+                    deadline,
                 )?;
             }
             if !stderr.eof && readiness.stderr.actionable() {
@@ -899,6 +1017,7 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                     &mut first_close_failure,
                     &mut cleanup_complete,
                     &mut buffer,
+                    deadline,
                 )?;
             }
             if !acted {
@@ -929,6 +1048,7 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         first_close_failure: &mut Option<ProfileStdioFailureV1>,
         cleanup_complete: &mut bool,
         buffer: &mut [u8],
+        deadline: Instant,
     ) -> Result<(), ProfileStdioFailureV1> {
         let role = match accumulator.stream {
             ProfileStreamV1::Stdout => FdRoleV1::ParentStdout,
@@ -944,6 +1064,10 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         };
         let mut successful_reads = 0usize;
         loop {
+            if let Some(new) = self.control_failure(deadline) {
+                let failure = self.finalize_failure(new, first_close_failure, *cleanup_complete);
+                return Err(failure);
+            }
             match self.syscalls_mut().read(raw, accumulator.stream, buffer) {
                 Ok(ReadResultV1::Bytes(length)) if length > 0 && length <= buffer.len() => {
                     let bytes = &buffer[..length];
@@ -955,6 +1079,14 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                     if presentation_failure.is_none() {
                         let mut remaining = bytes;
                         while !remaining.is_empty() {
+                            if let Some(new) = self.control_failure(deadline) {
+                                let failure = self.finalize_failure(
+                                    new,
+                                    first_close_failure,
+                                    *cleanup_complete,
+                                );
+                                return Err(failure);
+                            }
                             match sink.write_stream(accumulator.stream, remaining) {
                                 Ok(delivered) if delivered > 0 && delivered <= remaining.len() => {
                                     if let Err(new) = accumulator.delivered(delivered) {
@@ -992,6 +1124,14 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
                 }
                 Ok(ReadResultV1::WouldBlock) | Err(CallErrorV1::WouldBlock) => return Ok(()),
                 Err(CallErrorV1::Interrupted) => continue,
+                Err(CallErrorV1::TimedOut) => {
+                    let failure = self.finalize_failure(
+                        ProfileStdioFailureV1::protocol(),
+                        first_close_failure,
+                        *cleanup_complete,
+                    );
+                    return Err(failure);
+                }
                 Ok(ReadResultV1::Eof) => {
                     accumulator.eof = true;
                     let descriptor = match self.take(role) {
@@ -1038,6 +1178,16 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
             .with_cleanup(cleanup_complete & cleanup)
     }
 
+    fn control_failure(&self, deadline: Instant) -> Option<ProfileStdioFailureV1> {
+        if self.control.cancelled.load(Ordering::Acquire) {
+            Some(ProfileStdioFailureV1::cancelled())
+        } else if Instant::now() >= deadline {
+            Some(ProfileStdioFailureV1::deadline())
+        } else {
+            None
+        }
+    }
+
     fn syscalls_mut(&mut self) -> &mut S {
         self.syscalls
             .as_mut()
@@ -1073,6 +1223,12 @@ impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
         }
         complete
     }
+}
+
+fn poll_timeout_millis_v1(deadline: Instant) -> i32 {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let bounded = remaining.min(DRAIN_POLL_SLICE_V1);
+    i32::try_from(bounded.as_millis().max(1)).unwrap_or(1)
 }
 
 #[cfg(all(
@@ -1145,6 +1301,7 @@ impl ProfileStdioSyscallsV1 for LinuxProfileStdioSyscallsV1 {
         &mut self,
         stdout: Option<RawFd>,
         stderr: Option<RawFd>,
+        timeout_millis: i32,
     ) -> Result<PollInterestResultV1, CallErrorV1> {
         let mut descriptors = Vec::with_capacity(2);
         let mut streams = Vec::with_capacity(2);
@@ -1161,7 +1318,13 @@ impl ProfileStdioSyscallsV1 for LinuxProfileStdioSyscallsV1 {
                 streams.push(stream);
             }
         }
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                timeout_millis,
+            )
+        };
         if result < 0 {
             let errno = last_errno();
             return Err(if errno == libc::EINTR {
@@ -1171,7 +1334,7 @@ impl ProfileStdioSyscallsV1 for LinuxProfileStdioSyscallsV1 {
             });
         }
         if result == 0 {
-            return Err(CallErrorV1::Errno(libc::ETIMEDOUT));
+            return Err(CallErrorV1::TimedOut);
         }
         let mut readiness = PollInterestResultV1::default();
         for (descriptor, stream) in descriptors.into_iter().zip(streams) {
@@ -1258,6 +1421,24 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
     use std::rc::Rc;
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    use std::{
+        fs::File,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+    };
+
+    struct TestBlockedChildStdioPlacementAuthorizationV1;
+
+    impl BlockedChildStdioPlacementAuthorizationV1 for TestBlockedChildStdioPlacementAuthorizationV1 {}
+
+    const fn test_child_placement_authorization() -> TestBlockedChildStdioPlacementAuthorizationV1 {
+        TestBlockedChildStdioPlacementAuthorizationV1
+    }
 
     #[derive(Clone, Debug)]
     struct FakeDescriptorV1 {
@@ -1285,6 +1466,7 @@ mod tests {
         next_inode: u64,
         open: BTreeMap<RawFd, FakeDescriptorV1>,
         polls: VecDeque<Result<PollInterestResultV1, CallErrorV1>>,
+        cancel_on_poll: Option<Arc<ProfileStdioDrainControlStateV1>>,
         stdout_reads: VecDeque<FakeReadV1>,
         stderr_reads: VecDeque<FakeReadV1>,
     }
@@ -1434,11 +1616,16 @@ mod tests {
             &mut self,
             _stdout: Option<RawFd>,
             _stderr: Option<RawFd>,
+            timeout_millis: i32,
         ) -> Result<PollInterestResultV1, CallErrorV1> {
             let mut state = self.0.borrow_mut();
+            assert!((1..=DRAIN_POLL_SLICE_V1.as_millis() as i32).contains(&timeout_millis));
             state
                 .record(StdioOperationV1::Poll)
                 .map_err(CallErrorV1::Errno)?;
+            if let Some(control) = state.cancel_on_poll.take() {
+                control.cancelled.store(true, Ordering::Release);
+            }
             state
                 .polls
                 .pop_front()
@@ -1551,6 +1738,10 @@ mod tests {
                         role: FdRoleV1::ParentStderr,
                     }),
                 ],
+                control: Arc::new(ProfileStdioDrainControlStateV1 {
+                    cancelled: AtomicBool::new(false),
+                }),
+                cancellation_issued: false,
             },
             state,
         )
@@ -1623,6 +1814,58 @@ mod tests {
     }
 
     #[test]
+    fn bounded_poll_slice_observes_supervisor_cancellation_and_cleans() {
+        let (mut parent, state) = fake_parent();
+        let cancellation = parent
+            .take_cancellation()
+            .expect("one opaque cancellation signal");
+        assert!(parent.take_cancellation().is_none());
+        state.borrow_mut().cancel_on_poll = Some(Arc::clone(&cancellation.state));
+        state
+            .borrow_mut()
+            .polls
+            .push_back(Err(CallErrorV1::TimedOut));
+        let error = parent
+            .drain(&mut CollectSinkV1::default())
+            .expect_err("cancellation after a bounded poll slice");
+        assert_eq!(error.reason(), "stdio_drain_cancelled");
+        assert_eq!(error.first_operation, StdioOperationV1::Control);
+        assert_eq!(error.errno, None);
+        assert!(error.cleanup_complete());
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
+    fn fixed_deadline_failure_is_typed_and_cleans_without_polling() {
+        let (mut parent, state) = fake_parent();
+        let error = parent
+            .drain_until(&mut CollectSinkV1::default(), Instant::now())
+            .expect_err("expired deadline");
+        assert_eq!(error.reason(), "stdio_drain_deadline_exceeded");
+        assert_eq!(error.first_operation, StdioOperationV1::Control);
+        assert_eq!(error.errno, Some(libc::ETIMEDOUT));
+        assert!(error.cleanup_complete());
+        assert!(!state.borrow().calls.contains(&StdioOperationV1::Poll));
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
+    fn cancellation_handle_can_cancel_before_the_first_poll() {
+        let (mut parent, state) = fake_parent();
+        parent
+            .take_cancellation()
+            .expect("one opaque cancellation signal")
+            .cancel();
+        let error = parent
+            .drain(&mut CollectSinkV1::default())
+            .expect_err("pre-poll cancellation");
+        assert_eq!(error.reason(), "stdio_drain_cancelled");
+        assert!(error.cleanup_complete());
+        assert!(!state.borrow().calls.contains(&StdioOperationV1::Poll));
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
     fn bounded_read_turn_prevents_one_hot_stream_from_starving_the_other() {
         let (parent, state) = fake_parent();
         {
@@ -1681,6 +1924,87 @@ mod tests {
         };
         assert!(!report.capture_complete());
         assert!(report.requires_execute_only_classification());
+    }
+
+    #[test]
+    fn drain_streams_and_hashes_every_byte_after_capture_limit() {
+        let (parent, state) = fake_parent();
+        {
+            let mut state = state.borrow_mut();
+            for _ in 0..17 {
+                state.polls.push_back(Ok(ready(hung_up(), hung_up())));
+            }
+            for _ in 0..(STREAM_CAPTURE_LIMIT_V1 / DRAIN_BUFFER_BYTES_V1) {
+                state
+                    .stdout_reads
+                    .push_back(FakeReadV1::Data(vec![b'a'; DRAIN_BUFFER_BYTES_V1]));
+            }
+            state
+                .stdout_reads
+                .extend([FakeReadV1::Data(vec![b'!']), FakeReadV1::Eof]);
+            state.stderr_reads.push_back(FakeReadV1::Eof);
+        }
+        let mut sink = CollectSinkV1::default();
+        let report = parent.drain(&mut sink).expect("overflow drain reaches EOF");
+        assert_eq!(sink.stdout.len(), STREAM_CAPTURE_LIMIT_V1 + 1);
+        assert_eq!(sink.stdout[STREAM_CAPTURE_LIMIT_V1], b'!');
+        assert_eq!(report.stdout.captured.len(), STREAM_CAPTURE_LIMIT_V1);
+        assert_eq!(
+            report.stdout.drained_bytes,
+            STREAM_CAPTURE_LIMIT_V1 as u64 + 1
+        );
+        assert_eq!(report.stdout.delivered_bytes, report.stdout.drained_bytes);
+        let mut expected = blake3::Hasher::new_derive_key(STREAM_HASH_DOMAIN_V1);
+        expected.update(b"stdout");
+        for _ in 0..(STREAM_CAPTURE_LIMIT_V1 / DRAIN_BUFFER_BYTES_V1) {
+            expected.update(&[b'a'; DRAIN_BUFFER_BYTES_V1]);
+        }
+        expected.update(b"!");
+        assert_eq!(
+            report.stdout.streaming_hash,
+            *expected.finalize().as_bytes()
+        );
+        assert!(!report.capture_complete());
+        assert!(report.requires_execute_only_classification());
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
+    fn sink_failure_stops_delivery_but_continues_draining_both_streams() {
+        let (parent, state) = fake_parent();
+        {
+            let mut state = state.borrow_mut();
+            state.polls.push_back(Ok(ready(hung_up(), hung_up())));
+            state
+                .stdout_reads
+                .extend([FakeReadV1::Data(b"stdout".to_vec()), FakeReadV1::Eof]);
+            state
+                .stderr_reads
+                .extend([FakeReadV1::Data(b"stderr".to_vec()), FakeReadV1::Eof]);
+        }
+        let mut sink = CollectSinkV1 {
+            fail_on: Some(ProfileStreamV1::Stdout),
+            ..CollectSinkV1::default()
+        };
+        let report = parent
+            .drain(&mut sink)
+            .expect("presentation failure must not stop pipe draining");
+        assert_eq!(sink.call_order, [ProfileStreamV1::Stdout]);
+        assert!(sink.stdout.is_empty());
+        assert!(sink.stderr.is_empty());
+        assert_eq!(report.stdout.captured, b"stdout");
+        assert_eq!(report.stderr.captured, b"stderr");
+        assert_eq!(report.stdout.drained_bytes, 6);
+        assert_eq!(report.stderr.drained_bytes, 6);
+        assert_eq!(report.stdout.delivered_bytes, 0);
+        assert_eq!(report.stderr.delivered_bytes, 0);
+        assert!(report.capture_complete());
+        assert_eq!(
+            report.presentation_failure,
+            Some(PresentationFailureV1::Stdout)
+        );
+        assert!(report.requires_execute_only_classification());
+        assert!(state.borrow().open.is_empty());
     }
 
     #[test]
@@ -1852,7 +2176,9 @@ mod tests {
         let (syscalls, state) = FakeSyscallsV1::new();
         let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("construct");
         let start = state.borrow().calls.len();
-        let handoff = session.prepare_blocked_child().expect("prepare");
+        let handoff = session
+            .prepare_blocked_child(test_child_placement_authorization())
+            .expect("prepare");
         let baseline = state.borrow().calls[start..].to_vec();
         assert_eq!(
             state.borrow().open.keys().copied().collect::<Vec<_>>(),
@@ -1885,7 +2211,7 @@ mod tests {
             let start = state.borrow().calls.len();
             state.borrow_mut().fail_at = Some(start + offset + 1);
             let error = session
-                .prepare_blocked_child()
+                .prepare_blocked_child(test_child_placement_authorization())
                 .expect_err("injected child preparation call");
             assert_eq!(error.first_operation, expected, "call {}", offset + 1);
             assert!(
@@ -1915,13 +2241,33 @@ mod tests {
             .additional_failures
             .push(start + second_dup_offset + 2);
         let error = session
-            .prepare_blocked_child()
+            .prepare_blocked_child(test_child_placement_authorization())
             .expect_err("dup3 and cleanup failure");
         assert_eq!(
             error.first_operation,
             StdioOperationV1::Dup3(FdRoleV1::PlacedStdout)
         );
         assert!(!error.cleanup_complete());
+        assert!(state.borrow().open.is_empty());
+    }
+
+    #[test]
+    fn close_range_unavailable_is_typed_and_cleans_every_known_descriptor() {
+        let baseline = child_preparation_baseline();
+        let close_range_offset = baseline
+            .iter()
+            .position(|operation| *operation == StdioOperationV1::CloseRange)
+            .expect("close_range call");
+        let (syscalls, state) = FakeSyscallsV1::new();
+        let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("construct");
+        let start = state.borrow().calls.len();
+        state.borrow_mut().fail_at = Some(start + close_range_offset + 1);
+        let error = session
+            .prepare_blocked_child(test_child_placement_authorization())
+            .expect_err("close_range unavailable");
+        assert_eq!(error.first_operation, StdioOperationV1::CloseRange);
+        assert_eq!(error.errno, Some(libc::EIO));
+        assert!(error.cleanup_complete());
         assert!(state.borrow().open.is_empty());
     }
 
@@ -2000,8 +2346,7 @@ mod tests {
                 .push_back(Ok(ready(readable(), PollStreamResultV1::default())));
             state.stdout_reads.push_back(FakeReadV1::Errno(libc::EPIPE));
             let start = state.calls.len();
-            state.fail_at = Some(start + 2);
-            state.additional_failures.push(start + 3);
+            state.fail_at = Some(start + 3);
         }
         let error = parent
             .drain(&mut CollectSinkV1::default())
@@ -2010,7 +2355,7 @@ mod tests {
             error.first_operation,
             StdioOperationV1::Read(ProfileStreamV1::Stdout)
         );
-        assert_eq!(error.errno, Some(libc::EIO));
+        assert_eq!(error.errno, Some(libc::EPIPE));
         assert!(!error.cleanup_complete());
         assert!(state.borrow().open.is_empty());
     }
@@ -2092,6 +2437,8 @@ mod tests {
         assert_not_copy::<BlockedChildStdioHandoffV1<FakeSyscallsV1>>();
         assert_not_clone::<ParentStdioDrainV1<FakeSyscallsV1>>();
         assert_not_copy::<ParentStdioDrainV1<FakeSyscallsV1>>();
+        assert_not_clone::<ProfileStdioDrainCancellationV1>();
+        assert_not_copy::<ProfileStdioDrainCancellationV1>();
     }
 
     #[cfg(not(all(
@@ -2105,6 +2452,175 @@ mod tests {
         let error = open_profile_owned_stdio_v1().expect_err("non-Linux target is refused");
         assert_eq!(error.reason(), "unsupported_platform");
         assert!(error.cleanup_complete());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    fn live_child_descriptor_contract(high_descriptor: RawFd) -> bool {
+        let mut facts = [DescriptorFactsV1 {
+            device: 0,
+            inode: 0,
+            mode: 0,
+        }; 3];
+        for (index, fd) in [0, 1, 2].into_iter().enumerate() {
+            let mut value = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            if unsafe { libc::fstat(fd, value.as_mut_ptr()) } != 0 {
+                return false;
+            }
+            let value = unsafe { value.assume_init() };
+            facts[index] = DescriptorFactsV1 {
+                device: value.st_dev,
+                inode: value.st_ino,
+                mode: value.st_mode,
+            };
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status_flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let expected_access = if fd == libc::STDIN_FILENO {
+                libc::O_RDONLY
+            } else {
+                libc::O_WRONLY
+            };
+            if facts[index].mode & libc::S_IFMT as u32 != libc::S_IFIFO as u32
+                || fd_flags != 0
+                || status_flags < 0
+                || status_flags & libc::O_ACCMODE != expected_access
+                || status_flags & libc::O_NONBLOCK != 0
+            {
+                return false;
+            }
+        }
+        if facts[0] == facts[1] || facts[0] == facts[2] || facts[1] == facts[2] {
+            return false;
+        }
+        for fd in [3, high_descriptor] {
+            if unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1 || last_errno() != libc::EBADF {
+                return false;
+            }
+        }
+        let mut byte = 0_u8;
+        if unsafe { libc::read(libc::STDIN_FILENO, (&mut byte as *mut u8).cast(), 1) } != 0 {
+            return false;
+        }
+        live_child_write_all(libc::STDOUT_FILENO, b"live-stdout\n")
+            && live_child_write_all(libc::STDERR_FILENO, b"live-stderr\n")
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    fn live_child_write_all(fd: RawFd, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let result = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if result > 0 {
+                bytes = &bytes[result as usize..];
+            } else if result < 0 && last_errno() == libc::EINTR {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    fn expected_live_stream_hash(stream: ProfileStreamV1, bytes: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new_derive_key(STREAM_HASH_DOMAIN_V1);
+        hasher.update(match stream {
+            ProfileStreamV1::Stdout => b"stdout",
+            ProfileStreamV1::Stderr => b"stderr",
+        });
+        hasher.update(bytes);
+        *hasher.finalize().as_bytes()
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn linux_live_forked_child_places_exact_stdio_closes_range_and_parent_reaps() {
+        let session = open_profile_owned_stdio_v1().expect("live pipe construction");
+        let null = File::open("/dev/null").expect("open fixed descriptor seed");
+        let high_raw = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 127) };
+        assert!(high_raw >= 127, "seed one sparse inherited descriptor");
+        let high = unsafe { OwnedFd::from_raw_fd(high_raw) };
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork disposable stdio child");
+        if child == 0 {
+            let handoff = match session.prepare_blocked_child(test_child_placement_authorization())
+            {
+                Ok(handoff) => handoff,
+                Err(error) => {
+                    let status = match (error.first_operation, error.errno) {
+                        (StdioOperationV1::CloseRange, Some(libc::ENOSYS)) => 122,
+                        (StdioOperationV1::CloseRange, _) => 123,
+                        (StdioOperationV1::Dup3(_), _) => 124,
+                        _ => 120,
+                    };
+                    unsafe { libc::_exit(status) }
+                }
+            };
+            let valid = live_child_descriptor_contract(high_raw);
+            drop(handoff);
+            unsafe { libc::_exit(if valid { 0 } else { 121 }) };
+        }
+
+        drop(high);
+        drop(null);
+        let parent = session
+            .into_parent_drain()
+            .expect("parent ownership transition");
+        let mut sink = CollectSinkV1::default();
+        let drain = parent.drain(&mut sink);
+        let mut status = 0_i32;
+        let waited = loop {
+            let result = unsafe { libc::waitpid(child, &mut status, 0) };
+            if result < 0 && last_errno() == libc::EINTR {
+                continue;
+            }
+            break result;
+        };
+        assert_eq!(waited, child, "parent reaps the exact disposable child");
+        assert!(libc::WIFEXITED(status));
+        assert_eq!(libc::WEXITSTATUS(status), 0);
+        assert_eq!(
+            unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(last_errno(), libc::ECHILD);
+        let report = drain.expect("parent drains both live child streams to EOF");
+        assert_eq!(sink.stdout, b"live-stdout\n");
+        assert_eq!(sink.stderr, b"live-stderr\n");
+        assert_eq!(report.stdout.captured(), sink.stdout);
+        assert_eq!(report.stderr.captured(), sink.stderr);
+        assert_eq!(report.stdout.drained_bytes(), sink.stdout.len() as u64);
+        assert_eq!(report.stderr.drained_bytes(), sink.stderr.len() as u64);
+        assert_eq!(report.stdout.delivered_bytes(), sink.stdout.len() as u64);
+        assert_eq!(report.stderr.delivered_bytes(), sink.stderr.len() as u64);
+        assert_eq!(
+            report.stdout.streaming_hash(),
+            &expected_live_stream_hash(ProfileStreamV1::Stdout, &sink.stdout)
+        );
+        assert_eq!(
+            report.stderr.streaming_hash(),
+            &expected_live_stream_hash(ProfileStreamV1::Stderr, &sink.stderr)
+        );
+        assert!(report.capture_complete());
+        assert!(!report.requires_execute_only_classification());
     }
 
     #[cfg(all(
