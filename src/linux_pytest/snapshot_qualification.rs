@@ -4,10 +4,10 @@
 //! operation that can update access time, the exact source mount must report
 //! `ST_NOATIME`. The qualifier then exercises the ordinary (non-`O_NOATIME`)
 //! read surfaces used by capture: directory enumeration, regular-file bytes,
-//! a symlink target, xattr-list calls on pinned directory and symlink `O_PATH`
-//! descriptors, and one positive named-xattr list/get on a pinned regular-file
-//! `O_PATH` descriptor. It then proves that the representative objects' pinned
-//! identities remain unchanged. A mount flag alone is not enough, and an
+//! a symlink target, xattr-list calls on authenticated readable directory and
+//! regular-file descriptors, and the symlink `O_PATH` capability probe. It
+//! proves that every readable descriptor matches its pinned `O_PATH` identity
+//! before and after the operation. A mount flag alone is not enough, and an
 //! `O_NOATIME` open is not accepted as a substitute: the eventual traversal
 //! intentionally uses ordinary reads so that root-owned runtime files remain
 //! readable without `CAP_FOWNER`.
@@ -328,9 +328,20 @@ mod platform {
 
         fn exercise_symlink(&self, fd: BorrowedFd<'_>) -> io::Result<()>;
 
-        fn exercise_xattr_list(&self, probe: &PinnedProbeV1) -> io::Result<()>;
+        fn exercise_xattr_list(
+            &self,
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            probe: &PinnedProbeV1,
+        ) -> io::Result<ReadExerciseV1>;
 
-        fn exercise_regular_xattr(&self, fd: BorrowedFd<'_>, name: &CStr) -> io::Result<()>;
+        fn exercise_regular_xattr(
+            &self,
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            probe: &PinnedProbeV1,
+            xattr_name: &CStr,
+        ) -> io::Result<ReadExerciseV1>;
 
         fn reobserve_probe(
             &self,
@@ -445,31 +456,69 @@ mod platform {
             Ok(())
         }
 
-        fn exercise_xattr_list(&self, probe: &PinnedProbeV1) -> io::Result<()> {
+        fn exercise_xattr_list(
+            &self,
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            probe: &PinnedProbeV1,
+        ) -> io::Result<ReadExerciseV1> {
+            let readable = match probe.observation.mode & libc::S_IFMT {
+                libc::S_IFDIR => Some(openat2_owned(
+                    parent,
+                    name,
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )?),
+                libc::S_IFLNK => None,
+                _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            };
+            let fd = readable.as_ref().map_or(probe.fd.as_fd(), |fd| fd.as_fd());
+            let before = raw_node_observation(fd)?;
+            if before != probe.observation {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            }
             let mut buffer = [0u8; XATTR_BUFFER_BYTES];
-            bounded_xattr_list(probe.fd.as_raw_fd(), &mut buffer).map(|_| ())
+            bounded_xattr_list(fd.as_raw_fd(), &mut buffer)?;
+            let after = raw_node_observation(fd)?;
+            Ok(ReadExerciseV1 { before, after })
         }
 
-        fn exercise_regular_xattr(&self, fd: BorrowedFd<'_>, name: &CStr) -> io::Result<()> {
+        fn exercise_regular_xattr(
+            &self,
+            parent: BorrowedFd<'_>,
+            name: &CStr,
+            probe: &PinnedProbeV1,
+            xattr_name: &CStr,
+        ) -> io::Result<ReadExerciseV1> {
+            let fd = openat2_owned(
+                parent,
+                name,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let before = raw_node_observation(fd.as_fd())?;
+            if before != probe.observation {
+                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            }
             let mut buffer = [0u8; XATTR_BUFFER_BYTES];
             let listed = bounded_xattr_list(fd.as_raw_fd(), &mut buffer)?;
             if listed == 0 {
                 return Err(io::Error::from_raw_os_error(libc::ENODATA));
             }
-            if !xattr_list_contains(&buffer[..listed], name.to_bytes()) {
+            if !xattr_list_contains(&buffer[..listed], xattr_name.to_bytes()) {
                 return Err(io::Error::from_raw_os_error(libc::ENODATA));
             }
 
-            let value_bytes = raw_get_xattr(fd.as_raw_fd(), name, None)?;
+            let value_bytes = raw_get_xattr(fd.as_raw_fd(), xattr_name, None)?;
             if value_bytes > XATTR_BUFFER_BYTES {
                 return Err(io::Error::from_raw_os_error(libc::E2BIG));
             }
             let output_len = value_bytes.max(1);
-            let observed = raw_get_xattr(fd.as_raw_fd(), name, Some(&mut buffer[..output_len]))?;
+            let observed =
+                raw_get_xattr(fd.as_raw_fd(), xattr_name, Some(&mut buffer[..output_len]))?;
             if observed != value_bytes {
                 return Err(io::Error::from_raw_os_error(libc::ESTALE));
             }
-            Ok(())
+            let after = raw_node_observation(fd.as_fd())?;
+            Ok(ReadExerciseV1 { before, after })
         }
 
         fn reobserve_probe(
@@ -587,12 +636,24 @@ mod platform {
             directory_read.after,
             SourceViewQualificationStageV1::ReadDirectory,
         )?;
-        hooks.exercise_xattr_list(&directory).map_err(|error| {
-            io_failure(
-                SourceViewQualificationStageV1::ReadDirectoryXattrList,
-                error,
-            )
-        })?;
+        let directory_xattr = hooks
+            .exercise_xattr_list(trusted_parent, probes.directory, &directory)
+            .map_err(|error| {
+                io_failure(
+                    SourceViewQualificationStageV1::ReadDirectoryXattrList,
+                    error,
+                )
+            })?;
+        require_unchanged(
+            directory.observation,
+            directory_xattr.before,
+            SourceViewQualificationStageV1::ReadDirectoryXattrList,
+        )?;
+        require_unchanged(
+            directory.observation,
+            directory_xattr.after,
+            SourceViewQualificationStageV1::ReadDirectoryXattrList,
+        )?;
 
         let regular_read = hooks
             .exercise_regular(trusted_parent, probes.regular)
@@ -607,16 +668,38 @@ mod platform {
             regular_read.after,
             SourceViewQualificationStageV1::ReadRegular,
         )?;
-        hooks
-            .exercise_regular_xattr(regular.fd.as_fd(), probes.xattr)
+        let regular_xattr = hooks
+            .exercise_regular_xattr(trusted_parent, probes.regular, &regular, probes.xattr)
             .map_err(|error| io_failure(SourceViewQualificationStageV1::ReadRegularXattr, error))?;
+        require_unchanged(
+            regular.observation,
+            regular_xattr.before,
+            SourceViewQualificationStageV1::ReadRegularXattr,
+        )?;
+        require_unchanged(
+            regular.observation,
+            regular_xattr.after,
+            SourceViewQualificationStageV1::ReadRegularXattr,
+        )?;
 
         hooks
             .exercise_symlink(symlink.fd.as_fd())
             .map_err(|error| io_failure(SourceViewQualificationStageV1::ReadSymlink, error))?;
-        hooks.exercise_xattr_list(&symlink).map_err(|error| {
-            io_failure(SourceViewQualificationStageV1::ReadSymlinkXattrList, error)
-        })?;
+        let symlink_xattr = hooks
+            .exercise_xattr_list(trusted_parent, probes.symlink, &symlink)
+            .map_err(|error| {
+                io_failure(SourceViewQualificationStageV1::ReadSymlinkXattrList, error)
+            })?;
+        require_unchanged(
+            symlink.observation,
+            symlink_xattr.before,
+            SourceViewQualificationStageV1::ReadSymlinkXattrList,
+        )?;
+        require_unchanged(
+            symlink.observation,
+            symlink_xattr.after,
+            SourceViewQualificationStageV1::ReadSymlinkXattrList,
+        )?;
 
         revalidate_probe(
             hooks,
@@ -777,6 +860,13 @@ mod platform {
             (
                 RefusalCode::SnapshotRequiredObjectUnsupported,
                 SourceViewQualificationReasonV1::MissingXattr,
+            )
+        } else if stage == SourceViewQualificationStageV1::ReadSymlinkXattrList
+            && errno == Some(libc::EBADF)
+        {
+            (
+                RefusalCode::RequiredKernelCapabilityMissing,
+                SourceViewQualificationReasonV1::RequiredKernelCapability,
             )
         } else if matches!(
             stage,
@@ -1042,6 +1132,9 @@ mod platform {
             first_mount: MountObservationV1,
             second_mount: MountObservationV1,
             regular_read_after: Cell<NodeObservationV1>,
+            directory_xattr_after: Cell<NodeObservationV1>,
+            regular_xattr_after: Cell<NodeObservationV1>,
+            symlink_xattr_after: Cell<NodeObservationV1>,
             directory_xattr_list_errno: Cell<Option<i32>>,
             regular_xattr_errno: Cell<Option<i32>>,
             symlink_xattr_list_errno: Cell<Option<i32>>,
@@ -1055,6 +1148,9 @@ mod platform {
                     first_mount: MOUNT_NOATIME,
                     second_mount: MOUNT_NOATIME,
                     regular_read_after: Cell::new(observation(ProbeKindV1::Regular, 3)),
+                    directory_xattr_after: Cell::new(observation(ProbeKindV1::Directory, 2)),
+                    regular_xattr_after: Cell::new(observation(ProbeKindV1::Regular, 3)),
+                    symlink_xattr_after: Cell::new(observation(ProbeKindV1::Symlink, 4)),
                     directory_xattr_list_errno: Cell::new(None),
                     regular_xattr_errno: Cell::new(None),
                     symlink_xattr_list_errno: Cell::new(None),
@@ -1140,7 +1236,12 @@ mod platform {
                 Ok(())
             }
 
-            fn exercise_xattr_list(&self, probe: &PinnedProbeV1) -> io::Result<()> {
+            fn exercise_xattr_list(
+                &self,
+                _parent: BorrowedFd<'_>,
+                _name: &CStr,
+                probe: &PinnedProbeV1,
+            ) -> io::Result<ReadExerciseV1> {
                 let errno = match probe.observation.mode & libc::S_IFMT {
                     libc::S_IFDIR => {
                         self.record("list_directory_xattrs");
@@ -1154,15 +1255,31 @@ mod platform {
                 };
                 match errno {
                     Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-                    None => Ok(()),
+                    None => Ok(ReadExerciseV1 {
+                        before: probe.observation,
+                        after: match probe.observation.mode & libc::S_IFMT {
+                            libc::S_IFDIR => self.directory_xattr_after.get(),
+                            libc::S_IFLNK => self.symlink_xattr_after.get(),
+                            _ => unreachable!("object kind was validated above"),
+                        },
+                    }),
                 }
             }
 
-            fn exercise_regular_xattr(&self, _fd: BorrowedFd<'_>, _name: &CStr) -> io::Result<()> {
+            fn exercise_regular_xattr(
+                &self,
+                _parent: BorrowedFd<'_>,
+                _name: &CStr,
+                probe: &PinnedProbeV1,
+                _xattr_name: &CStr,
+            ) -> io::Result<ReadExerciseV1> {
                 self.record("list_get_regular_xattr");
                 match self.regular_xattr_errno.get() {
                     Some(errno) => Err(io::Error::from_raw_os_error(errno)),
-                    None => Ok(()),
+                    None => Ok(ReadExerciseV1 {
+                        before: probe.observation,
+                        after: self.regular_xattr_after.get(),
+                    }),
                 }
             }
 
@@ -1375,6 +1492,73 @@ mod platform {
                     "list_directory_xattrs",
                 ]
             );
+        }
+
+        #[test]
+        fn readable_xattr_descriptor_drift_refuses_before_qualification() {
+            let file = File::open("/dev/null").unwrap();
+            let directory_hooks = MockHooksV1::stable();
+            let mut changed_directory = observation(ProbeKindV1::Directory, 2);
+            changed_directory.ctime.nanoseconds += 1;
+            directory_hooks.directory_xattr_after.set(changed_directory);
+            let failure = qualify_with_hooks(file.as_fd(), &probes(), &directory_hooks)
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.stage(),
+                SourceViewQualificationStageV1::ReadDirectoryXattrList
+            );
+            assert_eq!(
+                failure.reason(),
+                SourceViewQualificationReasonV1::SourceChanged
+            );
+
+            let regular_hooks = MockHooksV1::stable();
+            let mut changed_regular = observation(ProbeKindV1::Regular, 3);
+            changed_regular.ctime.nanoseconds += 1;
+            regular_hooks.regular_xattr_after.set(changed_regular);
+            let failure = qualify_with_hooks(file.as_fd(), &probes(), &regular_hooks)
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.stage(),
+                SourceViewQualificationStageV1::ReadRegularXattr
+            );
+            assert_eq!(
+                failure.reason(),
+                SourceViewQualificationReasonV1::SourceChanged
+            );
+        }
+
+        #[test]
+        fn only_symlink_o_path_ebadf_is_a_typed_capability_refusal() {
+            let file = File::open("/dev/null").unwrap();
+            let directory_hooks = MockHooksV1::stable();
+            directory_hooks
+                .directory_xattr_list_errno
+                .set(Some(libc::EBADF));
+            let failure = qualify_with_hooks(file.as_fd(), &probes(), &directory_hooks)
+                .err()
+                .unwrap();
+            assert_eq!(failure.reason(), SourceViewQualificationReasonV1::Io);
+            assert_eq!(failure.code(), RefusalCode::SnapshotConstructionFailed);
+
+            let symlink_hooks = MockHooksV1::stable();
+            symlink_hooks
+                .symlink_xattr_list_errno
+                .set(Some(libc::EBADF));
+            let failure = qualify_with_hooks(file.as_fd(), &probes(), &symlink_hooks)
+                .err()
+                .unwrap();
+            assert_eq!(
+                failure.stage(),
+                SourceViewQualificationStageV1::ReadSymlinkXattrList
+            );
+            assert_eq!(
+                failure.reason(),
+                SourceViewQualificationReasonV1::RequiredKernelCapability
+            );
+            assert_eq!(failure.code(), RefusalCode::RequiredKernelCapabilityMissing);
         }
 
         #[test]

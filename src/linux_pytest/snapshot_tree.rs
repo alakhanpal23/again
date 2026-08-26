@@ -1887,6 +1887,10 @@ mod platform {
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
     }
 
+    const fn source_regular_xattr_open_flags() -> i32 {
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
     struct OpenHow {
@@ -1958,6 +1962,21 @@ mod platform {
 
         fn directory_open_flags(&self) -> i32 {
             source_directory_open_flags()
+        }
+
+        /// Return the non-`O_PATH` descriptor flags required by upstream Linux
+        /// for empty-path xattr syscalls. Test hooks default to the historical
+        /// pinned-handle behavior so their synthetic xattr seam does not gain a
+        /// second, unmodeled descriptor.
+        fn readable_xattr_open_flags(&self, _file_type: u32) -> Option<i32> {
+            None
+        }
+
+        /// Only the deliberate symlink `O_PATH` capability probe may classify
+        /// `EBADF` as a missing kernel facility. An `EBADF` from any readable
+        /// descriptor remains an ordinary fatal I/O/lifetime failure.
+        fn o_path_xattr_ebadf_is_capability_gap(&self, _file_type: u32) -> bool {
+            false
         }
 
         fn rejects_symlinks_before_xattrs(&self) -> bool {
@@ -2035,6 +2054,23 @@ mod platform {
                 } else {
                     0
                 }
+        }
+
+        fn readable_xattr_open_flags(&self, file_type: u32) -> Option<i32> {
+            let no_atime = if self.destination_observation {
+                libc::O_NOATIME
+            } else {
+                0
+            };
+            match file_type {
+                libc::S_IFDIR => Some(source_directory_open_flags() | no_atime),
+                libc::S_IFREG => Some(source_regular_xattr_open_flags() | no_atime),
+                _ => None,
+            }
+        }
+
+        fn o_path_xattr_ebadf_is_capability_gap(&self, file_type: u32) -> bool {
+            file_type == libc::S_IFLNK && !self.destination_observation
         }
 
         fn rejects_symlinks_before_xattrs(&self) -> bool {
@@ -2334,10 +2370,52 @@ mod platform {
                 None => self.root_mount_id = Some(mount_id),
                 _ => {}
             }
+            let readable_xattr_fd = match self.hooks.readable_xattr_open_flags(file_type) {
+                Some(flags) => {
+                    let readable = openat2_owned(
+                        self.gate,
+                        self.hooks,
+                        parent_fd,
+                        name,
+                        flags,
+                        SOURCE_RESOLVE,
+                        self.policy.openat2_attempts.get(),
+                    )
+                    .map_err(|error| {
+                        error.map_leaf(|error| {
+                            map_open_error(SourceTreeStageV1::CaptureXattrs, &relative_path, error)
+                        })
+                    })?;
+                    self.hooks
+                        .observe_live_tree_fds(depth, u32::from(depth) * 2 + 4);
+                    let readable_statx = statx_identity(self.gate, self.hooks, readable.as_fd())
+                        .map_err(|error| {
+                            error.map_leaf(|error| {
+                                map_statx_error(
+                                    SourceTreeStageV1::CaptureXattrs,
+                                    &relative_path,
+                                    error,
+                                )
+                            })
+                        })?;
+                    if readable_statx != statx {
+                        return Err(source_changed(
+                            SourceTreeStageV1::CaptureXattrs,
+                            &relative_path,
+                        )
+                        .into());
+                    }
+                    Some(readable)
+                }
+                None => None,
+            };
+            let xattr_fd = readable_xattr_fd
+                .as_ref()
+                .map_or(handle.as_raw_fd(), |fd| fd.as_raw_fd());
             let xattrs = capture_stable_xattrs_with_gate(
                 self.gate,
                 self.hooks,
-                handle.as_raw_fd(),
+                xattr_fd,
                 &relative_path,
                 self.policy.xattrs,
                 self.policy.xattr_stability_attempts.get(),
@@ -2349,8 +2427,36 @@ mod platform {
                         .get()
                         .saturating_sub(self.total_xattr_bytes),
                     max_plan_bytes: self.remaining_plan_bytes(),
+                    ebadf_is_capability_gap: readable_xattr_fd.is_none()
+                        && self.hooks.o_path_xattr_ebadf_is_capability_gap(file_type),
                 },
             )?;
+            let pinned_after_xattrs = statx_identity(self.gate, self.hooks, handle.as_fd())
+                .map_err(|error| {
+                    error.map_leaf(|error| {
+                        map_statx_error(SourceTreeStageV1::CaptureXattrs, &relative_path, error)
+                    })
+                })?;
+            let readable_after_xattrs = match readable_xattr_fd.as_ref() {
+                Some(readable) => Some(
+                    statx_identity(self.gate, self.hooks, readable.as_fd()).map_err(|error| {
+                        error.map_leaf(|error| {
+                            map_statx_error(SourceTreeStageV1::CaptureXattrs, &relative_path, error)
+                        })
+                    })?,
+                ),
+                None => None,
+            };
+            if pinned_after_xattrs != statx
+                || readable_after_xattrs
+                    .as_ref()
+                    .is_some_and(|observed| observed != &statx)
+            {
+                return Err(
+                    source_changed(SourceTreeStageV1::CaptureXattrs, &relative_path).into(),
+                );
+            }
+            drop(readable_xattr_fd);
             let (xattr_bytes, xattr_plan_bytes) = xattr_storage_bytes(&xattrs)?;
             self.total_xattr_bytes = self
                 .total_xattr_bytes
@@ -3202,9 +3308,11 @@ mod platform {
         Fatal(SourceTreeFailureV1),
     }
 
+    #[derive(Clone, Copy)]
     struct XattrCaptureBoundsV1 {
         max_xattr_bytes: u64,
         max_plan_bytes: u64,
+        ebadf_is_capability_gap: bool,
     }
 
     fn capture_stable_xattrs_with_gate<G: AttemptGateV1, H: EnumerationHooks>(
@@ -3218,15 +3326,7 @@ mod platform {
     ) -> Result<Box<[CapturedXattrV1]>, TraversalFailureV1<SourceTreeFailureV1>> {
         let mut last_errno = None;
         for _ in 0..attempts {
-            let first = match capture_xattr_pass(
-                gate,
-                hooks,
-                fd,
-                relative_path,
-                limits,
-                bounds.max_xattr_bytes,
-                bounds.max_plan_bytes,
-            ) {
+            let first = match capture_xattr_pass(gate, hooks, fd, relative_path, limits, bounds) {
                 Ok(value) => value,
                 Err(XattrPassError::Resource(error)) => {
                     return Err(TraversalFailureV1::Resource(error));
@@ -3237,15 +3337,7 @@ mod platform {
                 }
                 Err(XattrPassError::Fatal(error)) => return Err(error.into()),
             };
-            let second = match capture_xattr_pass(
-                gate,
-                hooks,
-                fd,
-                relative_path,
-                limits,
-                bounds.max_xattr_bytes,
-                bounds.max_plan_bytes,
-            ) {
+            let second = match capture_xattr_pass(gate, hooks, fd, relative_path, limits, bounds) {
                 Ok(value) => value,
                 Err(XattrPassError::Resource(error)) => {
                     return Err(TraversalFailureV1::Resource(error));
@@ -3297,6 +3389,7 @@ mod platform {
             XattrCaptureBoundsV1 {
                 max_xattr_bytes,
                 max_plan_bytes,
+                ebadf_is_capability_gap: false,
             },
         ) {
             Ok(xattrs) => Ok(xattrs),
@@ -3313,13 +3406,14 @@ mod platform {
         fd: RawFd,
         relative_path: &[u8],
         limits: SourceXattrLimitsV1,
-        max_xattr_bytes: u64,
-        max_plan_bytes: u64,
+        bounds: XattrCaptureBoundsV1,
     ) -> Result<Vec<CapturedXattrV1>, XattrPassError> {
         let list_size =
             run_io_attempt(gate, || hooks.list_xattrs(fd, None)).map_err(|error| match error {
                 TraversalFailureV1::Resource(error) => XattrPassError::Resource(error),
-                TraversalFailureV1::Leaf(error) => map_xattr_call(relative_path, error),
+                TraversalFailureV1::Leaf(error) => {
+                    map_xattr_call(relative_path, error, bounds.ebadf_is_capability_gap)
+                }
             })?;
         if list_size > limits.max_list_bytes.get() as usize {
             return Err(XattrPassError::Fatal(limit(
@@ -3327,7 +3421,7 @@ mod platform {
                 SourceTreeLimitV1::XattrListBytes,
             )));
         }
-        if list_size as u64 > max_plan_bytes {
+        if list_size as u64 > bounds.max_plan_bytes {
             return Err(XattrPassError::Fatal(limit(
                 relative_path,
                 SourceTreeLimitV1::PlanBytes,
@@ -3342,7 +3436,9 @@ mod platform {
             run_io_attempt(gate, || hooks.list_xattrs(fd, Some(&mut list))).map_err(|error| {
                 match error {
                     TraversalFailureV1::Resource(error) => XattrPassError::Resource(error),
-                    TraversalFailureV1::Leaf(error) => map_xattr_call(relative_path, error),
+                    TraversalFailureV1::Leaf(error) => {
+                        map_xattr_call(relative_path, error, bounds.ebadf_is_capability_gap)
+                    }
                 }
             })?;
         if used > list_size {
@@ -3372,7 +3468,7 @@ mod platform {
             .ok_or_else(|| {
                 XattrPassError::Fatal(limit(relative_path, SourceTreeLimitV1::TotalXattrBytes))
             })?;
-        if retained_bytes > max_xattr_bytes {
+        if retained_bytes > bounds.max_xattr_bytes {
             return Err(XattrPassError::Fatal(limit(
                 relative_path,
                 SourceTreeLimitV1::TotalXattrBytes,
@@ -3385,7 +3481,7 @@ mod platform {
             })?;
         if retained_bytes
             .checked_add(fixed_bytes)
-            .is_none_or(|bytes| bytes > max_plan_bytes)
+            .is_none_or(|bytes| bytes > bounds.max_plan_bytes)
         {
             return Err(XattrPassError::Fatal(limit(
                 relative_path,
@@ -3396,7 +3492,7 @@ mod platform {
             if retained_bytes
                 .checked_add(fixed_bytes)
                 .and_then(|bytes| bytes.checked_add(name.len() as u64 + 1))
-                .is_none_or(|bytes| bytes > max_plan_bytes)
+                .is_none_or(|bytes| bytes > bounds.max_plan_bytes)
             {
                 return Err(XattrPassError::Fatal(limit(
                     relative_path,
@@ -3419,7 +3515,7 @@ mod platform {
                             SourceTreeLimitV1::TotalXattrBytes,
                         ))
                     })?;
-                    if retained_bytes > max_xattr_bytes {
+                    if retained_bytes > bounds.max_xattr_bytes {
                         return Err(XattrPassError::Fatal(limit(
                             relative_path,
                             SourceTreeLimitV1::TotalXattrBytes,
@@ -3427,7 +3523,7 @@ mod platform {
                     }
                     if retained_bytes
                         .checked_add(fixed_bytes)
-                        .is_none_or(|bytes| bytes > max_plan_bytes)
+                        .is_none_or(|bytes| bytes > bounds.max_plan_bytes)
                     {
                         return Err(XattrPassError::Fatal(limit(
                             relative_path,
@@ -3445,9 +3541,11 @@ mod platform {
                                 TraversalFailureV1::Resource(error) => {
                                     XattrPassError::Resource(error)
                                 }
-                                TraversalFailureV1::Leaf(error) => {
-                                    map_xattr_call(relative_path, error)
-                                }
+                                TraversalFailureV1::Leaf(error) => map_xattr_call(
+                                    relative_path,
+                                    error,
+                                    bounds.ebadf_is_capability_gap,
+                                ),
                             })?;
                     if used > size {
                         return Err(XattrPassError::Retry(Some(libc::ERANGE)));
@@ -3469,7 +3567,11 @@ mod platform {
                     return Err(XattrPassError::Resource(error));
                 }
                 Err(TraversalFailureV1::Leaf(error)) => {
-                    return Err(map_xattr_call(relative_path, error));
+                    return Err(map_xattr_call(
+                        relative_path,
+                        error,
+                        bounds.ebadf_is_capability_gap,
+                    ));
                 }
             };
             captured.push(CapturedXattrV1 { name, value });
@@ -3524,10 +3626,22 @@ mod platform {
         Ok(names)
     }
 
-    fn map_xattr_call(relative_path: &[u8], error: io::Error) -> XattrPassError {
+    fn map_xattr_call(
+        relative_path: &[u8],
+        error: io::Error,
+        ebadf_is_capability_gap: bool,
+    ) -> XattrPassError {
         match error.raw_os_error() {
             Some(libc::ERANGE | libc::ENODATA) => XattrPassError::Retry(error.raw_os_error()),
             Some(libc::ENOSYS | libc::EINVAL | libc::E2BIG) => {
+                XattrPassError::Fatal(SourceTreeFailureV1::new(
+                    RefusalCode::RequiredKernelCapabilityMissing,
+                    SourceTreeStageV1::CaptureXattrs,
+                    SourceTreeFailureReasonV1::RequiredKernelCapability,
+                    error.raw_os_error(),
+                ))
+            }
+            Some(libc::EBADF) if ebadf_is_capability_gap => {
                 XattrPassError::Fatal(SourceTreeFailureV1::new(
                     RefusalCode::RequiredKernelCapabilityMissing,
                     SourceTreeStageV1::CaptureXattrs,
@@ -4364,6 +4478,19 @@ mod platform {
                 source_directory_open_flags() | libc::O_NOATIME
             }
 
+            fn readable_xattr_open_flags(&self, file_type: u32) -> Option<i32> {
+                let no_atime = if self.destination_observation {
+                    libc::O_NOATIME
+                } else {
+                    0
+                };
+                match file_type {
+                    libc::S_IFDIR => Some(source_directory_open_flags() | no_atime),
+                    libc::S_IFREG => Some(source_regular_xattr_open_flags() | no_atime),
+                    _ => None,
+                }
+            }
+
             fn rejects_symlinks_before_xattrs(&self) -> bool {
                 self.destination_observation
             }
@@ -4373,9 +4500,57 @@ mod platform {
             }
         }
 
+        struct PostXattrIdentityDriftHooksV1 {
+            statx_calls: Cell<u8>,
+            list_calls: Cell<u8>,
+            drift_call: u8,
+        }
+
+        impl EnumerationHooks for PostXattrIdentityDriftHooksV1 {
+            fn statx_once(&self, fd: BorrowedFd<'_>) -> io::Result<SourceStatxV1> {
+                let call = self.statx_calls.get();
+                self.statx_calls.set(call + 1);
+                let mut observed = raw_statx_identity_once(fd)?;
+                if call == self.drift_call {
+                    observed.ctime.nanoseconds += 1;
+                }
+                Ok(observed)
+            }
+
+            fn list_xattrs(&self, _fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+                self.list_calls.set(self.list_calls.get() + 1);
+                if let Some(output) = output {
+                    assert!(!output.is_empty());
+                }
+                Ok(0)
+            }
+
+            fn get_xattr(
+                &self,
+                _fd: RawFd,
+                _name: &CStr,
+                _output: Option<&mut [u8]>,
+            ) -> io::Result<usize> {
+                Err(io::Error::from_raw_os_error(libc::ENODATA))
+            }
+
+            fn directory_open_flags(&self) -> i32 {
+                source_directory_open_flags() | libc::O_NOATIME
+            }
+
+            fn readable_xattr_open_flags(&self, file_type: u32) -> Option<i32> {
+                match file_type {
+                    libc::S_IFDIR => Some(source_directory_open_flags() | libc::O_NOATIME),
+                    libc::S_IFREG => Some(source_regular_xattr_open_flags() | libc::O_NOATIME),
+                    _ => None,
+                }
+            }
+        }
+
         #[derive(Clone, Copy, Debug, Eq, PartialEq)]
         enum OpenedFdRoleV1 {
             EntryHandle,
+            XattrReader,
             DirectoryReader,
             ReopenedName,
         }
@@ -4384,9 +4559,13 @@ mod platform {
         enum AttemptEventV1 {
             DuplicateFd,
             OpenEntryHandle,
+            OpenXattrReader,
             OpenDirectoryReader,
             OpenReopenedName,
             InspectEntryHandleStatx,
+            InspectXattrReaderStatx,
+            RevalidatePinnedAfterXattrsStatx,
+            RevalidateXattrReaderStatx,
             InspectDirectoryReaderStatx,
             ListXattrsSize,
             ListXattrsValue,
@@ -4405,7 +4584,9 @@ mod platform {
             opened_fds: RefCell<BTreeMap<RawFd, OpenedFdRoleV1>>,
             path_open_calls: Cell<u8>,
             entry_statx_calls: Cell<u8>,
+            xattr_statx_calls: Cell<u8>,
             directory_statx_calls: Cell<u8>,
+            readable_xattr_requested: Cell<bool>,
         }
 
         impl CountingEnumerationHooksV1 {
@@ -4431,7 +4612,11 @@ mod platform {
                 flags: i32,
                 resolve: u64,
             ) -> io::Result<OwnedFd> {
-                let role = if flags & libc::O_DIRECTORY != 0 {
+                let xattr_reader = self.readable_xattr_requested.get();
+                let role = if xattr_reader {
+                    self.record(AttemptEventV1::OpenXattrReader);
+                    OpenedFdRoleV1::XattrReader
+                } else if flags & libc::O_DIRECTORY != 0 {
                     self.record(AttemptEventV1::OpenDirectoryReader);
                     OpenedFdRoleV1::DirectoryReader
                 } else {
@@ -4446,6 +4631,9 @@ mod platform {
                     }
                 };
                 let opened = raw_openat2_once(parent, name, flags, resolve)?;
+                if xattr_reader {
+                    self.readable_xattr_requested.set(false);
+                }
                 self.opened_fds
                     .borrow_mut()
                     .insert(opened.as_raw_fd(), role);
@@ -4463,10 +4651,19 @@ mod platform {
                     OpenedFdRoleV1::EntryHandle => {
                         let call = self.entry_statx_calls.get();
                         self.entry_statx_calls.set(call + 1);
+                        match call {
+                            0 => AttemptEventV1::InspectEntryHandleStatx,
+                            1 => AttemptEventV1::RevalidatePinnedAfterXattrsStatx,
+                            _ => AttemptEventV1::RevalidatePinnedHandleStatx,
+                        }
+                    }
+                    OpenedFdRoleV1::XattrReader => {
+                        let call = self.xattr_statx_calls.get();
+                        self.xattr_statx_calls.set(call + 1);
                         if call == 0 {
-                            AttemptEventV1::InspectEntryHandleStatx
+                            AttemptEventV1::InspectXattrReaderStatx
                         } else {
-                            AttemptEventV1::RevalidatePinnedHandleStatx
+                            AttemptEventV1::RevalidateXattrReaderStatx
                         }
                     }
                     OpenedFdRoleV1::DirectoryReader => {
@@ -4528,6 +4725,18 @@ mod platform {
 
             fn directory_open_flags(&self) -> i32 {
                 source_directory_open_flags() | libc::O_NOATIME
+            }
+
+            fn readable_xattr_open_flags(&self, file_type: u32) -> Option<i32> {
+                self.readable_xattr_requested.set(true);
+                match file_type {
+                    libc::S_IFDIR => Some(source_directory_open_flags() | libc::O_NOATIME),
+                    libc::S_IFREG => Some(source_regular_xattr_open_flags() | libc::O_NOATIME),
+                    _ => {
+                        self.readable_xattr_requested.set(false);
+                        None
+                    }
+                }
             }
         }
 
@@ -4936,8 +5145,73 @@ mod platform {
                 KernelHooks::DESTINATION.directory_open_flags(),
                 source_directory_open_flags() | libc::O_NOATIME
             );
+            assert_eq!(
+                KernelHooks::SOURCE.readable_xattr_open_flags(libc::S_IFDIR),
+                Some(source_directory_open_flags())
+            );
+            assert_eq!(
+                KernelHooks::SOURCE.readable_xattr_open_flags(libc::S_IFREG),
+                Some(source_regular_xattr_open_flags())
+            );
+            assert_eq!(
+                KernelHooks::DESTINATION.readable_xattr_open_flags(libc::S_IFREG),
+                Some(source_regular_xattr_open_flags() | libc::O_NOATIME)
+            );
+            assert_eq!(
+                KernelHooks::SOURCE.readable_xattr_open_flags(libc::S_IFLNK),
+                None
+            );
+            assert!(KernelHooks::SOURCE.o_path_xattr_ebadf_is_capability_gap(libc::S_IFLNK));
+            assert!(!KernelHooks::SOURCE.o_path_xattr_ebadf_is_capability_gap(libc::S_IFREG));
             assert!(!KernelHooks::SOURCE.rejects_symlinks_before_xattrs());
             assert!(KernelHooks::DESTINATION.rejects_symlinks_before_xattrs());
+        }
+
+        #[test]
+        fn only_the_deliberate_o_path_xattr_probe_types_ebadf_as_a_kernel_gap() {
+            let ordinary =
+                map_xattr_call(b"regular", io::Error::from_raw_os_error(libc::EBADF), false);
+            let XattrPassError::Fatal(ordinary) = ordinary else {
+                panic!("EBADF must be fatal")
+            };
+            assert_eq!(ordinary.reason(), SourceTreeFailureReasonV1::Io);
+            assert_eq!(ordinary.code(), RefusalCode::SnapshotConstructionFailed);
+
+            let capability =
+                map_xattr_call(b"symlink", io::Error::from_raw_os_error(libc::EBADF), true);
+            let XattrPassError::Fatal(capability) = capability else {
+                panic!("EBADF must be a typed fatal refusal")
+            };
+            assert_eq!(
+                capability.reason(),
+                SourceTreeFailureReasonV1::RequiredKernelCapability
+            );
+            assert_eq!(
+                capability.code(),
+                RefusalCode::RequiredKernelCapabilityMissing
+            );
+        }
+
+        #[test]
+        fn xattr_identity_checks_cover_readable_before_and_both_descriptors_after() {
+            // Root enumeration observes, in order: pinned O_PATH, readable
+            // xattr fd, pinned O_PATH after capture, readable fd after capture.
+            for drift_call in [1, 2, 3] {
+                let tree = TestTree::new();
+                let hooks = PostXattrIdentityDriftHooksV1 {
+                    statx_calls: Cell::new(0),
+                    list_calls: Cell::new(0),
+                    drift_call,
+                };
+                let mut visitor = RecordingVisitor::default();
+                let failure = source_failure(
+                    enumerate(&tree, policy(1, 1), &hooks, &mut visitor).unwrap_err(),
+                );
+                assert_eq!(failure.stage(), SourceTreeStageV1::CaptureXattrs);
+                assert_eq!(failure.reason(), SourceTreeFailureReasonV1::SourceChanged);
+                assert!(visitor.events.is_empty());
+                assert_eq!(hooks.list_calls.get(), if drift_call == 1 { 0 } else { 4 });
+            }
         }
 
         #[test]
@@ -5483,12 +5757,19 @@ mod platform {
             }
             let hooks = TestHooks::default();
             let mut visitor = RecordingVisitor::default();
-            enumerate(&deep, policy(8, 16), &hooks, &mut visitor).unwrap();
-            let committed_bound = 2 * 8 + 5;
+            let deep_policy = policy(8, 16);
+            let committed_bound = deep_policy.max_live_source_fds();
+            enumerate(&deep, deep_policy, &hooks, &mut visitor).unwrap();
             let observations = hooks.fd_observations.borrow();
             assert_eq!(
                 observations.iter().map(|(_, live)| *live).max(),
                 Some(committed_bound)
+            );
+            assert!(
+                observations
+                    .iter()
+                    .any(|(depth, live)| *live == u32::from(*depth) * 2 + 4),
+                "the readable xattr handoff must be included in live-FD accounting"
             );
             assert!(
                 observations
