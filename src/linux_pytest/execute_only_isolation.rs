@@ -316,6 +316,8 @@ mod tests {
     // must own only child-half endpoints and satisfy the stronger raw-syscall
     // consumption/Drop contract before reporting placement.
     unsafe impl isolation_qualification::IsolationChildContinuationV1 for SiblingOwnedStdioPlacementV1 {
+        const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+
         fn continue_in_child_v1(
             self,
             _brand: isolation_qualification::IsolationChildOnlyBrandV1,

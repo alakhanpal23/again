@@ -92,6 +92,13 @@ impl IsolationChildContinuationFailureV1 {
 /// `PlacedAndAuthenticated` only after atomically placing and authenticating
 /// descriptors 0, 1, and 2. The brand cannot be constructed by the parent.
 pub(super) unsafe trait IsolationChildContinuationV1: Sized {
+    /// Whether this product continuation requires an empty supplementary-group
+    /// set before the parent irreversibly denies `setgroups` and writes the GID
+    /// map. The fixed command-free diagnostic deliberately preserves its
+    /// previously qualified bootstrap transcript and does not request this
+    /// stronger Gate 3 precondition.
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool;
+
     fn continue_in_child_v1(
         self,
         brand: IsolationChildOnlyBrandV1,
@@ -111,6 +118,8 @@ struct CloseInheritedStdioV1;
     target_pointer_width = "64"
 ))]
 unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = false;
+
     fn continue_in_child_v1(
         self,
         _brand: IsolationChildOnlyBrandV1,
@@ -142,6 +151,8 @@ unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
     target_pointer_width = "64"
 )))]
 unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = false;
+
     fn continue_in_child_v1(
         self,
         _brand: IsolationChildOnlyBrandV1,
@@ -1842,7 +1853,7 @@ mod platform {
         // Bound the inherited set before cloning. The child must clear and
         // authenticate it before the parent irreversibly writes
         // `setgroups=deny` and the gid map.
-        let _host_supplementary_groups = capture_supplementary_groups()?;
+        let host_supplementary_groups = capture_supplementary_groups()?;
         let parent_namespaces = NamespaceFdSetV1::open_at(
             self_proc.as_raw_fd(),
             IsolationQualificationStageV1::ParentNamespaces,
@@ -1997,11 +2008,20 @@ mod platform {
             IsolationQualificationStageV1::OpenChildProc,
         ));
 
-        // The namespace child performs setgroups(0, NULL) while that syscall
-        // is still permitted. Authenticate the empty result from the pinned
-        // proc view before denying all later setgroups calls and installing
-        // the gid map.
-        guarded!(verify_child_groups(proc_fd, &[], deadline));
+        // A Gate 3 product continuation clears groups while that syscall is
+        // still permitted; the fixed diagnostic preserves and authenticates
+        // its established inherited-group transcript. Pin the selected result
+        // before denying all later setgroups calls and installing the gid map.
+        let expected_child_groups = if C::REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1 {
+            &[][..]
+        } else {
+            host_supplementary_groups.as_slice()
+        };
+        guarded!(verify_child_groups(
+            proc_fd,
+            expected_child_groups,
+            deadline
+        ));
 
         guarded!(write_and_verify_id_map(
             proc_fd,
@@ -2020,7 +2040,11 @@ mod platform {
             IsolationQualificationStageV1::VerifyGidMap,
             deadline,
         ));
-        guarded!(verify_child_groups_and_capabilities(proc_fd, &[], deadline,));
+        guarded!(verify_child_groups_and_capabilities(
+            proc_fd,
+            expected_child_groups,
+            deadline,
+        ));
 
         let child_namespaces = guarded!(NamespaceFdSetV1::open_at(
             proc_fd,
@@ -4321,8 +4345,10 @@ mod platform {
         // This must happen before the parent writes `setgroups=deny`. GID
         // normalization does not clear supplementary groups, and after the
         // deny handshake the child can no longer repair an inherited set.
-        if let Err(error) = child_clear_and_verify_supplementary_groups_v1(operations) {
-            child_credential_fail_v1(report_write, &nonce, error, deadline);
+        if C::REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1 {
+            if let Err(error) = child_clear_and_verify_supplementary_groups_v1(operations) {
+                child_credential_fail_v1(report_write, &nonce, error, deadline);
+            }
         }
 
         let ready = child_encode_common_frame(READY_MAGIC_V1, PHASE_READY_V1, &nonce);
@@ -7860,6 +7886,24 @@ mod platform {
         const DISPOSABLE_FD_SCRUB_MAGIC_V1: &[u8; 8] = b"AGNFDT01";
         const DISPOSABLE_FD_SCRUB_COMPLETE_V1: u8 = 1;
 
+        struct EmptyGroupsTestContinuationV1;
+
+        // SAFETY: this test continuation is zero-sized with trivial Drop and
+        // delegates to the same raw-syscall-only child stdio closure used by
+        // the fixed diagnostic. Its distinct associated precondition exercises
+        // the Gate 3 empty-supplementary-group handshake.
+        unsafe impl IsolationChildContinuationV1 for EmptyGroupsTestContinuationV1 {
+            const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+
+            fn continue_in_child_v1(
+                self,
+                brand: IsolationChildOnlyBrandV1,
+            ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1>
+            {
+                CloseInheritedStdioV1.continue_in_child_v1(brand)
+            }
+        }
+
         fn seccomp_filter_fingerprint_v1() -> u64 {
             let mut hash = 0xcbf2_9ce4_8422_2325_u64;
             for instruction in &SECCOMP_FILTER_V1 {
@@ -10535,7 +10579,7 @@ mod platform {
             for operation in operations {
                 let plan = IsolationOperationPlanV1::fail(operation);
                 let observed = match begin_blocked_rootless_namespace_bootstrap_with_plan_v1(
-                    CloseInheritedStdioV1,
+                    EmptyGroupsTestContinuationV1,
                     plan,
                 ) {
                     Ok(blocked) => match blocked.continue_to_isolation_ready_v1() {

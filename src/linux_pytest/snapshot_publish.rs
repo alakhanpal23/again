@@ -6111,12 +6111,16 @@ mod portable_tests {
         <VerifiedBoundRegularBytesV1 as AmbiguousIfClone<_>>::probe();
         <VerifiedBoundRegularBytesV1 as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<VerifiedBoundRegularBytesV1>());
+        #[cfg(target_os = "linux")]
+        let directory_mode = libc::S_IFDIR;
+        #[cfg(not(target_os = "linux"))]
+        let directory_mode = u32::from(libc::S_IFDIR);
         let root_live_statx = SourceStatxV1::for_test(
             1,
             1,
             1,
             1,
-            u32::from(libc::S_IFDIR) | 0o500,
+            directory_mode | 0o500,
             1,
             1,
             1,
