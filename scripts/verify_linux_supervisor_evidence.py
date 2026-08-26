@@ -17,6 +17,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import stat
+import struct
 import sys
 import zipfile
 
@@ -30,6 +31,16 @@ MAX_REPORT_BYTES = 64 * 1024
 MAX_TOTAL_UNCOMPRESSED_BYTES = 2 * 1024 * 1024
 MAX_COMPRESSION_RATIO = 200
 ALLOWED_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+ALLOWED_DOS_FILE_ATTRIBUTES = 0x01 | 0x02 | 0x04 | 0x20
+
+LOCAL_FILE_HEADER_SIGNATURE = 0x04034B50
+CENTRAL_DIRECTORY_HEADER_SIGNATURE = 0x02014B50
+DATA_DESCRIPTOR_SIGNATURE = 0x08074B50
+END_OF_CENTRAL_DIRECTORY_SIGNATURE = 0x06054B50
+LOCAL_FILE_HEADER = struct.Struct("<IHHHHHIIIHH")
+CENTRAL_DIRECTORY_HEADER = struct.Struct("<IHHHHHHIIIHHHHHII")
+DATA_DESCRIPTOR = struct.Struct("<IIII")
+END_OF_CENTRAL_DIRECTORY = struct.Struct("<IHHHHIIH")
 
 SOURCE_SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
 KERNEL_RELEASE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~-]{0,254}\Z")
@@ -98,7 +109,7 @@ def _strict_json(data: bytes, label: str) -> dict[str, object]:
             object_pairs_hook=_reject_duplicate_key,
             parse_constant=_reject_json_constant,
         )
-    except (json.JSONDecodeError, EvidenceError) as error:
+    except (json.JSONDecodeError, EvidenceError, RecursionError) as error:
         raise EvidenceError(f"{label}: malformed JSON: {error}") from error
     if type(value) is not dict:
         raise EvidenceError(f"{label}: JSON value must be one object")
@@ -207,15 +218,19 @@ def _validate_member_metadata(info: zipfile.ZipInfo) -> None:
         raise EvidenceError(f"archive member is not a regular file: {original}")
     if info.flag_bits & 0x1:
         raise EvidenceError(f"encrypted archive member: {original}")
+    if info.flag_bits & ~(0x08 | 0x800):
+        raise EvidenceError(f"unsupported ZIP member flags: {original}")
     if info.compress_type not in ALLOWED_COMPRESSION:
         raise EvidenceError(f"unsupported compression method: {original}")
 
     mode = info.external_attr >> 16
-    dos_directory = bool(info.external_attr & 0x10)
+    dos_attributes = info.external_attr & 0xFF
+    if dos_attributes & ~ALLOWED_DOS_FILE_ATTRIBUTES:
+        raise EvidenceError(f"DOS special archive member: {original}")
     if info.create_system == 3:
         regular = stat.S_ISREG(mode)
     elif info.create_system == 0:
-        regular = not dos_directory
+        regular = True
     else:
         regular = False
     if not regular:
@@ -233,6 +248,155 @@ def _validate_member_metadata(info: zipfile.ZipInfo) -> None:
             raise EvidenceError(f"compressed-bomb ratio: {original}")
 
 
+def _require_slice(data: bytes, offset: int, size: int, label: str) -> bytes:
+    end = offset + size
+    if offset < 0 or size < 0 or end > len(data):
+        raise EvidenceError(f"truncated ZIP {label}")
+    return data[offset:end]
+
+
+def _validate_data_descriptor(
+    archive_bytes: bytes,
+    start: int,
+    end: int,
+    info: zipfile.ZipInfo,
+) -> None:
+    descriptor = _require_slice(
+        archive_bytes, start, DATA_DESCRIPTOR.size, f"data descriptor for {info.filename}"
+    )
+    if start + DATA_DESCRIPTOR.size != end:
+        raise EvidenceError(f"non-canonical ZIP data descriptor: {info.filename}")
+    signature, crc, compressed_size, file_size = DATA_DESCRIPTOR.unpack(descriptor)
+    if signature != DATA_DESCRIPTOR_SIGNATURE:
+        raise EvidenceError(f"unsigned ZIP data descriptor: {info.filename}")
+    if (crc, compressed_size, file_size) != (
+        info.CRC,
+        info.compress_size,
+        info.file_size,
+    ):
+        raise EvidenceError(f"ZIP data descriptor mismatch: {info.filename}")
+
+
+def _validate_exact_zip_layout(
+    archive_bytes: bytes,
+    evidence: zipfile.ZipFile,
+    infos: list[zipfile.ZipInfo],
+) -> None:
+    """Require every archive byte to belong to one canonical ZIP record."""
+    if evidence.comment != b"":
+        raise EvidenceError("ZIP archive comment must be empty")
+    if len(archive_bytes) < END_OF_CENTRAL_DIRECTORY.size:
+        raise EvidenceError("truncated ZIP end record")
+
+    eocd_offset = len(archive_bytes) - END_OF_CENTRAL_DIRECTORY.size
+    eocd_bytes = _require_slice(
+        archive_bytes,
+        eocd_offset,
+        END_OF_CENTRAL_DIRECTORY.size,
+        "end record",
+    )
+    (
+        signature,
+        disk_number,
+        central_disk,
+        disk_entries,
+        total_entries,
+        central_size,
+        central_offset,
+        comment_size,
+    ) = END_OF_CENTRAL_DIRECTORY.unpack(eocd_bytes)
+    if signature != END_OF_CENTRAL_DIRECTORY_SIGNATURE or comment_size != 0:
+        raise EvidenceError("ZIP end record must be canonical and end exactly at EOF")
+    if disk_number != 0 or central_disk != 0 or disk_entries != total_entries:
+        raise EvidenceError("multi-disk ZIP archives are unsupported")
+    if total_entries != len(infos):
+        raise EvidenceError("ZIP end record member count mismatch")
+    if central_offset != evidence.start_dir or central_offset + central_size != eocd_offset:
+        raise EvidenceError("ZIP central directory offsets do not cover the archive exactly")
+
+    ordered = sorted(infos, key=lambda info: info.header_offset)
+    if not ordered or ordered[0].header_offset != 0:
+        raise EvidenceError("ZIP must begin with the first local file header")
+    for index, info in enumerate(ordered):
+        offset = info.header_offset
+        fixed = _require_slice(
+            archive_bytes, offset, LOCAL_FILE_HEADER.size, f"local header for {info.filename}"
+        )
+        (
+            local_signature,
+            _version_needed,
+            local_flags,
+            local_compression,
+            _modified_time,
+            _modified_date,
+            local_crc,
+            local_compressed_size,
+            local_file_size,
+            name_size,
+            extra_size,
+        ) = LOCAL_FILE_HEADER.unpack(fixed)
+        if local_signature != LOCAL_FILE_HEADER_SIGNATURE:
+            raise EvidenceError(f"invalid ZIP local header: {info.filename}")
+        name_start = offset + LOCAL_FILE_HEADER.size
+        name = _require_slice(archive_bytes, name_start, name_size, "local member name")
+        if extra_size != 0:
+            raise EvidenceError(f"ZIP local extra fields are unsupported: {info.filename}")
+        try:
+            expected_name = info.orig_filename.encode("utf-8")
+        except UnicodeEncodeError as error:
+            raise EvidenceError(f"non-UTF-8 ZIP member name: {info.orig_filename}") from error
+        if name != expected_name:
+            raise EvidenceError(f"ZIP local member name mismatch: {info.filename}")
+        if local_flags != info.flag_bits or local_compression != info.compress_type:
+            raise EvidenceError(f"ZIP local header metadata mismatch: {info.filename}")
+        data_start = name_start + name_size + extra_size
+        data_end = data_start + info.compress_size
+        next_offset = (
+            ordered[index + 1].header_offset
+            if index + 1 < len(ordered)
+            else evidence.start_dir
+        )
+        _require_slice(archive_bytes, data_start, info.compress_size, "compressed member data")
+        if local_flags & 0x08:
+            if (local_crc, local_compressed_size, local_file_size) != (0, 0, 0):
+                raise EvidenceError(f"non-canonical deferred ZIP sizes: {info.filename}")
+            _validate_data_descriptor(archive_bytes, data_end, next_offset, info)
+        else:
+            if (local_crc, local_compressed_size, local_file_size) != (
+                info.CRC,
+                info.compress_size,
+                info.file_size,
+            ):
+                raise EvidenceError(f"ZIP local size or CRC mismatch: {info.filename}")
+            if data_end != next_offset:
+                raise EvidenceError(f"unreferenced bytes after ZIP member: {info.filename}")
+
+    cursor = evidence.start_dir
+    for info in infos:
+        fixed = _require_slice(
+            archive_bytes,
+            cursor,
+            CENTRAL_DIRECTORY_HEADER.size,
+            f"central header for {info.filename}",
+        )
+        fields = CENTRAL_DIRECTORY_HEADER.unpack(fixed)
+        if fields[0] != CENTRAL_DIRECTORY_HEADER_SIGNATURE:
+            raise EvidenceError(f"invalid ZIP central header: {info.filename}")
+        name_size, extra_size, member_comment_size = fields[10], fields[11], fields[12]
+        local_offset = fields[16]
+        name_start = cursor + CENTRAL_DIRECTORY_HEADER.size
+        name = _require_slice(archive_bytes, name_start, name_size, "central member name")
+        if name != info.orig_filename.encode("utf-8") or local_offset != info.header_offset:
+            raise EvidenceError(f"ZIP central member mismatch: {info.filename}")
+        if member_comment_size != 0:
+            raise EvidenceError(f"ZIP member comment must be empty: {info.filename}")
+        if extra_size != 0:
+            raise EvidenceError(f"ZIP central extra fields are unsupported: {info.filename}")
+        cursor = name_start + name_size + extra_size + member_comment_size
+    if cursor != eocd_offset:
+        raise EvidenceError("ZIP central directory contains gaps or unreferenced bytes")
+
+
 def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -247,10 +411,22 @@ def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
             if archive_info.st_size <= 0 or archive_info.st_size > MAX_ARCHIVE_BYTES:
                 raise EvidenceError("archive byte size is outside the allowed limit")
             archive_bytes = source.read(MAX_ARCHIVE_BYTES + 1)
+            final_info = os.fstat(source.fileno())
     except OSError as error:
         raise EvidenceError(f"cannot read archive: {error}") from error
     if len(archive_bytes) != archive_info.st_size or len(archive_bytes) > MAX_ARCHIVE_BYTES:
         raise EvidenceError("archive changed while being read or exceeds the byte limit")
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(archive_info) != identity(final_info):
+        raise EvidenceError("archive identity changed while being read")
     archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
 
     expected_names = _expected_member_names()
@@ -267,6 +443,7 @@ def _read_members(archive: Path) -> tuple[dict[str, bytes], str]:
                 raise EvidenceError("archive contains duplicate member names")
             if set(names) != expected_names:
                 raise EvidenceError("archive member set does not match the exact allowlist")
+            _validate_exact_zip_layout(archive_bytes, evidence, infos)
 
             total_size = 0
             for info in infos:
@@ -300,10 +477,35 @@ def _canonical_json_bytes(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def verify_archive(archive: Path, expected_source_sha: str) -> dict[str, object]:
+def _type_exact_equal(left: object, right: object) -> bool:
+    if type(left) is not type(right):
+        return False
+    if type(left) is dict:
+        left_dict = left
+        right_dict = right
+        return set(left_dict) == set(right_dict) and all(
+            _type_exact_equal(left_dict[key], right_dict[key]) for key in left_dict
+        )
+    if type(left) is list:
+        left_list = left
+        right_list = right
+        return len(left_list) == len(right_list) and all(
+            _type_exact_equal(a, b) for a, b in zip(left_list, right_list)
+        )
+    return left == right
+
+
+def verify_archive(
+    archive: Path, expected_source_sha: str, expected_kernel_release: str
+) -> dict[str, object]:
     """Verify *archive* and return its deterministic audit record."""
-    if SOURCE_SHA_RE.fullmatch(expected_source_sha) is None:
+    if type(expected_source_sha) is not str or SOURCE_SHA_RE.fullmatch(expected_source_sha) is None:
         raise EvidenceError("expected source SHA must be 40 lowercase hexadecimal characters")
+    if (
+        type(expected_kernel_release) is not str
+        or KERNEL_RELEASE_RE.fullmatch(expected_kernel_release) is None
+    ):
+        raise EvidenceError("expected kernel release is invalid")
 
     contents, archive_sha256 = _read_members(archive)
     raw_records: list[dict[str, object]] = []
@@ -332,7 +534,7 @@ def verify_archive(archive: Path, expected_source_sha: str) -> dict[str, object]
         _require_exact_int(record["iteration"], iteration, f"validated line {iteration}.iteration")
         expected = dict(raw)
         expected["iteration"] = iteration
-        if record != expected:
+        if not _type_exact_equal(record, expected):
             raise EvidenceError(
                 f"validated line {iteration} does not equal its raw record plus iteration"
             )
@@ -350,8 +552,8 @@ def verify_archive(archive: Path, expected_source_sha: str) -> dict[str, object]
         raise EvidenceError("report.json.platform must be an object")
     _require_exact_keys(platform, REPORT_PLATFORM_KEYS, "report.json.platform")
     kernel_release = platform["kernel_release"]
-    if type(kernel_release) is not str or KERNEL_RELEASE_RE.fullmatch(kernel_release) is None:
-        raise EvidenceError("report.json contains an invalid kernel release")
+    if kernel_release != expected_kernel_release:
+        raise EvidenceError("report.json kernel release does not match trusted metadata")
 
     expected_report = {
         "schema": "again.linux-pytest-supervisor-qualification.v1",
@@ -374,7 +576,7 @@ def verify_archive(archive: Path, expected_source_sha: str) -> dict[str, object]
             "reuse_authority": False,
         },
     }
-    if report != expected_report:
+    if not _type_exact_equal(report, expected_report):
         raise EvidenceError("report.json does not equal the independently reconstructed report")
 
     manifest = [
@@ -389,6 +591,7 @@ def verify_archive(archive: Path, expected_source_sha: str) -> dict[str, object]
     return {
         "archive_sha256": archive_sha256,
         "fork_delivery_orders": sorted(observed_orders),
+        "kernel_release": expected_kernel_release,
         "member_count": len(contents),
         "member_manifest_sha256": manifest_sha256,
         "schema": "again.linux-pytest-supervisor-evidence-audit.v1",
@@ -403,13 +606,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("archive", type=Path)
     parser.add_argument("--expected-source-sha", required=True)
+    parser.add_argument("--expected-kernel-release", required=True)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        audit = verify_archive(args.archive, args.expected_source_sha)
+        audit = verify_archive(
+            args.archive, args.expected_source_sha, args.expected_kernel_release
+        )
     except EvidenceError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1

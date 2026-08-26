@@ -19,6 +19,7 @@ from scripts import verify_linux_supervisor_evidence as verifier
 
 
 SOURCE_SHA = "0123456789abcdef0123456789abcdef01234567"
+KERNEL_RELEASE = "6.17.0-test"
 
 
 def compact(value: object) -> bytes:
@@ -104,13 +105,21 @@ def write_zip(
     *,
     special: dict[str, int] | None = None,
     duplicate: tuple[str, bytes] | None = None,
+    create_system: int = 3,
+    dos_attributes: int = 0,
+    comment: bytes = b"",
+    extra: bytes = b"",
 ) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.comment = comment
         for name, data in members.items():
             info = zipfile.ZipInfo(name)
-            info.create_system = 3
-            info.external_attr = (stat.S_IFREG | 0o600) << 16
+            info.create_system = create_system
+            info.external_attr = (
+                ((stat.S_IFREG | 0o600) << 16) if create_system == 3 else dos_attributes
+            )
             info.compress_type = zipfile.ZIP_DEFLATED
+            info.extra = extra
             if special and name in special:
                 info.external_attr = special[name] << 16
             archive.writestr(info, data)
@@ -128,20 +137,21 @@ class EvidenceVerifierTests(unittest.TestCase):
 
     def verify(self, members: dict[str, bytes] | None = None) -> dict[str, object]:
         write_zip(self.archive, valid_members() if members is None else members)
-        return verifier.verify_archive(self.archive, SOURCE_SHA)
+        return verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
 
     def assert_rejected(self, members: dict[str, bytes]) -> None:
         write_zip(self.archive, members)
         with self.assertRaises(verifier.EvidenceError):
-            verifier.verify_archive(self.archive, SOURCE_SHA)
+            verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
 
     def test_valid_archive_emits_deterministic_content_bound_audit(self) -> None:
         first = self.verify()
-        second = verifier.verify_archive(self.archive, SOURCE_SHA)
+        second = verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
         self.assertEqual(first, second)
         self.assertEqual(first["member_count"], 302)
         self.assertEqual(first["validated_sample_count"], 100)
         self.assertEqual(first["source_commit"], SOURCE_SHA)
+        self.assertEqual(first["kernel_release"], KERNEL_RELEASE)
         self.assertEqual(len(first["archive_sha256"]), 64)
         self.assertEqual(len(first["member_manifest_sha256"]), 64)
         self.assertEqual(
@@ -159,6 +169,8 @@ class EvidenceVerifierTests(unittest.TestCase):
                 str(self.archive),
                 "--expected-source-sha",
                 SOURCE_SHA,
+                "--expected-kernel-release",
+                KERNEL_RELEASE,
             ],
             check=False,
             capture_output=True,
@@ -196,7 +208,31 @@ class EvidenceVerifierTests(unittest.TestCase):
             duplicate=("sample-001/stdout.raw", members["sample-001/stdout.raw"]),
         )
         with self.assertRaises(verifier.EvidenceError):
-            verifier.verify_archive(self.archive, SOURCE_SHA)
+            verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
+
+    def test_archive_requires_exact_byte_coverage(self) -> None:
+        write_zip(self.archive, valid_members())
+        canonical = self.archive.read_bytes()
+        hostile_archives = [
+            b"HIDDEN-PREFIX" + canonical,
+            canonical + b"HIDDEN-TRAILER",
+        ]
+        hidden = Path(self.temporary.name) / "hidden.zip"
+        with zipfile.ZipFile(hidden, "w") as archive:
+            archive.writestr("hidden.txt", b"unreviewed")
+        hostile_archives.append(hidden.read_bytes() + canonical)
+        for hostile in hostile_archives:
+            with self.subTest(prefix=hostile[:8], suffix=hostile[-8:]):
+                self.archive.write_bytes(hostile)
+                with self.assertRaises(verifier.EvidenceError):
+                    verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
+
+        write_zip(self.archive, valid_members(), comment=b"unreviewed-comment")
+        with self.assertRaises(verifier.EvidenceError):
+            verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
+        write_zip(self.archive, valid_members(), extra=b"\x99\x99\x00\x00")
+        with self.assertRaises(verifier.EvidenceError):
+            verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
 
     def test_absolute_traversal_and_noncanonical_paths_are_rejected(self) -> None:
         for hostile in [
@@ -220,7 +256,26 @@ class EvidenceVerifierTests(unittest.TestCase):
                 name = "sample-001/stdout.raw"
                 write_zip(self.archive, members, special={name: mode})
                 with self.assertRaises(verifier.EvidenceError):
-                    verifier.verify_archive(self.archive, SOURCE_SHA)
+                    verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
+
+    def test_dos_origin_regular_files_are_supported_but_special_attributes_refuse(self) -> None:
+        write_zip(
+            self.archive,
+            valid_members(),
+            create_system=0,
+            dos_attributes=0x20,
+        )
+        verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
+        for attributes in [0x08, 0x10, 0x40]:
+            with self.subTest(attributes=attributes):
+                write_zip(
+                    self.archive,
+                    valid_members(),
+                    create_system=0,
+                    dos_attributes=attributes,
+                )
+                with self.assertRaises(verifier.EvidenceError):
+                    verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
 
     def test_oversized_compressed_member_is_rejected_before_read(self) -> None:
         members = valid_members()
@@ -265,6 +320,7 @@ class EvidenceVerifierTests(unittest.TestCase):
             b'{"schema":1,"schema":2}\n',
             compact(probe("child_stop_first")) + b"{}\n",
             b"[]\n",
+            b"[" * 2_000 + b"0" + b"]" * 2_000,
         ]
         for mutation in mutations:
             with self.subTest(mutation=mutation[:20]):
@@ -279,6 +335,21 @@ class EvidenceVerifierTests(unittest.TestCase):
                 lines = members["validated.jsonl"].splitlines()
                 changed = json.loads(lines[0])
                 changed[field] = value
+                lines[0] = compact(changed).rstrip(b"\n")
+                members["validated.jsonl"] = b"\n".join(lines) + b"\n"
+                self.assert_rejected(members)
+
+    def test_validated_record_comparison_is_type_exact(self) -> None:
+        mutations = [
+            ("result", "task_count", 2.0),
+            ("scope", "reuse_authority", 0),
+        ]
+        for section, field, value in mutations:
+            with self.subTest(section=section, field=field):
+                members = valid_members()
+                lines = members["validated.jsonl"].splitlines()
+                changed = json.loads(lines[0])
+                changed[section][field] = value
                 lines[0] = compact(changed).rstrip(b"\n")
                 members["validated.jsonl"] = b"\n".join(lines) + b"\n"
                 self.assert_rejected(members)
@@ -327,12 +398,34 @@ class EvidenceVerifierTests(unittest.TestCase):
         members["report.json"] = compact(changed)
         self.assert_rejected(members)
 
+    def test_report_comparison_is_type_exact(self) -> None:
+        mutations = [
+            ("validated_sample_count", 100.0),
+            ("first_iteration", 1.0),
+            ("scope.reuse_authority", 0),
+        ]
+        for field, value in mutations:
+            with self.subTest(field=field):
+                members = valid_members()
+                changed = report()
+                if field.startswith("scope."):
+                    changed["scope"][field.split(".", 1)[1]] = value
+                else:
+                    changed[field] = value
+                members["report.json"] = compact(changed)
+                self.assert_rejected(members)
+
+    def test_kernel_release_is_bound_to_trusted_metadata(self) -> None:
+        self.verify()
+        with self.assertRaises(verifier.EvidenceError):
+            verifier.verify_archive(self.archive, SOURCE_SHA, "6.17.1-other")
+
     def test_expected_source_sha_is_exact_and_must_match(self) -> None:
         self.verify()
         for source_sha in ["A" * 40, "0" * 39, "g" * 40, "f" * 40]:
             with self.subTest(source_sha=source_sha):
                 with self.assertRaises(verifier.EvidenceError):
-                    verifier.verify_archive(self.archive, source_sha)
+                    verifier.verify_archive(self.archive, source_sha, KERNEL_RELEASE)
 
     def test_malformed_aggregate_json_is_rejected(self) -> None:
         for name in ["validated.jsonl", "report.json"]:
@@ -347,10 +440,10 @@ class EvidenceVerifierTests(unittest.TestCase):
         symlink = Path(self.temporary.name) / "link.zip"
         symlink.symlink_to(target)
         with self.assertRaises(verifier.EvidenceError):
-            verifier.verify_archive(symlink, SOURCE_SHA)
+            verifier.verify_archive(symlink, SOURCE_SHA, KERNEL_RELEASE)
         self.archive.write_bytes(b"not a zip")
         with self.assertRaises(verifier.EvidenceError):
-            verifier.verify_archive(self.archive, SOURCE_SHA)
+            verifier.verify_archive(self.archive, SOURCE_SHA, KERNEL_RELEASE)
 
 
 if __name__ == "__main__":
