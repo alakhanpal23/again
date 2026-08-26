@@ -189,6 +189,9 @@ class EvidenceAssemblerTests(unittest.TestCase):
     def assert_no_output(self, name: str = "evidence.zip") -> None:
         self.assertFalse((self.outputs / name).exists())
 
+    def staging_paths(self) -> list[Path]:
+        return list(self.outputs.glob(".again-evidence-stage-*.tmp"))
+
     def verify(self, path: Path) -> dict[str, object]:
         return verifier.verify_archive(
             path,
@@ -209,6 +212,12 @@ class EvidenceAssemblerTests(unittest.TestCase):
         self.assertEqual(second_audit, self.verify(second))
         self.assertEqual(first_audit["member_count"], 5)
         self.assertTrue(all(value is False for value in first_audit["authority"].values()))
+        for path in (first, second):
+            metadata = path.stat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+        self.assertEqual(self.staging_paths(), [])
         with zipfile.ZipFile(first) as archive:
             self.assertEqual([info.filename for info in archive.infolist()], list(assembler.MEMBER_ORDER))
             for info in archive.infolist():
@@ -351,6 +360,40 @@ class EvidenceAssemblerTests(unittest.TestCase):
         self.write_members(members)
         self.assert_refusal("archive_verification_failed", self.package)
         self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_final_name_is_absent_during_write_and_verification(self) -> None:
+        real_write = assembler.os.write
+        real_verify = assembler.verifier.verify_archive
+        observed_writes = 0
+        observed_verification = 0
+
+        def observing_write(descriptor: int, value: bytes) -> int:
+            nonlocal observed_writes
+            observed_writes += 1
+            self.assert_no_output()
+            self.assertEqual(len(self.staging_paths()), 1)
+            return real_write(descriptor, value)
+
+        def observing_verify(path: Path, *args) -> dict[str, object]:
+            nonlocal observed_verification
+            observed_verification += 1
+            self.assert_no_output()
+            self.assertEqual(path.parent, self.outputs)
+            self.assertTrue(path.name.startswith(".again-evidence-stage-"))
+            metadata = path.stat()
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_nlink, 1)
+            return real_verify(path, *args)
+
+        with mock.patch.object(assembler.os, "write", side_effect=observing_write), mock.patch.object(
+            assembler.verifier, "verify_archive", side_effect=observing_verify
+        ):
+            self.package()
+        self.assertGreater(observed_writes, 0)
+        self.assertEqual(observed_verification, 1)
+        self.assertTrue((self.outputs / "evidence.zip").is_file())
+        self.assertEqual(self.staging_paths(), [])
 
     def test_overwrite_attempt_preserves_existing_bytes(self) -> None:
         existing = self.outputs / "evidence.zip"
@@ -373,6 +416,7 @@ class EvidenceAssemblerTests(unittest.TestCase):
         def failing_write(descriptor: int, value: bytes) -> int:
             nonlocal calls
             calls += 1
+            self.assert_no_output()
             if calls == 1:
                 return real_write(descriptor, value[:17])
             raise OSError("injected write failure")
@@ -381,6 +425,120 @@ class EvidenceAssemblerTests(unittest.TestCase):
             self.assert_refusal("output_write_failed", self.package)
         self.assertGreaterEqual(calls, 2)
         self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_publication_race_preserves_existing_final(self) -> None:
+        real_link = assembler.os.link
+        raced = False
+
+        def racing_link(source: str, destination: str, **kwargs) -> None:
+            nonlocal raced
+            if not raced:
+                raced = True
+                (self.outputs / destination).write_bytes(b"racing publisher")
+            real_link(source, destination, **kwargs)
+
+        with mock.patch.object(assembler.os, "link", side_effect=racing_link):
+            self.assert_refusal("output_exists", self.package)
+        self.assertTrue(raced)
+        self.assertEqual((self.outputs / "evidence.zip").read_bytes(), b"racing publisher")
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_close_failure_preserves_verifier_code_and_marks_cleanup_uncertain(self) -> None:
+        real_close = assembler.os.close
+        real_fstat = assembler.os.fstat
+        failed = False
+        armed = False
+
+        def refusing_verify(*_args) -> dict[str, object]:
+            nonlocal armed
+            armed = True
+            raise verifier.EvidenceError("injected verifier refusal")
+
+        def failing_close(descriptor: int) -> None:
+            nonlocal failed
+            metadata = real_fstat(descriptor)
+            if armed and not failed and stat.S_ISREG(metadata.st_mode):
+                failed = True
+                real_close(descriptor)
+                raise OSError("injected close failure")
+            real_close(descriptor)
+
+        with mock.patch.object(
+            assembler.verifier,
+            "verify_archive",
+            side_effect=refusing_verify,
+        ), mock.patch.object(assembler.os, "close", side_effect=failing_close):
+            with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                self.package()
+        self.assertTrue(failed)
+        self.assertEqual(refused.exception.code, "archive_verification_failed")
+        self.assertFalse(refused.exception.cleanup_complete)
+        self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_directory_close_failure_attempts_cleanup_after_accepted_archive(self) -> None:
+        real_close = assembler.os.close
+        real_fstat = assembler.os.fstat
+        failed = False
+
+        def failing_close(descriptor: int) -> None:
+            nonlocal failed
+            metadata = real_fstat(descriptor)
+            if (
+                not failed
+                and stat.S_ISDIR(metadata.st_mode)
+                and (self.outputs / "evidence.zip").exists()
+            ):
+                failed = True
+                real_close(descriptor)
+                raise OSError("injected output-directory close failure")
+            real_close(descriptor)
+
+        with mock.patch.object(assembler.os, "close", side_effect=failing_close):
+            with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                self.package()
+        self.assertTrue(failed)
+        self.assertEqual(refused.exception.code, "output_close_failed")
+        self.assertFalse(refused.exception.cleanup_complete)
+        self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
+
+    def test_unlink_failure_preserves_verifier_code_and_marks_cleanup_uncertain(self) -> None:
+        with mock.patch.object(
+            assembler.verifier,
+            "verify_archive",
+            side_effect=verifier.EvidenceError("injected verifier refusal"),
+        ), mock.patch.object(assembler.os, "unlink", side_effect=OSError("injected unlink failure")):
+            with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                self.package()
+        self.assertEqual(refused.exception.code, "archive_verification_failed")
+        self.assertFalse(refused.exception.cleanup_complete)
+        self.assert_no_output()
+        leftovers = self.staging_paths()
+        self.assertEqual(len(leftovers), 1)
+        leftovers[0].unlink()
+
+    def test_cleanup_fsync_failure_preserves_verifier_code_and_marks_uncertain(self) -> None:
+        real_fsync = assembler.os.fsync
+        real_fstat = assembler.os.fstat
+
+        def failing_directory_fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(real_fstat(descriptor).st_mode):
+                raise OSError("injected directory fsync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(
+            assembler.verifier,
+            "verify_archive",
+            side_effect=verifier.EvidenceError("injected verifier refusal"),
+        ), mock.patch.object(assembler.os, "fsync", side_effect=failing_directory_fsync):
+            with self.assertRaises(assembler.AssemblyRefusal) as refused:
+                self.package()
+        self.assertEqual(refused.exception.code, "archive_verification_failed")
+        self.assertFalse(refused.exception.cleanup_complete)
+        self.assert_no_output()
+        self.assertEqual(self.staging_paths(), [])
 
     def test_source_directory_is_never_an_output_and_inputs_are_not_mutated(self) -> None:
         before = {path.name: path.read_bytes() for path in self.inputs.iterdir()}

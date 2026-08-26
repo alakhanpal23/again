@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import hashlib
 import io
 import json
 import os
 from pathlib import Path, PurePath, PurePosixPath
 import re
+import secrets
 import stat
 import sys
 from typing import Any
@@ -54,9 +56,10 @@ SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
 class AssemblyRefusal(ValueError):
     """Stable fail-closed refusal from the evidence assembler."""
 
-    def __init__(self, code: str):
+    def __init__(self, code: str, *, cleanup_complete: bool = True):
         super().__init__(code)
         self.code = code
+        self.cleanup_complete = cleanup_complete
 
 
 @dataclasses.dataclass(frozen=True)
@@ -138,6 +141,10 @@ def _directory_flags() -> int:
 
 def _regular_read_flags() -> int:
     return os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _regular_audit_flags() -> int:
+    return _regular_read_flags() | getattr(os, "O_NONBLOCK", 0)
 
 
 def _path_components(path: os.PathLike[str] | str) -> tuple[bool, tuple[str, ...]]:
@@ -366,18 +373,153 @@ def _same_created_file(
 
 def _unlink_created_file(
     directory_fd: int,
-    output_name: str,
+    name: str,
     identity: tuple[int, int] | None,
-) -> None:
-    if identity is None or not _same_created_file(directory_fd, output_name, identity):
-        return
+) -> bool:
+    """Remove only the exact inode created by this invocation."""
+
+    if identity is None:
+        return True
     try:
-        os.unlink(output_name, dir_fd=directory_fd)
+        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if not stat.S_ISREG(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+        return False
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except OSError:
+        return False
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+MAX_STAGING_CREATE_ATTEMPTS = 16
+STAGING_TOKEN_BYTES = 16
+
+
+def _create_staging_file(directory_fd: int) -> tuple[str, int, tuple[int, int]]:
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    for _ in range(MAX_STAGING_CREATE_ATTEMPTS):
+        name = f".again-evidence-stage-{secrets.token_hex(STAGING_TOKEN_BYTES)}.tmp"
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        except OSError as error:
+            raise AssemblyRefusal("staging_unavailable") from error
+        identity: tuple[int, int] | None = None
+        try:
+            initial = os.fstat(descriptor)
+            identity = (initial.st_dev, initial.st_ino)
+            os.fchmod(descriptor, 0o600)
+            metadata = os.fstat(descriptor)
+        except OSError as error:
+            cleanup_complete = True
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_complete = False
+            if identity is None:
+                cleanup_complete = False
+            else:
+                cleanup_complete = (
+                    _unlink_created_file(directory_fd, name, identity) and cleanup_complete
+                )
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                cleanup_complete = False
+            raise AssemblyRefusal(
+                "staging_unavailable", cleanup_complete=cleanup_complete
+            ) from error
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size != 0
+        ):
+            try:
+                os.close(descriptor)
+            except OSError:
+                cleanup_complete = False
+            else:
+                cleanup_complete = True
+            cleanup_complete = (
+                _unlink_created_file(directory_fd, name, identity) and cleanup_complete
+            )
+            try:
+                os.fsync(directory_fd)
+            except OSError:
+                cleanup_complete = False
+            raise AssemblyRefusal(
+                "staging_identity_changed", cleanup_complete=cleanup_complete
+            )
+        return name, descriptor, (metadata.st_dev, metadata.st_ino)
+    raise AssemblyRefusal("staging_name_exhausted")
+
+
+def _read_descriptor_bytes(descriptor: int, limit: int) -> tuple[bytes, os.stat_result]:
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size < 0
+            or before.st_size > limit
+        ):
+            raise AssemblyRefusal("output_identity_changed")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        chunks: list[bytes] = []
+        observed = 0
+        while True:
+            chunk = os.read(descriptor, min(64 * 1024, limit + 1 - observed))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            observed += len(chunk)
+            if observed > limit:
+                raise AssemblyRefusal("output_identity_changed")
+        after = os.fstat(descriptor)
+    except AssemblyRefusal:
+        raise
+    except OSError as error:
+        raise AssemblyRefusal("output_identity_changed") from error
+    if _file_identity(before) != _file_identity(after) or observed != before.st_size:
+        raise AssemblyRefusal("output_identity_changed")
+    return b"".join(chunks), after
+
+
+def _cleanup_failed_assembly(
+    directory_fd: int,
+    staging_name: str | None,
+    created_identity: tuple[int, int] | None,
+    output_name: str,
+    final_identity: tuple[int, int] | None,
+    cleanup_complete: bool,
+) -> bool:
+    complete = cleanup_complete
+    if final_identity is not None:
+        complete = _unlink_created_file(directory_fd, output_name, final_identity) and complete
+    if staging_name is not None:
+        complete = _unlink_created_file(directory_fd, staging_name, created_identity) and complete
+    try:
         os.fsync(directory_fd)
     except OSError:
-        # The caller still receives failure. Never unlink an identity we can no
-        # longer prove is the file created by this invocation.
-        return
+        complete = False
+    return complete
 
 
 def package_evidence(
@@ -396,28 +538,24 @@ def package_evidence(
     expected_archive_sha256 = hashlib.sha256(archive_bytes).hexdigest()
 
     output_fd = _open_directory_no_follow(output_directory)
+    staging_name: str | None = None
     archive_fd: int | None = None
+    final_audit_fd: int | None = None
     created_identity: tuple[int, int] | None = None
-    output_path = Path(output_directory) / output_name
+    final_identity: tuple[int, int] | None = None
+    output_directory_identity: tuple[int, int] | None = None
+    primary: BaseException | None = None
+    audit: dict[str, object] | None = None
+    cleanup_complete = True
     try:
-        output_metadata = os.fstat(output_fd)
-        if (output_metadata.st_dev, output_metadata.st_ino) == input_identity:
-            raise AssemblyRefusal("source_mutation_forbidden")
-        flags = (
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-        )
         try:
-            archive_fd = os.open(output_name, flags, 0o600, dir_fd=output_fd)
-        except FileExistsError as error:
-            raise AssemblyRefusal("output_exists") from error
+            output_metadata = os.fstat(output_fd)
         except OSError as error:
             raise AssemblyRefusal("output_unavailable") from error
-        created = os.fstat(archive_fd)
-        created_identity = (created.st_dev, created.st_ino)
+        output_directory_identity = (output_metadata.st_dev, output_metadata.st_ino)
+        if (output_metadata.st_dev, output_metadata.st_ino) == input_identity:
+            raise AssemblyRefusal("source_mutation_forbidden")
+        staging_name, archive_fd, created_identity = _create_staging_file(output_fd)
         offset = 0
         try:
             while offset < len(archive_bytes):
@@ -429,16 +567,21 @@ def package_evidence(
         except OSError as error:
             raise AssemblyRefusal("output_write_failed") from error
 
-        written = os.fstat(archive_fd)
+        try:
+            written = os.fstat(archive_fd)
+        except OSError as error:
+            raise AssemblyRefusal("output_identity_changed") from error
         if (
             not stat.S_ISREG(written.st_mode)
+            or stat.S_IMODE(written.st_mode) != 0o600
             or written.st_nlink != 1
             or written.st_size != len(archive_bytes)
         ):
             raise AssemblyRefusal("output_identity_changed")
+        staging_path = Path(output_directory) / staging_name
         try:
             audit = verifier.verify_archive(
-                output_path,
+                staging_path,
                 expectations.source_commit,
                 expectations.binary_sha256,
                 expectations.source_sha256,
@@ -447,28 +590,166 @@ def package_evidence(
             )
         except verifier.EvidenceError as error:
             raise AssemblyRefusal("archive_verification_failed") from error
-        after_verify = os.fstat(archive_fd)
+        try:
+            after_verify = os.fstat(archive_fd)
+        except OSError as error:
+            raise AssemblyRefusal("output_identity_changed") from error
         if (
             _file_identity(after_verify) != _file_identity(written)
-            or not _same_created_file(output_fd, output_name, created_identity)
+            or not _same_created_file(output_fd, staging_name, created_identity)
             or audit.get("archive_sha256") != expected_archive_sha256
         ):
             raise AssemblyRefusal("output_identity_changed")
+
+        staged_bytes, staged_metadata = _read_descriptor_bytes(
+            archive_fd, verifier.MAX_ARCHIVE_BYTES
+        )
+        if (
+            staged_bytes != archive_bytes
+            or hashlib.sha256(staged_bytes).hexdigest() != expected_archive_sha256
+            or stat.S_IMODE(staged_metadata.st_mode) != 0o600
+            or staged_metadata.st_nlink != 1
+        ):
+            raise AssemblyRefusal("output_identity_changed")
+        try:
+            os.close(archive_fd)
+        except OSError as error:
+            cleanup_complete = False
+            raise AssemblyRefusal("output_close_failed", cleanup_complete=False) from error
+        archive_fd = None
+
+        try:
+            os.link(
+                staging_name,
+                output_name,
+                src_dir_fd=output_fd,
+                dst_dir_fd=output_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            raise AssemblyRefusal("output_exists") from error
+        except (NotImplementedError, TypeError) as error:
+            raise AssemblyRefusal("publication_unsupported") from error
+        except OSError as error:
+            if error.errno in {errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP}:
+                raise AssemblyRefusal("publication_unsupported") from error
+            raise AssemblyRefusal("publication_failed") from error
+        final_identity = created_identity
+        try:
+            published = os.stat(output_name, dir_fd=output_fd, follow_symlinks=False)
+        except OSError as error:
+            raise AssemblyRefusal("publication_identity_changed") from error
+        if (
+            not stat.S_ISREG(published.st_mode)
+            or (published.st_dev, published.st_ino) != created_identity
+            or stat.S_IMODE(published.st_mode) != 0o600
+            or published.st_nlink != 2
+            or published.st_size != len(archive_bytes)
+        ):
+            raise AssemblyRefusal("publication_identity_changed")
+        if not _unlink_created_file(output_fd, staging_name, created_identity):
+            raise AssemblyRefusal("staging_unlink_failed")
+        staging_name = None
+
         try:
             os.fsync(output_fd)
         except OSError as error:
-            raise AssemblyRefusal("output_write_failed") from error
+            raise AssemblyRefusal("publication_fsync_failed") from error
+
+        try:
+            final_audit_fd = os.open(output_name, _regular_audit_flags(), dir_fd=output_fd)
+        except OSError as error:
+            raise AssemblyRefusal("output_identity_changed") from error
+        final_bytes, final_metadata = _read_descriptor_bytes(
+            final_audit_fd, verifier.MAX_ARCHIVE_BYTES
+        )
+        try:
+            final_path_metadata = os.stat(
+                output_name, dir_fd=output_fd, follow_symlinks=False
+            )
+        except OSError as error:
+            raise AssemblyRefusal("output_identity_changed") from error
+        if (
+            not stat.S_ISREG(final_metadata.st_mode)
+            or (final_metadata.st_dev, final_metadata.st_ino) != created_identity
+            or _file_identity(final_path_metadata) != _file_identity(final_metadata)
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            or final_metadata.st_nlink != 1
+            or final_metadata.st_size != len(archive_bytes)
+            or final_bytes != archive_bytes
+            or hashlib.sha256(final_bytes).hexdigest() != expected_archive_sha256
+        ):
+            raise AssemblyRefusal("output_identity_changed")
+        try:
+            os.close(final_audit_fd)
+        except OSError as error:
+            cleanup_complete = False
+            raise AssemblyRefusal("output_close_failed", cleanup_complete=False) from error
+        final_audit_fd = None
+    except BaseException as error:
+        primary = error
+
+    if primary is None:
+        try:
+            os.close(output_fd)
+        except OSError as error:
+            recovery_fd: int | None = None
+            try:
+                recovery_fd = _open_directory_no_follow(output_directory)
+                recovered = os.fstat(recovery_fd)
+                if (recovered.st_dev, recovered.st_ino) == output_directory_identity:
+                    _cleanup_failed_assembly(
+                        recovery_fd,
+                        staging_name,
+                        created_identity,
+                        output_name,
+                        final_identity,
+                        False,
+                    )
+            except (AssemblyRefusal, OSError):
+                pass
+            finally:
+                if recovery_fd is not None:
+                    try:
+                        os.close(recovery_fd)
+                    except OSError:
+                        pass
+            raise AssemblyRefusal("output_close_failed", cleanup_complete=False) from error
+        if audit is None:
+            raise AssemblyRefusal("internal_audit_missing")
         return audit
-    except BaseException:
-        if archive_fd is not None:
-            os.close(archive_fd)
+
+    for descriptor_name in ("final_audit_fd", "archive_fd"):
+        descriptor = final_audit_fd if descriptor_name == "final_audit_fd" else archive_fd
+        if descriptor is None:
+            continue
+        try:
+            os.close(descriptor)
+        except OSError:
+            cleanup_complete = False
+        if descriptor_name == "final_audit_fd":
+            final_audit_fd = None
+        else:
             archive_fd = None
-        _unlink_created_file(output_fd, output_name, created_identity)
-        raise
-    finally:
-        if archive_fd is not None:
-            os.close(archive_fd)
+
+    if isinstance(primary, AssemblyRefusal):
+        cleanup_complete = primary.cleanup_complete and cleanup_complete
+    cleanup_complete = _cleanup_failed_assembly(
+        output_fd,
+        staging_name,
+        created_identity,
+        output_name,
+        final_identity,
+        cleanup_complete,
+    )
+    try:
         os.close(output_fd)
+    except OSError:
+        cleanup_complete = False
+
+    if isinstance(primary, AssemblyRefusal):
+        raise AssemblyRefusal(primary.code, cleanup_complete=cleanup_complete) from primary
+    raise primary
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
