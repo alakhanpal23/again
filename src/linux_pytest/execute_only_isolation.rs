@@ -27,8 +27,15 @@
 use std::fmt;
 
 use super::RefusalCode;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::execute_only_stdio::ProfileStdioIsolationChildV1;
 use super::isolation_qualification::{
-    self, BlockedRootlessNamespaceBootstrapV1, IsolationChildContinuationV1,
+    self, BlockedRootlessNamespaceBootstrapV1, IsolationCancellationFailureV1,
     IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1,
 };
 
@@ -209,6 +216,29 @@ pub(super) struct FirstExecuteOnlyIsolationReadyPermitV1 {
     state: BlockedIsolationStateV1,
 }
 
+/// Typed uncertainty from explicit cancellation of an isolation-ready child.
+/// The live guard has been consumed and still performs its bounded Drop
+/// fallback, but that retry is not observable and cannot prove cleanup.
+pub(super) struct ExecuteOnlyIsolationCancellationFailureV1 {
+    errno: Option<i32>,
+}
+
+impl ExecuteOnlyIsolationCancellationFailureV1 {
+    pub(super) const fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+}
+
+impl fmt::Debug for ExecuteOnlyIsolationCancellationFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecuteOnlyIsolationCancellationFailureV1")
+            .field("errno", &self.errno)
+            .field("cleanup_complete", &false)
+            .finish()
+    }
+}
+
 impl fmt::Debug for FirstExecuteOnlyIsolationReadyPermitV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -216,6 +246,20 @@ impl fmt::Debug for FirstExecuteOnlyIsolationReadyPermitV1 {
             .field("state", &"isolation-ready-non-authoritative")
             .field("live", &"<opaque-cleanup-owned>")
             .finish()
+    }
+}
+
+impl FirstExecuteOnlyIsolationReadyPermitV1 {
+    pub(super) fn cancel_and_reap_v1(
+        self,
+    ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
+        self._live
+            .cancel_and_reap_v1()
+            .map_err(|failure: IsolationCancellationFailureV1| {
+                ExecuteOnlyIsolationCancellationFailureV1 {
+                    errno: failure.errno(),
+                }
+            })
     }
 }
 
@@ -229,13 +273,17 @@ pub(super) fn begin_blocked_execute_only_isolation_v1()
 /// Compose one sibling-owned continuation into namespace PID 1 before clone.
 /// The parent drops its fork-local copy immediately and retains only cleanup
 /// ownership.
-pub(super) fn begin_blocked_execute_only_isolation_with_child_v1<
-    C: IsolationChildContinuationV1,
->(
-    continuation: C,
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_execute_only_isolation_with_profile_stdio_v1(
+    continuation: ProfileStdioIsolationChildV1,
 ) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
     finish_blocked_execute_only_isolation_v1(
-        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_child_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_profile_stdio_v1(
             continuation,
         ),
     )
@@ -309,26 +357,6 @@ impl BlockedExecuteOnlyIsolationContinuationPermitV1 {
 mod tests {
     use super::*;
 
-    struct SiblingOwnedStdioPlacementV1;
-
-    // SAFETY: this compile-only sibling shape owns no resources, has trivial
-    // fork-local Drop, and performs no operation. A real stdio implementation
-    // must own only child-half endpoints and satisfy the stronger raw-syscall
-    // consumption/Drop contract before reporting placement.
-    unsafe impl isolation_qualification::IsolationChildContinuationV1 for SiblingOwnedStdioPlacementV1 {
-        const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
-
-        fn continue_in_child_v1(
-            self,
-            _brand: isolation_qualification::IsolationChildOnlyBrandV1,
-        ) -> Result<
-            isolation_qualification::IsolationChildStdioStateV1,
-            isolation_qualification::IsolationChildContinuationFailureV1,
-        > {
-            Ok(isolation_qualification::IsolationChildStdioStateV1::PlacedAndAuthenticated)
-        }
-    }
-
     #[test]
     fn state_machine_is_monotonic_and_poison_preserves_first_failure() {
         let mut state = BlockedIsolationStateV1::new();
@@ -397,20 +425,20 @@ mod tests {
         <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfCopy<_>>::probe();
     }
 
-    #[cfg(not(all(
+    #[cfg(all(
         target_os = "linux",
         target_arch = "x86_64",
         target_env = "gnu",
         target_pointer_width = "64"
-    )))]
+    ))]
     #[test]
-    fn sibling_child_continuation_composes_without_parent_resource_access() {
-        assert!(!std::mem::needs_drop::<SiblingOwnedStdioPlacementV1>());
-        let error =
-            begin_blocked_execute_only_isolation_with_child_v1(SiblingOwnedStdioPlacementV1)
-                .unwrap_err();
-        assert_eq!(error.stage(), "platform");
-        assert!(error.cleanup_complete());
+    fn stdio_composition_surface_accepts_only_the_concrete_profile_child() {
+        let _concrete: fn(
+            ProfileStdioIsolationChildV1,
+        ) -> Result<
+            BlockedExecuteOnlyIsolationV1,
+            BlockedExecuteOnlyIsolationFailureV1,
+        > = begin_blocked_execute_only_isolation_with_profile_stdio_v1;
     }
 
     #[cfg(not(all(
@@ -472,7 +500,9 @@ mod tests {
             format!("{ready:?}"),
             "FirstExecuteOnlyIsolationReadyPermitV1 { state: \"isolation-ready-non-authoritative\", live: \"<opaque-cleanup-owned>\" }"
         );
-        drop(ready);
+        ready
+            .cancel_and_reap_v1()
+            .expect("explicit cancellation must terminally reap the child");
     }
 
     #[cfg(all(
@@ -489,13 +519,15 @@ mod tests {
         let (parent_capture, child_stdio) = session
             .split_for_isolation_v1()
             .expect("pre-clone linear split");
-        let blocked = begin_blocked_execute_only_isolation_with_child_v1(child_stdio)
+        let blocked = begin_blocked_execute_only_isolation_with_profile_stdio_v1(child_stdio)
             .expect("authenticated child consumes only the stdio child half");
         let ready = blocked
             .into_continuation_permit()
             .continue_to_isolation_ready_v1()
             .expect("stdio placement preserves protocol descriptors 3 and 4");
-        drop(ready);
+        ready
+            .cancel_and_reap_v1()
+            .expect("explicit cancellation must terminally reap the child");
         let capture = parent_capture
             .drain_capture_v1()
             .expect("isolation cleanup closes child writers and exposes exact EOF");

@@ -32,10 +32,7 @@ use std::time::{Duration, Instant};
     target_env = "gnu",
     target_pointer_width = "64"
 ))]
-use super::isolation_qualification::{
-    IsolationChildContinuationFailureV1, IsolationChildContinuationV1, IsolationChildOnlyBrandV1,
-    IsolationChildStdioStateV1,
-};
+use super::isolation_qualification::IsolationChildOnlyBrandV1;
 
 const STREAM_CAPTURE_LIMIT_V1: usize = super::LINUX_PYTEST_V1_MAX_STREAM_BYTES as usize;
 const DRAIN_BUFFER_BYTES_V1: usize = 64 * 1024;
@@ -963,7 +960,14 @@ impl fmt::Debug for ProfileStdioIsolationChildV1 {
     target_pointer_width = "64"
 ))]
 impl ProfileStdioIsolationChildV1 {
-    fn continue_raw_v1(mut self) -> Result<IsolationChildStdioStateV1, i32> {
+    pub(super) fn continue_in_authenticated_child_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<(), i32> {
+        self.continue_raw_v1()
+    }
+
+    fn continue_raw_v1(mut self) -> Result<(), i32> {
         let roles = [
             (
                 FdRoleV1::ChildStdin,
@@ -1059,7 +1063,7 @@ impl ProfileStdioIsolationChildV1 {
                 }
                 self.descriptors[index].take();
             }
-            Ok(IsolationChildStdioStateV1::PlacedAndAuthenticated)
+            Ok(())
         })();
 
         if let Err(primary) = result {
@@ -1077,7 +1081,7 @@ impl ProfileStdioIsolationChildV1 {
             }
             return Err(primary);
         }
-        Ok(IsolationChildStdioStateV1::PlacedAndAuthenticated)
+        Ok(())
     }
 }
 
@@ -1134,27 +1138,6 @@ fn child_fcntl_v1(
 ))]
 fn child_errno_v1() -> i32 {
     unsafe { *libc::__errno_location() }
-}
-
-// SAFETY: this value owns only three child pipe endpoints above descriptor 4.
-// Its fork-local Drop and child consumption use direct syscalls only, without
-// allocation, locks, unwinding, libc cleanup wrappers, or parent authority.
-#[cfg(all(
-    target_os = "linux",
-    target_arch = "x86_64",
-    target_env = "gnu",
-    target_pointer_width = "64"
-))]
-unsafe impl IsolationChildContinuationV1 for ProfileStdioIsolationChildV1 {
-    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
-
-    fn continue_in_child_v1(
-        self,
-        _brand: IsolationChildOnlyBrandV1,
-    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
-        self.continue_raw_v1()
-            .map_err(|errno| IsolationChildContinuationFailureV1::new(Some(errno)))
-    }
 }
 
 pub(super) struct BlockedChildStdioHandoffV1<S: ProfileStdioSyscallsV1> {
@@ -1435,6 +1418,15 @@ impl<S: ProfileStdioSyscallsV1> Drop for ParentStdioDrainV1<S> {
 }
 
 impl<S: ProfileStdioSyscallsV1> ParentStdioDrainV1<S> {
+    /// Close every parent endpoint without waiting for EOF.
+    ///
+    /// This is reserved for setup refusal or for cancellation paths where the
+    /// child could not be proved terminally reaped. It is deliberately
+    /// consuming and reports only cleanup completeness.
+    pub(super) fn close_without_capture_v1(mut self) -> bool {
+        self.cleanup_all()
+    }
+
     /// Issue the drain's only cancellation signal before moving the drain to
     /// its foreground owner.
     pub(super) fn take_cancellation(&mut self) -> Option<ProfileStdioDrainCancellationV1> {
@@ -2308,6 +2300,27 @@ mod tests {
             },
             state,
         )
+    }
+
+    #[test]
+    fn close_without_capture_is_consuming_and_reports_every_close_failure() {
+        let (parent, state) = fake_parent();
+        assert!(parent.close_without_capture_v1());
+        assert!(state.borrow().open.is_empty());
+
+        let (parent, state) = fake_parent();
+        state.borrow_mut().fail_at = Some(1);
+        assert!(!parent.close_without_capture_v1());
+        assert!(state.borrow().open.is_empty());
+        assert_eq!(
+            state
+                .borrow()
+                .calls
+                .iter()
+                .filter(|operation| matches!(operation, StdioOperationV1::Close(_)))
+                .count(),
+            2
+        );
     }
 
     fn eof_schedule(state: &Rc<RefCell<FakeStateV1>>) {

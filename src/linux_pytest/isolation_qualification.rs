@@ -38,6 +38,14 @@
 use super::RefusalCode;
 use std::fmt;
 
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::execute_only_stdio::ProfileStdioIsolationChildV1;
+
 const PROTOCOL_VERSION_V2: u16 = 2;
 
 /// Completed, terminally reaped diagnostic evidence.
@@ -57,18 +65,18 @@ pub(super) struct IsolationChildOnlyBrandV1 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum IsolationChildStdioStateV1 {
+enum IsolationChildStdioStateV1 {
     Closed,
     PlacedAndAuthenticated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct IsolationChildContinuationFailureV1 {
+struct IsolationChildContinuationFailureV1 {
     errno: Option<i32>,
 }
 
 impl IsolationChildContinuationFailureV1 {
-    pub(super) const fn new(errno: Option<i32>) -> Self {
+    const fn new(errno: Option<i32>) -> Self {
         Self { errno }
     }
 }
@@ -91,7 +99,7 @@ impl IsolationChildContinuationFailureV1 {
 /// must use only async-signal-safe raw syscalls and may report
 /// `PlacedAndAuthenticated` only after atomically placing and authenticating
 /// descriptors 0, 1, and 2. The brand cannot be constructed by the parent.
-pub(super) unsafe trait IsolationChildContinuationV1: Sized {
+unsafe trait IsolationChildContinuationV1: Sized {
     /// Whether this product continuation requires an empty supplementary-group
     /// set before the parent irreversibly denies `setgroups` and writes the GID
     /// map. The fixed command-free diagnostic deliberately preserves its
@@ -103,6 +111,29 @@ pub(super) unsafe trait IsolationChildContinuationV1: Sized {
         self,
         brand: IsolationChildOnlyBrandV1,
     ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1>;
+}
+
+// SAFETY: this is the only production implementation of the child continuation
+// seam. The concrete value can be issued only by the profile-owned stdio split;
+// it owns only three child pipe endpoints and performs only raw, fork-safe
+// descriptor operations after receiving the unforgeable child brand.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildContinuationV1 for ProfileStdioIsolationChildV1 {
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+
+    fn continue_in_child_v1(
+        self,
+        brand: IsolationChildOnlyBrandV1,
+    ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
+        self.continue_in_authenticated_child_v1(brand)
+            .map(|()| IsolationChildStdioStateV1::PlacedAndAuthenticated)
+            .map_err(|errno| IsolationChildContinuationFailureV1::new(Some(errno)))
+    }
 }
 
 struct CloseInheritedStdioV1;
@@ -493,6 +524,19 @@ pub(super) struct IsolationReadyRootlessNamespaceV1 {
     _inner: platform::IsolationReadyRootlessNamespaceV1,
 }
 
+/// Failure to prove terminal cleanup of an isolation-ready command-free child.
+/// The consumed platform guard still performs its bounded Drop fallback, but
+/// that unobservable retry cannot upgrade this refusal to complete cleanup.
+pub(super) struct IsolationCancellationFailureV1 {
+    errno: Option<i32>,
+}
+
+impl IsolationCancellationFailureV1 {
+    pub(super) const fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+}
+
 impl fmt::Debug for BlockedRootlessNamespaceBootstrapV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -513,6 +557,14 @@ impl fmt::Debug for IsolationReadyRootlessNamespaceV1 {
     }
 }
 
+impl IsolationReadyRootlessNamespaceV1 {
+    pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+        self._inner
+            .cancel_and_reap_v1()
+            .map_err(|errno| IsolationCancellationFailureV1 { errno })
+    }
+}
+
 impl BlockedRootlessNamespaceBootstrapV1 {
     pub(super) fn continue_to_isolation_ready_v1(
         self,
@@ -525,16 +577,28 @@ impl BlockedRootlessNamespaceBootstrapV1 {
 
 pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1()
 -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
-    begin_blocked_rootless_namespace_bootstrap_with_child_v1(CloseInheritedStdioV1)
+    begin_blocked_rootless_namespace_bootstrap_with_continuation_v1(CloseInheritedStdioV1)
 }
 
-pub(super) fn begin_blocked_rootless_namespace_bootstrap_with_child_v1<
+fn begin_blocked_rootless_namespace_bootstrap_with_continuation_v1<
     C: IsolationChildContinuationV1,
 >(
     continuation: C,
 ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
     platform::begin_blocked_rootless_namespace_bootstrap_v1(continuation)
         .map(|inner| BlockedRootlessNamespaceBootstrapV1 { _inner: inner })
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_rootless_namespace_bootstrap_with_profile_stdio_v1(
+    continuation: ProfileStdioIsolationChildV1,
+) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    begin_blocked_rootless_namespace_bootstrap_with_continuation_v1(continuation)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -629,6 +693,12 @@ mod platform {
 
     pub(super) struct IsolationReadyRootlessNamespaceV1 {
         _private: (),
+    }
+
+    impl IsolationReadyRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
+            Err(Some(libc::ENOSYS))
+        }
     }
 
     impl BlockedRootlessNamespaceBootstrapV1 {
@@ -1822,6 +1892,12 @@ mod platform {
     pub(super) struct IsolationReadyRootlessNamespaceV1 {
         _guard: ProbeChildGuardV1,
         _nonce: [u8; NONCE_BYTES_V1],
+    }
+
+    impl IsolationReadyRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(mut self) -> Result<(), Option<i32>> {
+            self._guard.kill_and_reap()
+        }
     }
 
     pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
@@ -10619,6 +10695,12 @@ mod platform {
         _private: (),
     }
 
+    impl IsolationReadyRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
+            Err(Some(libc::ENOSYS))
+        }
+    }
+
     impl BlockedRootlessNamespaceBootstrapV1 {
         pub(super) fn continue_to_isolation_ready_v1(
             self,
@@ -10668,6 +10750,12 @@ mod platform {
 
     pub(super) struct IsolationReadyRootlessNamespaceV1 {
         _private: (),
+    }
+
+    impl IsolationReadyRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
+            Err(Some(libc::ENOSYS))
+        }
     }
 
     impl BlockedRootlessNamespaceBootstrapV1 {

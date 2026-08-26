@@ -70,6 +70,7 @@ pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 
 mod canonical;
 mod execute_only_admission;
+mod execute_only_connector;
 mod execute_only_isolation;
 mod execute_only_runtime;
 mod execute_only_seccomp;
