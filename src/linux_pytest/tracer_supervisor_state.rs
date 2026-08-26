@@ -21,8 +21,8 @@ use super::tracer_event_message::{
     decode_linux_ptrace_event_message_x86_64_v1,
 };
 use super::tracer_fork_decode::{
-    Clone3ArgsCaptureV1, ForkFamilyBirthObservationV1, ForkFamilyDecodeErrorV1,
-    decode_fork_family_entry_x86_64_v1,
+    CLONE3_ARGS_BUFFER_BYTES_V1, Clone3ArgsCaptureV1, ForkFamilyBirthObservationV1,
+    ForkFamilyDecodeErrorV1, decode_fork_family_entry_x86_64_v1, plan_clone3_args_read_x86_64_v1,
 };
 use super::tracer_syscall_info::{
     DecodedPtraceSyscallInfoX8664V1, DecodedSeccompSyscallInfoX8664V1,
@@ -143,6 +143,36 @@ pub(super) struct StoppedSeccompTaskPermitV1 {
     frame: DecodedSeccompSyscallInfoX8664V1,
 }
 
+/// Linear instruction to copy one exact native `clone_args` prefix while the
+/// correlated seccomp stop remains held.
+///
+/// The raw address and syscall frame exist only in this transport token. The
+/// token is neither `Clone` nor `Copy`, and its private fields prevent a
+/// sibling from changing its task, stop, address, or declared length. It is
+/// still only a pure-planner instruction: no process-memory read is proven.
+pub(super) struct TracerSupervisorClone3ArgsReadV1 {
+    session_brand: u64,
+    raw_tid: i32,
+    stop_generation: u64,
+    address: u64,
+    byte_count: usize,
+    frame: DecodedSeccompSyscallInfoX8664V1,
+}
+
+impl TracerSupervisorClone3ArgsReadV1 {
+    pub(super) const fn raw_tid(&self) -> i32 {
+        self.raw_tid
+    }
+
+    pub(super) const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub(super) const fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+}
+
 /// One linear resume instruction. Its private correlation fields bind it to
 /// one supervisor, one held stop, and one cursor position.
 pub(super) struct TracerSupervisorResumeIntentV1 {
@@ -170,6 +200,7 @@ pub(super) enum TracerSupervisorIntentV1 {
     ReadEventMessage(TracerSupervisorEventMessageReadV1),
     ReadSyscallInfo(TracerSupervisorSyscallInfoReadV1),
     HoldStoppedSeccompTask(StoppedSeccompTaskPermitV1),
+    ReadClone3Args(TracerSupervisorClone3ArgsReadV1),
     Resume(TracerSupervisorResumeIntentV1),
     WaitForNextStop,
 }
@@ -199,7 +230,9 @@ pub(super) enum TracerSupervisorExecuteOnlyReasonV1 {
     SyscallInfoShapeMismatch,
     SeccompPermitResponseOutOfOrder,
     SeccompPermitCorrelationMismatch,
-    Clone3MemoryReaderUnavailable,
+    Clone3ArgsReadResponseOutOfOrder,
+    Clone3ArgsReadCorrelationMismatch,
+    Clone3ArgsReadUnavailable,
     ForkFamilyDecode(ForkFamilyDecodeErrorV1),
     PendingForkCapacityExceeded,
     DuplicatePendingFork,
@@ -231,6 +264,13 @@ enum PendingExchangeV1 {
         session_brand: u64,
         raw_tid: i32,
         stop_generation: u64,
+    },
+    Clone3ArgsRead {
+        session_brand: u64,
+        raw_tid: i32,
+        stop_generation: u64,
+        address: u64,
+        byte_count: usize,
     },
     Resume {
         session_brand: u64,
@@ -617,9 +657,98 @@ impl TracerSupervisorStateV1 {
         }
         let syscall_number = permit.frame.syscall_number();
         if syscall_number == TRACER_TASK_CLONE3_NR_X86_64_V1 {
-            return self.poison(TracerSupervisorExecuteOnlyReasonV1::Clone3MemoryReaderUnavailable);
+            let read_spec = match plan_clone3_args_read_x86_64_v1(permit.frame.arguments()) {
+                Ok(spec) => spec,
+                Err(error) => {
+                    return self
+                        .poison(TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(error));
+                }
+            };
+            let address = read_spec.address();
+            let byte_count = read_spec.byte_count();
+            self.exchange = PendingExchangeV1::Clone3ArgsRead {
+                session_brand: self.session_brand,
+                raw_tid,
+                stop_generation,
+                address,
+                byte_count,
+            };
+            return Ok(TracerSupervisorIntentV1::ReadClone3Args(
+                TracerSupervisorClone3ArgsReadV1 {
+                    session_brand: self.session_brand,
+                    raw_tid,
+                    stop_generation,
+                    address,
+                    byte_count,
+                    frame: permit.frame,
+                },
+            ));
         }
-        let fork = self.decode_pending_fork(syscall_number, permit.frame.arguments())?;
+        self.finish_stopped_seccomp_frame(raw_tid, stop_generation, permit.frame, None, sink)
+    }
+
+    /// Consume the exact result of the requested bounded `clone_args` copy.
+    ///
+    /// The response remains correlated to the same held seccomp stop. No
+    /// resume can be issued before this token is consumed successfully.
+    pub(super) fn accept_clone3_args_read<S: NormalizedTracerTaskEventSinkV1>(
+        &mut self,
+        token: TracerSupervisorClone3ArgsReadV1,
+        capture: Clone3ArgsCaptureV1<'_>,
+        sink: &mut S,
+    ) -> Result<TracerSupervisorIntentV1, TracerSupervisorExecuteOnlyReasonV1> {
+        self.require_healthy()?;
+        let PendingExchangeV1::Clone3ArgsRead {
+            session_brand,
+            raw_tid,
+            stop_generation,
+            address,
+            byte_count,
+        } = self.exchange
+        else {
+            return self
+                .poison(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadResponseOutOfOrder);
+        };
+        if session_brand != self.session_brand
+            || token.session_brand != session_brand
+            || token.raw_tid != raw_tid
+            || token.stop_generation != stop_generation
+            || token.address != address
+            || token.byte_count != byte_count
+            || token.frame.syscall_number() != TRACER_TASK_CLONE3_NR_X86_64_V1
+            || token.frame.arguments()[0] != address
+            || token.frame.arguments()[1] != byte_count as u64
+        {
+            return self
+                .poison(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadCorrelationMismatch);
+        }
+        let exact = match capture {
+            Clone3ArgsCaptureV1::Exact {
+                copied_byte_count,
+                buffer,
+            } => (copied_byte_count, buffer),
+            Clone3ArgsCaptureV1::Unavailable => {
+                return self.poison(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadUnavailable);
+            }
+            Clone3ArgsCaptureV1::NotApplicable => {
+                return self.poison(TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(
+                    ForkFamilyDecodeErrorV1::UnexpectedClone3Capture,
+                ));
+            }
+        };
+        self.finish_stopped_seccomp_frame(raw_tid, stop_generation, token.frame, Some(exact), sink)
+    }
+
+    fn finish_stopped_seccomp_frame<S: NormalizedTracerTaskEventSinkV1>(
+        &mut self,
+        raw_tid: i32,
+        stop_generation: u64,
+        frame: DecodedSeccompSyscallInfoX8664V1,
+        clone3_capture: Option<(usize, &[u8; CLONE3_ARGS_BUFFER_BYTES_V1])>,
+        sink: &mut S,
+    ) -> Result<TracerSupervisorIntentV1, TracerSupervisorExecuteOnlyReasonV1> {
+        let syscall_number = frame.syscall_number();
+        let fork = self.decode_pending_fork(syscall_number, frame.arguments(), clone3_capture)?;
         let pending_index = if fork.is_some() {
             if self.pending_fork_index(raw_tid).is_some() {
                 return self.poison(TracerSupervisorExecuteOnlyReasonV1::DuplicatePendingFork);
@@ -890,6 +1019,7 @@ impl TracerSupervisorStateV1 {
         &mut self,
         syscall_number: u32,
         arguments: &[u64; 6],
+        clone3_capture: Option<(usize, &[u8; CLONE3_ARGS_BUFFER_BYTES_V1])>,
     ) -> Result<
         Option<(LinuxPtraceEventV1, ForkFamilyBirthObservationV1)>,
         TracerSupervisorExecuteOnlyReasonV1,
@@ -897,6 +1027,7 @@ impl TracerSupervisorStateV1 {
         if !matches!(
             syscall_number,
             TRACER_TASK_CLONE_NR_X86_64_V1
+                | TRACER_TASK_CLONE3_NR_X86_64_V1
                 | TRACER_TASK_FORK_NR_X86_64_V1
                 | TRACER_TASK_VFORK_NR_X86_64_V1
         ) {
@@ -908,12 +1039,14 @@ impl TracerSupervisorStateV1 {
             LinuxPtraceEventV1::Vfork,
             LinuxPtraceEventV1::Clone,
         ] {
-            match decode_fork_family_entry_x86_64_v1(
-                syscall_number,
-                arguments,
-                Clone3ArgsCaptureV1::NotApplicable,
-                event,
-            ) {
+            let capture = match clone3_capture {
+                Some((copied_byte_count, buffer)) => Clone3ArgsCaptureV1::Exact {
+                    copied_byte_count,
+                    buffer,
+                },
+                None => Clone3ArgsCaptureV1::NotApplicable,
+            };
+            match decode_fork_family_entry_x86_64_v1(syscall_number, arguments, capture, event) {
                 Ok(observation) => return Ok(Some((event, observation))),
                 Err(ForkFamilyDecodeErrorV1::PtraceEventMismatch) => {}
                 Err(error) => {
@@ -1116,6 +1249,7 @@ mod tests {
     const CHILD_TID: i32 = 42_001;
     const GRANDCHILD_A_TID: i32 = 43_001;
     const GRANDCHILD_B_TID: i32 = 44_001;
+    const SIGCHLD: u64 = 17;
     const SIGTRAP: u8 = 5;
     const SIGSTOP: u8 = 19;
     const PTRACE_EVENT_STOP: u16 = 128;
@@ -1220,6 +1354,13 @@ mod tests {
         }
     }
 
+    fn take_clone3_read(intent: TracerSupervisorIntentV1) -> TracerSupervisorClone3ArgsReadV1 {
+        match intent {
+            TracerSupervisorIntentV1::ReadClone3Args(token) => token,
+            _ => panic!("expected clone3 args read"),
+        }
+    }
+
     fn take_resume(intent: TracerSupervisorIntentV1) -> TracerSupervisorResumeIntentV1 {
         match intent {
             TracerSupervisorIntentV1::Resume(intent) => intent,
@@ -1299,6 +1440,68 @@ mod tests {
             supervisor
                 .confirm_resume_succeeded(resume)
                 .expect("confirm seccomp resume"),
+            TracerSupervisorIntentV1::WaitForNextStop
+        ));
+    }
+
+    fn clone3_buffer(flags: u64, exit_signal: u64) -> [u8; CLONE3_ARGS_BUFFER_BYTES_V1] {
+        let mut buffer = [0_u8; CLONE3_ARGS_BUFFER_BYTES_V1];
+        buffer[0..8].copy_from_slice(&flags.to_le_bytes());
+        buffer[32..40].copy_from_slice(&exit_signal.to_le_bytes());
+        buffer
+    }
+
+    fn reach_clone3_read<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        address: u64,
+        declared_size: usize,
+        sink: &mut FixedSinkV1<N>,
+    ) -> TracerSupervisorClone3ArgsReadV1 {
+        let permit = reach_seccomp_permit(
+            supervisor,
+            raw_tid,
+            TRACER_TASK_CLONE3_NR_X86_64_V1,
+            [address, declared_size as u64, 0, 0, 0, 0],
+            sink,
+        );
+        take_clone3_read(
+            supervisor
+                .consume_stopped_seccomp_permit(permit, sink)
+                .expect("plan clone3 args read"),
+        )
+    }
+
+    fn enter_clone3<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        address: u64,
+        declared_size: usize,
+        sink: &mut FixedSinkV1<N>,
+    ) {
+        let read = reach_clone3_read(supervisor, raw_tid, address, declared_size, sink);
+        assert_eq!(read.raw_tid(), raw_tid);
+        assert_eq!(read.address(), address);
+        assert_eq!(read.byte_count(), declared_size);
+        let buffer = clone3_buffer(0, SIGCHLD);
+        let resume = take_resume(
+            supervisor
+                .accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: declared_size,
+                        buffer: &buffer,
+                    },
+                    sink,
+                )
+                .expect("accept clone3 args read"),
+        );
+        assert_eq!(resume.raw_tid(), raw_tid);
+        assert_eq!(resume.request(), TracerSupervisorResumeRequestV1::Syscall);
+        assert!(matches!(
+            supervisor
+                .confirm_resume_succeeded(resume)
+                .expect("confirm clone3 seccomp resume"),
             TracerSupervisorIntentV1::WaitForNextStop
         ));
     }
@@ -1884,7 +2087,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_live_tasks_allow_normal_syscalls_but_not_clone3_memory_capture() {
+    fn multiple_live_tasks_allow_normal_syscalls_and_bounded_clone3_capture() {
         let mut sink = FixedSinkV1::<16>::new();
         let mut supervisor = begin(&mut sink);
         enter_syscall(
@@ -1933,19 +2136,333 @@ mod tests {
         ));
         finish_syscall(&mut supervisor, ROOT_TID, ROOT_TID.into(), &mut sink);
 
-        let permit = reach_seccomp_permit(
-            &mut supervisor,
-            ROOT_TID,
-            TRACER_TASK_CLONE3_NR_X86_64_V1,
-            [0x1000, 88, 0, 0, 0, 0],
-            &mut sink,
-        );
-        assert_eq!(
-            supervisor
+        enter_clone3(&mut supervisor, ROOT_TID, 0x1000, 88, &mut sink);
+    }
+
+    #[test]
+    fn clone3_published_versions_request_exact_bounded_copy_before_resume() {
+        for declared_size in [64, 80, 88] {
+            let mut sink = FixedSinkV1::<16>::new();
+            let mut supervisor = begin(&mut sink);
+            let address = 0x1000 + declared_size as u64;
+            let read =
+                reach_clone3_read(&mut supervisor, ROOT_TID, address, declared_size, &mut sink);
+            assert_eq!(read.raw_tid(), ROOT_TID);
+            assert_eq!(read.address(), address);
+            assert_eq!(read.byte_count(), declared_size);
+            assert_eq!(sink.length, 1);
+
+            let buffer = clone3_buffer(0, SIGCHLD);
+            let resume = take_resume(
+                supervisor
+                    .accept_clone3_args_read(
+                        read,
+                        Clone3ArgsCaptureV1::Exact {
+                            copied_byte_count: declared_size,
+                            buffer: &buffer,
+                        },
+                        &mut sink,
+                    )
+                    .expect("exact clone3 capture"),
+            );
+            assert_eq!(sink.length, 2);
+            assert_eq!(resume.raw_tid(), ROOT_TID);
+            assert_eq!(resume.request(), TracerSupervisorResumeRequestV1::Syscall);
+            assert!(matches!(
+                supervisor.confirm_resume_succeeded(resume).unwrap(),
+                TracerSupervisorIntentV1::WaitForNextStop
+            ));
+            finish_syscall(&mut supervisor, ROOT_TID, -1, &mut sink);
+        }
+    }
+
+    #[test]
+    fn clone3_invalid_pointer_and_sizes_fail_before_copy_or_resume() {
+        for (address, declared_size, expected) in [
+            (0, 64, ForkFamilyDecodeErrorV1::Clone3NullArgsPointer),
+            (
+                0x1000,
+                63,
+                ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooSmall,
+            ),
+            (
+                0x1000,
+                65,
+                ForkFamilyDecodeErrorV1::Clone3DeclaredSizeAmbiguous,
+            ),
+            (
+                0x1000,
+                89,
+                ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooLarge,
+            ),
+        ] {
+            let mut sink = FixedSinkV1::<8>::new();
+            let mut supervisor = begin(&mut sink);
+            let permit = reach_seccomp_permit(
+                &mut supervisor,
+                ROOT_TID,
+                TRACER_TASK_CLONE3_NR_X86_64_V1,
+                [address, declared_size, 0, 0, 0, 0],
+                &mut sink,
+            );
+            let error = supervisor
                 .consume_stopped_seccomp_permit(permit, &mut sink)
+                .err();
+            assert_eq!(
+                error,
+                Some(TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(
+                    expected
+                ))
+            );
+            assert_eq!(sink.length, 1);
+            assert_eq!(supervisor.observe_wait(ROOT_TID, 9, &mut sink).err(), error);
+        }
+    }
+
+    #[test]
+    fn clone3_unavailable_short_long_and_dirty_tail_copies_fail_sticky() {
+        for case in 0..5 {
+            let mut sink = FixedSinkV1::<8>::new();
+            let mut supervisor = begin(&mut sink);
+            let read = reach_clone3_read(&mut supervisor, ROOT_TID, 0x1000, 64, &mut sink);
+            let mut buffer = clone3_buffer(0, SIGCHLD);
+            if case == 4 {
+                buffer[64] = 1;
+            }
+            let result = match case {
+                0 => supervisor.accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Unavailable,
+                    &mut sink,
+                ),
+                1 => supervisor.accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::NotApplicable,
+                    &mut sink,
+                ),
+                2 => supervisor.accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 63,
+                        buffer: &buffer,
+                    },
+                    &mut sink,
+                ),
+                3 => supervisor.accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 65,
+                        buffer: &buffer,
+                    },
+                    &mut sink,
+                ),
+                _ => supervisor.accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 64,
+                        buffer: &buffer,
+                    },
+                    &mut sink,
+                ),
+            };
+            let expected = match case {
+                0 => TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadUnavailable,
+                1 => TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(
+                    ForkFamilyDecodeErrorV1::UnexpectedClone3Capture,
+                ),
+                2 | 3 => TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(
+                    ForkFamilyDecodeErrorV1::Clone3CopiedByteCountMismatch,
+                ),
+                _ => TracerSupervisorExecuteOnlyReasonV1::ForkFamilyDecode(
+                    ForkFamilyDecodeErrorV1::Clone3UncopiedTailNonzero,
+                ),
+            };
+            assert_eq!(result.err(), Some(expected));
+            assert_eq!(sink.length, 1);
+            assert_eq!(
+                supervisor.observe_wait(ROOT_TID, 9, &mut sink).err(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn clone3_read_tokens_are_session_tid_stop_address_and_length_bound() {
+        for mutation in 0..5 {
+            let mut sink = FixedSinkV1::<8>::new();
+            let mut supervisor = begin(&mut sink);
+            let mut read = reach_clone3_read(&mut supervisor, ROOT_TID, 0x1000, 64, &mut sink);
+            match mutation {
+                0 => read.session_brand = read.session_brand.wrapping_add(1),
+                1 => read.raw_tid += 1,
+                2 => read.stop_generation = read.stop_generation.wrapping_add(1),
+                3 => read.address += 8,
+                _ => read.byte_count += 8,
+            }
+            let buffer = clone3_buffer(0, SIGCHLD);
+            let error = supervisor
+                .accept_clone3_args_read(
+                    read,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 64,
+                        buffer: &buffer,
+                    },
+                    &mut sink,
+                )
+                .err();
+            assert_eq!(
+                error,
+                Some(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadCorrelationMismatch)
+            );
+            assert_eq!(supervisor.observe_wait(ROOT_TID, 9, &mut sink).err(), error);
+        }
+
+        let mut sink_a = FixedSinkV1::<8>::new();
+        let mut sink_b = FixedSinkV1::<8>::new();
+        let mut supervisor_a = begin(&mut sink_a);
+        let mut supervisor_b = begin(&mut sink_b);
+        let read_a = reach_clone3_read(&mut supervisor_a, ROOT_TID, 0x1000, 64, &mut sink_a);
+        let _read_b = reach_clone3_read(&mut supervisor_b, ROOT_TID, 0x1000, 64, &mut sink_b);
+        let buffer = clone3_buffer(0, SIGCHLD);
+        assert_eq!(
+            supervisor_b
+                .accept_clone3_args_read(
+                    read_a,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 64,
+                        buffer: &buffer,
+                    },
+                    &mut sink_b,
+                )
                 .err(),
-            Some(TracerSupervisorExecuteOnlyReasonV1::Clone3MemoryReaderUnavailable)
+            Some(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadCorrelationMismatch)
         );
+    }
+
+    #[test]
+    fn duplicate_clone3_response_after_resume_intent_fails_out_of_order() {
+        let mut sink_a = FixedSinkV1::<8>::new();
+        let mut sink_b = FixedSinkV1::<8>::new();
+        let mut supervisor_a = begin(&mut sink_a);
+        let mut supervisor_b = begin(&mut sink_b);
+        let read_a = reach_clone3_read(&mut supervisor_a, ROOT_TID, 0x1000, 64, &mut sink_a);
+        let read_b = reach_clone3_read(&mut supervisor_b, ROOT_TID, 0x1000, 64, &mut sink_b);
+        let buffer = clone3_buffer(0, SIGCHLD);
+        assert!(matches!(
+            supervisor_a
+                .accept_clone3_args_read(
+                    read_a,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 64,
+                        buffer: &buffer,
+                    },
+                    &mut sink_a,
+                )
+                .unwrap(),
+            TracerSupervisorIntentV1::Resume(_)
+        ));
+        assert_eq!(
+            supervisor_a
+                .accept_clone3_args_read(
+                    read_b,
+                    Clone3ArgsCaptureV1::Exact {
+                        copied_byte_count: 64,
+                        buffer: &buffer,
+                    },
+                    &mut sink_a,
+                )
+                .err(),
+            Some(TracerSupervisorExecuteOnlyReasonV1::Clone3ArgsReadResponseOutOfOrder)
+        );
+    }
+
+    #[test]
+    fn clone3_fork_correlates_parent_first_and_child_first_delivery() {
+        for child_first in [false, true] {
+            let mut sink = FixedSinkV1::<16>::new();
+            let mut supervisor = begin(&mut sink);
+            enter_clone3(&mut supervisor, ROOT_TID, 0x1000, 88, &mut sink);
+
+            if child_first {
+                assert!(matches!(
+                    supervisor
+                        .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                        .unwrap(),
+                    TracerSupervisorIntentV1::WaitForNextStop
+                ));
+            }
+            let event_read = take_event_read(
+                supervisor
+                    .observe_wait(
+                        ROOT_TID,
+                        ptrace_event_status(LinuxPtraceEventV1::Fork),
+                        &mut sink,
+                    )
+                    .unwrap(),
+            );
+            let after_event = supervisor
+                .accept_event_message(event_read, &event_message(CHILD_TID as u64), &mut sink)
+                .unwrap();
+            if child_first {
+                confirm_child_then_parent(&mut supervisor, after_event, CHILD_TID, ROOT_TID);
+            } else {
+                assert!(matches!(
+                    after_event,
+                    TracerSupervisorIntentV1::WaitForNextStop
+                ));
+                let pair = supervisor
+                    .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                    .unwrap();
+                confirm_child_then_parent(&mut supervisor, pair, CHILD_TID, ROOT_TID);
+            }
+            finish_syscall(&mut supervisor, ROOT_TID, CHILD_TID.into(), &mut sink);
+        }
+    }
+
+    #[test]
+    fn clone3_capture_selects_exact_fork_vfork_and_clone_events() {
+        for (flags, exit_signal, expected_event) in [
+            (0, SIGCHLD, LinuxPtraceEventV1::Fork),
+            (0x4100, 0, LinuxPtraceEventV1::Vfork),
+            (0, 0, LinuxPtraceEventV1::Clone),
+        ] {
+            let mut sink = FixedSinkV1::<16>::new();
+            let mut supervisor = begin(&mut sink);
+            let read = reach_clone3_read(&mut supervisor, ROOT_TID, 0x1000, 88, &mut sink);
+            let buffer = clone3_buffer(flags, exit_signal);
+            let resume = take_resume(
+                supervisor
+                    .accept_clone3_args_read(
+                        read,
+                        Clone3ArgsCaptureV1::Exact {
+                            copied_byte_count: 88,
+                            buffer: &buffer,
+                        },
+                        &mut sink,
+                    )
+                    .unwrap(),
+            );
+            assert!(matches!(
+                supervisor.confirm_resume_succeeded(resume).unwrap(),
+                TracerSupervisorIntentV1::WaitForNextStop
+            ));
+            assert!(matches!(
+                supervisor
+                    .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                    .unwrap(),
+                TracerSupervisorIntentV1::WaitForNextStop
+            ));
+            let event_read = take_event_read(
+                supervisor
+                    .observe_wait(ROOT_TID, ptrace_event_status(expected_event), &mut sink)
+                    .unwrap(),
+            );
+            let pair = supervisor
+                .accept_event_message(event_read, &event_message(CHILD_TID as u64), &mut sink)
+                .unwrap();
+            confirm_child_then_parent(&mut supervisor, pair, CHILD_TID, ROOT_TID);
+            finish_syscall(&mut supervisor, ROOT_TID, CHILD_TID.into(), &mut sink);
+        }
     }
 
     #[test]

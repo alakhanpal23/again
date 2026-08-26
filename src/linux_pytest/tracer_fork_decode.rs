@@ -21,7 +21,7 @@ use super::tracer_wait_status::LinuxPtraceEventV1;
 const CLONE3_ARGS_SIZE_VER0_V1: usize = 64;
 const CLONE3_ARGS_SIZE_VER1_V1: usize = 80;
 const CLONE3_ARGS_SIZE_VER2_V1: usize = 88;
-const CLONE3_ARGS_BUFFER_BYTES_V1: usize = CLONE3_ARGS_SIZE_VER2_V1;
+pub(super) const CLONE3_ARGS_BUFFER_BYTES_V1: usize = CLONE3_ARGS_SIZE_VER2_V1;
 
 const CLONE3_FLAGS_OFFSET_V1: usize = 0;
 const CLONE3_PIDFD_OFFSET_V1: usize = 8;
@@ -119,6 +119,27 @@ pub(super) enum Clone3ArgsCaptureV1<'a> {
     },
 }
 
+/// The exact bounded process-memory copy required for one native `clone3`
+/// entry while its seccomp stop is still held.
+///
+/// This is a transport instruction, not a normalized observation. It retains
+/// the tracee pointer only long enough for the future reviewed connector to
+/// perform the requested copy and grants no tracing or execution authority.
+pub(super) struct Clone3ArgsReadSpecV1 {
+    address: u64,
+    byte_count: usize,
+}
+
+impl Clone3ArgsReadSpecV1 {
+    pub(super) const fn address(&self) -> u64 {
+        self.address
+    }
+
+    pub(super) const fn byte_count(&self) -> usize {
+        self.byte_count
+    }
+}
+
 /// Data-minimized lifecycle facts derived from a fork-family entry and event.
 ///
 /// This is an observation only. In particular, `Clone` does not imply that the
@@ -212,6 +233,35 @@ impl ForkFamilyDecoderSummaryV1 {
 pub(super) static FORK_FAMILY_DECODER_SUMMARY_V1: ForkFamilyDecoderSummaryV1 =
     ForkFamilyDecoderSummaryV1 { _private: () };
 
+/// Validate the pointer and versioned size before requesting tracee memory.
+///
+/// Keeping this validation beside the clone3 decoder preserves one precedence
+/// contract for both the pure planner and the eventual kernel connector.
+pub(super) fn plan_clone3_args_read_x86_64_v1(
+    arguments: &[u64; 6],
+) -> Result<Clone3ArgsReadSpecV1, ForkFamilyDecodeErrorV1> {
+    if arguments[0] == 0 {
+        return Err(ForkFamilyDecodeErrorV1::Clone3NullArgsPointer);
+    }
+    let declared_size = arguments[1];
+    if declared_size < CLONE3_ARGS_SIZE_VER0_V1 as u64 {
+        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooSmall);
+    }
+    if declared_size > CLONE3_ARGS_SIZE_VER2_V1 as u64 {
+        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooLarge);
+    }
+    if !matches!(
+        declared_size as usize,
+        CLONE3_ARGS_SIZE_VER0_V1 | CLONE3_ARGS_SIZE_VER1_V1 | CLONE3_ARGS_SIZE_VER2_V1
+    ) {
+        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeAmbiguous);
+    }
+    Ok(Clone3ArgsReadSpecV1 {
+        address: arguments[0],
+        byte_count: declared_size as usize,
+    })
+}
+
 /// Decode one exact native x86_64 fork-family syscall-entry observation.
 ///
 /// `arguments` are the six native syscall argument words from the validated
@@ -286,22 +336,8 @@ fn decode_clone3_v1(
     arguments: &[u64; 6],
     capture: Clone3ArgsCaptureV1<'_>,
 ) -> Result<ForkFamilyBirthObservationV1, ForkFamilyDecodeErrorV1> {
-    if arguments[0] == 0 {
-        return Err(ForkFamilyDecodeErrorV1::Clone3NullArgsPointer);
-    }
-    let declared_size = arguments[1];
-    if declared_size < CLONE3_ARGS_SIZE_VER0_V1 as u64 {
-        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooSmall);
-    }
-    if declared_size > CLONE3_ARGS_SIZE_VER2_V1 as u64 {
-        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooLarge);
-    }
-    if !matches!(
-        declared_size as usize,
-        CLONE3_ARGS_SIZE_VER0_V1 | CLONE3_ARGS_SIZE_VER1_V1 | CLONE3_ARGS_SIZE_VER2_V1
-    ) {
-        return Err(ForkFamilyDecodeErrorV1::Clone3DeclaredSizeAmbiguous);
-    }
+    let read_spec = plan_clone3_args_read_x86_64_v1(arguments)?;
+    let declared_size = read_spec.byte_count();
 
     let (copied_byte_count, buffer) = match capture {
         Clone3ArgsCaptureV1::Exact {
@@ -312,7 +348,7 @@ fn decode_clone3_v1(
             return Err(ForkFamilyDecodeErrorV1::Clone3ArgsUnavailable);
         }
     };
-    if copied_byte_count != declared_size as usize {
+    if copied_byte_count != declared_size {
         return Err(ForkFamilyDecodeErrorV1::Clone3CopiedByteCountMismatch);
     }
     if buffer[copied_byte_count..].iter().any(|byte| *byte != 0) {
@@ -327,7 +363,7 @@ fn decode_clone3_v1(
         return Err(ForkFamilyDecodeErrorV1::Clone3SignalBitsInFlags);
     }
     validate_common_flags_v1(fields.flags, fields.exit_signal, true)?;
-    validate_clone3_fields_v1(&fields, declared_size as usize)?;
+    validate_clone3_fields_v1(&fields, declared_size)?;
     Ok(classify_clone_birth_v1(fields.flags, fields.exit_signal))
 }
 

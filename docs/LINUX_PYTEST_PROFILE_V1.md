@@ -679,8 +679,14 @@ kernel-reported child TID. Child and parent resumes must then be confirmed one
 step at a time. Its
 constructor is intentionally private, so it is not a kernel-backed supervisor
 issuer. It cannot install the production filter, call ptrace, accept a
-workload, capture `clone3` memory, prove `ECHILD`, or grant any completeness or
-execution authority. Those remain implementation requirements below.
+workload, perform or prove a `clone3` process-memory copy, prove `ECHILD`, or
+grant any completeness or execution authority. The planner does validate the
+nonnull native pointer and exact 64/80/88-byte version before exposing one
+linear bounded-copy instruction; it binds the response to the same session,
+TID, stop generation, address, and length and permits no resume until the
+existing zero-tail clone decoder accepts the capture. That instruction is not
+a process-memory reader or kernel provenance. Those remain implementation
+requirements below.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
