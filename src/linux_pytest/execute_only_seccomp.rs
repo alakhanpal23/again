@@ -4,11 +4,16 @@
 //! This module is deliberately only a plan and a pure verifier. It does not
 //! invoke `prctl`, `seccomp`, or `ptrace`; it accepts no command, path,
 //! environment, descriptor, PID, or callback. Required native x86_64 workload
-//! syscalls route to `SECCOMP_RET_TRACE`, while only the irreducible
-//! sigreturn/exit control calls return `SECCOMP_RET_ALLOW`. Wrong audit
-//! architectures, x32-tagged calls, and every unlisted native call fail closed.
-//! The opaque installed witness has no production issuer until a future child
-//! kernel connector supplies exact install and readback evidence.
+//! syscalls, including sigreturn and exit control calls, route to
+//! `SECCOMP_RET_TRACE`. Wrong audit architectures, x32-tagged calls, and every
+//! unlisted native call fail closed. The syscall table is provisional: a future
+//! connector may consume it only after the exact pinned runtime and fixed smoke
+//! workload have produced a reviewed live syscall corpus. Missing calls remain
+//! fatal rather than being added speculatively.
+//!
+//! The opaque installed witness has no production issuer. The pure transcript
+//! verifier below is not kernel evidence; only a future connector-owned,
+//! unforgeable stopped-child operation token may unlock production issuance.
 
 #![allow(
     dead_code,
@@ -29,14 +34,41 @@ const AUDIT_ARCH_X86_64_V1: u32 = 0xc000_003e;
 const X32_SYSCALL_BIT_V1: u32 = 0x4000_0000;
 const SECCOMP_RET_KILL_PROCESS_V1: u32 = 0x8000_0000;
 const SECCOMP_RET_TRACE_V1: u32 = 0x7ff0_0000;
-const SECCOMP_RET_ALLOW_V1: u32 = 0x7fff_0000;
+const SECCOMP_RET_ACTION_FULL_V1: u32 = 0xffff_0000;
+const SECCOMP_RET_DATA_V1: u32 = 0x0000_ffff;
 const WORKLOAD_TRACE_COOKIE_V1: u16 = 0xb503;
 const WORKLOAD_TRACE_RESULT_V1: u32 = SECCOMP_RET_TRACE_V1 | WORKLOAD_TRACE_COOKIE_V1 as u32;
+const WORKLOAD_POLICY_DIGEST_DOMAIN_V1: &str =
+    "again linux pytest provisional workload seccomp program v1";
+const RESERVED_SECCOMP_TRACE_COOKIES_V1: [u16; 4] = [
+    WORKLOAD_TRACE_COOKIE_V1,
+    super::tracer_seccomp::trace_all_native_seccomp_cookie_spec_v1(),
+    super::trace_protocol::PTRACE_TRANSPORT_GETPID_COOKIE_V1,
+    super::trace_protocol::PTRACE_TRANSPORT_GETPPID_COOKIE_V1,
+];
+
+const fn trace_cookies_are_nonzero_and_unique_v1(cookies: &[u16]) -> bool {
+    let mut left = 0;
+    while left < cookies.len() {
+        if cookies[left] == 0 {
+            return false;
+        }
+        let mut right = left + 1;
+        while right < cookies.len() {
+            if cookies[left] == cookies[right] {
+                return false;
+            }
+            right += 1;
+        }
+        left += 1;
+    }
+    true
+}
 
 const NR_RT_SIGRETURN_X86_64_V1: u32 = 15;
 const NR_EXIT_X86_64_V1: u32 = 60;
 const NR_EXIT_GROUP_X86_64_V1: u32 = 231;
-const CONTROL_SYSCALLS_V1: [u32; 3] = [
+const CONTROL_TRACE_SYSCALLS_V1: [u32; 3] = [
     NR_RT_SIGRETURN_X86_64_V1,
     NR_EXIT_X86_64_V1,
     NR_EXIT_GROUP_X86_64_V1,
@@ -472,12 +504,14 @@ const TRACE_SYSCALLS_V1: &[TraceSyscallV1] = &[
 ];
 
 const WORKLOAD_FILTER_PREFIX_INSTRUCTIONS_V1: usize = 6;
-const WORKLOAD_FILTER_SUFFIX_INSTRUCTIONS_V1: usize = CONTROL_SYSCALLS_V1.len() * 2 + 1;
+const WORKLOAD_FILTER_SUFFIX_INSTRUCTIONS_V1: usize = CONTROL_TRACE_SYSCALLS_V1.len() * 2 + 1;
 const WORKLOAD_FILTER_INSTRUCTION_COUNT_V1: usize = WORKLOAD_FILTER_PREFIX_INSTRUCTIONS_V1
     + TRACE_SYSCALLS_V1.len() * 2
     + WORKLOAD_FILTER_SUFFIX_INSTRUCTIONS_V1;
 const WORKLOAD_FILTER_CANONICAL_BYTE_COUNT_V1: usize = WORKLOAD_FILTER_INSTRUCTION_COUNT_V1 * 8;
-const WORKLOAD_FILTER_FNV1A64_V1: u64 = 0x33f2_5684_e1cb_db3f;
+// Diagnostic drift checksum only. Security identity uses the domain-separated
+// BLAKE3 digest below.
+const WORKLOAD_FILTER_FNV1A64_V1: u64 = 0xa45e_17a1_5003_1340;
 const WORKLOAD_FILTER_MAX_INSTRUCTIONS_V1: usize = 256;
 
 /// Linux `struct seccomp_data`, frozen for layout checks and cBPF offsets.
@@ -548,9 +582,14 @@ const fn build_workload_filter_v1() -> [WorkloadSockFilterV1; WORKLOAD_FILTER_IN
         syscall_index += 1;
     }
     let mut control_index = 0;
-    while control_index < CONTROL_SYSCALLS_V1.len() {
-        output[output_index] = jump_v1(BPF_JMP_JEQ_K_V1, CONTROL_SYSCALLS_V1[control_index], 0, 1);
-        output[output_index + 1] = stmt_v1(BPF_RET_K_V1, SECCOMP_RET_ALLOW_V1);
+    while control_index < CONTROL_TRACE_SYSCALLS_V1.len() {
+        output[output_index] = jump_v1(
+            BPF_JMP_JEQ_K_V1,
+            CONTROL_TRACE_SYSCALLS_V1[control_index],
+            0,
+            1,
+        );
+        output[output_index + 1] = stmt_v1(BPF_RET_K_V1, WORKLOAD_TRACE_RESULT_V1);
         output_index += 2;
         control_index += 1;
     }
@@ -595,6 +634,17 @@ const fn fnv1a64_v1(bytes: &[u8]) -> u64 {
         index += 1;
     }
     value
+}
+
+fn workload_policy_digest_blake3_v1() -> [u8; 32] {
+    workload_policy_digest_for_bytes_v1(&WORKLOAD_FILTER_CANONICAL_BYTES_V1)
+}
+
+fn workload_policy_digest_for_bytes_v1(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(WORKLOAD_POLICY_DIGEST_DOMAIN_V1);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -651,9 +701,7 @@ fn verify_filter_v1(program: &[WorkloadSockFilterV1]) -> Result<(), FilterVerifi
                         || instruction.jump_false != 0
                         || !matches!(
                             instruction.operand,
-                            SECCOMP_RET_KILL_PROCESS_V1
-                                | WORKLOAD_TRACE_RESULT_V1
-                                | SECCOMP_RET_ALLOW_V1
+                            SECCOMP_RET_KILL_PROCESS_V1 | WORKLOAD_TRACE_RESULT_V1
                         )
                     {
                         return Err(FilterVerificationRefusalV1::InvalidReturn);
@@ -770,6 +818,11 @@ impl WorkloadSeccompPlanV1 {
         WORKLOAD_FILTER_FNV1A64_V1
     }
 
+    /// Domain-separated security identity of the exact canonical cBPF bytes.
+    pub(super) fn policy_digest_blake3(&self) -> [u8; 32] {
+        workload_policy_digest_blake3_v1()
+    }
+
     pub(super) const fn trace_cookie(&self) -> u16 {
         WORKLOAD_TRACE_COOKIE_V1
     }
@@ -778,8 +831,29 @@ impl WorkloadSeccompPlanV1 {
         TRACE_SYSCALLS_V1.len() as u16
     }
 
+    pub(super) const fn traced_control_syscall_count(&self) -> u8 {
+        CONTROL_TRACE_SYSCALLS_V1.len() as u8
+    }
+
     pub(super) const fn allow_syscall_count(&self) -> u8 {
-        CONTROL_SYSCALLS_V1.len() as u8
+        0
+    }
+
+    pub(super) const fn syscall_table_is_provisional(&self) -> bool {
+        true
+    }
+
+    pub(super) const fn requires_exact_runtime_and_live_corpus_qualification(&self) -> bool {
+        true
+    }
+
+    pub(super) const fn production_target_supported(&self) -> bool {
+        cfg!(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_pointer_width = "64"
+        ))
     }
 
     pub(super) const fn command_authority(&self) -> bool {
@@ -799,6 +873,15 @@ impl WorkloadSeccompPlanV1 {
     }
 }
 
+#[cfg(any(
+    test,
+    all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    )
+))]
 pub(super) static FIRST_EXECUTE_ONLY_WORKLOAD_SECCOMP_PLAN_V1: WorkloadSeccompPlanV1 =
     WorkloadSeccompPlanV1 { _private: () };
 
@@ -811,7 +894,7 @@ enum InstalledWitnessRefusalV1 {
     InstallResult,
     InstalledSeccompMode,
     ReadbackCount,
-    ClaimedFingerprint,
+    ClaimedPolicyDigest,
     Filter(FilterVerificationRefusalV1),
 }
 
@@ -823,7 +906,7 @@ struct InstalledFilterEvidenceV1<'program> {
     install_result: i64,
     installed_seccomp_mode: u8,
     readback_count: usize,
-    claimed_fingerprint: u64,
+    claimed_policy_digest: [u8; 32],
     readback: &'program [WorkloadSockFilterV1],
 }
 
@@ -834,14 +917,14 @@ struct InstalledFilterEvidenceV1<'program> {
 #[must_use = "an installed workload filter witness must be consumed by future connector composition"]
 pub(super) struct InstalledWorkloadSeccompWitnessV1 {
     _seal: InstalledWitnessSealV1,
-    fingerprint: u64,
+    policy_digest: [u8; 32],
 }
 
 struct InstalledWitnessSealV1;
 
 impl InstalledWorkloadSeccompWitnessV1 {
-    pub(super) const fn byte_fingerprint_fnv1a64(&self) -> u64 {
-        self.fingerprint
+    pub(super) const fn policy_digest_blake3(&self) -> &[u8; 32] {
+        &self.policy_digest
     }
 
     pub(super) const fn execution_authority(&self) -> bool {
@@ -861,14 +944,15 @@ impl fmt::Debug for InstalledWorkloadSeccompWitnessV1 {
 
 impl Drop for InstalledWorkloadSeccompWitnessV1 {
     fn drop(&mut self) {
-        self.fingerprint = 0;
+        self.policy_digest.fill(0);
     }
 }
 
-#[allow(dead_code)]
-fn issue_installed_witness_v1(
+/// Pure transcript consistency check. Passing it proves only that caller-held
+/// bytes describe the frozen plan; it does not prove a kernel operation ran.
+fn verify_installed_transcript_v1(
     evidence: InstalledFilterEvidenceV1<'_>,
-) -> Result<InstalledWorkloadSeccompWitnessV1, InstalledWitnessRefusalV1> {
+) -> Result<(), InstalledWitnessRefusalV1> {
     if evidence.completed_operations != WORKLOAD_SECCOMP_OPERATIONS_V1 {
         return Err(InstalledWitnessRefusalV1::OperationSequence);
     }
@@ -892,13 +976,25 @@ fn issue_installed_witness_v1(
     {
         return Err(InstalledWitnessRefusalV1::ReadbackCount);
     }
-    if evidence.claimed_fingerprint != WORKLOAD_FILTER_FNV1A64_V1 {
-        return Err(InstalledWitnessRefusalV1::ClaimedFingerprint);
+    if evidence.claimed_policy_digest != workload_policy_digest_blake3_v1() {
+        return Err(InstalledWitnessRefusalV1::ClaimedPolicyDigest);
     }
     verify_filter_v1(evidence.readback).map_err(InstalledWitnessRefusalV1::Filter)?;
+    Ok(())
+}
+
+/// Test-only constructor. Production issuance intentionally does not exist:
+/// the future connector must add a separate issuer that consumes its sealed
+/// stopped-child and completed-operation evidence before calling the pure
+/// verifier and constructing this witness.
+#[cfg(test)]
+fn issue_installed_witness_for_test_v1(
+    evidence: InstalledFilterEvidenceV1<'_>,
+) -> Result<InstalledWorkloadSeccompWitnessV1, InstalledWitnessRefusalV1> {
+    verify_installed_transcript_v1(evidence)?;
     Ok(InstalledWorkloadSeccompWitnessV1 {
         _seal: InstalledWitnessSealV1,
-        fingerprint: WORKLOAD_FILTER_FNV1A64_V1,
+        policy_digest: workload_policy_digest_blake3_v1(),
     })
 }
 
@@ -908,9 +1004,33 @@ const _: () = assert!(WORKLOAD_FILTER_CANONICAL_BYTE_COUNT_V1 == 1_784);
 const _: () = assert!(WORKLOAD_FILTER_CANONICAL_BYTE_COUNT_V1 <= u16::MAX as usize);
 const _: () =
     assert!(fnv1a64_v1(&WORKLOAD_FILTER_CANONICAL_BYTES_V1) == WORKLOAD_FILTER_FNV1A64_V1);
+const _: () = assert!(trace_cookies_are_nonzero_and_unique_v1(
+    &RESERVED_SECCOMP_TRACE_COOKIES_V1
+));
+const _: () =
+    assert!(WORKLOAD_TRACE_RESULT_V1 & SECCOMP_RET_ACTION_FULL_V1 == SECCOMP_RET_TRACE_V1);
+const _: () =
+    assert!(WORKLOAD_TRACE_RESULT_V1 & SECCOMP_RET_DATA_V1 == WORKLOAD_TRACE_COOKIE_V1 as u32);
 
-#[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
 const _: () = {
+    assert!(BPF_LD_W_ABS_V1 == 0x20);
+    assert!(BPF_JMP_JEQ_K_V1 == 0x15);
+    assert!(BPF_JMP_JSET_K_V1 == 0x45);
+    assert!(BPF_RET_K_V1 == 0x06);
+    assert!(AUDIT_ARCH_X86_64_V1 == 0xc000_003e);
+    assert!(X32_SYSCALL_BIT_V1 == 0x4000_0000);
+    assert!(libc::SECCOMP_RET_KILL_PROCESS == SECCOMP_RET_KILL_PROCESS_V1);
+    assert!(libc::SECCOMP_RET_TRACE == SECCOMP_RET_TRACE_V1);
+    assert!(libc::SECCOMP_RET_ACTION_FULL == SECCOMP_RET_ACTION_FULL_V1);
+    assert!(libc::SECCOMP_RET_DATA == SECCOMP_RET_DATA_V1);
+    assert!(libc::SECCOMP_SET_MODE_FILTER == SECCOMP_SET_MODE_FILTER_V1);
+    assert!(libc::SECCOMP_FILTER_FLAG_TSYNC as u32 == SECCOMP_FILTER_FLAG_TSYNC_V1);
     assert!(libc::SYS_read == 0);
     assert!(libc::SYS_rt_sigreturn == 15);
     assert!(libc::SYS_execve == 59);
@@ -921,14 +1041,35 @@ const _: () = {
     assert!(libc::SYS_execveat == 322);
     assert!(libc::SYS_clone3 == 435);
     assert!(libc::SYS_close_range == 436);
+    assert!(libc::SYS_openat2 == 437);
+    assert!(libc::SYS_faccessat2 == 439);
+    assert!(libc::SYS_epoll_pwait2 == 441);
     assert!(libc::PR_GET_SECCOMP == 21);
     assert!(libc::PR_GET_NO_NEW_PRIVS == 39);
+    assert!(PTRACE_SECCOMP_GET_FILTER_V1 == 0x420c);
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+
+    // Plausible runtime/library calls deliberately absent pending exact live
+    // corpus evidence. Their presence here is a regression tripwire, not a
+    // proposal to admit them.
+    const PLAUSIBLE_BUT_UNQUALIFIED_SYSCALLS_V1: &[(u32, &str)] = &[
+        (18, "pwrite64"),
+        (27, "mincore"),
+        (41, "socket"),
+        (42, "connect"),
+        (309, "getcpu"),
+        (324, "membarrier"),
+        (326, "copy_file_range"),
+        (327, "preadv2"),
+        (328, "pwritev2"),
+        (434, "pidfd_open"),
+        (449, "futex_waitv"),
+    ];
 
     fn evaluate_filter_v1(architecture: u32, syscall_number: u32) -> Option<u32> {
         let mut accumulator = 0;
@@ -981,8 +1122,8 @@ mod tests {
         {
             return WORKLOAD_TRACE_RESULT_V1;
         }
-        if CONTROL_SYSCALLS_V1.contains(&syscall_number) {
-            return SECCOMP_RET_ALLOW_V1;
+        if CONTROL_TRACE_SYSCALLS_V1.contains(&syscall_number) {
+            return WORKLOAD_TRACE_RESULT_V1;
         }
         SECCOMP_RET_KILL_PROCESS_V1
     }
@@ -996,7 +1137,7 @@ mod tests {
             install_result: 0,
             installed_seccomp_mode: SECCOMP_MODE_FILTER_V1,
             readback_count: WORKLOAD_FILTER_INSTRUCTION_COUNT_V1,
-            claimed_fingerprint: WORKLOAD_FILTER_FNV1A64_V1,
+            claimed_policy_digest: workload_policy_digest_blake3_v1(),
             readback: program,
         }
     }
@@ -1035,6 +1176,36 @@ mod tests {
         assert_eq!(plan.instructions(), &WORKLOAD_FILTER_V1);
     }
 
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn linux_libc_sock_filter_layout_and_seccomp_uapi_match() {
+        assert_eq!(
+            size_of::<WorkloadSockFilterV1>(),
+            size_of::<libc::sock_filter>()
+        );
+        assert_eq!(
+            align_of::<WorkloadSockFilterV1>(),
+            align_of::<libc::sock_filter>()
+        );
+        assert_eq!(offset_of!(libc::sock_filter, code), 0);
+        assert_eq!(offset_of!(libc::sock_filter, jt), 2);
+        assert_eq!(offset_of!(libc::sock_filter, jf), 3);
+        assert_eq!(offset_of!(libc::sock_filter, k), 4);
+        assert_eq!(libc::SECCOMP_RET_KILL_PROCESS, SECCOMP_RET_KILL_PROCESS_V1);
+        assert_eq!(libc::SECCOMP_RET_TRACE, SECCOMP_RET_TRACE_V1);
+        assert_eq!(libc::SECCOMP_RET_ACTION_FULL, SECCOMP_RET_ACTION_FULL_V1);
+        assert_eq!(libc::SECCOMP_RET_DATA, SECCOMP_RET_DATA_V1);
+        assert_eq!(
+            libc::SECCOMP_FILTER_FLAG_TSYNC as u32,
+            SECCOMP_FILTER_FLAG_TSYNC_V1
+        );
+    }
+
     #[test]
     fn syscall_table_is_sorted_unique_named_and_disjoint_from_controls() {
         for pair in TRACE_SYSCALLS_V1.windows(2) {
@@ -1042,8 +1213,62 @@ mod tests {
         }
         for entry in TRACE_SYSCALLS_V1 {
             assert!(!entry.name.is_empty());
-            assert!(!CONTROL_SYSCALLS_V1.contains(&entry.number));
+            assert!(!CONTROL_TRACE_SYSCALLS_V1.contains(&entry.number));
         }
+    }
+
+    #[test]
+    fn provisional_table_keeps_plausible_absent_calls_fail_closed() {
+        for &(number, name) in PLAUSIBLE_BUT_UNQUALIFIED_SYSCALLS_V1 {
+            assert!(
+                !TRACE_SYSCALLS_V1.iter().any(|entry| entry.number == number),
+                "{name} was added without live-corpus qualification"
+            );
+            assert!(!CONTROL_TRACE_SYSCALLS_V1.contains(&number), "{name}");
+            assert_eq!(
+                evaluate_filter_v1(AUDIT_ARCH_X86_64_V1, number),
+                Some(SECCOMP_RET_KILL_PROCESS_V1),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn all_listed_and_control_calls_trace_with_no_allow_return() {
+        for number in TRACE_SYSCALLS_V1
+            .iter()
+            .map(|entry| entry.number)
+            .chain(CONTROL_TRACE_SYSCALLS_V1)
+        {
+            assert_eq!(
+                evaluate_filter_v1(AUDIT_ARCH_X86_64_V1, number),
+                Some(WORKLOAD_TRACE_RESULT_V1)
+            );
+        }
+        for instruction in WORKLOAD_FILTER_V1 {
+            if instruction.code == BPF_RET_K_V1 {
+                assert!(matches!(
+                    instruction.operand,
+                    SECCOMP_RET_KILL_PROCESS_V1 | WORKLOAD_TRACE_RESULT_V1
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn workload_cookie_is_reserved_and_cross_protocol_unique() {
+        assert_eq!(
+            RESERVED_SECCOMP_TRACE_COOKIES_V1,
+            [
+                WORKLOAD_TRACE_COOKIE_V1,
+                super::super::tracer_seccomp::trace_all_native_seccomp_cookie_spec_v1(),
+                super::super::trace_protocol::PTRACE_TRANSPORT_GETPID_COOKIE_V1,
+                super::super::trace_protocol::PTRACE_TRANSPORT_GETPPID_COOKIE_V1,
+            ]
+        );
+        assert!(trace_cookies_are_nonzero_and_unique_v1(
+            &RESERVED_SECCOMP_TRACE_COOKIES_V1
+        ));
     }
 
     #[test]
@@ -1066,10 +1291,10 @@ mod tests {
                 entry.name
             );
         }
-        for syscall_number in CONTROL_SYSCALLS_V1 {
+        for syscall_number in CONTROL_TRACE_SYSCALLS_V1 {
             assert_eq!(
                 evaluate_filter_v1(AUDIT_ARCH_X86_64_V1, syscall_number),
-                Some(SECCOMP_RET_ALLOW_V1)
+                Some(WORKLOAD_TRACE_RESULT_V1)
             );
         }
     }
@@ -1126,10 +1351,23 @@ mod tests {
             fnv1a64_v1(&WORKLOAD_FILTER_CANONICAL_BYTES_V1),
             WORKLOAD_FILTER_FNV1A64_V1
         );
+        assert_eq!(WORKLOAD_FILTER_FNV1A64_V1, 0xa45e_17a1_5003_1340);
+        assert_eq!(
+            workload_policy_digest_blake3_v1(),
+            [
+                90, 104, 114, 5, 238, 106, 101, 165, 52, 152, 102, 131, 19, 91, 28, 10, 97, 221, 3,
+                167, 225, 156, 28, 130, 72, 104, 162, 206, 110, 43, 14, 136,
+            ]
+        );
         assert_eq!(verify_filter_v1(&WORKLOAD_FILTER_V1), Ok(()));
 
         let mut mutation = WORKLOAD_FILTER_V1;
         mutation[6].operand ^= 1;
+        let mutation_bytes = canonical_filter_bytes_v1(&mutation);
+        assert_ne!(
+            workload_policy_digest_for_bytes_v1(&mutation_bytes),
+            workload_policy_digest_blake3_v1()
+        );
         assert_eq!(
             verify_filter_v1(&mutation),
             Err(FilterVerificationRefusalV1::Fingerprint)
@@ -1188,10 +1426,11 @@ mod tests {
 
     #[test]
     fn installed_witness_requires_every_exact_readback_dimension() {
-        let witness = issue_installed_witness_v1(valid_evidence_v1(&WORKLOAD_FILTER_V1)).unwrap();
+        let witness =
+            issue_installed_witness_for_test_v1(valid_evidence_v1(&WORKLOAD_FILTER_V1)).unwrap();
         assert_eq!(
-            witness.byte_fingerprint_fnv1a64(),
-            WORKLOAD_FILTER_FNV1A64_V1
+            witness.policy_digest_blake3(),
+            &workload_policy_digest_blake3_v1()
         );
         assert!(!witness.execution_authority());
         let debug = format!("{witness:?}");
@@ -1201,7 +1440,7 @@ mod tests {
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.completed_operations = &WORKLOAD_SECCOMP_OPERATIONS_V1[..6];
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::OperationSequence
         );
         let mut reordered_operations = WORKLOAD_SECCOMP_OPERATIONS_V1;
@@ -1209,57 +1448,57 @@ mod tests {
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.completed_operations = &reordered_operations;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::OperationSequence
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.task_count = 2;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::TaskCount
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.no_new_privileges = 0;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::NoNewPrivileges
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.initial_seccomp_mode = 2;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::InitialSeccompMode
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.install_result = -1;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::InstallResult
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.installed_seccomp_mode = 0;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::InstalledSeccompMode
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
         evidence.readback_count -= 1;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::ReadbackCount
         );
         let mut evidence = valid_evidence_v1(&WORKLOAD_FILTER_V1);
-        evidence.claimed_fingerprint ^= 1;
+        evidence.claimed_policy_digest[0] ^= 1;
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
-            InstalledWitnessRefusalV1::ClaimedFingerprint
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
+            InstalledWitnessRefusalV1::ClaimedPolicyDigest
         );
 
         let mut mutated = WORKLOAD_FILTER_V1;
         mutated[6].operand ^= 1;
         let evidence = valid_evidence_v1(&mutated);
         assert_eq!(
-            issue_installed_witness_v1(evidence).unwrap_err(),
+            issue_installed_witness_for_test_v1(evidence).unwrap_err(),
             InstalledWitnessRefusalV1::Filter(FilterVerificationRefusalV1::Fingerprint)
         );
     }
@@ -1273,7 +1512,23 @@ mod tests {
         );
         assert_eq!(plan.trace_cookie(), WORKLOAD_TRACE_COOKIE_V1);
         assert_eq!(plan.trace_syscall_count(), 105);
-        assert_eq!(plan.allow_syscall_count(), 3);
+        assert_eq!(plan.traced_control_syscall_count(), 3);
+        assert_eq!(plan.allow_syscall_count(), 0);
+        assert!(plan.syscall_table_is_provisional());
+        assert!(plan.requires_exact_runtime_and_live_corpus_qualification());
+        assert_eq!(
+            plan.production_target_supported(),
+            cfg!(all(
+                target_os = "linux",
+                target_arch = "x86_64",
+                target_env = "gnu",
+                target_pointer_width = "64"
+            ))
+        );
+        assert_eq!(
+            plan.policy_digest_blake3(),
+            workload_policy_digest_blake3_v1()
+        );
         assert!(!plan.command_authority());
         assert!(!plan.execution_authority());
         assert!(!plan.profile_authority());
