@@ -108,7 +108,8 @@ pub(super) enum BoundRegularReadRefusalV1 {
 
 /// One non-clonable aggregate budget for every runtime-resolution allocation.
 /// It is retained through canonical checkpoint construction so no phase can
-/// restart the allowance. Allocation is always fallible and charged first.
+/// restart the allowance. Budget admission precedes each fallible allocation;
+/// observed capacity is reconciled and charged before the buffer is issued.
 pub(super) struct RuntimeMemoryEscrowV1 {
     remaining: Cell<usize>,
 }
@@ -127,28 +128,38 @@ impl RuntimeMemoryEscrowV1 {
         }
     }
 
-    fn charge(&self, bytes: usize) -> Result<(), BoundRegularReadRefusalV1> {
-        let remaining = self
-            .remaining
-            .get()
-            .checked_sub(bytes)
-            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
-        self.remaining.set(remaining);
-        Ok(())
-    }
-
     pub(super) fn try_vec_with_capacity<T>(
         &self,
         capacity: usize,
     ) -> Result<Vec<T>, BoundRegularReadRefusalV1> {
-        let bytes = capacity
-            .checked_mul(std::mem::size_of::<T>())
+        self.try_vec_with_capacity_using(capacity, |output, requested| {
+            output.try_reserve_exact(requested).map_err(|_| ())
+        })
+    }
+
+    fn try_vec_with_capacity_using<T>(
+        &self,
+        capacity: usize,
+        reserve: impl FnOnce(&mut Vec<T>, usize) -> Result<(), ()>,
+    ) -> Result<Vec<T>, BoundRegularReadRefusalV1> {
+        let element_bytes = std::mem::size_of::<T>();
+        let requested_bytes = capacity
+            .checked_mul(element_bytes)
             .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
-        self.charge(bytes)?;
+        let remaining = self.remaining.get();
+        if requested_bytes > remaining {
+            return Err(BoundRegularReadRefusalV1::MemoryBudget);
+        }
         let mut output = Vec::new();
-        output
-            .try_reserve_exact(capacity)
-            .map_err(|_| BoundRegularReadRefusalV1::MemoryBudget)?;
+        reserve(&mut output, capacity).map_err(|()| BoundRegularReadRefusalV1::MemoryBudget)?;
+        let observed_bytes = output
+            .capacity()
+            .checked_mul(element_bytes)
+            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+        let reconciled = remaining
+            .checked_sub(observed_bytes)
+            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+        self.remaining.set(reconciled);
         Ok(output)
     }
 
@@ -166,15 +177,46 @@ impl RuntimeMemoryEscrowV1 {
         output: &mut Vec<u8>,
         value: &[u8],
     ) -> Result<(), BoundRegularReadRefusalV1> {
-        if output.capacity() - output.len() < value.len() {
-            let additional = value.len() - (output.capacity() - output.len());
-            self.charge(additional)?;
-            output
-                .try_reserve_exact(additional)
-                .map_err(|_| BoundRegularReadRefusalV1::MemoryBudget)?;
+        let required_length = output
+            .len()
+            .checked_add(value.len())
+            .ok_or(BoundRegularReadRefusalV1::MemoryBudget)?;
+        if required_length > output.capacity() {
+            // Allocate a charged replacement instead of growing in place. If
+            // the allocator returns unchargeable excess capacity or fails,
+            // the replacement is dropped and the existing buffer is unchanged.
+            let mut replacement = self.try_vec_with_capacity(required_length)?;
+            replacement.extend_from_slice(output);
+            replacement.extend_from_slice(value);
+            *output = replacement;
+            return Ok(());
         }
         output.extend_from_slice(value);
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn remaining_for_test(&self) -> usize {
+        self.remaining.get()
+    }
+
+    #[cfg(test)]
+    fn try_vec_with_injected_allocation_failure_for_test<T>(
+        &self,
+        capacity: usize,
+    ) -> Result<Vec<T>, BoundRegularReadRefusalV1> {
+        self.try_vec_with_capacity_using(capacity, |_, _| Err(()))
+    }
+
+    #[cfg(test)]
+    fn try_vec_with_excess_capacity_for_test<T>(
+        &self,
+        requested: usize,
+        reserved: usize,
+    ) -> Result<Vec<T>, BoundRegularReadRefusalV1> {
+        self.try_vec_with_capacity_using(requested, |output, _| {
+            output.try_reserve_exact(reserved).map_err(|_| ())
+        })
     }
 }
 
@@ -6243,5 +6285,37 @@ mod portable_tests {
             BoundRegularReadRefusalV1::MemoryBudget
         );
         assert!(format!("{memory:?}").contains("redacted-budget"));
+
+        let allocation_failure = RuntimeMemoryEscrowV1::with_limit_for_test(8);
+        assert_eq!(
+            allocation_failure
+                .try_vec_with_injected_allocation_failure_for_test::<u8>(8)
+                .unwrap_err(),
+            BoundRegularReadRefusalV1::MemoryBudget
+        );
+        assert_eq!(allocation_failure.remaining_for_test(), 8);
+        let allocated = allocation_failure.try_vec_with_capacity::<u8>(8).unwrap();
+        assert_eq!(
+            allocation_failure.remaining_for_test(),
+            8 - allocated.capacity()
+        );
+
+        let excess_capacity = RuntimeMemoryEscrowV1::with_limit_for_test(8);
+        assert_eq!(
+            excess_capacity
+                .try_vec_with_excess_capacity_for_test::<u8>(8, 9)
+                .unwrap_err(),
+            BoundRegularReadRefusalV1::MemoryBudget
+        );
+        assert_eq!(excess_capacity.remaining_for_test(), 8);
+
+        let replacement_memory = RuntimeMemoryEscrowV1::with_limit_for_test(64);
+        let mut bytes = replacement_memory.try_bytes_from_slice(b"four").unwrap();
+        let after_first = replacement_memory.remaining_for_test();
+        replacement_memory
+            .try_extend_bytes(&mut bytes, b"-more-than-spare")
+            .unwrap();
+        assert_eq!(bytes, b"four-more-than-spare");
+        assert!(replacement_memory.remaining_for_test() < after_first);
     }
 }

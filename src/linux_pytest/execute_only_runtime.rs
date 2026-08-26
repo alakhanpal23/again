@@ -60,6 +60,12 @@ const DT_STRTAB: u64 = 5;
 const DT_STRSZ: u64 = 10;
 const DT_RPATH: u64 = 15;
 const DT_RUNPATH: u64 = 29;
+const DT_FLAGS: u64 = 30;
+const DT_FLAGS_1: u64 = 0x6fff_fffb;
+#[cfg(test)]
+const DF_BIND_NOW: u64 = 0x8;
+#[cfg(test)]
+const DF_1_NODEFLIB: u64 = 0x800;
 
 /// Stable, payload-free refusals from the first runtime checkpoint.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -315,7 +321,10 @@ pub(super) fn validate_x86_64_elf_v1(
     let mut previous_load_virtual_address = None;
     let mut first_load_page = None;
     let mut maximum_load_page_end = 0u64;
-    for header in bytes[program_offset..table_end].chunks_exact(program_entry_size) {
+    for (index, header) in bytes[program_offset..table_end]
+        .chunks_exact(program_entry_size)
+        .enumerate()
+    {
         if u32::from_le_bytes(header[0..4].try_into().expect("bounded program header")) != PT_LOAD {
             continue;
         }
@@ -330,7 +339,7 @@ pub(super) fn validate_x86_64_elf_v1(
             u64::from_le_bytes(header[40..48].try_into().expect("bounded program header"));
         let alignment =
             u64::from_le_bytes(header[48..56].try_into().expect("bounded program header"));
-        offset
+        let file_end = offset
             .checked_add(file_size)
             .filter(|end| *end <= bytes.len() as u64)
             .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
@@ -351,6 +360,40 @@ pub(super) fn validate_x86_64_elf_v1(
             || previous_load_virtual_address.is_some_and(|previous| virtual_address < previous)
         {
             return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader);
+        }
+        for previous in bytes[program_offset..program_offset + index * program_entry_size]
+            .chunks_exact(program_entry_size)
+        {
+            if u32::from_le_bytes(previous[0..4].try_into().expect("bounded program header"))
+                != PT_LOAD
+            {
+                continue;
+            }
+            let previous_offset =
+                u64::from_le_bytes(previous[8..16].try_into().expect("bounded program header"));
+            let previous_virtual_address =
+                u64::from_le_bytes(previous[16..24].try_into().expect("bounded program header"));
+            let previous_file_size =
+                u64::from_le_bytes(previous[32..40].try_into().expect("bounded program header"));
+            let previous_memory_size =
+                u64::from_le_bytes(previous[40..48].try_into().expect("bounded program header"));
+            let previous_file_end = previous_offset
+                .checked_add(previous_file_size)
+                .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+            let previous_memory_end = previous_virtual_address
+                .checked_add(previous_memory_size)
+                .ok_or(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)?;
+            let file_overlap = file_size != 0
+                && previous_file_size != 0
+                && offset < previous_file_end
+                && previous_offset < file_end;
+            let virtual_overlap = memory_size != 0
+                && previous_memory_size != 0
+                && virtual_address < previous_memory_end
+                && previous_virtual_address < memory_end;
+            if file_overlap || virtual_overlap {
+                return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader);
+            }
         }
         previous_load_virtual_address = Some(virtual_address);
         let first_page = *first_load_page.get_or_insert(load_page);
@@ -633,7 +676,13 @@ fn parse_runtime_closure_request_v1(
             terminated = true;
             continue;
         }
-        if terminated || tag == DT_RPATH || tag == DT_RUNPATH || !known_dynamic_tag_v1(tag) {
+        let unmodeled_flags = matches!(tag, DT_FLAGS | DT_FLAGS_1) && value != 0;
+        if terminated
+            || tag == DT_RPATH
+            || tag == DT_RUNPATH
+            || unmodeled_flags
+            || !known_dynamic_tag_v1(tag)
+        {
             return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag);
         }
         if tag != DT_NEEDED {
@@ -1107,6 +1156,20 @@ mod tests {
             validate_x86_64_elf_v1(&excessive_span),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
         );
+
+        let mut virtual_overlap = elf_fixture();
+        append_second_load(&mut virtual_overlap, 120, 0x40_0078, 0, 1);
+        assert_eq!(
+            validate_x86_64_elf_v1(&virtual_overlap),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
+
+        let mut file_overlap = elf_fixture();
+        append_second_load(&mut file_overlap, 120, 0x50_0078, 1, 1);
+        assert_eq!(
+            validate_x86_64_elf_v1(&file_overlap),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
+        );
     }
 
     #[test]
@@ -1129,6 +1192,14 @@ mod tests {
             ELF64_LOAD_PAGE_BYTES - 1,
         );
         assert_eq!(validate_x86_64_elf_v1(&span_boundary), Ok(()));
+
+        let mut adjacent_ranges = elf_fixture();
+        append_second_load(&mut adjacent_ranges, 121, 0x40_0079, 0, 1);
+        assert_eq!(validate_x86_64_elf_v1(&adjacent_ranges), Ok(()));
+
+        let mut adjacent_file = elf_fixture();
+        append_second_load(&mut adjacent_file, 121, 0x50_0079, 1, 1);
+        assert_eq!(validate_x86_64_elf_v1(&adjacent_file), Ok(()));
     }
 
     #[test]
@@ -1331,7 +1402,7 @@ mod tests {
         );
         assert_eq!(
             parse_runtime_fixture(&ambiguous_load_mapping).unwrap_err(),
-            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader
         );
 
         for tag in [DT_RPATH, DT_RUNPATH, 0x1234_5678] {
@@ -1341,6 +1412,26 @@ mod tests {
                 parse_runtime_fixture(&malformed).unwrap_err(),
                 FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag
             );
+        }
+
+        for (tag, value) in [
+            (DT_FLAGS, DF_BIND_NOW),
+            (DT_FLAGS_1, DF_1_NODEFLIB),
+            (DT_FLAGS, 1 << 63),
+            (DT_FLAGS_1, 1 << 63),
+        ] {
+            let mut unmodeled_flags = runtime_closure_elf_fixture();
+            write_dynamic_entry(&mut unmodeled_flags, 1, tag, value);
+            assert_eq!(
+                parse_runtime_fixture(&unmodeled_flags).unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamicTag
+            );
+        }
+
+        for tag in [DT_FLAGS, DT_FLAGS_1] {
+            let mut zero_flags = runtime_closure_elf_fixture();
+            write_dynamic_entry(&mut zero_flags, 1, tag, 0);
+            assert!(parse_runtime_fixture(&zero_flags).is_ok());
         }
 
         let mut duplicate_strtab = runtime_closure_elf_fixture();
@@ -1517,7 +1608,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
-    fn real_system_python_parses_only_to_an_unresolved_request() {
+    fn real_system_python_parse_is_diagnostic_only_and_never_pinned_evidence() {
         let Some(path) = ["/usr/bin/python3", "/usr/local/bin/python3"]
             .into_iter()
             .find(|path| std::path::Path::new(path).is_file())
@@ -1525,10 +1616,15 @@ mod tests {
             return;
         };
         let bytes = std::fs::read(path).unwrap();
-        let request = parse_runtime_fixture(&bytes).unwrap();
-        assert!(request.interpreter.starts_with(b"/"));
-        assert!(!request.needed.is_empty());
-        assert!(format!("{request:?}").contains("resolution_authority: false"));
+        // The ambient host path is not descriptor-bound published evidence.
+        // This diagnostic may accept or conservatively refuse that host's
+        // current ELF shape, but neither outcome participates in qualification.
+        let diagnostic = format!("{:?}", parse_runtime_fixture(&bytes));
+        assert!(!diagnostic.contains("qualified"));
+        assert!(!diagnostic.contains("pinned"));
+        if diagnostic.starts_with("Ok(") {
+            assert!(diagnostic.contains("resolution_authority: false"));
+        }
     }
 
     #[test]
