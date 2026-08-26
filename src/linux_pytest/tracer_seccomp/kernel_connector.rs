@@ -378,6 +378,8 @@ mod platform {
     const PTRACE_CONT_V1: u64 = 7;
     const PTRACE_SYSCALL_V1: u64 = 24;
     const PTRACE_SEIZE_V1: u64 = 0x4206;
+    const PTRACE_GETSIGMASK_V1: u64 = 0x420a;
+    const PTRACE_SETSIGMASK_V1: u64 = 0x420b;
     const PTRACE_GETEVENTMSG_V1: u64 = 0x4201;
     const PTRACE_SECCOMP_GET_FILTER_V1: u64 = 0x420c;
     const PTRACE_GET_SYSCALL_INFO_V1: u64 = 0x420e;
@@ -413,6 +415,9 @@ mod platform {
         PtraceFilterCount,
         PtraceFilterRead,
         PtraceEventMessage,
+        PtraceSignalMaskRead,
+        PtraceSignalMaskWrite,
+        PtraceSignalMaskVerify,
         PtraceSyscallInfo,
         PtraceResumeContinue,
         PtraceResumeSyscall,
@@ -1174,6 +1179,7 @@ mod platform {
                                     None,
                                 )
                             })?;
+                        block_tracee_sigchld_v1(faults, tree.root_tid)?;
                         tree.record_nested_announcement(child_tid)?;
                     }
                     supervisor
@@ -1485,28 +1491,6 @@ mod platform {
                 child_exit_v1(CHILD_FAILURE_EXIT_V1);
             }
 
-            // The nested child exits with SIGCHLD so clone3 remains a fork
-            // event. Block that signal in this disposable tracee before the
-            // seccomp filter exists: otherwise Linux may nondeterministically
-            // expose a signal-delivery stop between the nested reap and the
-            // root exit, adding an event outside the fixed 11-transition
-            // transcript. The tracee and its child both terminate, so this
-            // process-local mask needs no restoration and cannot affect the
-            // tracer's independently snapshotted signal state.
-            let blocked_signals = SIGCHLD_MASK_V1;
-            if raw_syscall6_v1(
-                libc::SYS_rt_sigprocmask,
-                i64::from(libc::SIG_BLOCK),
-                (&blocked_signals as *const u64) as i64,
-                0,
-                KERNEL_SIGNAL_SET_BYTES_V1,
-                0,
-                0,
-            ) != 0
-            {
-                child_exit_v1(CHILD_FAILURE_EXIT_V1);
-            }
-
             let mapping = raw_syscall6_v1(
                 libc::SYS_mmap,
                 0,
@@ -1793,6 +1777,73 @@ mod platform {
             ));
         }
         Ok(message)
+    }
+
+    /// Block `SIGCHLD` only after Linux has produced the fork event.
+    ///
+    /// The root tracee is stopped for the event throughout this operation, so
+    /// its mask cannot race the read-modify-write. Delaying the mask change
+    /// until this point preserves the kernel's real parent-event/child-stop
+    /// delivery order while preventing a later child-exit signal from adding
+    /// an event outside the fixed transcript.
+    fn block_tracee_sigchld_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        raw_tid: i32,
+    ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+        let mut observed = 0_u64;
+        let read = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceSignalMaskRead,
+            PTRACE_GETSIGMASK_V1,
+            raw_tid,
+            KERNEL_SIGNAL_SET_BYTES_V1 as u64,
+            (&mut observed as *mut u64) as u64,
+        )
+        .map_err(|errno| ptrace_failure_v1(FixedTwoTaskSupervisorStageV1::SignalState, errno))?;
+        if read != 0 || observed & SIGCHLD_MASK_V1 != 0 {
+            return Err(failure_v1(
+                FixedTwoTaskSupervisorStageV1::SignalState,
+                FixedTwoTaskSupervisorReasonV1::UnexpectedLifecycleEvent,
+                None,
+            ));
+        }
+
+        let blocked = observed | SIGCHLD_MASK_V1;
+        let written = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceSignalMaskWrite,
+            PTRACE_SETSIGMASK_V1,
+            raw_tid,
+            KERNEL_SIGNAL_SET_BYTES_V1 as u64,
+            (&blocked as *const u64) as u64,
+        )
+        .map_err(|errno| ptrace_failure_v1(FixedTwoTaskSupervisorStageV1::SignalState, errno))?;
+        if written != 0 {
+            return Err(failure_v1(
+                FixedTwoTaskSupervisorStageV1::SignalState,
+                FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
+                None,
+            ));
+        }
+
+        let mut verified = 0_u64;
+        let reread = ptrace_call_v1(
+            faults,
+            ConnectorKernelOperationV1::PtraceSignalMaskVerify,
+            PTRACE_GETSIGMASK_V1,
+            raw_tid,
+            KERNEL_SIGNAL_SET_BYTES_V1 as u64,
+            (&mut verified as *mut u64) as u64,
+        )
+        .map_err(|errno| ptrace_failure_v1(FixedTwoTaskSupervisorStageV1::SignalState, errno))?;
+        if reread != 0 || verified != blocked {
+            return Err(failure_v1(
+                FixedTwoTaskSupervisorStageV1::SignalState,
+                FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn read_syscall_info_v1(
@@ -2489,10 +2540,12 @@ mod platform {
         use super::*;
 
         #[test]
-        fn fixed_tracee_blocks_exactly_sigchld() {
+        fn fixed_tracee_signal_mask_contract_is_exact() {
             assert_eq!(KERNEL_SIGNAL_SET_BYTES_V1, 8);
             assert_eq!(SIGCHLD_MASK_V1.count_ones(), 1);
             assert_ne!(SIGCHLD_MASK_V1 & (1_u64 << (libc::SIGCHLD - 1)), 0);
+            assert_eq!(PTRACE_GETSIGMASK_V1, 0x420a);
+            assert_eq!(PTRACE_SETSIGMASK_V1, 0x420b);
         }
 
         #[test]
@@ -2731,6 +2784,43 @@ mod platform {
             assert_eq!((failure.stage(), failure.reason()), ("event_message", "io"));
             event.assert_consumed();
             assert_forward_failure_cleans_tree_v1(failure);
+
+            for script in [
+                vec![(
+                    ConnectorKernelOperationV1::PtraceSignalMaskRead,
+                    InjectedKernelResultV1::Errno(libc::EIO),
+                )],
+                vec![
+                    (
+                        ConnectorKernelOperationV1::PtraceSignalMaskRead,
+                        InjectedKernelResultV1::Return(0),
+                    ),
+                    (
+                        ConnectorKernelOperationV1::PtraceSignalMaskWrite,
+                        InjectedKernelResultV1::Errno(libc::EIO),
+                    ),
+                ],
+                vec![
+                    (
+                        ConnectorKernelOperationV1::PtraceSignalMaskRead,
+                        InjectedKernelResultV1::Return(0),
+                    ),
+                    (
+                        ConnectorKernelOperationV1::PtraceSignalMaskWrite,
+                        InjectedKernelResultV1::Return(0),
+                    ),
+                    (
+                        ConnectorKernelOperationV1::PtraceSignalMaskVerify,
+                        InjectedKernelResultV1::Errno(libc::EIO),
+                    ),
+                ],
+            ] {
+                let mut signal_mask = ScriptedFaultsV1::new(script);
+                let failure = block_tracee_sigchld_v1(&mut signal_mask, 1).unwrap_err();
+                assert_eq!((failure.stage(), failure.reason()), ("signal_state", "io"));
+                signal_mask.assert_consumed();
+                assert_forward_failure_cleans_tree_v1(failure);
+            }
 
             let mut syscall = ScriptedFaultsV1::one(
                 ConnectorKernelOperationV1::PtraceSyscallInfo,
