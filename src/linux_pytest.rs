@@ -69,6 +69,7 @@ pub const WORKSPACE_MERKLE_DOMAIN: &str = "again linux pytest workspace merkle v
 pub const RUNTIME_MERKLE_DOMAIN: &str = "again linux pytest runtime merkle v1";
 
 mod canonical;
+mod execute_only_admission;
 mod identity;
 mod isolation_qualification;
 mod ptrace_transport_qualification;
