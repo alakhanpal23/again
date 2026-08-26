@@ -57,7 +57,30 @@ cat > "$fake_bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$GH_CALL_LOG"
-[ "${GH_FAIL:-0}" -eq 0 ]
+[ "${GH_FAIL:-0}" -eq 0 ] || exit 1
+case "$1:$2" in
+    release:view)
+        cat "$PUBLISHED_INVENTORY"
+        ;;
+    release:download)
+        destination=
+        while [ "$#" -gt 0 ]; do
+            case "$1" in
+                --dir)
+                    destination=$2
+                    shift 2
+                    ;;
+                *)
+                    shift
+                    ;;
+            esac
+        done
+        [ -n "$destination" ]
+        while IFS= read -r asset; do
+            cp "$REMOTE_ASSETS/$asset" "$destination/$asset"
+        done < "$PUBLISHED_INVENTORY"
+        ;;
+esac
 EOF
 chmod 0755 "$fake_bin/gh"
 
@@ -104,6 +127,54 @@ while IFS= read -r call; do
         }
     done
 done < "$call_log"
+
+# The published-release verifier refuses additions or omissions in GitHub's
+# live asset inventory before downloading and authenticating the exact set.
+published_inventory=$fixture/published-inventory
+cat > "$published_inventory" <<EOF
+SHA256SUMS
+again-${version}-aarch64-apple-darwin.tar.gz
+again-${version}-aarch64-unknown-linux-gnu.tar.gz
+again-${version}-source.cdx.json
+again-${version}-x86_64-apple-darwin.tar.gz
+again-${version}-x86_64-unknown-linux-gnu.tar.gz
+EOF
+published_call_log=$fixture/published-gh-calls
+GH_CALL_LOG=$published_call_log PUBLISHED_INVENTORY=$published_inventory \
+    REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    sh "$repository/scripts/verify_published_release.sh" \
+    --version "$version" --repository alakhanpal23/again \
+    > "$fixture/published.out"
+grep -Fx "Verified exact published Again release $version from alakhanpal23/again" \
+    "$fixture/published.out" >/dev/null
+test "$(wc -l < "$published_call_log" | tr -d ' ')" -eq 8
+test "$(grep -c '^attestation verify ' "$published_call_log")" -eq 6
+grep -F "release view $version --repo alakhanpal23/again --json assets" \
+    "$published_call_log" >/dev/null
+grep -F "release download $version --repo alakhanpal23/again --dir " \
+    "$published_call_log" >/dev/null
+
+printf '%s\n' unexpected-asset >> "$published_inventory"
+if GH_CALL_LOG=$fixture/published-inventory-failure-calls \
+    PUBLISHED_INVENTORY=$published_inventory REMOTE_ASSETS=$assets \
+    PATH="$fake_bin:$PATH" sh "$repository/scripts/verify_published_release.sh" \
+    --version "$version" --repository alakhanpal23/again \
+    > /dev/null 2>&1; then
+    echo "error: published-release verifier accepted an unexpected asset" >&2
+    exit 1
+fi
+sed '$d' "$published_inventory" > "$fixture/published-inventory-restored"
+mv "$fixture/published-inventory-restored" "$published_inventory"
+
+sed '$d' "$published_inventory" > "$fixture/published-inventory-missing"
+if GH_CALL_LOG=$fixture/published-inventory-missing-calls \
+    PUBLISHED_INVENTORY=$fixture/published-inventory-missing REMOTE_ASSETS=$assets \
+    PATH="$fake_bin:$PATH" sh "$repository/scripts/verify_published_release.sh" \
+    --version "$version" --repository alakhanpal23/again \
+    > /dev/null 2>&1; then
+    echo "error: published-release verifier accepted a missing asset" >&2
+    exit 1
+fi
 
 # The public installer authenticates both downloaded inputs with the same
 # pinned provenance policy before it extracts or installs the archive.

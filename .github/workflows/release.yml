@@ -46,6 +46,7 @@ jobs:
           cargo +1.88.0 test --locked --all-features
           cargo +1.88.0 test --locked --test generated_differential generated_differential_100k -- --ignored --exact --nocapture
           sh -n scripts/install.sh scripts/uninstall.sh scripts/verify_release.sh \
+            scripts/verify_published_release.sh \
             scripts/test_packaging.sh scripts/test_release_verification.sh
           python3 -m py_compile scripts/package_release.py
           sh scripts/test_packaging.sh
@@ -213,3 +214,45 @@ jobs:
             "dist/again-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
             "dist/again-${GITHUB_REF_NAME}-source.cdx.json" \
             dist/SHA256SUMS
+
+  verify-published-release:
+    name: verify published release and installer
+    needs: publish
+    if: github.repository == 'alakhanpal23/again'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      attestations: read
+      contents: read
+    steps:
+      - name: Check out the exact released source without persisting credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download and authenticate the exact public release inventory
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sh scripts/verify_published_release.sh \
+            --version "$TAG" \
+            --repository "$GITHUB_REPOSITORY"
+      - name: Exercise the authenticated public installer and uninstaller
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          install_root=$(mktemp -d)
+          trap 'rm -rf "$install_root"' EXIT
+          destination="$install_root/again"
+          sh scripts/install.sh --version "$TAG" --dest "$destination"
+          test "$("$destination" --version)" = "again ${TAG#v}"
+          sh scripts/uninstall.sh --dest "$destination"
+          test ! -e "$destination"
+          test ! -e "${destination}.again-install"
+          test ! -e "${destination}.previous"
+          test ! -e "${destination}.again-lock"
