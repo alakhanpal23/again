@@ -38,6 +38,7 @@ use super::snapshot_policy::{
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_tree::{SOURCE_TREE_REQUESTED_STATX_MASK_V1, SourceStatxV1};
+use super::{Blake3Digest, FileContentDigest};
 
 const STAGING_NAME_PREFIX: &[u8] = b".again-snapshot-stage-";
 const STAGING_NONCE_HEX_BYTES: usize = 32;
@@ -71,6 +72,212 @@ const MAX_LIVE_PUBLICATION_FDS: u32 = 2;
 // included.
 const CLEANUP_FDS_PER_DEPTH: u32 = 2;
 const CLEANUP_FIXED_FDS: u32 = 4;
+const BOUND_REGULAR_PATH_MAX_COMPONENTS_V1: usize = 40;
+const BOUND_REGULAR_SYMLINK_MAX_HOPS_V1: usize = 40;
+const BOUND_REGULAR_TARGET_MAX_BYTES_V1: usize = 4096;
+const BOUND_REGULAR_MAX_BYTES_V1: u32 = 16 * 1024 * 1024;
+const BOUND_REGULAR_MAX_OBSERVED_NODES_V1: usize =
+    BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 * (BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 + 1);
+const BOUND_REGULAR_IDENTITY_DOMAIN_V1: &str = "again bound published regular identity v1";
+
+/// Stable, payload-free refusals from the operation-specific published-child
+/// reader. These values are diagnostic only and never grant execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BoundRegularReadRefusalV1 {
+    InvalidPath,
+    ComponentLimit,
+    InvalidByteCeiling,
+    SymlinkLimit,
+    SymlinkCycle,
+    SymlinkTargetInvalid,
+    MissingNode,
+    MountCrossing,
+    MagicLink,
+    NodeType,
+    IdentityDrift,
+    SizeMismatch,
+    ByteLimit,
+    ShortRead,
+    Io,
+    UnsupportedPlatform,
+}
+
+/// A relative raw-byte path admitted for one descriptor-relative read.
+/// Construction is bounded and rejects all ambient or escaping spellings.
+pub(super) struct ValidatedBoundRelativePathV1(Box<[u8]>);
+
+impl ValidatedBoundRelativePathV1 {
+    pub(super) fn parse(path: &[u8]) -> Result<Self, BoundRegularReadRefusalV1> {
+        validate_bound_components_v1(path)?;
+        Ok(Self(path.into()))
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ValidatedBoundRelativePathV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ValidatedBoundRelativePathV1(<redacted>)")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VerifiedBoundNodeKindV1 {
+    Directory,
+    Symlink,
+    Regular,
+}
+
+/// One descriptor-observed node in the normalized resolution walk. Access is
+/// intentionally limited to the manifest cross-checking module.
+pub(super) struct VerifiedBoundPathNodeV1 {
+    normalized_path: Box<[u8]>,
+    kind: VerifiedBoundNodeKindV1,
+    statx_commitment: [u8; 102],
+    symlink_target: Option<Box<[u8]>>,
+    normalized_next_path: Option<Box<[u8]>>,
+}
+
+impl VerifiedBoundPathNodeV1 {
+    pub(super) fn normalized_path(&self) -> &[u8] {
+        &self.normalized_path
+    }
+
+    pub(super) const fn kind(&self) -> VerifiedBoundNodeKindV1 {
+        self.kind
+    }
+
+    pub(super) const fn statx_commitment(&self) -> &[u8; 102] {
+        &self.statx_commitment
+    }
+
+    pub(super) fn symlink_target(&self) -> Option<&[u8]> {
+        self.symlink_target.as_deref()
+    }
+
+    pub(super) fn normalized_next_path(&self) -> Option<&[u8]> {
+        self.normalized_next_path.as_deref()
+    }
+}
+
+impl fmt::Debug for VerifiedBoundPathNodeV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedBoundPathNodeV1")
+            .field("kind", &self.kind)
+            .field("path", &"<redacted>")
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Owned output from the sole descriptor-relative regular-byte operation.
+/// It contains no descriptor or host pathname and is not clonable.
+pub(super) struct VerifiedBoundRegularBytesV1 {
+    bytes: Vec<u8>,
+    nodes: Vec<VerifiedBoundPathNodeV1>,
+    root_statx_commitment: [u8; 102],
+    terminal_identity_digest: Blake3Digest,
+    content_digest: FileContentDigest,
+}
+
+impl VerifiedBoundRegularBytesV1 {
+    pub(super) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub(super) fn nodes(&self) -> &[VerifiedBoundPathNodeV1] {
+        &self.nodes
+    }
+
+    pub(super) const fn root_statx_commitment(&self) -> &[u8; 102] {
+        &self.root_statx_commitment
+    }
+
+    pub(super) const fn terminal_identity_digest(&self) -> Blake3Digest {
+        self.terminal_identity_digest
+    }
+
+    pub(super) const fn content_digest(&self) -> FileContentDigest {
+        self.content_digest
+    }
+}
+
+impl fmt::Debug for VerifiedBoundRegularBytesV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VerifiedBoundRegularBytesV1")
+            .field("bytes", &"<redacted>")
+            .field("node_count", &self.nodes.len())
+            .field("identity", &"<redacted>")
+            .finish()
+    }
+}
+
+impl Drop for VerifiedBoundRegularBytesV1 {
+    fn drop(&mut self) {
+        self.bytes.fill(0);
+    }
+}
+
+fn validate_bound_components_v1(path: &[u8]) -> Result<(), BoundRegularReadRefusalV1> {
+    if path.is_empty() || path[0] == b'/' || path.contains(&0) {
+        return Err(BoundRegularReadRefusalV1::InvalidPath);
+    }
+    let mut count = 0usize;
+    for component in path.split(|byte| *byte == b'/') {
+        if component.is_empty() || component == b"." || component == b".." {
+            return Err(BoundRegularReadRefusalV1::InvalidPath);
+        }
+        count = count
+            .checked_add(1)
+            .ok_or(BoundRegularReadRefusalV1::ComponentLimit)?;
+        if count > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 || component.len() > MAX_BASENAME_BYTES {
+            return Err(BoundRegularReadRefusalV1::ComponentLimit);
+        }
+    }
+    Ok(())
+}
+
+fn read_exact_bound_regular_size_v1<R: std::io::Read>(
+    reader: &mut R,
+    size: usize,
+) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
+    let mut bytes = vec![0u8; size];
+    if let Err(error) = reader.read_exact(&mut bytes) {
+        bytes.fill(0);
+        return Err(match error.kind() {
+            io::ErrorKind::UnexpectedEof => BoundRegularReadRefusalV1::ShortRead,
+            _ => BoundRegularReadRefusalV1::Io,
+        });
+    }
+    let mut extra = [0u8; 1];
+    let extra_count = match reader.read(&mut extra) {
+        Ok(count) => count,
+        Err(_) => {
+            bytes.fill(0);
+            return Err(BoundRegularReadRefusalV1::Io);
+        }
+    };
+    if extra_count != 0 {
+        bytes.fill(0);
+        return Err(BoundRegularReadRefusalV1::SizeMismatch);
+    }
+    Ok(bytes)
+}
+
+pub(super) fn read_bound_regular_bytes_v1(
+    bound: &BoundPublishedSnapshotChildV1,
+    path: &ValidatedBoundRelativePathV1,
+    byte_ceiling: u32,
+) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
+    if byte_ceiling == 0 || byte_ceiling > BOUND_REGULAR_MAX_BYTES_V1 {
+        return Err(BoundRegularReadRefusalV1::InvalidByteCeiling);
+    }
+    platform::read_bound_regular_bytes_v1(bound, path.as_bytes(), byte_ceiling)
+}
 
 const fn cleanup_fd_peak(max_cleanup_depth: u16) -> u32 {
     max_cleanup_depth as u32 * CLEANUP_FDS_PER_DEPTH + CLEANUP_FIXED_FDS
@@ -593,6 +800,8 @@ pub(super) fn create_staged_snapshot_directory_at<'parent>(
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 mod platform {
+    use std::collections::VecDeque;
+    use std::ffi::CString;
     use std::mem::{self, MaybeUninit};
     use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
 
@@ -1116,6 +1325,292 @@ mod platform {
         #[cfg(test)]
         pub(super) fn root_directory(&self) -> BorrowedFd<'_> {
             self.root.as_fd()
+        }
+    }
+
+    pub(super) fn read_bound_regular_bytes_v1(
+        bound: &BoundPublishedSnapshotChildV1,
+        path: &[u8],
+        byte_ceiling: u32,
+    ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
+        let published_before = node_statx_v1(bound.published.as_fd())?;
+        let root_before = node_statx_v1(bound.root.as_fd())?;
+        if published_before.mode() & libc::S_IFMT != libc::S_IFDIR
+            || root_before.mode() & libc::S_IFMT != libc::S_IFDIR
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let root_commitment = root_before.commitment_bytes_v1();
+        let initial = split_bound_path_v1(path)?;
+        let mut pending = VecDeque::from(initial.clone());
+        let mut resolved_prefix = Vec::<Vec<u8>>::new();
+        let mut directory: Option<OwnedFd> = None;
+        let mut nodes = Vec::<VerifiedBoundPathNodeV1>::new();
+        let mut normalized_paths = vec![join_bound_components_v1(&initial)?];
+        let mut symlink_hops = 0usize;
+
+        loop {
+            let component = pending
+                .front()
+                .ok_or(BoundRegularReadRefusalV1::InvalidPath)?
+                .clone();
+            let component_name = CString::new(component.clone())
+                .map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
+            let parent = directory
+                .as_ref()
+                .map_or(bound.root.as_fd(), std::os::fd::AsFd::as_fd);
+            let parent_before = node_statx_v1(parent)?;
+            let path_fd = open_bound_component_v1(
+                parent,
+                &component_name,
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let parent_after = node_statx_v1(parent)?;
+            if parent_before.commitment_bytes_v1() != parent_after.commitment_bytes_v1() {
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            let before = node_statx_v1(path_fd.as_fd())?;
+            let mut observed_path_components = resolved_prefix.clone();
+            observed_path_components.push(component.clone());
+            let observed_path = join_bound_components_v1(&observed_path_components)?;
+            let mode_type = before.mode() & libc::S_IFMT;
+
+            if mode_type == libc::S_IFLNK {
+                symlink_hops = symlink_hops
+                    .checked_add(1)
+                    .ok_or(BoundRegularReadRefusalV1::SymlinkLimit)?;
+                if symlink_hops > BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 {
+                    return Err(BoundRegularReadRefusalV1::SymlinkLimit);
+                }
+                let target = read_bound_link_v1(parent, &component_name)?;
+                let after = node_statx_v1(path_fd.as_fd())?;
+                if before.commitment_bytes_v1() != after.commitment_bytes_v1() {
+                    return Err(BoundRegularReadRefusalV1::IdentityDrift);
+                }
+                let target_components = split_bound_path_v1(&target)
+                    .map_err(|_| BoundRegularReadRefusalV1::SymlinkTargetInvalid)?;
+                let mut next = resolved_prefix.clone();
+                next.extend(target_components);
+                next.extend(pending.iter().skip(1).cloned());
+                if next.len() > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
+                    return Err(BoundRegularReadRefusalV1::ComponentLimit);
+                }
+                let normalized_next = join_bound_components_v1(&next)?;
+                if normalized_paths
+                    .iter()
+                    .any(|existing| existing.as_slice() == normalized_next.as_slice())
+                {
+                    return Err(BoundRegularReadRefusalV1::SymlinkCycle);
+                }
+                normalized_paths.push(normalized_next.clone());
+                push_unique_bound_node_v1(
+                    &mut nodes,
+                    VerifiedBoundPathNodeV1 {
+                        normalized_path: observed_path.into_boxed_slice(),
+                        kind: VerifiedBoundNodeKindV1::Symlink,
+                        statx_commitment: before.commitment_bytes_v1(),
+                        symlink_target: Some(target.into_boxed_slice()),
+                        normalized_next_path: Some(normalized_next.into_boxed_slice()),
+                    },
+                )?;
+                pending = next.into();
+                resolved_prefix.clear();
+                directory = None;
+                continue;
+            }
+
+            let terminal = pending.len() == 1;
+            if mode_type == libc::S_IFDIR && !terminal {
+                push_unique_bound_node_v1(
+                    &mut nodes,
+                    VerifiedBoundPathNodeV1 {
+                        normalized_path: observed_path.into_boxed_slice(),
+                        kind: VerifiedBoundNodeKindV1::Directory,
+                        statx_commitment: before.commitment_bytes_v1(),
+                        symlink_target: None,
+                        normalized_next_path: None,
+                    },
+                )?;
+                resolved_prefix.push(component);
+                pending.pop_front();
+                directory = Some(path_fd);
+                continue;
+            }
+            if mode_type != libc::S_IFREG || !terminal {
+                return Err(BoundRegularReadRefusalV1::NodeType);
+            }
+
+            let read_fd = open_bound_component_v1(
+                parent,
+                &component_name,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NOATIME | libc::O_CLOEXEC,
+            )?;
+            let opened = node_statx_v1(read_fd.as_fd())?;
+            if before.commitment_bytes_v1() != opened.commitment_bytes_v1() {
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            if opened.nlink() != 1 {
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            let size =
+                usize::try_from(opened.size()).map_err(|_| BoundRegularReadRefusalV1::ByteLimit)?;
+            if size > byte_ceiling as usize {
+                return Err(BoundRegularReadRefusalV1::ByteLimit);
+            }
+            let mut file = std::fs::File::from(read_fd);
+            let mut bytes = read_exact_bound_regular_size_v1(&mut file, size)?;
+            let after = node_statx_v1(file.as_fd())?;
+            if opened.commitment_bytes_v1() != after.commitment_bytes_v1() {
+                bytes.fill(0);
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            let terminal_commitment = opened.commitment_bytes_v1();
+            push_unique_bound_node_v1(
+                &mut nodes,
+                VerifiedBoundPathNodeV1 {
+                    normalized_path: observed_path.into_boxed_slice(),
+                    kind: VerifiedBoundNodeKindV1::Regular,
+                    statx_commitment: terminal_commitment,
+                    symlink_target: None,
+                    normalized_next_path: None,
+                },
+            )?;
+            let root_after = node_statx_v1(bound.root.as_fd())?;
+            let published_after = node_statx_v1(bound.published.as_fd())?;
+            if root_commitment != root_after.commitment_bytes_v1()
+                || published_before.commitment_bytes_v1() != published_after.commitment_bytes_v1()
+            {
+                bytes.fill(0);
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            let content_digest =
+                FileContentDigest::derive(super::super::FILE_CONTENT_DOMAIN, &[&bytes]);
+            return Ok(VerifiedBoundRegularBytesV1 {
+                terminal_identity_digest: Blake3Digest::derive(
+                    BOUND_REGULAR_IDENTITY_DOMAIN_V1,
+                    &[&terminal_commitment],
+                ),
+                bytes,
+                nodes,
+                root_statx_commitment: root_commitment,
+                content_digest,
+            });
+        }
+    }
+
+    fn split_bound_path_v1(path: &[u8]) -> Result<Vec<Vec<u8>>, BoundRegularReadRefusalV1> {
+        validate_bound_components_v1(path)?;
+        Ok(path
+            .split(|byte| *byte == b'/')
+            .map(<[u8]>::to_vec)
+            .collect())
+    }
+
+    fn join_bound_components_v1(
+        components: &[Vec<u8>],
+    ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
+        if components.is_empty() || components.len() > BOUND_REGULAR_PATH_MAX_COMPONENTS_V1 {
+            return Err(BoundRegularReadRefusalV1::ComponentLimit);
+        }
+        let length = components
+            .iter()
+            .try_fold(components.len() - 1, |total, component| {
+                total.checked_add(component.len())
+            })
+            .ok_or(BoundRegularReadRefusalV1::ComponentLimit)?;
+        let mut joined = Vec::with_capacity(length);
+        for (index, component) in components.iter().enumerate() {
+            if index != 0 {
+                joined.push(b'/');
+            }
+            joined.extend_from_slice(component);
+        }
+        validate_bound_components_v1(&joined)?;
+        Ok(joined)
+    }
+
+    fn push_unique_bound_node_v1(
+        nodes: &mut Vec<VerifiedBoundPathNodeV1>,
+        node: VerifiedBoundPathNodeV1,
+    ) -> Result<(), BoundRegularReadRefusalV1> {
+        if let Some(existing) = nodes
+            .iter()
+            .find(|existing| existing.normalized_path == node.normalized_path)
+        {
+            if existing.kind != node.kind
+                || existing.statx_commitment != node.statx_commitment
+                || existing.symlink_target != node.symlink_target
+            {
+                return Err(BoundRegularReadRefusalV1::IdentityDrift);
+            }
+            return Ok(());
+        }
+        if nodes.len() == BOUND_REGULAR_MAX_OBSERVED_NODES_V1 {
+            return Err(BoundRegularReadRefusalV1::ComponentLimit);
+        }
+        nodes.push(node);
+        Ok(())
+    }
+
+    fn open_bound_component_v1(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        flags: i32,
+    ) -> Result<OwnedFd, BoundRegularReadRefusalV1> {
+        openat2_owned(parent, name, flags, HARD_MAX_OPENAT2_ATTEMPTS).map_err(map_bound_io_v1)
+    }
+
+    fn read_bound_link_v1(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Result<Vec<u8>, BoundRegularReadRefusalV1> {
+        let mut target = vec![0u8; BOUND_REGULAR_TARGET_MAX_BYTES_V1 + 1];
+        let count = unsafe {
+            libc::readlinkat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if count < 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let count = usize::try_from(count).map_err(|_| BoundRegularReadRefusalV1::Io)?;
+        if count == 0 || count > BOUND_REGULAR_TARGET_MAX_BYTES_V1 {
+            return Err(BoundRegularReadRefusalV1::SymlinkTargetInvalid);
+        }
+        target.truncate(count);
+        Ok(target)
+    }
+
+    fn node_statx_v1(fd: BorrowedFd<'_>) -> Result<SourceStatxV1, BoundRegularReadRefusalV1> {
+        let mut raw = MaybeUninit::<libc::statx>::zeroed();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                fd.as_raw_fd(),
+                c"".as_ptr(),
+                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                SOURCE_TREE_REQUESTED_STATX_MASK_V1,
+                raw.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let raw = unsafe { raw.assume_init() };
+        SourceStatxV1::from_linux_statx_v1(&raw).map_err(map_bound_io_v1)
+    }
+
+    fn map_bound_io_v1(error: io::Error) -> BoundRegularReadRefusalV1 {
+        match error.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ENOTDIR) => BoundRegularReadRefusalV1::MissingNode,
+            Some(libc::EXDEV) => BoundRegularReadRefusalV1::MountCrossing,
+            Some(libc::ELOOP) => BoundRegularReadRefusalV1::MagicLink,
+            Some(libc::EFBIG) => BoundRegularReadRefusalV1::ByteLimit,
+            Some(libc::ESTALE) => BoundRegularReadRefusalV1::IdentityDrift,
+            _ => BoundRegularReadRefusalV1::Io,
         }
     }
 
@@ -3608,6 +4103,31 @@ mod platform {
             .commitment_bytes_v1()
         }
 
+        fn publish_bound_tree(
+            fixture: &Fixture,
+            populate: impl FnOnce(&Path),
+        ) -> BoundPublishedSnapshotChildV1 {
+            let staged = fixture.stage();
+            let root = fixture
+                .staging_path()
+                .join(OsStr::from_bytes(ROOT.to_bytes()));
+            fs::create_dir(&root).unwrap();
+            populate(&root);
+            let published = staged
+                .verify_ready_with(|_| Ok(()))
+                .unwrap()
+                .publish_at(FINAL)
+                .unwrap();
+            let expected = published_child_commitment(&published, ROOT);
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap()
+        }
+
         fn bind_leaf(error: SnapshotPublishedChildBindErrorV1) -> SnapshotPublishErrorV1 {
             assert_eq!(
                 error.publication_state(),
@@ -4399,6 +4919,153 @@ mod platform {
         }
 
         #[test]
+        fn bound_regular_reader_accepts_direct_and_relative_symlink_terminal_bytes() {
+            let direct_fixture = Fixture::new();
+            let direct = publish_bound_tree(&direct_fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python"), b"direct").unwrap();
+            });
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            let direct_bytes =
+                super::super::read_bound_regular_bytes_v1(&direct, &path, 6).unwrap();
+            assert_eq!(direct_bytes.bytes(), b"direct");
+            assert_eq!(
+                direct_bytes.nodes().last().unwrap().kind(),
+                VerifiedBoundNodeKindV1::Regular
+            );
+
+            let link_fixture = Fixture::new();
+            let linked = publish_bound_tree(&link_fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python-real"), b"linked").unwrap();
+                symlink("python-real", root.join(".venv/bin/python")).unwrap();
+            });
+            let linked_bytes =
+                super::super::read_bound_regular_bytes_v1(&linked, &path, 6).unwrap();
+            assert_eq!(linked_bytes.bytes(), b"linked");
+            let symlink = linked_bytes
+                .nodes()
+                .iter()
+                .find(|node| node.kind() == VerifiedBoundNodeKindV1::Symlink)
+                .unwrap();
+            assert_eq!(symlink.symlink_target(), Some(b"python-real".as_slice()));
+            assert_eq!(
+                symlink.normalized_next_path(),
+                Some(b".venv/bin/python-real".as_slice())
+            );
+        }
+
+        #[test]
+        fn bound_regular_reader_enforces_exact_symlink_hop_boundary() {
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            for (hop_count, expected) in [
+                (BOUND_REGULAR_SYMLINK_MAX_HOPS_V1, Ok(())),
+                (
+                    BOUND_REGULAR_SYMLINK_MAX_HOPS_V1 + 1,
+                    Err(BoundRegularReadRefusalV1::SymlinkLimit),
+                ),
+            ] {
+                let fixture = Fixture::new();
+                let bound = publish_bound_tree(&fixture, |root| {
+                    let bin = root.join(".venv/bin");
+                    fs::create_dir_all(&bin).unwrap();
+                    fs::write(bin.join("terminal"), b"x").unwrap();
+                    for index in 0..hop_count {
+                        let name = if index == 0 {
+                            "python".to_owned()
+                        } else {
+                            format!("link-{index}")
+                        };
+                        let target = if index + 1 == hop_count {
+                            "terminal".to_owned()
+                        } else {
+                            format!("link-{}", index + 1)
+                        };
+                        symlink(target, bin.join(name)).unwrap();
+                    }
+                });
+                assert_eq!(
+                    super::super::read_bound_regular_bytes_v1(&bound, &path, 1).map(|_| ()),
+                    expected
+                );
+            }
+        }
+
+        #[test]
+        fn bound_regular_reader_rejects_cycle_escape_missing_special_and_size() {
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            for (target, expected) in [
+                ("python", BoundRegularReadRefusalV1::SymlinkCycle),
+                ("/bin/sh", BoundRegularReadRefusalV1::SymlinkTargetInvalid),
+                ("../python", BoundRegularReadRefusalV1::SymlinkTargetInvalid),
+            ] {
+                let fixture = Fixture::new();
+                let bound = publish_bound_tree(&fixture, |root| {
+                    fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                    symlink(target, root.join(".venv/bin/python")).unwrap();
+                });
+                assert_eq!(
+                    super::super::read_bound_regular_bytes_v1(&bound, &path, 64).unwrap_err(),
+                    expected
+                );
+            }
+
+            let missing_fixture = Fixture::new();
+            let missing = publish_bound_tree(&missing_fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+            });
+            assert_eq!(
+                super::super::read_bound_regular_bytes_v1(&missing, &path, 64).unwrap_err(),
+                BoundRegularReadRefusalV1::MissingNode
+            );
+
+            let special_fixture = Fixture::new();
+            let special = publish_bound_tree(&special_fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                std::os::unix::net::UnixListener::bind(root.join(".venv/bin/python")).unwrap();
+            });
+            assert_eq!(
+                super::super::read_bound_regular_bytes_v1(&special, &path, 64).unwrap_err(),
+                BoundRegularReadRefusalV1::NodeType
+            );
+
+            let large_fixture = Fixture::new();
+            let large = publish_bound_tree(&large_fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python"), [0u8; 65]).unwrap();
+            });
+            assert_eq!(
+                super::super::read_bound_regular_bytes_v1(&large, &path, 64).unwrap_err(),
+                BoundRegularReadRefusalV1::ByteLimit
+            );
+            assert_eq!(
+                super::super::read_bound_regular_bytes_v1(&large, &path, 0).unwrap_err(),
+                BoundRegularReadRefusalV1::InvalidByteCeiling
+            );
+        }
+
+        #[test]
+        fn same_uid_post_bind_replacement_is_evidence_for_manifest_rejection_not_containment() {
+            let fixture = Fixture::new();
+            let bound = publish_bound_tree(&fixture, |root| {
+                fs::create_dir_all(root.join(".venv/bin")).unwrap();
+                fs::write(root.join(".venv/bin/python"), b"before").unwrap();
+            });
+            fs::write(
+                fixture.final_path().join("root/.venv/bin/python"),
+                b"after!",
+            )
+            .unwrap();
+            let path = ValidatedBoundRelativePathV1::parse(b".venv/bin/python").unwrap();
+            let observed = super::super::read_bound_regular_bytes_v1(&bound, &path, 6).unwrap();
+            assert_eq!(observed.bytes(), b"after!");
+            assert_ne!(
+                observed.content_digest(),
+                FileContentDigest::derive(super::super::super::FILE_CONTENT_DOMAIN, &[b"before"])
+            );
+        }
+
+        #[test]
         fn invalid_and_missing_published_child_names_fail_with_durable_state() {
             let invalid = Fixture::new();
             let published = invalid.publish_root();
@@ -4800,6 +5467,14 @@ mod platform {
         }
     }
 
+    pub(super) fn read_bound_regular_bytes_v1(
+        _bound: &BoundPublishedSnapshotChildV1,
+        _path: &[u8],
+        _byte_ceiling: u32,
+    ) -> Result<VerifiedBoundRegularBytesV1, BoundRegularReadRefusalV1> {
+        Err(BoundRegularReadRefusalV1::UnsupportedPlatform)
+    }
+
     impl fmt::Debug for BoundPublishedSnapshotChildV1 {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
@@ -5025,6 +5700,98 @@ mod portable_tests {
         assert_eq!(
             decomposed,
             4 * open_retries + 16 + generic_retries * (2 * open_retries + 5)
+        );
+    }
+
+    #[test]
+    fn bound_regular_path_validation_is_raw_bounded_and_relative() {
+        assert!(ValidatedBoundRelativePathV1::parse(b".venv/bin/python").is_ok());
+        assert!(ValidatedBoundRelativePathV1::parse(&[0xff]).is_ok());
+        for invalid in [
+            b"".as_slice(),
+            b"/absolute",
+            b"a//b",
+            b"a/./b",
+            b"a/../b",
+            b"a/",
+            b"a\0b",
+        ] {
+            assert_eq!(
+                ValidatedBoundRelativePathV1::parse(invalid).unwrap_err(),
+                BoundRegularReadRefusalV1::InvalidPath
+            );
+        }
+    }
+
+    #[test]
+    fn bound_regular_path_component_and_name_ceilings_are_exact() {
+        let exact = std::iter::repeat_n("a", BOUND_REGULAR_PATH_MAX_COMPONENTS_V1)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert!(ValidatedBoundRelativePathV1::parse(exact.as_bytes()).is_ok());
+        let excessive = format!("{exact}/a");
+        assert_eq!(
+            ValidatedBoundRelativePathV1::parse(excessive.as_bytes()).unwrap_err(),
+            BoundRegularReadRefusalV1::ComponentLimit
+        );
+        assert!(ValidatedBoundRelativePathV1::parse(&vec![b'a'; MAX_BASENAME_BYTES]).is_ok());
+        assert_eq!(
+            ValidatedBoundRelativePathV1::parse(&vec![b'a'; MAX_BASENAME_BYTES + 1]).unwrap_err(),
+            BoundRegularReadRefusalV1::ComponentLimit
+        );
+    }
+
+    #[test]
+    fn verified_regular_bytes_are_linear_zeroing_and_redacted() {
+        trait AmbiguousIfClone<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        impl<T: Clone> AmbiguousIfClone<u8> for T {}
+        trait AmbiguousIfCopy<A> {
+            fn probe() {}
+        }
+        impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+        impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+
+        <VerifiedBoundRegularBytesV1 as AmbiguousIfClone<_>>::probe();
+        <VerifiedBoundRegularBytesV1 as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<VerifiedBoundRegularBytesV1>());
+        let value = VerifiedBoundRegularBytesV1 {
+            bytes: b"secret".to_vec(),
+            nodes: Vec::new(),
+            root_statx_commitment: [0; 102],
+            terminal_identity_digest: Blake3Digest::derive(
+                BOUND_REGULAR_IDENTITY_DOMAIN_V1,
+                &[b"identity"],
+            ),
+            content_digest: FileContentDigest::derive(
+                super::super::FILE_CONTENT_DOMAIN,
+                &[b"secret"],
+            ),
+        };
+        let debug = format!("{value:?}");
+        assert!(!debug.contains("secret"));
+        assert!(debug.contains("<redacted>"));
+    }
+
+    #[test]
+    fn bounded_regular_read_distinguishes_exact_short_and_growth() {
+        assert_eq!(
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"exact"), 5).unwrap(),
+            b"exact"
+        );
+        assert_eq!(
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"short"), 6).unwrap_err(),
+            BoundRegularReadRefusalV1::ShortRead
+        );
+        assert_eq!(
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(b"growth"), 5).unwrap_err(),
+            BoundRegularReadRefusalV1::SizeMismatch
+        );
+        assert_eq!(
+            read_exact_bound_regular_size_v1(&mut io::Cursor::new(Vec::<u8>::new()), 0).unwrap(),
+            Vec::<u8>::new()
         );
     }
 }

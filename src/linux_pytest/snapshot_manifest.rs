@@ -35,9 +35,10 @@ use super::snapshot_policy::{
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
-    BoundPublishedSnapshotChildV1, SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1,
-    SnapshotPublishedChildBindErrorV1, seal_publish_and_bind_snapshot_child_at,
-    validate_snapshot_final_name,
+    BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, SnapshotPublishAndBindErrorV1,
+    SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1, ValidatedBoundRelativePathV1,
+    VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1, read_bound_regular_bytes_v1,
+    seal_publish_and_bind_snapshot_child_at, validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
@@ -172,6 +173,301 @@ impl fmt::Debug for PublishedCanonicalTreeV1<'_> {
 pub(super) struct FirstExecuteOnlyWorkspaceTreeBindingV1<'resources> {
     lexical: FirstExecuteOnlyLexicalAdmissionV1,
     workspace: PublishedCanonicalTreeV1<'resources>,
+}
+
+const FIRST_EXECUTE_ONLY_EXECUTABLE_V1: &[u8] = b".venv/bin/python";
+const FIRST_EXECUTE_ONLY_EXECUTABLE_MAX_BYTES_V1: u32 = 16 * 1024 * 1024;
+
+/// Stable, payload-free failures while consuming workspace evidence into the
+/// first executable-byte projection. None is a success-like classification.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1 {
+    InvalidFixedExecutable,
+    PathComponentLimit,
+    SymlinkLimit,
+    SymlinkCycle,
+    SymlinkTarget,
+    MissingNode,
+    MountCrossing,
+    MagicLink,
+    NodeType,
+    IdentityDrift,
+    SizeMismatch,
+    ByteLimit,
+    ShortRead,
+    Io,
+    ManifestNodeMissing,
+    ManifestNodeAmbiguous,
+    ManifestKindMismatch,
+    ManifestSymlinkMismatch,
+    ManifestContentMismatch,
+    ManifestDigestMismatch,
+    ManifestRootMismatch,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyRuntimeNodeBindingV1 {
+    normalized_path: Box<[u8]>,
+    normalized_next_path: Option<Box<[u8]>>,
+    kind: VerifiedBoundNodeKindV1,
+    statx_commitment: [u8; 102],
+    node_digest: NodeDigest,
+    logical_mode: u32,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FirstExecuteOnlyRuntimeNodeBindingV1 {
+    pub(super) fn normalized_path(&self) -> &[u8] {
+        &self.normalized_path
+    }
+
+    pub(super) fn normalized_next_path(&self) -> Option<&[u8]> {
+        self.normalized_next_path.as_deref()
+    }
+
+    pub(super) const fn kind(&self) -> VerifiedBoundNodeKindV1 {
+        self.kind
+    }
+
+    pub(super) const fn statx_commitment(&self) -> &[u8; 102] {
+        &self.statx_commitment
+    }
+
+    pub(super) const fn node_digest(&self) -> NodeDigest {
+        self.node_digest
+    }
+
+    pub(super) const fn logical_mode(&self) -> u32 {
+        self.logical_mode
+    }
+}
+
+/// Linear operation-specific projection. It retains the exact connector-owned
+/// physical and charged canonical tree evidence together with verified bytes;
+/// it exposes no descriptor and cannot mint execution authority.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources> {
+    binding: FirstExecuteOnlyWorkspaceTreeBindingV1<'resources>,
+    verified: VerifiedBoundRegularBytesV1,
+    nodes: Vec<FirstExecuteOnlyRuntimeNodeBindingV1>,
+    terminal_node_digest: NodeDigest,
+    terminal_logical_mode: u32,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_> {
+    pub(super) fn executable_bytes(&self) -> &[u8] {
+        self.verified.bytes()
+    }
+
+    pub(super) fn nodes(&self) -> &[FirstExecuteOnlyRuntimeNodeBindingV1] {
+        &self.nodes
+    }
+
+    pub(super) const fn workspace_root_digest(&self) -> NodeDigest {
+        self.binding.workspace.manifest.root_digest()
+    }
+
+    pub(super) const fn workspace_root_statx_commitment(&self) -> &[u8; 102] {
+        self.verified.root_statx_commitment()
+    }
+
+    pub(super) const fn terminal_node_digest(&self) -> NodeDigest {
+        self.terminal_node_digest
+    }
+
+    pub(super) const fn terminal_identity_digest(&self) -> super::Blake3Digest {
+        self.verified.terminal_identity_digest()
+    }
+
+    pub(super) const fn terminal_content_digest(&self) -> FileContentDigest {
+        self.verified.content_digest()
+    }
+
+    pub(super) const fn terminal_logical_mode(&self) -> u32 {
+        self.terminal_logical_mode
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyWorkspaceRuntimeEvidenceV1")
+            .field("binding", &"<opaque-connector-evidence>")
+            .field("verified_bytes", &"<redacted>")
+            .field("node_count", &self.nodes.len())
+            .finish()
+    }
+}
+
+/// Consume the connector-issued workspace binding and resolve only the fixed
+/// Gate 3 executable. The physical descriptor never escapes this operation.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn consume_first_execute_only_workspace_runtime_evidence_v1<'resources>(
+    binding: FirstExecuteOnlyWorkspaceTreeBindingV1<'resources>,
+) -> Result<
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+> {
+    let path = ValidatedBoundRelativePathV1::parse(FIRST_EXECUTE_ONLY_EXECUTABLE_V1)
+        .map_err(map_bound_regular_refusal_v1)?;
+    let verified = read_bound_regular_bytes_v1(
+        &binding.workspace.physical,
+        &path,
+        FIRST_EXECUTE_ONLY_EXECUTABLE_MAX_BYTES_V1,
+    )
+    .map_err(map_bound_regular_refusal_v1)?;
+    if verified.root_statx_commitment()
+        != binding
+            .workspace
+            .manifest
+            .destination_root_statx_commitment_v1()
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestRootMismatch);
+    }
+    let mut roots = binding
+        .workspace
+        .manifest
+        .entries
+        .as_slice()
+        .iter()
+        .filter(|entry| entry.relative_path.is_empty());
+    let root = roots
+        .next()
+        .ok_or(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestRootMismatch)?;
+    if roots.next().is_some()
+        || root.node_digest != binding.workspace.manifest.root_digest()
+        || !charged_manifest_entry_digest_consistent_v1(root)
+    {
+        return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
+    }
+
+    let mut nodes = Vec::with_capacity(verified.nodes().len());
+    let mut terminal = None;
+    for observed in verified.nodes() {
+        let mut matches = binding
+            .workspace
+            .manifest
+            .entries
+            .as_slice()
+            .iter()
+            .filter(|entry| entry.relative_path == observed.normalized_path());
+        let entry = matches
+            .next()
+            .ok_or(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeMissing)?;
+        if matches.next().is_some() {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeAmbiguous);
+        }
+        let manifest_kind = match &entry.payload {
+            ChargedManifestPayloadV1::Directory { .. } => VerifiedBoundNodeKindV1::Directory,
+            ChargedManifestPayloadV1::Regular { .. } => VerifiedBoundNodeKindV1::Regular,
+            ChargedManifestPayloadV1::Symlink { .. } => VerifiedBoundNodeKindV1::Symlink,
+        };
+        if manifest_kind != observed.kind() {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestKindMismatch);
+        }
+        if !charged_manifest_entry_digest_consistent_v1(entry) {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestDigestMismatch);
+        }
+        if let ChargedManifestPayloadV1::Symlink { target } = &entry.payload
+            && observed.symlink_target() != Some(target.as_slice())
+        {
+            return Err(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestSymlinkMismatch);
+        }
+        if observed.kind() == VerifiedBoundNodeKindV1::Regular {
+            let ChargedManifestPayloadV1::Regular { content_digest, .. } = &entry.payload else {
+                unreachable!("kind checked above")
+            };
+            if *content_digest != verified.content_digest()
+                || entry.metadata.size
+                    != u64::try_from(verified.bytes().len()).expect("bounded bytes fit u64")
+            {
+                return Err(
+                    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestContentMismatch,
+                );
+            }
+            terminal = Some((entry.node_digest, entry.metadata.mode));
+        }
+        nodes.push(FirstExecuteOnlyRuntimeNodeBindingV1 {
+            normalized_path: observed.normalized_path().into(),
+            normalized_next_path: observed.normalized_next_path().map(Into::into),
+            kind: observed.kind(),
+            statx_commitment: *observed.statx_commitment(),
+            node_digest: entry.node_digest,
+            logical_mode: entry.metadata.mode,
+        });
+    }
+    let (terminal_node_digest, terminal_logical_mode) =
+        terminal.ok_or(FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ManifestNodeMissing)?;
+    Ok(FirstExecuteOnlyWorkspaceRuntimeEvidenceV1 {
+        binding,
+        verified,
+        nodes,
+        terminal_node_digest,
+        terminal_logical_mode,
+    })
+}
+
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn charged_manifest_entry_digest_consistent_v1(entry: &ChargedManifestEntryV1<'_>) -> bool {
+    canonical::derive_manifest_node_digest_projection_streaming_v1(
+        entry.metadata.projection(),
+        entry.payload.projection(),
+        entry.hardlink_group.as_ref(),
+    )
+    .is_ok_and(|digest| digest == entry.node_digest)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn map_bound_regular_refusal_v1(
+    refusal: BoundRegularReadRefusalV1,
+) -> FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1 {
+    match refusal {
+        BoundRegularReadRefusalV1::InvalidPath
+        | BoundRegularReadRefusalV1::InvalidByteCeiling
+        | BoundRegularReadRefusalV1::UnsupportedPlatform => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::InvalidFixedExecutable
+        }
+        BoundRegularReadRefusalV1::ComponentLimit => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::PathComponentLimit
+        }
+        BoundRegularReadRefusalV1::SymlinkLimit => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::SymlinkLimit
+        }
+        BoundRegularReadRefusalV1::SymlinkCycle => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::SymlinkCycle
+        }
+        BoundRegularReadRefusalV1::SymlinkTargetInvalid => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::SymlinkTarget
+        }
+        BoundRegularReadRefusalV1::MissingNode => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MissingNode
+        }
+        BoundRegularReadRefusalV1::MountCrossing => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MountCrossing
+        }
+        BoundRegularReadRefusalV1::MagicLink => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MagicLink
+        }
+        BoundRegularReadRefusalV1::NodeType => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::NodeType
+        }
+        BoundRegularReadRefusalV1::IdentityDrift => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::IdentityDrift
+        }
+        BoundRegularReadRefusalV1::SizeMismatch => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::SizeMismatch
+        }
+        BoundRegularReadRefusalV1::ByteLimit => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ByteLimit
+        }
+        BoundRegularReadRefusalV1::ShortRead => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ShortRead
+        }
+        BoundRegularReadRefusalV1::Io => FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -2013,6 +2309,37 @@ mod tests {
             validate_first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1),
             Ok(())
         );
+    }
+
+    #[test]
+    fn runtime_projection_recomputes_manifest_node_digests() {
+        let resources = manifest_resources(1024 * 1024);
+        let (source_s1, destination_d1) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let (source_s2, destination_d2) =
+            first_execute_only_fixture(FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1);
+        let stable = stable_projection(
+            &resources,
+            source_s1,
+            source_s2,
+            destination_d1,
+            destination_d2,
+        );
+        let mut manifest = compile_charged(&resources, stable).unwrap();
+        assert!(
+            manifest
+                .entries
+                .as_slice()
+                .iter()
+                .all(charged_manifest_entry_digest_consistent_v1)
+        );
+        manifest.entries.as_mut_slice()[2].node_digest = NodeDigest::derive(
+            "again runtime checkpoint manifest mutation test",
+            &[b"mutation"],
+        );
+        assert!(!charged_manifest_entry_digest_consistent_v1(
+            &manifest.entries.as_slice()[2]
+        ));
     }
 
     #[test]
