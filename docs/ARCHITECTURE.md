@@ -1,5 +1,130 @@
 # Architecture
 
+## Architectural rules
+
+Again treats reuse as an authority transition, not a cache lookup. These rules
+apply across the local, Linux trace-backed, and team paths:
+
+1. **Unknown is not equivalent.** An unmodeled input, effect, platform, runtime,
+   transport state, or cleanup result refuses or becomes execute-only.
+2. **Bytes do not create authority.** Parsed JSON, decoded kernel frames,
+   structurally valid EffectIR, digests, and test fixtures are evidence inputs;
+   they cannot mint execution, candidate, promotion, or replay authority.
+3. **Authority capabilities move linearly.** Stopped-task permits, exchange
+   tokens, completion evidence, and hit permits are non-copyable and consumed
+   by one next transition. A sealed immutable snapshot may be duplicated only
+   through its private identity-preserving descriptor-clone path; every copy
+   remains bound to the same manifest and identity.
+4. **Execution and reuse are separate decisions.** A safely completed workload
+   may return exact foreground output while remaining permanently ineligible for
+   a candidate or hit.
+5. **Cleanup is part of correctness.** Terminal reap, final `ECHILD`, signal and
+   descriptor restoration, mount/branch cleanup, and durable publication are
+   required evidence, not best-effort afterthoughts.
+6. **Remote state cannot upgrade local safety.** A valid remote signature or
+   ciphertext never compensates for a missing local execution profile,
+   observation, precondition, or capability proof.
+7. **Claims follow retained evidence.** Pure tests prove pure logic; a fixed
+   diagnostic proves only its fixed transcript; product and performance claims
+   require their distinct end-to-end gates.
+
+## Current system map
+
+| Plane | Current implementation | Missing authority/product step |
+|---|---|---|
+| Explicit local reads | Working macOS MVP with strict policy, exact executable/profile checks, SQLite/CAS, double-run admission, complete-stream replay, explicit references, and reversible Codex skill | audited multi-host profile registry, signed distribution, and outside-alpha evidence |
+| Linux snapshots | Descriptor-stable enumeration, charged materialization, canonical workspace-tree compilation, durable publication, and reopened-child binding exist internally | connector-wired no-atime qualification, full workspace/runtime manifest and digest, content-addressed snapshot identity, and `SnapshotProvider` |
+| Linux isolation | Private-root, layout, scratch, procfs, descriptor scrub, capability, Landlock, terminal seccomp, and fixed ptrace diagnostics exist as separate hidden leaves | provisioned-runner composition with PID 1, descriptor-selected workspace/runtime, `/dev`, profile stdio, workload seccomp, and one cleanup owner |
+| Linux tracing | Strict decoders, trace-all filter, lifecycle recorder, branded pure supervisor planner, and a hidden fixed two-task kernel connector with options/filter witnesses, bounded private-range `clone3` capture, full reap, final `ECHILD`, and consuming cleanup exist | connector-wide fault injection, pinned 100/100 kernel evidence, semantic recorder, execute-only composition, and execution authority |
+| Linux EffectIR/reuse | Canonical EffectIR v2, comparison, promotion, manifest, and wire/storage contracts have substantial pure coverage | live semantic trace construction, complete candidate finalization, shadow dispatcher, fresh hit validation, and replay |
+| Team reuse | Encrypted v2 manifests, signed trust/provenance, strict Rust clients, Worker/D1/R2 boundary, team CLI, and CI wrapper exist for manual provisioning | deployed service, onboarding/control plane, production operations/security evidence, equivalent-profile cross-machine proof, and design-partner validation |
+
+The status of each row is normative only through [STATUS.md](STATUS.md). The
+phase ordering and exit gates are in [ROADMAP.md](ROADMAP.md).
+
+## Target Linux authority chain
+
+```text
+AdmissionInput
+  -> PytestAdmissionDraft                  lexical evidence only
+  -> SealedSnapshot                        descriptor-backed snapshot authority
+  -> PreparedPytest                        resolved invocation + sealed inputs
+  -> PreparedExecutionSession              isolated branch, stdio, PID 1
+  -> PreExecStoppedTask
+     + InstalledFilterWitness
+     + PtraceOptionsWitness
+  -> KernelTracerSession                   only kernel connector can issue
+  -> planner intents <-> exact kernel operations
+     + semantic EffectIR recorder
+  -> ConnectorExecutionOutcome
+       |- CleanupIncompleteFailure         typed failure/report; stop
+       |- ExecutedOnlyCleanupToken         immutable executed-only record; stop
+       `- ExecutionCompletionToken
+          + retained PreparedPytest
+          -> candidate eligibility finalizer
+          -> {immutable primary candidate, retained PreparedPytest}
+          -> ShadowEnvelopeV2
+          -> independent shadow candidate
+  -> separate promotion comparison row
+  -> freshly revalidated hit token
+  -> exact replay / transactional effect commit
+```
+
+The chain may stop safely at refusal or execute-only, but no arrow may be
+skipped. The intended ownership is:
+
+- `ProfileAdmission::parse_lexical` produces only a draft. It cannot resolve
+  selectors or create filesystem/execution authority.
+- A concrete `SnapshotProvider` must consume the existing connector checkpoint
+  only after source qualification, full workspace/runtime manifest construction,
+  content-addressed durable publication, and descriptor capability binding.
+- `finalize_against_snapshot` creates `PreparedPytest` by resolving the exact
+  selectors and executable chain against the sealed snapshot.
+- One private Linux execution connector temporarily consumes `PreparedPytest`,
+  owns branch creation, namespaces, stdio, filters, tracee launch, kernel
+  tracing, semantic recording, result capture, final root, and cleanup, then
+  returns that same live capability with a candidate-capable outcome. There is
+  no public generic sandbox/tracer trait that lets crate siblings substitute
+  evidence or reconstruct prepared authority from paths or identity bytes.
+- Exact installed-filter and ptrace-options witnesses unlock the currently pure
+  supervisor planner. A decoded frame or synthetic token cannot unlock it.
+- Every planner exchange is bound to the exact connector session, TID, stop
+  generation, operation, and buffer shape. The connector confirms success only
+  after the corresponding kernel call succeeds.
+- A `clone3` stopped-memory read additionally requires proof that every traced
+  task sharing the address space is stopped or absent, no untraced sibling can
+  mutate it, and the range is not externally mutable/shared. Without that
+  witness, the connector must not resume from the capture: it kills and drains
+  the tree and fails closed. An execute-only record may describe the failure
+  only after cleanup.
+- `ExecutionCompletionToken` is non-`Clone`, non-serializable, and connector-
+  issued only after no exchange or pending task relation remains, the lifecycle
+  recorder completes, every task exits and is reaped, a later wait returns
+  `ECHILD`, semantic and final-root state finalize, streams/status are complete,
+  and signal/descriptor/mount/branch cleanup succeeds.
+- `ExecutedOnlyCleanupToken` is issued only when the connector can prove the
+  same full cleanup boundary for a safely completed or deliberately terminated
+  non-candidate run. It can bind an immutable executed-only record but can never
+  create a candidate. A cleanup-incomplete or fatal connector outcome mints no
+  cleanup token and no candidate authority; any retained diagnostic must state
+  that narrower evidence explicitly.
+- `VerifiedExecutionRecordV2` must ultimately be constructible only through a
+  private finalizer that consumes one of those connector outcomes. Its current
+  structural binding surface is foundation code and must be narrowed before a
+  concrete profile is connected.
+- A verified primary finalizer must return the still-live `PreparedPytest`
+  beside the immutable candidate so `ShadowEnvelopeV2` can consume the same
+  sealed authority. The shadow may not recreate it from serializable identity
+  or host paths.
+- A candidate is immutable and grants no hit. Promotion stores a separate row
+  referencing two distinct complete candidates with byte-equal semantic views.
+- A promotion row or request key alone grants no replay. Fresh validation must
+  reconstruct the observation closure, revalidate runtime/profile and blobs,
+  enforce quarantine/revocation, and mint a one-use hit token.
+
+The first honest Linux product milestone stops after an executed-only foreground
+pytest run. Candidate, promotion, and replay authority remain later gates.
+
 ## Request path
 
 ```text
@@ -46,9 +171,14 @@ Automatic `PreToolUse` rewriting is disabled; the normal hook returns before rea
 - **Presenter:** exact full-stream `again run` replay, explicit full retrieval, and explicit verified `again reference` output. A reference contains only the result id, status, stream BLAKE3 digests, and byte lengths after the same live request/runtime/executable/proof/blob checks; on a miss it emits no requested output and runs nothing. The caller owns the assertion that the full bytes remain visible in the same active context. A context-keyed delivery ledger and clearing primitive remain dormant; automatic reference emission is disabled because hooks expose neither the effective output ceiling nor a delivery receipt. Once output presentation succeeds, later cache-admission or accounting errors preserve the already-produced status.
 - **Validator:** mandatory request-key, runtime-context, exact executable/profile, validation-record, result-constraint, and blob-byte revalidation on hits; first-miss shadow comparison; same-key divergence quarantine; and explainability. Before serving a hit it launches the exact executable with fixed cheap arguments, null stdin, and suppressed output to verify point-in-time exec authority. This probe is a real child process, but it does not use the requested argv.
 
-## EffectIR v1
+## EffectIR versions
 
-EffectIR v1 is the typed, round-trip-tested target record for trace-backed execution. The v0 engine does not persist it yet; it currently stores a smaller `V0Proof` JSON beside the result row and CAS blobs. The target durable record separates these concerns:
+The local explicit-read engine stores a smaller `V0Proof` JSON beside the result
+row and CAS blobs. Its historical/general trace design was called EffectIR v1.
+The frozen Linux pytest contract uses non-reinterpreting EffectIR v2 objects in
+[LINUX_PYTEST_WIRE_V1.md](LINUX_PYTEST_WIRE_V1.md); its schemas and canonical
+encoding have pure coverage, but a live semantic recorder does not yet exist.
+The durable trace record separates these concerns:
 
 - invocation identity: original and parsed request, cwd/workspace, stdin digest, policy/profile;
 - platform identity: OS, architecture, kernel/runtime, executor and tracer versions;
@@ -58,7 +188,8 @@ EffectIR v1 is the typed, round-trip-tested target record for trace-backed execu
 - proof: observation completeness, decision/reason, input root, policy hash, validation history;
 - metrics and privacy: saved time/bytes, source session, shareability and secret-taint classification.
 
-Schema versions are explicit. Unknown fields may be retained, but an unknown semantic version is ineligible for reuse.
+Schema versions are explicit. Unknown fields may be retained where the wire
+contract permits, but an unknown semantic version is ineligible for reuse.
 
 ## Trace-backed reuse design target
 

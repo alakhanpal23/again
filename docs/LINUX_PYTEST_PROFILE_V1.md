@@ -670,23 +670,20 @@ diagnostic JSON is not a persisted profile object and changes no field in
 [`LINUX_PYTEST_WIRE_V1.md`](LINUX_PYTEST_WIRE_V1.md). The profile remains
 **not qualified**.
 
-The production-tracer foundation now also includes a syscall-free,
-fixed-capacity supervisor planner. It composes the strict wait, event-message,
-syscall-info, fork-family, and task-lifecycle decoders; brands every linear
-exchange token to one supervisor instance and exact stop generation; and
-correlates both parent-event-first and child-stop-first fork delivery by the
-kernel-reported child TID. Child and parent resumes must then be confirmed one
-step at a time. Its
-constructor is intentionally private, so it is not a kernel-backed supervisor
-issuer. It cannot install the production filter, call ptrace, accept a
-workload, perform or prove a `clone3` process-memory copy, prove `ECHILD`, or
-grant any completeness or execution authority. The planner does validate the
-nonnull native pointer and exact 64/80/88-byte version before exposing one
-linear bounded-copy instruction; it binds the response to the same session,
-TID, stop generation, address, and length and permits no resume until the
-existing zero-tail clone decoder accepts the capture. That instruction is not
-a process-memory reader or kernel provenance. Those remain implementation
-requirements below.
+The production-tracer foundation now includes a syscall-free, fixed-capacity
+supervisor planner plus one private fixed two-task diagnostic connector. The
+planner composes the strict wait, event-message, syscall-info, fork-family, and
+task-lifecycle decoders; brands every linear exchange token to one supervisor
+instance and exact stop generation; correlates both fork delivery orders; and
+confirms child and parent resumes one step at a time. The connector owns its
+only production issuer, verifies the frozen ptrace options and installed
+seven-instruction filter, performs the exact bounded 88-byte stopped-memory
+read only after a single-task/private-anonymous-range proof, correlates a child
+announcement with the same real wait stop before acquiring pidfd authority,
+and consumes completion only after both reaps and final `ECHILD`. It accepts no
+workload and grants no completeness, EffectIR, execution, profile, or reuse
+authority. Gate 2 remains open until connector-wide fault injection and the
+pinned 100/100 Linux evidence gate pass.
 
 Permanently denying `setgroups` is required for the unprivileged gid map, but
 does not clear the child's inherited supplementary groups. Before `clone3`,
@@ -794,6 +791,12 @@ memory with bounded copies and architecture checks. `CLONE_UNTRACED`, nested
 user/mount/network namespaces, and tracee ptrace are denied. Fork, vfork,
 clone, and clone3 are not considered complete until the new task is observed,
 assigned a logical id, configured with inherited options, and later reaped.
+Before a `clone3` argument read or any resume based on it, the connector must
+prove that every task sharing that address space is stopped or absent, no
+untraced sibling can mutate it, and the range is not externally mutable/shared.
+Without that witness it must not resume: it kills and drains the tree and fails
+closed. Execute-only classification does not make a raced capture safe for
+lifecycle correlation.
 The supervisor drains `waitpid(..., __WALL)` until the namespace contains no
 task; the leader exiting is not enough. If the tracer dies,
 `PTRACE_O_EXITKILL` kills tracees. Lost, malformed, out-of-order, or unknown
@@ -1140,12 +1143,16 @@ serializable or cloneable host path strings; diagnostic formatting redacts
 them. All cross-interface data structures have round-trip, unknown-version,
 unknown-bit, and canonical-hash tests before integration.
 
-## Parallel implementation plan
+## Component ownership plan
 
-The integration owner first freezes `PreparedPytest`, `SealedSnapshot`,
-`EffectRecordV2`, bitmap constants, reason codes, and the stable trait method
-signatures. After that checkpoint, three implementers work in parallel without
-sharing mutable modules.
+This section partitions architecture, not current terminal write authority. The
+default repository workflow uses one writer with parallel read-only correctness
+and systems review as defined in
+[DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md). Multiple writer
+worktrees are allowed only after the integration owner freezes
+`PreparedPytest`, `SealedSnapshot`, `EffectRecordV2`, bitmap constants, reason
+codes, and stable trait method signatures, and only when file ownership and
+acceptance tests are disjoint.
 
 ### Implementer A — snapshot and isolation
 
@@ -1189,9 +1196,11 @@ The merge sequence is explicit:
 
 1. **Stage 0, contract freeze:** the integration owner lands only shared types,
    traits, fixtures, and fake implementations.
-2. **Stage 1, parallel build:** A, B, and C implement against those fakes on
-   separate modules; changing a frozen interface requires owner review and a
-   coordinated fixture update.
+2. **Stage 1, partitioned build:** A, B, and C are component ownership labels.
+   Work is serialized in the main worktree by default. If the worktree criteria
+   pass, independent writers may implement against the fakes in separate
+   modules; changing a frozen interface requires owner review and a coordinated
+   fixture update.
 3. **Stage 2, boundary tests:** each implementer passes its adversarial unit
    contract independently; the owner rejects any implementation that sets a
    completeness bit without a positive and negative fixture.

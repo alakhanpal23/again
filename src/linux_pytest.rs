@@ -182,6 +182,59 @@ pub(crate) fn diagnose_fixed_ptrace_transport_v1() -> FixedPtraceTransportProbeD
     }
 }
 
+/// Redacted result of the fixed two-task kernel-supervisor diagnostic.
+///
+/// The completed form proves only the connector's fixed transcript and cleanup
+/// boundary. It cannot expose a task id, address, descriptor, command,
+/// EffectIR record, profile qualification, execution authority, or reuse
+/// authority.
+pub(crate) enum FixedTwoTaskSupervisorProbeDiagnosticV1 {
+    Completed {
+        task_count: u16,
+        accepted_transition_count: u64,
+        fork_birth_count: u64,
+        seccomp_entry_count: u64,
+        syscall_exit_count: u64,
+        no_return_resolution_count: u64,
+        ptrace_exit_event_count: u64,
+        terminal_reap_count: u64,
+    },
+    Refused {
+        code: RefusalCode,
+        stage: &'static str,
+        reason: &'static str,
+        errno: Option<i32>,
+        cleanup_complete: bool,
+        cleanup_errno: Option<i32>,
+        expected_unavailable: bool,
+    },
+}
+
+/// Run the closed no-command supervisor probe and erase connector capabilities.
+pub(crate) fn diagnose_fixed_two_task_supervisor_v1() -> FixedTwoTaskSupervisorProbeDiagnosticV1 {
+    match tracer_seccomp::qualify_fixed_two_task_supervisor_v1() {
+        Ok(completed) => FixedTwoTaskSupervisorProbeDiagnosticV1::Completed {
+            task_count: completed.task_count(),
+            accepted_transition_count: completed.accepted_transition_count(),
+            fork_birth_count: completed.fork_birth_count(),
+            seccomp_entry_count: completed.seccomp_entry_count(),
+            syscall_exit_count: completed.syscall_exit_count(),
+            no_return_resolution_count: completed.no_return_resolution_count(),
+            ptrace_exit_event_count: completed.ptrace_exit_event_count(),
+            terminal_reap_count: completed.terminal_reap_count(),
+        },
+        Err(failure) => FixedTwoTaskSupervisorProbeDiagnosticV1::Refused {
+            code: failure.code(),
+            stage: failure.stage(),
+            reason: failure.reason(),
+            errno: failure.errno(),
+            cleanup_complete: failure.cleanup_complete(),
+            cleanup_errno: failure.cleanup_errno(),
+            expected_unavailable: failure.is_expected_unavailable(),
+        },
+    }
+}
+
 #[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Blake3Digest([u8; 32]);
 

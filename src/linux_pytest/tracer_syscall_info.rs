@@ -76,6 +76,8 @@ pub(super) enum PtraceSyscallInfoDecodeErrorV1 {
 /// This type intentionally has no `Debug`, `Clone`, or `Copy` implementation:
 /// its words may contain tracee addresses. The instruction pointer exists only
 /// for immediate sealed-executable mapping and must not be logged or persisted.
+/// Once issued, the private fields are authoritative observations; this type
+/// must never gain a mutable field accessor.
 #[allow(dead_code)] // Foundational output for the future syscall decoder.
 pub(super) struct DecodedSeccompSyscallInfoX8664V1 {
     instruction_pointer: u64,

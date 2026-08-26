@@ -8,6 +8,13 @@
 //! syscall-exit observation. It says nothing about vDSO calls, task following,
 //! observation completeness, EffectIR, execution authority, or reuse authority.
 
+mod kernel_connector;
+
+pub(super) use kernel_connector::{
+    TracerSupervisorCleanupCompletionPermitV1, TracerSupervisorIssuerPermitV1,
+    qualify_fixed_two_task_supervisor_v1,
+};
+
 const LINUX_SECCOMP_DATA_SYSCALL_NUMBER_OFFSET_V1: u32 = 0;
 const LINUX_SECCOMP_DATA_ARCHITECTURE_OFFSET_V1: u32 = 4;
 
@@ -270,15 +277,22 @@ impl TraceAllNativeSeccompPolicySummaryV1 {
 pub(super) static TRACE_ALL_NATIVE_SECCOMP_POLICY_SUMMARY_V1: TraceAllNativeSeccompPolicySummaryV1 =
     TraceAllNativeSeccompPolicySummaryV1 { _private: () };
 
-/// A sealed permit for a future connector review.
+/// A sealed permit for the reviewed fixed no-command kernel connector.
 ///
-/// Sibling modules can name this type but cannot construct it. Adding a real
-/// issuer requires an explicit edit in this module; merely importing the
-/// static policy can never be mistaken for runtime qualification.
+/// Only this module and its private connector child can construct it. Merely
+/// importing the static policy can never be mistaken for runtime
+/// qualification or execution authority.
 #[allow(dead_code)]
 pub(super) struct FutureTracerSeccompConnectorPermitV1(());
 
-/// Borrowed static program view for a future, separately reviewed connector.
+#[cfg(test)]
+impl FutureTracerSeccompConnectorPermitV1 {
+    pub(super) const fn issue_for_test() -> Self {
+        Self(())
+    }
+}
+
+/// Borrowed static program view for the fixed diagnostic connector.
 #[allow(dead_code)]
 pub(super) struct TraceAllNativeSeccompProgramV1 {
     _private: (),

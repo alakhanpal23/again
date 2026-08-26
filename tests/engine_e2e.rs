@@ -254,6 +254,126 @@ fn ptrace_transport_probe_is_closed_redacted_and_non_authoritative() {
 }
 
 #[test]
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+fn supervisor_tree_probe_rejects_loader_injection_before_clone() {
+    let temp = TempDir::new().unwrap();
+    let output = run_process_with_env(
+        temp.path(),
+        &again_binary(),
+        &["__linux-pytest-supervisor-tree-probe-v1".to_owned()],
+        None,
+        &[("LD_LIBRARY_PATH", "/dev/null/again-supervisor-loader-path")],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "again.linux-pytest-supervisor-tree-probe.v1"
+    );
+    assert_eq!(report["status"], "broken");
+    assert!(report["result"].is_null());
+    assert_eq!(report["refusal"]["code"], "loader_injection_environment");
+    assert_eq!(report["refusal"]["stage"], "dedicated_helper");
+    assert_eq!(report["refusal"]["reason"], "loader_injection_environment");
+    assert_eq!(report["refusal"]["errno"], Value::Null);
+    assert_eq!(report["refusal"]["cleanup_complete"], true);
+    assert_eq!(report["refusal"]["cleanup_errno"], Value::Null);
+    assert!(!state_dir(temp.path()).exists());
+}
+
+#[test]
+fn supervisor_tree_probe_is_closed_redacted_and_non_authoritative() {
+    let temp = TempDir::new().unwrap();
+    let output = run_again(
+        temp.path(),
+        &["__linux-pytest-supervisor-tree-probe-v1"],
+        None,
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "probe wrote unexpected stderr: {:?}",
+        output.stderr
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "again.linux-pytest-supervisor-tree-probe.v1"
+    );
+    assert_eq!(report["profile_id"], "linux-pytest-v1");
+    assert_eq!(
+        report["scope"],
+        json!({
+            "kind": "fixed_no_command_two_task_supervisor",
+            "profile_qualification": false,
+            "accepts_command": false,
+            "effect_ir_authority": false,
+            "execution_authority": false,
+            "reuse_authority": false,
+        })
+    );
+    match output.status.code() {
+        Some(0) => {
+            assert_eq!(report["status"], "completed");
+            assert!(report["refusal"].is_null());
+            assert_eq!(
+                report["result"],
+                json!({
+                    "task_count": 2,
+                    "accepted_transition_count": 11,
+                    "fork_birth_count": 1,
+                    "seccomp_entry_count": 3,
+                    "syscall_exit_count": 1,
+                    "no_return_resolution_count": 2,
+                    "ptrace_exit_event_count": 2,
+                    "terminal_reap_count": 2,
+                    "cleanup_complete": true,
+                })
+            );
+        }
+        Some(77) => {
+            assert_eq!(report["status"], "unavailable");
+            assert!(report["result"].is_null());
+            assert_eq!(report["refusal"]["cleanup_complete"], true);
+            assert_eq!(report["refusal"]["cleanup_errno"], Value::Null);
+            if cfg!(target_os = "linux") {
+                assert_eq!(report["refusal"]["code"], "unsupported_architecture");
+                assert_eq!(report["refusal"]["reason"], "unsupported_architecture");
+            } else {
+                assert_eq!(report["refusal"]["code"], "unsupported_os");
+                assert_eq!(report["refusal"]["reason"], "unsupported_platform");
+            }
+            assert_eq!(report["refusal"]["stage"], "platform");
+            assert_eq!(report["refusal"]["errno"], Value::Null);
+        }
+        status => panic!("probe returned broken status {status:?}: {report}"),
+    }
+    assert!(!state_dir(temp.path()).exists());
+
+    let rejected = run_again(
+        temp.path(),
+        &[
+            "__linux-pytest-supervisor-tree-probe-v1",
+            "unexpected-command",
+        ],
+        None,
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unexpected argument"),
+        "unexpected rejection: {:?}",
+        rejected.stderr
+    );
+    assert!(!state_dir(temp.path()).exists());
+}
+
+#[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 fn rootless_namespace_probe_rejects_loader_injection_before_clone() {
     let temp = TempDir::new().unwrap();

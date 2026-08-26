@@ -10,6 +10,15 @@ replace a protected-tag policy or make the tag immutable after publication.
 Tags with a prerelease suffix are published as GitHub prereleases rather than
 as stable releases.
 
+Only a named human release authority may create or push a release tag. Before
+tagging, that person must verify that the applicable exact-SHA CI jobs actually
+ran and passed; a skipped, canceled, zero-step, or billing-blocked run is not a
+release gate. The workflow currently publishes unsigned artifacts, so it is not
+eligible for the outside-alpha gate until the reviewed signing/attestation and
+independent verification work below is complete. See
+[DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md#evidence-and-release-authority)
+and [Roadmap Gate 1](ROADMAP.md#gate-1--distributable-local-alpha).
+
 The release workflow uses Rust `1.88.0` explicitly for verification, native
 tests, builds, and SBOM generation. `rust-toolchain.toml` pins the same version,
 and release builds use `Cargo.lock` through `--locked`. All referenced GitHub
@@ -88,9 +97,12 @@ must not be assumed unless it has been enabled and verified for the release.
 
 ## Maintainer checklist
 
-1. Confirm that `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and the
+1. Confirm the named human release authority, intended release class, exact
+   candidate SHA, and successful nonempty applicable CI jobs. Do not use the
+   current unsigned path for an outside-alpha release.
+2. Confirm that `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and the
    intended release notes are correct on `main`.
-2. Run the same source and packaging gates locally:
+3. Run the same source and packaging gates locally:
 
    ```sh
    cargo +1.88.0 fmt --check
@@ -103,7 +115,7 @@ must not be assumed unless it has been enabled and verified for the release.
    sh scripts/test_packaging.sh
    ```
 
-3. Create and push an annotated tag whose version exactly matches
+4. Create and push an annotated tag whose version exactly matches
    `Cargo.toml`, for example:
 
    ```sh
@@ -111,9 +123,9 @@ must not be assumed unless it has been enabled and verified for the release.
    git push origin v0.1.0
    ```
 
-4. Review the source verification, all four native build jobs, the source SBOM
+5. Review the source verification, all four native build jobs, the source SBOM
    job, and the final tag revalidation and publication job.
-5. Download an archive and `SHA256SUMS`, verify the checksum, and exercise
+6. Download an archive and `SHA256SUMS`, verify the checksum, and exercise
    install, managed upgrade, lock contention, injected-error and injected-signal
    rollback, and uninstall in a temporary trusted destination.
 

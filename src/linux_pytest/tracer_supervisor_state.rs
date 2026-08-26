@@ -9,12 +9,12 @@
 //!
 //! The stopped-seccomp permit is deliberately short lived. It owns the
 //! non-`Copy` decoded frame only while the same correlated stop is held and
-//! must be consumed before a resume intent exists. The planner has no
-//! production constructor yet: a future reviewed connector must prove that
-//! wait and ptrace responses came from the kernel and that the expected filter
-//! was installed. The local single-task check is only a conservative
-//! prerequisite, not tracing-completeness or isolation authority. No type here
-//! grants observation completeness, EffectIR, execution, or reuse authority.
+//! must be consumed before a resume intent exists. Its sole production
+//! constructor is gated by the fixed no-command kernel connector, which proves
+//! the exact ptrace options and installed filter before issuance. That
+//! diagnostic boundary is not tracing-completeness or isolation authority. No
+//! type here grants observation completeness, EffectIR, execution, or reuse
+//! authority.
 
 use super::tracer_event_message::{
     DecodedLinuxPtraceEventMessageV1, LinuxPtraceEventMessageDecodeErrorV1,
@@ -23,6 +23,9 @@ use super::tracer_event_message::{
 use super::tracer_fork_decode::{
     CLONE3_ARGS_BUFFER_BYTES_V1, Clone3ArgsCaptureV1, ForkFamilyBirthObservationV1,
     ForkFamilyDecodeErrorV1, decode_fork_family_entry_x86_64_v1, plan_clone3_args_read_x86_64_v1,
+};
+use super::tracer_seccomp::{
+    TracerSupervisorCleanupCompletionPermitV1, TracerSupervisorIssuerPermitV1,
 };
 use super::tracer_syscall_info::{
     DecodedPtraceSyscallInfoX8664V1, DecodedSeccompSyscallInfoX8664V1,
@@ -111,6 +114,10 @@ pub(super) struct TracerSupervisorEventMessageReadV1 {
 impl TracerSupervisorEventMessageReadV1 {
     pub(super) const fn raw_tid(&self) -> i32 {
         self.raw_tid
+    }
+
+    pub(super) const fn event(&self) -> LinuxPtraceEventV1 {
+        self.event
     }
 }
 
@@ -242,6 +249,7 @@ pub(super) enum TracerSupervisorExecuteOnlyReasonV1 {
     ChildInitialStopCorrelationAmbiguous,
     ResumeConfirmationOutOfOrder,
     ResumeCorrelationMismatch,
+    IncompleteShutdown,
     TaskState(TracerTaskExecuteOnlyReasonV1),
 }
 
@@ -327,7 +335,8 @@ impl TracerSupervisorStateV1 {
     ///
     /// This records logical initial birth only. It does not prove seize,
     /// options, filter installation, isolation, or the caller's prior resume.
-    fn begin<S: NormalizedTracerTaskEventSinkV1>(
+    pub(super) fn begin<S: NormalizedTracerTaskEventSinkV1>(
+        _issuer: TracerSupervisorIssuerPermitV1,
         initial_raw_tid: i32,
         sink: &mut S,
     ) -> Result<Self, TracerSupervisorExecuteOnlyReasonV1> {
@@ -1231,12 +1240,54 @@ impl TracerSupervisorStateV1 {
         }
     }
 
+    /// Consume a fully drained planner after the connector has independently
+    /// proven final `ECHILD` and completed signal/descriptor cleanup.
+    pub(super) fn complete(
+        mut self,
+        _cleanup: TracerSupervisorCleanupCompletionPermitV1,
+    ) -> Result<CompletedTracerSupervisorStateV1, TracerSupervisorExecuteOnlyReasonV1> {
+        self.require_healthy()?;
+        if self.exchange != PendingExchangeV1::None
+            || self
+                .pending_forks
+                .iter()
+                .any(|pending| pending.raw_tid != 0)
+            || self
+                .pending_child_stops
+                .iter()
+                .any(|pending| pending.raw_tid != 0)
+        {
+            return self.poison(TracerSupervisorExecuteOnlyReasonV1::IncompleteShutdown);
+        }
+        let completed = self
+            .task_state
+            .complete()
+            .map_err(TracerSupervisorExecuteOnlyReasonV1::TaskState)?;
+        Ok(CompletedTracerSupervisorStateV1 {
+            summary: completed.summary(),
+        })
+    }
+
     fn poison<T>(
         &mut self,
         reason: TracerSupervisorExecuteOnlyReasonV1,
     ) -> Result<T, TracerSupervisorExecuteOnlyReasonV1> {
         let first = *self.poisoned.get_or_insert(reason);
         Err(first)
+    }
+}
+
+/// Redacted completion of the pure planner and task lifecycle recorder.
+///
+/// This carries no raw TID, descriptor, stopped frame, EffectIR object,
+/// execution authority, or reuse authority.
+pub(super) struct CompletedTracerSupervisorStateV1 {
+    summary: super::tracer_task_state::TracerTaskCompletionSummaryV1,
+}
+
+impl CompletedTracerSupervisorStateV1 {
+    pub(super) const fn summary(&self) -> super::tracer_task_state::TracerTaskCompletionSummaryV1 {
+        self.summary
     }
 }
 
@@ -1369,7 +1420,12 @@ mod tests {
     }
 
     fn begin<const N: usize>(sink: &mut FixedSinkV1<N>) -> TracerSupervisorStateV1 {
-        TracerSupervisorStateV1::begin(ROOT_TID, sink).expect("initial birth")
+        TracerSupervisorStateV1::begin(
+            TracerSupervisorIssuerPermitV1::issue_for_test(),
+            ROOT_TID,
+            sink,
+        )
+        .expect("initial birth")
     }
 
     fn reach_seccomp_syscall_read<const N: usize>(
@@ -1528,6 +1584,43 @@ mod tests {
             supervisor
                 .confirm_resume_succeeded(resume)
                 .expect("confirm syscall-exit resume"),
+            TracerSupervisorIntentV1::WaitForNextStop
+        ));
+    }
+
+    fn finish_zero_exit<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        sink: &mut FixedSinkV1<N>,
+    ) {
+        enter_syscall(
+            supervisor,
+            raw_tid,
+            super::super::tracer_task_state::TRACER_TASK_EXIT_NR_X86_64_V1,
+            [0; 6],
+            sink,
+        );
+        let exit_read = take_event_read(
+            supervisor
+                .observe_wait(raw_tid, ptrace_event_status(LinuxPtraceEventV1::Exit), sink)
+                .expect("ptrace exit event"),
+        );
+        let resume = take_resume(
+            supervisor
+                .accept_event_message(exit_read, &event_message(0), sink)
+                .expect("zero exit message"),
+        );
+        assert_eq!(resume.request(), TracerSupervisorResumeRequestV1::Continue);
+        assert!(matches!(
+            supervisor
+                .confirm_resume_succeeded(resume)
+                .expect("confirm exit resume"),
+            TracerSupervisorIntentV1::WaitForNextStop
+        ));
+        assert!(matches!(
+            supervisor
+                .observe_wait(raw_tid, 0, sink)
+                .expect("terminal zero reap"),
             TracerSupervisorIntentV1::WaitForNextStop
         ));
     }
@@ -2417,6 +2510,95 @@ mod tests {
             }
             finish_syscall(&mut supervisor, ROOT_TID, CHILD_TID.into(), &mut sink);
         }
+    }
+
+    #[test]
+    fn exact_two_task_transcripts_complete_with_the_same_redacted_summary() {
+        for child_first in [false, true] {
+            let mut sink = FixedSinkV1::<16>::new();
+            let mut supervisor = begin(&mut sink);
+            enter_clone3(&mut supervisor, ROOT_TID, 0x1000, 88, &mut sink);
+
+            if child_first {
+                assert!(matches!(
+                    supervisor
+                        .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                        .unwrap(),
+                    TracerSupervisorIntentV1::WaitForNextStop
+                ));
+            }
+            let event_read = take_event_read(
+                supervisor
+                    .observe_wait(
+                        ROOT_TID,
+                        ptrace_event_status(LinuxPtraceEventV1::Fork),
+                        &mut sink,
+                    )
+                    .unwrap(),
+            );
+            let after_event = supervisor
+                .accept_event_message(event_read, &event_message(CHILD_TID as u64), &mut sink)
+                .unwrap();
+            if child_first {
+                confirm_child_then_parent(&mut supervisor, after_event, CHILD_TID, ROOT_TID);
+            } else {
+                assert!(matches!(
+                    after_event,
+                    TracerSupervisorIntentV1::WaitForNextStop
+                ));
+                let pair = supervisor
+                    .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                    .unwrap();
+                confirm_child_then_parent(&mut supervisor, pair, CHILD_TID, ROOT_TID);
+            }
+            finish_syscall(&mut supervisor, ROOT_TID, CHILD_TID.into(), &mut sink);
+            finish_zero_exit(&mut supervisor, CHILD_TID, &mut sink);
+            finish_zero_exit(&mut supervisor, ROOT_TID, &mut sink);
+
+            let completed = supervisor
+                .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+                .expect("complete fixed transcript");
+            let summary = completed.summary();
+            assert_eq!(summary.task_count, 2);
+            assert_eq!(summary.accepted_transition_count, 11);
+            assert_eq!(summary.fork_birth_count, 1);
+            assert_eq!(summary.vfork_birth_count, 0);
+            assert_eq!(summary.clone_birth_count, 0);
+            assert_eq!(summary.seccomp_entry_count, 3);
+            assert_eq!(summary.syscall_exit_count, 1);
+            assert_eq!(summary.no_return_resolution_count, 2);
+            assert_eq!(summary.ptrace_exit_event_count, 2);
+            assert_eq!(summary.terminal_reap_count, 2);
+        }
+    }
+
+    #[test]
+    fn supervisor_completion_rejects_live_or_pending_state() {
+        let mut live_sink = FixedSinkV1::<4>::new();
+        let live = begin(&mut live_sink);
+        assert_eq!(
+            live.complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+                .err(),
+            Some(TracerSupervisorExecuteOnlyReasonV1::TaskState(
+                TracerTaskExecuteOnlyReasonV1::IncompleteShutdown,
+            ))
+        );
+
+        let mut pending_sink = FixedSinkV1::<4>::new();
+        let mut pending = begin(&mut pending_sink);
+        let _exchange = pending
+            .observe_wait(
+                ROOT_TID,
+                ptrace_event_status(LinuxPtraceEventV1::Seccomp),
+                &mut pending_sink,
+            )
+            .unwrap();
+        assert_eq!(
+            pending
+                .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+                .err(),
+            Some(TracerSupervisorExecuteOnlyReasonV1::IncompleteShutdown)
+        );
     }
 
     #[test]

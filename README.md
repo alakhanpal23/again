@@ -94,7 +94,7 @@ again doctor              Verify state, skill scopes, and safety capabilities
 
 `again explain <id>` reads a stored, non-quarantined result; without an id it reports only the latest event that was actually recorded. It does not reconstruct or invent an explanation for a refusal or failure that occurred before event persistence.
 
-See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md), [architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md), [roadmap](docs/ROADMAP.md), and [security model](SECURITY.md).
+See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md), [architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md), [roadmap](docs/ROADMAP.md), [development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md), and [security model](SECURITY.md).
 
 ## Open source and business
 

@@ -1,112 +1,355 @@
-# Delivery roadmap and gates
+# Delivery roadmap and product gates
 
-Dates are phase labels, not excuses to widen the documented reuse boundary. A feature ships only when its gate passes.
+This roadmap starts from the implementation described in [STATUS.md](STATUS.md).
+Dates are planning labels, never evidence. A phase advances only when its exit
+gate has a reproducible result and, where required, an immutable CI or retained
+runtime artifact.
 
-## Overnight vertical slice
+## Product objective
 
-Sequence:
+Again should eliminate repeated agent wait time without serving a result whose
+inputs, execution profile, or effects are not proven equivalent. The product
+advances through three user-visible stages:
 
-1. Freeze product promise, first user, v0 allowlist, refusal/no-store rules, and EffectIR v1.
-2. Build native explicit `again run`, an ownership-checked instruction-only Codex skill, doctor scope reporting, and a true no-op production hook while effective per-call workdir/TTY/shell/remote semantics are hidden. Retain exact-envelope, explicit-absolute-executable and opaque-handoff plumbing for experimental tests only.
-3. Build deterministic workspace/request fingerprint, SQLite index, immutable blob store, exact result replay, and full-output retrieval.
-4. Return exact full streams on every `again run` hit; add stats and human/machine-readable explanations. Keep delivery-ledger compaction disabled until Codex supplies a stable delivery receipt. A separately requested lookup-only reference may omit bytes only when the caller asserts those exact bytes remain in the same active context.
-5. Run policy tables, no-op hook/envelope fixtures, explicit-run TTY behavior, mutation invalidation, state/path symlink, ownership, mode and hard-link checks, output-limit/nonempty-stderr admission, corruption, concurrency, crash, and non-zero-result tests.
-6. Run `bench/direct_benchmark.py` for cold overhead, warm latency including the exact-executable probe child, wall time, mutation invalidation, resource observations, and full-stream equality with non-TTY streams.
-7. Test personal-only and project-only Codex skill installs, record limitations, and commit only a green checkpoint.
+1. **Explicit local exact reads:** accelerate a deliberately narrow set of
+   audited read-only commands while preserving complete streams.
+2. **Trace-backed local pytest:** execute one frozen pytest invocation shape in
+   an isolated Linux profile, then admit reuse only after complete observation
+   and independent shadow agreement.
+3. **Managed team reuse:** share encrypted, signed results only across equivalent
+   repository and execution profiles with local verification.
 
-Success gates:
+The current product is in stage 1. Stage-2 snapshot, isolation, seccomp, ptrace,
+and wire foundations exist, but no Linux pytest command can execute through the
+profile and no Linux reuse authority exists. Stage 3 has a manually provisioned
+client/service foundation, not a deployed product.
 
-- zero false hits in the adversarial fixture suite;
-- every production hook fixture emits no automatic allow/rewrite decision;
-- byte-perfect full stdout/stderr on every miss and hit, plus reliable `show` retrieval;
-- explicit `again run` resolves only audited executables from the actual local tool-shell context;
-- exact tool BLAKE3 and exact OS semantic profile match `strict-read-v0.5`; unknown updates fail closed;
-- every unmodeled loader, sanitizer, locale, terminal, or timezone environment override in the documented denylist refuses admission;
-- keys/proofs partition real/effective credentials, supplementary groups, supported macOS rlimits, and signal mask/dispositions;
-- every served hit passes a fixed-argument exact-executable capability probe without rerunning requested argv;
-- explicit TTY calls execute once uncached with inherited streams;
-- explicit policy refusals never execute the command; callers rerun original argv unchanged;
-- reusable results require exit zero, empty stderr, bounded complete captures, stable observations and shadow equality;
-- p95 explicit-CLI warm hit under 100 ms on the development machine;
-- warm speedup at least 3x on fixtures whose original duration is at least 500 ms;
-- install and first explicit cached call under one minute, with no hook trust review.
+## Critical path
 
-Kill or narrow immediately if any known stale/incorrect result is served, the production hook emits an automatic allow/rewrite decision, a cache hit changes either output stream, or median eligible warm speedup is below 2x.
+```text
+                         restore immutable evidence
+                             /              \
+                            v                v
+          distribute/validate local alpha   kernel two-task proof
+                            |                -> execute-only pytest
+                            |                -> complete candidates
+                            |                -> shadow/promote/reuse
+                            \                /
+                             v              v
+                         managed team alpha
+```
 
-## Days 1–7: trusted local alpha
+After Gate 0, Gate 1 distribution and Gate 2 Linux-supervisor work are
+independent branches. They may alternate implementation rounds, but only one
+terminal owns repository edits at a time unless an explicitly isolated Git
+worktree is assigned. Gate 6 requires both branches: Gate 1 and Gate 5. See
+[DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md).
 
-### Day 1 — reuse corpus
+## Gate 0 — restore evidence authority
 
-Expand to at least 1,000 deterministic/adversarial executions across Rust, Python, Go, TypeScript and shell repositories. Add property tests for parser and filesystem invalidation, `pwd -P`, `ls --color=never`, explicit `grep`/`rg` paths, `rg --no-ignore --sort=path`, recursive `.git` aliases, no-op hook envelopes, exact executable/OS profiles and unknown-profile refusal, ambient-input denylist coverage, runtime-context partitions, capability-probe failures, state-root placement and ownership/link/mode checks, configured ancestor owner/sticky rules, same-user/root state-parent races, bounded output, and empty-stderr admission. Publish every failure class as a regression fixture. Treat concurrent path mutation and transient global-resource changes as unresolved until stronger execution/snapshot boundaries exist.
+**Goal:** make the current source checkpoint eligible for engineering and
+release claims.
 
-### Day 2 — Linux trace boundary
+Work:
 
-Prototype rootless immutable/COW execution with enforced no-network policy and complete descendant tracking. Compare ptrace/seccomp/eBPF overhead and completeness. Tracer gaps remain execute-only.
+- resolve the GitHub Actions account billing/spending-limit block;
+- rerun macOS, Ubuntu, stock-rootless negative-lane, service, and applicable
+  integration workflows on the exact commit being evaluated;
+- retain raw artifacts and link the immutable runs from [STATUS.md](STATUS.md)
+  and [EVIDENCE.md](EVIDENCE.md); and
+- distinguish source failures, environment refusals, and zero-step CI
+  infrastructure failures.
 
-### Day 3 — EffectIR validation
+Exit gate:
 
-Record directories, absent paths, symlinks, metadata, executable/interpreter/library closure, environment digests, stdin, ordered effects, and completeness bitmap. Add replay preconditions and transactional staging.
+- formatting, pinned Rust 1.88 strict all-target/all-feature Clippy, locked
+  all-feature test suites, service tests, packaging tests, and the 100,000-case
+  differential gate pass on their documented platforms; and
+- every positive runtime claim names its exact source, platform, command, and
+  retained artifact.
 
-### Day 4 — shadow validation
+No later phase may treat a local pass or a zero-step CI failure as immutable
+release evidence.
 
-Shadow 100% of newly eligible hits; compare exact streams/status, canonical EffectIR and final filesystem root. Quarantine candidate and generalization class on mismatch. Add deterministic validation selection only after dependency completeness is demonstrated.
+## Gate 1 — distributable local alpha
 
-### Day 5 — real agent sessions
+**Goal:** put the stage-1 product in outside users' hands before broadening its
+semantic surface.
 
-Capture opt-in local metrics on representative Codex tasks without collecting command text or output. Measure total task latency, explicit-prefix adoption, miss overhead, reuse rate, full-stream byte cost, uncached TTY executions, and behavioral failures.
+**Entry gate:** Gate 0.
 
-### Day 6 — packaging and distribution
+Work:
 
-Normalized macOS/Linux releases, checksums/source SBOM, Homebrew tap, install script with signature verification, uninstall, upgrade, schema migration, bounded storage and GC. An installable artifact must still report unsupported and disable reuse unless its backend/profile is audited. Claim bit reproducibility only after an independent rebuild comparison.
+1. Replace duplicated single-host constants with one versioned audited-profile
+   registry shared by local executable verification and team runtime
+   attestation.
+2. Populate only profiles backed by exact host, OS, executable, and runtime
+   evidence. Unknown profiles continue to fail closed.
+3. Make `again doctor` report the selected profile, unsupported dimensions,
+   skill scope, and safe next action without implying reuse authority.
+4. Exercise real Codex sessions from workspace roots and subdirectories, with
+   TTY/non-TTY streams, interruption, long-running calls, personal/project skill
+   scopes, and automatic hooks remaining no-op.
+5. Run the direct benchmark on real non-sparse Rust, Python, Go, and TypeScript
+   repositories. Preserve exact streams and mutation invalidation.
+6. Add reviewed keyless artifact signing/attestation and independently tested
+   verification instructions around the existing native release workflow,
+   checksums, source SBOM, installer, rollback, and uninstaller.
+7. Publish a prerelease and provide a reviewed Homebrew or equivalent installation
+   path that still refuses unsupported runtime profiles.
 
-### Day 7 — outside alpha
+Product outcome:
 
-Ten real commands from at least five outside developers. Require seven to work without configuration, at least 3x median eligible warm speedup, zero semantic mismatches, and three explicit requests for CI/team sharing. If not, narrow the ICP/command profile before adding breadth.
+- an outside developer can install Again, run `again setup --codex`, inspect
+  support with `again doctor`, use explicit `again run`/`again reference`, and
+  remove the integration without hooks, accounts, daemons, or repository
+  mutation.
 
-Day-7 system gate: zero unexplained divergence in 100,000 eligible shadow comparisons, miss overhead below 15% for commands over one second, no host mutation after interrupted runs, and every unsupported effect explained.
+Exit gate:
 
-## Days 8–30: team product
+- five outside developers each attempt the same versioned 10-command corpus;
+- at least 35 of the 50 attempts are policy-admitted and complete successfully
+  without configuration after documented onboarding, with byte-identical cold
+  and warm streams; safe refusals are reported separately and do not count as
+  admitted successes;
+- eligible repeats achieve at least 3x median warm speedup with byte-identical
+  streams and zero known incorrect hits;
+- unsupported hosts and tools fail closed with actionable explanations; and
+- release artifacts have verified publisher authentication, not checksums alone.
 
-### Shared protocol
+Kill or narrow the stage-1 profile if any known stale result is served, a
+production hook rewrites a command, a hit changes either stream, or the median
+eligible warm speedup falls below 2x.
 
-Define content-addressed manifest/blob APIs with policy/profile identity, signed provenance, quarantine and revocation. Clients validate every remote candidate and never execute a remote blob.
+## Gate 2 — kernel-backed supervisor tree proof
 
-### Security and tenancy
+**Goal:** connect the pure production tracer planner to the Linux kernel without
+granting workload, Python, EffectIR, profile, execution, or reuse authority.
 
-End-to-end TLS, encrypted storage, tenant/repository namespaces, least-privilege credentials, ACLs, audit events, retention, deletion, quotas, rate limiting, secret-taint local-only policy, threat model, dependency/SBOM scanning and incident runbook.
+**Entry gate:** Gate 0. Gate 1 is an independent branch.
 
-### CI and remote execution
+The first executable artifact is a hidden, fixed, no-command two-task probe. A
+parent performs exact 88-byte `clone3(SIGCHLD)` and parent and child raw-exit.
+The connector must:
 
-GitHub Action and generic CI client; equivalent immutable images; staged output restore; trusted-builder or two-producer admission; local fallback. Remote execution is introduced only after local trace/replay gates hold.
+- own the only private issuer for `TracerSupervisorStateV1`;
+- prove exact ptrace options and exact installed-filter bytes before beginning;
+- drive every planner intent through real `waitpid(-1, __WALL)`,
+  `PTRACE_GETEVENTMSG`, `PTRACE_GET_SYSCALL_INFO`, bounded stopped-memory reads,
+  and ordered `PTRACE_CONT`/`PTRACE_SYSCALL` operations;
+- confirm a resume only after the exact ptrace operation returns success;
+- before reading or resuming from `clone3` arguments, prove that every task
+  sharing the address space is stopped or absent, no untraced sibling can
+  mutate it, and the range is not externally mutable/shared; otherwise do not
+  resume, kill and drain the tree, and fail closed;
+- consume a completion boundary that requires no outstanding exchange, no
+  pending birth/stop/resume, terminal reap for every task, connector-owned final
+  `ECHILD`, preserved signal state, drained `SIGCHLD`, and completed cleanup; and
+- emit only a fixed redacted diagnostic with every authority flag false.
 
-### Policy and analytics
+Current checkpoint: that hidden connector and redacted CLI diagnostic are now
+implemented, including exact option/filter readback, stopped private-range
+capture, event/stop identity correlation before pidfd authority, full-tree
+drain, final `ECHILD`, and consuming completion. A wait-returned stopped tracee
+is retained for cleanup before event-message correlation, including on a
+mismatch. Bounded proc/environment reads, bounded wait backoff, and typed
+seccomp/process-memory refusals are also implemented. This does not close Gate
+2: the connector-level fault matrix, both live kernel schedules, final strict
+post-hardening Linux validation, and pinned 100/100 evidence remain required.
 
-Organization policy packs, signed versions, “why run/reuse” audit, compute/time savings receipts, regression health, cache poisoning alerts, GC/storage reports. No surveillance telemetry by default.
+Before wiring a candidate record, narrow the authority path so structurally
+valid synthetic values cannot bind a reusable execution record. Completion
+evidence must be linear, connector-issued, and consumed exactly once.
 
-### Design partners and pricing evidence
+Exit gate:
 
-Work with 5–10 agent-heavy polyglot teams. Validate a free local engine plus paid shared cache/CI/policy/provenance. Price hypotheses are tested against verified savings, not vanity command counts.
+- parent-event-first and child-stop-first kernel schedules both satisfy the same
+  invariant summary;
+- exact stopped-memory address, TID, stop generation, and 88-byte count are
+  enforced; partial, long, unavailable, substituted, or dirty-tail reads never
+  resume the task;
+- every injected wait/ptrace/read/resume failure kills and reaps the complete
+  tree, preserves signal state, drains `SIGCHLD`, leaks no tracked descriptor,
+  and preserves the first typed error;
+- 100/100 fixed samples pass on a pinned provisioned Linux runner whose tracer
+  is outside seccomp, has `CAP_SYS_ADMIN` in the governing user namespace, and
+  runs a kernel with `CONFIG_SECCOMP_FILTER` and `CONFIG_CHECKPOINT_RESTORE`, as
+  required for `PTRACE_SECCOMP_GET_FILTER`;
+- the preserved fixed single-task ptrace diagnostic and stock-Ubuntu negative
+  namespace lane remain unchanged; and
+- public Linux dispatch remains disabled.
 
-Day-30 gates:
+## Gate 3 — first execute-only pytest product slice
 
-- 100% rejection of unsigned, revoked, cross-tenant, cross-repository, policy-mismatched and image-mismatched fixtures;
-- no validation mismatch served after discovery;
-- cross-machine equality for 100 hermetic workloads;
-- p95 local hit below 100 ms and shared hit faster than original execution;
-- at least 30% median end-to-end wall-time reduction on consenting team sessions while preserving exact full streams;
-- at least 20% useful cross-user hit rate for the chosen ICP;
-- three design partners willing to pay for shared reuse or verified compute savings.
+**Goal:** safely execute one real pytest selector through the documented Linux
+profile while making reuse impossible.
 
-If cross-user hits remain below 10%, reuse evidence can still support local optimization, but the remote-cache business thesis must be reconsidered.
+**Entry gate:** Gate 2.
 
-## How each stage compounds the moat
+The only invocation shape remains:
 
-| Stage | Product asset | Compounding asset |
+```text
+again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
+```
+
+The first acceptance fixture should use exactly one selector, such as
+`tests/test_smoke.py::test_smoke`. It must compose:
+
+- two-phase lexical and snapshot-backed admission;
+- connector-qualified immutable workspace/runtime snapshots;
+- rootless namespace PID 1, private root, scratch mounts, procfs, FD scrub,
+  capability elimination, Landlock, and production workload seccomp;
+- the kernel-backed supervisor and complete descendant cleanup;
+- profile-owned stdin/stdout/stderr; and
+- exact foreground stream and raw wait-status delivery.
+
+Product outcome:
+
+- admitted pytest runs execute in a disposable branch with no host network and
+  no writable host-workspace view; malformed invocations refuse before Python
+  starts; completed runs are always `Executed only` and cannot be shadowed,
+  promoted, or replayed.
+
+Exit gate:
+
+- exact stdout, stderr, and wait status are delivered;
+- the host workspace manifest is unchanged;
+- network, descriptor, mount, namespace, task, and branch cleanup canaries pass;
+- every descendant reaches terminal reap and final `ECHILD`;
+- unsupported signals, restarts, syscalls, mappings, or nondeterministic inputs
+  produce an explicit execute-only reason rather than a candidate; and
+- the feature remains limited to exact qualified Linux tuples.
+
+## Gate 4 — complete candidate construction
+
+**Goal:** turn a foreground execution into an immutable candidate without yet
+serving a cache hit.
+
+**Entry gate:** Gate 3.
+
+Work:
+
+- implement the semantic syscall adapter and complete EffectIR v2 recorder;
+- record executable/interpreter/library closure, descriptor-selected paths,
+  file and directory observations, absent paths, symlinks, metadata, environment
+  digests, stdin, ordered effects, task lifecycle, streams, and raw wait status;
+- bind the canonical snapshot manifest and digest to the prepared invocation;
+- broker or explicitly reject time, randomness, logical PID, sleep, asynchronous
+  signal, scheduling, and externally mutable shared-memory surfaces;
+- make every unsupported or incomplete trace permanently execute-only; and
+- store candidates immutably without mutating them into promoted records.
+
+Exit gate:
+
+- the completeness bitmap is closed for every admitted candidate;
+- no candidate can be created without connector completion evidence;
+- canonical wire objects round-trip and differential tests cover malformed,
+  reordered, substituted, over-limit, and unknown-version inputs; and
+- crash or interruption exposes no partial committed effect or candidate.
+
+## Gate 5 — shadow, promotion, and local pytest reuse
+
+**Goal:** serve the first trace-backed pytest hit.
+
+**Entry gate:** Gate 4.
+
+Work:
+
+1. Run the foreground and shadow in separate independently isolated invocations
+   from the same immutable inputs.
+2. Compare exact stdout, stderr, raw wait status, semantic EffectIR comparison
+   view, completeness, runtime/profile identity, and final filesystem root.
+3. On divergence, atomically quarantine only the exact v1 request-scoped class:
+   profile digest, workspace identity, shape key, and request key. Effect shape
+   remains analytics and grants no generalized quarantine authority.
+4. Create a separate promotion row referencing two distinct immutable candidates;
+   never mutate a candidate disposition.
+5. Revalidate current inputs and all replay preconditions before serving a hit.
+6. Start with 100% shadow validation and reduce it only after retained evidence
+   demonstrates dependency completeness.
+
+Product outcome:
+
+- a later identical qualified pytest invocation with no replay-required
+  workspace effects and an unchanged final workspace may return the promoted
+  result without rerunning pytest while preserving complete streams and status.
+  Filesystem-writing runs remain execute-only until transactional replay
+  preconditions and effect commit pass a later gate.
+
+Exit gate:
+
+- zero unexplained divergences in 100,000 eligible shadow comparisons;
+- zero known incorrect reuses and zero partial-effect commits;
+- miss overhead below 15% for commands over one second;
+- warm hit p95 below 100 ms and at least 3x speedup on eligible fixtures whose
+  original duration is at least 500 ms; and
+- every refusal, execute-only disposition, candidate, promotion, quarantine, and
+  replay has a stable explanation and retained evidence.
+
+## Gate 6 — managed team alpha
+
+**Goal:** convert the existing manually provisioned encrypted team foundation
+into a deployable, operable product without allowing remote state to upgrade an
+unsafe local execution profile.
+
+**Entry gates:** Gate 1 and Gate 5.
+
+Work:
+
+- deploy the Worker/D1/R2 service behind production TLS and pre-auth abuse
+  controls;
+- build account, tenant, repository, generation, profile, key, trust, rotation,
+  revocation, retention, deletion, quota, and recovery workflows;
+- prove production bucket and tenant isolation and obtain external security
+  review;
+- complete the cross-layer post-decrypt revocation race and stateful 100,000-case
+  D1/R2 protocol corpus;
+- keep `legacy_v2` as the default until `bundle_v1` passes the maximum-payload,
+  pending-reader cancellation, heap, and full local/live matrix gates;
+- prove cross-machine equality for equivalent execution profiles; and
+- deliver CI integration using signed, immutable client artifacts rather than
+  building secret-bearing code from an untrusted checkout.
+
+Exit gate:
+
+- 100% rejection of unsigned, revoked, stale-generation, cross-tenant,
+  cross-repository, policy-mismatched, and profile-mismatched fixtures;
+- cross-machine equality for at least 100 hermetic workloads;
+- at least 30% median end-to-end wall-time reduction on consenting team sessions;
+- at least 20% useful cross-user hit rate for the chosen customer profile; and
+- three design partners are willing to pay for verified shared reuse or compute
+  savings.
+
+If useful cross-user hits remain below 10%, retain the remote evidence and local
+optimization value but reconsider the shared-cache business thesis.
+
+## Explicitly deferred
+
+The following do not enter the critical path until their prerequisite gate is
+green:
+
+- arbitrary commands, arbitrary Python, pytest flags, interactive workloads,
+  macOS trace-backed execution, or cross-platform semantic generalization;
+- automatic Codex hook rewriting or automatic compact references without an
+  effective per-call context and delivery receipt;
+- remote execution before local trace/replay correctness;
+- `bundle_v1` rollout before its existing failed gates pass;
+- eBPF as a sole enforcement or completeness boundary;
+- reuse of filesystem-writing pytest runs before transactional preconditions and
+  effect commit are proven; and
+- broad observability or surveillance telemetry. Metrics remain opt-in,
+  content-free, and tied to explicit product gates.
+
+## Compounding assets
+
+| Stage | Product asset | Compounding evidence asset |
 |---|---|---|
-| v0 strict reads | explicit one-command wrapper, instruction skill, and clear refusal/rerun behavior | labeled admitted/refused command shapes, invalidation fixtures, output-repeat patterns |
-| traced local alpha | broader useful work | real EffectIR traces, minimized divergences, tool/runtime compatibility, validation history |
-| outside alpha | reproducible value | repository/language workload coverage and accepted policy generalizations |
-| team cache | shared saved work | cross-machine equivalence graph, artifact provenance, organization-specific effect graph |
-| remote execution | high-value acceleration | calibrated compute profiles, failure/poisoning corpus, verified savings history |
+| Explicit local reads | simple exact wrapper and reversible onboarding | admitted/refused shapes, invalidation corpus, real repeat patterns |
+| Kernel supervisor proof | real descendant transport and cleanup | kernel/profile compatibility and fault corpus |
+| Execute-only pytest | safe useful Linux execution | traced unsupported surfaces and workload compatibility |
+| Candidate + shadow | complete semantic records | minimized divergences and dependency closure |
+| Local reuse | saved pytest execution | validation history and calibrated replay preconditions |
+| Managed team reuse | shared verified savings | cross-machine equivalence, provenance, and organization-specific effect graphs |
 
-The moat is reuse-safety and compatibility evidence that improves conservative coverage. A blob store or opaque classifier alone is copyable.
+The moat is conservative reuse authority backed by evidence. A blob store,
+leaderboard score, or opaque classifier is not sufficient.
