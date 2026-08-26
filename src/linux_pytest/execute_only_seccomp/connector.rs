@@ -4,6 +4,13 @@
 //! never accepts or executes a command. A completed, non-authoritative probe is
 //! returned only after exact kernel readback, this process's terminal reap,
 //! final `ECHILD`, and signal-mask restoration. It is not a live-child witness.
+//!
+//! The connector admits only an exactly single-task host. It checks that fact
+//! before blocking every blockable signal, then rechecks exact `SIGCHLD` default
+//! disposition after the block and immediately before any mapping or fork. With
+//! no second task and no runnable signal handler, no in-process actor can race
+//! the diagnostic child's reaping policy. Hosts that need to run this from a
+//! multithreaded process must delegate to an owned single-threaded helper.
 
 use core::fmt;
 
@@ -11,8 +18,12 @@ use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::linux_pytest) enum WorkloadSeccompConnectorStageV1 {
+    VerifyHostSingleTask,
+    VerifySignalDisposition,
+    ReadPendingSignals,
     SignalBlock,
-    VerifyChildReapingPolicy,
+    VerifySignalMask,
+    AllocateSharedMapping,
     SpawnChild,
     WaitInitialStop,
     VerifyInitialSingleTask,
@@ -31,6 +42,8 @@ pub(in crate::linux_pytest) enum WorkloadSeccompConnectorStageV1 {
     ProveFinalEchild,
     VerifyPendingSignals,
     SignalRestore,
+    VerifyRestoredSignalMask,
+    VerifyFinalSignalDisposition,
     ReleaseSharedMapping,
 }
 
@@ -155,8 +168,15 @@ impl Drop for CompletedDisposableWorkloadFilterProbeV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ConnectorOperationV1 {
+    VerifyHostSingleTask,
+    VerifyInitialSignalDisposition,
+    ReadInitialPendingSignals,
     SignalBlock,
-    VerifyChildReapingPolicy,
+    VerifyBlockedSignalMask,
+    VerifyBlockedPendingSignals,
+    VerifyPreForkHostSingleTask,
+    VerifyPreForkSignalDisposition,
+    AllocateSharedMapping,
     SpawnChild,
     WaitInitialStop,
     VerifyInitialSingleTask,
@@ -174,17 +194,29 @@ enum ConnectorOperationV1 {
     ProveFinalEchild,
     VerifyPendingSignals,
     SignalRestore,
+    VerifyRestoredSignalMask,
+    VerifyFinalSignalDisposition,
     ReleaseSharedMapping,
     CleanupKill,
     CleanupReap,
     CleanupFinalEchild,
+    CleanupVerifyPendingSignals,
     CleanupSignalRestore,
+    CleanupVerifyRestoredSignalMask,
+    CleanupVerifyFinalSignalDisposition,
     CleanupSharedMapping,
 }
 
-const FORWARD_OPERATIONS_V1: [ConnectorOperationV1; 20] = [
+const FORWARD_OPERATIONS_V1: [ConnectorOperationV1; 29] = [
+    ConnectorOperationV1::VerifyInitialSignalDisposition,
+    ConnectorOperationV1::VerifyHostSingleTask,
+    ConnectorOperationV1::ReadInitialPendingSignals,
     ConnectorOperationV1::SignalBlock,
-    ConnectorOperationV1::VerifyChildReapingPolicy,
+    ConnectorOperationV1::VerifyBlockedSignalMask,
+    ConnectorOperationV1::VerifyBlockedPendingSignals,
+    ConnectorOperationV1::VerifyPreForkHostSingleTask,
+    ConnectorOperationV1::VerifyPreForkSignalDisposition,
+    ConnectorOperationV1::AllocateSharedMapping,
     ConnectorOperationV1::SpawnChild,
     ConnectorOperationV1::WaitInitialStop,
     ConnectorOperationV1::VerifyInitialSingleTask,
@@ -202,14 +234,19 @@ const FORWARD_OPERATIONS_V1: [ConnectorOperationV1; 20] = [
     ConnectorOperationV1::ProveFinalEchild,
     ConnectorOperationV1::VerifyPendingSignals,
     ConnectorOperationV1::SignalRestore,
+    ConnectorOperationV1::VerifyRestoredSignalMask,
+    ConnectorOperationV1::VerifyFinalSignalDisposition,
     ConnectorOperationV1::ReleaseSharedMapping,
 ];
 
-const CLEANUP_OPERATIONS_V1: [ConnectorOperationV1; 5] = [
+const CLEANUP_OPERATIONS_V1: [ConnectorOperationV1; 8] = [
     ConnectorOperationV1::CleanupKill,
     ConnectorOperationV1::CleanupReap,
     ConnectorOperationV1::CleanupFinalEchild,
+    ConnectorOperationV1::CleanupVerifyPendingSignals,
     ConnectorOperationV1::CleanupSignalRestore,
+    ConnectorOperationV1::CleanupVerifyRestoredSignalMask,
+    ConnectorOperationV1::CleanupVerifyFinalSignalDisposition,
     ConnectorOperationV1::CleanupSharedMapping,
 ];
 
@@ -237,9 +274,26 @@ struct StoppedChildPermitSealV1;
 
 fn stage_for_operation_v1(operation: ConnectorOperationV1) -> WorkloadSeccompConnectorStageV1 {
     match operation {
+        ConnectorOperationV1::VerifyHostSingleTask
+        | ConnectorOperationV1::VerifyPreForkHostSingleTask => {
+            WorkloadSeccompConnectorStageV1::VerifyHostSingleTask
+        }
+        ConnectorOperationV1::VerifyInitialSignalDisposition
+        | ConnectorOperationV1::VerifyPreForkSignalDisposition
+        | ConnectorOperationV1::VerifyFinalSignalDisposition
+        | ConnectorOperationV1::CleanupVerifyFinalSignalDisposition => {
+            WorkloadSeccompConnectorStageV1::VerifySignalDisposition
+        }
+        ConnectorOperationV1::ReadInitialPendingSignals
+        | ConnectorOperationV1::VerifyBlockedPendingSignals => {
+            WorkloadSeccompConnectorStageV1::ReadPendingSignals
+        }
         ConnectorOperationV1::SignalBlock => WorkloadSeccompConnectorStageV1::SignalBlock,
-        ConnectorOperationV1::VerifyChildReapingPolicy => {
-            WorkloadSeccompConnectorStageV1::VerifyChildReapingPolicy
+        ConnectorOperationV1::VerifyBlockedSignalMask => {
+            WorkloadSeccompConnectorStageV1::VerifySignalMask
+        }
+        ConnectorOperationV1::AllocateSharedMapping => {
+            WorkloadSeccompConnectorStageV1::AllocateSharedMapping
         }
         ConnectorOperationV1::SpawnChild => WorkloadSeccompConnectorStageV1::SpawnChild,
         ConnectorOperationV1::WaitInitialStop => WorkloadSeccompConnectorStageV1::WaitInitialStop,
@@ -276,11 +330,16 @@ fn stage_for_operation_v1(operation: ConnectorOperationV1) -> WorkloadSeccompCon
         ConnectorOperationV1::ProveFinalEchild | ConnectorOperationV1::CleanupFinalEchild => {
             WorkloadSeccompConnectorStageV1::ProveFinalEchild
         }
-        ConnectorOperationV1::VerifyPendingSignals => {
+        ConnectorOperationV1::VerifyPendingSignals
+        | ConnectorOperationV1::CleanupVerifyPendingSignals => {
             WorkloadSeccompConnectorStageV1::VerifyPendingSignals
         }
         ConnectorOperationV1::SignalRestore | ConnectorOperationV1::CleanupSignalRestore => {
             WorkloadSeccompConnectorStageV1::SignalRestore
+        }
+        ConnectorOperationV1::VerifyRestoredSignalMask
+        | ConnectorOperationV1::CleanupVerifyRestoredSignalMask => {
+            WorkloadSeccompConnectorStageV1::VerifyRestoredSignalMask
         }
         ConnectorOperationV1::ReleaseSharedMapping | ConnectorOperationV1::CleanupSharedMapping => {
             WorkloadSeccompConnectorStageV1::ReleaseSharedMapping
@@ -361,12 +420,35 @@ fn drive_stopped_child_v1(
     operations: &mut impl StoppedChildOperationsV1,
 ) -> Result<CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1> {
     let result = (|| {
-        observe_exact_v1(operations, ConnectorOperationV1::SignalBlock, 0)?;
         observe_exact_v1(
             operations,
-            ConnectorOperationV1::VerifyChildReapingPolicy,
+            ConnectorOperationV1::VerifyInitialSignalDisposition,
             0,
         )?;
+        observe_exact_v1(operations, ConnectorOperationV1::VerifyHostSingleTask, 1)?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::ReadInitialPendingSignals,
+            0,
+        )?;
+        observe_exact_v1(operations, ConnectorOperationV1::SignalBlock, 0)?;
+        observe_exact_v1(operations, ConnectorOperationV1::VerifyBlockedSignalMask, 0)?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::VerifyBlockedPendingSignals,
+            0,
+        )?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::VerifyPreForkHostSingleTask,
+            1,
+        )?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::VerifyPreForkSignalDisposition,
+            0,
+        )?;
+        observe_exact_v1(operations, ConnectorOperationV1::AllocateSharedMapping, 0)?;
         observe_exact_v1(operations, ConnectorOperationV1::SpawnChild, 0)?;
         observe_exact_v1(operations, ConnectorOperationV1::WaitInitialStop, 0)?;
         observe_exact_v1(operations, ConnectorOperationV1::VerifyInitialSingleTask, 1)?;
@@ -427,6 +509,16 @@ fn drive_stopped_child_v1(
         observe_exact_v1(operations, ConnectorOperationV1::ProveFinalEchild, 0)?;
         observe_exact_v1(operations, ConnectorOperationV1::VerifyPendingSignals, 0)?;
         observe_exact_v1(operations, ConnectorOperationV1::SignalRestore, 0)?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::VerifyRestoredSignalMask,
+            0,
+        )?;
+        observe_exact_v1(
+            operations,
+            ConnectorOperationV1::VerifyFinalSignalDisposition,
+            0,
+        )?;
         observe_exact_v1(operations, ConnectorOperationV1::ReleaseSharedMapping, 0)?;
 
         let evidence = InstalledFilterEvidenceV1 {
@@ -497,6 +589,7 @@ mod platform {
     const PTRACE_SETOPTIONS_V1: libc::c_uint = 0x4200;
     const PTRACE_O_EXITKILL_V1: usize = 0x0010_0000;
     const KERNEL_SIGNAL_SET_BYTES_V1: usize = core::mem::size_of::<u64>();
+    const SA_RESTORER_V1: libc::c_int = 0x0400_0000;
     const ALL_BLOCKABLE_SIGNALS_V1: u64 =
         !(signal_bit_v1(libc::SIGKILL) | signal_bit_v1(libc::SIGSTOP));
 
@@ -529,13 +622,22 @@ mod platform {
         filter: *const WorkloadSockFilterV1,
     }
 
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct SigchldDispositionV1 {
+        flags: libc::c_int,
+        restorer: usize,
+    }
+
     struct LiveStoppedChildOperationsV1 {
         child: Option<libc::pid_t>,
         shared: *mut SharedTranscriptV1,
         old_mask: u64,
         initial_pending: u64,
+        initial_sigchld: Option<SigchldDispositionV1>,
         signal_blocked: bool,
         reaped: bool,
+        #[cfg(test)]
+        fault_once: Option<(ConnectorOperationV1, OperationErrorV1)>,
     }
 
     impl LiveStoppedChildOperationsV1 {
@@ -545,8 +647,11 @@ mod platform {
                 shared: ptr::null_mut(),
                 old_mask: 0,
                 initial_pending: 0,
+                initial_sigchld: None,
                 signal_blocked: false,
                 reaped: false,
+                #[cfg(test)]
+                fault_once: None,
             }
         }
 
@@ -558,7 +663,46 @@ mod platform {
             unsafe { self.shared.as_ref() }.ok_or(OperationErrorV1::Failed)
         }
 
-        fn block_signal(&mut self) -> Result<i64, OperationErrorV1> {
+        fn observe_default_sigchld(&self) -> Result<SigchldDispositionV1, OperationErrorV1> {
+            let mut action = unsafe { core::mem::zeroed::<libc::sigaction>() };
+            if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), &mut action) } != 0 {
+                return Err(OperationErrorV1::Failed);
+            }
+            let mut mask_empty = true;
+            for signal in 1..=64 {
+                let member = unsafe { libc::sigismember(&action.sa_mask, signal) };
+                if member < 0 {
+                    return Err(OperationErrorV1::Failed);
+                }
+                mask_empty &= member == 0;
+            }
+            if action.sa_sigaction != libc::SIG_DFL
+                || action.sa_flags & !SA_RESTORER_V1 != 0
+                || !mask_empty
+            {
+                return Err(OperationErrorV1::SignalStateChanged);
+            }
+            Ok(SigchldDispositionV1 {
+                flags: action.sa_flags,
+                restorer: action.sa_restorer.map_or(0, |restorer| restorer as usize),
+            })
+        }
+
+        fn record_initial_sigchld(&mut self) -> Result<i64, OperationErrorV1> {
+            self.initial_sigchld = Some(self.observe_default_sigchld()?);
+            Ok(0)
+        }
+
+        fn verify_initial_sigchld_unchanged(&self) -> Result<i64, OperationErrorV1> {
+            let observed = self.observe_default_sigchld()?;
+            match self.initial_sigchld {
+                Some(expected) if observed == expected => Ok(0),
+                Some(_) => Err(OperationErrorV1::SignalStateChanged),
+                None => Ok(0),
+            }
+        }
+
+        fn read_initial_pending(&mut self) -> Result<i64, OperationErrorV1> {
             let mut pending_before = 0_u64;
             if unsafe {
                 libc::syscall(
@@ -570,6 +714,11 @@ mod platform {
             {
                 return Err(OperationErrorV1::Failed);
             }
+            self.initial_pending = pending_before;
+            Ok(0)
+        }
+
+        fn block_signal(&mut self) -> Result<i64, OperationErrorV1> {
             let desired = ALL_BLOCKABLE_SIGNALS_V1;
             let mut old_mask = 0_u64;
             if unsafe {
@@ -586,8 +735,11 @@ mod platform {
             }
             self.old_mask = old_mask;
             self.signal_blocked = true;
+            Ok(0)
+        }
+
+        fn verify_blocked_mask(&self) -> Result<i64, OperationErrorV1> {
             let mut observed_mask = 0_u64;
-            let mut pending_after = 0_u64;
             if unsafe {
                 libc::syscall(
                     libc::SYS_rt_sigprocmask,
@@ -597,29 +749,25 @@ mod platform {
                     KERNEL_SIGNAL_SET_BYTES_V1,
                 )
             } != 0
-                || observed_mask != (old_mask | desired)
-                || unsafe {
-                    libc::syscall(
-                        libc::SYS_rt_sigpending,
-                        &mut pending_after,
-                        KERNEL_SIGNAL_SET_BYTES_V1,
-                    )
-                } != 0
-                || pending_after != pending_before
+                || observed_mask != (self.old_mask | ALL_BLOCKABLE_SIGNALS_V1)
             {
                 return Err(OperationErrorV1::SignalStateChanged);
             }
-            self.initial_pending = pending_before;
             Ok(0)
         }
 
-        fn verify_child_reaping_policy(&self) -> Result<i64, OperationErrorV1> {
-            let mut action = unsafe { core::mem::zeroed::<libc::sigaction>() };
-            if unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), &mut action) } != 0 {
-                return Err(OperationErrorV1::Failed);
-            }
-            if action.sa_sigaction == libc::SIG_IGN || action.sa_flags & libc::SA_NOCLDWAIT != 0 {
-                return Err(OperationErrorV1::ReapingOwnershipLost);
+        fn verify_blocked_pending(&self) -> Result<i64, OperationErrorV1> {
+            let mut pending_after = 0_u64;
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigpending,
+                    &mut pending_after,
+                    KERNEL_SIGNAL_SET_BYTES_V1,
+                )
+            } != 0
+                || pending_after != self.initial_pending
+            {
+                return Err(OperationErrorV1::SignalStateChanged);
             }
             Ok(0)
         }
@@ -642,7 +790,7 @@ mod platform {
             Ok(0)
         }
 
-        fn spawn(&mut self) -> Result<i64, OperationErrorV1> {
+        fn allocate_shared_mapping(&mut self) -> Result<i64, OperationErrorV1> {
             let mapping = unsafe {
                 libc::mmap(
                     ptr::null_mut(),
@@ -658,6 +806,13 @@ mod platform {
             }
             self.shared = mapping.cast();
             SharedTranscriptV1::initialize(self.shared);
+            Ok(0)
+        }
+
+        fn spawn(&mut self) -> Result<i64, OperationErrorV1> {
+            if self.shared.is_null() {
+                return Err(OperationErrorV1::Failed);
+            }
             let child = unsafe { libc::fork() };
             if child < 0 {
                 return Err(OperationErrorV1::Failed);
@@ -721,22 +876,73 @@ mod platform {
 
         fn verify_single_task(&self) -> Result<i64, OperationErrorV1> {
             let path = format!("/proc/{}/task", self.child()?);
-            let mut entries = fs::read_dir(path).map_err(|_| OperationErrorV1::Failed)?;
-            let first = entries
-                .next()
-                .transpose()
-                .map_err(|_| OperationErrorV1::Failed)?;
-            let second = entries
-                .next()
-                .transpose()
-                .map_err(|_| OperationErrorV1::Failed)?;
-            if first.is_some() && second.is_none() {
-                Ok(1)
-            } else {
-                Err(OperationErrorV1::Failed)
-            }
+            count_exactly_one_task_v1(path)
         }
 
+        fn verify_host_single_task(&self) -> Result<i64, OperationErrorV1> {
+            count_exactly_one_task_v1("/proc/self/task")
+        }
+
+        fn verify_restored_signal_mask(&mut self) -> Result<i64, OperationErrorV1> {
+            if !self.signal_blocked {
+                return Ok(0);
+            }
+            let mut observed = 0_u64;
+            if unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigprocmask,
+                    libc::SIG_SETMASK,
+                    ptr::null::<u64>(),
+                    &mut observed,
+                    KERNEL_SIGNAL_SET_BYTES_V1,
+                )
+            } != 0
+                || observed != self.old_mask
+            {
+                return Err(OperationErrorV1::SignalStateChanged);
+            }
+            self.signal_blocked = false;
+            Ok(0)
+        }
+
+        fn release_shared_mapping(&mut self) -> Result<i64, OperationErrorV1> {
+            if self.shared.is_null() {
+                return Ok(0);
+            }
+            if unsafe {
+                libc::munmap(
+                    self.shared.cast(),
+                    core::mem::size_of::<SharedTranscriptV1>(),
+                )
+            } != 0
+            {
+                return Err(OperationErrorV1::Failed);
+            }
+            self.shared = ptr::null_mut();
+            Ok(0)
+        }
+    }
+
+    fn count_exactly_one_task_v1(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<i64, OperationErrorV1> {
+        let mut entries = fs::read_dir(path).map_err(|_| OperationErrorV1::Failed)?;
+        let first = entries
+            .next()
+            .transpose()
+            .map_err(|_| OperationErrorV1::Failed)?;
+        let second = entries
+            .next()
+            .transpose()
+            .map_err(|_| OperationErrorV1::Failed)?;
+        if first.is_some() && second.is_none() {
+            Ok(1)
+        } else {
+            Err(OperationErrorV1::Failed)
+        }
+    }
+
+    impl LiveStoppedChildOperationsV1 {
         fn reap(&mut self, cleanup: bool) -> Result<i64, OperationErrorV1> {
             if self.reaped || self.child.is_none() {
                 return Ok(0);
@@ -815,38 +1021,6 @@ mod platform {
             {
                 return Err(OperationErrorV1::Failed);
             }
-            let mut observed = 0_u64;
-            if unsafe {
-                libc::syscall(
-                    libc::SYS_rt_sigprocmask,
-                    libc::SIG_SETMASK,
-                    ptr::null::<u64>(),
-                    &mut observed,
-                    KERNEL_SIGNAL_SET_BYTES_V1,
-                )
-            } != 0
-                || observed != self.old_mask
-            {
-                return Err(OperationErrorV1::SignalStateChanged);
-            }
-            self.signal_blocked = false;
-            Ok(0)
-        }
-
-        fn release_shared_mapping(&mut self) -> Result<i64, OperationErrorV1> {
-            if self.shared.is_null() {
-                return Ok(0);
-            }
-            if unsafe {
-                libc::munmap(
-                    self.shared.cast(),
-                    core::mem::size_of::<SharedTranscriptV1>(),
-                )
-            } != 0
-            {
-                return Err(OperationErrorV1::Failed);
-            }
-            self.shared = ptr::null_mut();
             Ok(0)
         }
     }
@@ -857,13 +1031,37 @@ mod platform {
             operation: ConnectorOperationV1,
             readback: Option<&mut [WorkloadSockFilterV1]>,
         ) -> Result<i64, OperationErrorV1> {
+            #[cfg(test)]
+            if self
+                .fault_once
+                .is_some_and(|(candidate, _)| candidate == operation)
+            {
+                return Err(self
+                    .fault_once
+                    .take()
+                    .expect("matched one-shot live fault")
+                    .1);
+            }
             match operation {
+                ConnectorOperationV1::VerifyHostSingleTask
+                | ConnectorOperationV1::VerifyPreForkHostSingleTask => {
+                    self.verify_host_single_task()
+                }
+                ConnectorOperationV1::VerifyInitialSignalDisposition => {
+                    self.record_initial_sigchld()
+                }
+                ConnectorOperationV1::VerifyPreForkSignalDisposition
+                | ConnectorOperationV1::VerifyFinalSignalDisposition
+                | ConnectorOperationV1::CleanupVerifyFinalSignalDisposition => {
+                    self.verify_initial_sigchld_unchanged()
+                }
+                ConnectorOperationV1::ReadInitialPendingSignals => self.read_initial_pending(),
                 ConnectorOperationV1::SignalBlock => self.block_signal(),
+                ConnectorOperationV1::VerifyBlockedSignalMask => self.verify_blocked_mask(),
+                ConnectorOperationV1::VerifyBlockedPendingSignals => self.verify_blocked_pending(),
+                ConnectorOperationV1::AllocateSharedMapping => self.allocate_shared_mapping(),
                 ConnectorOperationV1::SpawnChild => self.spawn(),
                 ConnectorOperationV1::WaitInitialStop => self.wait_for_stop(libc::SIGSTOP),
-                ConnectorOperationV1::VerifyChildReapingPolicy => {
-                    self.verify_child_reaping_policy()
-                }
                 ConnectorOperationV1::VerifyInitialSingleTask
                 | ConnectorOperationV1::VerifyInstalledSingleTask => self.verify_single_task(),
                 ConnectorOperationV1::PtracePrepare => {
@@ -908,7 +1106,14 @@ mod platform {
                 | ConnectorOperationV1::CleanupFinalEchild => self.prove_echild(),
                 ConnectorOperationV1::SignalRestore
                 | ConnectorOperationV1::CleanupSignalRestore => self.restore_signal(),
-                ConnectorOperationV1::VerifyPendingSignals => self.verify_pending_signals(),
+                ConnectorOperationV1::VerifyRestoredSignalMask
+                | ConnectorOperationV1::CleanupVerifyRestoredSignalMask => {
+                    self.verify_restored_signal_mask()
+                }
+                ConnectorOperationV1::VerifyPendingSignals
+                | ConnectorOperationV1::CleanupVerifyPendingSignals => {
+                    self.verify_pending_signals()
+                }
                 ConnectorOperationV1::ReleaseSharedMapping
                 | ConnectorOperationV1::CleanupSharedMapping => self.release_shared_mapping(),
                 ConnectorOperationV1::CleanupKill => self.kill(),
@@ -918,9 +1123,14 @@ mod platform {
 
     impl Drop for LiveStoppedChildOperationsV1 {
         fn drop(&mut self) {
+            // These are bounded last-resort retries only. Their results are
+            // deliberately unobservable and can never upgrade a refusal's
+            // independently recorded cleanup uncertainty to success.
             let _ = self.kill();
             let _ = self.reap(true);
             let _ = self.restore_signal();
+            let _ = self.verify_restored_signal_mask();
+            let _ = self.verify_initial_sigchld_unchanged();
             let _ = self.release_shared_mapping();
         }
     }
@@ -1014,11 +1224,8 @@ mod platform {
         {
             return false;
         }
-        let mut operations = LiveStoppedChildOperationsV1::new();
-        operations.block_signal().is_ok()
-            && operations.verify_child_reaping_policy()
-                == Err(OperationErrorV1::ReapingOwnershipLost)
-            && operations.restore_signal().is_ok()
+        let operations = LiveStoppedChildOperationsV1::new();
+        operations.observe_default_sigchld() == Err(OperationErrorV1::SignalStateChanged)
     }
 
     #[cfg(test)]
@@ -1107,6 +1314,135 @@ mod platform {
         (unsafe { libc::waitpid(child, &mut status, 0) }) == child
             && libc::WIFEXITED(status)
             && libc::WEXITSTATUS(status) == 0
+            && operations.restore_signal().is_ok()
+            && operations.verify_restored_signal_mask().is_ok()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_mapping_is_released_after_injected_spawn_failure_v1() -> bool {
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        operations.fault_once = Some((ConnectorOperationV1::SpawnChild, OperationErrorV1::Failed));
+        let failure = drive_stopped_child_v1(
+            StoppedChildPermitV1 {
+                _seal: StoppedChildPermitSealV1,
+            },
+            &mut operations,
+        )
+        .expect_err("the injected fork boundary must refuse");
+        failure.stage() == WorkloadSeccompConnectorStageV1::SpawnChild
+            && failure.cleanup_complete()
+            && operations.shared.is_null()
+            && operations.child.is_none()
+            && !operations.signal_blocked
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_restore_readback_fault_has_bounded_fallback_v1() -> bool {
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        if operations.read_initial_pending().is_err()
+            || operations.block_signal().is_err()
+            || operations.restore_signal().is_err()
+        {
+            return false;
+        }
+        operations.fault_once = Some((
+            ConnectorOperationV1::VerifyRestoredSignalMask,
+            OperationErrorV1::SignalStateChanged,
+        ));
+        if operations.perform(ConnectorOperationV1::VerifyRestoredSignalMask, None)
+            != Err(OperationErrorV1::SignalStateChanged)
+        {
+            return false;
+        }
+        let first = operation_failure_v1(
+            ConnectorOperationV1::VerifyRestoredSignalMask,
+            OperationErrorV1::SignalStateChanged,
+        );
+        let cleanup_complete = cleanup_after_failure_v1(&mut operations)
+            && first.reason != WorkloadSeccompConnectorReasonV1::SignalStateChanged;
+        let failure = first.with_cleanup(cleanup_complete);
+        !failure.cleanup_complete() && !operations.signal_blocked
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_drop_retry_cannot_upgrade_recorded_uncertainty_v1() -> bool {
+        let mut original_mask = 0_u64;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_SETMASK,
+                ptr::null::<u64>(),
+                &mut original_mask,
+                KERNEL_SIGNAL_SET_BYTES_V1,
+            )
+        } != 0
+        {
+            return false;
+        }
+        let refusal = WorkloadSeccompConnectorFailureV1::new(
+            WorkloadSeccompConnectorStageV1::SpawnChild,
+            WorkloadSeccompConnectorReasonV1::KernelOperation,
+        )
+        .with_cleanup(false);
+        {
+            let mut operations = LiveStoppedChildOperationsV1::new();
+            if operations.read_initial_pending().is_err()
+                || operations.block_signal().is_err()
+                || operations.allocate_shared_mapping().is_err()
+            {
+                return false;
+            }
+            // Drop performs the bounded cleanup retry while `refusal` already
+            // owns its independent, immutable cleanup-uncertainty result.
+        }
+        let mut restored_mask = 0_u64;
+        let readback_ok = unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_SETMASK,
+                ptr::null::<u64>(),
+                &mut restored_mask,
+                KERNEL_SIGNAL_SET_BYTES_V1,
+            )
+        } == 0;
+        readback_ok && restored_mask == original_mask && !refusal.cleanup_complete()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_multithreaded_custom_sigchld_refuses_before_child_v1() -> bool {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        AMBIENT_HANDLER_CALLS_V1.store(0, Ordering::Relaxed);
+        let mut old = unsafe { core::mem::zeroed::<libc::sigaction>() };
+        let mut custom = unsafe { core::mem::zeroed::<libc::sigaction>() };
+        custom.sa_sigaction = ambient_handler_v1 as usize;
+        if unsafe { libc::sigemptyset(&mut custom.sa_mask) } != 0
+            || unsafe { libc::sigaction(libc::SIGCHLD, ptr::null(), &mut old) } != 0
+            || unsafe { libc::sigaction(libc::SIGCHLD, &custom, ptr::null_mut()) } != 0
+        {
+            return false;
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            while !thread_stop.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+        });
+        let result = qualify_stopped_workload_filter_live_v1();
+        stop.store(true, Ordering::Release);
+        let joined = thread.join().is_ok();
+        let restored = unsafe { libc::sigaction(libc::SIGCHLD, &old, ptr::null_mut()) } == 0;
+        matches!(
+            result,
+            Err(failure)
+                if failure.stage() == WorkloadSeccompConnectorStageV1::VerifySignalDisposition
+                    && failure.reason() == WorkloadSeccompConnectorReasonV1::SignalStateChanged
+                    && !failure.cleanup_complete()
+        ) && AMBIENT_HANDLER_CALLS_V1.load(Ordering::Relaxed) == 0
+            && joined
+            && restored
     }
 
     pub(in crate::linux_pytest) fn qualify_stopped_workload_filter_live_v1()
@@ -1158,7 +1494,9 @@ mod tests {
 
         fn expected_value(operation: ConnectorOperationV1) -> i64 {
             match operation {
-                ConnectorOperationV1::VerifyInitialSingleTask
+                ConnectorOperationV1::VerifyHostSingleTask
+                | ConnectorOperationV1::VerifyPreForkHostSingleTask
+                | ConnectorOperationV1::VerifyInitialSingleTask
                 | ConnectorOperationV1::VerifyInstalledSingleTask
                 | ConnectorOperationV1::ReadNoNewPrivileges => 1,
                 ConnectorOperationV1::PtraceReadbackCount
@@ -1225,6 +1563,7 @@ mod tests {
                 .iter()
                 .any(|operation| CLEANUP_OPERATIONS_V1.contains(operation))
         );
+        assert_eq!(operations.operations, FORWARD_OPERATIONS_V1);
     }
 
     #[test]
@@ -1500,9 +1839,61 @@ mod tests {
         target_pointer_width = "64"
     ))]
     #[test]
-    fn live_sig_ign_and_no_cldwait_are_typed_reaping_policy_refusals() {
+    fn live_sig_ign_and_no_cldwait_are_typed_signal_state_refusals() {
         assert_isolated_linux_case_v1(|| platform::test_reaping_policy_refusal_v1(false));
         assert_isolated_linux_case_v1(|| platform::test_reaping_policy_refusal_v1(true));
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn multithreaded_custom_sigchld_refuses_before_spawning_and_never_calls_handler() {
+        assert_isolated_linux_case_v1(
+            platform::test_multithreaded_custom_sigchld_refuses_before_child_v1,
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_mmap_success_then_injected_fork_failure_unmaps_exact_mapping() {
+        assert_isolated_linux_case_v1(
+            platform::test_mapping_is_released_after_injected_spawn_failure_v1,
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_restore_success_then_readback_failure_uses_bounded_fallback() {
+        assert_isolated_linux_case_v1(
+            platform::test_restore_readback_fault_has_bounded_fallback_v1,
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_drop_cleanup_retry_cannot_upgrade_recorded_uncertainty() {
+        assert_isolated_linux_case_v1(
+            platform::test_drop_retry_cannot_upgrade_recorded_uncertainty_v1,
+        );
     }
 
     #[cfg(all(
