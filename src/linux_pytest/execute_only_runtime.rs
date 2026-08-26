@@ -1180,15 +1180,15 @@ mod tests {
         );
 
         let mut later_permission_removal = elf_fixture();
-        append_second_load(&mut later_permission_removal, 121, 0x40_0079, 0, 1);
+        append_second_load(&mut later_permission_removal, 121, 0x40_0079, 1, 1);
         assert_eq!(
             validate_x86_64_elf_v1(&later_permission_removal),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
         );
 
         let mut differing_page_bias = elf_fixture();
-        append_second_load(&mut differing_page_bias, 0x1079, 0x40_0079, 0, 1);
-        differing_page_bias.resize(0x1079, 0);
+        append_second_load(&mut differing_page_bias, 0x1079, 0x40_0079, 1, 1);
+        differing_page_bias.resize(0x107a, 0);
         assert_eq!(
             validate_x86_64_elf_v1(&differing_page_bias),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfProgramHeader)
