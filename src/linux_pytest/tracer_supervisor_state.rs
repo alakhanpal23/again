@@ -253,6 +253,381 @@ pub(super) enum TracerSupervisorExecuteOnlyReasonV1 {
     TaskState(TracerTaskExecuteOnlyReasonV1),
 }
 
+impl TracerSupervisorExecuteOnlyReasonV1 {
+    /// Stable, data-free diagnostic code for the exact rejected planner edge.
+    ///
+    /// This deliberately does not use `Debug`: nested decoder variants can
+    /// contain raw status fields, while the connector may expose only this
+    /// fixed classification string.
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRawTid => "supervisor_invalid_raw_tid",
+            Self::SessionBrandExhausted => "supervisor_session_brand_exhausted",
+            Self::UnknownRawTid => "supervisor_unknown_raw_tid",
+            Self::StopGenerationOverflow => "supervisor_stop_generation_overflow",
+            Self::TransportSequenceOverflow => "supervisor_transport_sequence_overflow",
+            Self::StopWhileExchangePending => "supervisor_stop_while_exchange_pending",
+            Self::WaitStatusDecode(error) => wait_status_rejection_code_v1(error),
+            Self::ContinuedStatusUnsupported => "supervisor_continued_status_unsupported",
+            Self::EventZeroStopUnsupported => "supervisor_event_zero_stop_unsupported",
+            Self::EventStopContextAmbiguous => "supervisor_event_stop_context_ambiguous",
+            Self::ChildInitialStopCorrelationMissing => {
+                "supervisor_child_initial_stop_correlation_missing"
+            }
+            Self::UnexpectedSyscallStop => "supervisor_unexpected_syscall_stop",
+            Self::UnexpectedPtraceEvent => "supervisor_unexpected_ptrace_event",
+            Self::EventMessageResponseOutOfOrder => {
+                "supervisor_event_message_response_out_of_order"
+            }
+            Self::EventMessageCorrelationMismatch => {
+                "supervisor_event_message_correlation_mismatch"
+            }
+            Self::EventMessageDecode(error) => event_message_rejection_code_v1(error),
+            Self::EventMessageShapeMismatch => "supervisor_event_message_shape_mismatch",
+            Self::SyscallInfoResponseOutOfOrder => "supervisor_syscall_info_response_out_of_order",
+            Self::SyscallInfoCorrelationMismatch => "supervisor_syscall_info_correlation_mismatch",
+            Self::SyscallInfoDecode(error) => syscall_info_rejection_code_v1(error),
+            Self::SyscallInfoShapeMismatch => "supervisor_syscall_info_shape_mismatch",
+            Self::SeccompPermitResponseOutOfOrder => {
+                "supervisor_seccomp_permit_response_out_of_order"
+            }
+            Self::SeccompPermitCorrelationMismatch => {
+                "supervisor_seccomp_permit_correlation_mismatch"
+            }
+            Self::Clone3ArgsReadResponseOutOfOrder => {
+                "supervisor_clone3_args_read_response_out_of_order"
+            }
+            Self::Clone3ArgsReadCorrelationMismatch => {
+                "supervisor_clone3_args_read_correlation_mismatch"
+            }
+            Self::Clone3ArgsReadUnavailable => "supervisor_clone3_args_read_unavailable",
+            Self::ForkFamilyDecode(error) => fork_family_rejection_code_v1(error),
+            Self::PendingForkCapacityExceeded => "supervisor_pending_fork_capacity_exceeded",
+            Self::DuplicatePendingFork => "supervisor_duplicate_pending_fork",
+            Self::ForkEventMismatch => "supervisor_fork_event_mismatch",
+            Self::DuplicatePendingChildStop => "supervisor_duplicate_pending_child_stop",
+            Self::PendingChildStopCapacityExceeded => {
+                "supervisor_pending_child_stop_capacity_exceeded"
+            }
+            Self::ChildInitialStopCorrelationAmbiguous => {
+                "supervisor_child_initial_stop_correlation_ambiguous"
+            }
+            Self::ResumeConfirmationOutOfOrder => "supervisor_resume_confirmation_out_of_order",
+            Self::ResumeCorrelationMismatch => "supervisor_resume_correlation_mismatch",
+            Self::IncompleteShutdown => "supervisor_incomplete_shutdown",
+            Self::TaskState(error) => task_state_rejection_code_v1(error),
+        }
+    }
+}
+
+const fn wait_status_rejection_code_v1(error: LinuxWaitStatusDecodeErrorV1) -> &'static str {
+    match error {
+        LinuxWaitStatusDecodeErrorV1::PtraceEventBitsOnNonStop => {
+            "supervisor_wait_ptrace_event_bits_on_non_stop"
+        }
+        LinuxWaitStatusDecodeErrorV1::CoreFlagWithoutSignal => {
+            "supervisor_wait_core_flag_without_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::ReservedContinuationEncoding => {
+            "supervisor_wait_reserved_continuation_encoding"
+        }
+        LinuxWaitStatusDecodeErrorV1::InvalidTerminationSignal { .. } => {
+            "supervisor_wait_invalid_termination_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::SignaledTerminationHasExitPayload => {
+            "supervisor_wait_signaled_termination_has_exit_payload"
+        }
+        LinuxWaitStatusDecodeErrorV1::CoreFlagForNonCoreDumpSignal { .. } => {
+            "supervisor_wait_core_flag_for_non_core_dump_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::InvalidEventZeroStopSignal { .. } => {
+            "supervisor_wait_invalid_event_zero_stop_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::PtraceEventSignalMismatch { .. } => {
+            "supervisor_wait_ptrace_event_signal_mismatch"
+        }
+        LinuxWaitStatusDecodeErrorV1::UnsupportedPtraceEventVforkDone => {
+            "supervisor_wait_unsupported_ptrace_event_vfork_done"
+        }
+        LinuxWaitStatusDecodeErrorV1::PtraceEventStopSignalMismatch { .. } => {
+            "supervisor_wait_ptrace_event_stop_signal_mismatch"
+        }
+        LinuxWaitStatusDecodeErrorV1::UnknownPtraceEvent { .. } => {
+            "supervisor_wait_unknown_ptrace_event"
+        }
+    }
+}
+
+const fn event_message_rejection_code_v1(
+    error: LinuxPtraceEventMessageDecodeErrorV1,
+) -> &'static str {
+    match error {
+        LinuxPtraceEventMessageDecodeErrorV1::UpperWordNonzero => {
+            "supervisor_event_message_upper_word_nonzero"
+        }
+        LinuxPtraceEventMessageDecodeErrorV1::TidZero => "supervisor_event_message_tid_zero",
+        LinuxPtraceEventMessageDecodeErrorV1::TidExceedsLinuxX8664Limit => {
+            "supervisor_event_message_tid_exceeds_linux_x86_64_limit"
+        }
+        LinuxPtraceEventMessageDecodeErrorV1::ExitMessageMalformed(error) => {
+            event_exit_message_rejection_code_v1(error)
+        }
+        LinuxPtraceEventMessageDecodeErrorV1::ExitMessageIsNotFinal => {
+            "supervisor_event_message_exit_not_final"
+        }
+        LinuxPtraceEventMessageDecodeErrorV1::SeccompReservedBitsNonzero => {
+            "supervisor_event_message_seccomp_reserved_bits_nonzero"
+        }
+        LinuxPtraceEventMessageDecodeErrorV1::SeccompTraceCookieSchemaMismatch => {
+            "supervisor_event_message_seccomp_cookie_mismatch"
+        }
+    }
+}
+
+const fn event_exit_message_rejection_code_v1(error: LinuxWaitStatusDecodeErrorV1) -> &'static str {
+    match error {
+        LinuxWaitStatusDecodeErrorV1::PtraceEventBitsOnNonStop => {
+            "supervisor_event_message_exit_ptrace_event_bits_on_non_stop"
+        }
+        LinuxWaitStatusDecodeErrorV1::CoreFlagWithoutSignal => {
+            "supervisor_event_message_exit_core_flag_without_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::ReservedContinuationEncoding => {
+            "supervisor_event_message_exit_reserved_continuation_encoding"
+        }
+        LinuxWaitStatusDecodeErrorV1::InvalidTerminationSignal { .. } => {
+            "supervisor_event_message_exit_invalid_termination_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::SignaledTerminationHasExitPayload => {
+            "supervisor_event_message_exit_signaled_termination_has_exit_payload"
+        }
+        LinuxWaitStatusDecodeErrorV1::CoreFlagForNonCoreDumpSignal { .. } => {
+            "supervisor_event_message_exit_core_flag_for_non_core_dump_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::InvalidEventZeroStopSignal { .. } => {
+            "supervisor_event_message_exit_invalid_event_zero_stop_signal"
+        }
+        LinuxWaitStatusDecodeErrorV1::PtraceEventSignalMismatch { .. } => {
+            "supervisor_event_message_exit_ptrace_event_signal_mismatch"
+        }
+        LinuxWaitStatusDecodeErrorV1::UnsupportedPtraceEventVforkDone => {
+            "supervisor_event_message_exit_unsupported_ptrace_event_vfork_done"
+        }
+        LinuxWaitStatusDecodeErrorV1::PtraceEventStopSignalMismatch { .. } => {
+            "supervisor_event_message_exit_ptrace_event_stop_signal_mismatch"
+        }
+        LinuxWaitStatusDecodeErrorV1::UnknownPtraceEvent { .. } => {
+            "supervisor_event_message_exit_unknown_ptrace_event"
+        }
+    }
+}
+
+const fn syscall_info_rejection_code_v1(error: PtraceSyscallInfoDecodeErrorV1) -> &'static str {
+    match error {
+        PtraceSyscallInfoDecodeErrorV1::UnsupportedReturnedByteCount => {
+            "supervisor_syscall_info_unsupported_returned_byte_count"
+        }
+        PtraceSyscallInfoDecodeErrorV1::UnsupportedOperation => {
+            "supervisor_syscall_info_unsupported_operation"
+        }
+        PtraceSyscallInfoDecodeErrorV1::ExitReturnedByteCountMismatch => {
+            "supervisor_syscall_info_exit_byte_count_mismatch"
+        }
+        PtraceSyscallInfoDecodeErrorV1::SeccompReturnedByteCountMismatch => {
+            "supervisor_syscall_info_seccomp_byte_count_mismatch"
+        }
+        PtraceSyscallInfoDecodeErrorV1::HeaderReservedByteNonzero => {
+            "supervisor_syscall_info_header_reserved_byte_nonzero"
+        }
+        PtraceSyscallInfoDecodeErrorV1::HeaderFlagsNonzero => {
+            "supervisor_syscall_info_header_flags_nonzero"
+        }
+        PtraceSyscallInfoDecodeErrorV1::ArchitectureMismatch => {
+            "supervisor_syscall_info_architecture_mismatch"
+        }
+        PtraceSyscallInfoDecodeErrorV1::SeccompSyscallNumberDoesNotFitU32 => {
+            "supervisor_syscall_info_seccomp_number_does_not_fit_u32"
+        }
+        PtraceSyscallInfoDecodeErrorV1::SeccompSyscallNumberUsesX32Abi => {
+            "supervisor_syscall_info_seccomp_number_uses_x32_abi"
+        }
+        PtraceSyscallInfoDecodeErrorV1::SeccompSyscallNumberNotCanonicalNative => {
+            "supervisor_syscall_info_seccomp_number_not_canonical_native"
+        }
+        PtraceSyscallInfoDecodeErrorV1::SeccompCookieMismatch => {
+            "supervisor_syscall_info_seccomp_cookie_mismatch"
+        }
+        PtraceSyscallInfoDecodeErrorV1::ExitTailNonzero => {
+            "supervisor_syscall_info_exit_tail_nonzero"
+        }
+        PtraceSyscallInfoDecodeErrorV1::ExitIsErrorInvalid => {
+            "supervisor_syscall_info_exit_is_error_invalid"
+        }
+        PtraceSyscallInfoDecodeErrorV1::ExitResultShapeMismatch => {
+            "supervisor_syscall_info_exit_result_shape_mismatch"
+        }
+    }
+}
+
+const fn fork_family_rejection_code_v1(error: ForkFamilyDecodeErrorV1) -> &'static str {
+    match error {
+        ForkFamilyDecodeErrorV1::UnsupportedSyscall => "supervisor_fork_family_unsupported_syscall",
+        ForkFamilyDecodeErrorV1::UnexpectedClone3Capture => {
+            "supervisor_fork_family_unexpected_clone3_capture"
+        }
+        ForkFamilyDecodeErrorV1::Clone3ArgsUnavailable => {
+            "supervisor_fork_family_clone3_args_unavailable"
+        }
+        ForkFamilyDecodeErrorV1::Clone3NullArgsPointer => {
+            "supervisor_fork_family_clone3_null_args_pointer"
+        }
+        ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooSmall => {
+            "supervisor_fork_family_clone3_declared_size_too_small"
+        }
+        ForkFamilyDecodeErrorV1::Clone3DeclaredSizeTooLarge => {
+            "supervisor_fork_family_clone3_declared_size_too_large"
+        }
+        ForkFamilyDecodeErrorV1::Clone3DeclaredSizeAmbiguous => {
+            "supervisor_fork_family_clone3_declared_size_ambiguous"
+        }
+        ForkFamilyDecodeErrorV1::Clone3CopiedByteCountMismatch => {
+            "supervisor_fork_family_clone3_copied_byte_count_mismatch"
+        }
+        ForkFamilyDecodeErrorV1::Clone3UncopiedTailNonzero => {
+            "supervisor_fork_family_clone3_uncopied_tail_nonzero"
+        }
+        ForkFamilyDecodeErrorV1::LegacyCloneHighFlagBitsNonzero => {
+            "supervisor_fork_family_legacy_clone_high_flag_bits_nonzero"
+        }
+        ForkFamilyDecodeErrorV1::ExitSignalOutOfRange => {
+            "supervisor_fork_family_exit_signal_out_of_range"
+        }
+        ForkFamilyDecodeErrorV1::Clone3SignalBitsInFlags => {
+            "supervisor_fork_family_clone3_signal_bits_in_flags"
+        }
+        ForkFamilyDecodeErrorV1::TraceSuppressionFlag => {
+            "supervisor_fork_family_trace_suppression_flag"
+        }
+        ForkFamilyDecodeErrorV1::ReservedCloneFlag => "supervisor_fork_family_reserved_clone_flag",
+        ForkFamilyDecodeErrorV1::UnsupportedCloneFlags => {
+            "supervisor_fork_family_unsupported_clone_flags"
+        }
+        ForkFamilyDecodeErrorV1::InvalidCloneFlagCombination => {
+            "supervisor_fork_family_invalid_clone_flag_combination"
+        }
+        ForkFamilyDecodeErrorV1::SharedThreadGroupWithExitSignal => {
+            "supervisor_fork_family_shared_thread_group_with_exit_signal"
+        }
+        ForkFamilyDecodeErrorV1::VforkSharedThreadGroupUnsupported => {
+            "supervisor_fork_family_vfork_shared_thread_group_unsupported"
+        }
+        ForkFamilyDecodeErrorV1::LegacyCloneInactiveFieldNonzero => {
+            "supervisor_fork_family_legacy_clone_inactive_field_nonzero"
+        }
+        ForkFamilyDecodeErrorV1::Clone3InactiveFieldNonzero => {
+            "supervisor_fork_family_clone3_inactive_field_nonzero"
+        }
+        ForkFamilyDecodeErrorV1::Clone3ActiveFieldZero => {
+            "supervisor_fork_family_clone3_active_field_zero"
+        }
+        ForkFamilyDecodeErrorV1::Clone3SetTidExternalReadUnsupported => {
+            "supervisor_fork_family_clone3_set_tid_external_read_unsupported"
+        }
+        ForkFamilyDecodeErrorV1::Clone3FlagRequiresNewerVersion => {
+            "supervisor_fork_family_clone3_flag_requires_newer_version"
+        }
+        ForkFamilyDecodeErrorV1::Clone3StackShapeInvalid => {
+            "supervisor_fork_family_clone3_stack_shape_invalid"
+        }
+        ForkFamilyDecodeErrorV1::Clone3PidfdParentTidAlias => {
+            "supervisor_fork_family_clone3_pidfd_parent_tid_alias"
+        }
+        ForkFamilyDecodeErrorV1::PtraceEventMismatch => {
+            "supervisor_fork_family_ptrace_event_mismatch"
+        }
+    }
+}
+
+const fn task_state_rejection_code_v1(error: TracerTaskExecuteOnlyReasonV1) -> &'static str {
+    match error {
+        TracerTaskExecuteOnlyReasonV1::SequenceMismatch => "supervisor_task_sequence_mismatch",
+        TracerTaskExecuteOnlyReasonV1::CounterOverflow => "supervisor_task_counter_overflow",
+        TracerTaskExecuteOnlyReasonV1::InvalidRawTid => "supervisor_task_invalid_raw_tid",
+        TracerTaskExecuteOnlyReasonV1::UnknownRawTid => "supervisor_task_unknown_raw_tid",
+        TracerTaskExecuteOnlyReasonV1::DuplicateRawTid => "supervisor_task_duplicate_raw_tid",
+        TracerTaskExecuteOnlyReasonV1::InitialBirthRequired => {
+            "supervisor_task_initial_birth_required"
+        }
+        TracerTaskExecuteOnlyReasonV1::DuplicateInitialBirth => {
+            "supervisor_task_duplicate_initial_birth"
+        }
+        TracerTaskExecuteOnlyReasonV1::TaskCapacityExceeded => "supervisor_task_capacity_exceeded",
+        TracerTaskExecuteOnlyReasonV1::ParentNotRunning => "supervisor_task_parent_not_running",
+        TracerTaskExecuteOnlyReasonV1::SelfParentTid => "supervisor_task_self_parent_tid",
+        TracerTaskExecuteOnlyReasonV1::ChildAnnouncementWithoutEntry => {
+            "supervisor_task_child_announcement_without_entry"
+        }
+        TracerTaskExecuteOnlyReasonV1::ChildAnnouncementSyscallMismatch => {
+            "supervisor_task_child_announcement_syscall_mismatch"
+        }
+        TracerTaskExecuteOnlyReasonV1::DuplicateChildAnnouncement => {
+            "supervisor_task_duplicate_child_announcement"
+        }
+        TracerTaskExecuteOnlyReasonV1::DuplicateChildReady => {
+            "supervisor_task_duplicate_child_ready"
+        }
+        TracerTaskExecuteOnlyReasonV1::ChildNotReady => "supervisor_task_child_not_ready",
+        TracerTaskExecuteOnlyReasonV1::MissingChildAnnouncement => {
+            "supervisor_task_missing_child_announcement"
+        }
+        TracerTaskExecuteOnlyReasonV1::ChildResultMismatch => {
+            "supervisor_task_child_result_mismatch"
+        }
+        TracerTaskExecuteOnlyReasonV1::BirthGroupRelationMismatch => {
+            "supervisor_task_birth_group_relation_mismatch"
+        }
+        TracerTaskExecuteOnlyReasonV1::DuplicateExec => "supervisor_task_duplicate_exec",
+        TracerTaskExecuteOnlyReasonV1::ExecWithoutEntry => "supervisor_task_exec_without_entry",
+        TracerTaskExecuteOnlyReasonV1::ExecSyscallMismatch => {
+            "supervisor_task_exec_syscall_mismatch"
+        }
+        TracerTaskExecuteOnlyReasonV1::ExecTidReplacementUnsupported => {
+            "supervisor_task_exec_tid_replacement_unsupported"
+        }
+        TracerTaskExecuteOnlyReasonV1::ExecThreadTeardownUnsupported => {
+            "supervisor_task_exec_thread_teardown_unsupported"
+        }
+        TracerTaskExecuteOnlyReasonV1::DuplicateSeccompEntry => {
+            "supervisor_task_duplicate_seccomp_entry"
+        }
+        TracerTaskExecuteOnlyReasonV1::SyscallExitWithoutEntry => {
+            "supervisor_task_syscall_exit_without_entry"
+        }
+        TracerTaskExecuteOnlyReasonV1::SyscallRestartUnsupported => {
+            "supervisor_task_syscall_restart_unsupported"
+        }
+        TracerTaskExecuteOnlyReasonV1::NoReturnResolutionRequired => {
+            "supervisor_task_no_return_resolution_required"
+        }
+        TracerTaskExecuteOnlyReasonV1::MissingExecEvent => "supervisor_task_missing_exec_event",
+        TracerTaskExecuteOnlyReasonV1::ExecResultMismatch => "supervisor_task_exec_result_mismatch",
+        TracerTaskExecuteOnlyReasonV1::OutstandingSyscall => "supervisor_task_outstanding_syscall",
+        TracerTaskExecuteOnlyReasonV1::DuplicatePtraceExit => {
+            "supervisor_task_duplicate_ptrace_exit"
+        }
+        TracerTaskExecuteOnlyReasonV1::LateLifecycleEvent => "supervisor_task_late_lifecycle_event",
+        TracerTaskExecuteOnlyReasonV1::ReapBeforePtraceExit => {
+            "supervisor_task_reap_before_ptrace_exit"
+        }
+        TracerTaskExecuteOnlyReasonV1::InvalidTermination => "supervisor_task_invalid_termination",
+        TracerTaskExecuteOnlyReasonV1::TerminationMismatch => {
+            "supervisor_task_termination_mismatch"
+        }
+        TracerTaskExecuteOnlyReasonV1::SinkRejected => "supervisor_task_sink_rejected",
+        TracerTaskExecuteOnlyReasonV1::IncompleteShutdown => "supervisor_task_incomplete_shutdown",
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PendingExchangeV1 {
     None,
@@ -1593,6 +1968,16 @@ mod tests {
         raw_tid: i32,
         sink: &mut FixedSinkV1<N>,
     ) {
+        enter_zero_exit(supervisor, raw_tid, sink);
+        observe_zero_exit_event(supervisor, raw_tid, sink);
+        observe_zero_reap(supervisor, raw_tid, sink);
+    }
+
+    fn enter_zero_exit<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        sink: &mut FixedSinkV1<N>,
+    ) {
         enter_syscall(
             supervisor,
             raw_tid,
@@ -1600,6 +1985,13 @@ mod tests {
             [0; 6],
             sink,
         );
+    }
+
+    fn observe_zero_exit_event<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        sink: &mut FixedSinkV1<N>,
+    ) {
         let exit_read = take_event_read(
             supervisor
                 .observe_wait(raw_tid, ptrace_event_status(LinuxPtraceEventV1::Exit), sink)
@@ -1617,12 +2009,128 @@ mod tests {
                 .expect("confirm exit resume"),
             TracerSupervisorIntentV1::WaitForNextStop
         ));
+    }
+
+    fn observe_zero_reap<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        raw_tid: i32,
+        sink: &mut FixedSinkV1<N>,
+    ) {
         assert!(matches!(
             supervisor
                 .observe_wait(raw_tid, 0, sink)
                 .expect("terminal zero reap"),
             TracerSupervisorIntentV1::WaitForNextStop
         ));
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum FixedPostForkStepV1 {
+        ParentClone3Exit,
+        ParentExitEntry,
+        ParentPtraceExit,
+        ParentReap,
+        ChildExitEntry,
+        ChildPtraceExit,
+        ChildReap,
+    }
+
+    fn run_fixed_post_fork_step<const N: usize>(
+        supervisor: &mut TracerSupervisorStateV1,
+        step: FixedPostForkStepV1,
+        sink: &mut FixedSinkV1<N>,
+    ) {
+        match step {
+            FixedPostForkStepV1::ParentClone3Exit => {
+                finish_syscall(supervisor, ROOT_TID, CHILD_TID.into(), sink);
+            }
+            FixedPostForkStepV1::ParentExitEntry => enter_zero_exit(supervisor, ROOT_TID, sink),
+            FixedPostForkStepV1::ParentPtraceExit => {
+                observe_zero_exit_event(supervisor, ROOT_TID, sink);
+            }
+            FixedPostForkStepV1::ParentReap => observe_zero_reap(supervisor, ROOT_TID, sink),
+            FixedPostForkStepV1::ChildExitEntry => enter_zero_exit(supervisor, CHILD_TID, sink),
+            FixedPostForkStepV1::ChildPtraceExit => {
+                observe_zero_exit_event(supervisor, CHILD_TID, sink);
+            }
+            FixedPostForkStepV1::ChildReap => observe_zero_reap(supervisor, CHILD_TID, sink),
+        }
+    }
+
+    fn run_fixed_two_task_topological_merge(
+        child_first: bool,
+        parent_positions: u8,
+    ) -> super::super::tracer_task_state::TracerTaskCompletionSummaryV1 {
+        const PARENT_STEPS: [FixedPostForkStepV1; 4] = [
+            FixedPostForkStepV1::ParentClone3Exit,
+            FixedPostForkStepV1::ParentExitEntry,
+            FixedPostForkStepV1::ParentPtraceExit,
+            FixedPostForkStepV1::ParentReap,
+        ];
+        const CHILD_STEPS: [FixedPostForkStepV1; 3] = [
+            FixedPostForkStepV1::ChildExitEntry,
+            FixedPostForkStepV1::ChildPtraceExit,
+            FixedPostForkStepV1::ChildReap,
+        ];
+
+        let mut sink = FixedSinkV1::<16>::new();
+        let mut supervisor = begin(&mut sink);
+        enter_clone3(&mut supervisor, ROOT_TID, 0x1000, 88, &mut sink);
+
+        if child_first {
+            assert!(matches!(
+                supervisor
+                    .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                    .expect("child-first initial stop"),
+                TracerSupervisorIntentV1::WaitForNextStop
+            ));
+        }
+        let event_read = take_event_read(
+            supervisor
+                .observe_wait(
+                    ROOT_TID,
+                    ptrace_event_status(LinuxPtraceEventV1::Fork),
+                    &mut sink,
+                )
+                .expect("parent fork event"),
+        );
+        let after_event = supervisor
+            .accept_event_message(event_read, &event_message(CHILD_TID as u64), &mut sink)
+            .expect("fork event child identity");
+        if child_first {
+            confirm_child_then_parent(&mut supervisor, after_event, CHILD_TID, ROOT_TID);
+        } else {
+            assert!(matches!(
+                after_event,
+                TracerSupervisorIntentV1::WaitForNextStop
+            ));
+            let pair = supervisor
+                .observe_wait(CHILD_TID, event_stop_status(SIGTRAP), &mut sink)
+                .expect("parent-first child initial stop");
+            confirm_child_then_parent(&mut supervisor, pair, CHILD_TID, ROOT_TID);
+        }
+
+        let mut parent_index = 0;
+        let mut child_index = 0;
+        for position in 0..7 {
+            let step = if parent_positions & (1 << position) != 0 {
+                let step = PARENT_STEPS[parent_index];
+                parent_index += 1;
+                step
+            } else {
+                let step = CHILD_STEPS[child_index];
+                child_index += 1;
+                step
+            };
+            run_fixed_post_fork_step(&mut supervisor, step, &mut sink);
+        }
+        assert_eq!(parent_index, PARENT_STEPS.len());
+        assert_eq!(child_index, CHILD_STEPS.len());
+
+        supervisor
+            .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+            .expect("complete topological merge")
+            .summary()
     }
 
     fn confirm_child_then_parent(
@@ -2570,6 +3078,78 @@ mod tests {
             assert_eq!(summary.ptrace_exit_event_count, 2);
             assert_eq!(summary.terminal_reap_count, 2);
         }
+    }
+
+    #[test]
+    fn every_valid_fixed_two_task_post_fork_topological_merge_completes() {
+        let mut tested_merges = 0;
+        for child_first in [false, true] {
+            for parent_positions in 0_u8..(1 << 7) {
+                if parent_positions.count_ones() != 4 {
+                    continue;
+                }
+                let outcome = std::panic::catch_unwind(|| {
+                    run_fixed_two_task_topological_merge(child_first, parent_positions)
+                });
+                let summary = match outcome {
+                    Ok(summary) => summary,
+                    Err(_) => panic!(
+                        "valid post-fork merge rejected: child_first={child_first}, parent_positions={parent_positions:#04x}"
+                    ),
+                };
+                assert_eq!(summary.task_count, 2);
+                assert_eq!(summary.accepted_transition_count, 11);
+                assert_eq!(summary.initial_birth_count, 1);
+                assert_eq!(summary.child_announcement_count, 1);
+                assert_eq!(summary.child_ready_count, 1);
+                assert_eq!(summary.fork_birth_count, 1);
+                assert_eq!(summary.vfork_birth_count, 0);
+                assert_eq!(summary.clone_birth_count, 0);
+                assert_eq!(summary.exec_count, 0);
+                assert_eq!(summary.seccomp_entry_count, 3);
+                assert_eq!(summary.syscall_exit_count, 1);
+                assert_eq!(summary.no_return_resolution_count, 2);
+                assert_eq!(summary.ptrace_exit_event_count, 2);
+                assert_eq!(summary.terminal_reap_count, 2);
+                tested_merges += 1;
+            }
+        }
+        assert_eq!(tested_merges, 70);
+    }
+
+    #[test]
+    fn rejection_codes_are_granular_stable_and_payload_free() {
+        assert_eq!(
+            TracerSupervisorExecuteOnlyReasonV1::UnexpectedPtraceEvent.as_str(),
+            "supervisor_unexpected_ptrace_event"
+        );
+        assert_eq!(
+            TracerSupervisorExecuteOnlyReasonV1::EventMessageCorrelationMismatch.as_str(),
+            "supervisor_event_message_correlation_mismatch"
+        );
+
+        let first = TracerSupervisorExecuteOnlyReasonV1::WaitStatusDecode(
+            LinuxWaitStatusDecodeErrorV1::UnknownPtraceEvent { event_code: 0x1234 },
+        )
+        .as_str();
+        let second = TracerSupervisorExecuteOnlyReasonV1::WaitStatusDecode(
+            LinuxWaitStatusDecodeErrorV1::UnknownPtraceEvent { event_code: 0xabcd },
+        )
+        .as_str();
+        assert_eq!(first, "supervisor_wait_unknown_ptrace_event");
+        assert_eq!(first, second);
+        assert!(!first.contains("1234"));
+        assert!(!second.contains("abcd"));
+
+        let nested = TracerSupervisorExecuteOnlyReasonV1::EventMessageDecode(
+            LinuxPtraceEventMessageDecodeErrorV1::ExitMessageMalformed(
+                LinuxWaitStatusDecodeErrorV1::UnknownPtraceEvent { event_code: 0x1234 },
+            ),
+        )
+        .as_str();
+        assert_eq!(nested, "supervisor_event_message_exit_unknown_ptrace_event");
+        assert_ne!(nested, first);
+        assert!(!nested.contains("1234"));
     }
 
     #[test]

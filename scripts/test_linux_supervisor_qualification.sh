@@ -5,6 +5,20 @@ temporary_root=$(mktemp -d "${TMPDIR:-/tmp}/again-supervisor-qualification-test.
 trap 'rm -rf "$temporary_root"' EXIT HUP INT TERM
 fake_binary="$temporary_root/again"
 counter="$temporary_root/counter"
+fake_tools="$temporary_root/tools"
+mkdir "$fake_tools"
+
+cat > "$fake_tools/uname" <<'EOF'
+#!/bin/sh
+set -eu
+case "${1:-}" in
+  -s) printf 'Linux\n' ;;
+  -m) printf 'x86_64\n' ;;
+  -r) printf '6.17.0-again-test\n' ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod 700 "$fake_tools/uname"
 
 cat > "$fake_binary" <<'EOF'
 #!/bin/sh
@@ -17,6 +31,10 @@ if [ -f "$counter" ]; then
   iteration=$(( $(cat "$counter") + 1 ))
 fi
 printf '%d\n' "$iteration" > "$counter"
+if [ "${FAKE_FAIL_AT:-0}" -eq "$iteration" ]; then
+  printf '%s\n' '{"schema":"again.linux-pytest-supervisor-tree-probe.v1","profile_id":"linux-pytest-v1","scope":{"kind":"fixed_no_command_two_task_supervisor","profile_qualification":false,"accepts_command":false,"effect_ir_authority":false,"execution_authority":false,"reuse_authority":false},"status":"broken","result":null,"refusal":{"code":"isolation_preflight_failed","stage":"planner","reason":"supervisor_unexpected_ptrace_event","errno":null,"cleanup_complete":true,"cleanup_errno":null}}'
+  exit 1
+fi
 if [ "${FAKE_SINGLE_ORDER:-0}" = 1 ] || [ $((iteration % 2)) -eq 0 ]; then
   order=parent_event_first
 else
@@ -26,6 +44,7 @@ printf '%s\n' "{\"schema\":\"again.linux-pytest-supervisor-tree-probe.v1\",\"pro
 EOF
 chmod 700 "$fake_binary"
 
+PATH="$fake_tools:$PATH" \
 FAKE_SUPERVISOR_COUNTER="$counter" \
 AGAIN_SUPERVISOR_BINARY="$fake_binary" \
 AGAIN_SUPERVISOR_EVIDENCE_DIR="$temporary_root/success" \
@@ -40,9 +59,11 @@ jq -e '
   and .scope.execution_authority == false
   and .scope.reuse_authority == false
 ' "$temporary_root/success/report.json" > /dev/null
+test "$(find "$temporary_root/success" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
 
 printf '0\n' > "$counter"
 set +e
+PATH="$fake_tools:$PATH" \
 FAKE_SUPERVISOR_COUNTER="$counter" \
 FAKE_SINGLE_ORDER=1 \
 AGAIN_SUPERVISOR_BINARY="$fake_binary" \
@@ -51,5 +72,30 @@ AGAIN_SUPERVISOR_EVIDENCE_DIR="$temporary_root/one-order" \
 one_order_exit=$?
 set -e
 test "$one_order_exit" -ne 0
+test "$(cat "$counter")" -eq 100
+test "$(find "$temporary_root/one-order" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
+test "$(wc -l < "$temporary_root/one-order/validated.jsonl" | tr -d ' ')" -eq 100
+test ! -e "$temporary_root/one-order/report.json"
+
+printf '0\n' > "$counter"
+set +e
+PATH="$fake_tools:$PATH" \
+FAKE_SUPERVISOR_COUNTER="$counter" \
+FAKE_FAIL_AT=11 \
+AGAIN_SUPERVISOR_BINARY="$fake_binary" \
+AGAIN_SUPERVISOR_EVIDENCE_DIR="$temporary_root/sample-11-failure" \
+  scripts/qualify_linux_supervisor.sh > /dev/null 2>&1
+sample_failure_exit=$?
+set -e
+test "$sample_failure_exit" -ne 0
+test "$(cat "$counter")" -eq 100
+test "$(find "$temporary_root/sample-11-failure" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
+test "$(wc -l < "$temporary_root/sample-11-failure/validated.jsonl" | tr -d ' ')" -eq 99
+test "$(cat "$temporary_root/sample-11-failure/sample-011/exit-status.txt")" -eq 1
+grep -Fq 'supervisor_unexpected_ptrace_event' \
+  "$temporary_root/sample-11-failure/sample-011/stdout.raw"
+test ! -s "$temporary_root/sample-11-failure/sample-011/stderr.raw"
+test "$(cat "$temporary_root/sample-11-failure/sample-012/exit-status.txt")" -eq 0
+test ! -e "$temporary_root/sample-11-failure/report.json"
 
 printf 'Linux supervisor qualification harness tests passed.\n'

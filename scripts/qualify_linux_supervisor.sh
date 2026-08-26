@@ -34,6 +34,7 @@ mkdir -m 700 "$evidence_dir"
 : > "$evidence_dir/validated.jsonl"
 
 iteration=1
+failed_sample_count=0
 while [ "$iteration" -le "$sample_count" ]; do
   sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
   mkdir -m 700 "$sample_dir"
@@ -44,9 +45,11 @@ while [ "$iteration" -le "$sample_count" ]; do
   probe_exit=$?
   set -e
   printf '%d\n' "$probe_exit" > "$sample_dir/exit-status.txt"
-  test "$probe_exit" -eq 0
-  test ! -s "$sample_dir/stderr.raw"
-  jq -c -s -e --argjson iteration "$iteration" '
+  validated_record="$sample_dir/validated.json"
+  sample_valid=true
+  if [ "$probe_exit" -ne 0 ] || [ -s "$sample_dir/stderr.raw" ]; then
+    sample_valid=false
+  elif ! jq -c -s -e --argjson iteration "$iteration" '
     select(
       length == 1
       and (.[0] |
@@ -84,11 +87,26 @@ while [ "$iteration" -le "$sample_count" ]; do
       )
     )
     | .[0] + {iteration: $iteration}
-  ' "$sample_dir/stdout.raw" >> "$evidence_dir/validated.jsonl"
+  ' "$sample_dir/stdout.raw" > "$validated_record"; then
+    sample_valid=false
+  fi
+  if [ "$sample_valid" = true ]; then
+    cat "$validated_record" >> "$evidence_dir/validated.jsonl"
+  else
+    failed_sample_count=$((failed_sample_count + 1))
+  fi
+  rm -f "$validated_record"
   iteration=$((iteration + 1))
 done
 
-jq -s -e --arg source_commit "$source_commit" --arg kernel_release "$kernel_release" '
+if [ "$failed_sample_count" -ne 0 ]; then
+  printf 'error: %d of 100 supervisor samples failed validation; all raw samples were retained.\n' \
+    "$failed_sample_count" >&2
+  exit 1
+fi
+
+pending_report="$evidence_dir/report.json.pending"
+if ! jq -s -e --arg source_commit "$source_commit" --arg kernel_release "$kernel_release" '
   select(
     length == 100
     and ([.[].iteration] == [range(1; 101)])
@@ -116,6 +134,11 @@ jq -s -e --arg source_commit "$source_commit" --arg kernel_release "$kernel_rele
         reuse_authority: false
       }
     }
-' "$evidence_dir/validated.jsonl" > "$evidence_dir/report.json"
+' "$evidence_dir/validated.jsonl" > "$pending_report"; then
+  rm -f "$pending_report"
+  echo 'error: 100 validated samples did not contain both live fork-delivery orders.' >&2
+  exit 1
+fi
+mv "$pending_report" "$evidence_dir/report.json"
 
 printf 'Validated 100/100 fixed supervisor samples and both kernel fork-delivery orders.\n'

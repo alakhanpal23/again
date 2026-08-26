@@ -161,7 +161,9 @@ enum FixedTwoTaskSupervisorReasonV1 {
     FilterMismatch,
     QuiescenceUnproven,
     PrivateRangeUnproven,
-    PlannerRejected,
+    SupervisorRejected(&'static str),
+    ForkDeliveryOrderMissing,
+    PlannerSummaryMismatch,
     CleanupUncertain,
 }
 
@@ -183,7 +185,9 @@ impl FixedTwoTaskSupervisorReasonV1 {
             Self::FilterMismatch => "filter_mismatch",
             Self::QuiescenceUnproven => "quiescence_unproven",
             Self::PrivateRangeUnproven => "private_range_unproven",
-            Self::PlannerRejected => "planner_rejected",
+            Self::SupervisorRejected(reason) => reason,
+            Self::ForkDeliveryOrderMissing => "fork_delivery_order_missing",
+            Self::PlannerSummaryMismatch => "planner_summary_mismatch",
             Self::CleanupUncertain => "cleanup_uncertain",
         }
     }
@@ -344,8 +348,8 @@ mod platform {
         CLONE3_ARGS_BUFFER_BYTES_V1, Clone3ArgsCaptureV1,
     };
     use super::super::super::tracer_supervisor_state::{
-        CompletedTracerSupervisorStateV1, TracerSupervisorIntentV1,
-        TracerSupervisorResumeRequestV1, TracerSupervisorStateV1,
+        CompletedTracerSupervisorStateV1, TracerSupervisorExecuteOnlyReasonV1,
+        TracerSupervisorIntentV1, TracerSupervisorResumeRequestV1, TracerSupervisorStateV1,
     };
     use super::super::super::tracer_task_state::{
         NormalizedTracerTaskEventSinkV1, NormalizedTracerTaskEventV1,
@@ -1079,7 +1083,11 @@ mod platform {
             Some(order) => order,
             None => {
                 return Err(finish_failed_run_v1(
-                    planner_failure_v1(),
+                    failure_v1(
+                        FixedTwoTaskSupervisorStageV1::Planner,
+                        FixedTwoTaskSupervisorReasonV1::ForkDeliveryOrderMissing,
+                        None,
+                    ),
                     &mut tree,
                     &signal_state,
                     faults,
@@ -1099,13 +1107,7 @@ mod platform {
             .map_err(|failure| failure.with_cleanup(false, None))?;
         let completed = supervisor
             .complete(TracerSupervisorCleanupCompletionPermitV1(()))
-            .map_err(|_| {
-                failure_v1(
-                    FixedTwoTaskSupervisorStageV1::Planner,
-                    FixedTwoTaskSupervisorReasonV1::PlannerRejected,
-                    None,
-                )
-            })?;
+            .map_err(planner_failure_v1)?;
         fixed_completion_v1(completed, fork_delivery_order)
     }
 
@@ -1149,10 +1151,10 @@ mod platform {
             tree.root_tid,
             &mut sink,
         )
-        .map_err(|_| planner_failure_v1())?;
+        .map_err(planner_failure_v1)?;
         let mut intent = supervisor
             .observe_wait(initial_tid, initial_status, &mut sink)
-            .map_err(|_| planner_failure_v1())?;
+            .map_err(planner_failure_v1)?;
 
         for _ in 0..MAX_DRIVER_STEPS_V1 {
             intent = match intent {
@@ -1174,18 +1176,18 @@ mod platform {
                     }
                     supervisor
                         .accept_event_message(token, &message.to_le_bytes(), &mut sink)
-                        .map_err(|_| planner_failure_v1())?
+                        .map_err(planner_failure_v1)?
                 }
                 TracerSupervisorIntentV1::ReadSyscallInfo(token) => {
                     let mut buffer = [0_u8; 84];
                     let count = read_syscall_info_v1(faults, token.raw_tid(), &mut buffer)?;
                     supervisor
                         .accept_syscall_info(token, count, &buffer, &mut sink)
-                        .map_err(|_| planner_failure_v1())?
+                        .map_err(planner_failure_v1)?
                 }
                 TracerSupervisorIntentV1::HoldStoppedSeccompTask(permit) => supervisor
                     .consume_stopped_seccomp_permit(permit, &mut sink)
-                    .map_err(|_| planner_failure_v1())?,
+                    .map_err(planner_failure_v1)?,
                 TracerSupervisorIntentV1::ReadClone3Args(token) => {
                     prove_clone3_quiescence_v1(
                         tree,
@@ -1210,13 +1212,13 @@ mod platform {
                             },
                             &mut sink,
                         )
-                        .map_err(|_| planner_failure_v1())?
+                        .map_err(planner_failure_v1)?
                 }
                 TracerSupervisorIntentV1::Resume(resume) => {
                     resume_task_v1(faults, resume.raw_tid(), resume.request())?;
                     supervisor
                         .confirm_resume_succeeded(resume)
-                        .map_err(|_| planner_failure_v1())?
+                        .map_err(planner_failure_v1)?
                 }
                 TracerSupervisorIntentV1::WaitForNextStop => match wait_any_v1(faults, deadline)? {
                     Some((raw_tid, status)) => {
@@ -1228,7 +1230,7 @@ mod platform {
                         }
                         supervisor
                             .observe_wait(raw_tid, status, &mut sink)
-                            .map_err(|_| planner_failure_v1())?
+                            .map_err(planner_failure_v1)?
                     }
                     None => {
                         tree.prove_final_echild()?;
@@ -1264,7 +1266,11 @@ mod platform {
             || summary.ptrace_exit_event_count != 2
             || summary.terminal_reap_count != 2
         {
-            return Err(planner_failure_v1());
+            return Err(failure_v1(
+                FixedTwoTaskSupervisorStageV1::Planner,
+                FixedTwoTaskSupervisorReasonV1::PlannerSummaryMismatch,
+                None,
+            ));
         }
         Ok(CompletedFixedTwoTaskSupervisorProbeV1 {
             fork_delivery_order,
@@ -2381,10 +2387,12 @@ mod platform {
         }
     }
 
-    fn planner_failure_v1() -> FixedTwoTaskSupervisorFailureV1 {
+    fn planner_failure_v1(
+        reason: TracerSupervisorExecuteOnlyReasonV1,
+    ) -> FixedTwoTaskSupervisorFailureV1 {
         failure_v1(
             FixedTwoTaskSupervisorStageV1::Planner,
-            FixedTwoTaskSupervisorReasonV1::PlannerRejected,
+            FixedTwoTaskSupervisorReasonV1::SupervisorRejected(reason.as_str()),
             None,
         )
     }
@@ -2455,6 +2463,19 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn planner_failure_preserves_the_exact_redacted_supervisor_reason() {
+            let failure = planner_failure_v1(
+                TracerSupervisorExecuteOnlyReasonV1::EventMessageCorrelationMismatch,
+            );
+            assert_eq!(failure.stage(), "planner");
+            assert_eq!(
+                failure.reason(),
+                "supervisor_event_message_correlation_mismatch"
+            );
+            assert_eq!(failure.errno(), None);
+        }
 
         struct ScriptedFaultsV1 {
             script: Vec<(ConnectorKernelOperationV1, InjectedKernelResultV1)>,
