@@ -256,21 +256,31 @@ That binding can now be consumed by a descriptor-bound runtime checkpoint for
 `.venv/bin/python`. It pins and revalidates each ancestor and symlink, checks
 live metadata against the charged manifest, uses one fallible aggregate memory
 escrow, and validates a conservative kernel-loadable x86_64 ELF `PT_LOAD`
-envelope. It deliberately does not yet qualify `PT_INTERP`, `DT_NEEDED`, the
-runtime forest, the virtual environment, or pytest.
+envelope. The checkpoint now also extracts a bounded, canonical `PT_INTERP`
+and ordered `DT_NEEDED` request, rejects ambiguous page mappings and unmodeled
+loader-search flags, and retains that unresolved request under the same memory
+escrow. It deliberately does not resolve or qualify the interpreter,
+dependencies, runtime forest, virtual environment, or pytest.
 
-Two additional linear components are present but not yet connected. The stdio
-owner builds EOF stdin and bounded exact stdout/stderr capture with hashes,
-finite polling, cancellation, and cleanup-aware failure reporting; its
-production child-placement and nonblocking presenter seams remain closed. The
-isolation owner keeps namespace PID 1 behind an authenticated release, clears
-supplementary groups before mapping, constructs the private root and bounded
-scratch/procfs topology, scrubs descriptors, normalizes credentials, removes
-capabilities, verifies `no_new_privs`, and can invoke one unforgeable child-side
-continuation while the parent retains kill/reap ownership. It does not yet
-attach workspace/runtime descriptors, stdio, Landlock, workload seccomp, or
-the tracer. No component accepts a command or grants execution, profile,
-candidate, replay, hit, or reuse authority.
+The stdio and isolation owners now compose at their linear ownership boundary.
+All pipe endpoints are authenticated and relocated above protocol descriptors
+3/4 before the pre-clone split; the child-only continuation requires empty
+supplementary groups and places stdin/stdout/stderr, while the parent retains
+bounded exact EOF capture, cancellation, cleanup, and presentation evidence.
+There is still no orchestrator that launches this continuation through the
+qualified namespace path. The isolation owner otherwise retains namespace PID
+1, private-root, scratch/procfs, descriptor-scrub, credential, capability, and
+`no_new_privs` invariants behind parent-owned kill/reap authority.
+
+A separate provisional workload-seccomp plan is also integrated. Its exact
+223-instruction cBPF program traces every admitted and control syscall with a
+distinct cookie, kills wrong-architecture, x32, and unlisted calls, and is
+bound by canonical bytes plus a domain-separated BLAKE3 digest. Production
+cannot mint an installed-filter witness: connector-owned stopped-child install
+and readback evidence, supervisor cookie handling, and qualification against
+the pinned Python workload remain future composition work. No component
+accepts a command or grants execution, profile, candidate, replay, hit, or
+reuse authority.
 
 A separate bounded reference snapshot oracle records the fixed workspace
 fixture and exact argv while marking source, binary, and qualified-tuple
