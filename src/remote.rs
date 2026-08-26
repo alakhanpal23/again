@@ -733,9 +733,11 @@ impl RemotePullSession<'_> {
         if declared_length.is_some_and(|length| length > remaining) {
             return Err(RemoteError::ResponseBudgetExceeded);
         }
-        let resource_limit = usize::try_from(remaining)
-            .unwrap_or(usize::MAX)
-            .min(crate::team_config::MAX_LOOKUP_RESPONSE_BYTES as usize);
+        let resource_limit = effective_bounded_read_limit(
+            usize::try_from(crate::team_config::MAX_LOOKUP_RESPONSE_BYTES)
+                .map_err(|_| RemoteError::ResponseBudgetExceeded)?,
+            remaining,
+        );
         let bytes = match read_lookup_bundle_bounded(
             response,
             resource_limit,
@@ -893,7 +895,7 @@ impl RemotePullSession<'_> {
         {
             return Err(RemoteError::ResponseBudgetExceeded);
         }
-        let effective_limit = resource_limit.min(remaining as usize);
+        let effective_limit = effective_bounded_read_limit(resource_limit, remaining);
         let bytes = match read_bounded(response, effective_limit, operation, self.deadline).await {
             Err(RemoteError::ResponseTooLarge { .. }) if remaining < resource_limit as u64 => {
                 return Err(RemoteError::ResponseBudgetExceeded);
@@ -1114,7 +1116,7 @@ impl RemotePublishSession<'_> {
         {
             return Err(RemoteError::TransferBudgetExceeded);
         }
-        let effective_limit = resource_limit.min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let effective_limit = effective_bounded_read_limit(resource_limit, remaining);
         let bytes = match read_bounded(response, effective_limit, operation, self.deadline).await {
             Err(RemoteError::ResponseTooLarge { .. }) if remaining < resource_limit as u64 => {
                 return Err(RemoteError::TransferBudgetExceeded);
@@ -1438,6 +1440,15 @@ fn optional_content_length(response: &Response) -> Result<Option<u64>, RemoteErr
         .map_err(|_| RemoteError::InvalidContentLength)
 }
 
+fn effective_bounded_read_limit(resource_limit: usize, remaining_budget: u64) -> usize {
+    match usize::try_from(remaining_budget) {
+        Ok(remaining_budget) => resource_limit.min(remaining_budget),
+        // A budget larger than the address space cannot further constrain an
+        // already-addressable resource limit.
+        Err(_) => resource_limit,
+    }
+}
+
 fn bounded_content_length(response: &Response, limit: usize) -> Result<u64, RemoteError> {
     let Some(value) = response.headers().get(CONTENT_LENGTH) else {
         return Err(RemoteError::MissingContentLength);
@@ -1573,6 +1584,22 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn effective_read_limit_checks_u64_to_usize_boundaries() {
+        assert_eq!(effective_bounded_read_limit(1_024, 0), 0);
+        assert_eq!(effective_bounded_read_limit(1_024, 511), 511);
+        assert_eq!(effective_bounded_read_limit(1_024, 1_024), 1_024);
+        assert_eq!(effective_bounded_read_limit(1_024, 2_048), 1_024);
+        assert_eq!(
+            effective_bounded_read_limit(1_024, u64::from(u32::MAX) + 1),
+            1_024
+        );
+        assert_eq!(
+            effective_bounded_read_limit(usize::MAX, u64::MAX),
+            usize::MAX
+        );
     }
 
     fn team_clients(
