@@ -1,5 +1,8 @@
 name: linux-supervisor-qualification
 
+# Provisioning, security, one-job registration, and teardown:
+# docs/LINUX_SUPERVISOR_RUNNER.md
+
 on:
   workflow_dispatch:
 
@@ -22,22 +25,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
       - name: Require the provisioned kernel contract
-        shell: bash
-        run: |
-          test "$(uname -s)" = Linux
-          test "$(uname -m)" = x86_64
-          if test -r /proc/config.gz; then
-            zgrep -q '^CONFIG_SECCOMP_FILTER=y$' /proc/config.gz
-            zgrep -q '^CONFIG_CHECKPOINT_RESTORE=y$' /proc/config.gz
-          else
-            kernel_config="/boot/config-$(uname -r)"
-            test -r "${kernel_config}"
-            grep -q '^CONFIG_SECCOMP_FILTER=y$' "${kernel_config}"
-            grep -q '^CONFIG_CHECKPOINT_RESTORE=y$' "${kernel_config}"
-          fi
-          cap_eff=$(awk '/^CapEff:/ { print $2 }' /proc/self/status)
-          test -n "${cap_eff}"
-          test $((16#${cap_eff} & 16#200000)) -ne 0
+        run: scripts/preflight_linux_supervisor_runner.sh
       - name: Strict Linux source validation
         run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
       - name: Build the fixed diagnostic

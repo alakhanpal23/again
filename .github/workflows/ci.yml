@@ -274,5 +274,8 @@ jobs:
       - name: Test the Linux supervisor qualification harness
         if: runner.os == 'Linux'
         run: scripts/test_linux_supervisor_qualification.sh
+      - name: Test the provisioned Linux runner preflight
+        if: runner.os == 'Linux'
+        run: scripts/test_linux_supervisor_runner_preflight.sh
       - name: Run the deterministic 100,000-case gate
         run: cargo +1.88.0 test --locked --test generated_differential generated_differential_100k -- --ignored --exact --nocapture
