@@ -844,8 +844,8 @@ fn build_encrypted_publication_with_nonces_v2(
 /// Verified, fully authenticated plaintext. Private fields prevent callers
 /// from constructing a remote hit without running `verify_and_decrypt_v2`.
 pub struct VerifiedRemoteResultV2 {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
+    stdout: Zeroizing<Vec<u8>>,
+    stderr: Zeroizing<Vec<u8>>,
     duration_micros: u64,
     local_proof_digest: Digest,
     producer_id: String,
@@ -855,11 +855,11 @@ pub struct VerifiedRemoteResultV2 {
 
 impl VerifiedRemoteResultV2 {
     pub fn stdout(&self) -> &[u8] {
-        &self.stdout
+        self.stdout.as_slice()
     }
 
     pub fn stderr(&self) -> &[u8] {
-        &self.stderr
+        self.stderr.as_slice()
     }
 
     pub fn duration_micros(&self) -> u64 {
@@ -960,28 +960,32 @@ pub(crate) fn verify_and_decrypt_v2(
 
     let cipher = XChaCha20Poly1305::new_from_slice(repository_key.key_bytes.as_ref())
         .expect("repository encryption keys always contain exactly 32 bytes");
-    let stdout = cipher
-        .decrypt(
-            &Array(manifest.stdout.nonce),
-            Payload {
-                msg: stdout_ciphertext,
-                aad: &manifest.stream_aad(EncryptedStreamLabelV2::Stdout),
-            },
-        )
-        .map_err(|_| ManifestV2Error::AuthenticationFailed {
-            stream: EncryptedStreamLabelV2::Stdout,
-        })?;
-    let stderr = cipher
-        .decrypt(
-            &Array(manifest.stderr.nonce),
-            Payload {
-                msg: stderr_ciphertext,
-                aad: &manifest.stream_aad(EncryptedStreamLabelV2::Stderr),
-            },
-        )
-        .map_err(|_| ManifestV2Error::AuthenticationFailed {
-            stream: EncryptedStreamLabelV2::Stderr,
-        })?;
+    let stdout = Zeroizing::new(
+        cipher
+            .decrypt(
+                &Array(manifest.stdout.nonce),
+                Payload {
+                    msg: stdout_ciphertext,
+                    aad: &manifest.stream_aad(EncryptedStreamLabelV2::Stdout),
+                },
+            )
+            .map_err(|_| ManifestV2Error::AuthenticationFailed {
+                stream: EncryptedStreamLabelV2::Stdout,
+            })?,
+    );
+    let stderr = Zeroizing::new(
+        cipher
+            .decrypt(
+                &Array(manifest.stderr.nonce),
+                Payload {
+                    msg: stderr_ciphertext,
+                    aad: &manifest.stream_aad(EncryptedStreamLabelV2::Stderr),
+                },
+            )
+            .map_err(|_| ManifestV2Error::AuthenticationFailed {
+                stream: EncryptedStreamLabelV2::Stderr,
+            })?,
+    );
     if !stderr.is_empty() {
         return Err(ManifestV2Error::NonEmptyEncryptedStderr);
     }
@@ -2443,6 +2447,26 @@ mod tests {
             )
             .unwrap();
         assert!(!format!("{verified:?}").contains("UNIQUE PLAINTEXT"));
+    }
+
+    #[test]
+    fn verified_remote_plaintext_uses_zeroizing_ownership() {
+        fn requires_zeroizing_vec(_: &Zeroizing<Vec<u8>>) {}
+
+        let fixture = Fixture::new(DEFAULT_OUTPUT);
+        let publication = fixture.publication();
+        let verified = fixture
+            .verify(
+                publication.manifest(),
+                publication.stdout_r2_bytes(),
+                publication.stderr_r2_bytes(),
+            )
+            .unwrap();
+
+        requires_zeroizing_vec(&verified.stdout);
+        requires_zeroizing_vec(&verified.stderr);
+        assert_eq!(verified.stdout(), DEFAULT_OUTPUT);
+        assert!(verified.stderr().is_empty());
     }
 
     #[test]
