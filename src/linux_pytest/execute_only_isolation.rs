@@ -35,7 +35,8 @@ use super::RefusalCode;
 ))]
 use super::execute_only_stdio::ProfileStdioIsolationChildV1;
 use super::isolation_qualification::{
-    self, BlockedRootlessNamespaceBootstrapV1, IsolationCancellationFailureV1,
+    self, BlockedRootlessNamespaceBootstrapV1, IsolationCancellationCodeV1,
+    IsolationCancellationFailureV1, IsolationCancellationOperationV1,
     IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1,
 };
 
@@ -220,12 +221,32 @@ pub(super) struct FirstExecuteOnlyIsolationReadyPermitV1 {
 /// The live guard has been consumed and still performs its bounded Drop
 /// fallback, but that retry is not observable and cannot prove cleanup.
 pub(super) struct ExecuteOnlyIsolationCancellationFailureV1 {
+    operation: IsolationCancellationOperationV1,
+    code: IsolationCancellationCodeV1,
     errno: Option<i32>,
+    terminal_reap_complete: bool,
+    cleanup_complete: bool,
 }
 
 impl ExecuteOnlyIsolationCancellationFailureV1 {
+    pub(super) const fn operation(&self) -> IsolationCancellationOperationV1 {
+        self.operation
+    }
+
+    pub(super) const fn code(&self) -> IsolationCancellationCodeV1 {
+        self.code
+    }
+
     pub(super) const fn errno(&self) -> Option<i32> {
         self.errno
+    }
+
+    pub(super) const fn terminal_reap_complete(&self) -> bool {
+        self.terminal_reap_complete
+    }
+
+    pub(super) const fn cleanup_complete(&self) -> bool {
+        self.cleanup_complete
     }
 }
 
@@ -233,8 +254,11 @@ impl fmt::Debug for ExecuteOnlyIsolationCancellationFailureV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ExecuteOnlyIsolationCancellationFailureV1")
+            .field("operation", &self.operation)
+            .field("code", &self.code)
             .field("errno", &self.errno)
-            .field("cleanup_complete", &false)
+            .field("terminal_reap_complete", &self.terminal_reap_complete)
+            .field("cleanup_complete", &self.cleanup_complete)
             .finish()
     }
 }
@@ -257,7 +281,11 @@ impl FirstExecuteOnlyIsolationReadyPermitV1 {
             .cancel_and_reap_v1()
             .map_err(|failure: IsolationCancellationFailureV1| {
                 ExecuteOnlyIsolationCancellationFailureV1 {
+                    operation: failure.operation(),
+                    code: failure.code(),
                     errno: failure.errno(),
+                    terminal_reap_complete: failure.terminal_reap_complete(),
+                    cleanup_complete: failure.cleanup_complete(),
                 }
             })
     }

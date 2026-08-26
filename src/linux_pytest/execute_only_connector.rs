@@ -15,6 +15,80 @@
     reason = "the concrete stdio syscall owner remains private behind this crate-private checkpoint"
 )]
 
+struct IsolationCancellationStepFailureV1<P> {
+    primary: P,
+    terminal_reap_complete: bool,
+    cleanup_complete: bool,
+}
+
+struct StdioCancellationStepFailureV1<P> {
+    primary: P,
+    cleanup_complete: bool,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum CommandFreeCancellationFlowFailureV1<I, S> {
+    Isolation {
+        primary: I,
+        terminal_reap_complete: bool,
+        isolation_cleanup_complete: bool,
+        stdio_cleanup_complete: bool,
+    },
+    Stdio {
+        primary: S,
+        isolation_cleanup_complete: bool,
+        stdio_cleanup_complete: bool,
+    },
+}
+
+trait CommandFreeCancellationDriverV1 {
+    type IsolationFailure;
+    type StdioFailure;
+    type Report;
+
+    fn terminate_and_reap_v1(
+        &mut self,
+    ) -> Result<(), IsolationCancellationStepFailureV1<Self::IsolationFailure>>;
+    fn drain_stdio_v1(
+        &mut self,
+    ) -> Result<Self::Report, StdioCancellationStepFailureV1<Self::StdioFailure>>;
+    fn close_stdio_without_capture_v1(&mut self) -> bool;
+}
+
+fn explicit_cancellation_flow_v1<D: CommandFreeCancellationDriverV1>(
+    driver: &mut D,
+) -> Result<D::Report, CommandFreeCancellationFlowFailureV1<D::IsolationFailure, D::StdioFailure>> {
+    if let Err(failure) = driver.terminate_and_reap_v1() {
+        let stdio_cleanup_complete = driver.close_stdio_without_capture_v1();
+        return Err(CommandFreeCancellationFlowFailureV1::Isolation {
+            primary: failure.primary,
+            terminal_reap_complete: failure.terminal_reap_complete,
+            isolation_cleanup_complete: failure.cleanup_complete,
+            stdio_cleanup_complete,
+        });
+    }
+    driver
+        .drain_stdio_v1()
+        .map_err(|failure| CommandFreeCancellationFlowFailureV1::Stdio {
+            primary: failure.primary,
+            isolation_cleanup_complete: true,
+            stdio_cleanup_complete: failure.cleanup_complete,
+        })
+}
+
+fn drop_cleanup_flow_v1<D: CommandFreeCancellationDriverV1>(driver: &mut D) {
+    let _ = driver.terminate_and_reap_v1();
+    let _ = driver.close_stdio_without_capture_v1();
+}
+
+fn setup_failure_cleanup_v1<P>(
+    primary: P,
+    isolation_cleanup_complete: Option<bool>,
+    close_stdio: impl FnOnce() -> bool,
+) -> (P, Option<bool>, bool) {
+    let stdio_cleanup_complete = close_stdio();
+    (primary, isolation_cleanup_complete, stdio_cleanup_complete)
+}
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
@@ -33,6 +107,14 @@ mod supported {
     use super::super::execute_only_stdio::{
         LinuxProfileStdioSyscallsV1, ParentStdioDrainV1, ProfileStdioDrainReportV1,
         ProfileStdioFailureV1, open_profile_owned_stdio_v1,
+    };
+    use super::super::isolation_qualification::{
+        IsolationCancellationCodeV1, IsolationCancellationOperationV1,
+    };
+    use super::{
+        CommandFreeCancellationDriverV1, CommandFreeCancellationFlowFailureV1,
+        IsolationCancellationStepFailureV1, StdioCancellationStepFailureV1, drop_cleanup_flow_v1,
+        explicit_cancellation_flow_v1, setup_failure_cleanup_v1,
     };
 
     /// The first failure that prevented construction of the command-free
@@ -149,12 +231,47 @@ mod supported {
 
     impl Drop for FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
         fn drop(&mut self) {
-            if let Some(isolation) = self.isolation.take() {
-                let _ = isolation.cancel_and_reap_v1();
-            }
-            if let Some(stdio) = self.stdio.take() {
-                let _ = stdio.close_without_capture_v1();
-            }
+            drop_cleanup_flow_v1(self);
+        }
+    }
+
+    impl CommandFreeCancellationDriverV1 for FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
+        type IsolationFailure = ExecuteOnlyIsolationCancellationFailureV1;
+        type StdioFailure = ProfileStdioFailureV1;
+        type Report = ProfileStdioDrainReportV1;
+
+        fn terminate_and_reap_v1(
+            &mut self,
+        ) -> Result<(), IsolationCancellationStepFailureV1<Self::IsolationFailure>> {
+            let Some(isolation) = self.isolation.take() else {
+                return Ok(());
+            };
+            isolation
+                .cancel_and_reap_v1()
+                .map_err(|primary| IsolationCancellationStepFailureV1 {
+                    terminal_reap_complete: primary.terminal_reap_complete(),
+                    cleanup_complete: primary.cleanup_complete(),
+                    primary,
+                })
+        }
+
+        fn drain_stdio_v1(
+            &mut self,
+        ) -> Result<Self::Report, StdioCancellationStepFailureV1<Self::StdioFailure>> {
+            self.stdio
+                .take()
+                .expect("command-free owner retains one stdio drain")
+                .drain_capture_v1()
+                .map_err(|primary| StdioCancellationStepFailureV1 {
+                    cleanup_complete: primary.cleanup_complete(),
+                    primary,
+                })
+        }
+
+        fn close_stdio_without_capture_v1(&mut self) -> bool {
+            self.stdio
+                .take()
+                .is_none_or(ParentStdioDrainV1::close_without_capture_v1)
         }
     }
 
@@ -174,7 +291,11 @@ mod supported {
         let blocked = match begin_blocked_execute_only_isolation_with_profile_stdio_v1(child) {
             Ok(blocked) => blocked,
             Err(primary) => {
-                let stdio_cleanup_complete = parent.close_without_capture_v1();
+                let isolation_cleanup_complete = primary.cleanup_complete();
+                let (primary, _, stdio_cleanup_complete) =
+                    setup_failure_cleanup_v1(primary, Some(isolation_cleanup_complete), || {
+                        parent.close_without_capture_v1()
+                    });
                 return Err(CommandFreeSetupFailureV1::from_isolation(
                     primary,
                     stdio_cleanup_complete,
@@ -187,7 +308,11 @@ mod supported {
         {
             Ok(isolation) => isolation,
             Err(primary) => {
-                let stdio_cleanup_complete = parent.close_without_capture_v1();
+                let isolation_cleanup_complete = primary.cleanup_complete();
+                let (primary, _, stdio_cleanup_complete) =
+                    setup_failure_cleanup_v1(primary, Some(isolation_cleanup_complete), || {
+                        parent.close_without_capture_v1()
+                    });
                 return Err(CommandFreeSetupFailureV1::from_isolation(
                     primary,
                     stdio_cleanup_complete,
@@ -230,6 +355,7 @@ mod supported {
     /// terminal child cleanup succeeds; otherwise stdio is closed directly.
     pub(in crate::linux_pytest) struct CommandFreeCancellationFailureV1 {
         primary: CommandFreeCancellationPrimaryV1,
+        terminal_reap_complete: bool,
         isolation_cleanup_complete: bool,
         stdio_cleanup_complete: bool,
     }
@@ -241,6 +367,28 @@ mod supported {
 
         pub(in crate::linux_pytest) const fn isolation_cleanup_complete(&self) -> bool {
             self.isolation_cleanup_complete
+        }
+
+        pub(in crate::linux_pytest) const fn terminal_reap_complete(&self) -> bool {
+            self.terminal_reap_complete
+        }
+
+        pub(in crate::linux_pytest) const fn isolation_operation(
+            &self,
+        ) -> Option<IsolationCancellationOperationV1> {
+            match &self.primary {
+                CommandFreeCancellationPrimaryV1::Isolation(failure) => Some(failure.operation()),
+                CommandFreeCancellationPrimaryV1::Stdio(_) => None,
+            }
+        }
+
+        pub(in crate::linux_pytest) const fn isolation_code(
+            &self,
+        ) -> Option<IsolationCancellationCodeV1> {
+            match &self.primary {
+                CommandFreeCancellationPrimaryV1::Isolation(failure) => Some(failure.code()),
+                CommandFreeCancellationPrimaryV1::Stdio(_) => None,
+            }
         }
 
         pub(in crate::linux_pytest) const fn stdio_cleanup_complete(&self) -> bool {
@@ -257,6 +405,7 @@ mod supported {
             formatter
                 .debug_struct("CommandFreeCancellationFailureV1")
                 .field("primary", &self.primary)
+                .field("terminal_reap_complete", &self.terminal_reap_complete)
                 .field(
                     "isolation_cleanup_complete",
                     &self.isolation_cleanup_complete,
@@ -300,37 +449,29 @@ mod supported {
         pub(in crate::linux_pytest) fn cancel_and_finish_v1(
             mut self,
         ) -> Result<CommandFreeCancellationReportV1, CommandFreeCancellationFailureV1> {
-            let isolation = self
-                .isolation
-                .take()
-                .expect("command-free owner retains one isolation permit");
-            if let Err(primary) = isolation.cancel_and_reap_v1() {
-                let stdio_cleanup_complete = self
-                    .stdio
-                    .take()
-                    .expect("command-free owner retains one stdio drain")
-                    .close_without_capture_v1();
-                return Err(CommandFreeCancellationFailureV1 {
-                    primary: CommandFreeCancellationPrimaryV1::Isolation(primary),
-                    isolation_cleanup_complete: false,
-                    stdio_cleanup_complete,
-                });
-            }
-
-            let stdio = self
-                .stdio
-                .take()
-                .expect("command-free owner retains one stdio drain");
-            match stdio.drain_capture_v1() {
+            match explicit_cancellation_flow_v1(&mut self) {
                 Ok(stdio) => Ok(CommandFreeCancellationReportV1 { stdio }),
-                Err(primary) => {
-                    let stdio_cleanup_complete = primary.cleanup_complete();
-                    Err(CommandFreeCancellationFailureV1 {
-                        primary: CommandFreeCancellationPrimaryV1::Stdio(primary),
-                        isolation_cleanup_complete: true,
-                        stdio_cleanup_complete,
-                    })
-                }
+                Err(CommandFreeCancellationFlowFailureV1::Isolation {
+                    primary,
+                    terminal_reap_complete,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }) => Err(CommandFreeCancellationFailureV1 {
+                    primary: CommandFreeCancellationPrimaryV1::Isolation(primary),
+                    terminal_reap_complete,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }),
+                Err(CommandFreeCancellationFlowFailureV1::Stdio {
+                    primary,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }) => Err(CommandFreeCancellationFailureV1 {
+                    primary: CommandFreeCancellationPrimaryV1::Stdio(primary),
+                    terminal_reap_complete: true,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }),
             }
         }
     }
@@ -378,3 +519,158 @@ mod supported {
     reason = "the private re-export is the intentionally dormant later-orchestrator surface"
 )]
 pub(super) use supported::*;
+
+#[cfg(test)]
+mod portable_state_machine_tests {
+    use super::*;
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ActionV1 {
+        TerminateAndReap,
+        Drain,
+        CloseWithoutCapture,
+    }
+
+    struct FakeDriverV1 {
+        actions: Vec<ActionV1>,
+        isolation_failure: Option<(bool, bool)>,
+        stdio_failure: Option<bool>,
+        evidence_issued: bool,
+    }
+
+    impl FakeDriverV1 {
+        fn successful() -> Self {
+            Self {
+                actions: Vec::new(),
+                isolation_failure: None,
+                stdio_failure: None,
+                evidence_issued: false,
+            }
+        }
+    }
+
+    impl CommandFreeCancellationDriverV1 for FakeDriverV1 {
+        type IsolationFailure = &'static str;
+        type StdioFailure = &'static str;
+        type Report = &'static str;
+
+        fn terminate_and_reap_v1(
+            &mut self,
+        ) -> Result<(), IsolationCancellationStepFailureV1<Self::IsolationFailure>> {
+            self.actions.push(ActionV1::TerminateAndReap);
+            match self.isolation_failure {
+                Some((terminal_reap_complete, cleanup_complete)) => {
+                    Err(IsolationCancellationStepFailureV1 {
+                        primary: "isolation",
+                        terminal_reap_complete,
+                        cleanup_complete,
+                    })
+                }
+                None => Ok(()),
+            }
+        }
+
+        fn drain_stdio_v1(
+            &mut self,
+        ) -> Result<Self::Report, StdioCancellationStepFailureV1<Self::StdioFailure>> {
+            self.actions.push(ActionV1::Drain);
+            match self.stdio_failure {
+                Some(cleanup_complete) => Err(StdioCancellationStepFailureV1 {
+                    primary: "stdio",
+                    cleanup_complete,
+                }),
+                None => {
+                    self.evidence_issued = true;
+                    Ok("non-authoritative-evidence")
+                }
+            }
+        }
+
+        fn close_stdio_without_capture_v1(&mut self) -> bool {
+            self.actions.push(ActionV1::CloseWithoutCapture);
+            true
+        }
+    }
+
+    #[test]
+    fn setup_failure_cleanup_is_explicit_and_preserves_primary() {
+        let mut calls = Vec::new();
+        let (primary, isolation, stdio) =
+            setup_failure_cleanup_v1("setup-first", Some(false), || {
+                calls.push(ActionV1::CloseWithoutCapture);
+                false
+            });
+        assert_eq!(primary, "setup-first");
+        assert_eq!(isolation, Some(false));
+        assert!(!stdio);
+        assert_eq!(calls, [ActionV1::CloseWithoutCapture]);
+    }
+
+    #[test]
+    fn cancellation_terminates_before_drain_and_only_success_issues_evidence() {
+        let mut driver = FakeDriverV1::successful();
+        assert_eq!(
+            explicit_cancellation_flow_v1(&mut driver),
+            Ok("non-authoritative-evidence")
+        );
+        assert_eq!(
+            driver.actions,
+            [ActionV1::TerminateAndReap, ActionV1::Drain]
+        );
+        assert!(driver.evidence_issued);
+    }
+
+    #[test]
+    fn uncertain_reap_closes_without_capture_and_issues_no_evidence() {
+        let mut driver = FakeDriverV1::successful();
+        driver.isolation_failure = Some((false, false));
+        let failure = explicit_cancellation_flow_v1(&mut driver)
+            .expect_err("uncertain terminal reap refuses capture");
+        assert!(matches!(
+            failure,
+            CommandFreeCancellationFlowFailureV1::Isolation {
+                primary: "isolation",
+                terminal_reap_complete: false,
+                isolation_cleanup_complete: false,
+                stdio_cleanup_complete: true,
+            }
+        ));
+        assert_eq!(
+            driver.actions,
+            [ActionV1::TerminateAndReap, ActionV1::CloseWithoutCapture]
+        );
+        assert!(!driver.evidence_issued);
+    }
+
+    #[test]
+    fn stdio_failure_after_successful_reap_keeps_order_and_cleanup_facts() {
+        let mut driver = FakeDriverV1::successful();
+        driver.stdio_failure = Some(false);
+        let failure = explicit_cancellation_flow_v1(&mut driver)
+            .expect_err("stdio drain failure remains typed");
+        assert!(matches!(
+            failure,
+            CommandFreeCancellationFlowFailureV1::Stdio {
+                primary: "stdio",
+                isolation_cleanup_complete: true,
+                stdio_cleanup_complete: false,
+            }
+        ));
+        assert_eq!(
+            driver.actions,
+            [ActionV1::TerminateAndReap, ActionV1::Drain]
+        );
+        assert!(!driver.evidence_issued);
+    }
+
+    #[test]
+    fn drop_flow_terminates_then_closes_and_never_drains_or_issues_evidence() {
+        let mut driver = FakeDriverV1::successful();
+        drop_cleanup_flow_v1(&mut driver);
+        assert_eq!(
+            driver.actions,
+            [ActionV1::TerminateAndReap, ActionV1::CloseWithoutCapture]
+        );
+        assert!(!driver.evidence_issued);
+    }
+}

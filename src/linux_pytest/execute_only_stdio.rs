@@ -727,44 +727,56 @@ impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
     target_env = "gnu",
     target_pointer_width = "64"
 ))]
-impl ProfileOwnedStdioSessionV1<LinuxProfileStdioSyscallsV1> {
-    /// Split ownership before `clone3`: the parent receives only its EOF and
-    /// capture endpoints, while the child continuation receives only the three
-    /// pipe endpoints that must become descriptors 0, 1, and 2.
-    pub(super) fn split_for_isolation_v1(
+impl<S: ProfileStdioSyscallsV1> ProfileOwnedStdioSessionV1<S> {
+    fn split_for_isolation_inner_v1(
         mut self,
-    ) -> Result<
-        (
-            ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>,
-            ProfileStdioIsolationChildV1,
-        ),
-        ProfileStdioFailureV1,
-    > {
-        for role in [
-            FdRoleV1::ChildStdin,
-            FdRoleV1::ChildStdout,
-            FdRoleV1::ChildStderr,
-        ] {
-            if self.raw(role)? <= 4 {
-                return Err(ProfileStdioFailureV1::contract(
-                    StdioOperationV1::Authenticate(role),
-                ));
+    ) -> Result<(ParentStdioDrainV1<S>, ProfileStdioIsolationChildV1), ProfileStdioFailureV1> {
+        let authentication = (|| {
+            for role in [
+                FdRoleV1::ChildStdin,
+                FdRoleV1::ChildStdout,
+                FdRoleV1::ChildStderr,
+            ] {
+                if self.raw(role)? <= 4 {
+                    return Err(ProfileStdioFailureV1::contract(
+                        StdioOperationV1::Authenticate(role),
+                    ));
+                }
             }
-        }
+            Ok([
+                self.facts(FdRoleV1::ChildStdin)?,
+                self.facts(FdRoleV1::ChildStdout)?,
+                self.facts(FdRoleV1::ChildStderr)?,
+            ])
+        })();
+        let child_facts = match authentication {
+            Ok(facts) => facts,
+            Err(first) => {
+                let cleanup_complete = self.cleanup_all();
+                return Err(first.with_cleanup(cleanup_complete));
+            }
+        };
 
-        let child_facts = [
-            self.facts(FdRoleV1::ChildStdin)?,
-            self.facts(FdRoleV1::ChildStdout)?,
-            self.facts(FdRoleV1::ChildStderr)?,
-        ];
+        // Authentication above proves all six slots remain present. From this
+        // point onward ownership transfer is infallible; no error path may
+        // delegate observable cleanup to Drop.
         let child = [
-            self.take(FdRoleV1::ChildStdin)?,
-            self.take(FdRoleV1::ChildStdout)?,
-            self.take(FdRoleV1::ChildStderr)?,
+            self.take(FdRoleV1::ChildStdin)
+                .expect("authenticated child stdin remains owned"),
+            self.take(FdRoleV1::ChildStdout)
+                .expect("authenticated child stdout remains owned"),
+            self.take(FdRoleV1::ChildStderr)
+                .expect("authenticated child stderr remains owned"),
         ];
-        let eof_writer = self.take(FdRoleV1::StdinEofWriter)?;
-        let stdout = self.take(FdRoleV1::ParentStdout)?;
-        let stderr = self.take(FdRoleV1::ParentStderr)?;
+        let eof_writer = self
+            .take(FdRoleV1::StdinEofWriter)
+            .expect("constructed stdin EOF writer remains owned");
+        let stdout = self
+            .take(FdRoleV1::ParentStdout)
+            .expect("constructed parent stdout remains owned");
+        let stderr = self
+            .take(FdRoleV1::ParentStderr)
+            .expect("constructed parent stderr remains owned");
         let syscalls = self
             .syscalls
             .take()
@@ -787,6 +799,29 @@ impl ProfileOwnedStdioSessionV1<LinuxProfileStdioSyscallsV1> {
             fault: ChildStdioFaultPlanV1::none(),
         };
         Ok((parent, child))
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl ProfileOwnedStdioSessionV1<LinuxProfileStdioSyscallsV1> {
+    /// Split ownership before `clone3`: the parent receives only its EOF and
+    /// capture endpoints, while the child continuation receives only the three
+    /// pipe endpoints that must become descriptors 0, 1, and 2.
+    pub(super) fn split_for_isolation_v1(
+        self,
+    ) -> Result<
+        (
+            ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>,
+            ProfileStdioIsolationChildV1,
+        ),
+        ProfileStdioFailureV1,
+    > {
+        self.split_for_isolation_inner_v1()
     }
 }
 
@@ -2765,6 +2800,47 @@ mod tests {
         );
         assert!(!error.cleanup_complete());
         assert!(state.borrow().open.is_empty());
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn split_authentication_failure_explicitly_closes_every_endpoint_and_preserves_first_error() {
+        for cleanup_failures in [vec![2_usize], vec![2_usize, 4_usize]] {
+            let (syscalls, state) = FakeSyscallsV1::new();
+            let session = ProfileOwnedStdioSessionV1::construct(syscalls).expect("construct");
+            let start = state.borrow().calls.len();
+            {
+                let mut state = state.borrow_mut();
+                state.fail_at = Some(start + 1);
+                state.additional_failures = cleanup_failures
+                    .iter()
+                    .map(|offset| start + offset)
+                    .collect();
+            }
+            let error = session
+                .split_for_isolation_inner_v1()
+                .expect_err("split authentication is injected to fail");
+            assert_eq!(
+                error.first_operation,
+                StdioOperationV1::Fstat(FdRoleV1::ChildStdin)
+            );
+            assert_eq!(error.errno, Some(libc::EIO));
+            assert!(!error.cleanup_complete());
+            let state = state.borrow();
+            assert!(state.open.is_empty());
+            assert_eq!(
+                state.calls[start..]
+                    .iter()
+                    .filter(|operation| matches!(operation, StdioOperationV1::Close(_)))
+                    .count(),
+                6
+            );
+        }
     }
 
     #[test]

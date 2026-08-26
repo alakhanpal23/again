@@ -527,13 +527,65 @@ pub(super) struct IsolationReadyRootlessNamespaceV1 {
 /// Failure to prove terminal cleanup of an isolation-ready command-free child.
 /// The consumed platform guard still performs its bounded Drop fallback, but
 /// that unobservable retry cannot upgrade this refusal to complete cleanup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IsolationCancellationOperationV1 {
+    CloseControl,
+    CloseReport,
+    PidfdSignal,
+    PidSignal,
+    WaitPidfd,
+    ReapPidfd,
+    ReapPid,
+    FinalEchildAudit,
+    UnsupportedPlatform,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum IsolationCancellationCodeV1 {
+    OperationFailed,
+    InvalidChild,
+    ReapingOwnershipLost,
+    DeadlineExceeded,
+    UnsupportedPlatform,
+}
+
 pub(super) struct IsolationCancellationFailureV1 {
+    operation: IsolationCancellationOperationV1,
+    code: IsolationCancellationCodeV1,
     errno: Option<i32>,
+    terminal_reap_complete: bool,
+    cleanup_complete: bool,
 }
 
 impl IsolationCancellationFailureV1 {
+    pub(super) const fn operation(&self) -> IsolationCancellationOperationV1 {
+        self.operation
+    }
+
+    pub(super) const fn code(&self) -> IsolationCancellationCodeV1 {
+        self.code
+    }
+
     pub(super) const fn errno(&self) -> Option<i32> {
         self.errno
+    }
+
+    pub(super) const fn terminal_reap_complete(&self) -> bool {
+        self.terminal_reap_complete
+    }
+
+    pub(super) const fn cleanup_complete(&self) -> bool {
+        self.cleanup_complete
+    }
+
+    const fn unsupported() -> Self {
+        Self {
+            operation: IsolationCancellationOperationV1::UnsupportedPlatform,
+            code: IsolationCancellationCodeV1::UnsupportedPlatform,
+            errno: Some(libc::ENOSYS),
+            terminal_reap_complete: false,
+            cleanup_complete: false,
+        }
     }
 }
 
@@ -559,9 +611,7 @@ impl fmt::Debug for IsolationReadyRootlessNamespaceV1 {
 
 impl IsolationReadyRootlessNamespaceV1 {
     pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
-        self._inner
-            .cancel_and_reap_v1()
-            .map_err(|errno| IsolationCancellationFailureV1 { errno })
+        self._inner.cancel_and_reap_v1()
     }
 }
 
@@ -696,8 +746,8 @@ mod platform {
     }
 
     impl IsolationReadyRootlessNamespaceV1 {
-        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
-            Err(Some(libc::ENOSYS))
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
         }
     }
 
@@ -972,8 +1022,8 @@ mod platform {
     const CAPABILITY_SCAN_LENGTH_V1: usize = CAPABILITY_SCAN_MAX_V1 as usize + 1;
 
     /// Operation identifiers for the production syscall seams. A plan with no
-    /// selected operation is the production path; tests may select exactly one
-    /// boundary and force its wrapper to fail before issuing that syscall.
+    /// selected operation is the production path; tests may select bounded
+    /// boundaries and force their wrappers to fail before issuing a syscall.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum IsolationOperationV1 {
         AuthenticatedRelease,
@@ -1016,18 +1066,33 @@ mod platform {
 
     #[derive(Clone, Copy, Debug, Default)]
     struct IsolationOperationPlanV1 {
-        fail: Option<IsolationOperationV1>,
+        failures: [Option<IsolationOperationV1>; 3],
     }
 
     impl IsolationOperationPlanV1 {
         const fn fail(operation: IsolationOperationV1) -> Self {
             Self {
-                fail: Some(operation),
+                failures: [Some(operation), None, None],
             }
         }
 
+        #[cfg(test)]
+        const fn fail_many(operations: [IsolationOperationV1; 3]) -> Self {
+            Self {
+                failures: [
+                    Some(operations[0]),
+                    Some(operations[1]),
+                    Some(operations[2]),
+                ],
+            }
+        }
+
+        fn fails(self, operation: IsolationOperationV1) -> bool {
+            self.failures.contains(&Some(operation))
+        }
+
         fn check(self, operation: IsolationOperationV1) -> Result<(), i32> {
-            if self.fail == Some(operation) {
+            if self.fails(operation) {
                 Err(libc::EIO)
             } else {
                 Ok(())
@@ -1570,6 +1635,51 @@ mod platform {
         operations: IsolationOperationPlanV1,
     }
 
+    #[derive(Default)]
+    struct CancellationAccumulatorV1 {
+        first: Option<(IsolationCancellationOperationV1, Option<i32>)>,
+    }
+
+    impl CancellationAccumulatorV1 {
+        fn record(&mut self, operation: IsolationCancellationOperationV1, errno: Option<i32>) {
+            if self.first.is_none() {
+                self.first = Some((operation, errno));
+            }
+        }
+
+        fn finish(
+            self,
+            terminal_reap_complete: bool,
+        ) -> Result<(), IsolationCancellationFailureV1> {
+            let Some((operation, errno)) = self.first else {
+                return if terminal_reap_complete {
+                    Ok(())
+                } else {
+                    Err(IsolationCancellationFailureV1 {
+                        operation: IsolationCancellationOperationV1::ReapPid,
+                        code: IsolationCancellationCodeV1::ReapingOwnershipLost,
+                        errno: Some(libc::ECHILD),
+                        terminal_reap_complete: false,
+                        cleanup_complete: false,
+                    })
+                };
+            };
+            let code = match errno {
+                Some(libc::EINVAL) => IsolationCancellationCodeV1::InvalidChild,
+                Some(libc::ECHILD) => IsolationCancellationCodeV1::ReapingOwnershipLost,
+                Some(libc::ETIMEDOUT) => IsolationCancellationCodeV1::DeadlineExceeded,
+                _ => IsolationCancellationCodeV1::OperationFailed,
+            };
+            Err(IsolationCancellationFailureV1 {
+                operation,
+                code,
+                errno,
+                terminal_reap_complete,
+                cleanup_complete: false,
+            })
+        }
+    }
+
     impl ProbeChildGuardV1 {
         fn refuse(
             mut self,
@@ -1577,31 +1687,37 @@ mod platform {
         ) -> IsolationQualificationFailureV1 {
             match self.kill_and_reap() {
                 Ok(()) => failure,
-                Err(errno) => failure.with_cleanup_uncertain(errno),
+                Err(cleanup) => failure.with_cleanup_uncertain(cleanup.errno()),
             }
         }
 
-        fn kill_and_reap(&mut self) -> Result<(), Option<i32>> {
-            let mut close_errno = None;
+        fn kill_and_reap(&mut self) -> Result<(), IsolationCancellationFailureV1> {
+            let mut failures = CancellationAccumulatorV1::default();
             if self
                 .operations
                 .check(IsolationOperationV1::CloseControl)
                 .is_err()
             {
-                close_errno = Some(libc::EIO);
+                failures.record(
+                    IsolationCancellationOperationV1::CloseControl,
+                    Some(libc::EIO),
+                );
             }
             self.control_write.take();
             if self
                 .operations
                 .check(IsolationOperationV1::CloseReport)
                 .is_err()
-                && close_errno.is_none()
             {
-                close_errno = Some(libc::EIO);
+                failures.record(
+                    IsolationCancellationOperationV1::CloseReport,
+                    Some(libc::EIO),
+                );
             }
             self.report_read.take();
             if self.reaped {
-                return Ok(());
+                let terminal = self.audit_final_echild(&mut failures);
+                return failures.finish(terminal);
             }
             if self.refresh_deadline_on_cleanup {
                 if let Ok((_, refreshed)) = probe_deadlines() {
@@ -1612,11 +1728,8 @@ mod platform {
             let mut signal_errno = None;
             let mut needs_pid_fallback = pid_signal_fallback_required(self.pidfd.is_some(), None);
             if let Some(pidfd) = self.pidfd.as_ref() {
-                let signal_result = if self
-                    .operations
-                    .check(IsolationOperationV1::PidfdKill)
-                    .is_err()
-                {
+                let injected = self.operations.fails(IsolationOperationV1::PidfdKill);
+                let signal_result = if injected {
                     -1
                 } else {
                     unsafe {
@@ -1630,12 +1743,12 @@ mod platform {
                     }
                 };
                 if signal_result != 0 {
-                    signal_errno = if self.operations.fail == Some(IsolationOperationV1::PidfdKill)
-                    {
+                    signal_errno = if injected {
                         Some(libc::EIO)
                     } else {
                         last_errno()
                     };
+                    failures.record(IsolationCancellationOperationV1::PidfdSignal, signal_errno);
                     needs_pid_fallback = pid_signal_fallback_required(true, signal_errno);
                 }
             }
@@ -1644,7 +1757,11 @@ mod platform {
                 // single-task and SIGCHLD disposition checks exclude an
                 // in-process reaper, so this PID cannot be recycled here.
                 let Some(pid) = positive_direct_pid(self.pid) else {
-                    return Err(signal_errno.or(Some(libc::EINVAL)));
+                    failures.record(
+                        IsolationCancellationOperationV1::PidSignal,
+                        Some(libc::EINVAL),
+                    );
+                    return failures.finish(false);
                 };
                 let injected = self
                     .operations
@@ -1659,15 +1776,19 @@ mod platform {
                     } else if errno != Some(libc::ESRCH) {
                         signal_errno = errno.or(signal_errno);
                     }
+                    if injected || errno != Some(libc::ESRCH) {
+                        failures.record(IsolationCancellationOperationV1::PidSignal, signal_errno);
+                    }
                 }
             }
-            let reap_result = self.reap_bounded();
-            merge_cleanup_results(signal_errno.or(close_errno), reap_result)
+            self.reap_bounded(&mut failures);
+            let terminal = self.reaped && self.audit_final_echild(&mut failures);
+            failures.finish(terminal)
         }
 
-        fn reap_bounded(&mut self) -> Result<(), Option<i32>> {
+        fn reap_bounded(&mut self, failures: &mut CancellationAccumulatorV1) {
             if self.reaped {
-                return Ok(());
+                return;
             }
             if let Some(pidfd) = self.pidfd.as_ref().map(|fd| fd.as_raw_fd()) {
                 let wait_error = if self
@@ -1675,27 +1796,28 @@ mod platform {
                     .check(IsolationOperationV1::WaitPidfd)
                     .is_err()
                 {
-                    Some(protocol_failure(
-                        IsolationQualificationStageV1::WaitForChild,
-                        IsolationQualificationReasonV1::WaitFailed,
-                        Some(libc::EIO),
-                    ))
+                    Some(libc::EIO)
                 } else {
-                    wait_pidfd_terminal(pidfd, self.deadline).err()
+                    wait_pidfd_terminal(pidfd, self.deadline)
+                        .err()
+                        .and_then(|error| error.errno())
                 };
+                if wait_error.is_some() {
+                    failures.record(IsolationCancellationOperationV1::WaitPidfd, wait_error);
+                }
                 match self.reap_pidfd(pidfd) {
-                    Ok(_) => return Ok(()),
+                    Ok(_) => return,
                     Err(pidfd_reap_error) => {
-                        let pid_reap_result = self.reap_pid_bounded();
-                        return merge_reap_fallback(
+                        failures.record(
+                            IsolationCancellationOperationV1::ReapPidfd,
                             pidfd_reap_error,
-                            wait_error.and_then(|error| error.errno()),
-                            pid_reap_result,
                         );
                     }
                 }
             }
-            self.reap_pid_bounded()
+            if let Err(errno) = self.reap_pid_bounded() {
+                failures.record(IsolationCancellationOperationV1::ReapPid, errno);
+            }
         }
 
         fn reap_pid_bounded(&mut self) -> Result<(), Option<i32>> {
@@ -1714,18 +1836,6 @@ mod platform {
                         return Err(Some(libc::ECHILD));
                     }
                     self.reaped = true;
-                    if self
-                        .operations
-                        .check(IsolationOperationV1::FinalEchildAudit)
-                        .is_err()
-                    {
-                        let mut final_status = 0_i32;
-                        if unsafe { libc::waitpid(pid, &mut final_status, libc::WNOHANG) } != -1
-                            || last_errno() != Some(libc::ECHILD)
-                        {
-                            return Err(Some(libc::EIO));
-                        }
-                    }
                     if injected_reap_failure {
                         return Err(Some(libc::EIO));
                     }
@@ -1748,6 +1858,34 @@ mod platform {
                     return Err(last_errno());
                 }
             }
+        }
+
+        fn audit_final_echild(&mut self, failures: &mut CancellationAccumulatorV1) -> bool {
+            let Some(pid) = positive_direct_pid(self.pid) else {
+                failures.record(
+                    IsolationCancellationOperationV1::FinalEchildAudit,
+                    Some(libc::EINVAL),
+                );
+                return false;
+            };
+            let injected = self
+                .operations
+                .fails(IsolationOperationV1::FinalEchildAudit);
+            let mut final_status = 0_i32;
+            let waited = unsafe { libc::waitpid(pid, &mut final_status, libc::WNOHANG) };
+            let errno = (waited < 0).then(last_errno).flatten();
+            let proved = waited == -1 && errno == Some(libc::ECHILD);
+            if injected || !proved {
+                failures.record(
+                    IsolationCancellationOperationV1::FinalEchildAudit,
+                    if injected {
+                        Some(libc::EIO)
+                    } else {
+                        errno.or(Some(libc::EBUSY))
+                    },
+                );
+            }
+            proved
         }
 
         fn reap_success(
@@ -1860,21 +1998,6 @@ mod platform {
         !pidfd_present || pidfd_errno.is_some()
     }
 
-    fn merge_cleanup_results(
-        signal_errno: Option<i32>,
-        reap_result: Result<(), Option<i32>>,
-    ) -> Result<(), Option<i32>> {
-        reap_result.map_err(|wait_errno| wait_errno.or(signal_errno))
-    }
-
-    fn merge_reap_fallback(
-        pidfd_errno: Option<i32>,
-        wait_errno: Option<i32>,
-        pid_reap_result: Result<(), Option<i32>>,
-    ) -> Result<(), Option<i32>> {
-        pid_reap_result.map_err(|pid_errno| pid_errno.or(pidfd_errno).or(wait_errno))
-    }
-
     impl Drop for ProbeChildGuardV1 {
         fn drop(&mut self) {
             if !self.reaped {
@@ -1895,7 +2018,7 @@ mod platform {
     }
 
     impl IsolationReadyRootlessNamespaceV1 {
-        pub(super) fn cancel_and_reap_v1(mut self) -> Result<(), Option<i32>> {
+        pub(super) fn cancel_and_reap_v1(mut self) -> Result<(), IsolationCancellationFailureV1> {
             self._guard.kill_and_reap()
         }
     }
@@ -10481,7 +10604,7 @@ mod platform {
         }
 
         #[test]
-        fn cleanup_fallback_and_terminal_merge_are_fail_closed() {
+        fn cleanup_fallback_and_first_failure_accumulation_are_fail_closed() {
             assert!(pid_signal_fallback_required(false, None));
             for errno in [libc::EBADF, libc::EPERM, libc::ESRCH] {
                 assert!(pid_signal_fallback_required(true, Some(errno)));
@@ -10490,23 +10613,49 @@ mod platform {
             assert_eq!(positive_direct_pid(Some(42)), Some(42));
             assert_eq!(positive_direct_pid(Some(0)), None);
             assert_eq!(positive_direct_pid(Some(-42)), None);
-            assert_eq!(merge_cleanup_results(Some(libc::EBADF), Ok(())), Ok(()));
-            assert_eq!(
-                merge_cleanup_results(Some(libc::EBADF), Err(Some(libc::ETIMEDOUT))),
-                Err(Some(libc::ETIMEDOUT))
+            let mut dual = CancellationAccumulatorV1::default();
+            dual.record(
+                IsolationCancellationOperationV1::PidSignal,
+                Some(libc::EPERM),
             );
-            assert_eq!(
-                merge_reap_fallback(Some(libc::EBADF), Some(libc::EINVAL), Ok(())),
-                Ok(())
+            dual.record(
+                IsolationCancellationOperationV1::FinalEchildAudit,
+                Some(libc::EIO),
             );
+            let observed = dual.finish(true).expect_err("two failures refuse");
             assert_eq!(
-                merge_reap_fallback(
-                    Some(libc::EBADF),
-                    Some(libc::EINVAL),
-                    Err(Some(libc::ETIMEDOUT)),
-                ),
-                Err(Some(libc::ETIMEDOUT))
+                observed.operation(),
+                IsolationCancellationOperationV1::PidSignal
             );
+            assert_eq!(observed.errno(), Some(libc::EPERM));
+            assert!(observed.terminal_reap_complete());
+            assert!(!observed.cleanup_complete());
+
+            let mut failures = CancellationAccumulatorV1::default();
+            failures.record(
+                IsolationCancellationOperationV1::CloseControl,
+                Some(libc::EBADF),
+            );
+            failures.record(
+                IsolationCancellationOperationV1::PidSignal,
+                Some(libc::EPERM),
+            );
+            failures.record(
+                IsolationCancellationOperationV1::ReapPid,
+                Some(libc::ETIMEDOUT),
+            );
+            let observed = failures.finish(false).expect_err("three failures refuse");
+            assert_eq!(
+                observed.operation(),
+                IsolationCancellationOperationV1::CloseControl
+            );
+            assert_eq!(observed.errno(), Some(libc::EBADF));
+            assert_eq!(
+                observed.code(),
+                IsolationCancellationCodeV1::OperationFailed
+            );
+            assert!(!observed.terminal_reap_complete());
+            assert!(!observed.cleanup_complete());
         }
 
         #[test]
@@ -10557,13 +10706,8 @@ mod platform {
                     ),
                     "cleanup replaced the primary failure for {operation:?}"
                 );
-                if operation == IsolationOperationV1::ReapPid {
-                    assert!(!observed.cleanup_complete());
-                    assert_eq!(observed.cleanup_errno(), Some(libc::EIO));
-                } else {
-                    assert!(observed.cleanup_complete(), "{operation:?}");
-                    assert_eq!(observed.cleanup_errno(), None);
-                }
+                assert!(!observed.cleanup_complete(), "{operation:?}");
+                assert_eq!(observed.cleanup_errno(), Some(libc::EIO));
                 let mut status = 0_i32;
                 assert_eq!(
                     unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
@@ -10609,7 +10753,8 @@ mod platform {
                 );
                 let observed = guard.refuse(primary);
                 assert_eq!(observed.errno(), Some(libc::EPERM));
-                assert!(observed.cleanup_complete(), "{operation:?}");
+                assert!(!observed.cleanup_complete(), "{operation:?}");
+                assert_eq!(observed.cleanup_errno(), Some(libc::EIO));
                 let mut status = 0_i32;
                 assert_eq!(
                     unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
@@ -10617,6 +10762,53 @@ mod platform {
                 );
                 assert_eq!(last_errno(), Some(libc::ECHILD));
             }
+        }
+
+        #[test]
+        fn cancellation_dual_and_triple_failures_keep_first_and_still_prove_terminal_reap() {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork failed for ordered cancellation faults");
+            if pid == 0 {
+                loop {
+                    unsafe { libc::syscall(libc::SYS_pause) };
+                }
+            }
+            let (control_read, control_write) = test_pipe();
+            let (report_read, report_write) = test_pipe();
+            drop(control_read);
+            drop(report_write);
+            let mut guard = ProbeChildGuardV1 {
+                pid: Some(pid),
+                pidfd: None,
+                control_write: Some(control_write),
+                report_read: Some(report_read),
+                proc_directory: None,
+                child_namespaces: None,
+                deadline: test_deadline(),
+                refresh_deadline_on_cleanup: false,
+                reaped: false,
+                operations: IsolationOperationPlanV1::fail_many([
+                    IsolationOperationV1::CloseControl,
+                    IsolationOperationV1::PidKill,
+                    IsolationOperationV1::ReapPid,
+                ]),
+            };
+            let failure = guard
+                .kill_and_reap()
+                .expect_err("injected cancellation failures remain observable");
+            assert_eq!(
+                failure.operation(),
+                IsolationCancellationOperationV1::CloseControl
+            );
+            assert_eq!(failure.errno(), Some(libc::EIO));
+            assert!(failure.terminal_reap_complete());
+            assert!(!failure.cleanup_complete());
+            let mut status = 0_i32;
+            assert_eq!(
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) },
+                -1
+            );
+            assert_eq!(last_errno(), Some(libc::ECHILD));
         }
 
         #[test]
@@ -10696,8 +10888,8 @@ mod platform {
     }
 
     impl IsolationReadyRootlessNamespaceV1 {
-        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
-            Err(Some(libc::ENOSYS))
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
         }
     }
 
@@ -10753,8 +10945,8 @@ mod platform {
     }
 
     impl IsolationReadyRootlessNamespaceV1 {
-        pub(super) fn cancel_and_reap_v1(self) -> Result<(), Option<i32>> {
-            Err(Some(libc::ENOSYS))
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
         }
     }
 
