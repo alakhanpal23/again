@@ -11,8 +11,9 @@ usage() {
 Usage: install.sh --version TAG --dest PATH [--base-url URL | --artifact-dir DIR]
 
 TAG must be a release tag such as v0.1.0. PATH is the exact binary destination.
-With --artifact-dir, the directory must contain the archive and SHA256SUMS.
-Without it, assets are downloaded from the Again GitHub release URL.
+With --artifact-dir, a local development directory must contain the archive and
+SHA256SUMS. Without it, assets are downloaded from the Again GitHub release URL
+and the GitHub CLI authenticates their release-workflow provenance.
 EOF
     exit 2
 }
@@ -67,6 +68,10 @@ if [ -z "$artifact_dir" ]; then
             exit 2
             ;;
     esac
+    command -v gh >/dev/null 2>&1 || {
+        echo "error: GitHub CLI with attestation support is required for remote installation" >&2
+        exit 1
+    }
 fi
 
 host_os=$(uname -s)
@@ -233,6 +238,23 @@ else
 fi
 bounded_file "$tmp/$asset" "$MAX_ARCHIVE_BYTES" "release archive"
 bounded_file "$tmp/SHA256SUMS" "$MAX_CHECKSUM_BYTES" "checksum manifest"
+
+if [ -z "$artifact_dir" ]; then
+    verify_attestation() {
+        subject=$1
+        description=$2
+        gh attestation verify "$subject" \
+            --repo alakhanpal23/again \
+            --signer-workflow alakhanpal23/again/.github/workflows/release.yml \
+            --source-ref "refs/tags/$version" \
+            --deny-self-hosted-runners >/dev/null || {
+            echo "error: publisher attestation verification failed for $description" >&2
+            exit 1
+        }
+    }
+    verify_attestation "$tmp/SHA256SUMS" "checksum manifest"
+    verify_attestation "$tmp/$asset" "release archive"
+fi
 
 expected=$(awk -v file="$asset" '
     length($1) == 64 && tolower($1) !~ /[^0-9a-f]/ && ($2 == file || $2 == "*" file) {
