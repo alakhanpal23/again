@@ -2382,7 +2382,45 @@ mod tests {
                 source_s2,
                 c"root",
             )
-            .unwrap();
+            .unwrap_or_else(|error| match error {
+                SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    SnapshotPipelineFourViewErrorV1::Publication(failure),
+                ) => panic!(
+                    "publication failure: kind={:?} stage={:?} state={:?} errno={:?}",
+                    failure.kind(),
+                    failure.stage(),
+                    failure.publication_state(),
+                    failure.errno()
+                ),
+                SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    SnapshotPipelineFourViewErrorV1::Materialization(
+                        crate::linux_pytest::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Source(
+                            failure,
+                        ),
+                    ),
+                ) => panic!(
+                    "source failure: code={:?} stage={:?} reason={:?} errno={:?}",
+                    failure.code(),
+                    failure.stage(),
+                    failure.reason(),
+                    failure.errno()
+                ),
+                SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    SnapshotPipelineFourViewErrorV1::Materialization(
+                        crate::linux_pytest::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
+                            failure,
+                        ),
+                    ),
+                ) => panic!(
+                    "materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
+                    failure.code(),
+                    failure.stage(),
+                    failure.kind(),
+                    failure.regular_stage(),
+                    failure.errno()
+                ),
+                error => panic!("integrated snapshot failure: {error:?}"),
+            });
         let checkpoint =
             crate::linux_pytest::execute_only_runtime::qualify_first_execute_only_runtime_checkpoint_v1(
                 binding,
