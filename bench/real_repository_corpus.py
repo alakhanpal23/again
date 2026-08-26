@@ -1318,6 +1318,10 @@ def build_non_pass_report(
             "code": code,
             "detail_sha256": sha256_bytes(detail.encode("utf-8", errors="replace")),
         },
+        "scope": {
+            "claim": "non-authoritative local preflight over explicit repository inputs",
+            "subprocess_boundary": subprocess_boundary_record(),
+        },
         "provenance": {
             "binary": str(binary.source),
             "binary_execution": "private_no_follow_copy",

@@ -638,6 +638,14 @@ class RealRepositoryCorpusTests(unittest.TestCase):
         )
         self.assertEqual(report["result"], "non_pass")
         self.assertEqual(report["non_pass"]["code"], "unsupported_host_profile")
+        self.assertFalse(report["scope"]["subprocess_boundary"]["network_sandbox"])
+        self.assertFalse(
+            report["scope"]["subprocess_boundary"]["fresh_socket_creation_blocked"]
+        )
+        self.assertEqual(
+            report["scope"]["subprocess_boundary"]["descendant_sentinel"],
+            "bounded_best_effort",
+        )
         self.assertFalse(report["correctness"]["passed"])
         self.assertEqual(report["repositories"], [])
         self.assertEqual(
