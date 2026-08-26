@@ -2341,6 +2341,7 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    #[ignore = "requires a provisioned functionally qualified no-atime source view"]
     fn real_elf_materializes_publishes_and_reaches_non_authoritative_runtime_checkpoint() {
         let source = tempfile::tempdir().unwrap();
         let source_root = source.path().join("root");
