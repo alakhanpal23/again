@@ -225,6 +225,18 @@ The only invocation shape remains:
 again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
 ```
 
+Current checkpoint: a crate-private pure parser accepts only the exact inner
+argv `.venv/bin/python -I -m pytest tests/test_smoke.py::test_smoke` and returns
+a non-authoritative lexical wrapper around the existing Stage-0 selector. A
+fixed two-file fixture and bounded Python oracle freeze the intended evidence
+shape and refuse fixture drift, malformed JSON, stream mismatch, nonzero wait
+status, incomplete cleanup/reap, nonzero candidate/shadow/promotion/replay
+counts, or any authority claim. The oracle deliberately does not execute
+pytest, dereference its qualified-tuple reference, or independently bind the
+caller-reported binary/source hashes and cleanup booleans; even its consistent
+outcome grants no pass, qualification, execution, or reuse authority. No CLI,
+snapshot, isolation, tracer, or stdio path consumes this scaffold yet.
+
 The first acceptance fixture should use exactly one selector, such as
 `tests/test_smoke.py::test_smoke`. It must compose:
 
