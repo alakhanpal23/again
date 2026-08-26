@@ -370,6 +370,8 @@ mod platform {
     const WAIT_BACKOFF_NANOSECONDS_V1: i64 = 50_000;
     const RELEASE_BYTE_V1: u8 = 0x5a;
     const CHILD_FAILURE_EXIT_V1: u32 = 125;
+    const KERNEL_SIGNAL_SET_BYTES_V1: i64 = 8;
+    const SIGCHLD_MASK_V1: u64 = 1_u64 << (libc::SIGCHLD - 1);
     const CLONE_PIDFD_V1: u64 = 0x0000_1000;
     const WAIT_WALL_V1: libc::c_int = 0x4000_0000;
 
@@ -1483,6 +1485,28 @@ mod platform {
                 child_exit_v1(CHILD_FAILURE_EXIT_V1);
             }
 
+            // The nested child exits with SIGCHLD so clone3 remains a fork
+            // event. Block that signal in this disposable tracee before the
+            // seccomp filter exists: otherwise Linux may nondeterministically
+            // expose a signal-delivery stop between the nested reap and the
+            // root exit, adding an event outside the fixed 11-transition
+            // transcript. The tracee and its child both terminate, so this
+            // process-local mask needs no restoration and cannot affect the
+            // tracer's independently snapshotted signal state.
+            let blocked_signals = SIGCHLD_MASK_V1;
+            if raw_syscall6_v1(
+                libc::SYS_rt_sigprocmask,
+                i64::from(libc::SIG_BLOCK),
+                (&blocked_signals as *const u64) as i64,
+                0,
+                KERNEL_SIGNAL_SET_BYTES_V1,
+                0,
+                0,
+            ) != 0
+            {
+                child_exit_v1(CHILD_FAILURE_EXIT_V1);
+            }
+
             let mapping = raw_syscall6_v1(
                 libc::SYS_mmap,
                 0,
@@ -2463,6 +2487,13 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn fixed_tracee_blocks_exactly_sigchld() {
+            assert_eq!(KERNEL_SIGNAL_SET_BYTES_V1, 8);
+            assert_eq!(SIGCHLD_MASK_V1.count_ones(), 1);
+            assert_ne!(SIGCHLD_MASK_V1 & (1_u64 << (libc::SIGCHLD - 1)), 0);
+        }
 
         #[test]
         fn planner_failure_preserves_the_exact_redacted_supervisor_reason() {
