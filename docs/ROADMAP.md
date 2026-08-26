@@ -98,6 +98,17 @@ Work:
 7. Publish a prerelease and provide a reviewed Homebrew or equivalent installation
    path that still refuses unsupported runtime profiles.
 
+Current checkpoint: the real-repository validation harness for item 5 is
+implemented, bounded, offline-only, and exercised by portable CI tests. It
+requires explicit absolute paths to already-local Rust, Python, Go, and
+TypeScript Git worktrees, pins the exact Again binary, copies only selected
+tracked regular files, compares native/cold/warm streams and status exactly,
+and proves mutation invalidation. Unsupported hosts or profiles are typed
+`non_pass`, not evidence. No retained run against the four real repositories
+exists yet, so this advances the validation machinery without closing item 5
+or Gate 1. The audited-profile registry, richer doctor report, outside-user
+session corpus, and published prerelease remain separate unclosed work.
+
 Product outcome:
 
 - an outside developer can install Again, run `again setup --codex`, inspect
@@ -239,10 +250,20 @@ isolation, tracer, or stdio path consumes this scaffold yet. A dedicated
 connector transition can now consume the lexical proof while compiling the
 four-view workspace tree, verify the fixed selector's regular-file type,
 length, single-link manifest topology, and content digest before publication
-escrow or rename,
-and return one opaque linear workspace-tree binding. Nothing calls that
+escrow or rename, and return one opaque linear workspace-tree binding. Nothing calls that
 transition yet; it covers neither the runtime tree nor executable resolution
 and exposes no descriptor, execution, candidate, or reuse authority.
+
+A separate bounded reference snapshot oracle records the fixed workspace
+fixture and exact argv while marking source, binary, and qualified-tuple
+provenance as caller-supplied and unverified. An offline verifier accepts only
+the exact five-member future evidence archive and checks canonical ZIP layout,
+schemas, hashes, streams, wait status, workspace stability, cleanup/reap
+claims, execute-only counters, and false authority fields. These tools and
+their adversarial suites are connected to hosted CI. They validate evidence
+shape and internal consistency only: neither tool executes pytest, verifies
+the producer's runtime observations, qualifies a tuple, or grants product
+authority. There is no production evidence producer yet.
 
 The first acceptance fixture should use exactly one selector, such as
 `tests/test_smoke.py::test_smoke`. It must compose:

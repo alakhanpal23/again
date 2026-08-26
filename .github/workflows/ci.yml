@@ -275,6 +275,8 @@ jobs:
         run: python3 -B -m unittest scripts/test_verify_linux_supervisor_evidence.py
       - name: Test the offline Linux pytest execute-only evidence verifier
         run: python3 -B -m unittest scripts/test_verify_linux_pytest_execute_only_evidence.py
+      - name: Test the Linux pytest execute-only acceptance oracle
+        run: python3 -B -m unittest bench/test_linux_pytest_execute_only_evidence.py
       - name: Test the Linux pytest execute-only snapshot oracle
         run: python3 -B -m unittest bench/test_linux_pytest_execute_only_snapshot.py
       - name: Test the real-repository corpus harness
