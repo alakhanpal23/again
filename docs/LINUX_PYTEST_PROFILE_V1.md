@@ -22,7 +22,14 @@ connector-owned charged materialization, identity-checked atomic publication,
 and one shared resource contract exist as internal leaves. A no-atime
 source-view qualification path is also implemented as a crate-private leaf,
 but the connector does not invoke it and its fixed local probe retries are
-outside the shared resource ledger. The production and legacy test adapters
+outside the shared resource ledger. Upstream Linux xattr syscalls reject
+`O_PATH` file descriptions. The tree walker therefore retains `O_PATH` only as
+the identity anchor, opens a second non-following readable descriptor for each
+regular file and directory, and requires exact `statx` equality before and
+after xattr capture. Every added open and identity check is charged. The
+qualifier's deliberate symlink-xattr probe remains `O_PATH`-only and produces
+a typed missing-capability non-pass on upstream `EBADF`; it never falls back to
+a raceable parent/name lookup. The production and legacy test adapters
 refuse every symlink before creating it because durable replay of
 symlink xattrs and timestamps still requires a qualified dedicated staging
 filesystem and a final bounded `syncfs`. Before any destination-tree
