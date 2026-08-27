@@ -1854,6 +1854,8 @@ mod tests {
     use std::os::fd::AsFd;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::time::{Duration, SystemTime};
 
     const RUNTIME_FIXTURE_BASE: u64 = 0x40_0000;
     const RUNTIME_FIXTURE_INTERP_OFFSET: usize = 0x100;
@@ -2822,6 +2824,32 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn establish_relatime_stable_source_fixture(path: &std::path::Path) {
+        fn set_tree_times(path: &std::path::Path, modified: SystemTime, accessed: SystemTime) {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            if metadata.is_dir() {
+                for entry in fs::read_dir(path).unwrap() {
+                    set_tree_times(&entry.unwrap().path(), modified, accessed);
+                }
+            }
+            File::open(path)
+                .unwrap()
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(modified)
+                        .set_accessed(accessed),
+                )
+                .unwrap();
+        }
+
+        let modified = SystemTime::now();
+        let accessed = modified
+            .checked_add(Duration::from_secs(60 * 60))
+            .expect("one-hour fixture timestamp offset must fit");
+        set_tree_times(path, modified, accessed);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn run_real_publication_inventory_case(mutate_runtime_after_publication: bool) {
         let workspace_source = tempfile::tempdir().unwrap();
         let workspace_root = workspace_source.path().join("root");
@@ -2842,6 +2870,12 @@ mod tests {
             FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1,
         )
         .unwrap();
+        // The production source leaf correctly refuses metadata drift. These
+        // test-only qualified views run on ordinary relatime CI filesystems,
+        // so establish atime strictly after mtime/ctime once construction is
+        // complete. This stabilizes the inert fixture; it does not qualify the
+        // host mount or weaken source revalidation authority.
+        establish_relatime_stable_source_fixture(workspace_source.path());
 
         let runtime_source = tempfile::tempdir().unwrap();
         let runtime_root = runtime_source.path().join("root");
@@ -2856,6 +2890,7 @@ mod tests {
             forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[]),
         )
         .unwrap();
+        establish_relatime_stable_source_fixture(runtime_source.path());
 
         let workspace_source_fd = File::open(workspace_source.path()).unwrap();
         let runtime_source_fd = File::open(runtime_source.path()).unwrap();
