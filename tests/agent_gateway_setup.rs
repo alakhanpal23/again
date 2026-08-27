@@ -4,7 +4,7 @@ mod agent_gateway_setup;
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use agent_gateway_setup::{
     AgentGatewayClientV1, AgentGatewaySetupError, AgentGatewaySetupPlanV1, OwnedInstallOutcomeV1,
@@ -17,16 +17,24 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     let temp = TempDir::new().unwrap();
     let codex_path = temp.path().join("codex-config.toml");
     let claude_path = temp.path().join("claude-config.json");
+    let workspace = canonical_workspace(&temp);
 
-    let codex = AgentGatewaySetupPlanV1::codex(&codex_path).unwrap();
-    let same_codex = AgentGatewaySetupPlanV1::codex(&codex_path).unwrap();
+    let codex = AgentGatewaySetupPlanV1::codex(&codex_path, &workspace).unwrap();
+    let same_codex = AgentGatewaySetupPlanV1::codex(&codex_path, &workspace).unwrap();
     assert_eq!(codex, same_codex);
     assert_eq!(
         codex.local_cli_command,
-        "codex mcp add again -- again mcp serve"
+        format!(
+            "codex mcp add again -- again mcp serve --workspace {}",
+            workspace.display()
+        )
     );
     assert_eq!(codex.stdio.command, "again");
-    assert_eq!(codex.stdio.args, ["mcp", "serve"]);
+    assert_eq!(
+        codex.stdio.args,
+        ["mcp", "serve", "--workspace", workspace.to_str().unwrap()]
+    );
+    assert_eq!(codex.workspace, workspace);
     assert!(!codex.writes_by_default);
     assert!(!codex_path.exists());
     assert!(!codex.ownership_path.exists());
@@ -41,14 +49,20 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(value["writes_by_default"], false);
     assert_eq!(
         codex.to_string(),
-        "Dry run only. Install with:\ncodex mcp add again -- again mcp serve"
+        format!(
+            "Dry run only. Install with:\ncodex mcp add again -- again mcp serve --workspace {}",
+            workspace.display()
+        )
     );
 
-    let claude = AgentGatewaySetupPlanV1::claude(&claude_path).unwrap();
+    let claude = AgentGatewaySetupPlanV1::claude(&claude_path, &workspace).unwrap();
     assert_eq!(claude.client, AgentGatewayClientV1::Claude);
     assert_eq!(
         claude.local_cli_command,
-        "claude mcp add -s user again -- again mcp serve"
+        format!(
+            "claude mcp add -s user again -- again mcp serve --workspace {}",
+            workspace.display()
+        )
     );
     assert!(!claude_path.exists());
     assert!(!claude.ownership_path.exists());
@@ -57,6 +71,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
 #[test]
 fn explicit_first_install_creates_exact_private_owned_configs() {
     let temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&temp);
     for (client, name) in [
         (AgentGatewayClientV1::Codex, "config.toml"),
         (AgentGatewayClientV1::Claude, "config.json"),
@@ -64,7 +79,7 @@ fn explicit_first_install_creates_exact_private_owned_configs() {
         let directory = temp.path().join(client_name(client));
         fs::create_dir(&directory).unwrap();
         let path = directory.join(name);
-        let plan = AgentGatewaySetupPlanV1::dry_run(client, &path).unwrap();
+        let plan = AgentGatewaySetupPlanV1::dry_run(client, &path, &workspace).unwrap();
         assert_eq!(
             install_owned_config(&plan).unwrap(),
             OwnedInstallOutcomeV1::Installed
@@ -99,8 +114,9 @@ fn explicit_first_install_creates_exact_private_owned_configs() {
 #[test]
 fn exact_owned_reinstall_is_idempotent() {
     let temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&temp);
     let path = temp.path().join("config.toml");
-    let plan = AgentGatewaySetupPlanV1::codex(&path).unwrap();
+    let plan = AgentGatewaySetupPlanV1::codex(&path, &workspace).unwrap();
     assert_eq!(
         install_owned_config(&plan).unwrap(),
         OwnedInstallOutcomeV1::Installed
@@ -116,10 +132,11 @@ fn exact_owned_reinstall_is_idempotent() {
 #[test]
 fn existing_unowned_or_conflicting_configuration_is_never_overwritten() {
     let temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&temp);
     let path = temp.path().join("config.toml");
     let user_config = b"[mcp_servers.user]\ncommand = \"user-tool\"\n";
     fs::write(&path, user_config).unwrap();
-    let plan = AgentGatewaySetupPlanV1::codex(&path).unwrap();
+    let plan = AgentGatewaySetupPlanV1::codex(&path, &workspace).unwrap();
     assert!(matches!(
         install_owned_config(&plan),
         Err(AgentGatewaySetupError::UnownedConfiguration)
@@ -143,8 +160,9 @@ fn existing_unowned_or_conflicting_configuration_is_never_overwritten() {
 #[test]
 fn exact_config_without_ownership_is_still_refused() {
     let temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&temp);
     let path = temp.path().join("config.json");
-    let plan = AgentGatewaySetupPlanV1::claude(&path).unwrap();
+    let plan = AgentGatewaySetupPlanV1::claude(&path, &workspace).unwrap();
     fs::write(&path, plan.managed_config_document()).unwrap();
     assert!(matches!(
         install_owned_config(&plan),
@@ -154,14 +172,16 @@ fn exact_config_without_ownership_is_still_refused() {
 
 #[test]
 fn paths_are_bounded_and_existing_symlinks_are_refused() {
+    let workspace_temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&workspace_temp);
     assert!(matches!(
-        AgentGatewaySetupPlanV1::codex(Path::new("relative.toml")),
+        AgentGatewaySetupPlanV1::codex(Path::new("relative.toml"), &workspace),
         Err(AgentGatewaySetupError::InvalidConfigPath)
     ));
     let temp = TempDir::new().unwrap();
     let long_name = format!("{}-config.toml", "x".repeat(300));
     assert!(matches!(
-        AgentGatewaySetupPlanV1::codex(temp.path().join(long_name)),
+        AgentGatewaySetupPlanV1::codex(temp.path().join(long_name), &workspace),
         Err(AgentGatewaySetupError::InvalidConfigPath)
     ));
 
@@ -171,13 +191,88 @@ fn paths_are_bounded_and_existing_symlinks_are_refused() {
         fs::write(&target, "user data").unwrap();
         let path = temp.path().join("config.toml");
         symlink(&target, &path).unwrap();
-        let plan = AgentGatewaySetupPlanV1::codex(&path).unwrap();
+        let plan = AgentGatewaySetupPlanV1::codex(&path, &workspace).unwrap();
         assert!(matches!(
             install_owned_config(&plan),
             Err(AgentGatewaySetupError::UnsafeExistingPath)
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "user data");
     }
+}
+
+#[test]
+fn workspace_must_be_explicit_canonical_and_non_symlinked() {
+    let temp = TempDir::new().unwrap();
+    let config = temp.path().join("config.toml");
+    assert!(matches!(
+        AgentGatewaySetupPlanV1::codex(&config, Path::new(".")),
+        Err(AgentGatewaySetupError::InvalidWorkspace)
+    ));
+
+    let canonical = canonical_workspace(&temp);
+    let noncanonical = canonical.join("missing").join("..");
+    assert!(matches!(
+        AgentGatewaySetupPlanV1::codex(&config, noncanonical),
+        Err(AgentGatewaySetupError::InvalidWorkspace)
+    ));
+
+    #[cfg(unix)]
+    {
+        let link = canonical.join("workspace-link");
+        symlink(&canonical, &link).unwrap();
+        assert!(matches!(
+            AgentGatewaySetupPlanV1::codex(&config, &link),
+            Err(AgentGatewaySetupError::InvalidWorkspace)
+        ));
+    }
+}
+
+#[test]
+fn workspace_is_structured_in_config_and_safely_quoted_for_local_cli() {
+    let outer = TempDir::new().unwrap();
+    let spaced = outer.path().join("workspace with ' quote");
+    fs::create_dir(&spaced).unwrap();
+    let workspace = fs::canonicalize(&spaced).unwrap();
+    let config = outer.path().join("config.toml");
+    let plan = AgentGatewaySetupPlanV1::codex(&config, &workspace).unwrap();
+
+    assert_eq!(plan.stdio.args[3], workspace.to_str().unwrap());
+    assert!(plan.managed_config_document().contains("--workspace"));
+    assert!(
+        plan.managed_config_document()
+            .contains(workspace.to_str().unwrap())
+    );
+    assert!(plan.local_cli_command.contains("'\\''"));
+}
+
+#[test]
+fn changing_the_bound_workspace_cannot_reuse_prior_ownership() {
+    let temp = TempDir::new().unwrap();
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    fs::create_dir(&first).unwrap();
+    fs::create_dir(&second).unwrap();
+    let first = fs::canonicalize(first).unwrap();
+    let second = fs::canonicalize(second).unwrap();
+    let config = temp.path().join("config.toml");
+
+    let first_plan = AgentGatewaySetupPlanV1::codex(&config, first).unwrap();
+    let second_plan = AgentGatewaySetupPlanV1::codex(&config, second).unwrap();
+    assert_ne!(first_plan.ownership_digest, second_plan.ownership_digest);
+    assert_eq!(
+        install_owned_config(&first_plan).unwrap(),
+        OwnedInstallOutcomeV1::Installed
+    );
+    let installed = fs::read(&config).unwrap();
+    assert!(matches!(
+        install_owned_config(&second_plan),
+        Err(AgentGatewaySetupError::OwnershipConflict)
+    ));
+    assert_eq!(fs::read(&config).unwrap(), installed);
+}
+
+fn canonical_workspace(temporary: &TempDir) -> PathBuf {
+    fs::canonicalize(temporary.path()).unwrap()
 }
 
 fn client_name(client: AgentGatewayClientV1) -> &'static str {

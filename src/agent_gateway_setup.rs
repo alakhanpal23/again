@@ -1,10 +1,12 @@
 //! Deterministic, non-executing setup plans for the Again MCP gateway.
 //!
-//! Planning is always a dry run. The optional file installer is deliberately
-//! conservative: it creates only a previously absent configuration file and a
-//! sibling ownership record, or accepts an exact file it already owns. It never
-//! merges into or overwrites user-managed configuration; normal installations
-//! should use the emitted local CLI command.
+//! Planning is always a dry run. It authenticates the explicit workspace path,
+//! but never reads or writes agent configuration. The optional file installer
+//! is deliberately conservative: it creates only a previously absent
+//! configuration file and a sibling ownership record, or accepts an exact file
+//! it already owns. It never merges into or overwrites user-managed
+//! configuration; normal installations should use the emitted local CLI
+//! command.
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -16,13 +18,12 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
-const PLAN_VERSION: u32 = 1;
+const PLAN_VERSION: u32 = 2;
 const SERVER_NAME: &str = "again";
 const COMMAND: &str = "again";
-const ARGS: [&str; 2] = ["mcp", "serve"];
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 64 * 1_024;
-const OWNERSHIP_SUFFIX: &str = ".again-owner-v1";
+const OWNERSHIP_SUFFIX: &str = ".again-owner-v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,20 +39,13 @@ impl AgentGatewayClientV1 {
             Self::Claude => "claude",
         }
     }
-
-    fn local_cli_command(self) -> &'static str {
-        match self {
-            Self::Codex => "codex mcp add again -- again mcp serve",
-            Self::Claude => "claude mcp add -s user again -- again mcp serve",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StdioMcpCommandV1 {
     pub transport: &'static str,
     pub command: &'static str,
-    pub args: [&'static str; 2],
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -60,7 +54,8 @@ pub struct AgentGatewaySetupPlanV1 {
     pub client: AgentGatewayClientV1,
     pub server_name: &'static str,
     pub stdio: StdioMcpCommandV1,
-    pub local_cli_command: &'static str,
+    pub local_cli_command: String,
+    pub workspace: PathBuf,
     pub config_path: PathBuf,
     pub ownership_path: PathBuf,
     pub ownership_digest: String,
@@ -70,16 +65,29 @@ pub struct AgentGatewaySetupPlanV1 {
 }
 
 impl AgentGatewaySetupPlanV1 {
-    /// Construct a deterministic dry-run plan. This function never reads or
-    /// writes configuration and never executes the emitted command.
-    pub fn dry_run(client: AgentGatewayClientV1, config_path: impl AsRef<Path>) -> Result<Self> {
+    /// Construct a deterministic dry-run plan. This function authenticates the
+    /// workspace directory, but never reads or writes configuration and never
+    /// executes the emitted command.
+    pub fn dry_run(
+        client: AgentGatewayClientV1,
+        config_path: impl AsRef<Path>,
+        workspace: impl AsRef<Path>,
+    ) -> Result<Self> {
         let config_path = validate_config_path(config_path.as_ref())?;
+        let workspace = validate_workspace(workspace.as_ref())?;
         let ownership_path = ownership_path_for(&config_path)?;
-        let config_document = managed_config_document(client);
+        let args = vec![
+            "mcp".to_owned(),
+            "serve".to_owned(),
+            "--workspace".to_owned(),
+            workspace.to_string_lossy().into_owned(),
+        ];
+        let local_cli_command = local_cli_command(client, &args);
+        let config_document = managed_config_document(client, &args)?;
         if config_document.len() > MAX_CONFIG_BYTES {
             return Err(AgentGatewaySetupError::ConfigTooLarge);
         }
-        let ownership_digest = ownership_digest(client, &config_path, &config_document);
+        let ownership_digest = ownership_digest(client, &config_path, &workspace, &config_document);
         Ok(Self {
             version: PLAN_VERSION,
             client,
@@ -87,9 +95,10 @@ impl AgentGatewaySetupPlanV1 {
             stdio: StdioMcpCommandV1 {
                 transport: "stdio",
                 command: COMMAND,
-                args: ARGS,
+                args,
             },
-            local_cli_command: client.local_cli_command(),
+            local_cli_command,
+            workspace,
             config_path,
             ownership_path,
             ownership_digest,
@@ -99,12 +108,12 @@ impl AgentGatewaySetupPlanV1 {
         })
     }
 
-    pub fn codex(config_path: impl AsRef<Path>) -> Result<Self> {
-        Self::dry_run(AgentGatewayClientV1::Codex, config_path)
+    pub fn codex(config_path: impl AsRef<Path>, workspace: impl AsRef<Path>) -> Result<Self> {
+        Self::dry_run(AgentGatewayClientV1::Codex, config_path, workspace)
     }
 
-    pub fn claude(config_path: impl AsRef<Path>) -> Result<Self> {
-        Self::dry_run(AgentGatewayClientV1::Claude, config_path)
+    pub fn claude(config_path: impl AsRef<Path>, workspace: impl AsRef<Path>) -> Result<Self> {
+        Self::dry_run(AgentGatewayClientV1::Claude, config_path, workspace)
     }
 
     pub fn machine_readable_json(&self) -> Result<String> {
@@ -117,9 +126,10 @@ impl AgentGatewaySetupPlanV1 {
 
     fn ownership_record(&self) -> String {
         format!(
-            "again-agent-gateway-owner-v1\nclient={}\nserver={}\ndigest={}\n",
+            "again-agent-gateway-owner-v2\nclient={}\nserver={}\nworkspace_digest={}\ndigest={}\n",
             self.client.as_str(),
             self.server_name,
+            blake3::hash(self.workspace.as_os_str().as_encoded_bytes()).to_hex(),
             self.ownership_digest
         )
     }
@@ -145,10 +155,14 @@ pub enum OwnedInstallOutcomeV1 {
 pub enum AgentGatewaySetupError {
     #[error("gateway config path must be an absolute, bounded UTF-8 file path")]
     InvalidConfigPath,
+    #[error("gateway workspace must be an explicit canonical, bounded, non-symlink directory")]
+    InvalidWorkspace,
     #[error("gateway managed config exceeds its fixed size bound")]
     ConfigTooLarge,
     #[error("gateway setup plan serialization failed: {0}")]
     SerializePlan(serde_json::Error),
+    #[error("gateway setup plan is internally inconsistent")]
+    InvalidPlan,
     #[error("gateway config parent is missing, not a directory, or is a symlink")]
     UnsafeConfigParent,
     #[error("gateway config or ownership record is a symlink or non-regular file")]
@@ -202,10 +216,35 @@ pub fn install_owned_config(plan: &AgentGatewaySetupPlanV1) -> Result<OwnedInsta
 }
 
 fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
+    let workspace = validate_workspace(&plan.workspace)?;
+    let expected_args = vec![
+        "mcp".to_owned(),
+        "serve".to_owned(),
+        "--workspace".to_owned(),
+        workspace.to_string_lossy().into_owned(),
+    ];
+    let expected_document = managed_config_document(plan.client, &expected_args)?;
+    if plan.version != PLAN_VERSION
+        || plan.server_name != SERVER_NAME
+        || plan.stdio.transport != "stdio"
+        || plan.stdio.command != COMMAND
+        || plan.stdio.args != expected_args
+        || plan.local_cli_command != local_cli_command(plan.client, &expected_args)
+        || plan.writes_by_default
+        || plan.install_policy != "create_absent_or_verify_exact_owned_v1"
+        || plan.config_document != expected_document
+    {
+        return Err(AgentGatewaySetupError::InvalidPlan);
+    }
     if validate_config_path(&plan.config_path)? != plan.config_path
         || ownership_path_for(&plan.config_path)? != plan.ownership_path
-        || ownership_digest(plan.client, &plan.config_path, &plan.config_document)
-            != plan.ownership_digest
+        || workspace != plan.workspace
+        || ownership_digest(
+            plan.client,
+            &plan.config_path,
+            &plan.workspace,
+            &plan.config_document,
+        ) != plan.ownership_digest
     {
         return Err(AgentGatewaySetupError::InvalidConfigPath);
     }
@@ -218,6 +257,29 @@ fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
         return Err(AgentGatewaySetupError::UnsafeConfigParent);
     }
     Ok(())
+}
+
+fn validate_workspace(path: &Path) -> Result<PathBuf> {
+    let Some(path_text) = path.to_str() else {
+        return Err(AgentGatewaySetupError::InvalidWorkspace);
+    };
+    if !path.is_absolute()
+        || path_text.is_empty()
+        || path_text.len() > MAX_PATH_BYTES
+        || path_text.contains('\0')
+    {
+        return Err(AgentGatewaySetupError::InvalidWorkspace);
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| AgentGatewaySetupError::InvalidWorkspace)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AgentGatewaySetupError::InvalidWorkspace);
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| AgentGatewaySetupError::InvalidWorkspace)?;
+    if canonical != path {
+        return Err(AgentGatewaySetupError::InvalidWorkspace);
+    }
+    Ok(canonical)
 }
 
 fn validate_config_path(path: &Path) -> Result<PathBuf> {
@@ -246,39 +308,68 @@ fn ownership_path_for(config_path: &Path) -> Result<PathBuf> {
     Ok(config_path.with_file_name(owned_name))
 }
 
-fn managed_config_document(client: AgentGatewayClientV1) -> String {
+fn managed_config_document(client: AgentGatewayClientV1, args: &[String]) -> Result<String> {
     match client {
-        AgentGatewayClientV1::Codex => concat!(
-            "# Created and wholly owned by Again gateway setup v1.\n",
-            "[mcp_servers.again]\n",
-            "command = \"again\"\n",
-            "args = [\"mcp\", \"serve\"]\n",
-        )
-        .to_owned(),
-        AgentGatewayClientV1::Claude => concat!(
-            "{\n",
-            "  \"mcpServers\": {\n",
-            "    \"again\": {\n",
-            "      \"type\": \"stdio\",\n",
-            "      \"command\": \"again\",\n",
-            "      \"args\": [\"mcp\", \"serve\"]\n",
-            "    }\n",
-            "  }\n",
-            "}\n",
-        )
-        .to_owned(),
+        AgentGatewayClientV1::Codex => {
+            let encoded = args
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(AgentGatewaySetupError::SerializePlan)?
+                .join(", ");
+            Ok(format!(
+                "# Created and wholly owned by Again gateway setup v2.\n[mcp_servers.again]\ncommand = \"again\"\nargs = [{encoded}]\n"
+            ))
+        }
+        AgentGatewayClientV1::Claude => serde_json::to_string_pretty(&serde_json::json!({
+            "mcpServers": {
+                "again": {
+                    "type": "stdio",
+                    "command": "again",
+                    "args": args,
+                }
+            }
+        }))
+        .map(|value| format!("{value}\n"))
+        .map_err(AgentGatewaySetupError::SerializePlan),
+    }
+}
+
+fn local_cli_command(client: AgentGatewayClientV1, args: &[String]) -> String {
+    let mut command = match client {
+        AgentGatewayClientV1::Codex => "codex mcp add again -- again".to_owned(),
+        AgentGatewayClientV1::Claude => "claude mcp add -s user again -- again".to_owned(),
+    };
+    for argument in args {
+        command.push(' ');
+        command.push_str(&shell_quote(argument));
+    }
+    command
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./,:=@%+-".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
     }
 }
 
 fn ownership_digest(
     client: AgentGatewayClientV1,
     config_path: &Path,
+    workspace: &Path,
     config_document: &str,
 ) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"again.agent-gateway-setup.owner.v1\0");
+    hasher.update(b"again.agent-gateway-setup.owner.v2\0");
     hash_field(&mut hasher, client.as_str().as_bytes());
     hash_field(&mut hasher, config_path.as_os_str().as_encoded_bytes());
+    hash_field(&mut hasher, workspace.as_os_str().as_encoded_bytes());
     hash_field(&mut hasher, config_document.as_bytes());
     hasher.finalize().to_hex().to_string()
 }

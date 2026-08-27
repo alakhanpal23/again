@@ -776,9 +776,8 @@ impl ExperimentalMcpGatewayV1 {
 
     pub fn serve_stdio(&self, authorization_scope: &AuthorizationScopeId) -> io::Result<()> {
         let stdin = io::stdin();
-        let stdout = io::stdout();
         let mut reader = BufReader::new(stdin.lock());
-        let mut writer = stdout.lock();
+        let mut writer = io::stdout();
         self.gateway.serve_stdio(
             &mut reader,
             &mut writer,

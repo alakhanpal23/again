@@ -118,6 +118,9 @@ enum McpClientArg {
 struct McpSetupArgs {
     #[arg(long, value_enum)]
     client: McpClientArg,
+    /// Explicit canonical repository root to bind into the installed server command.
+    #[arg(long)]
+    workspace: PathBuf,
     /// Emit the machine-readable setup plan.
     #[arg(long)]
     json: bool,
@@ -848,7 +851,7 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
             }
         }
     };
-    let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path)?;
+    let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path, &args.workspace)?;
     if args.json {
         println!("{}", plan.machine_readable_json()?);
     } else {

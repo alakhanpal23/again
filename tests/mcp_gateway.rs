@@ -30,6 +30,7 @@ struct FakeProvider {
     calls: Mutex<Vec<ProviderCall>>,
     cancellations: Mutex<Vec<ProviderCancellation>>,
     block: Option<Arc<BlockState>>,
+    panics: bool,
     observed_secret: Mutex<Option<Vec<u8>>>,
     freshness: Freshness,
 }
@@ -49,6 +50,7 @@ impl FakeProvider {
             calls: Mutex::new(Vec::new()),
             cancellations: Mutex::new(Vec::new()),
             block: None,
+            panics: false,
             observed_secret: Mutex::new(None),
             freshness: Freshness {
                 revision: "fake-revision-7".into(),
@@ -69,6 +71,11 @@ impl FakeProvider {
 
     fn blocking(mut self, state: Arc<BlockState>) -> Self {
         self.block = Some(state);
+        self
+    }
+
+    fn panicking(mut self) -> Self {
+        self.panics = true;
         self
     }
 
@@ -95,6 +102,7 @@ impl ToolExecution for FakeProvider {
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
         self.calls.lock().unwrap().push(call);
+        assert!(!self.panics, "injected provider panic");
         if let Some(secret) = secrets.get("token") {
             *self.observed_secret.lock().unwrap() = Some(secret.to_vec());
         }
@@ -928,6 +936,112 @@ fn stdio_is_newline_delimited_and_recovers_after_an_oversized_frame() {
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["error"]["code"], -32_021);
     assert_eq!(responses[1]["result"], json!({}));
+}
+
+#[test]
+fn stdio_reads_cancellation_while_the_provider_call_is_running() {
+    let block = Arc::new(BlockState::default());
+    let cancelled = McpError {
+        code: McpErrorCode::RequestCancelled as i64,
+        message: "cancelled upstream".into(),
+        data: None,
+    };
+    let provider = Arc::new(
+        FakeProvider::new("fake", vec![tool("wait")])
+            .with_result(Err(ProviderError(cancelled.clone())))
+            .blocking(Arc::clone(&block)),
+    );
+    let gateway = gateway(Arc::clone(&provider));
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"stdio-test\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":\"running\",\"method\":\"tools/call\",\"params\":{\"name\":\"fake.wait\",\"arguments\":{}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":\"running\"}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n"
+    );
+    let mut reader = BufReader::new(Cursor::new(input.as_bytes()));
+    let mut output = Vec::new();
+    gateway
+        .serve_stdio(
+            &mut reader,
+            &mut output,
+            &AuthorizationScopeId::new("scope:stdio-cancel").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+        .unwrap();
+
+    let responses = String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 3);
+    let running = responses
+        .iter()
+        .find(|response| response["id"] == "running")
+        .unwrap();
+    assert_eq!(running["error"], serde_json::to_value(cancelled).unwrap());
+    assert!(
+        responses
+            .iter()
+            .any(|response| response["id"] == 2 && response["result"] == json!({}))
+    );
+    let calls = provider.calls.lock().unwrap();
+    let cancellations = provider.cancellations.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(cancellations.len(), 1);
+    assert_eq!(
+        calls[0].physical_attempt_id,
+        cancellations[0].physical_attempt_id
+    );
+}
+
+#[test]
+fn provider_panic_does_not_leave_request_id_permanently_active() {
+    let provider = Arc::new(FakeProvider::new("fake", vec![tool("panic")]).panicking());
+    let gateway = gateway(provider);
+    initialize(&gateway);
+    let request = serde_json::to_vec(&json!({
+        "jsonrpc": "2.0",
+        "id": "same",
+        "method": "tools/call",
+        "params": { "name": "fake.panic", "arguments": {} }
+    }))
+    .unwrap();
+
+    for logical in ["logical:panic-1", "logical:panic-2"] {
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gateway.process_bytes(&request, &context(logical), EphemeralSecrets::empty())
+        }));
+        assert!(unwind.is_err());
+    }
+}
+
+#[test]
+fn stdio_contains_provider_panic_as_payload_free_internal_error() {
+    let provider = Arc::new(FakeProvider::new("fake", vec![tool("panic")]).panicking());
+    let gateway = gateway(provider);
+    initialize(&gateway);
+    let input = b"{\"jsonrpc\":\"2.0\",\"id\":\"panic\",\"method\":\"tools/call\",\"params\":{\"name\":\"fake.panic\",\"arguments\":{}}}\n";
+    let mut reader = BufReader::new(Cursor::new(input));
+    let mut output = Vec::new();
+    gateway
+        .serve_stdio(
+            &mut reader,
+            &mut output,
+            &AuthorizationScopeId::new("scope:stdio-panic").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+        .unwrap();
+
+    let response: Value = serde_json::from_slice(output.strip_suffix(b"\n").unwrap()).unwrap();
+    assert_eq!(response["id"], "panic");
+    assert_eq!(
+        response["error"]["code"],
+        McpErrorCode::InternalError as i64
+    );
+    assert_eq!(response["error"]["message"], "gateway worker failed");
+    assert!(response["error"].get("data").is_none());
 }
 
 #[test]

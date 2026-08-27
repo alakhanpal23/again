@@ -10,8 +10,10 @@ use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -21,6 +23,26 @@ use thiserror::Error;
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 pub const GATEWAY_NAME: &str = "again-mcp-gateway";
 pub const GATEWAY_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const STDIO_MAX_INFLIGHT_V1: usize = 16;
+const STDIO_RESPONSE_QUEUE_V1: usize = STDIO_MAX_INFLIGHT_V1 * 2;
+
+struct StdioActivationV1 {
+    sender: SyncSender<()>,
+    signalled: AtomicBool,
+}
+
+impl StdioActivationV1 {
+    fn signal(&self) {
+        if self
+            .signalled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = self.sender.send(());
+        }
+    }
+}
 
 /// All parser and provider-output bounds are explicit and independently
 /// configurable.  Defaults are deliberately finite.
@@ -659,6 +681,20 @@ struct ActiveCall {
     effect: EffectClass,
 }
 
+struct ActiveCallRegistration<'a> {
+    active: &'a Mutex<BTreeMap<JsonRpcId, ActiveCall>>,
+    request_id: JsonRpcId,
+}
+
+impl Drop for ActiveCallRegistration<'_> {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.request_id);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum JsonRpcId {
     Number(i64),
@@ -815,8 +851,18 @@ impl McpGateway {
         context: &GatewayRequestContext,
         secrets: EphemeralSecrets<'_>,
     ) -> Option<Vec<u8>> {
+        self.process_bytes_inner(input, context, secrets, None)
+    }
+
+    fn process_bytes_inner(
+        &self,
+        input: &[u8],
+        context: &GatewayRequestContext,
+        secrets: EphemeralSecrets<'_>,
+        activation: Option<&StdioActivationV1>,
+    ) -> Option<Vec<u8>> {
         let response = match self.parse_message(input) {
-            Ok(message) => self.handle_message(message, context, secrets),
+            Ok(message) => self.handle_message(message, context, secrets, activation),
             Err(error) => Some(error_response(Value::Null, input_error_to_mcp(&error))),
         };
         response.map(|value| {
@@ -828,34 +874,194 @@ impl McpGateway {
     /// configured frame limit. Sensitive calls are never approved by this loop;
     /// mutating, external, privileged, and unknown tools are forwarded without
     /// reuse and remain subject to the upstream provider's own authorization.
-    pub fn serve_stdio<R: BufRead, W: Write>(
+    pub fn serve_stdio<R: BufRead, W: Write + Send>(
         &self,
         reader: &mut R,
         writer: &mut W,
         authorization_scope: &AuthorizationScopeId,
         secrets: EphemeralSecrets<'_>,
     ) -> io::Result<()> {
-        while let Some(frame) = read_bounded_frame(reader, self.limits.max_message_bytes)? {
-            let logical_number = self.next_stdio_logical_call.fetch_add(1, Ordering::Relaxed);
-            let context = GatewayRequestContext::new(
-                authorization_scope.clone(),
-                LogicalCallId::new(format!("stdio:{logical_number}"))
-                    .expect("generated logical call ids are valid"),
-            );
-            let response = match frame {
-                Ok(bytes) => self.process_bytes(&bytes, &context, secrets),
-                Err(error) => Some(
-                    serde_json::to_vec(&error_response(Value::Null, input_error_to_mcp(&error)))
-                        .expect("JSON-RPC error values are serializable"),
-                ),
-            };
-            if let Some(response) = response {
-                writer.write_all(&response)?;
-                writer.write_all(b"\n")?;
-                writer.flush()?;
-            }
+        struct StdioJobV1 {
+            bytes: Vec<u8>,
+            context: GatewayRequestContext,
+            response_id: Value,
+            activation: Arc<StdioActivationV1>,
         }
-        Ok(())
+
+        thread::scope(|scope| {
+            let (job_sender, job_receiver) =
+                mpsc::sync_channel::<StdioJobV1>(STDIO_MAX_INFLIGHT_V1);
+            let job_receiver = Arc::new(Mutex::new(job_receiver));
+            let (response_sender, response_receiver) =
+                mpsc::sync_channel::<Vec<u8>>(STDIO_RESPONSE_QUEUE_V1);
+            let inflight = Arc::new(AtomicUsize::new(0));
+
+            let writer_handle = scope.spawn(move || -> io::Result<()> {
+                while let Ok(response) = response_receiver.recv() {
+                    writer.write_all(&response)?;
+                    writer.write_all(b"\n")?;
+                    writer.flush()?;
+                }
+                Ok(())
+            });
+
+            let mut workers = Vec::new();
+            for _ in 0..STDIO_MAX_INFLIGHT_V1 {
+                let jobs = Arc::clone(&job_receiver);
+                let responses = response_sender.clone();
+                let inflight = Arc::clone(&inflight);
+                workers.push(scope.spawn(move || {
+                    loop {
+                        let job = {
+                            let receiver = jobs.lock().unwrap_or_else(|poison| poison.into_inner());
+                            receiver.recv()
+                        };
+                        let Ok(job) = job else {
+                            break;
+                        };
+                        let response =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                self.process_bytes_inner(
+                                    &job.bytes,
+                                    &job.context,
+                                    secrets,
+                                    Some(&job.activation),
+                                )
+                            }))
+                            .unwrap_or_else(|_| {
+                                Some(
+                                    serde_json::to_vec(&error_response(
+                                        job.response_id,
+                                        McpError::typed(
+                                            McpErrorCode::InternalError,
+                                            "gateway worker failed",
+                                        ),
+                                    ))
+                                    .expect("JSON-RPC error values are serializable"),
+                                )
+                            });
+                        job.activation.signal();
+                        if let Some(response) = response
+                            && responses.send(response).is_err()
+                        {
+                            inflight.fetch_sub(1, Ordering::AcqRel);
+                            break;
+                        }
+                        inflight.fetch_sub(1, Ordering::AcqRel);
+                    }
+                }));
+            }
+
+            let read_result = (|| -> io::Result<()> {
+                while let Some(frame) = read_bounded_frame(reader, self.limits.max_message_bytes)? {
+                    let logical_number =
+                        self.next_stdio_logical_call.fetch_add(1, Ordering::Relaxed);
+                    let context = GatewayRequestContext::new(
+                        authorization_scope.clone(),
+                        LogicalCallId::new(format!("stdio:{logical_number}"))
+                            .expect("generated logical call ids are valid"),
+                    );
+                    match frame {
+                        Ok(bytes) => {
+                            if let Some(response_id) = self.stdio_tool_call_response_id(&bytes) {
+                                let admitted = inflight
+                                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                                        (current < STDIO_MAX_INFLIGHT_V1).then_some(current + 1)
+                                    })
+                                    .is_ok();
+                                if !admitted {
+                                    let response = serde_json::to_vec(&error_response(
+                                        response_id,
+                                        McpError::typed(
+                                            McpErrorCode::LimitExceeded,
+                                            "stdio in-flight limit reached",
+                                        ),
+                                    ))
+                                    .expect("JSON-RPC error values are serializable");
+                                    response_sender.send(response).map_err(|_| {
+                                        io::Error::new(
+                                            io::ErrorKind::BrokenPipe,
+                                            "stdio response writer stopped",
+                                        )
+                                    })?;
+                                    continue;
+                                }
+                                let (activation_sender, activation_receiver) =
+                                    mpsc::sync_channel(1);
+                                let activation = Arc::new(StdioActivationV1 {
+                                    sender: activation_sender,
+                                    signalled: AtomicBool::new(false),
+                                });
+                                let job = StdioJobV1 {
+                                    bytes,
+                                    context,
+                                    response_id,
+                                    activation,
+                                };
+                                if job_sender.send(job).is_err() {
+                                    inflight.fetch_sub(1, Ordering::AcqRel);
+                                    return Err(io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "stdio worker queue stopped",
+                                    ));
+                                }
+                                activation_receiver.recv().map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "stdio worker activation failed",
+                                    )
+                                })?;
+                            } else if let Some(response) =
+                                self.process_bytes(&bytes, &context, secrets)
+                            {
+                                response_sender.send(response).map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::BrokenPipe,
+                                        "stdio response writer stopped",
+                                    )
+                                })?;
+                            }
+                        }
+                        Err(error) => {
+                            let response = serde_json::to_vec(&error_response(
+                                Value::Null,
+                                input_error_to_mcp(&error),
+                            ))
+                            .expect("JSON-RPC error values are serializable");
+                            response_sender.send(response).map_err(|_| {
+                                io::Error::new(
+                                    io::ErrorKind::BrokenPipe,
+                                    "stdio response writer stopped",
+                                )
+                            })?;
+                        }
+                    }
+                }
+                Ok(())
+            })();
+
+            drop(job_sender);
+            for worker in workers {
+                if worker.join().is_err() && read_result.is_ok() {
+                    drop(response_sender);
+                    let _ = writer_handle.join();
+                    return Err(io::Error::other("stdio worker panicked"));
+                }
+            }
+            drop(response_sender);
+            let writer_result = writer_handle
+                .join()
+                .map_err(|_| io::Error::other("stdio writer panicked"))?;
+            read_result.and(writer_result)
+        })
+    }
+
+    fn stdio_tool_call_response_id(&self, input: &[u8]) -> Option<Value> {
+        let message = self.parse_message(input).ok()?;
+        let request = ParsedRequest::from_value(message).ok()?;
+        (request.method == "tools/call")
+            .then(|| request.id.map(|id| id.to_value()))
+            .flatten()
     }
 
     fn handle_message(
@@ -863,6 +1069,7 @@ impl McpGateway {
         message: Value,
         context: &GatewayRequestContext,
         secrets: EphemeralSecrets<'_>,
+        activation: Option<&StdioActivationV1>,
     ) -> Option<Value> {
         let request = match ParsedRequest::from_value(message) {
             Ok(request) => request,
@@ -885,6 +1092,7 @@ impl McpGateway {
                 request.params,
                 context,
                 secrets,
+                activation,
             ),
             "notifications/cancelled" if request.id.is_none() => {
                 self.cancel(request.params, context);
@@ -956,6 +1164,7 @@ impl McpGateway {
         params: Option<Value>,
         context: &GatewayRequestContext,
         secrets: EphemeralSecrets<'_>,
+        activation: Option<&StdioActivationV1>,
     ) -> Option<Value> {
         if !self.initialized.load(Ordering::Acquire) {
             return Some(error_response(
@@ -1020,6 +1229,13 @@ impl McpGateway {
                 }
             }
         }
+        let _active_registration = ActiveCallRegistration {
+            active: &self.active,
+            request_id: request_id.clone(),
+        };
+        if let Some(activation) = activation {
+            activation.signal();
+        }
 
         let translation = translate_tool_call_v1(&route, &arguments, context, &freshness);
         let call = ProviderCall {
@@ -1038,10 +1254,6 @@ impl McpGateway {
             .provider
             .execute(call, secrets)
             .and_then(|result| route.provider.capture_result(result));
-        self.active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&request_id);
 
         match upstream {
             Ok(captured) => {
