@@ -10,9 +10,13 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
 use blake3::Hasher;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
+use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
+use crate::agent_gateway_setup::{
+    AgentGatewayClientV1, AgentGatewaySetupPlanV1, install_owned_config,
+};
 use crate::executable::{
     ExecutableIdentity, ToolKind, host_audited_apple_profile, verify_executable,
 };
@@ -33,7 +37,7 @@ const MAX_STORABLE_STREAM_BYTES: usize = 16 * 1024 * 1024;
 #[command(
     name = "again",
     version,
-    about = "Proof-carrying reuse for agent tool calls"
+    about = "Repository-aware execution memory for coding-agent tool calls"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -50,6 +54,8 @@ enum CommandName {
     Reference(ReferenceArgs),
     /// Reuse or publish an encrypted result through an explicit team profile.
     Team(TeamArgs),
+    /// Run or configure the experimental repository-aware MCP gateway.
+    Mcp(McpArgs),
     /// Handle one Codex tool or compaction lifecycle hook event on stdin.
     #[command(hide = true)]
     Hook(HookArgs),
@@ -76,6 +82,48 @@ enum CommandName {
     /// Run the fixed no-command Linux filesystem-ready diagnostic.
     #[command(name = "__linux-pytest-filesystem-ready-probe-v1", hide = true)]
     LinuxPytestFilesystemReadyProbeV1,
+}
+
+#[derive(Debug, Args)]
+struct McpArgs {
+    #[command(subcommand)]
+    command: McpCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpCommand {
+    /// Serve the experimental repository tools over bounded stdio JSON-RPC.
+    Serve(McpServeArgs),
+    /// Print an opt-in Codex or Claude MCP setup plan.
+    Setup(McpSetupArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpServeArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Stable, non-secret local authorization-scope identifier.
+    #[arg(long)]
+    authorization_scope: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum McpClientArg {
+    Codex,
+    Claude,
+}
+
+#[derive(Debug, Args)]
+struct McpSetupArgs {
+    #[arg(long, value_enum)]
+    client: McpClientArg,
+    /// Emit the machine-readable setup plan.
+    #[arg(long)]
+    json: bool,
+    /// Explicit path for a wholly Again-owned config file. Existing unowned files are refused.
+    #[arg(long)]
+    install_owned_config: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -436,6 +484,10 @@ pub fn run_cli() -> Result<i32> {
                 crate::team_inspect::inspect(args.profile, args.command, args.json)
             }
         },
+        CommandName::Mcp(args) => match args.command {
+            McpCommand::Serve(args) => mcp_serve(args),
+            McpCommand::Setup(args) => mcp_setup(args),
+        },
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         CommandName::Exec(args) => execute_pending_call(&args.call),
         CommandName::Explain(args) => explain(args),
@@ -748,6 +800,76 @@ fn normalized_args() -> Vec<OsString> {
         arguments[1] = OsString::from("run");
     }
     arguments
+}
+
+fn mcp_serve(args: McpServeArgs) -> Result<i32> {
+    let cwd = std::env::current_dir()?;
+    let workspace = match args.workspace {
+        Some(workspace) => fs::canonicalize(&workspace)
+            .with_context(|| format!("resolve MCP workspace {}", workspace.display()))?,
+        None => discover_workspace(&cwd)?,
+    };
+    let authorization_scope = match args.authorization_scope {
+        Some(scope) => crate::mcp_gateway::AuthorizationScopeId::new(scope)?,
+        None => {
+            let mut hasher = Hasher::new();
+            hasher.update(b"again.local-mcp-authorization-scope.v1\0");
+            hasher.update(workspace.as_os_str().as_encoded_bytes());
+            let digest = hasher.finalize().to_hex();
+            crate::mcp_gateway::AuthorizationScopeId::new(format!(
+                "local-workspace:{}",
+                &digest[..24]
+            ))?
+        }
+    };
+    eprintln!(
+        "Again MCP gateway is experimental; only bounded built-in repository reads are reuse-eligible."
+    );
+    let gateway = ExperimentalMcpGatewayV1::build(&workspace)?;
+    gateway.serve_stdio(&authorization_scope)?;
+    Ok(0)
+}
+
+fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
+    let client = match args.client {
+        McpClientArg::Codex => AgentGatewayClientV1::Codex,
+        McpClientArg::Claude => AgentGatewayClientV1::Claude,
+    };
+    let config_path = match args.install_owned_config.as_ref() {
+        Some(path) => path.clone(),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("HOME is unavailable; pass --install-owned-config"))?;
+            match client {
+                AgentGatewayClientV1::Codex => home.join(".codex").join("config.toml"),
+                AgentGatewayClientV1::Claude => home.join(".claude.json"),
+            }
+        }
+    };
+    let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path)?;
+    if args.json {
+        println!("{}", plan.machine_readable_json()?);
+    } else {
+        println!("{plan}");
+        if args.install_owned_config.is_none() {
+            println!("# experimental dry run; no configuration was changed");
+        }
+    }
+    if args.install_owned_config.is_some() {
+        let outcome = install_owned_config(&plan)?;
+        eprintln!(
+            "Again-owned MCP configuration result: {}",
+            match outcome {
+                crate::agent_gateway_setup::OwnedInstallOutcomeV1::Installed => "installed",
+                crate::agent_gateway_setup::OwnedInstallOutcomeV1::AlreadyInstalledOwned => {
+                    "already_installed_owned"
+                }
+            }
+        );
+    }
+    Ok(0)
 }
 
 fn setup(args: SetupArgs) -> Result<i32> {

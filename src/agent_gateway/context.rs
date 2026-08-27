@@ -148,6 +148,7 @@ impl PresentationContextV1 {
         self.output_ceiling
     }
 
+    #[allow(dead_code)]
     fn compact_identity(&self) -> AgentContextIdentityV1 {
         AgentContextIdentityV1 {
             agent_id: self
@@ -222,6 +223,7 @@ impl GatewayResultIdentityV1 {
         })
     }
 
+    #[allow(dead_code)]
     fn digest_reference(self) -> DigestReferenceV1 {
         DigestReferenceV1 {
             algorithm: "blake3".to_owned(),
@@ -334,6 +336,7 @@ impl DeliveryReceiptV1 {
 
 /// Narrow crate-private presenter completion boundary. Callers cannot mint a
 /// receipt until exact stream counts, status delivery, and completion all hold.
+#[allow(dead_code)]
 pub(crate) fn presenter_complete_exact_delivery_v1(
     context: &PresentationContextV1,
     call: &GatewayToolCallV1,

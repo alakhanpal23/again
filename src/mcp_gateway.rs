@@ -825,9 +825,9 @@ impl McpGateway {
     }
 
     /// Serve newline-delimited MCP frames without ever buffering more than the
-    /// configured frame limit.  Sensitive calls are not approved by this loop;
-    /// callers needing approval use [`Self::process_bytes`] with an explicit
-    /// [`ApprovalGrant`].
+    /// configured frame limit. Sensitive calls are never approved by this loop;
+    /// mutating, external, privileged, and unknown tools are forwarded without
+    /// reuse and remain subject to the upstream provider's own authorization.
     pub fn serve_stdio<R: BufRead, W: Write>(
         &self,
         reader: &mut R,

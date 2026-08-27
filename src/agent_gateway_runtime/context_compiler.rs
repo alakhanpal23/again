@@ -163,6 +163,7 @@ impl fmt::Debug for ExactDeliveryAuthorityV1 {
 /// Crate-local presenter completion boundary. Product composition must invoke
 /// this only after the supplied bytes reached the named context and status is
 /// complete; byte equality is rechecked here before authority is issued.
+#[allow(dead_code)]
 pub(crate) fn complete_exact_delivery_v1(
     context: &ContextIdentityV1,
     result: &ContextResultV1,

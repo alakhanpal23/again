@@ -3,7 +3,7 @@ name = "again-cli"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Proof-carrying reuse for agent tool calls"
+description = "Repository-aware execution memory and tool-call control plane for coding agents"
 license = "Apache-2.0"
 repository = "https://github.com/alakhanpal23/again"
 

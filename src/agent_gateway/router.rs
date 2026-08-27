@@ -120,6 +120,7 @@ pub fn route_gateway_candidate_v1(
     }
 }
 
+#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 enum VerifiedCandidateOriginV1 {
     RecordedExecution {
@@ -237,14 +238,14 @@ fn validate_origin_identifier(value: &str) -> Result<(), CandidateEvidenceRefusa
     Ok(())
 }
 
-struct VerifiedStoreCandidateEvidenceV1 {
-    request_digest: RequestDigestV1,
-    result_digest: DigestReferenceV1,
-    store_record_digest: DigestReferenceV1,
-    freshness: CandidateFreshnessV1,
+pub(crate) struct VerifiedStoreCandidateEvidenceV1 {
+    pub(crate) request_digest: RequestDigestV1,
+    pub(crate) result_digest: DigestReferenceV1,
+    pub(crate) store_record_digest: DigestReferenceV1,
+    pub(crate) freshness: CandidateFreshnessV1,
 }
 
-fn issue_recorded_candidate_v1(
+pub(crate) fn issue_recorded_candidate_v1(
     evidence: VerifiedStoreCandidateEvidenceV1,
 ) -> Result<ReuseCandidateV1, CandidateEvidenceRefusalV1> {
     evidence
@@ -265,18 +266,20 @@ fn issue_recorded_candidate_v1(
     })
 }
 
-struct VerifiedCoverageEvidenceV1 {
-    request_digest: RequestDigestV1,
-    result_digest: DigestReferenceV1,
-    freshness: CandidateFreshnessV1,
-    rule_id: String,
-    rule_version: String,
-    source_request_digest: RequestDigestV1,
-    source_result_digest: DigestReferenceV1,
-    validator_digest: DigestReferenceV1,
+#[allow(dead_code)]
+pub(crate) struct VerifiedCoverageEvidenceV1 {
+    pub(crate) request_digest: RequestDigestV1,
+    pub(crate) result_digest: DigestReferenceV1,
+    pub(crate) freshness: CandidateFreshnessV1,
+    pub(crate) rule_id: String,
+    pub(crate) rule_version: String,
+    pub(crate) source_request_digest: RequestDigestV1,
+    pub(crate) source_result_digest: DigestReferenceV1,
+    pub(crate) validator_digest: DigestReferenceV1,
 }
 
-fn issue_coverage_candidate_v1(
+#[allow(dead_code)]
+pub(crate) fn issue_coverage_candidate_v1(
     evidence: VerifiedCoverageEvidenceV1,
 ) -> Result<ReuseCandidateV1, CandidateEvidenceRefusalV1> {
     validate_origin_identifier(&evidence.rule_id)?;
@@ -305,7 +308,7 @@ fn issue_coverage_candidate_v1(
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct InflightJoinEvidenceV1 {
+pub(crate) struct InflightJoinEvidenceV1 {
     request_digest: RequestDigestV1,
     effect_class: EffectClass,
     lifecycle_generation: u64,
@@ -322,17 +325,17 @@ impl fmt::Debug for InflightJoinEvidenceV1 {
     }
 }
 
-struct CoordinatorJoinObservationV1 {
-    request_digest: RequestDigestV1,
-    effect_class: EffectClass,
-    lifecycle_generation: u64,
-    observed_generation: u64,
-    started_at_millis: u64,
-    observed_at_millis: u64,
-    revalidated_at_generation: Option<u64>,
+pub(crate) struct CoordinatorJoinObservationV1 {
+    pub(crate) request_digest: RequestDigestV1,
+    pub(crate) effect_class: EffectClass,
+    pub(crate) lifecycle_generation: u64,
+    pub(crate) observed_generation: u64,
+    pub(crate) started_at_millis: u64,
+    pub(crate) observed_at_millis: u64,
+    pub(crate) revalidated_at_generation: Option<u64>,
 }
 
-fn issue_inflight_join_evidence_v1(
+pub(crate) fn issue_inflight_join_evidence_v1(
     observation: CoordinatorJoinObservationV1,
 ) -> Result<InflightJoinEvidenceV1, CandidateEvidenceRefusalV1> {
     if observation.lifecycle_generation == 0
@@ -397,7 +400,7 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    fn with_exact(mut self, candidate: ReuseCandidateV1) -> Self {
+    pub(crate) fn with_exact(mut self, candidate: ReuseCandidateV1) -> Self {
         if matches!(
             candidate.origin,
             VerifiedCandidateOriginV1::RecordedExecution { .. }
@@ -407,7 +410,8 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    fn with_coverage(mut self, candidate: ReuseCandidateV1) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn with_coverage(mut self, candidate: ReuseCandidateV1) -> Self {
         if matches!(
             candidate.origin,
             VerifiedCandidateOriginV1::DeterministicCoverage { .. }
@@ -417,7 +421,7 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    fn with_inflight(mut self, evidence: InflightJoinEvidenceV1) -> Self {
+    pub(crate) fn with_inflight(mut self, evidence: InflightJoinEvidenceV1) -> Self {
         self.inflight = Some(evidence);
         self
     }

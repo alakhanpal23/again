@@ -1086,6 +1086,141 @@ pub fn observe_repository_v1(
     observe_repository_inner(workspace, plan, limits, || {})
 }
 
+/// Read one bounded regular file through the descriptor-relative, no-follow
+/// traversal used by repository authority. Both the file and workspace are
+/// authenticated again after the read.
+pub(crate) fn read_repository_file_v1(
+    workspace: &Path,
+    relative: &Path,
+    maximum_bytes: u64,
+) -> AuthorityResult<Vec<u8>> {
+    if maximum_bytes == 0 {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "bound repository provider read",
+        ));
+    }
+    let root = secure_open_path(
+        workspace,
+        ExpectedNodeV1::Directory,
+        StateDimensionV1::Repository,
+        "open repository provider workspace",
+    )?;
+    let root_before = FilesystemIdentityV1::from_metadata(&root.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::Repository,
+            workspace,
+            "inspect repository provider workspace",
+            error,
+        )
+    })?);
+    let mut file = secure_open_relative(
+        &root,
+        relative,
+        ExpectedNodeV1::Regular,
+        StateDimensionV1::RepositoryContent,
+        relative,
+        "open repository provider input",
+    )?;
+    let before = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            relative,
+            "inspect repository provider input",
+            error,
+        )
+    })?);
+    if before.size > maximum_bytes {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "read repository provider input",
+        ));
+    }
+    let capacity = usize::try_from(before.size).map_err(|_| {
+        incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "allocate repository provider input",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "allocate repository provider input",
+        )
+    })?;
+    file.by_ref()
+        .take(maximum_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                relative,
+                "read repository provider input",
+                error,
+            )
+        })?;
+    if bytes.len() as u64 > maximum_bytes {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "read repository provider input",
+        ));
+    }
+    let after = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            relative,
+            "reinspect repository provider input",
+            error,
+        )
+    })?);
+    let reopened = secure_open_relative(
+        &root,
+        relative,
+        ExpectedNodeV1::Regular,
+        StateDimensionV1::RepositoryContent,
+        relative,
+        "reopen repository provider input",
+    )?;
+    let path_after =
+        FilesystemIdentityV1::from_metadata(&reopened.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                relative,
+                "inspect reopened repository provider input",
+                error,
+            )
+        })?);
+    let root_after = secure_open_path(
+        workspace,
+        ExpectedNodeV1::Directory,
+        StateDimensionV1::Repository,
+        "reopen repository provider workspace",
+    )?;
+    let root_after =
+        FilesystemIdentityV1::from_metadata(&root_after.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                workspace,
+                "reinspect repository provider workspace",
+                error,
+            )
+        })?);
+    if before != after || after != path_after || root_before != root_after {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            relative,
+            "authenticate repository provider read",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn observe_repository_inner<F>(
     workspace: &Path,
     plan: &RepositoryObservationPlanV1,
@@ -1803,6 +1938,7 @@ fn observe_negative_dependency(
     })
 }
 
+#[allow(dead_code)]
 fn stable_directory_listing(
     path: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
@@ -2142,6 +2278,7 @@ fn observe_regular_file_relative(
     })
 }
 
+#[allow(dead_code)]
 fn symlink(path: &Path, operation: &'static str) -> IncompleteToolStateV1 {
     IncompleteToolStateV1::single(
         IncompleteReasonCodeV1::SymlinkRefused,
@@ -3682,6 +3819,7 @@ impl std::fmt::Debug for ExternalDependencyObservationV1 {
 }
 
 impl ExternalDependencyObservationV1 {
+    #[allow(dead_code)]
     pub(crate) fn from_token(
         provider_id: impl Into<String>,
         resource_identifier: &[u8],
@@ -3780,6 +3918,29 @@ pub fn validated_no_external_dependencies_for_test_v1(
             StateDimensionV1::ExternalFreshness,
             None,
             "bound no-external-dependencies proof",
+        ));
+    }
+    Ok(ValidatedNoExternalDependenciesProofV1 {
+        digest: StateDigestV1::from_domain_and_bytes(
+            b"again.validated-no-external-dependencies.v1",
+            evidence,
+        ),
+    })
+}
+
+/// Crate-trusted issuance boundary for tool implementations whose closed
+/// schema was reviewed to have no external dependencies. The evidence is
+/// committed immediately and the opaque proof cannot be constructed by SDK
+/// callers or deserialized from an MCP request.
+pub(crate) fn issue_no_external_dependencies_v1(
+    evidence: &[u8],
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<ValidatedNoExternalDependenciesProofV1> {
+    if evidence.is_empty() || evidence.len() > limits.max_identity_bytes {
+        return Err(incomplete_limit(
+            StateDimensionV1::ExternalFreshness,
+            None,
+            "bound trusted no-external-dependencies proof",
         ));
     }
     Ok(ValidatedNoExternalDependenciesProofV1 {

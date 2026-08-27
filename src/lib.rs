@@ -1,8 +1,13 @@
+pub mod agent_gateway;
+pub mod agent_gateway_runtime;
+pub mod agent_gateway_setup;
 pub mod effect;
 pub mod engine;
 pub mod executable;
+pub mod execution_backend;
 pub mod fingerprint;
 pub mod hook;
+pub mod mcp_gateway;
 // Keep the disabled Linux pytest profile crate-private while its implementations
 // are built behind the frozen interfaces.
 #[allow(dead_code)]
@@ -27,5 +32,6 @@ pub(crate) mod team_publish;
 pub mod team_pull;
 pub mod team_request_key;
 pub mod trust_bundle;
+pub mod workspace_authority;
 
 pub use engine::run_cli;
