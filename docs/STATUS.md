@@ -3,9 +3,12 @@
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
 Current hosted evidence checkpoint: source commit
-`dfaf4eeb7ae3ee3f816c438f99f4a019d62e769b` passed exact-SHA hosted
-[`CI run 33001488042`](https://github.com/alakhanpal23/again/actions/runs/33001488042)
-on 2026-08-26. Gate 2 retains a narrower live-evidence checkpoint: source
+`f483b6031285e6d604de4d318cf6c60c77c82cc3` passed exact-SHA hosted
+[`CI run 33125773383`](https://github.com/alakhanpal23/again/actions/runs/33125773383)
+on 2026-08-27. Its macOS and Ubuntu jobs passed formatting, pinned Rust 1.88
+strict Clippy, locked tests, offline evidence/harness suites, and the explicit
+100,000-case gate; the stock-Linux lane also retained the required typed
+non-qualifying capability result. Gate 2 retains a narrower live-evidence checkpoint: source
 commit `3d1fb201507a43b830d5ce341b2253957634016d` passed exact-SHA hosted
 [`CI run 32963128960`](https://github.com/alakhanpal23/again/actions/runs/32963128960)
 and the provisioned Linux x86_64
