@@ -19,7 +19,9 @@ struct RepositoryFixture {
 impl RepositoryFixture {
     fn git() -> Self {
         let temporary = TempDir::new().expect("temporary repository");
-        let root = temporary.path().join("repository");
+        let root = fs::canonicalize(temporary.path())
+            .expect("canonical temporary root")
+            .join("repository");
         fs::create_dir(&root).expect("repository root");
         let fixture = Self { temporary, root };
         fixture.run_git(&["init", "-q"]);
@@ -31,7 +33,9 @@ impl RepositoryFixture {
 
     fn plain() -> Self {
         let temporary = TempDir::new().expect("temporary repository");
-        let root = temporary.path().join("repository");
+        let root = fs::canonicalize(temporary.path())
+            .expect("canonical temporary root")
+            .join("repository");
         fs::create_dir(&root).expect("repository root");
         Self { temporary, root }
     }
@@ -88,6 +92,41 @@ fn content_plan(path: &str) -> RepositoryObservationPlanV1 {
 
 fn digest(value: &[u8]) -> StateDigestV1 {
     StateDigestV1::from_domain_and_bytes(b"again.authority-test.v1", value)
+}
+
+fn classify_environment(
+    plan: EnvironmentObservationPlanV1,
+    observed: &[StateDimensionV1],
+) -> EnvironmentObservationPlanV1 {
+    let exclusions = [
+        StateDimensionV1::OperatingSystem,
+        StateDimensionV1::Architecture,
+        StateDimensionV1::Kernel,
+        StateDimensionV1::Executables,
+        StateDimensionV1::WorkingDirectory,
+        StateDimensionV1::EnvironmentValues,
+        StateDimensionV1::ResourceProfile,
+        StateDimensionV1::SandboxBackend,
+        StateDimensionV1::McpProviderToolSchema,
+        StateDimensionV1::AuthorizationScope,
+    ]
+    .into_iter()
+    .filter(|dimension| !observed.contains(dimension))
+    .map(|dimension| (dimension, b"test tool schema excludes dimension".to_vec()))
+    .collect();
+    plan.with_relevance_proof(
+        EnvironmentRelevanceProofV1::from_exclusions(exclusions, &limits()).unwrap(),
+    )
+}
+
+fn no_external() -> ExternalFreshnessV1 {
+    ExternalFreshnessV1::no_external_dependencies(
+        validated_no_external_dependencies_for_test_v1(
+            b"test schema has no external inputs",
+            &limits(),
+        )
+        .unwrap(),
+    )
 }
 
 fn task(revision: u64) -> TaskStateV1 {
@@ -225,7 +264,10 @@ fn task_revision_changes_task_and_complete_state() {
     let repository =
         observe_repository_v1(fixture.root(), &content_plan("input"), &limits()).unwrap();
     let environment = observe_environment_v1(
-        &EnvironmentObservationPlanV1::new().with_operating_system(),
+        &classify_environment(
+            EnvironmentObservationPlanV1::new().with_operating_system(),
+            &[StateDimensionV1::OperatingSystem],
+        ),
         &limits(),
     )
     .unwrap();
@@ -233,22 +275,18 @@ fn task_revision_changes_task_and_complete_state() {
         repository.clone(),
         environment.clone(),
         task(1),
-        ExternalFreshnessV1::no_external_dependencies(),
+        no_external(),
     );
-    let second = CompleteToolStateV1::new(
-        repository,
-        environment,
-        task(2),
-        ExternalFreshnessV1::no_external_dependencies(),
-    );
+    let second = CompleteToolStateV1::new(repository, environment, task(2), no_external());
     assert_ne!(
         first.agent_context().task().digest(),
         second.agent_context().task().digest()
     );
     assert_ne!(first.digest(), second.digest());
+    let first_digest = first.digest();
     assert_eq!(
-        first.reusable_authority().complete_state_digest(),
-        first.digest()
+        first.into_reusable_authority().complete_state_digest(),
+        first_digest
     );
 }
 
@@ -265,11 +303,19 @@ fn environment_and_tool_versions_change_environment_authority() {
         )
         .unwrap();
         observe_environment_v1(
-            &EnvironmentObservationPlanV1::new()
-                .with_operating_system()
-                .with_architecture()
-                .with_kernel_identity("test-kernel")
-                .with_executable(executable),
+            &classify_environment(
+                EnvironmentObservationPlanV1::new()
+                    .with_operating_system()
+                    .with_architecture()
+                    .with_kernel_identity("test-kernel")
+                    .with_executable(executable),
+                &[
+                    StateDimensionV1::OperatingSystem,
+                    StateDimensionV1::Architecture,
+                    StateDimensionV1::Kernel,
+                    StateDimensionV1::Executables,
+                ],
+            ),
             &limits(),
         )
         .unwrap()
@@ -323,6 +369,114 @@ fn symlinks_and_special_files_are_typed_refusals() {
 }
 
 #[test]
+fn intermediate_symlink_and_replacement_never_read_outside_scope() {
+    let fixture = RepositoryFixture::plain();
+    fixture.write("inside/value", b"inside\n");
+    let external = TempDir::new().unwrap();
+    fs::write(external.path().join("value"), b"outside-secret\n").unwrap();
+
+    symlink(external.path(), fixture.root().join("escape")).unwrap();
+    let refusal = observe_repository_v1(fixture.root(), &content_plan("escape/value"), &limits())
+        .unwrap_err();
+    assert_eq!(
+        refusal.primary_code(),
+        IncompleteReasonCodeV1::SymlinkRefused
+    );
+
+    let inside = fixture.root().join("inside");
+    let displaced = fixture.root().join("inside-old");
+    let refusal = observe_repository_with_test_hook_v1(
+        fixture.root(),
+        &content_plan("inside/value"),
+        &limits(),
+        || {
+            fs::rename(&inside, &displaced).unwrap();
+            symlink(external.path(), &inside).unwrap();
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        refusal.primary_code(),
+        IncompleteReasonCodeV1::SymlinkRefused
+            | IncompleteReasonCodeV1::RepositoryReplaced
+            | IncompleteReasonCodeV1::ConcurrentMutation
+    ));
+}
+
+#[test]
+fn executable_and_cwd_intermediate_symlinks_are_refused() {
+    let fixture = RepositoryFixture::plain();
+    fixture.write("tool", b"tool\n");
+    let alias = fixture.root().join("alias");
+    symlink(fixture.root(), &alias).unwrap();
+    let executable =
+        ExecutableObservationRequestV1::new("tool", alias.join("tool"), b"version", &limits())
+            .unwrap();
+    let executable_refusal = observe_environment_v1(
+        &classify_environment(
+            EnvironmentObservationPlanV1::new().with_executable(executable),
+            &[StateDimensionV1::Executables],
+        ),
+        &limits(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        executable_refusal.primary_code(),
+        IncompleteReasonCodeV1::SymlinkRefused
+    );
+
+    let cwd_refusal = observe_environment_v1(
+        &classify_environment(
+            EnvironmentObservationPlanV1::new().with_cwd(alias),
+            &[StateDimensionV1::WorkingDirectory],
+        ),
+        &limits(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        cwd_refusal.primary_code(),
+        IncompleteReasonCodeV1::SymlinkRefused
+    );
+}
+
+#[test]
+fn environment_omissions_are_unknown_and_relevance_proof_is_bound() {
+    let empty =
+        observe_environment_v1(&EnvironmentObservationPlanV1::new(), &limits()).unwrap_err();
+    assert_eq!(
+        empty.primary_code(),
+        IncompleteReasonCodeV1::UnknownRelevantState
+    );
+
+    let build = |evidence: &[u8]| {
+        let exclusions = [
+            StateDimensionV1::Architecture,
+            StateDimensionV1::Kernel,
+            StateDimensionV1::Executables,
+            StateDimensionV1::WorkingDirectory,
+            StateDimensionV1::EnvironmentValues,
+            StateDimensionV1::ResourceProfile,
+            StateDimensionV1::SandboxBackend,
+            StateDimensionV1::McpProviderToolSchema,
+            StateDimensionV1::AuthorizationScope,
+        ]
+        .into_iter()
+        .map(|dimension| (dimension, evidence.to_vec()))
+        .collect();
+        observe_environment_v1(
+            &EnvironmentObservationPlanV1::new()
+                .with_operating_system()
+                .with_relevance_proof(
+                    EnvironmentRelevanceProofV1::from_exclusions(exclusions, &limits()).unwrap(),
+                ),
+            &limits(),
+        )
+        .unwrap()
+    };
+    assert_ne!(build(b"schema-a").digest(), build(b"schema-b").digest());
+}
+
+#[test]
 fn repository_replacement_during_observation_is_refused() {
     let fixture = RepositoryFixture::plain();
     fixture.write("input", b"input\n");
@@ -373,16 +527,22 @@ fn canonical_encoding_is_deterministic_and_plan_order_independent() {
     let environment_value_b =
         EnvironmentValueDigestV1::from_value(OsStr::new("B"), OsStr::new("2"), &limits()).unwrap();
     let environment_forward = observe_environment_v1(
-        &EnvironmentObservationPlanV1::new()
-            .with_environment_value(environment_value_a.clone())
-            .with_environment_value(environment_value_b.clone()),
+        &classify_environment(
+            EnvironmentObservationPlanV1::new()
+                .with_environment_value(environment_value_a.clone())
+                .with_environment_value(environment_value_b.clone()),
+            &[StateDimensionV1::EnvironmentValues],
+        ),
         &limits(),
     )
     .unwrap();
     let environment_reverse = observe_environment_v1(
-        &EnvironmentObservationPlanV1::new()
-            .with_environment_value(environment_value_b)
-            .with_environment_value(environment_value_a),
+        &classify_environment(
+            EnvironmentObservationPlanV1::new()
+                .with_environment_value(environment_value_b)
+                .with_environment_value(environment_value_a),
+            &[StateDimensionV1::EnvironmentValues],
+        ),
         &limits(),
     )
     .unwrap();
@@ -427,7 +587,28 @@ fn explicit_not_git_unknown_environment_and_sparse_states_fail_closed() {
     assert_eq!(no_git.git_state(), &RepositoryGitStateV1::NotGitRepository);
 
     let unknown = observe_environment_v1(
-        &EnvironmentObservationPlanV1::new().with_unknown_dimension(StateDimensionV1::Kernel),
+        &EnvironmentObservationPlanV1::new()
+            .with_unknown_dimension(StateDimensionV1::Kernel)
+            .with_relevance_proof(
+                EnvironmentRelevanceProofV1::from_exclusions(
+                    [
+                        StateDimensionV1::OperatingSystem,
+                        StateDimensionV1::Architecture,
+                        StateDimensionV1::Executables,
+                        StateDimensionV1::WorkingDirectory,
+                        StateDimensionV1::EnvironmentValues,
+                        StateDimensionV1::ResourceProfile,
+                        StateDimensionV1::SandboxBackend,
+                        StateDimensionV1::McpProviderToolSchema,
+                        StateDimensionV1::AuthorizationScope,
+                    ]
+                    .into_iter()
+                    .map(|dimension| (dimension, b"excluded".to_vec()))
+                    .collect(),
+                    &limits(),
+                )
+                .unwrap(),
+            ),
         &limits(),
     )
     .unwrap_err();
@@ -575,9 +756,12 @@ fn every_configurable_input_bound_fails_closed() {
         EnvironmentValueDigestV1::from_value(OsStr::new("B"), OsStr::new("2"), &limits()).unwrap();
     assert_eq!(
         observe_environment_v1(
-            &EnvironmentObservationPlanV1::new()
-                .with_environment_value(first)
-                .with_environment_value(second),
+            &classify_environment(
+                EnvironmentObservationPlanV1::new()
+                    .with_environment_value(first)
+                    .with_environment_value(second),
+                &[StateDimensionV1::EnvironmentValues],
+            ),
             &environment_limits,
         )
         .unwrap_err()

@@ -140,6 +140,36 @@ class WorkspaceAuthorityFixtureTests(unittest.TestCase):
             )
         self.assertEqual(replacement.exception.code, "repository_replaced")
 
+    def test_intermediate_symlink_and_replacement_are_refused(self) -> None:
+        self.write("inside/value", b"inside\n")
+        with tempfile.TemporaryDirectory(prefix="again-authority-external-") as raw_external:
+            external = pathlib.Path(raw_external).resolve()
+            (external / "value").write_bytes(b"outside-secret\n")
+            (self.root / "escape").symlink_to(external)
+            with self.assertRaises(fixture.FixtureRefusal) as escaped:
+                fixture.observe_repository(
+                    self.root,
+                    fixture.ObservationPlan(content_paths=("escape/value",)),
+                )
+            self.assertEqual(escaped.exception.code, "symlink_refused")
+
+            displaced = self.root / "inside-old"
+
+            def replace_intermediate() -> None:
+                (self.root / "inside").rename(displaced)
+                (self.root / "inside").symlink_to(external)
+
+            with self.assertRaises(fixture.FixtureRefusal) as replaced:
+                fixture.observe_repository(
+                    self.root,
+                    fixture.ObservationPlan(content_paths=("inside/value",)),
+                    between_samples=replace_intermediate,
+                )
+            self.assertIn(
+                replaced.exception.code,
+                {"symlink_refused", "repository_replaced", "concurrent_mutation"},
+            )
+
     def test_task_environment_and_secret_digests(self) -> None:
         first_task = fixture.task_digest(task_id="task", task_revision=1, plan_revision=1)
         second_task = fixture.task_digest(task_id="task", task_revision=2, plan_revision=1)

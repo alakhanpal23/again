@@ -14,7 +14,7 @@ import json
 import os
 import pathlib
 import stat
-import subprocess
+import errno
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -107,8 +107,69 @@ def environment_digest(*, tool_path: pathlib.Path, tool_version: str, limits: Li
     )
 
 
+def _open_secure(path: pathlib.Path, *, directory: bool) -> int:
+    """Open every component without following symlinks."""
+    if not path.is_absolute():
+        raise FixtureRefusal("invalid_observation_plan", "secure fixture paths must be absolute")
+    current = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        parts = [part for part in path.parts if part not in ("/", "", ".")]
+        for index, part in enumerate(parts):
+            final = index + 1 == len(parts)
+            inspected = os.stat(part, dir_fd=current, follow_symlinks=False)
+            if stat.S_ISLNK(inspected.st_mode):
+                raise FixtureRefusal("symlink_refused", "symlink component refused")
+            if not final and not stat.S_ISDIR(inspected.st_mode):
+                raise FixtureRefusal("special_file_refused", "non-directory component refused")
+            flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+            if not final or directory:
+                flags |= os.O_DIRECTORY
+            else:
+                flags |= os.O_NONBLOCK
+            try:
+                opened = os.open(part, flags, dir_fd=current)
+            except OSError as error:
+                if error.errno in (errno.ELOOP,):
+                    raise FixtureRefusal("symlink_refused", "symlink component refused") from error
+                if error.errno in (errno.ENOTDIR,):
+                    raise FixtureRefusal("symlink_refused", "component changed during open") from error
+                raise
+            os.close(current)
+            current = opened
+        metadata = os.fstat(current)
+        wanted = stat.S_ISDIR(metadata.st_mode) if directory else stat.S_ISREG(metadata.st_mode)
+        if not wanted:
+            raise FixtureRefusal("special_file_refused", "unexpected node type")
+        return current
+    except BaseException:
+        os.close(current)
+        raise
+
+
+def _secure_kind(path: pathlib.Path) -> str | None:
+    parent_fd = _open_secure(path.parent, directory=True)
+    try:
+        try:
+            metadata = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(metadata.st_mode):
+            raise FixtureRefusal("symlink_refused", "symlink refused")
+        if stat.S_ISDIR(metadata.st_mode):
+            return "directory"
+        if stat.S_ISREG(metadata.st_mode):
+            return "regular"
+        raise FixtureRefusal("special_file_refused", "special file refused")
+    finally:
+        os.close(parent_fd)
+
+
 def _identity(path: pathlib.Path) -> tuple[int, ...]:
-    metadata = path.lstat()
+    descriptor = _open_secure(path, directory=True)
+    try:
+        metadata = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
     return (
         metadata.st_dev,
         metadata.st_ino,
@@ -169,40 +230,41 @@ def _normalize_plan(plan: ObservationPlan, limits: Limits) -> ObservationPlan:
 
 
 def _reject_symlink_or_special(path: pathlib.Path, *, directory: bool | None = None) -> os.stat_result:
-    metadata = path.lstat()
-    if stat.S_ISLNK(metadata.st_mode):
-        raise FixtureRefusal("symlink_refused", f"symlink refused: {path}")
-    ordinary = stat.S_ISREG(metadata.st_mode) or stat.S_ISDIR(metadata.st_mode)
-    if not ordinary:
-        raise FixtureRefusal("special_file_refused", f"special file refused: {path}")
-    if directory is True and not stat.S_ISDIR(metadata.st_mode):
-        raise FixtureRefusal("special_file_refused", f"directory required: {path}")
-    if directory is False and not stat.S_ISREG(metadata.st_mode):
-        raise FixtureRefusal("special_file_refused", f"regular file required: {path}")
-    return metadata
+    kind = _secure_kind(path)
+    if kind is None:
+        raise FileNotFoundError(path)
+    expected_directory = directory if directory is not None else kind == "directory"
+    descriptor = _open_secure(path, directory=expected_directory)
+    try:
+        return os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _stable_regular_file(path: pathlib.Path, limits: Limits) -> dict[str, Any]:
-    before = _reject_symlink_or_special(path, directory=False)
+    descriptor = _open_secure(path, directory=False)
+    before = os.fstat(descriptor)
     if before.st_size > limits.max_file_bytes:
         raise FixtureRefusal("input_limit_exceeded", f"file is too large: {path}")
     digest = hashlib.sha256()
     size = 0
-    with path.open("rb") as source:
-        opened = os.fstat(source.fileno())
-        if (opened.st_dev, opened.st_ino, opened.st_mode) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-        ):
-            raise FixtureRefusal("concurrent_mutation", f"file changed while opening: {path}")
-        for block in iter(lambda: source.read(64 * 1024), b""):
+    try:
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
             size += len(block)
             if size > limits.max_file_bytes:
                 raise FixtureRefusal("input_limit_exceeded", f"file grew beyond bound: {path}")
             digest.update(block)
-        after_handle = os.fstat(source.fileno())
-    after_path = path.lstat()
+        after_handle = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    reopened = _open_secure(path, directory=False)
+    try:
+        after_path = os.fstat(reopened)
+    finally:
+        os.close(reopened)
     if _stat_tuple(before) != _stat_tuple(after_handle) or _stat_tuple(before) != _stat_tuple(after_path):
         raise FixtureRefusal("concurrent_mutation", f"file changed while reading: {path}")
     return {
@@ -226,14 +288,21 @@ def _stat_tuple(metadata: os.stat_result) -> tuple[int, ...]:
 
 
 def _list_directory(path: pathlib.Path, limits: Limits) -> tuple[tuple[int, ...], list[str]]:
-    before = _reject_symlink_or_special(path, directory=True)
-    names = sorted(os.listdir(path), key=os.fsencode)
+    descriptor = _open_secure(path, directory=True)
+    before = os.fstat(descriptor)
+    names = sorted(os.listdir(descriptor), key=os.fsencode)
     if len(names) > limits.max_directory_entries:
         raise FixtureRefusal("input_limit_exceeded", f"directory has too many entries: {path}")
     if any(len(os.fsencode(name)) > limits.max_path_bytes for name in names):
         raise FixtureRefusal("input_limit_exceeded", f"directory name is too long: {path}")
-    after = path.lstat()
-    if _stat_tuple(before) != _stat_tuple(after):
+    after = os.fstat(descriptor)
+    os.close(descriptor)
+    reopened = _open_secure(path, directory=True)
+    try:
+        after_path = os.fstat(reopened)
+    finally:
+        os.close(reopened)
+    if _stat_tuple(before) != _stat_tuple(after) or _stat_tuple(before) != _stat_tuple(after_path):
         raise FixtureRefusal("concurrent_mutation", f"directory changed while listing: {path}")
     return _stat_tuple(before), names
 
@@ -271,30 +340,19 @@ def _walk_tree(path: pathlib.Path, limits: Limits) -> tuple[list[dict[str, Any]]
 
 def _git_state(root: pathlib.Path, limits: Limits) -> dict[str, Any]:
     dot_git = root / ".git"
-    if not dot_git.exists() and not dot_git.is_symlink():
+    if _secure_kind(dot_git) is None:
         return {"kind": "not_git_repository"}
     metadata = _reject_symlink_or_special(dot_git)
     if not stat.S_ISDIR(metadata.st_mode):
         raise FixtureRefusal("special_file_refused", "reference fixture requires a .git directory")
     sparse = dot_git / "info" / "sparse-checkout"
-    if sparse.exists() or sparse.is_symlink():
+    if _secure_kind(sparse) is not None:
         raise FixtureRefusal("sparse_checkout_ambiguous", "sparse checkout marker is present")
     head = _stable_regular_file(dot_git / "HEAD", limits)
     index_path = dot_git / "index"
-    index = _stable_regular_file(index_path, limits) if index_path.exists() else None
-    completed = subprocess.run(
-        ("git", "rev-parse", "--verify", "HEAD"),
-        cwd=root,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0", "LC_ALL": "C"},
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        check=False,
-    )
-    head_object = completed.stdout.decode("ascii").strip() if completed.returncode == 0 else None
+    index = _stable_regular_file(index_path, limits) if _secure_kind(index_path) is not None else None
     return {
         "head_file": head,
-        "head_object": head_object,
         "index": index,
         "kind": "git",
     }
@@ -310,8 +368,10 @@ def observe_repository(
     """Return one deterministic reference epoch or a typed refusal."""
 
     plan = _normalize_plan(plan, limits)
+    if not root.is_absolute():
+        raise FixtureRefusal("invalid_observation_plan", "workspace path must be absolute")
     _reject_symlink_or_special(root, directory=True)
-    canonical_root = root.resolve(strict=True)
+    canonical_root = root
     root_identity = _identity(canonical_root)
     git_before = _git_state(canonical_root, limits)
 
@@ -338,7 +398,7 @@ def observe_repository(
             )
         for relative in plan.negative_dependencies:
             candidate = canonical_root / relative
-            if candidate.exists() or candidate.is_symlink():
+            if _secure_kind(candidate) is not None:
                 metadata = _reject_symlink_or_special(candidate)
                 identity: tuple[int, ...] | None = _stat_tuple(metadata)
                 present = True
