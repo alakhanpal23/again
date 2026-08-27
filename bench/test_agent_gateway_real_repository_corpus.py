@@ -86,6 +86,15 @@ class FakeAudit:
         return self.windows.pop(0)
 
 
+class EvidenceSession:
+    def __init__(self, label: str, pid: int):
+        self.label = label
+        self.pid = pid
+
+    def evidence(self) -> dict[str, Any]:
+        return {"label": self.label, "pid": self.pid}
+
+
 def mcp_result(value: Mapping[str, Any], result_id: str = "a" * 64) -> dict[str, Any]:
     result = dict(value)
     result["_meta"] = {
@@ -433,6 +442,78 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             audit.totals()
         self.assertEqual(refused.exception.code, "database_schema")
 
+    def test_gateway_counters_reconcile_all_requests_and_provider_terminals(self) -> None:
+        counters = corpus.reconcile_gateway_counters(
+            {
+                "requested": 39,
+                "executed": 21,
+                "inflight_join": 1,
+                "exact_hit": 17,
+                "completed": 17,
+                "failed": 4,
+            }
+        )
+        self.assertEqual(counters["provider_executions"], 21)
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.reconcile_gateway_counters(
+                {
+                    "requested": 40,
+                    "executed": 21,
+                    "inflight_join": 1,
+                    "exact_hit": 17,
+                    "completed": 17,
+                    "failed": 4,
+                }
+            )
+        self.assertEqual(refused.exception.code, "gateway_counter_mismatch")
+
+    def test_latency_analysis_is_bounded_and_flags_only_real_outliers(self) -> None:
+        scenarios = {
+            "fast": {
+                "label": "fast",
+                "command": {"tool": "repo.read"},
+                "elapsed_ms": 10.0,
+            },
+            "bulk": [
+                {
+                    "label": "bulk",
+                    "command": {"tool": "repo.search"},
+                    "elapsed_ms": 500.0,
+                },
+                {
+                    "label": "outlier",
+                    "command": {"tool": "repo.search"},
+                    "elapsed_ms": 9000.0,
+                },
+            ],
+        }
+        analysis = corpus.latency_analysis(scenarios, timeout_seconds=90)
+        self.assertEqual(analysis["count"], 3)
+        self.assertEqual(analysis["maximum_ms"], 9000.0)
+        self.assertEqual(analysis["anomalous"], [])
+        many = {
+            str(index): {
+                "label": str(index),
+                "command": {"tool": "repo.read"},
+                "elapsed_ms": 10.0 if index < 20 else 3000.0,
+            }
+            for index in range(21)
+        }
+        flagged = corpus.latency_analysis(many, timeout_seconds=90)
+        self.assertEqual([item["label"] for item in flagged["anomalous"]], ["20"])
+
+    def test_process_ledger_retains_all_unique_launched_processes(self) -> None:
+        sessions = [
+            EvidenceSession("first", 101),
+            EvidenceSession("retired-before-restart", 102),
+            EvidenceSession("restarted", 103),
+        ]
+        records = corpus.process_evidence(sessions)
+        self.assertEqual([item["pid"] for item in records], [101, 102, 103])
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.process_evidence([EvidenceSession("same", 1), EvidenceSession("same", 2)])
+        self.assertEqual(refused.exception.code, "process_ledger")
+
     def test_workspace_manifest_rejects_symlinks_and_is_stable(self) -> None:
         workspace = self.root / "manifest"
         workspace.mkdir()
@@ -457,6 +538,19 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             with self.assertRaises(corpus.HarnessRefusal) as refused:
                 corpus.write_json_exclusive(self.root / "large.json", {"large": "value"})
         self.assertEqual(refused.exception.code, "evidence_oversized")
+
+    def test_output_location_is_new_canonical_and_outside_every_source(self) -> None:
+        source = self.root / "source"
+        source.mkdir()
+        output = self.root / "evidence.json"
+        self.assertEqual(corpus.validate_output_location(output, [source]), output)
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.validate_output_location(source / "evidence.json", [source])
+        self.assertEqual(refused.exception.code, "output_inside_source")
+        output.write_text("existing")
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.validate_output_location(output, [source])
+        self.assertEqual(refused.exception.code, "output_exists")
 
     def test_server_environment_is_offline_minimal_and_state_scoped(self) -> None:
         environment = corpus._server_environment(

@@ -36,7 +36,7 @@ from typing import Any
 
 
 SCHEMA = "again.agent-gateway-real-repository-corpus.v1"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 EXPECTED_DATABASE_SCHEMA = 7
 LANGUAGES = ("rust", "python", "go", "typescript")
@@ -156,6 +156,27 @@ def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
         except OSError:
             pass
         raise
+
+
+def validate_output_location(
+    output: pathlib.Path, protected_roots: Sequence[pathlib.Path]
+) -> pathlib.Path:
+    if not output.is_absolute() or output.resolve(strict=False) != output:
+        raise HarnessRefusal("output_not_canonical", "evidence path must be absolute and canonical")
+    try:
+        output.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        raise HarnessRefusal("output_unavailable", "evidence output cannot be inspected") from error
+    else:
+        raise HarnessRefusal("output_exists", f"refusing to overwrite evidence: {output}")
+    for root in protected_roots:
+        if output == root or root in output.parents:
+            raise HarnessRefusal(
+                "output_inside_source", f"evidence output cannot be inside source: {root}"
+            )
+    return output
 
 
 def _translate_support_refusal(error: BaseException) -> HarnessRefusal:
@@ -699,6 +720,91 @@ def invocation_record(
     }
 
 
+def latency_analysis(value: Any, timeout_seconds: float) -> dict[str, Any]:
+    timings: list[tuple[str, float]] = []
+
+    def visit(current: Any) -> None:
+        if isinstance(current, dict):
+            label = current.get("label")
+            elapsed = current.get("elapsed_ms")
+            if (
+                isinstance(label, str)
+                and isinstance(current.get("command"), dict)
+                and isinstance(elapsed, (int, float))
+                and not isinstance(elapsed, bool)
+            ):
+                timings.append((label, float(elapsed)))
+            for child in current.values():
+                visit(child)
+        elif isinstance(current, list):
+            for child in current:
+                visit(child)
+
+    visit(value)
+    if not timings:
+        raise HarnessRefusal("timing_missing", "no invocation timings were recorded")
+    ordered = sorted(elapsed for _, elapsed in timings)
+
+    def nearest_rank(fraction: float) -> float:
+        index = max(0, min(len(ordered) - 1, int(len(ordered) * fraction + 0.999999) - 1))
+        return ordered[index]
+
+    anomaly_threshold = min(timeout_seconds * 1000, max(2000.0, nearest_rank(0.95) * 4))
+    anomalous = [
+        {"label": label, "elapsed_ms": elapsed}
+        for label, elapsed in sorted(timings, key=lambda item: item[1], reverse=True)
+        if elapsed > anomaly_threshold
+    ]
+    return {
+        "count": len(timings),
+        "minimum_ms": ordered[0],
+        "median_ms": nearest_rank(0.5),
+        "p95_ms": nearest_rank(0.95),
+        "maximum_ms": ordered[-1],
+        "anomaly_threshold_ms": anomaly_threshold,
+        "anomalous": anomalous,
+        "slowest": [
+            {"label": label, "elapsed_ms": elapsed}
+            for label, elapsed in sorted(timings, key=lambda item: item[1], reverse=True)[:5]
+        ],
+    }
+
+
+def reconcile_gateway_counters(totals: Mapping[str, int]) -> dict[str, int]:
+    counters = {
+        "requested": int(totals.get("requested", 0)),
+        "provider_executions": int(totals.get("executed", 0)),
+        "inflight_joins": int(totals.get("inflight_join", 0)),
+        "exact_hits": int(totals.get("exact_hit", 0)),
+    }
+    routes = (
+        counters["provider_executions"]
+        + counters["inflight_joins"]
+        + counters["exact_hits"]
+    )
+    if counters["requested"] != routes:
+        raise HarnessRefusal(
+            "gateway_counter_mismatch",
+            f"requested={counters['requested']} but terminal routes={routes}",
+        )
+    if int(totals.get("completed", 0)) + int(totals.get("failed", 0)) != counters[
+        "provider_executions"
+    ]:
+        raise HarnessRefusal(
+            "gateway_counter_mismatch", "provider executions do not reconcile to completion/failure"
+        )
+    return counters
+
+
+def process_evidence(sessions: Sequence[Any]) -> list[dict[str, Any]]:
+    records = [session.evidence() for session in sessions]
+    labels = [record.get("label") for record in records]
+    pids = [record.get("pid") for record in records]
+    if len(set(labels)) != len(labels) or len(set(pids)) != len(pids):
+        raise HarnessRefusal("process_ledger", "MCP process ledger is not one-to-one")
+    return records
+
+
 def run_verified_call(
     session: Any,
     audit: GatewayAudit,
@@ -866,7 +972,6 @@ def run_repository(
         scenarios["later_reuse"] = later
 
         second.close()
-        sessions.remove(second)
         restarted = start_session(
             binary, workspace, state, temporary_root, f"{snapshot.language}-restarted", timeout_seconds
         )
@@ -1112,13 +1217,7 @@ def run_repository(
         }
 
         totals = audit.totals()
-        counters = {
-            "requested": totals.get("requested", 0),
-            "provider_executions": totals.get("executed", 0),
-            "inflight_joins": totals.get("inflight_join", 0),
-            "exact_hits": totals.get("exact_hit", 0),
-            "false_hits": false_hits,
-        }
+        counters = {**reconcile_gateway_counters(totals), "false_hits": false_hits}
         if counters["false_hits"] != 0:
             raise HarnessRefusal("false_hits", "one or more reuse results were incorrect")
         return {
@@ -1135,10 +1234,11 @@ def run_repository(
             },
             "workspace_fixture_manifest_sha256": prepared["fixture_manifest_sha256"],
             "scenarios": scenarios,
+            "latency_analysis": latency_analysis(scenarios, timeout_seconds),
             "gateway_event_totals": totals,
             "counters": counters,
             "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
-            "processes": [session.evidence() for session in sessions],
+            "processes": process_evidence(sessions),
         }
     finally:
         failures: list[str] = []
@@ -1320,11 +1420,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = arguments.json_out
     try:
         repositories = [parse_repository_argument(item) for item in arguments.repository]
-        for repository in repositories:
-            if output == repository.root or repository.root in output.parents:
-                raise HarnessRefusal(
-                    "output_inside_source", "evidence output cannot be inside a source repository"
-                )
+        validate_output_location(
+            output, [arguments.source_root, *(repository.root for repository in repositories)]
+        )
         report = evaluate(
             again_binary=arguments.again_binary,
             source_root=arguments.source_root,
