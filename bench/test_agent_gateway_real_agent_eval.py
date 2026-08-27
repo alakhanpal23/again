@@ -291,6 +291,12 @@ class RealAgentEvalTests(unittest.TestCase):
         self.assertEqual(dirty["changed"], ["facts/primary.txt"])
         self.assertEqual(dirty["added"], ["unexpected.txt"])
 
+        symlink = repository / "unsafe-link"
+        symlink.symlink_to(changed_path)
+        with self.assertRaises(real_eval.HarnessRefusal) as unsafe:
+            real_eval.snapshot_repository_contents(repository)
+        self.assertEqual(unsafe.exception.code, "repository_unsafe")
+
     def test_unsupported_client_versions_are_refused(self) -> None:
         codex_help = "Codex CLI --version"
         exec_help = "Run Codex non-interactively --ephemeral --json --sandbox"
@@ -355,6 +361,19 @@ class RealAgentEvalTests(unittest.TestCase):
         self.assertEqual(record["classification"], "client_nonzero_exit")
         self.assertEqual(record["task_outcome"], "fail")
 
+    def test_mcp_crash_is_a_typed_command_failure(self) -> None:
+        crash = real_eval.CommandResult(
+            returncode=70,
+            stdout=b'{"partial":true}\n',
+            stderr=b"MCP server exited\n",
+            elapsed_ms=3.0,
+            timed_out=False,
+            output_limited=False,
+        )
+        with self.assertRaises(real_eval.HarnessRefusal) as failed:
+            real_eval.require_checked_command(crash, "Again stats after agent cohort")
+        self.assertEqual(failed.exception.code, "command_failed")
+
     def test_malformed_agent_output_is_detected(self) -> None:
         analysis = real_eval.analyze_agent_output(
             "claude", b"not-json\n", real_eval.TASKS[0]
@@ -368,6 +387,40 @@ class RealAgentEvalTests(unittest.TestCase):
             real_eval.TASKS[0],
         )
         self.assertTrue(wrong_final.malformed)
+
+    def test_partial_result_and_missing_token_accounting_are_explicit(self) -> None:
+        task = real_eval.TASKS[0]
+        partial = real_eval.analyze_agent_output(
+            "claude",
+            b'{"type":"tool_use","id":"one","name":"mcp__again__repo.read"}\n',
+            task,
+        )
+        self.assertTrue(partial.malformed)
+        self.assertEqual(partial.malformed_reason, "agent output contained no final response")
+        self.assertEqual(partial.client_reported_tokens, {})
+
+        final = json.dumps(dict(task.expected), separators=(",", ":"))
+        complete = real_eval.analyze_agent_output(
+            "claude",
+            real_eval.canonical_json_bytes({"type": "result", "result": final}) + b"\n",
+            task,
+        )
+        self.assertFalse(complete.malformed)
+        self.assertTrue(complete.oracle_passed)
+        self.assertEqual(complete.client_reported_tokens, {})
+
+    def test_duplicate_json_keys_are_never_silently_accepted(self) -> None:
+        with self.assertRaises(real_eval.HarnessRefusal) as duplicate:
+            real_eval.strict_json_loads(b'{"value":1,"value":2}')
+        self.assertEqual(duplicate.exception.code, "duplicate_json_key")
+
+        analysis = real_eval.analyze_agent_output(
+            "codex",
+            b'{"type":"result","type":"result","result":"{}"}\n',
+            real_eval.TASKS[0],
+        )
+        self.assertTrue(analysis.malformed)
+        self.assertEqual(analysis.malformed_reason, "agent emitted malformed JSONL")
 
     def test_no_tool_use_classification_is_not_e2e_success(self) -> None:
         classified = real_eval.classify_paired_run(
@@ -472,6 +525,66 @@ class RealAgentEvalTests(unittest.TestCase):
         with self.assertRaises(real_eval.HarnessRefusal) as overwrite:
             real_eval.write_json_exclusive(first, left)
         self.assertEqual(overwrite.exception.code, "evidence_exists")
+
+    def test_interrupted_pairs_are_excluded_and_completed_pairs_resume(self) -> None:
+        journal_root = self.root / "run-state"
+        identity = {"source": "a" * 40, "harness": "b" * 64}
+        journal = real_eval.RunJournal.open(journal_root, identity)
+        first = journal.start_attempt("codex--later_checksum_v1", 2)
+        self.assertIsNone(journal.load_completed(first.pair_id))
+
+        resumed = real_eval.RunJournal.open(journal_root, identity)
+        second = resumed.start_attempt(first.pair_id, 2)
+        abandoned = journal_root / "attempts" / (
+            f"{first.pair_id}.{first.number:04d}.abandoned.json"
+        )
+        self.assertFalse(real_eval.read_bounded_json_object(abandoned)["comparison_eligible"])
+        self.assertIsNone(resumed.load_completed(first.pair_id))
+        resumed.fail_attempt(second, "agent_crash")
+
+        third = resumed.start_attempt(first.pair_id, 2)
+        complete_pair = {
+            "client": "codex",
+            "task_id": "later_checksum_v1",
+            "baseline": {"runs": [{"task_outcome": "pass"}]},
+            "again_enabled": {"runs": [{"task_outcome": "pass"}]},
+        }
+        resumed.complete_attempt(third, complete_pair)
+        pair_path = journal_root / "pairs" / f"{first.pair_id}.complete.json"
+        retained_bytes = pair_path.read_bytes()
+
+        reopened = real_eval.RunJournal.open(journal_root, identity)
+        self.assertEqual(reopened.load_completed(first.pair_id), complete_pair)
+        self.assertEqual(pair_path.read_bytes(), retained_bytes)
+        self.assertEqual(reopened.summary()["completed_pairs"], 1)
+        self.assertEqual(reopened.summary()["abandoned_attempts"], 1)
+        self.assertEqual(reopened.summary()["failed_attempts"], 1)
+        with self.assertRaises(real_eval.HarnessRefusal) as rerun:
+            reopened.start_attempt(first.pair_id, 2)
+        self.assertEqual(rerun.exception.code, "journal_pair_complete")
+        self.assertEqual(pair_path.read_bytes(), retained_bytes)
+
+    def test_run_journal_refuses_identity_changes_and_secret_material(self) -> None:
+        journal_root = self.root / "identity-state"
+        journal = real_eval.RunJournal.open(journal_root, {"identity": "one"})
+        attempt = journal.start_attempt("claude--marker_locations_v1", 2)
+        secret = b"unit-test-live-secret"
+        with self.assertRaises(real_eval.HarnessRefusal) as secret_refusal:
+            journal.complete_attempt(attempt, {"leak": secret.decode()}, (secret,))
+        self.assertEqual(secret_refusal.exception.code, "credential_persistence")
+        self.assertIsNone(journal.load_completed(attempt.pair_id))
+
+        with self.assertRaises(real_eval.HarnessRefusal) as mismatch:
+            real_eval.RunJournal.open(journal_root, {"identity": "two"})
+        self.assertEqual(mismatch.exception.code, "journal_identity_mismatch")
+
+    def test_statistics_review_never_turns_estimates_into_savings_claims(self) -> None:
+        review = real_eval.review_statistical_claims("dry-run", [], [])
+        self.assertFalse(review["comparison_matrix_complete"])
+        self.assertFalse(review["token_savings_claim_permitted"])
+        self.assertFalse(review["time_savings_claim_permitted"])
+        self.assertFalse(review["quality_improvement_claim_permitted"])
+        self.assertFalse(review["dry_run_is_live_evidence"])
 
 
 if __name__ == "__main__":

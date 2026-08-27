@@ -40,6 +40,8 @@ MAX_COMMAND_STDOUT_BYTES = 32 * 1024 * 1024
 MAX_COMMAND_STDERR_BYTES = 4 * 1024 * 1024
 MAX_HELP_BYTES = 2 * 1024 * 1024
 MAX_BINARY_BYTES = 512 * 1024 * 1024
+MAX_JOURNAL_FILE_BYTES = 8 * 1024 * 1024
+MAX_JOURNAL_ATTEMPTS = 128
 SUPPORTED_PLACEHOLDERS = {
     "{prompt}",
     "{workspace}",
@@ -208,6 +210,12 @@ class ClientInspection:
 class RuntimePin:
     version: str
     sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
+class JournalAttempt:
+    pair_id: str
+    number: int
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1614,6 +1622,167 @@ def validate_runtime_pin(pin: RuntimePin, observed_version: str, observed_sha256
         raise HarnessRefusal("runtime_pin_mismatch", "runtime identity differs from its exact pin")
 
 
+def execute_live_pair(
+    *,
+    private: pathlib.Path,
+    client: str,
+    task: TaskSpec,
+    order: Sequence[str],
+    attempt_number: int,
+    template: CommandTemplate,
+    model: str,
+    credential_name: str,
+    credential_value: str,
+    again_binary: pathlib.Path,
+    shim_directory: pathlib.Path,
+    bootstrap_environment: Mapping[str, str],
+    fixture_digest_sha256: str,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    task_root = (
+        private
+        / "live"
+        / client
+        / task.task_id
+        / f"attempt-{attempt_number:04d}"
+    )
+    task_root.mkdir(mode=0o700, parents=True)
+    pair_repository = task_root / "repository"
+    pair_fixture = create_fixture_repository(
+        pair_repository, bootstrap_environment, timeout_seconds
+    )
+    if pair_fixture["fixture_digest_sha256"] != fixture_digest_sha256:
+        raise HarnessRefusal(
+            "fixture_mismatch", "fresh pair fixture differs from the pinned fixture"
+        )
+    initial_repository_diff = repository_diff(
+        pair_fixture["file_sha256"], snapshot_repository_contents(pair_repository)
+    )
+    if not initial_repository_diff["clean"]:
+        raise HarnessRefusal("fixture_dirty", "fresh pair fixture is not exact")
+    again_home = task_root / "again-state"
+    again_home.mkdir(mode=0o700)
+    baseline_again_home = task_root / "baseline-state"
+    stats_environment = dict(bootstrap_environment)
+    stats_environment["AGAIN_HOME"] = str(again_home)
+    baseline_paths = (
+        template.executable.parent,
+        pathlib.Path("/usr/bin"),
+        pathlib.Path("/bin"),
+    )
+    enabled_paths = (shim_directory, *baseline_paths)
+    condition_records: dict[str, dict[str, Any]] = {}
+    setup_summary: dict[str, Any] | None = None
+    for condition in order:
+        before = read_again_stats(
+            again_binary,
+            pair_repository,
+            stats_environment,
+            timeout_seconds,
+        )
+        runs, condition_setup = run_cohort(
+            client=client,
+            condition=condition,
+            task=task,
+            template=template,
+            model=model,
+            workspace=pair_repository,
+            run_root=task_root / "runs",
+            again_home=again_home if condition == "again_enabled" else baseline_again_home,
+            baseline_paths=baseline_paths,
+            enabled_paths=enabled_paths,
+            setup_binary=again_binary,
+            setup_environment=bootstrap_environment,
+            credential_name=credential_name,
+            credential_value=credential_value,
+            timeout_seconds=timeout_seconds,
+        )
+        after = read_again_stats(
+            again_binary,
+            pair_repository,
+            stats_environment,
+            timeout_seconds,
+        )
+        delta = stats_delta(before, after)
+        final_repository_diff = repository_diff(
+            pair_fixture["file_sha256"], snapshot_repository_contents(pair_repository)
+        )
+        if not final_repository_diff["clean"]:
+            raise HarnessRefusal(
+                "unexpected_repository_mutation",
+                "agent condition changed the retained fixture repository",
+            )
+        if condition == "baseline" and any(delta.values()):
+            raise HarnessRefusal(
+                "baseline_contaminated",
+                "Again stats changed during baseline condition",
+            )
+        condition_records[condition] = {
+            "runs": runs,
+            "gateway_stats_delta": delta,
+            "repository_diff": final_repository_diff,
+        }
+        if condition_setup is not None:
+            setup_summary = condition_setup
+    if setup_summary is None:
+        raise HarnessRefusal(
+            "setup_plan", "enabled condition did not retain an Again setup plan"
+        )
+    baseline_runs = condition_records["baseline"]["runs"]
+    enabled_runs = condition_records["again_enabled"]["runs"]
+    gateway_delta = condition_records["again_enabled"]["gateway_stats_delta"]
+    reconciliation = classify_paired_run(baseline_runs, enabled_runs, gateway_delta)
+    pair = {
+        "client": client,
+        "task_id": task.task_id,
+        "concurrency": task.concurrency,
+        "treatment_order": list(order),
+        "journal_attempt": attempt_number,
+        "fresh_isolated_state": True,
+        "fixture_git_sha": pair_fixture["git_sha"],
+        "initial_repository_diff": initial_repository_diff,
+        "baseline": condition_records["baseline"],
+        "again_enabled": {
+            **condition_records["again_enabled"],
+            "setup": setup_summary,
+        },
+        "reconciliation": reconciliation,
+    }
+    return pair, [*baseline_runs, *enabled_runs]
+
+
+def review_statistical_claims(
+    mode: str,
+    pairs: Sequence[Mapping[str, Any]],
+    all_runs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    confirmed_delivery_pairs = sum(
+        pair["reconciliation"]["classification"] == "end_to_end_again_observed"
+        for pair in pairs
+    )
+    direct_token_runs = sum(
+        bool(run["client_reported_tokens"]["counts"]) for run in all_runs
+    )
+    complete_matrix = mode == "live" and len(pairs) == len(TASKS) * 2
+    return {
+        "comparison_matrix_complete": complete_matrix,
+        "comparison_pairs_eligible": len(pairs) if mode == "live" else 0,
+        "confirmed_again_delivery_pairs": confirmed_delivery_pairs,
+        "runs_with_direct_client_token_counts": direct_token_runs,
+        "token_savings_claim_permitted": False,
+        "token_savings_claim_reason": (
+            "direct token counts, when present, are observations rather than a causal savings measure"
+        ),
+        "time_savings_claim_permitted": False,
+        "time_savings_claim_reason": (
+            "harness wall time and Again estimated milliseconds are not provider-supplied causal savings"
+        ),
+        "quality_improvement_claim_permitted": False,
+        "general_acceleration_claim_permitted": False,
+        "dry_run_is_live_evidence": False,
+    }
+
+
 def evaluate(
     *,
     mode: str,
@@ -1626,6 +1795,7 @@ def evaluate(
     runtime_pins: Mapping[str, RuntimePin],
     maximum_runs: int,
     timeout_seconds: float,
+    run_state_root: pathlib.Path | None = None,
 ) -> tuple[dict[str, Any], tuple[bytes, ...]]:
     if mode not in {"dry-run", "live"}:
         raise HarnessRefusal("mode", "evaluation mode is invalid")
@@ -1633,6 +1803,10 @@ def evaluate(
         raise HarnessRefusal("network_authorization", "live mode requires --allow-network")
     if mode == "dry-run" and allow_network:
         raise HarnessRefusal("network_authorization", "dry-run mode refuses --allow-network")
+    if mode == "live" and run_state_root is None:
+        raise HarnessRefusal("run_state", "live mode requires an explicit --run-state-dir")
+    if mode == "dry-run" and run_state_root is not None:
+        raise HarnessRefusal("run_state", "dry-run mode does not write live run state")
     if not 1 <= maximum_runs <= MAX_AGENT_RUNS:
         raise HarnessRefusal("maximum_runs", "--max-runs is outside the bounded range")
     if not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
@@ -1708,128 +1882,142 @@ def evaluate(
                 timeout_seconds,
             )
 
+        source_revision = source_git_sha(source_root, bootstrap_environment, timeout_seconds)
+        harness_sha256 = file_sha256(pathlib.Path(__file__).resolve())
+        platform_identity = {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+            "python": platform.python_version(),
+        }
+        run_identity = {
+            "schema": SCHEMA,
+            "source_git_sha": source_revision,
+            "harness_sha256": harness_sha256,
+            "fixture_digest_sha256": fixture["fixture_digest_sha256"],
+            "fixture_repository_git_sha": fixture["git_sha"],
+            "platform": platform_identity,
+            "runtimes": {
+                "again": {
+                    "version": again["version"],
+                    "sha256": again["binary_sha256"],
+                },
+                **{
+                    client: {
+                        "version": inspections[client].version,
+                        "sha256": inspections[client].executable_sha256,
+                    }
+                    for client in clients
+                },
+            },
+            "clients": {
+                client: {
+                    "model": models[client],
+                    "settings_id": settings_ids[client],
+                    "command_template_sha256": templates[client].identity(),
+                }
+                for client in clients
+            },
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "concurrency": task.concurrency,
+                    "prompt_sha256": sha256_bytes(task.prompt.encode("utf-8")),
+                    "oracle_sha256": sha256_bytes(canonical_json_bytes(dict(task.expected))),
+                }
+                for task in TASKS
+            ],
+            "treatment_assignment": "alternating_sorted_client_plus_task_index_v1",
+            "planned_agent_runs": planned,
+        }
+        secret_bytes = tuple(value.encode("utf-8") for value in credentials.values())
+        journal = (
+            RunJournal.open(run_state_root, run_identity)
+            if mode == "live" and run_state_root is not None
+            else None
+        )
         pairs: list[dict[str, Any]] = []
         all_runs: list[dict[str, Any]] = []
-        if mode == "live":
-            for client_index, client in enumerate(clients):
-                client_root = private / "live" / client
-                baseline_paths = (
-                    templates[client].executable.parent,
-                    pathlib.Path("/usr/bin"),
-                    pathlib.Path("/bin"),
-                )
-                enabled_paths = (shim_directory, *baseline_paths)
-                for task_index, task in enumerate(TASKS):
-                    task_root = client_root / task.task_id
-                    task_root.mkdir(mode=0o700, parents=True)
-                    pair_repository = task_root / "repository"
-                    pair_fixture = create_fixture_repository(
-                        pair_repository, bootstrap_environment, timeout_seconds
-                    )
-                    if pair_fixture["fixture_digest_sha256"] != fixture["fixture_digest_sha256"]:
-                        raise HarnessRefusal(
-                            "fixture_mismatch", "fresh pair fixture differs from the pinned fixture"
-                        )
-                    initial_repository_diff = repository_diff(
-                        pair_fixture["file_sha256"],
-                        snapshot_repository_contents(pair_repository),
-                    )
-                    if not initial_repository_diff["clean"]:
-                        raise HarnessRefusal("fixture_dirty", "fresh pair fixture is not exact")
-                    again_home = task_root / "again-state"
-                    again_home.mkdir(mode=0o700)
-                    baseline_again_home = task_root / "baseline-state"
-                    stats_environment = dict(bootstrap_environment)
-                    stats_environment["AGAIN_HOME"] = str(again_home)
-                    order = treatment_order(client_index, task_index)
-                    condition_records: dict[str, dict[str, Any]] = {}
-                    setup_summary: dict[str, Any] | None = None
-                    for condition in order:
-                        before = read_again_stats(
-                            again_binary,
-                            pair_repository,
-                            stats_environment,
-                            timeout_seconds,
-                        )
-                        runs, condition_setup = run_cohort(
-                            client=client,
-                            condition=condition,
-                            task=task,
-                            template=templates[client],
-                            model=models[client],
-                            workspace=pair_repository,
-                            run_root=task_root / "runs",
-                            again_home=(
-                                again_home
-                                if condition == "again_enabled"
-                                else baseline_again_home
-                            ),
-                            baseline_paths=baseline_paths,
-                            enabled_paths=enabled_paths,
-                            setup_binary=again_binary,
-                            setup_environment=bootstrap_environment,
-                            credential_name=credential_names[client],
-                            credential_value=credentials[client],
-                            timeout_seconds=timeout_seconds,
-                        )
-                        after = read_again_stats(
-                            again_binary,
-                            pair_repository,
-                            stats_environment,
-                            timeout_seconds,
-                        )
-                        delta = stats_delta(before, after)
-                        final_repository_diff = repository_diff(
-                            pair_fixture["file_sha256"],
-                            snapshot_repository_contents(pair_repository),
-                        )
-                        if not final_repository_diff["clean"]:
-                            raise HarnessRefusal(
-                                "unexpected_repository_mutation",
-                                "agent condition changed the retained fixture repository",
-                            )
-                        if condition == "baseline" and any(delta.values()):
-                            raise HarnessRefusal(
-                                "baseline_contaminated",
-                                "Again stats changed during baseline condition",
-                            )
-                        condition_records[condition] = {
-                            "runs": runs,
-                            "gateway_stats_delta": delta,
-                            "repository_diff": final_repository_diff,
-                        }
-                        if condition_setup is not None:
-                            setup_summary = condition_setup
-                    if setup_summary is None:
-                        raise HarnessRefusal(
-                            "setup_plan", "enabled condition did not retain an Again setup plan"
-                        )
-                    baseline_runs = condition_records["baseline"]["runs"]
-                    enabled_runs = condition_records["again_enabled"]["runs"]
-                    gateway_delta = condition_records["again_enabled"][
-                        "gateway_stats_delta"
-                    ]
-                    reconciliation = classify_paired_run(
-                        baseline_runs, enabled_runs, gateway_delta
-                    )
-                    pair = {
+        dry_run_matrix: list[dict[str, Any]] = []
+        resumed_completed_pairs = 0
+        invocation_agent_runs = 0
+        for client_index, client in enumerate(clients):
+            for task_index, task in enumerate(TASKS):
+                order = treatment_order(client_index, task_index)
+                dry_run_matrix.append(
+                    {
+                        "pair_id": f"{client}--{task.task_id}",
                         "client": client,
                         "task_id": task.task_id,
-                        "concurrency": task.concurrency,
+                        "agent_runs": 2 * task.concurrency,
                         "treatment_order": list(order),
-                        "fresh_isolated_state": True,
-                        "fixture_git_sha": pair_fixture["git_sha"],
-                        "initial_repository_diff": initial_repository_diff,
-                        "baseline": condition_records["baseline"],
-                        "again_enabled": {
-                            **condition_records["again_enabled"],
-                            "setup": setup_summary,
-                        },
-                        "reconciliation": reconciliation,
+                        "status": (
+                            "not_executed_offline_plan" if mode == "dry-run" else "scheduled_live"
+                        ),
                     }
+                )
+        if mode == "live":
+            for client_index, client in enumerate(clients):
+                for task_index, task in enumerate(TASKS):
+                    if journal is None:
+                        raise HarnessRefusal("run_state", "live run journal was not initialized")
+                    pair_id = f"{client}--{task.task_id}"
+                    order = treatment_order(client_index, task_index)
+                    pair = journal.load_completed(pair_id)
+                    if pair is not None:
+                        if (
+                            pair.get("client") != client
+                            or pair.get("task_id") != task.task_id
+                            or pair.get("concurrency") != task.concurrency
+                            or pair.get("treatment_order") != list(order)
+                        ):
+                            raise HarnessRefusal(
+                                "journal_pair", "completed pair does not match its matrix position"
+                            )
+                        pair_runs = [
+                            *pair["baseline"]["runs"],
+                            *pair["again_enabled"]["runs"],
+                        ]
+                        resumed_completed_pairs += 1
+                        pairs.append(pair)
+                        all_runs.extend(pair_runs)
+                        continue
+                    agent_slots = 2 * task.concurrency
+                    if invocation_agent_runs + agent_slots > maximum_runs:
+                        raise HarnessRefusal(
+                            "maximum_runs", "next atomic pair would exceed the live run ceiling"
+                        )
+                    attempt = journal.start_attempt(pair_id, agent_slots)
+                    try:
+                        pair, pair_runs = execute_live_pair(
+                            private=private,
+                            client=client,
+                            task=task,
+                            order=order,
+                            attempt_number=attempt.number,
+                            template=templates[client],
+                            model=models[client],
+                            credential_name=credential_names[client],
+                            credential_value=credentials[client],
+                            again_binary=again_binary,
+                            shim_directory=shim_directory,
+                            bootstrap_environment=bootstrap_environment,
+                            fixture_digest_sha256=fixture["fixture_digest_sha256"],
+                            timeout_seconds=timeout_seconds,
+                        )
+                        journal.complete_attempt(attempt, pair, secret_bytes)
+                    except BaseException as error:
+                        if isinstance(error, HarnessRefusal):
+                            failure_code = error.code
+                        elif isinstance(error, KeyboardInterrupt):
+                            failure_code = "interrupted"
+                        else:
+                            failure_code = "internal_failure"
+                        journal.fail_attempt(attempt, failure_code)
+                        raise
+                    invocation_agent_runs += agent_slots
                     pairs.append(pair)
-                    all_runs.extend(baseline_runs)
-                    all_runs.extend(enabled_runs)
+                    all_runs.extend(pair_runs)
 
         aggregate_gateway = {name: 0 for name in STATS_FIELDS}
         false_hits = 0
@@ -1858,20 +2046,14 @@ def evaluate(
                 "per_run_timeout_seconds": timeout_seconds,
             },
             "provenance": {
-                "source_git_sha": source_git_sha(
-                    source_root, bootstrap_environment, timeout_seconds
-                ),
-                "harness_sha256": file_sha256(pathlib.Path(__file__).resolve()),
+                "source_git_sha": source_revision,
+                "harness_sha256": harness_sha256,
                 "again": again,
                 "fixture_repository_git_sha": fixture["git_sha"],
                 "fixture_file_sha256": fixture["file_sha256"],
                 "fixture_digest_sha256": fixture["fixture_digest_sha256"],
-                "platform": {
-                    "system": platform.system(),
-                    "release": platform.release(),
-                    "machine": platform.machine(),
-                    "python": platform.python_version(),
-                },
+                "platform": platform_identity,
+                "run_identity_sha256": sha256_bytes(canonical_json_bytes(run_identity)),
             },
             "clients": {
                 client: {
@@ -1895,6 +2077,8 @@ def evaluate(
                 ),
                 "planned_agent_runs": planned,
                 "executed_agent_runs": len(all_runs),
+                "executed_agent_runs_this_invocation": invocation_agent_runs,
+                "resumed_completed_pairs": resumed_completed_pairs,
                 "tasks": [
                     {
                         "task_id": task.task_id,
@@ -1917,6 +2101,7 @@ def evaluate(
                     "estimated_tokens_avoided": "explicit Again stats estimate",
                 },
             },
+            "dry_run_matrix": dry_run_matrix,
             "paired_runs": pairs,
             "aggregate": {
                 "gateway": aggregate_gateway,
@@ -1939,6 +2124,8 @@ def evaluate(
                     "value": aggregate_gateway["estimated_tokens_avoided"],
                 },
             },
+            "run_journal": journal.summary() if journal is not None else None,
+            "statistical_review": review_statistical_claims(mode, pairs, all_runs),
             "limitations": [
                 "No model-quality improvement is inferred from these samples.",
                 "Token savings are not claimed; only direct client counts and explicitly labeled Again estimates are recorded.",
@@ -1948,7 +2135,6 @@ def evaluate(
             ],
             "manual_live_runs_remaining": planned if mode == "dry-run" else 0,
         }
-        secret_bytes = tuple(value.encode("utf-8") for value in credentials.values())
         return evidence, secret_bytes
 
 
@@ -1985,6 +2171,277 @@ def write_json_exclusive(
     os.close(descriptor)
 
 
+def read_bounded_json_object(path: pathlib.Path) -> dict[str, Any]:
+    try:
+        before = path.lstat()
+    except OSError as error:
+        raise HarnessRefusal("journal_read", "journal file is unreadable") from error
+    if (
+        stat.S_ISLNK(before.st_mode)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_size > MAX_JOURNAL_FILE_BYTES
+    ):
+        raise HarnessRefusal("journal_unsafe", "journal entry is not a bounded regular file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise HarnessRefusal("journal_read", "journal file could not be opened") from error
+    value = bytearray()
+    try:
+        opened = os.fstat(descriptor)
+        if _stat_identity(before) != _stat_identity(opened):
+            raise HarnessRefusal("journal_race", "journal file changed while opening")
+        while True:
+            block = os.read(descriptor, 64 * 1024)
+            if not block:
+                break
+            value.extend(block)
+            if len(value) > MAX_JOURNAL_FILE_BYTES:
+                raise HarnessRefusal("journal_bound", "journal file exceeded its read bound")
+        after_handle = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    after_path = path.lstat()
+    if (
+        _stat_identity(before) != _stat_identity(after_handle)
+        or _stat_identity(before) != _stat_identity(after_path)
+        or len(value) != before.st_size
+    ):
+        raise HarnessRefusal("journal_race", "journal file changed while reading")
+    decoded = strict_json_loads(bytes(value))
+    if not isinstance(decoded, dict):
+        raise HarnessRefusal("journal_shape", "journal entry is not a JSON object")
+    return decoded
+
+
+def _ensure_private_directory(path: pathlib.Path, *, create: bool) -> None:
+    if create:
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise HarnessRefusal("journal_directory", "journal directory could not be created") from error
+    try:
+        metadata = path.lstat()
+    except OSError as error:
+        raise HarnessRefusal("journal_directory", "journal directory is unreadable") from error
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise HarnessRefusal(
+            "journal_directory", "journal directories must be private non-symlink directories"
+        )
+
+
+class RunJournal:
+    """Append-only pair journal; only complete pair envelopes are comparison evidence."""
+
+    SCHEMA = "again.agent-gateway-real-agent-run-journal.v1"
+
+    def __init__(self, root: pathlib.Path, identity: Mapping[str, Any]):
+        self.root = root
+        self.identity = dict(identity)
+        self.identity_sha256 = sha256_bytes(canonical_json_bytes(self.identity))
+        self.attempts = root / "attempts"
+        self.pairs = root / "pairs"
+
+    @classmethod
+    def open(cls, root: pathlib.Path, identity: Mapping[str, Any]) -> RunJournal:
+        if not root.is_absolute():
+            raise HarnessRefusal("journal_directory", "run-state directory must be absolute")
+        root_existed = root.exists() or root.is_symlink()
+        _ensure_private_directory(root, create=True)
+        journal = cls(root, identity)
+        manifest_path = root / "manifest.json"
+        if not manifest_path.exists():
+            if root_existed and any(root.iterdir()):
+                raise HarnessRefusal(
+                    "journal_uninitialized", "existing run-state directory has no manifest"
+                )
+            write_json_exclusive(
+                manifest_path,
+                {
+                    "schema": cls.SCHEMA,
+                    "identity": journal.identity,
+                    "identity_sha256": journal.identity_sha256,
+                },
+            )
+        manifest = read_bounded_json_object(manifest_path)
+        if manifest != {
+            "schema": cls.SCHEMA,
+            "identity": journal.identity,
+            "identity_sha256": journal.identity_sha256,
+        }:
+            raise HarnessRefusal(
+                "journal_identity_mismatch", "run-state manifest does not match this evaluation"
+            )
+        for directory in (journal.attempts, journal.pairs):
+            _ensure_private_directory(directory, create=True)
+        journal._validate_entry_bound()
+        return journal
+
+    def _validate_entry_bound(self) -> None:
+        entries = list(self.root.rglob("*"))
+        if len(entries) > MAX_JOURNAL_ATTEMPTS * 4 + 16:
+            raise HarnessRefusal("journal_bound", "run-state directory has too many entries")
+        for path in entries:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise HarnessRefusal("journal_unsafe", "run-state directory contains a symlink")
+
+    @staticmethod
+    def _validate_pair_id(pair_id: str) -> None:
+        if not re.fullmatch(r"[a-z0-9_]+--[a-z0-9_]+", pair_id):
+            raise HarnessRefusal("journal_pair_id", "journal pair ID is invalid")
+
+    def _attempt_path(self, attempt: JournalAttempt, status: str) -> pathlib.Path:
+        return self.attempts / f"{attempt.pair_id}.{attempt.number:04d}.{status}.json"
+
+    def _pair_path(self, pair_id: str) -> pathlib.Path:
+        self._validate_pair_id(pair_id)
+        return self.pairs / f"{pair_id}.complete.json"
+
+    def load_completed(self, pair_id: str) -> dict[str, Any] | None:
+        path = self._pair_path(pair_id)
+        if not path.exists() and not path.is_symlink():
+            return None
+        envelope = read_bounded_json_object(path)
+        pair = envelope.get("pair")
+        if not isinstance(pair, dict):
+            raise HarnessRefusal("journal_pair", "completed journal pair is malformed")
+        expected = {
+            "schema": self.SCHEMA,
+            "identity_sha256": self.identity_sha256,
+            "pair_id": pair_id,
+            "pair_sha256": sha256_bytes(canonical_json_bytes(pair)),
+            "comparison_eligible": True,
+            "pair": pair,
+        }
+        if envelope != expected:
+            raise HarnessRefusal("journal_pair", "completed journal pair failed validation")
+        return pair
+
+    def start_attempt(self, pair_id: str, agent_slots: int) -> JournalAttempt:
+        self._validate_pair_id(pair_id)
+        if self.load_completed(pair_id) is not None:
+            raise HarnessRefusal("journal_pair_complete", "completed pair cannot be rerun")
+        started_paths = sorted(self.attempts.glob(f"{pair_id}.*.started.json"))
+        if len(started_paths) >= MAX_JOURNAL_ATTEMPTS:
+            raise HarnessRefusal("journal_bound", "pair has too many retained attempts")
+        numbers: list[int] = []
+        for started_path in started_paths:
+            match = re.fullmatch(
+                rf"{re.escape(pair_id)}\.(\d{{4}})\.started\.json", started_path.name
+            )
+            if match is None:
+                raise HarnessRefusal("journal_attempt", "journal attempt name is malformed")
+            number = int(match.group(1))
+            numbers.append(number)
+            attempt = JournalAttempt(pair_id, number)
+            terminal_paths = [
+                self._attempt_path(attempt, status)
+                for status in ("abandoned", "failed", "finished")
+            ]
+            present = [path for path in terminal_paths if path.exists() or path.is_symlink()]
+            if len(present) > 1:
+                raise HarnessRefusal("journal_attempt", "journal attempt has multiple terminal states")
+            if not present:
+                write_json_exclusive(
+                    self._attempt_path(attempt, "abandoned"),
+                    {
+                        "schema": self.SCHEMA,
+                        "identity_sha256": self.identity_sha256,
+                        "pair_id": pair_id,
+                        "attempt": number,
+                        "status": "abandoned",
+                        "comparison_eligible": False,
+                    },
+                )
+        number = max(numbers, default=0) + 1
+        if number > MAX_JOURNAL_ATTEMPTS:
+            raise HarnessRefusal("journal_bound", "pair attempt count exceeded its bound")
+        attempt = JournalAttempt(pair_id, number)
+        write_json_exclusive(
+            self._attempt_path(attempt, "started"),
+            {
+                "schema": self.SCHEMA,
+                "identity_sha256": self.identity_sha256,
+                "pair_id": pair_id,
+                "attempt": number,
+                "agent_slots": agent_slots,
+                "status": "started",
+                "comparison_eligible": False,
+            },
+        )
+        return attempt
+
+    def fail_attempt(self, attempt: JournalAttempt, failure_code: str) -> None:
+        validate_identifier(failure_code, "failure code")
+        write_json_exclusive(
+            self._attempt_path(attempt, "failed"),
+            {
+                "schema": self.SCHEMA,
+                "identity_sha256": self.identity_sha256,
+                "pair_id": attempt.pair_id,
+                "attempt": attempt.number,
+                "status": "failed",
+                "failure_code": failure_code,
+                "comparison_eligible": False,
+            },
+        )
+
+    def complete_attempt(
+        self,
+        attempt: JournalAttempt,
+        pair: Mapping[str, Any],
+        credentials: Sequence[bytes] = (),
+    ) -> None:
+        pair_value = dict(pair)
+        pair_path = self._pair_path(attempt.pair_id)
+        write_json_exclusive(
+            pair_path,
+            {
+                "schema": self.SCHEMA,
+                "identity_sha256": self.identity_sha256,
+                "pair_id": attempt.pair_id,
+                "pair_sha256": sha256_bytes(canonical_json_bytes(pair_value)),
+                "comparison_eligible": True,
+                "pair": pair_value,
+            },
+            credentials,
+        )
+        write_json_exclusive(
+            self._attempt_path(attempt, "finished"),
+            {
+                "schema": self.SCHEMA,
+                "identity_sha256": self.identity_sha256,
+                "pair_id": attempt.pair_id,
+                "attempt": attempt.number,
+                "status": "finished",
+                "comparison_eligible": True,
+            },
+        )
+
+    def summary(self) -> dict[str, Any]:
+        completed = sorted(self.pairs.glob("*.complete.json"))
+        abandoned = sorted(self.attempts.glob("*.abandoned.json"))
+        failed = sorted(self.attempts.glob("*.failed.json"))
+        return {
+            "schema": self.SCHEMA,
+            "identity_sha256": self.identity_sha256,
+            "completed_pairs": len(completed),
+            "abandoned_attempts": len(abandoned),
+            "failed_attempts": len(failed),
+            "only_complete_pairs_are_comparison_eligible": True,
+        }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
@@ -2006,6 +2463,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--claude-credential-env", default="ANTHROPIC_API_KEY")
     parser.add_argument("--max-runs", type=int, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
+    parser.add_argument("--run-state-dir", type=pathlib.Path)
     parser.add_argument("--json-out", type=pathlib.Path, required=True)
     arguments = parser.parse_args(argv)
     if arguments.json_out.exists() or arguments.json_out.is_symlink():
@@ -2040,6 +2498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         },
         maximum_runs=arguments.max_runs,
         timeout_seconds=arguments.timeout_seconds,
+        run_state_root=arguments.run_state_dir,
     )
     write_json_exclusive(output, evidence, credentials)
     print(f"wrote {evidence['evidence_kind']} to {output}")
