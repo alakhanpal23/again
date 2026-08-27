@@ -18,13 +18,14 @@ pub enum BackendKind {
     RemoteMcp,
 }
 
-/// The exact authority a backend possesses in this sprint.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Non-authoritative capability metadata emitted only by the constructors in
+/// this module. It is presentation data, not an execution capability token.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendAuthority {
-    pub exact_local_read: bool,
-    pub local_command_execution: bool,
-    pub remote_tool_forwarding: bool,
+    exact_local_read: bool,
+    local_command_execution: bool,
+    remote_tool_forwarding: bool,
 }
 
 impl BackendAuthority {
@@ -43,17 +44,60 @@ impl BackendAuthority {
         local_command_execution: false,
         remote_tool_forwarding: true,
     };
+
+    #[must_use]
+    pub const fn permits_exact_local_read(self) -> bool {
+        self.exact_local_read
+    }
+
+    #[must_use]
+    pub const fn permits_local_command_execution(self) -> bool {
+        self.local_command_execution
+    }
+
+    #[must_use]
+    pub const fn permits_remote_tool_forwarding(self) -> bool {
+        self.remote_tool_forwarding
+    }
 }
 
 /// Availability and authority metadata that Terminal A can inspect without
 /// accidentally invoking a backend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BackendDescriptor {
-    pub kind: BackendKind,
-    pub available: bool,
-    pub authority: BackendAuthority,
-    pub qualification: Qualification,
+    kind: BackendKind,
+    available: bool,
+    authority: BackendAuthority,
+    qualification: Qualification,
+}
+
+impl BackendDescriptor {
+    #[must_use]
+    pub const fn kind(self) -> BackendKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub const fn is_available(self) -> bool {
+        self.available
+    }
+
+    #[must_use]
+    pub const fn authority(self) -> BackendAuthority {
+        self.authority
+    }
+
+    #[must_use]
+    pub const fn qualification(self) -> Qualification {
+        self.qualification
+    }
+
+    /// Backend descriptors can inform routing but can never authorize a call.
+    #[must_use]
+    pub const fn is_authoritative(self) -> bool {
+        false
+    }
 }
 
 /// Qualification is deliberately explicit: configured is not qualified.

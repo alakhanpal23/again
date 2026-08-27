@@ -5,6 +5,7 @@
 //! not persist credentials, approve sensitive calls, invoke an AI model, or
 //! perform local command execution.
 
+use std::cell::Cell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -70,20 +71,26 @@ impl Default for GatewayLimits {
     }
 }
 
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[derive(Clone, Eq, Error, PartialEq)]
 pub enum GatewayInputError {
     #[error("JSON-RPC frame is {actual} bytes; limit is {limit}")]
     MessageTooLarge { limit: usize, actual: usize },
-    #[error("malformed JSON: {message}")]
-    MalformedJson { message: String },
-    #[error("duplicate JSON object key: {key}")]
-    DuplicateKey { key: String },
+    #[error("malformed JSON")]
+    MalformedJson,
+    #[error("duplicate JSON object key")]
+    DuplicateKey,
     #[error("JSON depth {actual} exceeds limit {limit}")]
     DepthLimit { limit: usize, actual: usize },
     #[error("JSON node count exceeds limit {limit}")]
     NodeLimit { limit: usize },
     #[error("invalid JSON-RPC request: {message}")]
     InvalidRequest { message: String },
+}
+
+impl fmt::Debug for GatewayInputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, formatter)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,19 +103,29 @@ pub enum McpErrorCode {
     InternalError = -32_603,
     NotInitialized = -32_020,
     LimitExceeded = -32_021,
-    ApprovalRequired = -32_022,
     RequestCancelled = -32_800,
 }
 
 /// JSON-RPC/MCP error object.  Provider errors use this same type and are
 /// forwarded without code, message, or data rewriting.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpError {
     pub code: i64,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+impl fmt::Debug for McpError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("McpError")
+            .field("code", &self.code)
+            .field("message", &"<redacted>")
+            .field("data", &self.data.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl McpError {
@@ -236,31 +253,9 @@ impl<'a> EphemeralSecrets<'a> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ApprovalGrant {
-    logical_call_id: LogicalCallId,
-    namespaced_tool_name: String,
-}
-
-impl ApprovalGrant {
-    #[must_use]
-    pub fn new(logical_call_id: LogicalCallId, namespaced_tool_name: impl Into<String>) -> Self {
-        Self {
-            logical_call_id,
-            namespaced_tool_name: namespaced_tool_name.into(),
-        }
-    }
-
-    fn authorizes(&self, logical_call_id: &LogicalCallId, namespaced_tool_name: &str) -> bool {
-        self.logical_call_id == *logical_call_id
-            && self.namespaced_tool_name == namespaced_tool_name
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GatewayRequestContext {
     pub authorization_scope: AuthorizationScopeId,
     pub logical_call_id: LogicalCallId,
-    pub approval: Option<ApprovalGrant>,
 }
 
 impl GatewayRequestContext {
@@ -269,14 +264,7 @@ impl GatewayRequestContext {
         Self {
             authorization_scope,
             logical_call_id,
-            approval: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_approval(mut self, approval: ApprovalGrant) -> Self {
-        self.approval = Some(approval);
-        self
     }
 }
 
@@ -303,29 +291,45 @@ pub enum EffectClass {
     ReadOnly,
     Mutating,
     ExternalSideEffect,
+    Privileged,
     Unknown,
 }
 
 impl EffectClass {
-    #[must_use]
-    pub const fn replayable(self) -> bool {
-        matches!(self, Self::ReadOnly)
-    }
-
-    #[must_use]
-    pub const fn user_sensitive(self) -> bool {
-        matches!(
-            self,
-            Self::Mutating | Self::ExternalSideEffect | Self::Unknown
-        )
-    }
-
     const fn wire_name(self) -> &'static str {
         match self {
             Self::ReadOnly => "read_only",
             Self::Mutating => "mutating",
             Self::ExternalSideEffect => "external_side_effect",
+            Self::Privileged => "privileged",
             Self::Unknown => "unknown",
+        }
+    }
+
+    #[must_use]
+    pub const fn reuse_disposition(self) -> ReuseDispositionV1 {
+        if matches!(self, Self::ReadOnly) {
+            ReuseDispositionV1::EligibleForStateEvaluation
+        } else {
+            ReuseDispositionV1::BypassReuse
+        }
+    }
+}
+
+/// Routing-only reuse disposition. Eligibility requests later state
+/// evaluation; it is never evidence that a result may be reused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReuseDispositionV1 {
+    EligibleForStateEvaluation,
+    BypassReuse,
+}
+
+impl ReuseDispositionV1 {
+    const fn wire_name(self) -> &'static str {
+        match self {
+            Self::EligibleForStateEvaluation => "eligible_for_state_evaluation",
+            Self::BypassReuse => "bypass_reuse",
         }
     }
 }
@@ -357,9 +361,15 @@ impl ProviderTool {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct CapturedToolResult {
     exact: Value,
+}
+
+impl fmt::Debug for CapturedToolResult {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CapturedToolResult(<redacted>)")
+    }
 }
 
 impl CapturedToolResult {
@@ -374,7 +384,95 @@ impl CapturedToolResult {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// Canonical, explicitly non-authoritative translation of one MCP tool call.
+/// It is complete enough for a later core-lane mapping, but cannot itself
+/// grant reuse.
+#[derive(Clone, Eq, PartialEq)]
+pub struct GatewayToolCallTranslationV1 {
+    schema_version: u16,
+    provider_identity: String,
+    tool_schema_identity: String,
+    namespaced_tool_name: String,
+    upstream_tool_name: String,
+    authorization_scope_identity: String,
+    freshness: Freshness,
+    disposition: ReuseDispositionV1,
+    canonical_arguments: Vec<u8>,
+    canonical_digest: [u8; 32],
+}
+
+impl fmt::Debug for GatewayToolCallTranslationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayToolCallTranslationV1")
+            .field("schema_version", &self.schema_version)
+            .field("disposition", &self.disposition)
+            .field("canonical_digest", &self.canonical_digest)
+            .field("canonical_arguments", &"<redacted>")
+            .finish()
+    }
+}
+
+impl GatewayToolCallTranslationV1 {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    #[must_use]
+    pub fn provider_identity(&self) -> &str {
+        &self.provider_identity
+    }
+
+    #[must_use]
+    pub fn tool_schema_identity(&self) -> &str {
+        &self.tool_schema_identity
+    }
+
+    #[must_use]
+    pub fn namespaced_tool_name(&self) -> &str {
+        &self.namespaced_tool_name
+    }
+
+    #[must_use]
+    pub fn upstream_tool_name(&self) -> &str {
+        &self.upstream_tool_name
+    }
+
+    #[must_use]
+    pub fn authorization_scope_identity(&self) -> &str {
+        &self.authorization_scope_identity
+    }
+
+    #[must_use]
+    pub const fn freshness(&self) -> &Freshness {
+        &self.freshness
+    }
+
+    #[must_use]
+    pub const fn disposition(&self) -> ReuseDispositionV1 {
+        self.disposition
+    }
+
+    #[must_use]
+    pub fn canonical_arguments(&self) -> &[u8] {
+        &self.canonical_arguments
+    }
+
+    #[must_use]
+    pub const fn canonical_digest(&self) -> &[u8; 32] {
+        &self.canonical_digest
+    }
+
+    /// This translation is an input to later authority evaluation, never an
+    /// authority result.
+    #[must_use]
+    pub const fn permits_reuse(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct ProviderCall {
     pub logical_call_id: LogicalCallId,
     pub physical_attempt_id: PhysicalAttemptId,
@@ -385,7 +483,23 @@ pub struct ProviderCall {
     pub arguments: Value,
     pub freshness: Freshness,
     pub effect: EffectClass,
-    pub replayable: bool,
+    pub translation: GatewayToolCallTranslationV1,
+}
+
+impl fmt::Debug for ProviderCall {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderCall")
+            .field("logical_call_id", &self.logical_call_id)
+            .field("physical_attempt_id", &self.physical_attempt_id)
+            .field("provider_identity", &self.provider_identity)
+            .field("upstream_tool_name", &self.upstream_tool_name)
+            .field("namespaced_tool_name", &self.namespaced_tool_name)
+            .field("arguments", &"<redacted>")
+            .field("effect", &self.effect)
+            .field("translation", &self.translation)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -872,29 +986,6 @@ impl McpGateway {
             });
             return Some(error_response(response_id, error));
         }
-        if route.effect.user_sensitive()
-            && !context.approval.as_ref().is_some_and(|approval| {
-                approval.authorizes(&context.logical_call_id, &route.namespaced_name)
-            })
-        {
-            self.audit.record(GatewayAuditEvent {
-                logical_call_id: context.logical_call_id.0.clone(),
-                physical_attempt_id: None,
-                authorization_scope: context.authorization_scope.0.clone(),
-                provider_identity: Some(route.provider_identity.clone()),
-                tool_schema_identity: Some(route.schema_identity.clone()),
-                effect: Some(route.effect),
-                outcome: AuditOutcome::Rejected,
-            });
-            return Some(error_response(
-                response_id,
-                McpError::typed(
-                    McpErrorCode::ApprovalRequired,
-                    "explicit user approval is required for this tool",
-                ),
-            ));
-        }
-
         let physical_attempt_id =
             PhysicalAttemptId(self.next_physical_attempt.fetch_add(1, Ordering::Relaxed));
         let cancellation = ProviderCancellation {
@@ -930,6 +1021,7 @@ impl McpGateway {
             }
         }
 
+        let translation = translate_tool_call_v1(&route, &arguments, context, &freshness);
         let call = ProviderCall {
             logical_call_id: context.logical_call_id.clone(),
             physical_attempt_id,
@@ -940,7 +1032,7 @@ impl McpGateway {
             arguments,
             freshness,
             effect: route.effect,
-            replayable: route.effect.replayable(),
+            translation,
         };
         let upstream = route
             .provider
@@ -972,13 +1064,19 @@ impl McpGateway {
                 Some(success_response(response_id, exact))
             }
             Err(error) => {
-                self.record_call_audit(
-                    context,
-                    &route,
-                    physical_attempt_id,
-                    AuditOutcome::ProviderError,
-                );
-                Some(error_response(response_id, error.0))
+                let (outcome, forwarded) = if validate_provider_error(&error.0, self.limits) {
+                    (AuditOutcome::ProviderError, error.0)
+                } else {
+                    (
+                        AuditOutcome::Rejected,
+                        McpError::typed(
+                            McpErrorCode::LimitExceeded,
+                            "upstream provider error exceeded gateway limits",
+                        ),
+                    )
+                };
+                self.record_call_audit(context, &route, physical_attempt_id, outcome);
+                Some(error_response(response_id, forwarded))
             }
         }
     }
@@ -1166,7 +1264,7 @@ fn error_response(id: Value, error: McpError) -> Value {
 
 fn input_error_to_mcp(error: &GatewayInputError) -> McpError {
     match error {
-        GatewayInputError::MalformedJson { .. } | GatewayInputError::DuplicateKey { .. } => {
+        GatewayInputError::MalformedJson | GatewayInputError::DuplicateKey => {
             McpError::typed(McpErrorCode::ParseError, "invalid JSON")
         }
         GatewayInputError::MessageTooLarge { .. }
@@ -1335,6 +1433,45 @@ fn tool_schema_identity(tool: &ProviderTool) -> String {
     tagged_blake3("again.mcp.tool-schema.v1", &canonical_json_bytes(&identity))
 }
 
+fn translate_tool_call_v1(
+    route: &ToolRoute,
+    arguments: &Value,
+    context: &GatewayRequestContext,
+    freshness: &Freshness,
+) -> GatewayToolCallTranslationV1 {
+    const TRANSLATION_SCHEMA_VERSION_V1: u16 = 1;
+    let disposition = route.effect.reuse_disposition();
+    let canonical_arguments = canonical_json_bytes(arguments);
+    let canonical_record = json!({
+        "schemaVersion": TRANSLATION_SCHEMA_VERSION_V1,
+        "providerIdentity": route.provider_identity,
+        "toolSchemaIdentity": route.schema_identity,
+        "namespacedToolName": route.namespaced_name,
+        "upstreamToolName": route.definition.name,
+        "authorizationScopeIdentity": context.authorization_scope.as_str(),
+        "freshness": freshness,
+        "reuseDisposition": disposition,
+        "arguments": arguments,
+    });
+    let canonical_record = canonical_json_bytes(&canonical_record);
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.mcp.gateway-tool-call-translation.v1");
+    hasher.update(&[0]);
+    hasher.update(&canonical_record);
+    GatewayToolCallTranslationV1 {
+        schema_version: TRANSLATION_SCHEMA_VERSION_V1,
+        provider_identity: route.provider_identity.clone(),
+        tool_schema_identity: route.schema_identity.clone(),
+        namespaced_tool_name: route.namespaced_name.clone(),
+        upstream_tool_name: route.definition.name.clone(),
+        authorization_scope_identity: context.authorization_scope.0.clone(),
+        freshness: freshness.clone(),
+        disposition,
+        canonical_arguments,
+        canonical_digest: *hasher.finalize().as_bytes(),
+    }
+}
+
 fn tagged_blake3(domain: &str, bytes: &[u8]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain.as_bytes());
@@ -1398,6 +1535,33 @@ fn validate_freshness(freshness: &Freshness, limits: GatewayLimits) -> Result<()
     Ok(())
 }
 
+fn validate_provider_error(error: &McpError, limits: GatewayLimits) -> bool {
+    if error.message.len() > limits.max_metadata_bytes {
+        return false;
+    }
+    if let Some(data) = &error.data
+        && validate_value_bounds(
+            data,
+            limits.max_result_depth,
+            limits.max_result_nodes,
+            limits.max_result_bytes,
+        )
+        .is_err()
+    {
+        return false;
+    }
+    let Ok(value) = serde_json::to_value(error) else {
+        return false;
+    };
+    validate_value_bounds(
+        &value,
+        limits.max_result_depth,
+        limits.max_result_nodes,
+        limits.max_result_bytes,
+    )
+    .is_ok()
+}
+
 fn tool_list_value(route: &ToolRoute) -> Value {
     let mut tool = Map::new();
     tool.insert("name".into(), Value::String(route.namespaced_name.clone()));
@@ -1438,8 +1602,8 @@ fn tool_list_value(route: &ToolRoute) -> Value {
         Value::String(route.effect.wire_name().into()),
     );
     meta.insert(
-        "again.dev/replayable".into(),
-        Value::Bool(route.effect.replayable()),
+        "again.dev/reuseDisposition".into(),
+        Value::String(route.effect.reuse_disposition().wire_name().into()),
     );
     tool.insert("_meta".into(), Value::Object(meta));
     Value::Object(tool)
@@ -1643,9 +1807,25 @@ fn validate_value_bounds(
                     .ok_or(ValueBoundViolation::Bytes)?;
             }
             Value::Array(values) => {
-                stack.extend(values.iter().map(|value| (value, depth + 1)));
+                let remaining = max_nodes.saturating_sub(nodes).saturating_sub(stack.len());
+                if values.len() > remaining {
+                    return Err(ValueBoundViolation::Nodes);
+                }
+                stack
+                    .try_reserve(values.len())
+                    .map_err(|_| ValueBoundViolation::Nodes)?;
+                for value in values {
+                    stack.push((value, depth + 1));
+                }
             }
             Value::Object(object) => {
+                let remaining = max_nodes.saturating_sub(nodes).saturating_sub(stack.len());
+                if object.len() > remaining {
+                    return Err(ValueBoundViolation::Nodes);
+                }
+                stack
+                    .try_reserve(object.len())
+                    .map_err(|_| ValueBoundViolation::Nodes)?;
                 for (key, value) in object {
                     string_bytes = string_bytes
                         .checked_add(key.len())
@@ -1675,24 +1855,40 @@ fn parse_bounded_json(input: &[u8], limits: GatewayLimits) -> Result<Value, Gate
         });
     }
     let mut deserializer = serde_json::Deserializer::from_slice(input);
-    let value = UniqueValueSeed
-        .deserialize(&mut deserializer)
-        .map_err(|error| {
-            let message = error.to_string();
-            if let Some(key) = message
-                .strip_prefix("duplicate object key `")
-                .and_then(|rest| rest.split('`').next())
-            {
-                GatewayInputError::DuplicateKey { key: key.into() }
-            } else {
-                GatewayInputError::MalformedJson { message }
+    let budget = ParseBudgetV1 {
+        nodes: Cell::new(0),
+        max_nodes: limits.max_json_nodes,
+        max_depth: limits.max_json_depth,
+    };
+    let value = UniqueValueSeed {
+        budget: &budget,
+        depth: 1,
+    }
+    .deserialize(&mut deserializer)
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.starts_with("__again_duplicate_key__") {
+            GatewayInputError::DuplicateKey
+        } else if let Some(actual) = message
+            .strip_prefix("__again_depth__")
+            .and_then(|rest| rest.split(':').next())
+            .and_then(|actual| actual.parse().ok())
+        {
+            GatewayInputError::DepthLimit {
+                limit: limits.max_json_depth,
+                actual,
             }
-        })?;
+        } else if message.starts_with("__again_nodes__") {
+            GatewayInputError::NodeLimit {
+                limit: limits.max_json_nodes,
+            }
+        } else {
+            GatewayInputError::MalformedJson
+        }
+    })?;
     deserializer
         .end()
-        .map_err(|error| GatewayInputError::MalformedJson {
-            message: error.to_string(),
-        })?;
+        .map_err(|_| GatewayInputError::MalformedJson)?;
     validate_value_bounds(
         &value,
         limits.max_json_depth,
@@ -1715,22 +1911,62 @@ fn parse_bounded_json(input: &[u8], limits: GatewayLimits) -> Result<Value, Gate
     Ok(value)
 }
 
-struct UniqueValueSeed;
+struct ParseBudgetV1 {
+    nodes: Cell<usize>,
+    max_nodes: usize,
+    max_depth: usize,
+}
 
-impl<'de> DeserializeSeed<'de> for UniqueValueSeed {
+impl ParseBudgetV1 {
+    fn observe<E: de::Error>(&self, depth: usize) -> Result<(), E> {
+        if depth > self.max_depth {
+            return Err(E::custom(format!("__again_depth__{depth}:")));
+        }
+        let nodes = self
+            .nodes
+            .get()
+            .checked_add(1)
+            .ok_or_else(|| E::custom("__again_nodes__"))?;
+        if nodes > self.max_nodes {
+            return Err(E::custom("__again_nodes__"));
+        }
+        self.nodes.set(nodes);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UniqueValueSeed<'a> {
+    budget: &'a ParseBudgetV1,
+    depth: usize,
+}
+
+impl UniqueValueSeed<'_> {
+    fn child(self) -> Self {
+        Self {
+            budget: self.budget,
+            depth: self.depth.saturating_add(1),
+        }
+    }
+}
+
+impl<'de> DeserializeSeed<'de> for UniqueValueSeed<'_> {
     type Value = Value;
 
     fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_any(UniqueValueVisitor)
+        self.budget.observe::<D::Error>(self.depth)?;
+        deserializer.deserialize_any(UniqueValueVisitor { seed: self })
     }
 }
 
-struct UniqueValueVisitor;
+struct UniqueValueVisitor<'a> {
+    seed: UniqueValueSeed<'a>,
+}
 
-impl<'de> Visitor<'de> for UniqueValueVisitor {
+impl<'de> Visitor<'de> for UniqueValueVisitor<'_> {
     type Value = Value;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1781,7 +2017,7 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
     where
         D: Deserializer<'de>,
     {
-        UniqueValueSeed.deserialize(deserializer)
+        self.seed.deserialize(deserializer)
     }
 
     fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
@@ -1789,7 +2025,7 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
         A: SeqAccess<'de>,
     {
         let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(1024));
-        while let Some(value) = sequence.next_element_seed(UniqueValueSeed)? {
+        while let Some(value) = sequence.next_element_seed(self.seed.child())? {
             values.push(value);
         }
         Ok(Value::Array(values))
@@ -1802,9 +2038,9 @@ impl<'de> Visitor<'de> for UniqueValueVisitor {
         let mut values = Map::new();
         while let Some(key) = object.next_key::<String>()? {
             if values.contains_key(&key) {
-                return Err(de::Error::custom(format!("duplicate object key `{key}`")));
+                return Err(de::Error::custom("__again_duplicate_key__"));
             }
-            let value = object.next_value_seed(UniqueValueSeed)?;
+            let value = object.next_value_seed(self.seed.child())?;
             values.insert(key, value);
         }
         Ok(Value::Object(values))

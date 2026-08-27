@@ -2,28 +2,25 @@
 mod execution_backend;
 
 use execution_backend::{
-    AuditedLocalRead, AuditedReadRequest, AuditedReadResult, BackendAuthority, BackendError,
-    BackendKind, ExactReadAdapter, Firecracker, GVisor, Qualification, RemoteMcp, RootlessLinux,
+    AuditedLocalRead, AuditedReadRequest, AuditedReadResult, BackendError, BackendKind,
+    ExactReadAdapter, Firecracker, GVisor, Qualification, RemoteMcp, RootlessLinux,
     UnsupportedReason,
 };
 
 #[test]
 fn authority_matrix_is_minimal_and_explicit() {
     let local = AuditedLocalRead.descriptor();
-    assert!(local.available);
-    assert_eq!(local.qualification, Qualification::Composable);
-    assert_eq!(
-        local.authority,
-        BackendAuthority {
-            exact_local_read: true,
-            local_command_execution: false,
-            remote_tool_forwarding: false,
-        }
-    );
+    assert!(local.is_available());
+    assert_eq!(local.qualification(), Qualification::Composable);
+    assert!(local.authority().permits_exact_local_read());
+    assert!(!local.authority().permits_local_command_execution());
+    assert!(!local.authority().permits_remote_tool_forwarding());
+    assert!(!local.is_authoritative());
 
     let rootless = RootlessLinux.descriptor();
-    assert!(!rootless.available);
-    assert!(!rootless.authority.local_command_execution);
+    assert_eq!(rootless.kind(), BackendKind::RootlessLinux);
+    assert!(!rootless.is_available());
+    assert!(!rootless.authority().permits_local_command_execution());
 
     let gvisor = GVisor {
         runtime_name: "runsc".into(),
@@ -33,18 +30,18 @@ fn authority_matrix_is_minimal_and_explicit() {
         profile_name: "future-profile".into(),
     }
     .descriptor();
-    assert_eq!(gvisor.qualification, Qualification::DescriptorOnly);
-    assert_eq!(firecracker.qualification, Qualification::DescriptorOnly);
-    assert_eq!(gvisor.authority, rootless.authority);
-    assert_eq!(firecracker.authority, rootless.authority);
+    assert_eq!(gvisor.qualification(), Qualification::DescriptorOnly);
+    assert_eq!(firecracker.qualification(), Qualification::DescriptorOnly);
+    assert_eq!(gvisor.authority(), rootless.authority());
+    assert_eq!(firecracker.authority(), rootless.authority());
 
     let remote = RemoteMcp {
         provider_identity: "provider-identity".into(),
     }
     .descriptor();
-    assert!(remote.available);
-    assert!(remote.authority.remote_tool_forwarding);
-    assert!(!remote.authority.local_command_execution);
+    assert!(remote.is_available());
+    assert!(remote.authority().permits_remote_tool_forwarding());
+    assert!(!remote.authority().permits_local_command_execution());
 }
 
 #[test]
@@ -81,9 +78,9 @@ fn unavailable_sandbox_backends_return_typed_unsupported() {
 #[test]
 fn rootless_linux_cannot_accidentally_gain_command_authority() {
     let descriptor = RootlessLinux.descriptor();
-    assert!(!descriptor.available);
-    assert!(!descriptor.authority.local_command_execution);
-    assert_eq!(descriptor.qualification, Qualification::CommandFree);
+    assert!(!descriptor.is_available());
+    assert!(!descriptor.authority().permits_local_command_execution());
+    assert_eq!(descriptor.qualification(), Qualification::CommandFree);
 
     // Its public API accepts no command, argv, environment, closure, or adapter.
     let refusal = RootlessLinux.require_available().unwrap_err();

@@ -7,11 +7,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 use mcp_gateway::{
-    ApprovalGrant, AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecret,
-    EphemeralSecrets, Freshness, FreshnessMetadata, GatewayAuditEvent, GatewayAuditSink,
-    GatewayInputError, GatewayLimits, GatewayRequestContext, LogicalCallId, McpError, McpErrorCode,
-    McpGateway, ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError,
-    ProviderRegistration, ProviderTool, SideEffectClassification, StructuredResultCapture,
+    AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecret, EphemeralSecrets,
+    Freshness, FreshnessMetadata, GatewayAuditEvent, GatewayAuditSink, GatewayInputError,
+    GatewayLimits, GatewayRequestContext, LogicalCallId, McpError, McpErrorCode, McpGateway,
+    ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration,
+    ProviderTool, ReuseDispositionV1, SideEffectClassification, StructuredResultCapture,
     ToolCancellation, ToolDiscovery, ToolExecution,
 };
 use serde_json::{Value, json};
@@ -31,6 +31,7 @@ struct FakeProvider {
     cancellations: Mutex<Vec<ProviderCancellation>>,
     block: Option<Arc<BlockState>>,
     observed_secret: Mutex<Option<Vec<u8>>>,
+    freshness: Freshness,
 }
 
 impl FakeProvider {
@@ -49,6 +50,10 @@ impl FakeProvider {
             cancellations: Mutex::new(Vec::new()),
             block: None,
             observed_secret: Mutex::new(None),
+            freshness: Freshness {
+                revision: "fake-revision-7".into(),
+                observed_at_unix_ms: Some(123_456),
+            },
         }
     }
 
@@ -64,6 +69,11 @@ impl FakeProvider {
 
     fn blocking(mut self, state: Arc<BlockState>) -> Self {
         self.block = Some(state);
+        self
+    }
+
+    fn with_freshness(mut self, revision: &str) -> Self {
+        self.freshness.revision = revision.into();
         self
     }
 }
@@ -112,10 +122,7 @@ impl ToolCancellation for FakeProvider {
 
 impl FreshnessMetadata for FakeProvider {
     fn freshness(&self) -> Freshness {
-        Freshness {
-            revision: "fake-revision-7".into(),
-            observed_at_unix_ms: Some(123_456),
-        }
+        self.freshness.clone()
     }
 }
 
@@ -324,6 +331,135 @@ fn tools_call_forwards_exact_arguments_and_structured_result() {
 }
 
 #[test]
+fn canonical_translation_is_deterministic_complete_redacted_and_non_authoritative() {
+    let provider = Arc::new(FakeProvider::new("fake", vec![tool("echo")]));
+    let gateway = gateway(Arc::clone(&provider));
+    initialize(&gateway);
+    for (id, arguments) in [
+        (
+            2,
+            serde_json::from_str::<Value>(r#"{"b":2,"a":1}"#).unwrap(),
+        ),
+        (
+            3,
+            serde_json::from_str::<Value>(r#"{"a":1,"b":2}"#).unwrap(),
+        ),
+    ] {
+        let response = invoke(
+            &gateway,
+            json!({
+                "jsonrpc":"2.0", "id":id, "method":"tools/call",
+                "params":{"name":"fake.echo","arguments":arguments}
+            }),
+            &context("logical:canonical"),
+        );
+        assert!(response.get("result").is_some());
+    }
+    let calls = provider.calls.lock().unwrap();
+    let first = &calls[0].translation;
+    let second = &calls[1].translation;
+    assert_eq!(first.schema_version(), 1);
+    assert_eq!(first.provider_identity(), calls[0].provider_identity);
+    assert_eq!(first.namespaced_tool_name(), "fake.echo");
+    assert_eq!(first.upstream_tool_name(), "echo");
+    assert_eq!(first.authorization_scope_identity(), "scope:test");
+    assert_eq!(first.freshness().revision, "fake-revision-7");
+    assert_eq!(first.canonical_arguments(), br#"{"a":1,"b":2}"#);
+    assert_eq!(first.canonical_digest(), second.canonical_digest());
+    assert_eq!(first.tool_schema_identity().len(), 64);
+    assert!(!first.permits_reuse());
+    assert!(!format!("{:?}", calls[0]).contains("\"a\":1"));
+
+    let captured = CapturedToolResult::exact(json!({ "secret": "result-payload" }));
+    assert!(!format!("{captured:?}").contains("result-payload"));
+    let error = McpError {
+        code: -1,
+        message: "secret-message".into(),
+        data: Some(json!({ "secret": "error-payload" })),
+    };
+    let diagnostic = format!("{error:?}");
+    assert!(!diagnostic.contains("secret-message"));
+    assert!(!diagnostic.contains("error-payload"));
+}
+
+fn translation_digest_for(
+    provider: FakeProvider,
+    authorization_scope: &str,
+    arguments: Value,
+) -> [u8; 32] {
+    let provider = Arc::new(provider);
+    let gateway = gateway(Arc::clone(&provider));
+    initialize(&gateway);
+    let call_context = GatewayRequestContext::new(
+        AuthorizationScopeId::new(authorization_scope).unwrap(),
+        LogicalCallId::new("logical:binding-check").unwrap(),
+    );
+    let response = invoke(
+        &gateway,
+        json!({
+            "jsonrpc":"2.0", "id":77, "method":"tools/call",
+            "params":{"name":"fake.echo","arguments":arguments}
+        }),
+        &call_context,
+    );
+    assert!(response.get("result").is_some());
+    *provider.calls.lock().unwrap()[0]
+        .translation
+        .canonical_digest()
+}
+
+#[test]
+fn canonical_translation_digest_binds_every_declared_identity_dimension() {
+    let baseline = translation_digest_for(
+        FakeProvider::new("fake", vec![tool("echo")]),
+        "scope:one",
+        json!({ "value": 1 }),
+    );
+
+    let mut changed_provider = FakeProvider::new("fake", vec![tool("echo")]);
+    changed_provider.descriptor.version = "2.0.0".into();
+    let changed_provider =
+        translation_digest_for(changed_provider, "scope:one", json!({ "value": 1 }));
+
+    let changed_schema = translation_digest_for(
+        FakeProvider::new(
+            "fake",
+            vec![ProviderTool::new(
+                "echo",
+                json!({ "type":"object", "properties": { "other": { "type":"number" } } }),
+            )],
+        ),
+        "scope:one",
+        json!({ "value": 1 }),
+    );
+    let changed_scope = translation_digest_for(
+        FakeProvider::new("fake", vec![tool("echo")]),
+        "scope:two",
+        json!({ "value": 1 }),
+    );
+    let changed_freshness = translation_digest_for(
+        FakeProvider::new("fake", vec![tool("echo")]).with_freshness("revision-8"),
+        "scope:one",
+        json!({ "value": 1 }),
+    );
+    let changed_arguments = translation_digest_for(
+        FakeProvider::new("fake", vec![tool("echo")]),
+        "scope:one",
+        json!({ "value": 2 }),
+    );
+
+    for changed in [
+        changed_provider,
+        changed_schema,
+        changed_scope,
+        changed_freshness,
+        changed_arguments,
+    ] {
+        assert_ne!(baseline, changed);
+    }
+}
+
+#[test]
 fn provider_error_is_forwarded_exactly() {
     let upstream = McpError {
         code: -31_777,
@@ -348,6 +484,50 @@ fn provider_error_is_forwarded_exactly() {
 }
 
 #[test]
+fn oversized_or_deep_provider_errors_become_payload_free_limit_refusals() {
+    let mut deep_data = json!({ "must_not_escape": true });
+    for _ in 0..GatewayLimits::default().max_result_depth {
+        deep_data = json!({ "nested": deep_data });
+    }
+    for upstream in [
+        McpError {
+            code: -31_778,
+            message: "x".repeat(GatewayLimits::default().max_metadata_bytes + 1),
+            data: Some(json!({ "must_not_escape": "message-case" })),
+        },
+        McpError {
+            code: -31_779,
+            message: "bounded".into(),
+            data: Some(deep_data.clone()),
+        },
+    ] {
+        let provider = Arc::new(
+            FakeProvider::new("fake", vec![tool("fail")]).with_result(Err(ProviderError(upstream))),
+        );
+        let gateway = McpGateway::new(
+            vec![ProviderRegistration::untrusted(provider)],
+            GatewayLimits::default(),
+        )
+        .unwrap();
+        initialize(&gateway);
+        let response = invoke(
+            &gateway,
+            json!({
+                "jsonrpc":"2.0", "id":9, "method":"tools/call",
+                "params":{"name":"fake.fail","arguments":{}}
+            }),
+            &context("logical:bounded-error"),
+        );
+        assert_eq!(
+            response["error"]["code"],
+            McpErrorCode::LimitExceeded as i64
+        );
+        assert!(response["error"].get("data").is_none());
+        assert!(!response.to_string().contains("must_not_escape"));
+    }
+}
+
+#[test]
 fn malformed_oversized_deep_node_heavy_and_duplicate_input_are_rejected() {
     let limits = GatewayLimits {
         max_message_bytes: 512,
@@ -360,7 +540,7 @@ fn malformed_oversized_deep_node_heavy_and_duplicate_input_are_rejected() {
 
     assert!(matches!(
         gateway.parse_message(br#"{"jsonrpc":"2.0",]"#),
-        Err(GatewayInputError::MalformedJson { .. })
+        Err(GatewayInputError::MalformedJson)
     ));
     assert!(matches!(
         gateway.parse_message(&vec![b'x'; 513]),
@@ -368,7 +548,7 @@ fn malformed_oversized_deep_node_heavy_and_duplicate_input_are_rejected() {
     ));
     assert_eq!(
         gateway.parse_message(br#"{"jsonrpc":"2.0","id":1,"id":2,"method":"ping"}"#),
-        Err(GatewayInputError::DuplicateKey { key: "id".into() })
+        Err(GatewayInputError::DuplicateKey)
     );
 
     initialize(&gateway);
@@ -391,6 +571,33 @@ fn malformed_oversized_deep_node_heavy_and_duplicate_input_are_rejected() {
         &context("logical:nodes"),
     );
     assert_eq!(nodes["error"]["code"], -32_021);
+}
+
+#[test]
+fn parser_enforces_global_depth_nodes_and_nested_duplicate_keys_during_decode() {
+    let limits = GatewayLimits {
+        max_json_depth: 3,
+        max_json_nodes: 5,
+        ..GatewayLimits::default()
+    };
+    let gateway = McpGateway::new(Vec::new(), limits).unwrap();
+    assert_eq!(gateway.parse_message(br#"[[[]]]"#).unwrap(), json!([[[]]]));
+    assert!(matches!(
+        gateway.parse_message(br#"[[[[]]]]"#),
+        Err(GatewayInputError::DepthLimit {
+            limit: 3,
+            actual: 4
+        })
+    ));
+    assert!(matches!(
+        gateway.parse_message(br#"[0,1,2,3,4]"#),
+        Err(GatewayInputError::NodeLimit { limit: 5 })
+    ));
+    let duplicate = gateway
+        .parse_message(br#"{"outer":{"payload-secret":1,"payload-secret":2}}"#)
+        .unwrap_err();
+    assert_eq!(duplicate, GatewayInputError::DuplicateKey);
+    assert!(!format!("{duplicate:?}").contains("payload-secret"));
 }
 
 #[test]
@@ -509,47 +716,55 @@ fn audit_records_are_secret_free_and_credentials_are_ephemeral() {
 }
 
 #[test]
-fn mutating_and_external_tools_are_non_replayable_and_require_approval() {
+fn non_read_only_tools_transparently_bypass_reuse_and_reach_the_provider() {
     let provider = Arc::new(
-        FakeProvider::new("fake", vec![tool("read"), tool("mutate"), tool("external")])
-            .with_effect("mutate", EffectClass::Mutating)
-            .with_effect("external", EffectClass::ExternalSideEffect),
+        FakeProvider::new(
+            "fake",
+            vec![
+                tool("read"),
+                tool("mutate"),
+                tool("external"),
+                tool("privileged"),
+                tool("unknown"),
+            ],
+        )
+        .with_effect("mutate", EffectClass::Mutating)
+        .with_effect("external", EffectClass::ExternalSideEffect)
+        .with_effect("privileged", EffectClass::Privileged)
+        .with_effect("unknown", EffectClass::Unknown),
     );
     let gateway = gateway(Arc::clone(&provider));
     initialize(&gateway);
 
-    let denied = invoke(
-        &gateway,
-        json!({
-            "jsonrpc":"2.0", "id":2, "method":"tools/call",
-            "params":{"name":"fake.mutate","arguments":{}}
-        }),
-        &context("logical:mutate"),
-    );
-    assert_eq!(denied["error"]["code"], -32_022);
-    assert!(provider.calls.lock().unwrap().is_empty());
-
     for (id, name, logical) in [
-        (3, "fake.mutate", "logical:mutate-approved"),
-        (4, "fake.external", "logical:external-approved"),
+        (2, "fake.read", "logical:read"),
+        (3, "fake.mutate", "logical:mutate"),
+        (4, "fake.external", "logical:external"),
+        (5, "fake.privileged", "logical:privileged"),
+        (6, "fake.unknown", "logical:unknown"),
     ] {
-        let logical_id = LogicalCallId::new(logical).unwrap();
-        let approved = context(logical).with_approval(ApprovalGrant::new(logical_id, name));
         let response = invoke(
             &gateway,
             json!({
                 "jsonrpc":"2.0", "id":id, "method":"tools/call",
                 "params":{"name":name,"arguments":{}}
             }),
-            &approved,
+            &context(logical),
         );
         assert!(response.get("result").is_some());
     }
     let calls = provider.calls.lock().unwrap();
-    assert_eq!(calls[0].effect, EffectClass::Mutating);
-    assert!(!calls[0].replayable);
-    assert_eq!(calls[1].effect, EffectClass::ExternalSideEffect);
-    assert!(!calls[1].replayable);
+    assert_eq!(
+        calls[0].translation.disposition(),
+        ReuseDispositionV1::EligibleForStateEvaluation
+    );
+    for call in &calls[1..] {
+        assert_eq!(
+            call.translation.disposition(),
+            ReuseDispositionV1::BypassReuse
+        );
+        assert!(!call.translation.permits_reuse());
+    }
 }
 
 #[test]
@@ -585,10 +800,16 @@ fn untrusted_annotations_cannot_make_an_unknown_tool_replayable() {
     let tools = listed["result"]["tools"].as_array().unwrap();
     assert_eq!(tools[0]["name"], "trusted.annotated");
     assert_eq!(tools[0]["_meta"]["again.dev/effectClass"], "read_only");
-    assert_eq!(tools[0]["_meta"]["again.dev/replayable"], true);
+    assert_eq!(
+        tools[0]["_meta"]["again.dev/reuseDisposition"],
+        "eligible_for_state_evaluation"
+    );
     assert_eq!(tools[1]["name"], "untrusted.annotated");
     assert_eq!(tools[1]["_meta"]["again.dev/effectClass"], "unknown");
-    assert_eq!(tools[1]["_meta"]["again.dev/replayable"], false);
+    assert_eq!(
+        tools[1]["_meta"]["again.dev/reuseDisposition"],
+        "bypass_reuse"
+    );
 }
 
 fn identities_for(provider: FakeProvider) -> (String, String) {
