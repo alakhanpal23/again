@@ -192,7 +192,8 @@ class GatewayProductE2ETest(unittest.TestCase):
             INSERT INTO gateway_events
                 (call_id, gateway_result_id, event_type, reason,
                  estimated_tokens_avoided, created_ms)
-            VALUES (NULL, ?1, 'binding_quarantined', 'result_corrupt', 0, 1000)
+            VALUES ('quarantine-audit-call', ?1, 'binding_quarantined',
+                    'result_corrupt', 0, 1000)
             """,
             (result_id,),
         )
@@ -201,7 +202,8 @@ class GatewayProductE2ETest(unittest.TestCase):
         reader = harness.GatewayEvents(database)
         events = reader.result_events(result_id, harness.EventWindow(999, 2000, 1, 1))
         self.assertEqual(len(events), 1)
-        self.assertIsNone(events[0]["call_id"])
+        self.assertEqual(events[0]["call_id"], "quarantine-audit-call")
+        self.assertIsNone(events[0]["request_row_call_id"])
         self.assertEqual(events[0]["reason"], "result_corrupt")
         self.assertEqual(
             harness.reconcile_events(events, {"binding_quarantined": 1}),

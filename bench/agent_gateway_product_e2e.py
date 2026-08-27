@@ -755,13 +755,15 @@ class GatewayEvents:
         with self._snapshot() as connection:
             rows = connection.execute(
                 """
-                SELECT id, event_type, call_id, lease_id, gateway_result_id,
-                       reason, created_ms
-                FROM gateway_events
-                WHERE gateway_result_id = ?1
-                  AND id BETWEEN ?2 AND ?3
-                  AND created_ms BETWEEN ?4 AND ?5
-                ORDER BY id
+                SELECT e.id, e.event_type, e.call_id, e.lease_id,
+                       e.gateway_result_id, e.reason, e.created_ms,
+                       r.call_id AS request_row_call_id
+                FROM gateway_events AS e
+                LEFT JOIN gateway_requests AS r ON r.call_id = e.call_id
+                WHERE e.gateway_result_id = ?1
+                  AND e.id BETWEEN ?2 AND ?3
+                  AND e.created_ms BETWEEN ?4 AND ?5
+                ORDER BY e.id
                 """,
                 (
                     gateway_result_id,
@@ -1422,7 +1424,7 @@ def run_product_e2e(
             corrupt_events = corrupt_reader.result_events(current_result_id, window)
             corrupt_counts = reconcile_events(corrupt_events, {"binding_quarantined": 1})
             if (
-                corrupt_events[0].get("call_id") is not None
+                corrupt_events[0].get("request_row_call_id") is not None
                 or corrupt_events[0].get("reason") != "result_corrupt"
             ):
                 raise HarnessRefusal(
