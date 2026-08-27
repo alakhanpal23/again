@@ -260,9 +260,12 @@ root. Its fixed six-directory lookup resolves the frozen `PT_INTERP` and ordered
 `DT_NEEDED` graph under explicit node, depth, byte, lookup, descriptor, and
 memory bounds. This is deliberately not a loader proof: loader cache, preload,
 environment, `RPATH`/`RUNPATH`, glibc-hwcaps, virtual-environment, and pytest
-semantics remain unmodeled. A native dual-publication test exists but still
-requires execution on hosted Ubuntu; the local x86_64 QEMU attempt timed out
-before the test ran and is not positive evidence.
+semantics remain unmodeled. The native dual-publication test passed on hosted
+Ubuntu at source commit `eec5d95edd2b01a94c3ac8bd76c2c5dc0f26f502` in
+[CI run 33028269206](https://github.com/alakhanpal23/again/actions/runs/33028269206),
+including complete fixed-directory lookup and refusal after a published runtime
+mutation. The earlier local x86_64 QEMU timeout remains non-evidence, and this
+structural result does not qualify the loader or authorize execution.
 
 The runtime, stdio, and isolation owners now meet at one command-free connector
 checkpoint. It requires the real runtime checkpoint and concrete
