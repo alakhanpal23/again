@@ -266,6 +266,29 @@ fn stale_freshness_never_issues_a_router_proof() {
 }
 
 #[test]
+fn store_rows_cannot_satisfy_external_revalidation_by_themselves() {
+    let temp = TempDir::new().unwrap();
+    let store = Store::open(temp.path().join("state")).unwrap();
+    let call = make_call(
+        EffectClass::FreshnessBoundRead,
+        FreshnessRequirementV1::RequireRevalidation,
+        "revalidation",
+    );
+    let binding = binding(&call);
+    let lease = leader(store.acquire_gateway_call(&binding, "owner").unwrap());
+    assert_eq!(
+        store.start_gateway_execution(&lease, "owner").unwrap(),
+        GatewayExecutionStart::Started
+    );
+    assert!(matches!(
+        store
+            .observe_gateway_route_proof_v1(&binding, &call)
+            .unwrap(),
+        GatewayRouteProofObservationV1::Unavailable(GatewayRouteProofUnavailableV1::Freshness)
+    ));
+}
+
+#[test]
 fn lifecycle_generation_advances_after_expiry_and_old_record_is_not_selected() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("state");

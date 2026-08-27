@@ -124,9 +124,6 @@ pub fn route_gateway_candidate_v1(
 #[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 enum VerifiedCandidateOriginV1 {
-    RecordedExecution {
-        store_record_digest: DigestReferenceV1,
-    },
     DeterministicCoverage {
         rule_id: String,
         rule_version: String,
@@ -139,16 +136,13 @@ enum VerifiedCandidateOriginV1 {
         model_id: String,
         model_version: String,
     },
-    LegacyUntrustedStoreObservation,
 }
 
 impl fmt::Debug for VerifiedCandidateOriginV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self {
-            Self::RecordedExecution { .. } => "recorded_execution",
             Self::DeterministicCoverage { .. } => "deterministic_coverage",
             Self::SemanticOrAiGenerated { .. } => "semantic_or_ai_generated",
-            Self::LegacyUntrustedStoreObservation => "legacy_untrusted_store_observation",
         };
         formatter
             .debug_struct("VerifiedCandidateOriginV1")
@@ -184,9 +178,6 @@ impl fmt::Debug for ReuseCandidateV1 {
 pub enum CandidateEvidenceRefusalV1 {
     Identifier,
     Digest,
-    Lifecycle,
-    Effect,
-    Freshness,
 }
 
 impl ReuseCandidateV1 {
@@ -241,32 +232,6 @@ fn validate_origin_identifier(value: &str) -> Result<(), CandidateEvidenceRefusa
     Ok(())
 }
 
-pub(crate) struct VerifiedStoreCandidateEvidenceV1 {
-    pub(crate) request_digest: RequestDigestV1,
-    pub(crate) result_digest: DigestReferenceV1,
-    pub(crate) store_record_digest: DigestReferenceV1,
-    pub(crate) freshness: CandidateFreshnessV1,
-}
-
-pub(crate) fn issue_recorded_candidate_v1(
-    evidence: VerifiedStoreCandidateEvidenceV1,
-) -> Result<ReuseCandidateV1, CandidateEvidenceRefusalV1> {
-    evidence
-        .result_digest
-        .validate_bounded()
-        .map_err(|_| CandidateEvidenceRefusalV1::Digest)?;
-    evidence
-        .store_record_digest
-        .validate_bounded()
-        .map_err(|_| CandidateEvidenceRefusalV1::Digest)?;
-    Ok(ReuseCandidateV1 {
-        request_digest: evidence.request_digest,
-        result_digest: evidence.result_digest,
-        origin: VerifiedCandidateOriginV1::LegacyUntrustedStoreObservation,
-        freshness: evidence.freshness,
-    })
-}
-
 #[allow(dead_code)]
 pub(crate) struct VerifiedCoverageEvidenceV1 {
     pub(crate) request_digest: RequestDigestV1,
@@ -308,74 +273,6 @@ pub(crate) fn issue_coverage_candidate_v1(
     })
 }
 
-#[derive(PartialEq, Eq)]
-pub(crate) struct InflightJoinEvidenceV1 {
-    request_digest: RequestDigestV1,
-    effect_class: EffectClass,
-    lifecycle_generation: u64,
-    observed_generation: u64,
-    started_at_millis: u64,
-    observed_at_millis: u64,
-    revalidated_at_generation: Option<u64>,
-    freshness: CandidateFreshnessV1,
-}
-
-impl fmt::Debug for InflightJoinEvidenceV1 {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("InflightJoinEvidenceV1(<redacted>)")
-    }
-}
-
-pub(crate) struct CoordinatorJoinObservationV1 {
-    pub(crate) request_digest: RequestDigestV1,
-    pub(crate) effect_class: EffectClass,
-    pub(crate) lifecycle_generation: u64,
-    pub(crate) observed_generation: u64,
-    pub(crate) started_at_millis: u64,
-    pub(crate) observed_at_millis: u64,
-    pub(crate) revalidated_at_generation: Option<u64>,
-}
-
-pub(crate) fn issue_inflight_join_evidence_v1(
-    observation: CoordinatorJoinObservationV1,
-) -> Result<InflightJoinEvidenceV1, CandidateEvidenceRefusalV1> {
-    if observation.lifecycle_generation == 0
-        || observation.lifecycle_generation != observation.observed_generation
-    {
-        return Err(CandidateEvidenceRefusalV1::Lifecycle);
-    }
-    if !matches!(
-        observation.effect_class,
-        EffectClass::SnapshotRead
-            | EffectClass::FreshnessBoundRead
-            | EffectClass::DeterministicCompute
-    ) {
-        return Err(CandidateEvidenceRefusalV1::Effect);
-    }
-    let age = observation
-        .observed_at_millis
-        .checked_sub(observation.started_at_millis)
-        .ok_or(CandidateEvidenceRefusalV1::Freshness)?;
-    let freshness =
-        if observation.revalidated_at_generation == Some(observation.lifecycle_generation) {
-            CandidateFreshnessV1::Revalidated
-        } else if observation.effect_class == EffectClass::SnapshotRead {
-            CandidateFreshnessV1::ExactSnapshot
-        } else {
-            CandidateFreshnessV1::AgeMillis(age)
-        };
-    Ok(InflightJoinEvidenceV1 {
-        request_digest: observation.request_digest,
-        effect_class: observation.effect_class,
-        lifecycle_generation: observation.lifecycle_generation,
-        observed_generation: observation.observed_generation,
-        started_at_millis: observation.started_at_millis,
-        observed_at_millis: observation.observed_at_millis,
-        revalidated_at_generation: observation.revalidated_at_generation,
-        freshness,
-    })
-}
-
 #[derive(Default)]
 pub struct RoutingCandidatesV1 {
     store_exact: Option<StoreExactResultProofV1>,
@@ -401,12 +298,6 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    pub(crate) fn with_exact(self, _candidate: ReuseCandidateV1) -> Self {
-        // Compatibility only: caller-described evidence can no longer enter
-        // the exact-serve slot. Store transactions issue the sealed proof.
-        self
-    }
-
     pub fn with_store_exact_proof(mut self, proof: StoreExactResultProofV1) -> Self {
         self.store_exact = Some(proof);
         self
@@ -420,12 +311,6 @@ impl RoutingCandidatesV1 {
         ) {
             self.deterministic_coverage = Some(candidate);
         }
-        self
-    }
-
-    pub(crate) fn with_inflight(self, _evidence: InflightJoinEvidenceV1) -> Self {
-        // Compatibility only; synthesized lifecycle observations do not grant
-        // join authority.
         self
     }
 
@@ -557,19 +442,8 @@ mod authority_tests {
     }
 
     #[test]
-    fn legacy_store_observations_cannot_serve_but_coverage_stays_sealed() {
+    fn deterministic_coverage_stays_sealed() {
         let call = call(EffectClass::SnapshotRead, FreshnessRequirementV1::Snapshot);
-        let exact = issue_recorded_candidate_v1(VerifiedStoreCandidateEvidenceV1 {
-            request_digest: call.request_digest(),
-            result_digest: digest("result"),
-            store_record_digest: digest("store-record"),
-            freshness: CandidateFreshnessV1::ExactSnapshot,
-        })
-        .unwrap();
-        assert_eq!(
-            route(&call, &RoutingCandidatesV1::default().with_exact(exact)),
-            GatewayDecision::Execute
-        );
         let coverage = issue_coverage_candidate_v1(VerifiedCoverageEvidenceV1 {
             request_digest: call.request_digest(),
             result_digest: digest("covered-result"),
@@ -588,96 +462,5 @@ mod authority_tests {
             ),
             GatewayDecision::ServeDeterministicCoverage
         );
-    }
-
-    #[test]
-    fn legacy_coordinator_observations_cannot_join() {
-        let bounded_call = call(
-            EffectClass::FreshnessBoundRead,
-            FreshnessRequirementV1::MaxAgeMillis(50),
-        );
-        let observation = |age: u64, revalidated: bool| CoordinatorJoinObservationV1 {
-            request_digest: bounded_call.request_digest(),
-            effect_class: EffectClass::FreshnessBoundRead,
-            lifecycle_generation: 7,
-            observed_generation: 7,
-            started_at_millis: 100,
-            observed_at_millis: 100 + age,
-            revalidated_at_generation: revalidated.then_some(7),
-        };
-        let fresh = issue_inflight_join_evidence_v1(observation(50, false)).unwrap();
-        assert_eq!(
-            route(
-                &bounded_call,
-                &RoutingCandidatesV1::default().with_inflight(fresh)
-            ),
-            GatewayDecision::Execute
-        );
-        let stale = issue_inflight_join_evidence_v1(observation(51, false)).unwrap();
-        assert_eq!(
-            route(
-                &bounded_call,
-                &RoutingCandidatesV1::default().with_inflight(stale)
-            ),
-            GatewayDecision::Execute
-        );
-
-        let revalidation_call = call(
-            EffectClass::FreshnessBoundRead,
-            FreshnessRequirementV1::RequireRevalidation,
-        );
-        let evidence = issue_inflight_join_evidence_v1(CoordinatorJoinObservationV1 {
-            request_digest: revalidation_call.request_digest(),
-            effect_class: EffectClass::FreshnessBoundRead,
-            lifecycle_generation: 9,
-            observed_generation: 9,
-            started_at_millis: 100,
-            observed_at_millis: 200,
-            revalidated_at_generation: Some(9),
-        })
-        .unwrap();
-        assert_eq!(
-            route(
-                &revalidation_call,
-                &RoutingCandidatesV1::default().with_inflight(evidence)
-            ),
-            GatewayDecision::Execute
-        );
-    }
-
-    #[test]
-    fn invalid_coordinator_observations_never_issue_join_evidence() {
-        let call = call(EffectClass::SnapshotRead, FreshnessRequirementV1::Snapshot);
-        for observation in [
-            CoordinatorJoinObservationV1 {
-                request_digest: call.request_digest(),
-                effect_class: EffectClass::SnapshotRead,
-                lifecycle_generation: 1,
-                observed_generation: 2,
-                started_at_millis: 0,
-                observed_at_millis: 1,
-                revalidated_at_generation: None,
-            },
-            CoordinatorJoinObservationV1 {
-                request_digest: call.request_digest(),
-                effect_class: EffectClass::Mutation,
-                lifecycle_generation: 1,
-                observed_generation: 1,
-                started_at_millis: 0,
-                observed_at_millis: 1,
-                revalidated_at_generation: None,
-            },
-            CoordinatorJoinObservationV1 {
-                request_digest: call.request_digest(),
-                effect_class: EffectClass::SnapshotRead,
-                lifecycle_generation: 1,
-                observed_generation: 1,
-                started_at_millis: 2,
-                observed_at_millis: 1,
-                revalidated_at_generation: None,
-            },
-        ] {
-            assert!(issue_inflight_join_evidence_v1(observation).is_err());
-        }
     }
 }

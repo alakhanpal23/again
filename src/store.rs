@@ -303,6 +303,7 @@ pub enum GatewayCallAcquisition {
     },
     Follower {
         call_id: String,
+        lease_id: String,
         leader_call_id: String,
         leader: String,
         expires_at_ms: i64,
@@ -539,6 +540,7 @@ pub struct StoreInflightJoinProofV1 {
     observed_generation: u64,
     execution_started_ms: u64,
     observed_at_ms: u64,
+    lease_id: String,
     lease_record_digest: String,
 }
 
@@ -551,6 +553,10 @@ impl std::fmt::Debug for StoreInflightJoinProofV1 {
 impl StoreInflightJoinProofV1 {
     pub const fn lifecycle_generation(&self) -> u64 {
         self.lifecycle_generation
+    }
+
+    pub(crate) fn lease_id(&self) -> &str {
+        &self.lease_id
     }
 
     pub(crate) fn authorizes_router_call_v1(&self, call: &GatewayToolCallV1) -> bool {
@@ -1407,6 +1413,7 @@ impl Store {
             transaction.commit()?;
             return Ok(GatewayCallAcquisition::Follower {
                 call_id,
+                lease_id,
                 leader_call_id,
                 leader,
                 expires_at_ms,
@@ -1838,6 +1845,7 @@ impl Store {
             observed_generation: current_generation,
             execution_started_ms: started_at_ms,
             observed_at_ms,
+            lease_id: lease.lease_id.clone(),
             lease_record_digest,
         };
         transaction.commit()?;
@@ -2541,8 +2549,12 @@ fn freshness_requirement_holds_v1(
         return false;
     };
     match requirement {
-        FreshnessRequirementV1::Snapshot | FreshnessRequirementV1::RequireRevalidation => true,
+        FreshnessRequirementV1::Snapshot => true,
         FreshnessRequirementV1::MaxAgeMillis(maximum) => age <= maximum,
+        // The store can validate its own rows, but it cannot manufacture a
+        // fresh external-state revalidation. A later validator must issue a
+        // separate bound proof before this mode can route to reuse.
+        FreshnessRequirementV1::RequireRevalidation => false,
     }
 }
 

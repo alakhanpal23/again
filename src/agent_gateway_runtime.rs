@@ -27,11 +27,7 @@ use crate::agent_gateway::protocol::{
     PermissionClass, PresentationMode, ProviderIdentityV1, RepositoryEnvironmentStateV1,
     StateDigestReferenceV1, TaskIdentityV1, ToolIdentityV1, WorkspaceIdentityV1,
 };
-use crate::agent_gateway::router::{
-    CandidateFreshnessV1, CoordinatorJoinObservationV1, GatewayDecision, RoutingCandidatesV1,
-    VerifiedStoreCandidateEvidenceV1, issue_inflight_join_evidence_v1, issue_recorded_candidate_v1,
-    route,
-};
+use crate::agent_gateway::router::{GatewayDecision, RoutingCandidatesV1, route};
 use crate::mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecrets, Freshness,
     FreshnessMetadata, GatewayLimits, McpError, McpErrorCode, McpGateway, ProviderCall,
@@ -42,8 +38,8 @@ use crate::mcp_gateway::{
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
     GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayStats, Store, ValidatedGatewayReadV1,
-    gateway_policy_digest,
+    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayRouteProofObservationV1, GatewayStats,
+    Store, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -63,6 +59,7 @@ const MAX_SEARCH_RESULTS_V1: usize = 500;
 const MAX_SEARCH_LINE_BYTES_V1: usize = 4 * 1024;
 const MAX_SEARCH_OUTPUT_BYTES_V1: usize = 512 * 1024;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
+const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_millis(250);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 
 fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
@@ -378,19 +375,9 @@ impl GatewayControlledProviderV1 {
         epoch: &WorkspaceExecutionEpochV1,
         call: &ProviderCall,
         resolved: &ResolvedRequestV1,
-        call_id: String,
+        call_id: &str,
+        cancelled: &AtomicBool,
     ) -> Result<Option<Value>, ProviderError> {
-        let logical_call_id = call.logical_call_id.as_str().to_owned();
-        let physical_attempt_id = call.physical_attempt_id.get();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let _active = self.remember_active(
-            &logical_call_id,
-            physical_attempt_id,
-            ActiveCoordinatorV1::Follower {
-                call_id: call_id.clone(),
-                cancelled: Arc::clone(&cancelled),
-            },
-        );
         let deadline = Instant::now() + FOLLOWER_WAIT_V1;
         let answer = loop {
             if cancelled.load(Ordering::Acquire) {
@@ -433,7 +420,7 @@ impl GatewayControlledProviderV1 {
                 .store
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .cancel_gateway_follower(&call_id);
+                .cancel_gateway_follower(call_id);
         }
         answer
     }
@@ -536,19 +523,22 @@ impl ToolExecution for GatewayControlledProviderV1 {
             GatewayCallAcquisition::Ready {
                 gateway_result_id, ..
             } => {
-                let candidate = issue_recorded_candidate_v1(VerifiedStoreCandidateEvidenceV1 {
-                    request_digest: resolved.core_call.request_digest(),
-                    result_digest: DigestReferenceV1::new("blake3", &gateway_result_id)
-                        .map_err(|_| internal_provider_error_v1())?,
-                    store_record_digest: DigestReferenceV1::new("blake3", &gateway_result_id)
-                        .map_err(|_| internal_provider_error_v1())?,
-                    freshness: CandidateFreshnessV1::ExactSnapshot,
-                })
-                .map_err(|_| internal_provider_error_v1())?;
-                let decision = route(
-                    &resolved.core_call,
-                    &RoutingCandidatesV1::default().with_exact(candidate),
-                );
+                let proof = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .observe_gateway_route_proof_v1(&resolved.binding, &resolved.core_call);
+                let decision = match proof {
+                    Ok(GatewayRouteProofObservationV1::Exact(proof))
+                        if proof.gateway_result_id() == gateway_result_id =>
+                    {
+                        route(
+                            &resolved.core_call,
+                            &RoutingCandidatesV1::default().with_store_exact_proof(proof),
+                        )
+                    }
+                    _ => GatewayDecision::Execute,
+                };
                 if decision == GatewayDecision::ServeExact {
                     let value = self.load_exact(&resolved, &gateway_result_id);
                     let revalidated = self.resolve(&epoch, &call);
@@ -564,31 +554,55 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 self.execute_direct(&epoch, call, secrets)
             }
             GatewayCallAcquisition::Follower {
-                call_id,
-                expires_at_ms,
-                ..
+                call_id, lease_id, ..
             } => {
-                let now = now_millis_u64_v1();
-                let observed = now.min(u64::try_from(expires_at_ms).unwrap_or(now));
-                let evidence = issue_inflight_join_evidence_v1(CoordinatorJoinObservationV1 {
-                    request_digest: resolved.core_call.request_digest(),
-                    effect_class: CoreEffectClass::SnapshotRead,
-                    lifecycle_generation: 1,
-                    observed_generation: 1,
-                    started_at_millis: observed,
-                    observed_at_millis: observed,
-                    revalidated_at_generation: None,
-                });
-                if evidence.is_ok_and(|evidence| {
-                    route(
-                        &resolved.core_call,
-                        &RoutingCandidatesV1::default().with_inflight(evidence),
-                    ) == GatewayDecision::JoinInflight
-                }) && let Some(value) =
-                    self.wait_as_follower(&epoch, &call, &resolved, call_id)?
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let _active = self.remember_active(
+                    call.logical_call_id.as_str(),
+                    call.physical_attempt_id.get(),
+                    ActiveCoordinatorV1::Follower {
+                        call_id: call_id.clone(),
+                        cancelled: Arc::clone(&cancelled),
+                    },
+                );
+                let proof_deadline = Instant::now() + FOLLOWER_PROOF_WAIT_V1;
+                let decision = loop {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Err(cancelled_provider_error_v1());
+                    }
+                    let proof = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .observe_gateway_route_proof_v1(&resolved.binding, &resolved.core_call);
+                    match proof {
+                        Ok(GatewayRouteProofObservationV1::Inflight(proof))
+                            if proof.lease_id() == lease_id =>
+                        {
+                            break route(
+                                &resolved.core_call,
+                                &RoutingCandidatesV1::default().with_store_inflight_proof(proof),
+                            );
+                        }
+                        Ok(GatewayRouteProofObservationV1::Unavailable(
+                            crate::store::GatewayRouteProofUnavailableV1::ExecutionNotStarted,
+                        )) if Instant::now() < proof_deadline => {
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                        _ => break GatewayDecision::Execute,
+                    }
+                };
+                if decision == GatewayDecision::JoinInflight
+                    && let Some(value) =
+                        self.wait_as_follower(&epoch, &call, &resolved, &call_id, &cancelled)?
                 {
                     return Ok(value);
                 }
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .cancel_gateway_follower(&call_id);
                 self.execute_direct(&epoch, call, secrets)
             }
             GatewayCallAcquisition::Leader {
@@ -1194,10 +1208,6 @@ fn now_millis_i64_v1() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-fn now_millis_u64_v1() -> u64 {
-    u64::try_from(now_millis_i64_v1()).unwrap_or_default()
-}
-
 fn invalid_arguments_v1(error: impl std::fmt::Display) -> ProviderError {
     let _ = error;
     ProviderError(McpError::typed(
@@ -1214,16 +1224,9 @@ fn provider_io_v1(error: impl std::fmt::Display) -> ProviderError {
     ))
 }
 
-fn internal_provider_error_v1() -> ProviderError {
-    ProviderError(McpError::typed(
-        McpErrorCode::InternalError,
-        "gateway authority construction failed",
-    ))
-}
-
 fn cancelled_provider_error_v1() -> ProviderError {
     ProviderError(McpError::typed(
-        McpErrorCode::InternalError,
+        McpErrorCode::RequestCancelled,
         "gateway call cancelled",
     ))
 }
@@ -1467,7 +1470,11 @@ mod product_tests {
                 )
                 .is_none()
         );
-        worker.join().unwrap();
+        let cancelled = worker.join().unwrap();
+        assert_eq!(
+            cancelled["error"]["code"],
+            McpErrorCode::RequestCancelled as i64
+        );
         let retry = process(
             &gateway,
             "retry",
