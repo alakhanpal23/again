@@ -56,6 +56,18 @@ pre-alpha until these gates close:
    allowlisted upstream MCP proxy. Side effects, credentials, deployments,
    payments, and unknown tools continue to bypass reuse.
 
+Current checkpoint: item 1 is closed for the built-in tools, and acquisition
+events are now only candidates; exact-hit and in-flight-join statistics are
+promoted after one-use proof consumption, result loading, and repository
+revalidation. The retained production-binary harness closes the deterministic
+portion of item 5 with 11/11 scenarios, four real MCP processes, 12 provider
+executions, and zero false hits at source
+`bb896396dc768cf6704bbb3380de6be012588556`. The separate real-agent harness
+passed its offline dry run against Codex 0.150.1 and Claude 2.1.220, but all 16
+networked/paid paired runs remain manual and unexecuted. Item 2 remains open for
+bytes, tokens, and time: full-result delivery has no authenticated recipient
+receipt, so those savings must not be claimed from route counters.
+
 ## Critical path
 
 ```text
