@@ -1097,7 +1097,13 @@ def run_product_e2e(
             concurrent_binding, events, counts = _binding_and_events(
                 reader,
                 window,
-                {"requested": 2, "executed": 1, "inflight_join": 1, "completed": 1},
+                {
+                    "requested": 2,
+                    "executed": 1,
+                    "inflight_candidate": 1,
+                    "inflight_join": 1,
+                    "completed": 1,
+                },
             )
             roles = Counter(item["role"] for item in events if item["event_type"] == "requested")
             if roles != Counter({"leader": 1, "follower": 1}):
@@ -1122,7 +1128,9 @@ def run_product_e2e(
             exact_result = require_success(exact_response, "exact repeat")
             window = reader.end(start)
             exact_binding, _, counts = _binding_and_events(
-                reader, window, {"requested": 1, "exact_hit": 1}
+                reader,
+                window,
+                {"requested": 1, "exact_candidate": 1, "exact_hit": 1},
             )
             if exact_binding != concurrent_binding or exact_result != concurrent_results[0]:
                 raise HarnessRefusal("exact_reuse_unproven", "exact repeat did not preserve binding/output")
@@ -1208,7 +1216,9 @@ def run_product_e2e(
             irrelevant_result = require_success(irrelevant_response, "irrelevant mutation")
             window = reader.end(start)
             irrelevant_binding, _, counts = _binding_and_events(
-                reader, window, {"requested": 1, "exact_hit": 1}
+                reader,
+                window,
+                {"requested": 1, "exact_candidate": 1, "exact_hit": 1},
             )
             if irrelevant_binding != relevant_binding or irrelevant_result != relevant_result:
                 raise HarnessRefusal(
@@ -1234,7 +1244,7 @@ def run_product_e2e(
             follower_thread, follower_outcome = _thread_call(
                 lambda: second.tool_call("follower-case-cancel", "repo.search", follower_args)
             )
-            reader.wait_for_event(follower_binding, start, "inflight_join", 5.0)
+            reader.wait_for_event(follower_binding, start, "inflight_candidate", 5.0)
             second.cancel("follower-case-cancel")
             follower_response = _join_call(follower_thread, follower_outcome, timeout_seconds)
             leader_response = _join_call(leader_thread, leader_outcome, timeout_seconds)
@@ -1248,7 +1258,7 @@ def run_product_e2e(
                 {
                     "requested": 2,
                     "executed": 1,
-                    "inflight_join": 1,
+                    "inflight_candidate": 1,
                     "follower_cancelled": 1,
                     "completed": 1,
                 },

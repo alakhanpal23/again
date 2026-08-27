@@ -10,8 +10,8 @@ use again::store::{
     GatewayAgentContext, GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion,
     GatewayCoordinatorInputV1, GatewayDependencyV1, GatewayExecutionStart, GatewayFailure,
     GatewayFailureReason, GatewayFollowerCancellation, GatewayFreshnessEvidenceV1,
-    GatewayOperationDispositionV1, GatewayPresentation, GatewayRefusalReason, Store, StoredResult,
-    ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayOperationDispositionV1, GatewayPresentation, GatewayRefusalReason, GatewayServedRouteV1,
+    Store, StoredResult, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -148,7 +148,10 @@ fn twenty_callers_elect_one_leader_for_exact_read_binding() {
     let stats = Store::open(&root).unwrap().gateway_stats().unwrap();
     assert_eq!(stats.requested, CALLERS as u64);
     assert_eq!(stats.executed, 0, "acquisition is not execution");
-    assert_eq!(stats.inflight_joins, (CALLERS - 1) as u64);
+    assert_eq!(
+        stats.inflight_joins, 0,
+        "acquisition candidates are not served joins"
+    );
 }
 
 #[test]
@@ -185,6 +188,72 @@ fn follower_observes_and_retrieves_content_addressed_full_result() {
     assert_eq!(full.stdout, b"completed output");
     assert_eq!(full.stderr, b"diagnostic");
     assert_eq!(full.dependencies.len(), 2);
+}
+
+#[test]
+fn route_stats_require_final_served_promotion_and_are_idempotent() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("state");
+    let proof = binding("served-request", "served-state");
+    let store = Store::open(&root).unwrap();
+    let (_, lease) = leader(store.acquire_gateway_call(&proof, "leader").unwrap());
+    let follower_call = follower(store.acquire_gateway_call(&proof, "follower").unwrap());
+    let result = stored_result(&root, &proof, b"served output");
+    let gateway_result_id = complete(&store, &lease, "leader", &result);
+    let exact_call = match store.acquire_gateway_call(&proof, "exact").unwrap() {
+        GatewayCallAcquisition::Ready {
+            call_id,
+            gateway_result_id: observed,
+        } => {
+            assert_eq!(observed, gateway_result_id);
+            call_id
+        }
+        other => panic!("expected ready acquisition, got {other:?}"),
+    };
+
+    let before = store.gateway_stats().unwrap();
+    assert_eq!(before.executed, 1);
+    assert_eq!(before.exact_hits, 0);
+    assert_eq!(before.inflight_joins, 0);
+    assert!(
+        !store
+            .record_gateway_route_served(
+                &follower_call,
+                &gateway_result_id,
+                GatewayServedRouteV1::Exact,
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_gateway_route_served(
+                &follower_call,
+                &gateway_result_id,
+                GatewayServedRouteV1::Inflight,
+            )
+            .unwrap()
+    );
+    assert!(
+        !store
+            .record_gateway_route_served(
+                &follower_call,
+                &gateway_result_id,
+                GatewayServedRouteV1::Inflight,
+            )
+            .unwrap()
+    );
+    assert!(
+        store
+            .record_gateway_route_served(
+                &exact_call,
+                &gateway_result_id,
+                GatewayServedRouteV1::Exact,
+            )
+            .unwrap()
+    );
+    let after = store.gateway_stats().unwrap();
+    assert_eq!(after.exact_hits, 1);
+    assert_eq!(after.inflight_joins, 1);
 }
 
 #[test]

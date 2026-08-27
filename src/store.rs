@@ -457,6 +457,28 @@ pub struct GatewayStats {
     pub stale_or_divergent_quarantines: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayServedRouteV1 {
+    Exact,
+    Inflight,
+}
+
+impl GatewayServedRouteV1 {
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::Exact => "exact_hit",
+            Self::Inflight => "inflight_join",
+        }
+    }
+
+    fn request_role(self) -> &'static str {
+        match self {
+            Self::Exact => "ready",
+            Self::Inflight => "follower",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayFullResultV1 {
     pub gateway_result_id: String,
@@ -1391,7 +1413,7 @@ impl Store {
                     Some(&call_id),
                     None,
                     Some(&gateway_result_id),
-                    "exact_hit",
+                    "exact_candidate",
                     None,
                     0,
                     now,
@@ -1468,7 +1490,7 @@ impl Store {
                 Some(&call_id),
                 Some(&lease_id),
                 None,
-                "inflight_join",
+                "inflight_candidate",
                 None,
                 0,
                 now,
@@ -2241,6 +2263,109 @@ impl Store {
             stderr,
             dependencies,
         }))
+    }
+
+    /// Record a provider execution that bypassed coordinator authority. This
+    /// counter is emitted immediately before the provider invocation and does
+    /// not imply that the call succeeded or produced reusable evidence.
+    pub fn record_gateway_direct_execution(&self, record_request: bool) -> Result<()> {
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if record_request {
+            record_gateway_event_v1_tx(
+                &transaction,
+                None,
+                None,
+                None,
+                "requested",
+                Some("direct"),
+                0,
+                now,
+            )?;
+        }
+        record_gateway_event_v1_tx(
+            &transaction,
+            None,
+            None,
+            None,
+            "executed",
+            Some("direct"),
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Promote an acquisition candidate to a served route only after the
+    /// caller has consumed the one-use proof, loaded the exact result, and
+    /// revalidated repository state. Repeated promotion is idempotent.
+    pub fn record_gateway_route_served(
+        &self,
+        call_id: &str,
+        gateway_result_id: &str,
+        route: GatewayServedRouteV1,
+    ) -> Result<bool> {
+        validate_digest(gateway_result_id, "gateway result digest")?;
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let request = transaction
+            .query_row(
+                "SELECT role, status, gateway_result_id, joined_lease_id FROM gateway_requests WHERE call_id = ?1",
+                [call_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((role, status, request_result_id, lease_id)) = request else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let visible: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready')",
+            [gateway_result_id],
+            |row| row.get(0),
+        )?;
+        let route_shape_valid = match route {
+            GatewayServedRouteV1::Exact => lease_id.is_none(),
+            GatewayServedRouteV1::Inflight => lease_id.is_some(),
+        };
+        if role != route.request_role()
+            || status != "ready"
+            || request_result_id.as_deref() != Some(gateway_result_id)
+            || !route_shape_valid
+            || !visible
+        {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let already_recorded: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_events WHERE call_id = ?1 AND event_type = ?2)",
+            params![call_id, route.event_type()],
+            |row| row.get(0),
+        )?;
+        if already_recorded {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        record_gateway_event_v1_tx(
+            &transaction,
+            Some(call_id),
+            lease_id.as_deref(),
+            Some(gateway_result_id),
+            route.event_type(),
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn record_gateway_delivery(

@@ -38,8 +38,8 @@ use crate::mcp_gateway::{
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
     GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayRouteProofObservationV1, GatewayStats,
-    Store, ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayRouteProofObservationV1,
+    GatewayServedRouteV1, GatewayStats, Store, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -168,7 +168,13 @@ impl GatewayControlledProviderV1 {
         epoch: &WorkspaceExecutionEpochV1,
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
+        record_request: bool,
     ) -> Result<Value, ProviderError> {
+        let _ = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .record_gateway_direct_execution(record_request);
         self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
@@ -398,12 +404,24 @@ impl GatewayControlledProviderV1 {
                     {
                         break Ok(None);
                     }
-                    break self.load_exact(resolved, &gateway_result_id).map_err(|_| {
+                    let loaded = self.load_exact(resolved, &gateway_result_id).map_err(|_| {
                         ProviderError(McpError::typed(
                             McpErrorCode::InternalError,
                             "verified gateway result became unavailable",
                         ))
                     });
+                    if matches!(loaded, Ok(Some(_))) {
+                        let _ = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .record_gateway_route_served(
+                                call_id,
+                                &gateway_result_id,
+                                GatewayServedRouteV1::Inflight,
+                            );
+                    }
+                    break loaded;
                 }
                 Ok(GatewayCallObservation::Inflight { .. }) if Instant::now() < deadline => {
                     thread::sleep(Duration::from_millis(2));
@@ -505,10 +523,10 @@ impl ToolExecution for GatewayControlledProviderV1 {
             provider_io_v1(anyhow!("descriptor-retained workspace issuance failed"))
         })?;
         if call.effect != EffectClass::ReadOnly {
-            return self.execute_direct(&epoch, call, secrets);
+            return self.execute_direct(&epoch, call, secrets, true);
         }
         let Some(resolved) = self.resolve(&epoch, &call) else {
-            return self.execute_direct(&epoch, call, secrets);
+            return self.execute_direct(&epoch, call, secrets, true);
         };
         let owner = Self::owner(&call);
         let acquisition = self
@@ -517,11 +535,12 @@ impl ToolExecution for GatewayControlledProviderV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .acquire_gateway_call(&resolved.binding, &owner);
         let Ok(acquisition) = acquisition else {
-            return self.execute_direct(&epoch, call, secrets);
+            return self.execute_direct(&epoch, call, secrets, true);
         };
         match acquisition {
             GatewayCallAcquisition::Ready {
-                gateway_result_id, ..
+                call_id,
+                gateway_result_id,
             } => {
                 let proof = self
                     .store
@@ -548,10 +567,19 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
                     {
+                        let _ = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .record_gateway_route_served(
+                                &call_id,
+                                &gateway_result_id,
+                                GatewayServedRouteV1::Exact,
+                            );
                         return Ok(value);
                     }
                 }
-                self.execute_direct(&epoch, call, secrets)
+                self.execute_direct(&epoch, call, secrets, false)
             }
             GatewayCallAcquisition::Follower {
                 call_id, lease_id, ..
@@ -603,7 +631,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .cancel_gateway_follower(&call_id);
-                self.execute_direct(&epoch, call, secrets)
+                self.execute_direct(&epoch, call, secrets, false)
             }
             GatewayCallAcquisition::Leader {
                 lease_id,
@@ -621,11 +649,13 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
-                    return self.execute_direct(&epoch, call, secrets);
+                    return self.execute_direct(&epoch, call, secrets, false);
                 }
                 self.execute_as_leader(&epoch, call, secrets, &resolved, lease_id, owner)
             }
-            GatewayCallAcquisition::Refused { .. } => self.execute_direct(&epoch, call, secrets),
+            GatewayCallAcquisition::Refused { .. } => {
+                self.execute_direct(&epoch, call, secrets, true)
+            }
         }
     }
 }
