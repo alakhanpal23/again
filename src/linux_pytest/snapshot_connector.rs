@@ -644,8 +644,9 @@ impl<'resources> SnapshotPublicationSessionV1<'resources> {
     /// session's publication policy and sole resource ledger.
     ///
     /// The caller cannot substitute an attempt count: the leaf policy fixes
-    /// the bound at `openat2_attempts + 1` for the terminal descriptor-based
-    /// `statx`. The reservation must be acquired before sealing begins.
+    /// the bound at `openat2_attempts + 2`: one descriptor-based bind `statx`
+    /// plus one prepaid, one-shot retained-root projection `statx`. The
+    /// reservation must be acquired before sealing begins.
     pub(super) fn reserve_published_child_bind_attempts(
         &self,
     ) -> Result<SnapshotPublishedChildBindReservationV1<'resources>, SnapshotPipelineResourceErrorV1>
