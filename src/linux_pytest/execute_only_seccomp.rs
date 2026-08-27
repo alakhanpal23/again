@@ -22,7 +22,7 @@
 
 #![allow(
     dead_code,
-    reason = "the frozen plan has no production consumer until the future kernel connector is composed"
+    reason = "the frozen plan and disposable probe remain crate-private until live-child filter and supervisor composition"
 )]
 
 use core::fmt;
@@ -31,7 +31,7 @@ mod connector;
 
 #[allow(
     unused_imports,
-    reason = "the sibling main connector has not yet consumed this crate-private checkpoint"
+    reason = "the future live-child orchestrator has not yet consumed this crate-private diagnostic checkpoint"
 )]
 pub(in crate::linux_pytest) use connector::{
     CompletedDisposableWorkloadFilterProbeV1, WorkloadSeccompConnectorFailureV1,

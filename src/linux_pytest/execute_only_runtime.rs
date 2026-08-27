@@ -1305,7 +1305,11 @@ struct RuntimeForestNodeInputV1 {
 
 fn push_runtime_forest_node_v1(
     nodes: &mut Vec<RuntimeForestNodeV1>,
-    #[allow(unused_mut)] mut input: RuntimeForestNodeInputV1,
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(unused_mut)
+    )]
+    mut input: RuntimeForestNodeInputV1,
     memory: &RuntimeMemoryEscrowV1,
     total_bytes: &mut u64,
 ) -> Result<usize, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
@@ -2859,6 +2863,33 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn unwrap_fixture_publication_v1<T>(
+        label: &str,
+        result: Result<T, super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1>,
+    ) -> T {
+        match result {
+            Ok(value) => value,
+            Err(
+                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Materialization(
+                        super::super::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
+                            failure,
+                        ),
+                    ),
+                ),
+            ) => panic!(
+                "{label} materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
+                failure.code(),
+                failure.stage(),
+                failure.kind(),
+                failure.regular_stage(),
+                failure.errno()
+            ),
+            Err(error) => panic!("{label} publication failure: {error:?}"),
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     fn run_real_publication_inventory_case(mutate_runtime_after_publication: bool) {
         let workspace_source = tempfile::tempdir().unwrap();
         let workspace_root = workspace_source.path().join("root");
@@ -2929,8 +2960,9 @@ mod tests {
                 workspace_source_fd.as_fd(),
             )
         };
-        let workspace_binding = workspace_connector
-            .materialize_first_execute_only_workspace_tree_and_publish_at(
+        let workspace_binding = unwrap_fixture_publication_v1(
+            "workspace",
+            workspace_connector.materialize_first_execute_only_workspace_tree_and_publish_at(
                 lexical,
                 workspace_publication_fd.as_fd(),
                 c".again-snapshot-stage-11111111111111111111111111111111",
@@ -2938,24 +2970,8 @@ mod tests {
                 workspace_s1,
                 workspace_s2,
                 c"root",
-            )
-            .unwrap_or_else(|error| match error {
-                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
-                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Materialization(
-                        super::super::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
-                            failure,
-                        ),
-                    ),
-                ) => panic!(
-                    "workspace materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
-                    failure.code(),
-                    failure.stage(),
-                    failure.kind(),
-                    failure.regular_stage(),
-                    failure.errno()
-                ),
-                error => panic!("workspace publication failure: {error:?}"),
-            });
+            ),
+        );
         let checkpoint = qualify_first_execute_only_runtime_checkpoint_v1(workspace_binding)
             .expect("real workspace publication must reach the descriptor-bound checkpoint");
 
@@ -2969,32 +2985,17 @@ mod tests {
                 runtime_source_fd.as_fd(),
             )
         };
-        let runtime_publication_token = runtime_connector
-            .materialize_first_execute_only_runtime_inventory_tree_and_publish_at(
+        let runtime_publication_token = unwrap_fixture_publication_v1(
+            "runtime",
+            runtime_connector.materialize_first_execute_only_runtime_inventory_tree_and_publish_at(
                 runtime_publication_fd.as_fd(),
                 c".again-snapshot-stage-22222222222222222222222222222222",
                 c"runtime-final",
                 runtime_s1,
                 runtime_s2,
                 c"root",
-            )
-            .unwrap_or_else(|error| match error {
-                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
-                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Materialization(
-                        super::super::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
-                            failure,
-                        ),
-                    ),
-                ) => panic!(
-                    "runtime materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
-                    failure.code(),
-                    failure.stage(),
-                    failure.kind(),
-                    failure.regular_stage(),
-                    failure.errno()
-                ),
-                error => panic!("runtime publication failure: {error:?}"),
-            });
+            ),
+        );
         let expected_workspace_root = checkpoint.workspace_root_digest();
         let expected_runtime_root = runtime_publication_token.root_digest();
 

@@ -268,9 +268,10 @@ mutation. The earlier local x86_64 QEMU timeout remains non-evidence, and this
 structural result does not qualify the loader or authorize execution.
 
 The runtime, stdio, and isolation owners now meet at one command-free connector
-checkpoint. It requires the real runtime checkpoint and concrete
-isolation-ready child, authenticates and splits all pipe ownership, and retains
-bounded parent capture. Cancellation terminates and reaps before EOF draining;
+checkpoint. It requires and retains the two-publication structural inventory
+before creating the concrete isolation-ready child, authenticates and splits
+all pipe ownership, and retains bounded parent capture. Cancellation terminates
+and reaps before EOF draining;
 uncertain reap closes without capture, and split/setup failures retain their
 first error separately from cleanup completeness. The connector exposes no
 release frame, command, PID, descriptor, execution, candidate, replay, or reuse
@@ -309,7 +310,8 @@ The first acceptance fixture should use exactly one selector, such as
 `tests/test_smoke.py::test_smoke`. It must compose:
 
 - two-phase lexical and snapshot-backed admission;
-- connector-qualified immutable workspace/runtime snapshots;
+- descriptor-bound, manifest-reconciled, whole-inventory-revalidated
+  workspace/runtime publications;
 - rootless namespace PID 1, private root, scratch mounts, procfs, FD scrub,
   capability elimination, Landlock, and production workload seccomp;
 - the kernel-backed supervisor and complete descendant cleanup;

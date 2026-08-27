@@ -21,7 +21,7 @@
 
 #![allow(
     dead_code,
-    reason = "crate-private Gate 3 handoff is held until runtime and stdio composition"
+    reason = "the crate-private ready-child handoff remains dormant until filesystem attachment and command release composition"
 )]
 
 use std::fmt;
