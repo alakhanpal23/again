@@ -183,6 +183,31 @@ class GatewayProductE2ETest(unittest.TestCase):
         self.assertEqual(reader.events("x" * 64, window), [])
         self.assertEqual(reader.events("b" * 64, harness.EventWindow(2_001, 3_000, 1, 3)), [])
 
+    def test_result_event_reconciliation_includes_pre_request_quarantine(self) -> None:
+        database = self.database()
+        result_id = "a" * 64
+        connection = sqlite3.connect(database)
+        connection.execute(
+            """
+            INSERT INTO gateway_events
+                (call_id, gateway_result_id, event_type, reason,
+                 estimated_tokens_avoided, created_ms)
+            VALUES (NULL, ?1, 'binding_quarantined', 'result_corrupt', 0, 1000)
+            """,
+            (result_id,),
+        )
+        connection.commit()
+        connection.close()
+        reader = harness.GatewayEvents(database)
+        events = reader.result_events(result_id, harness.EventWindow(999, 2000, 1, 1))
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["call_id"])
+        self.assertEqual(events[0]["reason"], "result_corrupt")
+        self.assertEqual(
+            harness.reconcile_events(events, {"binding_quarantined": 1}),
+            {"binding_quarantined": 1},
+        )
+
     def test_unknown_database_schema_is_refused(self) -> None:
         reader = harness.GatewayEvents(self.database(version=999))
         with self.assertRaises(harness.HarnessRefusal) as refused:

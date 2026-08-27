@@ -745,6 +745,34 @@ class GatewayEvents:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def result_events(
+        self, gateway_result_id: str, window: EventWindow
+    ) -> list[dict[str, Any]]:
+        """Return events bound directly to one result, including pre-request quarantine."""
+
+        if not RESULT_ID_RE.fullmatch(gateway_result_id):
+            raise HarnessRefusal("result_id_malformed", "gateway result ID is malformed")
+        with self._snapshot() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, event_type, call_id, lease_id, gateway_result_id,
+                       reason, created_ms
+                FROM gateway_events
+                WHERE gateway_result_id = ?1
+                  AND id BETWEEN ?2 AND ?3
+                  AND created_ms BETWEEN ?4 AND ?5
+                ORDER BY id
+                """,
+                (
+                    gateway_result_id,
+                    window.first_event_id,
+                    window.last_event_id,
+                    window.start_ms,
+                    window.end_ms,
+                ),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def wait_for_binding(self, start: EventWindowStart, timeout: float) -> str:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -1391,16 +1419,21 @@ def run_product_e2e(
             )
             corrupt_result = require_success(corrupt_response, "corrupted evidence retry")
             window = corrupt_reader.end(start)
-            corrupt_binding, _, corrupt_counts = _binding_and_events(
-                corrupt_reader,
-                window,
-                {"requested": 1, "exact_hit": 1},
-            )
-            # The acquisition event is advisory; absence of a result reference plus
-            # exact recomputed bytes proves the corrupted blob was not delivered.
+            corrupt_events = corrupt_reader.result_events(current_result_id, window)
+            corrupt_counts = reconcile_events(corrupt_events, {"binding_quarantined": 1})
             if (
-                corrupt_binding != crash_binding
-                or result_id(corrupt_result) is not None
+                corrupt_events[0].get("call_id") is not None
+                or corrupt_events[0].get("reason") != "result_corrupt"
+            ):
+                raise HarnessRefusal(
+                    "corrupt_quarantine_unproven",
+                    "corrupt result was not quarantined before request authority",
+                )
+            # The hardened store quarantines before issuing a ready acquisition.
+            # Absence of a result reference plus exact recomputed bytes proves the
+            # corrupt blob was not delivered by the direct no-reuse fallback.
+            if (
+                result_id(corrupt_result) is not None
                 or result_without_reference(corrupt_result)
                 != result_without_reference(recovery_result)
             ):
@@ -1428,9 +1461,16 @@ def run_product_e2e(
                 "served_result_id": None,
                 "recomputed_output_matches": True,
                 "timing_ms": corrupt_ms,
+                "prior_request_binding": crash_binding,
                 "health_result_sha256": sha256_bytes(canonical_json_bytes(corruption_health)),
                 "health_window": _window_record(health_window, health_binding, health_counts),
-                **_window_record(window, corrupt_binding, corrupt_counts),
+                "quarantine_window": {
+                    "gateway_result_id": current_result_id,
+                    "time_window": dataclasses.asdict(window),
+                    "event_counts": corrupt_counts,
+                    "reason": "result_corrupt",
+                    "request_authority_issued": False,
+                },
             }
             false_hit_cases.append(
                 {"classification": "corrupt_refusal", "served_result_id": result_id(corrupt_result)}
