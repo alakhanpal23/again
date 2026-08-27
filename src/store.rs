@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -22,6 +22,7 @@ const CLEANUP_INTERVAL_MS: i64 = 60 * 60 * 1_000;
 const CLEANUP_ROW_LIMIT: i64 = 512;
 const CLEANUP_ARTIFACT_LIMIT: i64 = 256;
 const MAX_LOCAL_BLOB_BYTES: usize = 16 * 1024 * 1024;
+pub const GATEWAY_LEASE_TTL_MS: i64 = 30_000;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
@@ -80,6 +81,7 @@ impl EventDisposition {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
 pub struct StoreStats {
     pub executions: u64,
     pub full_replays: u64,
@@ -90,6 +92,205 @@ pub struct StoreStats {
     /// Sum of positive `(recorded execution duration - observed replay wall
     /// time)` estimates. Slower replays contribute zero, never negative time.
     pub estimated_execution_ms_saved: u64,
+    pub requested: u64,
+    pub executed: u64,
+    pub exact_hits: u64,
+    pub coverage_hits: u64,
+    pub inflight_joins: u64,
+    pub compact_deliveries: u64,
+    pub estimated_tokens_avoided: u64,
+    pub stale_or_divergent_quarantines: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayRefusalReason {
+    InvalidCallKey,
+    InvalidStateDigest,
+    InvalidOwner,
+    InvalidAgentContext,
+    Quarantined,
+    CallNotFound,
+    LeaseNotFound,
+    LeaseExpired,
+    LeaseNotCurrent,
+    OwnerMismatch,
+    NotFollower,
+    ResultNotFound,
+    AlreadyTerminal,
+}
+
+impl GatewayRefusalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidCallKey => "invalid_call_key",
+            Self::InvalidStateDigest => "invalid_state_digest",
+            Self::InvalidOwner => "invalid_owner",
+            Self::InvalidAgentContext => "invalid_agent_context",
+            Self::Quarantined => "quarantined",
+            Self::CallNotFound => "call_not_found",
+            Self::LeaseNotFound => "lease_not_found",
+            Self::LeaseExpired => "lease_expired",
+            Self::LeaseNotCurrent => "lease_not_current",
+            Self::OwnerMismatch => "owner_mismatch",
+            Self::NotFollower => "not_follower",
+            Self::ResultNotFound => "result_not_found",
+            Self::AlreadyTerminal => "already_terminal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayCallAcquisition {
+    Leader {
+        call_id: String,
+        lease_id: String,
+        expires_at_ms: i64,
+    },
+    Follower {
+        call_id: String,
+        leader_call_id: String,
+        leader: String,
+        expires_at_ms: i64,
+    },
+    Ready {
+        call_id: String,
+        result_id: String,
+    },
+    Refused {
+        reason: GatewayRefusalReason,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayCallObservation {
+    Inflight {
+        leader_call_id: String,
+        leader: String,
+        expires_at_ms: i64,
+        followers: u64,
+    },
+    Ready {
+        result_id: String,
+    },
+    Failed {
+        reason: String,
+    },
+    Quarantined {
+        reason: String,
+    },
+    Missing,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayHeartbeat {
+    Extended { expires_at_ms: i64 },
+    Refused { reason: GatewayRefusalReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayCompletion {
+    Completed {
+        call_id: String,
+        result_id: String,
+    },
+    AlreadyCompleted {
+        call_id: String,
+        result_id: String,
+    },
+    Quarantined {
+        call_id: String,
+        existing_result_id: String,
+        conflicting_result_id: String,
+    },
+    Refused {
+        reason: GatewayRefusalReason,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayFailure {
+    Failed { call_id: String },
+    Refused { reason: GatewayRefusalReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayFollowerCancellation {
+    Cancelled,
+    AlreadyCancelled,
+    Refused { reason: GatewayRefusalReason },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayAgentContext {
+    pub session_id: String,
+    pub turn_id: String,
+    pub agent_id: String,
+    pub compaction_epoch: u64,
+}
+
+impl GatewayAgentContext {
+    pub fn new(
+        session_id: impl Into<String>,
+        turn_id: impl Into<String>,
+        agent_id: impl Into<String>,
+        compaction_epoch: u64,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            turn_id: turn_id.into(),
+            agent_id: agent_id.into(),
+            compaction_epoch,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.session_id.is_empty() && !self.turn_id.is_empty() && !self.agent_id.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GatewayPresentation {
+    Full,
+    Compact { estimated_tokens_avoided: u64 },
+}
+
+impl GatewayPresentation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Compact { .. } => "compact",
+        }
+    }
+
+    fn estimated_tokens_avoided(self) -> u64 {
+        match self {
+            Self::Full => 0,
+            Self::Compact {
+                estimated_tokens_avoided,
+            } => estimated_tokens_avoided,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct GatewayStats {
+    pub requested: u64,
+    pub executed: u64,
+    pub exact_hits: u64,
+    pub coverage_hits: u64,
+    pub inflight_joins: u64,
+    pub compact_deliveries: u64,
+    pub estimated_tokens_avoided: u64,
+    pub stale_or_divergent_quarantines: u64,
 }
 
 pub struct Store {
@@ -314,6 +515,110 @@ impl Store {
                 SET elapsed_ms = 0
                 WHERE disposition IN ('replayed_full', 'replayed_compact');
                 PRAGMA user_version = 5;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 6 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS gateway_requests (
+                    call_id TEXT PRIMARY KEY,
+                    call_key TEXT NOT NULL,
+                    state_digest TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    joined_lease_id TEXT,
+                    result_id TEXT,
+                    reason TEXT,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE RESTRICT
+                );
+                CREATE INDEX IF NOT EXISTS gateway_requests_key_idx
+                    ON gateway_requests(call_key, state_digest, created_ms);
+                CREATE INDEX IF NOT EXISTS gateway_requests_lease_idx
+                    ON gateway_requests(joined_lease_id, status);
+
+                CREATE TABLE IF NOT EXISTS gateway_results (
+                    gateway_result_id TEXT PRIMARY KEY,
+                    call_key TEXT NOT NULL,
+                    state_digest TEXT NOT NULL,
+                    result_id TEXT NOT NULL,
+                    lease_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    quarantine_reason TEXT,
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    UNIQUE (call_key, state_digest, result_id),
+                    FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE RESTRICT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS gateway_results_ready_idx
+                    ON gateway_results(call_key, state_digest) WHERE status = 'ready';
+                CREATE INDEX IF NOT EXISTS gateway_results_result_idx ON gateway_results(result_id);
+
+                CREATE TABLE IF NOT EXISTS result_dependencies (
+                    gateway_result_id TEXT NOT NULL,
+                    dependency_key TEXT NOT NULL,
+                    dependency_digest TEXT NOT NULL,
+                    PRIMARY KEY (gateway_result_id, dependency_key),
+                    FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS result_dependencies_digest_idx
+                    ON result_dependencies(dependency_key, dependency_digest);
+
+                CREATE TABLE IF NOT EXISTS inflight_leases (
+                    lease_id TEXT PRIMARY KEY,
+                    call_id TEXT NOT NULL UNIQUE,
+                    call_key TEXT NOT NULL,
+                    state_digest TEXT NOT NULL,
+                    owner TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    result_id TEXT,
+                    reason TEXT,
+                    acquired_ms INTEGER NOT NULL,
+                    heartbeat_ms INTEGER NOT NULL,
+                    expires_ms INTEGER NOT NULL,
+                    completed_ms INTEGER,
+                    FOREIGN KEY (call_id) REFERENCES gateway_requests(call_id) ON DELETE RESTRICT,
+                    FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE RESTRICT
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS inflight_leases_active_idx
+                    ON inflight_leases(call_key, state_digest) WHERE status = 'active';
+                CREATE INDEX IF NOT EXISTS inflight_leases_expiry_idx
+                    ON inflight_leases(status, expires_ms);
+
+                CREATE TABLE IF NOT EXISTS gateway_deliveries (
+                    session_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL,
+                    compaction_epoch INTEGER NOT NULL CHECK(compaction_epoch >= 0),
+                    result_id TEXT NOT NULL,
+                    presentation TEXT NOT NULL,
+                    estimated_tokens_avoided INTEGER NOT NULL DEFAULT 0,
+                    delivered_ms INTEGER NOT NULL,
+                    PRIMARY KEY (
+                        session_id, turn_id, agent_id, compaction_epoch, result_id, presentation
+                    ),
+                    FOREIGN KEY (result_id) REFERENCES results(id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+
+                CREATE TABLE IF NOT EXISTS gateway_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    call_id TEXT,
+                    lease_id TEXT,
+                    result_id TEXT,
+                    event_type TEXT NOT NULL,
+                    reason TEXT,
+                    estimated_tokens_avoided INTEGER NOT NULL DEFAULT 0,
+                    created_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS gateway_events_created_idx ON gateway_events(created_ms);
+                CREATE INDEX IF NOT EXISTS gateway_events_type_idx ON gateway_events(event_type);
+                PRAGMA user_version = 6;
                 COMMIT;
                 "#,
             )?;
@@ -588,6 +893,780 @@ impl Store {
         Ok(removed as u64)
     }
 
+    /// Atomically acquire leadership, join the live leader, or reuse a ready
+    /// result for one exact `(call_key, state_digest)` pair.
+    pub fn acquire_gateway_call(
+        &self,
+        call_key: &str,
+        state_digest: &str,
+        owner: &str,
+    ) -> Result<GatewayCallAcquisition> {
+        if call_key.is_empty() {
+            return Ok(GatewayCallAcquisition::Refused {
+                reason: GatewayRefusalReason::InvalidCallKey,
+            });
+        }
+        if state_digest.is_empty() {
+            return Ok(GatewayCallAcquisition::Refused {
+                reason: GatewayRefusalReason::InvalidStateDigest,
+            });
+        }
+        if owner.is_empty() {
+            return Ok(GatewayCallAcquisition::Refused {
+                reason: GatewayRefusalReason::InvalidOwner,
+            });
+        }
+
+        let now = now_ms();
+        let call_id = format!("gc_{}", Uuid::new_v4().simple());
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        expire_gateway_leases_tx(&transaction, now, Some((call_key, state_digest)))?;
+
+        let binding = transaction
+            .query_row(
+                "SELECT status, result_id, quarantine_reason FROM gateway_results WHERE call_key = ?1 AND state_digest = ?2 ORDER BY created_ms DESC LIMIT 1",
+                params![call_key, state_digest],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((status, result_id, quarantine_reason)) = binding {
+            if status == "ready" && gateway_result_is_visible(&transaction, &result_id)? {
+                insert_gateway_request(
+                    &transaction,
+                    &call_id,
+                    call_key,
+                    state_digest,
+                    owner,
+                    "ready",
+                    "ready",
+                    None,
+                    Some(&result_id),
+                    None,
+                    now,
+                )?;
+                record_gateway_event_tx(
+                    &transaction,
+                    Some(&call_id),
+                    None,
+                    Some(&result_id),
+                    "requested",
+                    None,
+                    0,
+                    now,
+                )?;
+                record_gateway_event_tx(
+                    &transaction,
+                    Some(&call_id),
+                    None,
+                    Some(&result_id),
+                    "exact_hit",
+                    None,
+                    0,
+                    now,
+                )?;
+                transaction.commit()?;
+                return Ok(GatewayCallAcquisition::Ready { call_id, result_id });
+            }
+
+            let reason = quarantine_reason.unwrap_or_else(|| {
+                if status == "quarantined" {
+                    "divergent_result".to_owned()
+                } else {
+                    "result_not_visible".to_owned()
+                }
+            });
+            transaction.execute(
+                "UPDATE gateway_results SET status = 'quarantined', quarantine_reason = ?3, updated_ms = ?4 WHERE call_key = ?1 AND state_digest = ?2",
+                params![call_key, state_digest, reason, now],
+            )?;
+            insert_gateway_request(
+                &transaction,
+                &call_id,
+                call_key,
+                state_digest,
+                owner,
+                "refused",
+                "quarantined",
+                None,
+                None,
+                Some(&reason),
+                now,
+            )?;
+            record_gateway_event_tx(
+                &transaction,
+                Some(&call_id),
+                None,
+                None,
+                "requested",
+                None,
+                0,
+                now,
+            )?;
+            record_gateway_event_tx(
+                &transaction,
+                Some(&call_id),
+                None,
+                None,
+                "acquire_refused",
+                Some(&reason),
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCallAcquisition::Refused {
+                reason: GatewayRefusalReason::Quarantined,
+            });
+        }
+
+        let active = transaction
+            .query_row(
+                "SELECT lease_id, call_id, owner, expires_ms FROM inflight_leases WHERE call_key = ?1 AND state_digest = ?2 AND status = 'active'",
+                params![call_key, state_digest],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((lease_id, leader_call_id, leader, expires_at_ms)) = active {
+            insert_gateway_request(
+                &transaction,
+                &call_id,
+                call_key,
+                state_digest,
+                owner,
+                "follower",
+                "waiting",
+                Some(&lease_id),
+                None,
+                None,
+                now,
+            )?;
+            record_gateway_event_tx(
+                &transaction,
+                Some(&call_id),
+                Some(&lease_id),
+                None,
+                "requested",
+                None,
+                0,
+                now,
+            )?;
+            record_gateway_event_tx(
+                &transaction,
+                Some(&call_id),
+                Some(&lease_id),
+                None,
+                "inflight_join",
+                None,
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCallAcquisition::Follower {
+                call_id,
+                leader_call_id,
+                leader,
+                expires_at_ms,
+            });
+        }
+
+        let lease_id = format!("gl_{}", Uuid::new_v4().simple());
+        let expires_at_ms = now.saturating_add(GATEWAY_LEASE_TTL_MS);
+        insert_gateway_request(
+            &transaction,
+            &call_id,
+            call_key,
+            state_digest,
+            owner,
+            "leader",
+            "inflight",
+            Some(&lease_id),
+            None,
+            None,
+            now,
+        )?;
+        transaction.execute(
+            "INSERT INTO inflight_leases (lease_id, call_id, call_key, state_digest, owner, status, acquired_ms, heartbeat_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
+            params![lease_id, call_id, call_key, state_digest, owner, now, expires_at_ms],
+        )?;
+        record_gateway_event_tx(
+            &transaction,
+            Some(&call_id),
+            Some(&lease_id),
+            None,
+            "requested",
+            None,
+            0,
+            now,
+        )?;
+        record_gateway_event_tx(
+            &transaction,
+            Some(&call_id),
+            Some(&lease_id),
+            None,
+            "executed",
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(GatewayCallAcquisition::Leader {
+            call_id,
+            lease_id,
+            expires_at_ms,
+        })
+    }
+
+    pub fn heartbeat_gateway_call(&self, lease_id: &str, owner: &str) -> Result<GatewayHeartbeat> {
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(lease) = gateway_lease_row(&transaction, lease_id)? else {
+            transaction.commit()?;
+            return Ok(GatewayHeartbeat::Refused {
+                reason: GatewayRefusalReason::LeaseNotFound,
+            });
+        };
+        if lease.owner != owner {
+            record_gateway_event_tx(
+                &transaction,
+                Some(&lease.call_id),
+                Some(lease_id),
+                None,
+                "heartbeat_refused",
+                Some(GatewayRefusalReason::OwnerMismatch.as_str()),
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayHeartbeat::Refused {
+                reason: GatewayRefusalReason::OwnerMismatch,
+            });
+        }
+        if lease.status != "active" {
+            let reason = lease_refusal_for_status(&lease.status);
+            transaction.commit()?;
+            return Ok(GatewayHeartbeat::Refused { reason });
+        }
+        if lease.expires_ms <= now {
+            expire_gateway_leases_tx(
+                &transaction,
+                now,
+                Some((&lease.call_key, &lease.state_digest)),
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayHeartbeat::Refused {
+                reason: GatewayRefusalReason::LeaseExpired,
+            });
+        }
+
+        let expires_at_ms = now.saturating_add(GATEWAY_LEASE_TTL_MS);
+        let changed = transaction.execute(
+            "UPDATE inflight_leases SET heartbeat_ms = ?3, expires_ms = ?4 WHERE lease_id = ?1 AND owner = ?2 AND status = 'active'",
+            params![lease_id, owner, now, expires_at_ms],
+        )?;
+        if changed != 1 {
+            transaction.commit()?;
+            return Ok(GatewayHeartbeat::Refused {
+                reason: GatewayRefusalReason::LeaseNotCurrent,
+            });
+        }
+        record_gateway_event_tx(
+            &transaction,
+            Some(&lease.call_id),
+            Some(lease_id),
+            None,
+            "heartbeat",
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(GatewayHeartbeat::Extended { expires_at_ms })
+    }
+
+    pub fn observe_gateway_call(&self, call_key: &str) -> Result<GatewayCallObservation> {
+        if call_key.is_empty() {
+            return Ok(GatewayCallObservation::Missing);
+        }
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        expire_gateway_leases_tx(&transaction, now, None)?;
+
+        let quarantined = transaction
+            .query_row(
+                "SELECT COALESCE(quarantine_reason, 'divergent_result') FROM gateway_results WHERE call_key = ?1 AND status = 'quarantined' ORDER BY updated_ms DESC LIMIT 1",
+                [call_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(reason) = quarantined {
+            transaction.commit()?;
+            return Ok(GatewayCallObservation::Quarantined { reason });
+        }
+
+        let ready = transaction
+            .query_row(
+                "SELECT gateway_results.result_id FROM gateway_results JOIN results ON results.id = gateway_results.result_id WHERE gateway_results.call_key = ?1 AND gateway_results.status = 'ready' AND results.quarantined = 0 ORDER BY gateway_results.updated_ms DESC LIMIT 1",
+                [call_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(result_id) = ready {
+            transaction.commit()?;
+            return Ok(GatewayCallObservation::Ready { result_id });
+        }
+
+        let inflight = transaction
+            .query_row(
+                "SELECT call_id, owner, expires_ms, (SELECT COUNT(*) FROM gateway_requests WHERE joined_lease_id = inflight_leases.lease_id AND role = 'follower' AND status = 'waiting') FROM inflight_leases WHERE call_key = ?1 AND status = 'active' ORDER BY acquired_ms DESC LIMIT 1",
+                [call_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, u64>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((leader_call_id, leader, expires_at_ms, followers)) = inflight {
+            transaction.commit()?;
+            return Ok(GatewayCallObservation::Inflight {
+                leader_call_id,
+                leader,
+                expires_at_ms,
+                followers,
+            });
+        }
+
+        let terminal = transaction
+            .query_row(
+                "SELECT status, COALESCE(reason, status) FROM gateway_requests WHERE call_key = ?1 ORDER BY updated_ms DESC, rowid DESC LIMIT 1",
+                [call_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        transaction.commit()?;
+        match terminal {
+            Some((status, reason)) if status == "quarantined" => {
+                Ok(GatewayCallObservation::Quarantined { reason })
+            }
+            Some((_status, reason)) => Ok(GatewayCallObservation::Failed { reason }),
+            None => Ok(GatewayCallObservation::Missing),
+        }
+    }
+
+    pub fn complete_gateway_call(
+        &self,
+        lease_id: &str,
+        result_id: &str,
+    ) -> Result<GatewayCompletion> {
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(lease) = gateway_lease_row(&transaction, lease_id)? else {
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::LeaseNotFound,
+            });
+        };
+        if lease.status == "completed" {
+            if lease.result_id.as_deref() == Some(result_id) {
+                transaction.commit()?;
+                return Ok(GatewayCompletion::AlreadyCompleted {
+                    call_id: lease.call_id,
+                    result_id: result_id.to_owned(),
+                });
+            }
+            if !gateway_result_is_visible(&transaction, result_id)? {
+                transaction.commit()?;
+                return Ok(GatewayCompletion::Refused {
+                    reason: GatewayRefusalReason::ResultNotFound,
+                });
+            }
+            let existing_result_id = lease.result_id.clone().unwrap_or_default();
+            quarantine_gateway_divergence_tx(
+                &transaction,
+                &lease,
+                &existing_result_id,
+                result_id,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Quarantined {
+                call_id: lease.call_id,
+                existing_result_id,
+                conflicting_result_id: result_id.to_owned(),
+            });
+        }
+        if lease.status != "active" {
+            let reason = lease_refusal_for_status(&lease.status);
+            record_gateway_event_tx(
+                &transaction,
+                Some(&lease.call_id),
+                Some(lease_id),
+                Some(result_id),
+                "stale_completion",
+                Some(reason.as_str()),
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused { reason });
+        }
+        if lease.expires_ms <= now {
+            expire_gateway_leases_tx(
+                &transaction,
+                now,
+                Some((&lease.call_key, &lease.state_digest)),
+            )?;
+            record_gateway_event_tx(
+                &transaction,
+                Some(&lease.call_id),
+                Some(lease_id),
+                Some(result_id),
+                "stale_completion",
+                Some(GatewayRefusalReason::LeaseExpired.as_str()),
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::LeaseExpired,
+            });
+        }
+
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT lease_id FROM inflight_leases WHERE call_key = ?1 AND state_digest = ?2 AND status = 'active'",
+                params![lease.call_key, lease.state_digest],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current.as_deref() != Some(lease_id) {
+            record_gateway_event_tx(
+                &transaction,
+                Some(&lease.call_id),
+                Some(lease_id),
+                Some(result_id),
+                "stale_completion",
+                Some(GatewayRefusalReason::LeaseNotCurrent.as_str()),
+                0,
+                now,
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::LeaseNotCurrent,
+            });
+        }
+        if !gateway_result_is_visible(&transaction, result_id)? {
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::ResultNotFound,
+            });
+        }
+
+        let existing = transaction
+            .query_row(
+                "SELECT result_id FROM gateway_results WHERE call_key = ?1 AND state_digest = ?2 AND status = 'ready'",
+                params![lease.call_key, lease.state_digest],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(existing_result_id) = existing {
+            if existing_result_id != result_id {
+                quarantine_gateway_divergence_tx(
+                    &transaction,
+                    &lease,
+                    &existing_result_id,
+                    result_id,
+                    now,
+                )?;
+                transaction.commit()?;
+                return Ok(GatewayCompletion::Quarantined {
+                    call_id: lease.call_id,
+                    existing_result_id,
+                    conflicting_result_id: result_id.to_owned(),
+                });
+            }
+        } else {
+            let gateway_result_id = format!("gr_{}", Uuid::new_v4().simple());
+            transaction.execute(
+                "INSERT INTO gateway_results (gateway_result_id, call_key, state_digest, result_id, lease_id, status, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, 'ready', ?6, ?6)",
+                params![
+                    gateway_result_id,
+                    lease.call_key,
+                    lease.state_digest,
+                    result_id,
+                    lease_id,
+                    now
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO result_dependencies (gateway_result_id, dependency_key, dependency_digest) VALUES (?1, 'state_digest', ?2)",
+                params![gateway_result_id, lease.state_digest],
+            )?;
+        }
+
+        let changed = transaction.execute(
+            "UPDATE inflight_leases SET status = 'completed', result_id = ?2, completed_ms = ?3 WHERE lease_id = ?1 AND status = 'active'",
+            params![lease_id, result_id, now],
+        )?;
+        if changed != 1 {
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::LeaseNotCurrent,
+            });
+        }
+        transaction.execute(
+            "UPDATE gateway_requests SET status = 'ready', result_id = ?2, updated_ms = ?3 WHERE joined_lease_id = ?1 AND status IN ('inflight', 'waiting')",
+            params![lease_id, result_id, now],
+        )?;
+        record_gateway_event_tx(
+            &transaction,
+            Some(&lease.call_id),
+            Some(lease_id),
+            Some(result_id),
+            "completed",
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(GatewayCompletion::Completed {
+            call_id: lease.call_id,
+            result_id: result_id.to_owned(),
+        })
+    }
+
+    pub fn fail_gateway_call(&self, lease_id: &str, reason: &str) -> Result<GatewayFailure> {
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(lease) = gateway_lease_row(&transaction, lease_id)? else {
+            transaction.commit()?;
+            return Ok(GatewayFailure::Refused {
+                reason: GatewayRefusalReason::LeaseNotFound,
+            });
+        };
+        if lease.status != "active" {
+            let reason = lease_refusal_for_status(&lease.status);
+            transaction.commit()?;
+            return Ok(GatewayFailure::Refused { reason });
+        }
+        if lease.expires_ms <= now {
+            expire_gateway_leases_tx(
+                &transaction,
+                now,
+                Some((&lease.call_key, &lease.state_digest)),
+            )?;
+            transaction.commit()?;
+            return Ok(GatewayFailure::Refused {
+                reason: GatewayRefusalReason::LeaseExpired,
+            });
+        }
+
+        let changed = transaction.execute(
+            "UPDATE inflight_leases SET status = 'failed', reason = ?2, completed_ms = ?3 WHERE lease_id = ?1 AND status = 'active'",
+            params![lease_id, reason, now],
+        )?;
+        if changed != 1 {
+            transaction.commit()?;
+            return Ok(GatewayFailure::Refused {
+                reason: GatewayRefusalReason::LeaseNotCurrent,
+            });
+        }
+        transaction.execute(
+            "UPDATE gateway_requests SET status = 'failed', reason = ?2, updated_ms = ?3 WHERE joined_lease_id = ?1 AND status IN ('inflight', 'waiting')",
+            params![lease_id, reason, now],
+        )?;
+        record_gateway_event_tx(
+            &transaction,
+            Some(&lease.call_id),
+            Some(lease_id),
+            None,
+            "failed",
+            Some(reason),
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(GatewayFailure::Failed {
+            call_id: lease.call_id,
+        })
+    }
+
+    pub fn cancel_gateway_follower(&self, call_id: &str) -> Result<GatewayFollowerCancellation> {
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let request = transaction
+            .query_row(
+                "SELECT role, status, joined_lease_id FROM gateway_requests WHERE call_id = ?1",
+                [call_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((role, status, lease_id)) = request else {
+            transaction.commit()?;
+            return Ok(GatewayFollowerCancellation::Refused {
+                reason: GatewayRefusalReason::CallNotFound,
+            });
+        };
+        if role != "follower" {
+            transaction.commit()?;
+            return Ok(GatewayFollowerCancellation::Refused {
+                reason: GatewayRefusalReason::NotFollower,
+            });
+        }
+        if status == "cancelled" {
+            transaction.commit()?;
+            return Ok(GatewayFollowerCancellation::AlreadyCancelled);
+        }
+        if status != "waiting" {
+            transaction.commit()?;
+            return Ok(GatewayFollowerCancellation::Refused {
+                reason: GatewayRefusalReason::AlreadyTerminal,
+            });
+        }
+
+        transaction.execute(
+            "UPDATE gateway_requests SET status = 'cancelled', reason = 'follower_cancelled', updated_ms = ?2 WHERE call_id = ?1 AND status = 'waiting'",
+            params![call_id, now],
+        )?;
+        record_gateway_event_tx(
+            &transaction,
+            Some(call_id),
+            lease_id.as_deref(),
+            None,
+            "follower_cancelled",
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(GatewayFollowerCancellation::Cancelled)
+    }
+
+    pub fn expire_abandoned_gateway_calls(&self, now: i64) -> Result<u64> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let expired = expire_gateway_leases_tx(&transaction, now, None)?;
+        transaction.commit()?;
+        Ok(expired)
+    }
+
+    /// Record one presentation without conflating sessions, turns, agents, or
+    /// compaction epochs. Returns false when the same presentation was already
+    /// recorded for the exact context.
+    pub fn record_gateway_delivery(
+        &self,
+        agent_context: &GatewayAgentContext,
+        result_id: &str,
+        presentation: GatewayPresentation,
+    ) -> Result<bool> {
+        if !agent_context.is_valid() || agent_context.compaction_epoch > i64::MAX as u64 {
+            bail!(GatewayRefusalReason::InvalidAgentContext.as_str());
+        }
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if !gateway_result_is_visible(&transaction, result_id)? {
+            transaction.commit()?;
+            bail!(GatewayRefusalReason::ResultNotFound.as_str());
+        }
+        let tokens = presentation.estimated_tokens_avoided();
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO gateway_deliveries (session_id, turn_id, agent_id, compaction_epoch, result_id, presentation, estimated_tokens_avoided, delivered_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                agent_context.session_id,
+                agent_context.turn_id,
+                agent_context.agent_id,
+                agent_context.compaction_epoch,
+                result_id,
+                presentation.as_str(),
+                tokens,
+                now
+            ],
+        )? == 1;
+        if inserted && matches!(presentation, GatewayPresentation::Compact { .. }) {
+            record_gateway_event_tx(
+                &transaction,
+                None,
+                None,
+                Some(result_id),
+                "compact_delivery",
+                None,
+                tokens,
+                now,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(inserted)
+    }
+
+    pub fn clear_gateway_deliveries(&self, agent_context: &GatewayAgentContext) -> Result<u64> {
+        if !agent_context.is_valid() || agent_context.compaction_epoch > i64::MAX as u64 {
+            bail!(GatewayRefusalReason::InvalidAgentContext.as_str());
+        }
+        let removed = self.conn.execute(
+            "DELETE FROM gateway_deliveries WHERE session_id = ?1 AND turn_id = ?2 AND agent_id = ?3 AND compaction_epoch = ?4",
+            params![
+                agent_context.session_id,
+                agent_context.turn_id,
+                agent_context.agent_id,
+                agent_context.compaction_epoch
+            ],
+        )?;
+        Ok(removed as u64)
+    }
+
+    pub fn gateway_stats(&self) -> Result<GatewayStats> {
+        let mut stats = GatewayStats::default();
+        let mut statement = self.conn.prepare(
+            "SELECT event_type, COUNT(*), COALESCE(SUM(estimated_tokens_avoided), 0) FROM gateway_events GROUP BY event_type",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (event_type, count, tokens) = row?;
+            match event_type.as_str() {
+                "requested" => stats.requested += count,
+                "executed" => stats.executed += count,
+                "exact_hit" => stats.exact_hits += count,
+                "coverage_hit" => stats.coverage_hits += count,
+                "inflight_join" => stats.inflight_joins += count,
+                "compact_delivery" => {
+                    stats.compact_deliveries += count;
+                    stats.estimated_tokens_avoided += tokens;
+                }
+                "stale_completion" | "divergent_result" => {
+                    stats.stale_or_divergent_quarantines += count;
+                }
+                _ => {}
+            }
+        }
+        Ok(stats)
+    }
+
     pub fn quarantine(&self, result_id: &str, reason: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE results SET quarantined = 1, quarantine_reason = ?2 WHERE id = ?1",
@@ -683,6 +1762,10 @@ impl Store {
             "DELETE FROM events WHERE id IN (SELECT id FROM events WHERE created_ms < ?1 ORDER BY created_ms ASC, id ASC LIMIT ?2)",
             params![event_cutoff, CLEANUP_ROW_LIMIT],
         )? as u64;
+        transaction.execute(
+            "DELETE FROM gateway_events WHERE id IN (SELECT id FROM gateway_events WHERE created_ms < ?1 ORDER BY created_ms ASC, id ASC LIMIT ?2)",
+            params![event_cutoff, CLEANUP_ROW_LIMIT],
+        )?;
 
         let candidates: Vec<String> = {
             let mut statement = transaction.prepare(
@@ -774,8 +1857,217 @@ impl Store {
                 _ => {}
             }
         }
+        let gateway = self.gateway_stats()?;
+        stats.requested = gateway.requested;
+        stats.executed = gateway.executed;
+        stats.exact_hits = gateway.exact_hits;
+        stats.coverage_hits = gateway.coverage_hits;
+        stats.inflight_joins = gateway.inflight_joins;
+        stats.compact_deliveries = gateway.compact_deliveries;
+        stats.estimated_tokens_avoided = gateway.estimated_tokens_avoided;
+        stats.stale_or_divergent_quarantines = gateway.stale_or_divergent_quarantines;
         Ok(stats)
     }
+}
+
+struct GatewayLeaseRow {
+    call_id: String,
+    call_key: String,
+    state_digest: String,
+    owner: String,
+    status: String,
+    result_id: Option<String>,
+    expires_ms: i64,
+}
+
+fn gateway_lease_row(
+    transaction: &Transaction<'_>,
+    lease_id: &str,
+) -> Result<Option<GatewayLeaseRow>> {
+    transaction
+        .query_row(
+            "SELECT call_id, call_key, state_digest, owner, status, result_id, expires_ms FROM inflight_leases WHERE lease_id = ?1",
+            [lease_id],
+            |row| {
+                Ok(GatewayLeaseRow {
+                    call_id: row.get(0)?,
+                    call_key: row.get(1)?,
+                    state_digest: row.get(2)?,
+                    owner: row.get(3)?,
+                    status: row.get(4)?,
+                    result_id: row.get(5)?,
+                    expires_ms: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .context("read gateway lease")
+}
+
+fn gateway_result_is_visible(transaction: &Transaction<'_>, result_id: &str) -> Result<bool> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM results WHERE id = ?1 AND quarantined = 0)",
+            [result_id],
+            |row| row.get(0),
+        )
+        .context("validate gateway result binding")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_gateway_request(
+    transaction: &Transaction<'_>,
+    call_id: &str,
+    call_key: &str,
+    state_digest: &str,
+    owner: &str,
+    role: &str,
+    status: &str,
+    lease_id: Option<&str>,
+    result_id: Option<&str>,
+    reason: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO gateway_requests (call_id, call_key, state_digest, owner, role, status, joined_lease_id, result_id, reason, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+        params![
+            call_id,
+            call_key,
+            state_digest,
+            owner,
+            role,
+            status,
+            lease_id,
+            result_id,
+            reason,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_gateway_event_tx(
+    transaction: &Transaction<'_>,
+    call_id: Option<&str>,
+    lease_id: Option<&str>,
+    result_id: Option<&str>,
+    event_type: &str,
+    reason: Option<&str>,
+    estimated_tokens_avoided: u64,
+    now: i64,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO gateway_events (call_id, lease_id, result_id, event_type, reason, estimated_tokens_avoided, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            call_id,
+            lease_id,
+            result_id,
+            event_type,
+            reason,
+            estimated_tokens_avoided,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn expire_gateway_leases_tx(
+    transaction: &Transaction<'_>,
+    now: i64,
+    exact: Option<(&str, &str)>,
+) -> Result<u64> {
+    let expired: Vec<(String, String)> = if let Some((call_key, state_digest)) = exact {
+        let mut statement = transaction.prepare(
+            "SELECT lease_id, call_id FROM inflight_leases WHERE status = 'active' AND expires_ms <= ?1 AND call_key = ?2 AND state_digest = ?3",
+        )?;
+        statement
+            .query_map(params![now, call_key, state_digest], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        let mut statement = transaction.prepare(
+            "SELECT lease_id, call_id FROM inflight_leases WHERE status = 'active' AND expires_ms <= ?1",
+        )?;
+        statement
+            .query_map([now], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    for (lease_id, call_id) in &expired {
+        transaction.execute(
+            "UPDATE inflight_leases SET status = 'expired', reason = 'lease_expired', completed_ms = ?2 WHERE lease_id = ?1 AND status = 'active'",
+            params![lease_id, now],
+        )?;
+        transaction.execute(
+            "UPDATE gateway_requests SET status = 'failed', reason = 'lease_expired', updated_ms = ?2 WHERE joined_lease_id = ?1 AND status IN ('inflight', 'waiting')",
+            params![lease_id, now],
+        )?;
+        record_gateway_event_tx(
+            transaction,
+            Some(call_id),
+            Some(lease_id),
+            None,
+            "lease_expired",
+            None,
+            0,
+            now,
+        )?;
+    }
+    Ok(expired.len() as u64)
+}
+
+fn lease_refusal_for_status(status: &str) -> GatewayRefusalReason {
+    match status {
+        "expired" => GatewayRefusalReason::LeaseExpired,
+        "quarantined" => GatewayRefusalReason::Quarantined,
+        "completed" | "failed" => GatewayRefusalReason::AlreadyTerminal,
+        _ => GatewayRefusalReason::LeaseNotCurrent,
+    }
+}
+
+fn quarantine_gateway_divergence_tx(
+    transaction: &Transaction<'_>,
+    lease: &GatewayLeaseRow,
+    existing_result_id: &str,
+    conflicting_result_id: &str,
+    now: i64,
+) -> Result<()> {
+    transaction.execute(
+        "UPDATE gateway_results SET status = 'quarantined', quarantine_reason = 'divergent_result', updated_ms = ?3 WHERE call_key = ?1 AND state_digest = ?2",
+        params![lease.call_key, lease.state_digest, now],
+    )?;
+    let gateway_result_id = format!("gr_{}", Uuid::new_v4().simple());
+    transaction.execute(
+        "INSERT INTO gateway_results (gateway_result_id, call_key, state_digest, result_id, lease_id, status, quarantine_reason, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, (SELECT lease_id FROM inflight_leases WHERE call_id = ?5), 'quarantined', 'divergent_result', ?6, ?6) ON CONFLICT(call_key, state_digest, result_id) DO UPDATE SET status = 'quarantined', quarantine_reason = 'divergent_result', updated_ms = excluded.updated_ms",
+        params![
+            gateway_result_id,
+            lease.call_key,
+            lease.state_digest,
+            conflicting_result_id,
+            lease.call_id,
+            now
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE inflight_leases SET status = 'quarantined', reason = 'divergent_result', completed_ms = ?2 WHERE call_id = ?1",
+        params![lease.call_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE gateway_requests SET status = 'quarantined', reason = 'divergent_result', updated_ms = ?2 WHERE joined_lease_id = (SELECT lease_id FROM inflight_leases WHERE call_id = ?1)",
+        params![lease.call_id, now],
+    )?;
+    record_gateway_event_tx(
+        transaction,
+        Some(&lease.call_id),
+        None,
+        Some(conflicting_result_id),
+        "divergent_result",
+        Some(existing_result_id),
+        0,
+        now,
+    )
 }
 
 impl FileDigestCache for Store {
