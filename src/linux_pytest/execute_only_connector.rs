@@ -1,9 +1,11 @@
 //! Command-free composition of existing Gate 3 checkpoints.
 //!
-//! This owner can prepare an isolation-ready child with authenticated profile
-//! stdio and can cancel that child again. It has no command, environment,
-//! release, task, descriptor, execution-result, candidate, replay, or reuse
-//! surface. In particular, reaching this checkpoint cannot execute a workload.
+//! This owner requires and retains the bounded structural inventory from both
+//! connector publications before it can prepare an isolation-ready child with
+//! authenticated profile stdio. It can cancel that child again. It has no
+//! command, environment, release, task, descriptor, execution-result,
+//! candidate, replay, or reuse surface. In particular, reaching this
+//! checkpoint cannot execute a workload.
 
 #![allow(
     dead_code,
@@ -103,7 +105,7 @@ mod supported {
         FirstExecuteOnlyIsolationReadyPermitV1,
         begin_blocked_execute_only_isolation_with_profile_stdio_v1,
     };
-    use super::super::execute_only_runtime::FirstExecuteOnlyRuntimeCheckpointV1;
+    use super::super::execute_only_runtime::FirstExecuteOnlyRuntimeStructuralInventoryV1;
     use super::super::execute_only_stdio::{
         LinuxProfileStdioSyscallsV1, ParentStdioDrainV1, ProfileStdioDrainReportV1,
         ProfileStdioFailureV1, open_profile_owned_stdio_v1,
@@ -208,10 +210,11 @@ mod supported {
         }
     }
 
-    /// Opaque, linear command-free owner. The runtime checkpoint is retained
-    /// solely to preserve the admission chain while the child remains live.
+    /// Opaque, linear command-free owner. The two-publication structural
+    /// inventory is retained solely to preserve the complete runtime admission
+    /// chain while the child remains live.
     pub(in crate::linux_pytest) struct FirstExecuteOnlyCommandFreeCheckpointV1<'resources> {
-        _runtime: FirstExecuteOnlyRuntimeCheckpointV1<'resources>,
+        _inventory: FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
         isolation: Option<FirstExecuteOnlyIsolationReadyPermitV1>,
         stdio: Option<ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>>,
     }
@@ -220,7 +223,7 @@ mod supported {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
                 .debug_struct("FirstExecuteOnlyCommandFreeCheckpointV1")
-                .field("runtime", &"<retained-redacted>")
+                .field("runtime_inventory", &"<retained-redacted>")
                 .field("child", &"<isolation-ready-cleanup-owned>")
                 .field("stdio", &"<profile-owned-redacted>")
                 .field("command", &"<none>")
@@ -280,7 +283,7 @@ mod supported {
     pub(in crate::linux_pytest) fn prepare_first_execute_only_command_free_checkpoint_v1<
         'resources,
     >(
-        runtime: FirstExecuteOnlyRuntimeCheckpointV1<'resources>,
+        inventory: FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
     ) -> Result<FirstExecuteOnlyCommandFreeCheckpointV1<'resources>, CommandFreeSetupFailureV1>
     {
         let session =
@@ -320,7 +323,7 @@ mod supported {
             }
         };
         Ok(FirstExecuteOnlyCommandFreeCheckpointV1 {
-            _runtime: runtime,
+            _inventory: inventory,
             isolation: Some(isolation),
             stdio: Some(parent),
         })
@@ -495,11 +498,13 @@ mod supported {
         impl<T: Copy> AmbiguousIfCopy<u8> for T {}
 
         #[test]
-        fn command_free_owner_is_linear_and_constructor_requires_runtime_checkpoint() {
+        fn command_free_owner_is_linear_and_constructor_requires_structural_inventory() {
             <FirstExecuteOnlyCommandFreeCheckpointV1<'static> as AmbiguousIfClone<_>>::probe();
             <FirstExecuteOnlyCommandFreeCheckpointV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfClone<_>>::probe();
+            <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfCopy<_>>::probe();
             let _constructor: fn(
-                FirstExecuteOnlyRuntimeCheckpointV1<'static>,
+                FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
             ) -> Result<
                 FirstExecuteOnlyCommandFreeCheckpointV1<'static>,
                 CommandFreeSetupFailureV1,
