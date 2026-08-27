@@ -205,6 +205,12 @@ class ClientInspection:
 
 
 @dataclasses.dataclass(frozen=True)
+class RuntimePin:
+    version: str
+    sha256: str
+
+
+@dataclasses.dataclass(frozen=True)
 class AgentOutputAnalysis:
     malformed: bool
     malformed_reason: str | None
@@ -860,7 +866,67 @@ def create_fixture_repository(
     revision = require_checked_command(revision_result, "fixture Git revision").decode().strip()
     if not re.fullmatch(r"[0-9a-f]{40}", revision):
         raise HarnessRefusal("fixture_git", "fixture Git revision is malformed")
-    return {"git_sha": revision, "file_sha256": manifest}
+    fixture_digest = hashlib.sha256(
+        b"again.real-agent-fixture.v1\0" + canonical_json_bytes(manifest)
+    ).hexdigest()
+    return {
+        "git_sha": revision,
+        "file_sha256": manifest,
+        "fixture_digest_sha256": fixture_digest,
+    }
+
+
+def snapshot_repository_contents(root: pathlib.Path) -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    entries = 0
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if relative.parts and relative.parts[0] == ".git":
+            continue
+        metadata = path.lstat()
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        entries += 1
+        if entries > 128:
+            raise HarnessRefusal("repository_bound", "fixture repository has too many files")
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise HarnessRefusal("repository_unsafe", "fixture contains a symlink or special file")
+        if metadata.st_size > 1024 * 1024:
+            raise HarnessRefusal("repository_bound", "fixture file exceeds its verification bound")
+        rendered = relative.as_posix()
+        snapshot[rendered] = {
+            "bytes": metadata.st_size,
+            "mode": stat.S_IMODE(metadata.st_mode),
+            "sha256": file_sha256(path, 1024 * 1024),
+        }
+    return snapshot
+
+
+def repository_diff(
+    expected_hashes: Mapping[str, str], current: Mapping[str, Mapping[str, Any]]
+) -> dict[str, Any]:
+    expected_names = set(expected_hashes)
+    current_names = set(current)
+    added = sorted(current_names - expected_names)
+    removed = sorted(expected_names - current_names)
+    changed = sorted(
+        name
+        for name in expected_names & current_names
+        if current[name].get("sha256") != expected_hashes[name]
+    )
+    mode_changed = sorted(
+        name
+        for name in expected_names & current_names
+        if current[name].get("mode") != 0o600
+    )
+    return {
+        "clean": not (added or removed or changed or mode_changed),
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "mode_changed": mode_changed,
+        "snapshot_sha256": sha256_bytes(canonical_json_bytes(dict(current))),
+    }
 
 
 def validate_setup_plan(
@@ -1533,6 +1599,21 @@ def planned_agent_runs(client_count: int) -> int:
     return client_count * 2 * sum(task.concurrency for task in TASKS)
 
 
+def treatment_order(client_index: int, task_index: int) -> tuple[str, str]:
+    if (client_index + task_index) % 2 == 0:
+        return ("baseline", "again_enabled")
+    return ("again_enabled", "baseline")
+
+
+def validate_runtime_pin(pin: RuntimePin, observed_version: str, observed_sha256: str) -> None:
+    if not pin.version or len(pin.version) > 256 or "\n" in pin.version or "\r" in pin.version:
+        raise HarnessRefusal("runtime_pin", "runtime version pin is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", pin.sha256):
+        raise HarnessRefusal("runtime_pin", "runtime SHA-256 pin is invalid")
+    if pin.version != observed_version or pin.sha256 != observed_sha256:
+        raise HarnessRefusal("runtime_pin_mismatch", "runtime identity differs from its exact pin")
+
+
 def evaluate(
     *,
     mode: str,
@@ -1542,6 +1623,7 @@ def evaluate(
     models: Mapping[str, str],
     settings_ids: Mapping[str, str],
     credential_names: Mapping[str, str],
+    runtime_pins: Mapping[str, RuntimePin],
     maximum_runs: int,
     timeout_seconds: float,
 ) -> tuple[dict[str, Any], tuple[bytes, ...]]:
@@ -1558,6 +1640,8 @@ def evaluate(
     clients = tuple(sorted(templates))
     if clients != ("claude", "codex"):
         raise HarnessRefusal("clients", "both explicit Codex and Claude templates are required")
+    if set(runtime_pins) != {"again", "claude", "codex"}:
+        raise HarnessRefusal("runtime_pin", "exact Again, Claude, and Codex pins are required")
     planned = planned_agent_runs(len(clients))
     if maximum_runs < planned:
         raise HarnessRefusal(
@@ -1598,6 +1682,16 @@ def evaluate(
             client: inspect_client(templates[client], bootstrap_environment, timeout_seconds)
             for client in clients
         }
+        validate_runtime_pin(
+            runtime_pins["again"], str(again["version"]), str(again["binary_sha256"])
+        )
+        again["runtime_pin_verified"] = True
+        for client in clients:
+            validate_runtime_pin(
+                runtime_pins[client],
+                inspections[client].version,
+                inspections[client].executable_sha256,
+            )
         shim_directory = private / "enabled-bin"
         shim_directory.mkdir(mode=0o700)
         (shim_directory / "again").symlink_to(again_binary)
@@ -1617,69 +1711,104 @@ def evaluate(
         pairs: list[dict[str, Any]] = []
         all_runs: list[dict[str, Any]] = []
         if mode == "live":
-            for client in clients:
+            for client_index, client in enumerate(clients):
                 client_root = private / "live" / client
-                again_home = client_root / "again-state"
-                stats_environment = dict(bootstrap_environment)
-                stats_environment["AGAIN_HOME"] = str(again_home)
-                again_home.mkdir(mode=0o700, parents=True)
                 baseline_paths = (
                     templates[client].executable.parent,
                     pathlib.Path("/usr/bin"),
                     pathlib.Path("/bin"),
                 )
                 enabled_paths = (shim_directory, *baseline_paths)
-                for task in TASKS:
+                for task_index, task in enumerate(TASKS):
                     task_root = client_root / task.task_id
-                    before = read_again_stats(
-                        again_binary, fixture_root, stats_environment, timeout_seconds
+                    task_root.mkdir(mode=0o700, parents=True)
+                    pair_repository = task_root / "repository"
+                    pair_fixture = create_fixture_repository(
+                        pair_repository, bootstrap_environment, timeout_seconds
                     )
-                    baseline_runs, _unused = run_cohort(
-                        client=client,
-                        condition="baseline",
-                        task=task,
-                        template=templates[client],
-                        model=models[client],
-                        workspace=fixture_root,
-                        run_root=task_root,
-                        again_home=again_home,
-                        baseline_paths=baseline_paths,
-                        enabled_paths=enabled_paths,
-                        setup_binary=again_binary,
-                        setup_environment=bootstrap_environment,
-                        credential_name=credential_names[client],
-                        credential_value=credentials[client],
-                        timeout_seconds=timeout_seconds,
-                    )
-                    after_baseline = read_again_stats(
-                        again_binary, fixture_root, stats_environment, timeout_seconds
-                    )
-                    baseline_delta = stats_delta(before, after_baseline)
-                    if any(baseline_delta.values()):
+                    if pair_fixture["fixture_digest_sha256"] != fixture["fixture_digest_sha256"]:
                         raise HarnessRefusal(
-                            "baseline_contaminated", "Again stats changed during baseline condition"
+                            "fixture_mismatch", "fresh pair fixture differs from the pinned fixture"
                         )
-                    enabled_runs, setup_summary = run_cohort(
-                        client=client,
-                        condition="again_enabled",
-                        task=task,
-                        template=templates[client],
-                        model=models[client],
-                        workspace=fixture_root,
-                        run_root=task_root,
-                        again_home=again_home,
-                        baseline_paths=baseline_paths,
-                        enabled_paths=enabled_paths,
-                        setup_binary=again_binary,
-                        setup_environment=bootstrap_environment,
-                        credential_name=credential_names[client],
-                        credential_value=credentials[client],
-                        timeout_seconds=timeout_seconds,
+                    initial_repository_diff = repository_diff(
+                        pair_fixture["file_sha256"],
+                        snapshot_repository_contents(pair_repository),
                     )
-                    after_enabled = read_again_stats(
-                        again_binary, fixture_root, stats_environment, timeout_seconds
-                    )
-                    gateway_delta = stats_delta(after_baseline, after_enabled)
+                    if not initial_repository_diff["clean"]:
+                        raise HarnessRefusal("fixture_dirty", "fresh pair fixture is not exact")
+                    again_home = task_root / "again-state"
+                    again_home.mkdir(mode=0o700)
+                    baseline_again_home = task_root / "baseline-state"
+                    stats_environment = dict(bootstrap_environment)
+                    stats_environment["AGAIN_HOME"] = str(again_home)
+                    order = treatment_order(client_index, task_index)
+                    condition_records: dict[str, dict[str, Any]] = {}
+                    setup_summary: dict[str, Any] | None = None
+                    for condition in order:
+                        before = read_again_stats(
+                            again_binary,
+                            pair_repository,
+                            stats_environment,
+                            timeout_seconds,
+                        )
+                        runs, condition_setup = run_cohort(
+                            client=client,
+                            condition=condition,
+                            task=task,
+                            template=templates[client],
+                            model=models[client],
+                            workspace=pair_repository,
+                            run_root=task_root / "runs",
+                            again_home=(
+                                again_home
+                                if condition == "again_enabled"
+                                else baseline_again_home
+                            ),
+                            baseline_paths=baseline_paths,
+                            enabled_paths=enabled_paths,
+                            setup_binary=again_binary,
+                            setup_environment=bootstrap_environment,
+                            credential_name=credential_names[client],
+                            credential_value=credentials[client],
+                            timeout_seconds=timeout_seconds,
+                        )
+                        after = read_again_stats(
+                            again_binary,
+                            pair_repository,
+                            stats_environment,
+                            timeout_seconds,
+                        )
+                        delta = stats_delta(before, after)
+                        final_repository_diff = repository_diff(
+                            pair_fixture["file_sha256"],
+                            snapshot_repository_contents(pair_repository),
+                        )
+                        if not final_repository_diff["clean"]:
+                            raise HarnessRefusal(
+                                "unexpected_repository_mutation",
+                                "agent condition changed the retained fixture repository",
+                            )
+                        if condition == "baseline" and any(delta.values()):
+                            raise HarnessRefusal(
+                                "baseline_contaminated",
+                                "Again stats changed during baseline condition",
+                            )
+                        condition_records[condition] = {
+                            "runs": runs,
+                            "gateway_stats_delta": delta,
+                            "repository_diff": final_repository_diff,
+                        }
+                        if condition_setup is not None:
+                            setup_summary = condition_setup
+                    if setup_summary is None:
+                        raise HarnessRefusal(
+                            "setup_plan", "enabled condition did not retain an Again setup plan"
+                        )
+                    baseline_runs = condition_records["baseline"]["runs"]
+                    enabled_runs = condition_records["again_enabled"]["runs"]
+                    gateway_delta = condition_records["again_enabled"][
+                        "gateway_stats_delta"
+                    ]
                     reconciliation = classify_paired_run(
                         baseline_runs, enabled_runs, gateway_delta
                     )
@@ -1687,10 +1816,13 @@ def evaluate(
                         "client": client,
                         "task_id": task.task_id,
                         "concurrency": task.concurrency,
-                        "baseline": {"runs": baseline_runs, "gateway_stats_delta": baseline_delta},
+                        "treatment_order": list(order),
+                        "fresh_isolated_state": True,
+                        "fixture_git_sha": pair_fixture["git_sha"],
+                        "initial_repository_diff": initial_repository_diff,
+                        "baseline": condition_records["baseline"],
                         "again_enabled": {
-                            "runs": enabled_runs,
-                            "gateway_stats_delta": gateway_delta,
+                            **condition_records["again_enabled"],
                             "setup": setup_summary,
                         },
                         "reconciliation": reconciliation,
@@ -1733,6 +1865,7 @@ def evaluate(
                 "again": again,
                 "fixture_repository_git_sha": fixture["git_sha"],
                 "fixture_file_sha256": fixture["file_sha256"],
+                "fixture_digest_sha256": fixture["fixture_digest_sha256"],
                 "platform": {
                     "system": platform.system(),
                     "release": platform.release(),
@@ -1745,6 +1878,7 @@ def evaluate(
                     "version": inspections[client].version,
                     "version_tuple": list(inspections[client].version_tuple),
                     "executable_sha256": inspections[client].executable_sha256,
+                    "runtime_pin_verified": True,
                     "model": models[client],
                     "settings_id": settings_ids[client],
                     "command_template": list(templates[client].arguments),
@@ -1756,6 +1890,9 @@ def evaluate(
             },
             "design": {
                 "conditions": ["baseline", "again_enabled"],
+                "treatment_assignment": (
+                    "deterministic alternation by sorted client index plus task index"
+                ),
                 "planned_agent_runs": planned,
                 "executed_agent_runs": len(all_runs),
                 "tasks": [
@@ -1768,6 +1905,8 @@ def evaluate(
                 ],
                 "agent_edits_permitted": False,
                 "fixture_repository_is_temporary": True,
+                "fresh_configuration_state_and_repository_per_pair": True,
+                "repository_contents_verified_after_each_condition": True,
                 "measurement_definitions": {
                     "response_bytes": (
                         "canonical bytes of redacted Again tool results observable in client events"
@@ -1851,8 +1990,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--mode", choices=("dry-run", "live"), default="dry-run")
     parser.add_argument("--allow-network", action="store_true")
     parser.add_argument("--again-binary", type=pathlib.Path, required=True)
+    parser.add_argument("--again-version", required=True)
+    parser.add_argument("--again-sha256", required=True)
     parser.add_argument("--codex-command-template", required=True)
     parser.add_argument("--claude-command-template", required=True)
+    parser.add_argument("--codex-version", required=True)
+    parser.add_argument("--codex-sha256", required=True)
+    parser.add_argument("--claude-version", required=True)
+    parser.add_argument("--claude-sha256", required=True)
     parser.add_argument("--codex-model", required=True)
     parser.add_argument("--claude-model", required=True)
     parser.add_argument("--codex-settings-id", required=True)
@@ -1887,6 +2032,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         credential_names={
             "codex": arguments.codex_credential_env,
             "claude": arguments.claude_credential_env,
+        },
+        runtime_pins={
+            "again": RuntimePin(arguments.again_version, arguments.again_sha256),
+            "codex": RuntimePin(arguments.codex_version, arguments.codex_sha256),
+            "claude": RuntimePin(arguments.claude_version, arguments.claude_sha256),
         },
         maximum_runs=arguments.max_runs,
         timeout_seconds=arguments.timeout_seconds,

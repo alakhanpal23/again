@@ -164,6 +164,7 @@ class RealAgentEvalTests(unittest.TestCase):
                 models={},
                 settings_ids={},
                 credential_names={},
+                runtime_pins={},
                 maximum_runs=16,
                 timeout_seconds=10,
             )
@@ -177,6 +178,7 @@ class RealAgentEvalTests(unittest.TestCase):
                 models={},
                 settings_ids={},
                 credential_names={},
+                runtime_pins={},
                 maximum_runs=16,
                 timeout_seconds=10,
             )
@@ -227,6 +229,67 @@ class RealAgentEvalTests(unittest.TestCase):
                 [run_observation(calls=1)], enabled, gateway_delta(requested=3)
             )
         self.assertEqual(contaminated.exception.code, "baseline_contaminated")
+
+    def test_matrix_is_exactly_16_runs_with_balanced_alternation(self) -> None:
+        self.assertEqual(real_eval.planned_agent_runs(2), 16)
+        orders = [
+            real_eval.treatment_order(client_index, task_index)
+            for client_index in range(2)
+            for task_index in range(len(real_eval.TASKS))
+        ]
+        self.assertEqual(orders.count(("baseline", "again_enabled")), 3)
+        self.assertEqual(orders.count(("again_enabled", "baseline")), 3)
+        self.assertTrue(any(task.concurrency == 2 for task in real_eval.TASKS))
+
+    def test_runtime_identity_pins_are_exact(self) -> None:
+        digest = "a" * 64
+        real_eval.validate_runtime_pin(
+            real_eval.RuntimePin("codex-cli 0.150.1", digest),
+            "codex-cli 0.150.1",
+            digest,
+        )
+        with self.assertRaises(real_eval.HarnessRefusal) as mismatch:
+            real_eval.validate_runtime_pin(
+                real_eval.RuntimePin("codex-cli 0.150.1", digest),
+                "codex-cli 0.150.2",
+                digest,
+            )
+        self.assertEqual(mismatch.exception.code, "runtime_pin_mismatch")
+        with self.assertRaises(real_eval.HarnessRefusal) as malformed:
+            real_eval.validate_runtime_pin(
+                real_eval.RuntimePin("codex-cli 0.150.1", "not-a-digest"),
+                "codex-cli 0.150.1",
+                "not-a-digest",
+            )
+        self.assertEqual(malformed.exception.code, "runtime_pin")
+
+    def test_repository_snapshot_detects_dirty_fixture_contents(self) -> None:
+        repository = self.root / "snapshot-repository"
+        repository.mkdir()
+        expected: dict[str, str] = {}
+        for relative, contents in real_eval.FIXTURE_FILES.items():
+            path = repository / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents)
+            path.chmod(0o600)
+            expected[relative] = hashlib.sha256(contents.encode()).hexdigest()
+        clean = real_eval.repository_diff(
+            expected, real_eval.snapshot_repository_contents(repository)
+        )
+        self.assertTrue(clean["clean"])
+
+        changed_path = repository / "facts" / "primary.txt"
+        changed_path.write_text("unexpected mutation\n")
+        changed_path.chmod(0o600)
+        added_path = repository / "unexpected.txt"
+        added_path.write_text("unexpected addition\n")
+        added_path.chmod(0o600)
+        dirty = real_eval.repository_diff(
+            expected, real_eval.snapshot_repository_contents(repository)
+        )
+        self.assertFalse(dirty["clean"])
+        self.assertEqual(dirty["changed"], ["facts/primary.txt"])
+        self.assertEqual(dirty["added"], ["unexpected.txt"])
 
     def test_unsupported_client_versions_are_refused(self) -> None:
         codex_help = "Codex CLI --version"
