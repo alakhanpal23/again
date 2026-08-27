@@ -24,6 +24,7 @@ pub const WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
 pub struct WorkspaceAuthorityLimitsV1 {
     pub max_plan_entries: usize,
     pub max_path_bytes: usize,
+    pub max_total_path_bytes: usize,
     pub max_file_bytes: u64,
     pub max_total_bytes: u64,
     pub max_tree_entries: u64,
@@ -43,6 +44,7 @@ impl Default for WorkspaceAuthorityLimitsV1 {
         Self {
             max_plan_entries: 1_024,
             max_path_bytes: 4_096,
+            max_total_path_bytes: 16 * 1024 * 1024,
             max_file_bytes: 256 * 1024 * 1024,
             max_total_bytes: 1024 * 1024 * 1024,
             max_tree_entries: 100_000,
@@ -445,6 +447,43 @@ impl RepositoryEpochV1 {
     }
 }
 
+/// One descriptor-retained repository identity for a complete provider call.
+///
+/// The owned root descriptor is deliberately private and this type is neither
+/// cloneable nor serializable. Repository observations, provider reads, and
+/// final validation performed through this value therefore remain attached to
+/// the exact directory opened at issuance even if its pathname is replaced and
+/// later restored.
+pub(crate) struct WorkspaceExecutionEpochV1 {
+    requested_workspace: PathBuf,
+    canonical_workspace: PathBuf,
+    root_handle: File,
+    root_identity: FilesystemIdentityV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RepositoryNodeKindV1 {
+    Missing,
+    Directory,
+    Regular,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryRegularFileV1 {
+    relative_path: PathBuf,
+    bytes: u64,
+}
+
+impl RepositoryRegularFileV1 {
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FilesystemIdentityV1 {
     device: u64,
@@ -486,6 +525,13 @@ impl FilesystemIdentityV1 {
 
     fn same_object(self, other: Self) -> bool {
         self.device == other.device && self.inode == other.inode
+    }
+
+    fn same_authority(self, other: Self) -> bool {
+        self.same_object(other)
+            && self.mode == other.mode
+            && self.uid == other.uid
+            && self.gid == other.gid
     }
 
     /// Stable identity omits mutable timestamps and directory size. Those are
@@ -682,6 +728,252 @@ fn secure_node_kind_relative(
             Some(display_path.to_path_buf()),
             operation,
         ))
+    }
+}
+
+impl WorkspaceExecutionEpochV1 {
+    pub(crate) fn begin(
+        workspace: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        validate_limits(limits)?;
+        let root_handle = secure_open_path(
+            workspace,
+            ExpectedNodeV1::Directory,
+            StateDimensionV1::Repository,
+            "open provider workspace epoch",
+        )?;
+        let canonical_workspace = descriptor_path(
+            &root_handle,
+            workspace,
+            StateDimensionV1::Repository,
+            "resolve provider workspace epoch",
+        )?;
+        check_path_bound(&canonical_workspace, limits, StateDimensionV1::Repository)?;
+        let root_identity =
+            FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::Repository,
+                    &canonical_workspace,
+                    "inspect provider workspace epoch",
+                    error,
+                )
+            })?);
+        let epoch = Self {
+            requested_workspace: workspace.to_path_buf(),
+            canonical_workspace,
+            root_handle,
+            root_identity,
+        };
+        epoch.verify_current_path()?;
+        Ok(epoch)
+    }
+
+    pub(crate) fn canonical_workspace(&self) -> &Path {
+        &self.canonical_workspace
+    }
+
+    pub(crate) fn classify_relative(
+        &self,
+        relative: &Path,
+    ) -> AuthorityResult<RepositoryNodeKindV1> {
+        let display = self.canonical_workspace.join(relative);
+        let kind = secure_node_kind_relative(
+            &self.root_handle,
+            relative,
+            StateDimensionV1::RepositoryContent,
+            &display,
+            "classify provider repository path",
+        )?;
+        Ok(match kind {
+            None => RepositoryNodeKindV1::Missing,
+            Some(SecureNodeKindV1::Directory) => RepositoryNodeKindV1::Directory,
+            Some(SecureNodeKindV1::Regular) => RepositoryNodeKindV1::Regular,
+        })
+    }
+
+    pub(crate) fn observe_repository(
+        &self,
+        plan: &RepositoryObservationPlanV1,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<RepositoryEpochV1> {
+        observe_repository_epoch_inner(self, plan, limits, || {})
+    }
+
+    pub(crate) fn read_repository_file(
+        &self,
+        relative: &Path,
+        maximum_bytes: u64,
+    ) -> AuthorityResult<Vec<u8>> {
+        self.read_repository_file_inner(relative, maximum_bytes, || {})
+    }
+
+    fn read_repository_file_inner<F>(
+        &self,
+        relative: &Path,
+        maximum_bytes: u64,
+        before_final_validation: F,
+    ) -> AuthorityResult<Vec<u8>>
+    where
+        F: FnOnce(),
+    {
+        if maximum_bytes == 0 {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "bound repository provider read",
+            ));
+        }
+        let mut file = secure_open_relative(
+            &self.root_handle,
+            relative,
+            ExpectedNodeV1::Regular,
+            StateDimensionV1::RepositoryContent,
+            relative,
+            "open repository provider input",
+        )?;
+        let before = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                relative,
+                "inspect repository provider input",
+                error,
+            )
+        })?);
+        if before.size > maximum_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "read repository provider input",
+            ));
+        }
+        let capacity = usize::try_from(before.size).map_err(|_| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "allocate repository provider input",
+            )
+        })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|_| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "allocate repository provider input",
+            )
+        })?;
+        file.by_ref()
+            .take(maximum_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    relative,
+                    "read repository provider input",
+                    error,
+                )
+            })?;
+        if bytes.len() as u64 > maximum_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "read repository provider input",
+            ));
+        }
+        let after = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                relative,
+                "reinspect repository provider input",
+                error,
+            )
+        })?);
+        let reopened = secure_open_relative(
+            &self.root_handle,
+            relative,
+            ExpectedNodeV1::Regular,
+            StateDimensionV1::RepositoryContent,
+            relative,
+            "reopen repository provider input",
+        )?;
+        let path_after =
+            FilesystemIdentityV1::from_metadata(&reopened.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    relative,
+                    "inspect reopened repository provider input",
+                    error,
+                )
+            })?);
+        before_final_validation();
+        self.verify_current_path()?;
+        if before != after || after != path_after {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                relative,
+                "authenticate repository provider read",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn list_regular_files(
+        &self,
+        start: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Vec<RepositoryRegularFileV1>> {
+        validate_limits(limits)?;
+        let normalized = normalize_provider_relative_path(start, limits)?;
+        let mut files = Vec::new();
+        let mut ledger = ProviderTraversalLedgerV1::default();
+        collect_provider_regular_files_v1(self, &normalized, 0, limits, &mut ledger, &mut files)?;
+        self.verify_current_path()?;
+        Ok(files)
+    }
+
+    fn verify_current_path(&self) -> AuthorityResult<()> {
+        let handle_identity =
+            FilesystemIdentityV1::from_metadata(&self.root_handle.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::Repository,
+                    &self.canonical_workspace,
+                    "reinspect provider workspace epoch",
+                    error,
+                )
+            })?);
+        let reopened = secure_open_path(
+            &self.requested_workspace,
+            ExpectedNodeV1::Directory,
+            StateDimensionV1::Repository,
+            "reopen provider workspace epoch",
+        )?;
+        let path_identity =
+            FilesystemIdentityV1::from_metadata(&reopened.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::Repository,
+                    &self.canonical_workspace,
+                    "inspect reopened provider workspace epoch",
+                    error,
+                )
+            })?);
+        let canonical_after = descriptor_path(
+            &reopened,
+            &self.requested_workspace,
+            StateDimensionV1::Repository,
+            "resolve reopened provider workspace epoch",
+        )?;
+        if !self.root_identity.same_authority(handle_identity)
+            || !self.root_identity.same_authority(path_identity)
+            || self.canonical_workspace != canonical_after
+        {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::RepositoryReplaced,
+                StateDimensionV1::Repository,
+                Some(self.canonical_workspace.clone()),
+                "verify provider workspace epoch",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -952,6 +1244,7 @@ fn directory_names_from_handle(
     // file description offset, so every sample must explicitly rewind it.
     unsafe { libc::rewinddir(stream.0) };
     let mut names = Vec::new();
+    let mut total_name_bytes = 0_usize;
     loop {
         set_errno_zero();
         // SAFETY: stream owns a live DIR pointer. The entry remains valid until
@@ -988,6 +1281,20 @@ fn directory_names_from_handle(
                 "bound directory entry name",
             ));
         }
+        total_name_bytes = total_name_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "sum directory entry name bytes",
+            )
+        })?;
+        if total_name_bytes > limits.max_total_path_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "bound directory entry name bytes",
+            ));
+        }
         names.try_reserve(1).map_err(|_| {
             incomplete_limit(
                 StateDimensionV1::RepositoryContent,
@@ -999,6 +1306,197 @@ fn directory_names_from_handle(
     }
     names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     Ok(names)
+}
+
+#[derive(Default)]
+struct ProviderTraversalLedgerV1 {
+    entries: u64,
+    path_bytes: usize,
+}
+
+impl ProviderTraversalLedgerV1 {
+    fn charge(
+        &mut self,
+        relative: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<()> {
+        self.entries = self.entries.checked_add(1).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "sum provider traversal entries",
+            )
+        })?;
+        if self.entries > limits.max_tree_entries {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "bound provider traversal entries",
+            ));
+        }
+        let bytes = relative.as_os_str().as_bytes().len();
+        if bytes > limits.max_path_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "bound provider traversal path",
+            ));
+        }
+        self.path_bytes = self.path_bytes.checked_add(bytes).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "sum provider traversal path bytes",
+            )
+        })?;
+        if self.path_bytes > limits.max_total_path_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "bound provider traversal path bytes",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn normalize_provider_relative_path(
+    path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(name) => normalized.push(name),
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(incomplete_plan(
+                    StateDimensionV1::RepositoryContent,
+                    Some(path),
+                    "normalize provider traversal path",
+                ));
+            }
+        }
+    }
+    check_path_bound(&normalized, limits, StateDimensionV1::RepositoryContent)?;
+    Ok(normalized)
+}
+
+fn collect_provider_regular_files_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    relative: &Path,
+    depth: usize,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ProviderTraversalLedgerV1,
+    files: &mut Vec<RepositoryRegularFileV1>,
+) -> AuthorityResult<()> {
+    if depth > limits.max_tree_depth {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(relative),
+            "bound provider traversal depth",
+        ));
+    }
+    ledger.charge(relative, limits)?;
+    let display = epoch.canonical_workspace.join(relative);
+    match secure_node_kind_relative(
+        &epoch.root_handle,
+        relative,
+        StateDimensionV1::RepositoryContent,
+        &display,
+        "inspect provider traversal entry",
+    )? {
+        None => Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::UnreadableRelevantState,
+            StateDimensionV1::RepositoryContent,
+            Some(display),
+            "require provider traversal entry",
+        )),
+        Some(SecureNodeKindV1::Regular) => {
+            let file = secure_open_relative(
+                &epoch.root_handle,
+                relative,
+                ExpectedNodeV1::Regular,
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "open provider traversal file",
+            )?;
+            let before =
+                FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "inspect provider traversal file",
+                        error,
+                    )
+                })?);
+            let reopened = secure_open_relative(
+                &epoch.root_handle,
+                relative,
+                ExpectedNodeV1::Regular,
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "reopen provider traversal file",
+            )?;
+            let after =
+                FilesystemIdentityV1::from_metadata(&reopened.metadata().map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "reinspect provider traversal file",
+                        error,
+                    )
+                })?);
+            if before != after {
+                return Err(concurrent(
+                    StateDimensionV1::RepositoryContent,
+                    &display,
+                    "authenticate provider traversal file",
+                ));
+            }
+            files.try_reserve(1).map_err(|_| {
+                incomplete_limit(
+                    StateDimensionV1::RepositoryContent,
+                    Some(&display),
+                    "allocate provider traversal result",
+                )
+            })?;
+            files.push(RepositoryRegularFileV1 {
+                relative_path: relative.to_path_buf(),
+                bytes: before.size,
+            });
+            Ok(())
+        }
+        Some(SecureNodeKindV1::Directory) => {
+            let (_identity, names) =
+                stable_directory_listing_relative(&epoch.root_handle, relative, &display, limits)?;
+            for name in names {
+                let child_bytes = relative
+                    .as_os_str()
+                    .as_bytes()
+                    .len()
+                    .checked_add(name.as_bytes().len())
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or_else(|| {
+                        incomplete_limit(
+                            StateDimensionV1::RepositoryContent,
+                            Some(relative),
+                            "sum provider child path bytes",
+                        )
+                    })?;
+                if child_bytes > limits.max_path_bytes {
+                    return Err(incomplete_limit(
+                        StateDimensionV1::RepositoryContent,
+                        Some(relative),
+                        "bound provider child path",
+                    ));
+                }
+                let child = relative.join(name);
+                collect_provider_regular_files_v1(epoch, &child, depth + 1, limits, ledger, files)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1086,141 +1584,6 @@ pub fn observe_repository_v1(
     observe_repository_inner(workspace, plan, limits, || {})
 }
 
-/// Read one bounded regular file through the descriptor-relative, no-follow
-/// traversal used by repository authority. Both the file and workspace are
-/// authenticated again after the read.
-pub(crate) fn read_repository_file_v1(
-    workspace: &Path,
-    relative: &Path,
-    maximum_bytes: u64,
-) -> AuthorityResult<Vec<u8>> {
-    if maximum_bytes == 0 {
-        return Err(incomplete_limit(
-            StateDimensionV1::RepositoryContent,
-            Some(relative),
-            "bound repository provider read",
-        ));
-    }
-    let root = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "open repository provider workspace",
-    )?;
-    let root_before = FilesystemIdentityV1::from_metadata(&root.metadata().map_err(|error| {
-        incomplete_io(
-            StateDimensionV1::Repository,
-            workspace,
-            "inspect repository provider workspace",
-            error,
-        )
-    })?);
-    let mut file = secure_open_relative(
-        &root,
-        relative,
-        ExpectedNodeV1::Regular,
-        StateDimensionV1::RepositoryContent,
-        relative,
-        "open repository provider input",
-    )?;
-    let before = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
-        incomplete_io(
-            StateDimensionV1::RepositoryContent,
-            relative,
-            "inspect repository provider input",
-            error,
-        )
-    })?);
-    if before.size > maximum_bytes {
-        return Err(incomplete_limit(
-            StateDimensionV1::RepositoryContent,
-            Some(relative),
-            "read repository provider input",
-        ));
-    }
-    let capacity = usize::try_from(before.size).map_err(|_| {
-        incomplete_limit(
-            StateDimensionV1::RepositoryContent,
-            Some(relative),
-            "allocate repository provider input",
-        )
-    })?;
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(capacity).map_err(|_| {
-        incomplete_limit(
-            StateDimensionV1::RepositoryContent,
-            Some(relative),
-            "allocate repository provider input",
-        )
-    })?;
-    file.by_ref()
-        .take(maximum_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::RepositoryContent,
-                relative,
-                "read repository provider input",
-                error,
-            )
-        })?;
-    if bytes.len() as u64 > maximum_bytes {
-        return Err(incomplete_limit(
-            StateDimensionV1::RepositoryContent,
-            Some(relative),
-            "read repository provider input",
-        ));
-    }
-    let after = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
-        incomplete_io(
-            StateDimensionV1::RepositoryContent,
-            relative,
-            "reinspect repository provider input",
-            error,
-        )
-    })?);
-    let reopened = secure_open_relative(
-        &root,
-        relative,
-        ExpectedNodeV1::Regular,
-        StateDimensionV1::RepositoryContent,
-        relative,
-        "reopen repository provider input",
-    )?;
-    let path_after =
-        FilesystemIdentityV1::from_metadata(&reopened.metadata().map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::RepositoryContent,
-                relative,
-                "inspect reopened repository provider input",
-                error,
-            )
-        })?);
-    let root_after = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "reopen repository provider workspace",
-    )?;
-    let root_after =
-        FilesystemIdentityV1::from_metadata(&root_after.metadata().map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::Repository,
-                workspace,
-                "reinspect repository provider workspace",
-                error,
-            )
-        })?);
-    if before != after || after != path_after || root_before != root_after {
-        return Err(concurrent(
-            StateDimensionV1::RepositoryContent,
-            relative,
-            "authenticate repository provider read",
-        ));
-    }
-    Ok(bytes)
-}
-
 fn observe_repository_inner<F>(
     workspace: &Path,
     plan: &RepositoryObservationPlanV1,
@@ -1230,92 +1593,61 @@ fn observe_repository_inner<F>(
 where
     F: FnOnce(),
 {
+    let epoch = WorkspaceExecutionEpochV1::begin(workspace, limits)?;
+    observe_repository_epoch_inner(&epoch, plan, limits, between_samples)
+}
+
+fn observe_repository_epoch_inner<F>(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+    between_samples: F,
+) -> AuthorityResult<RepositoryEpochV1>
+where
+    F: FnOnce(),
+{
     validate_limits(limits)?;
     let plan = normalize_plan(plan, limits)?;
-    let root_handle = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "open workspace directory",
-    )?;
-    let canonical_workspace = descriptor_path(
-        &root_handle,
-        workspace,
-        StateDimensionV1::Repository,
-        "resolve open workspace descriptor",
-    )?;
-    check_path_bound(&canonical_workspace, limits, StateDimensionV1::Repository)?;
-    let root_before =
-        FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+    execution_epoch.verify_current_path()?;
+    let canonical_workspace = execution_epoch.canonical_workspace.clone();
+    let root_before = FilesystemIdentityV1::from_metadata(
+        &execution_epoch.root_handle.metadata().map_err(|error| {
             incomplete_io(
                 StateDimensionV1::Repository,
                 &canonical_workspace,
-                "inspect open workspace",
+                "inspect retained workspace",
                 error,
             )
-        })?);
-    let initial_reopen = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "reopen workspace directory",
-    )?;
-    let path_before =
-        FilesystemIdentityV1::from_metadata(&initial_reopen.metadata().map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::Repository,
-                workspace,
-                "inspect reopened workspace",
-                error,
-            )
-        })?);
-    if root_before != path_before {
+        })?,
+    );
+    if !execution_epoch.root_identity.same_authority(root_before) {
         return Err(concurrent(
             StateDimensionV1::Repository,
             &canonical_workspace,
-            "open workspace identity",
+            "authenticate retained workspace",
         ));
     }
 
     let git_before = observe_git_state(&canonical_workspace, limits)?;
-    let observations_before = observe_plan_once(&canonical_workspace, &root_handle, &plan, limits)?;
-    between_samples();
-    let hook_reopen = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "reopen workspace after observation seam",
+    let observations_before = observe_plan_once(
+        &canonical_workspace,
+        &execution_epoch.root_handle,
+        &plan,
+        limits,
     )?;
-    let root_after_hook =
-        FilesystemIdentityV1::from_metadata(&hook_reopen.metadata().map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::Repository,
-                workspace,
-                "inspect workspace after observation seam",
-                error,
-            )
-        })?);
-    if !root_before.same_object(root_after_hook) {
-        return Err(IncompleteToolStateV1::single(
-            IncompleteReasonCodeV1::RepositoryReplaced,
-            StateDimensionV1::Repository,
-            Some(canonical_workspace),
-            "verify repository identity after observation seam",
-        ));
-    }
-    if root_before != root_after_hook {
-        return Err(concurrent(
-            StateDimensionV1::Repository,
-            &canonical_workspace,
-            "verify repository stability after observation seam",
-        ));
-    }
-    let observations_after = observe_plan_once(&canonical_workspace, &root_handle, &plan, limits)?;
+    between_samples();
+    execution_epoch.verify_current_path()?;
+    let observations_after = observe_plan_once(
+        &canonical_workspace,
+        &execution_epoch.root_handle,
+        &plan,
+        limits,
+    )?;
     if observations_before != observations_after {
         return Err(concurrent(
             StateDimensionV1::RepositoryContent,
             &canonical_workspace,
-            "compare repository observation samples",
+            "compare retained repository observation samples",
         ));
     }
     let git_after = observe_git_state(&canonical_workspace, limits)?;
@@ -1324,60 +1656,29 @@ where
             IncompleteReasonCodeV1::GitStateChanged,
             StateDimensionV1::RepositoryGit,
             Some(canonical_workspace.join(".git")),
-            "compare Git samples",
+            "compare retained Git samples",
         ));
     }
-
-    let root_after_handle =
-        FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+    execution_epoch.verify_current_path()?;
+    let root_after = FilesystemIdentityV1::from_metadata(
+        &execution_epoch.root_handle.metadata().map_err(|error| {
             incomplete_io(
                 StateDimensionV1::Repository,
                 &canonical_workspace,
-                "reinspect open workspace",
+                "reinspect retained workspace",
                 error,
             )
-        })?);
-    let final_reopen = secure_open_path(
-        workspace,
-        ExpectedNodeV1::Directory,
-        StateDimensionV1::Repository,
-        "final reopen workspace",
-    )?;
-    let root_after_path =
-        FilesystemIdentityV1::from_metadata(&final_reopen.metadata().map_err(|error| {
-            incomplete_io(
-                StateDimensionV1::Repository,
-                workspace,
-                "inspect final reopened workspace",
-                error,
-            )
-        })?);
-    let canonical_after = descriptor_path(
-        &final_reopen,
-        workspace,
-        StateDimensionV1::Repository,
-        "resolve final workspace descriptor",
-    )?;
-    if !root_before.same_object(root_after_handle)
-        || !root_before.same_object(root_after_path)
-        || canonical_workspace != canonical_after
-    {
-        return Err(IncompleteToolStateV1::single(
-            IncompleteReasonCodeV1::RepositoryReplaced,
-            StateDimensionV1::Repository,
-            Some(canonical_workspace),
-            "verify repository identity",
-        ));
-    }
-    if root_before != root_after_handle || root_before != root_after_path {
+        })?,
+    );
+    if !root_before.same_authority(root_after) {
         return Err(concurrent(
             StateDimensionV1::Repository,
             &canonical_workspace,
-            "verify repository stability",
+            "verify retained repository authority identity",
         ));
     }
 
-    let mut epoch = RepositoryEpochV1 {
+    let mut repository_epoch = RepositoryEpochV1 {
         schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
         canonical_workspace,
         workspace_identity: root_before,
@@ -1386,11 +1687,11 @@ where
         observations: observations_before,
         digest: StateDigestV1([0; 32]),
     };
-    epoch.digest = digest_encoded(
+    repository_epoch.digest = digest_encoded(
         b"again.repository-epoch.v1",
-        &encode_repository_epoch(&epoch),
+        &encode_repository_epoch(&repository_epoch),
     );
-    Ok(epoch)
+    Ok(repository_epoch)
 }
 
 #[cfg(test)]
@@ -1409,6 +1710,7 @@ where
 fn validate_limits(limits: &WorkspaceAuthorityLimitsV1) -> AuthorityResult<()> {
     let valid = limits.max_plan_entries > 0
         && limits.max_path_bytes > 0
+        && limits.max_total_path_bytes >= limits.max_path_bytes
         && limits.max_file_bytes > 0
         && limits.max_total_bytes > 0
         && limits.max_tree_entries > 0
@@ -4347,6 +4649,121 @@ fn dimension_tag(dimension: StateDimensionV1) -> u8 {
 
 fn digest_encoded(domain: &'static [u8], bytes: &[u8]) -> StateDigestV1 {
     StateDigestV1::from_domain_and_bytes(domain, bytes)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod retained_epoch_tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn retained_epoch_reads_original_repository_across_aba_path_swap() {
+        let temporary = TempDir::new().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let repository = base.join("repository");
+        let retained = base.join("retained");
+        fs::create_dir(&repository).unwrap();
+        fs::write(repository.join("input.txt"), b"original").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+
+        fs::rename(&repository, &retained).unwrap();
+        fs::create_dir(&repository).unwrap();
+        fs::write(repository.join("input.txt"), b"replacement").unwrap();
+        let bytes = epoch
+            .read_repository_file_inner(Path::new("input.txt"), 64, || {
+                fs::remove_file(repository.join("input.txt")).unwrap();
+                fs::remove_dir(&repository).unwrap();
+                fs::rename(&retained, &repository).unwrap();
+            })
+            .unwrap();
+
+        assert_eq!(bytes, b"original");
+    }
+
+    #[test]
+    fn retained_traversal_refuses_intermediate_symlinks() {
+        let temporary = TempDir::new().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let repository = base.join("repository");
+        let external = base.join("external");
+        fs::create_dir(&repository).unwrap();
+        fs::create_dir(&external).unwrap();
+        fs::write(external.join("secret.txt"), b"secret").unwrap();
+        std::os::unix::fs::symlink(&external, repository.join("linked")).unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+
+        let error = epoch
+            .list_regular_files(Path::new(""), &limits)
+            .unwrap_err();
+        assert_eq!(error.primary_code(), IncompleteReasonCodeV1::SymlinkRefused);
+    }
+
+    #[test]
+    fn retained_traversal_enforces_depth_directory_and_path_byte_bounds() {
+        let temporary = TempDir::new().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+
+        let depth_root = base.join("depth");
+        fs::create_dir_all(depth_root.join("a/b/c")).unwrap();
+        fs::write(depth_root.join("a/b/c/input"), b"x").unwrap();
+        let depth_limits = WorkspaceAuthorityLimitsV1 {
+            max_tree_depth: 2,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let depth_epoch = WorkspaceExecutionEpochV1::begin(&depth_root, &depth_limits).unwrap();
+        assert_eq!(
+            depth_epoch
+                .list_regular_files(Path::new(""), &depth_limits)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+
+        let directory_root = base.join("directory");
+        fs::create_dir(&directory_root).unwrap();
+        for name in ["one", "two", "three"] {
+            fs::write(directory_root.join(name), b"x").unwrap();
+        }
+        let directory_limits = WorkspaceAuthorityLimitsV1 {
+            max_directory_entries: 2,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let directory_epoch =
+            WorkspaceExecutionEpochV1::begin(&directory_root, &directory_limits).unwrap();
+        assert_eq!(
+            directory_epoch
+                .list_regular_files(Path::new(""), &directory_limits)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+
+        let byte_root = base.join("bytes");
+        fs::create_dir(&byte_root).unwrap();
+        for index in 0..24 {
+            fs::write(byte_root.join(format!("file{index:04}")), b"x").unwrap();
+        }
+        let max_path_bytes = byte_root.as_os_str().as_bytes().len() + 16;
+        let byte_limits = WorkspaceAuthorityLimitsV1 {
+            max_path_bytes,
+            max_total_path_bytes: max_path_bytes,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let byte_epoch = WorkspaceExecutionEpochV1::begin(&byte_root, &byte_limits).unwrap();
+        assert_eq!(
+            byte_epoch
+                .list_regular_files(Path::new(""), &byte_limits)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+    }
 }
 
 struct CanonicalEncoder {

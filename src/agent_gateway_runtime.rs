@@ -13,6 +13,7 @@ use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -41,15 +42,15 @@ use crate::mcp_gateway::{
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
     GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayOperationDispositionV1, GatewayStats, Store, ValidatedGatewayReadV1,
+    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayStats, Store, ValidatedGatewayReadV1,
     gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
-    ExternalFreshnessV1, McpIdentityV1, RepositoryObservationKindV1, RepositoryObservationPlanV1,
-    StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1,
-    issue_no_external_dependencies_v1, observe_environment_v1, observe_repository_v1,
-    read_repository_file_v1,
+    ExternalFreshnessV1, McpIdentityV1, RepositoryNodeKindV1, RepositoryObservationKindV1,
+    RepositoryObservationPlanV1, StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1,
+    WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1,
+    observe_environment_v1,
 };
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
@@ -62,6 +63,19 @@ const MAX_SEARCH_RESULTS_V1: usize = 500;
 const MAX_SEARCH_LINE_BYTES_V1: usize = 4 * 1024;
 const MAX_SEARCH_OUTPUT_BYTES_V1: usize = 512 * 1024;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
+const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
+
+fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
+    WorkspaceAuthorityLimitsV1 {
+        max_file_bytes: MAX_REPOSITORY_FILE_BYTES_V1,
+        max_total_bytes: MAX_REPOSITORY_SCAN_BYTES_V1,
+        max_tree_entries: MAX_REPOSITORY_ENTRIES_V1 as u64,
+        max_tree_depth: 128,
+        max_directory_entries: MAX_REPOSITORY_ENTRIES_V1 as u64,
+        max_total_path_bytes: 16 * 1024 * 1024,
+        ..WorkspaceAuthorityLimitsV1::default()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepositoryOperationV1 {
@@ -104,18 +118,46 @@ enum ActiveCoordinatorV1 {
     },
 }
 
+trait RepositoryEpochProviderV1: UpstreamProvider {
+    fn execute_with_epoch(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError>;
+}
+
 /// Provider wrapper used by the experimental MCP server. Its constructor is
 /// crate-private so an SDK caller cannot spoof the built-in provider identity
 /// and obtain reuse authority.
 pub(crate) struct GatewayControlledProviderV1 {
-    inner: Arc<dyn UpstreamProvider>,
+    inner: Arc<dyn RepositoryEpochProviderV1>,
     workspace: PathBuf,
     store: Arc<Mutex<Store>>,
-    active: Mutex<BTreeMap<String, ActiveCoordinatorV1>>,
+    active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
+}
+
+struct ActiveRegistrationV1<'a> {
+    provider: &'a GatewayControlledProviderV1,
+    key: (String, u64),
+}
+
+impl Drop for ActiveRegistrationV1<'_> {
+    fn drop(&mut self) {
+        self.provider
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&self.key);
+    }
 }
 
 impl GatewayControlledProviderV1 {
-    fn new(inner: Arc<dyn UpstreamProvider>, workspace: PathBuf, store: Arc<Mutex<Store>>) -> Self {
+    fn new(
+        inner: Arc<dyn RepositoryEpochProviderV1>,
+        workspace: PathBuf,
+        store: Arc<Mutex<Store>>,
+    ) -> Self {
         Self {
             inner,
             workspace,
@@ -126,13 +168,18 @@ impl GatewayControlledProviderV1 {
 
     fn execute_direct(
         &self,
+        epoch: &WorkspaceExecutionEpochV1,
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        self.inner.execute(call, secrets)
+        self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
-    fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
+    fn resolve(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: &ProviderCall,
+    ) -> Option<ResolvedRequestV1> {
         let operation = RepositoryOperationV1::from_call(call)?;
         let descriptor = self.inner.descriptor();
         if descriptor.id != REPOSITORY_PROVIDER_ID_V1
@@ -140,28 +187,32 @@ impl GatewayControlledProviderV1 {
         {
             return None;
         }
-        resolve_repository_request_v1(&self.workspace, call, operation).ok()
+        resolve_repository_request_v1(epoch, call, operation).ok()
     }
 
     fn owner(call: &ProviderCall) -> String {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"again.gateway.owner.v1\0");
         hasher.update(call.logical_call_id.as_str().as_bytes());
+        hasher.update(&call.physical_attempt_id.get().to_le_bytes());
         format!("mcp:{}", &hasher.finalize().to_hex()[..32])
     }
 
-    fn remember_active(&self, logical_call_id: &str, active: ActiveCoordinatorV1) {
+    fn remember_active(
+        &self,
+        logical_call_id: &str,
+        physical_attempt_id: u64,
+        active: ActiveCoordinatorV1,
+    ) -> ActiveRegistrationV1<'_> {
+        let key = (logical_call_id.to_owned(), physical_attempt_id);
         self.active
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .insert(logical_call_id.to_owned(), active);
-    }
-
-    fn forget_active(&self, logical_call_id: &str) {
-        self.active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(logical_call_id);
+            .insert(key.clone(), active);
+        ActiveRegistrationV1 {
+            provider: self,
+            key,
+        }
     }
 
     fn load_exact(
@@ -183,6 +234,7 @@ impl GatewayControlledProviderV1 {
 
     fn execute_as_leader(
         &self,
+        epoch: &WorkspaceExecutionEpochV1,
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
         resolved: &ResolvedRequestV1,
@@ -190,9 +242,11 @@ impl GatewayControlledProviderV1 {
         owner: String,
     ) -> Result<Value, ProviderError> {
         let logical_call_id = call.logical_call_id.as_str().to_owned();
+        let physical_attempt_id = call.physical_attempt_id.get();
         let cancelled = Arc::new(AtomicBool::new(false));
-        self.remember_active(
+        let _active = self.remember_active(
             &logical_call_id,
+            physical_attempt_id,
             ActiveCoordinatorV1::Leader {
                 lease_id: lease_id.clone(),
                 owner: owner.clone(),
@@ -201,12 +255,46 @@ impl GatewayControlledProviderV1 {
         );
         let verification_call = call.clone();
         let started = Instant::now();
-        let provider_result = self.inner.execute(call, secrets);
-        self.forget_active(&logical_call_id);
+        let heartbeat_failed = Arc::new(AtomicBool::new(false));
+        let provider_result = thread::scope(|scope| {
+            let (stop_sender, stop_receiver) = mpsc::channel::<()>();
+            let store = Arc::clone(&self.store);
+            let heartbeat_lease = lease_id.clone();
+            let heartbeat_owner = owner.clone();
+            let heartbeat_failed = Arc::clone(&heartbeat_failed);
+            scope.spawn(move || {
+                loop {
+                    match stop_receiver.recv_timeout(LEADER_HEARTBEAT_INTERVAL_V1) {
+                        Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                        Err(RecvTimeoutError::Timeout) => {
+                            let heartbeat = store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .heartbeat_gateway_call(&heartbeat_lease, &heartbeat_owner);
+                            if !matches!(heartbeat, Ok(GatewayHeartbeat::Extended { .. })) {
+                                heartbeat_failed.store(true, Ordering::Release);
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let result = self.inner.execute_with_epoch(epoch, call, secrets);
+            drop(stop_sender);
+            result
+        });
 
         match provider_result {
             Ok(value) if !cancelled.load(Ordering::Acquire) => {
-                let revalidated = self.resolve(&verification_call);
+                if heartbeat_failed.load(Ordering::Acquire) {
+                    let _ = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
+                    return Ok(value);
+                }
+                let revalidated = self.resolve(epoch, &verification_call);
                 if revalidated
                     .as_ref()
                     .map(|request| request.binding.binding_digest())
@@ -218,6 +306,14 @@ impl GatewayControlledProviderV1 {
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
                     return Ok(value);
+                }
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .fail_gateway_call(&lease_id, GatewayFailureReason::Cancelled);
+                    return Err(cancelled_provider_error_v1());
                 }
                 let bytes = canonical_json_bytes_v1(&value);
                 let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
@@ -258,7 +354,14 @@ impl GatewayControlledProviderV1 {
                     Ok(_) | Err(_) => Ok(value),
                 }
             }
-            Ok(value) => Ok(value),
+            Ok(_value) => {
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .fail_gateway_call(&lease_id, GatewayFailureReason::Cancelled);
+                Err(cancelled_provider_error_v1())
+            }
             Err(error) => {
                 let _ = self
                     .store
@@ -272,16 +375,19 @@ impl GatewayControlledProviderV1 {
 
     fn wait_as_follower(
         &self,
+        epoch: &WorkspaceExecutionEpochV1,
         call: &ProviderCall,
         resolved: &ResolvedRequestV1,
         call_id: String,
     ) -> Result<Option<Value>, ProviderError> {
         let logical_call_id = call.logical_call_id.as_str().to_owned();
+        let physical_attempt_id = call.physical_attempt_id.get();
         let cancelled = Arc::new(AtomicBool::new(false));
-        self.remember_active(
+        let _active = self.remember_active(
             &logical_call_id,
+            physical_attempt_id,
             ActiveCoordinatorV1::Follower {
-                call_id,
+                call_id: call_id.clone(),
                 cancelled: Arc::clone(&cancelled),
             },
         );
@@ -297,6 +403,14 @@ impl GatewayControlledProviderV1 {
                 .observe_gateway_call(&resolved.binding);
             match observation {
                 Ok(GatewayCallObservation::Ready { gateway_result_id }) => {
+                    if self
+                        .resolve(epoch, call)
+                        .as_ref()
+                        .map(|request| request.binding.binding_digest())
+                        != Some(resolved.binding.binding_digest())
+                    {
+                        break Ok(None);
+                    }
                     break self.load_exact(resolved, &gateway_result_id).map_err(|_| {
                         ProviderError(McpError::typed(
                             McpErrorCode::InternalError,
@@ -314,7 +428,13 @@ impl GatewayControlledProviderV1 {
                 Ok(GatewayCallObservation::Inflight { .. }) => break Ok(None),
             }
         };
-        self.forget_active(&logical_call_id);
+        if !matches!(answer, Ok(Some(_))) {
+            let _ = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .cancel_gateway_follower(&call_id);
+        }
         answer
     }
 }
@@ -353,7 +473,10 @@ impl ToolCancellation for GatewayControlledProviderV1 {
             .active
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .get(cancellation.logical_call_id.as_str())
+            .get(&(
+                cancellation.logical_call_id.as_str().to_owned(),
+                cancellation.physical_attempt_id.get(),
+            ))
             .cloned();
         if let Some(active) = active {
             match active {
@@ -390,11 +513,15 @@ impl ToolExecution for GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
+        let limits = gateway_workspace_limits_v1();
+        let epoch = WorkspaceExecutionEpochV1::begin(&self.workspace, &limits).map_err(|_| {
+            provider_io_v1(anyhow!("descriptor-retained workspace issuance failed"))
+        })?;
         if call.effect != EffectClass::ReadOnly {
-            return self.execute_direct(call, secrets);
+            return self.execute_direct(&epoch, call, secrets);
         }
-        let Some(resolved) = self.resolve(&call) else {
-            return self.execute_direct(call, secrets);
+        let Some(resolved) = self.resolve(&epoch, &call) else {
+            return self.execute_direct(&epoch, call, secrets);
         };
         let owner = Self::owner(&call);
         let acquisition = self
@@ -403,7 +530,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .acquire_gateway_call(&resolved.binding, &owner);
         let Ok(acquisition) = acquisition else {
-            return self.execute_direct(call, secrets);
+            return self.execute_direct(&epoch, call, secrets);
         };
         match acquisition {
             GatewayCallAcquisition::Ready {
@@ -422,12 +549,19 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     &resolved.core_call,
                     &RoutingCandidatesV1::default().with_exact(candidate),
                 );
-                if decision == GatewayDecision::ServeExact
-                    && let Ok(Some(value)) = self.load_exact(&resolved, &gateway_result_id)
-                {
-                    return Ok(value);
+                if decision == GatewayDecision::ServeExact {
+                    let value = self.load_exact(&resolved, &gateway_result_id);
+                    let revalidated = self.resolve(&epoch, &call);
+                    if revalidated
+                        .as_ref()
+                        .map(|request| request.binding.binding_digest())
+                        == Some(resolved.binding.binding_digest())
+                        && let Ok(Some(value)) = value
+                    {
+                        return Ok(value);
+                    }
                 }
-                self.execute_direct(call, secrets)
+                self.execute_direct(&epoch, call, secrets)
             }
             GatewayCallAcquisition::Follower {
                 call_id,
@@ -450,11 +584,12 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         &resolved.core_call,
                         &RoutingCandidatesV1::default().with_inflight(evidence),
                     ) == GatewayDecision::JoinInflight
-                }) && let Some(value) = self.wait_as_follower(&call, &resolved, call_id)?
+                }) && let Some(value) =
+                    self.wait_as_follower(&epoch, &call, &resolved, call_id)?
                 {
                     return Ok(value);
                 }
-                self.execute_direct(call, secrets)
+                self.execute_direct(&epoch, call, secrets)
             }
             GatewayCallAcquisition::Leader {
                 lease_id,
@@ -467,11 +602,16 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .unwrap_or_else(|poison| poison.into_inner())
                     .start_gateway_execution(&lease_id, &owner);
                 if !matches!(started, Ok(GatewayExecutionStart::Started)) {
-                    return self.execute_direct(call, secrets);
+                    let _ = self
+                        .store
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
+                    return self.execute_direct(&epoch, call, secrets);
                 }
-                self.execute_as_leader(call, secrets, &resolved, lease_id, owner)
+                self.execute_as_leader(&epoch, call, secrets, &resolved, lease_id, owner)
             }
-            GatewayCallAcquisition::Refused { .. } => self.execute_direct(call, secrets),
+            GatewayCallAcquisition::Refused { .. } => self.execute_direct(&epoch, call, secrets),
         }
     }
 }
@@ -487,6 +627,33 @@ impl RepositoryProviderV1 {
             bail!("MCP workspace is not a directory");
         }
         Ok(Self { workspace })
+    }
+
+    fn execute_with_epoch(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        _secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        match call.upstream_tool_name.as_str() {
+            "read" => repository_read_v1(epoch, &call.arguments),
+            "search" => repository_search_v1(epoch, &call.arguments),
+            _ => Err(ProviderError(McpError::typed(
+                McpErrorCode::MethodNotFound,
+                "unknown repository tool",
+            ))),
+        }
+    }
+}
+
+impl RepositoryEpochProviderV1 for RepositoryProviderV1 {
+    fn execute_with_epoch(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        RepositoryProviderV1::execute_with_epoch(self, epoch, call, secrets)
     }
 }
 
@@ -562,16 +729,13 @@ impl ToolExecution for RepositoryProviderV1 {
     fn execute(
         &self,
         call: ProviderCall,
-        _secrets: EphemeralSecrets<'_>,
+        secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        match call.upstream_tool_name.as_str() {
-            "read" => repository_read_v1(&self.workspace, &call.arguments),
-            "search" => repository_search_v1(&self.workspace, &call.arguments),
-            _ => Err(ProviderError(McpError::typed(
-                McpErrorCode::MethodNotFound,
-                "unknown repository tool",
-            ))),
-        }
+        let limits = gateway_workspace_limits_v1();
+        let epoch = WorkspaceExecutionEpochV1::begin(&self.workspace, &limits).map_err(|_| {
+            provider_io_v1(anyhow!("descriptor-retained workspace issuance failed"))
+        })?;
+        self.execute_with_epoch(&epoch, call, secrets)
     }
 }
 
@@ -586,7 +750,7 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
-        let provider: Arc<dyn UpstreamProvider> = Arc::new(RepositoryProviderV1::new(&workspace)?);
+        let provider = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
             provider,
             workspace,
@@ -625,28 +789,32 @@ impl ExperimentalMcpGatewayV1 {
 }
 
 fn resolve_repository_request_v1(
-    workspace: &Path,
+    execution_epoch: &WorkspaceExecutionEpochV1,
     call: &ProviderCall,
     operation: RepositoryOperationV1,
 ) -> Result<ResolvedRequestV1> {
-    let limits = WorkspaceAuthorityLimitsV1::default();
+    let limits = gateway_workspace_limits_v1();
+    let workspace = execution_epoch.canonical_workspace();
     let relative = argument_path_v1(&call.arguments, operation == RepositoryOperationV1::Search)?;
-    let absolute = safe_repository_path_v1(workspace, &relative, true)?;
-    let observation_plan = match fs::symlink_metadata(&absolute) {
-        Ok(metadata) if metadata.file_type().is_symlink() => bail!("repository path is a symlink"),
-        Ok(metadata) if metadata.is_file() => {
+    let observation_plan = match execution_epoch
+        .classify_relative(&relative)
+        .map_err(|_| anyhow!("repository path classification is incomplete"))?
+    {
+        RepositoryNodeKindV1::Regular => {
             RepositoryObservationPlanV1::new(vec![relative.clone()], vec![], vec![], vec![])
         }
-        Ok(metadata) if metadata.is_dir() && operation == RepositoryOperationV1::Search => {
+        RepositoryNodeKindV1::Directory if operation == RepositoryOperationV1::Search => {
             RepositoryObservationPlanV1::new(vec![], vec![relative.clone()], vec![], vec![])
         }
-        Ok(_) => bail!("repository path is not an admitted regular file or directory"),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+        RepositoryNodeKindV1::Missing => {
             RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![relative.clone()])
         }
-        Err(error) => return Err(error.into()),
+        RepositoryNodeKindV1::Directory => {
+            bail!("repository path is not an admitted regular file")
+        }
     };
-    let repository = observe_repository_v1(workspace, &observation_plan, &limits)
+    let repository = execution_epoch
+        .observe_repository(&observation_plan, &limits)
         .map_err(|_| anyhow!("repository state is incomplete"))?;
 
     let exclusions = vec![
@@ -806,19 +974,22 @@ fn resolve_repository_request_v1(
     Ok(ResolvedRequestV1 { core_call, binding })
 }
 
-fn repository_read_v1(workspace: &Path, arguments: &Value) -> Result<Value, ProviderError> {
+fn repository_read_v1(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
     let relative = argument_path_v1(arguments, false).map_err(invalid_arguments_v1)?;
-    let path = safe_repository_path_v1(workspace, &relative, false).map_err(provider_io_v1)?;
-    let metadata = fs::symlink_metadata(&path).map_err(provider_io_v1)?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_file()
-        || metadata.len() > MAX_REPOSITORY_FILE_BYTES_V1
+    if execution_epoch
+        .classify_relative(&relative)
+        .map_err(|_| provider_io_v1(anyhow!("descriptor-bound repository classification failed")))?
+        != RepositoryNodeKindV1::Regular
     {
         return Err(invalid_arguments_v1(anyhow!(
             "path is not an admitted bounded regular file"
         )));
     }
-    let bytes = read_repository_file_v1(workspace, &relative, MAX_REPOSITORY_FILE_BYTES_V1)
+    let bytes = execution_epoch
+        .read_repository_file(&relative, MAX_REPOSITORY_FILE_BYTES_V1)
         .map_err(|_| provider_io_v1(anyhow!("descriptor-bound repository read failed")))?;
     let text = String::from_utf8(bytes)
         .map_err(|_| invalid_arguments_v1(anyhow!("repository file is not UTF-8")))?;
@@ -828,7 +999,10 @@ fn repository_read_v1(workspace: &Path, arguments: &Value) -> Result<Value, Prov
     }))
 }
 
-fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, ProviderError> {
+fn repository_search_v1(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
     let object = arguments
         .as_object()
         .ok_or_else(|| invalid_arguments_v1(anyhow!("arguments must be an object")))?;
@@ -840,7 +1014,6 @@ fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, Pr
             invalid_arguments_v1(anyhow!("pattern must be a non-empty bounded string"))
         })?;
     let relative = argument_path_v1(arguments, true).map_err(invalid_arguments_v1)?;
-    let start = safe_repository_path_v1(workspace, &relative, false).map_err(provider_io_v1)?;
     let maximum = object
         .get("maxResults")
         .and_then(Value::as_u64)
@@ -849,27 +1022,37 @@ fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, Pr
         .ok()
         .filter(|maximum| (1..=MAX_SEARCH_RESULTS_V1).contains(maximum))
         .ok_or_else(|| invalid_arguments_v1(anyhow!("maxResults is outside 1..=500")))?;
-    let mut files = Vec::new();
-    collect_regular_files_v1(workspace, &start, &mut files).map_err(provider_io_v1)?;
-    files.sort();
+    let limits = gateway_workspace_limits_v1();
+    let mut files = execution_epoch
+        .list_regular_files(&relative, &limits)
+        .map_err(|_| provider_io_v1(anyhow!("descriptor-bound search traversal failed")))?;
+    files.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
     let mut scanned = 0_u64;
     let mut matches = Vec::new();
     let mut rendered_bytes = 0_usize;
     let mut truncated = false;
     'files: for file in files {
-        let metadata = fs::symlink_metadata(&file).map_err(provider_io_v1)?;
-        scanned = scanned.saturating_add(metadata.len());
-        if metadata.len() > MAX_REPOSITORY_FILE_BYTES_V1 || scanned > MAX_REPOSITORY_SCAN_BYTES_V1 {
+        scanned = scanned.checked_add(file.bytes()).ok_or_else(|| {
+            ProviderError(McpError::typed(
+                McpErrorCode::LimitExceeded,
+                "repository search bound exceeded",
+            ))
+        })?;
+        if file.bytes() > MAX_REPOSITORY_FILE_BYTES_V1 || scanned > MAX_REPOSITORY_SCAN_BYTES_V1 {
             return Err(ProviderError(McpError::typed(
                 McpErrorCode::LimitExceeded,
                 "repository search bound exceeded",
             )));
         }
-        let relative_file = file
-            .strip_prefix(workspace)
-            .map_err(|_| provider_io_v1(anyhow!("search escaped workspace")))?;
-        let bytes = read_repository_file_v1(workspace, relative_file, MAX_REPOSITORY_FILE_BYTES_V1)
+        let relative_file = file.relative_path();
+        let bytes = execution_epoch
+            .read_repository_file(relative_file, MAX_REPOSITORY_FILE_BYTES_V1)
             .map_err(|_| provider_io_v1(anyhow!("descriptor-bound search read failed")))?;
+        if bytes.len() as u64 != file.bytes() {
+            return Err(provider_io_v1(anyhow!(
+                "repository file changed after traversal"
+            )));
+        }
         let Ok(text) = std::str::from_utf8(&bytes) else {
             continue;
         };
@@ -933,37 +1116,6 @@ fn bounded_utf8_prefix_v1(value: &str, maximum_bytes: usize) -> &str {
     &value[..end]
 }
 
-fn collect_regular_files_v1(
-    workspace: &Path,
-    start: &Path,
-    files: &mut Vec<PathBuf>,
-) -> Result<()> {
-    if files.len() >= MAX_REPOSITORY_ENTRIES_V1 {
-        bail!("repository entry bound exceeded");
-    }
-    let metadata = fs::symlink_metadata(start)?;
-    if metadata.file_type().is_symlink() {
-        bail!("repository search refuses symlinks");
-    }
-    if metadata.is_file() {
-        files.push(start.to_path_buf());
-        return Ok(());
-    }
-    if !metadata.is_dir() {
-        bail!("repository search refuses special files");
-    }
-    let mut children = fs::read_dir(start)?.collect::<Result<Vec<_>, _>>()?;
-    children.sort_by_key(|entry| entry.file_name());
-    for child in children {
-        let path = child.path();
-        if !path.starts_with(workspace) {
-            bail!("repository search escaped workspace");
-        }
-        collect_regular_files_v1(workspace, &path, files)?;
-    }
-    Ok(())
-}
-
 fn argument_path_v1(arguments: &Value, default_dot: bool) -> Result<PathBuf> {
     let object = arguments
         .as_object()
@@ -990,37 +1142,6 @@ fn argument_path_v1(arguments: &Value, default_dot: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn safe_repository_path_v1(
-    workspace: &Path,
-    relative: &Path,
-    allow_missing: bool,
-) -> Result<PathBuf> {
-    let mut current = workspace.to_path_buf();
-    let mut missing = false;
-    for component in relative.components() {
-        match component {
-            Component::CurDir => continue,
-            Component::Normal(name) => current.push(name),
-            _ => bail!("path traversal refused"),
-        }
-        if missing {
-            continue;
-        }
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => bail!("symlink path refused"),
-            Ok(_) => {}
-            Err(error) if allow_missing && error.kind() == io::ErrorKind::NotFound => {
-                missing = true;
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if !current.starts_with(workspace) {
-        bail!("path escaped workspace");
-    }
-    Ok(current)
-}
-
 fn attach_result_reference_v1(mut value: Value, gateway_result_id: &str) -> Value {
     let Some(object) = value.as_object_mut() else {
         return value;
@@ -1036,7 +1157,7 @@ fn attach_result_reference_v1(mut value: Value, gateway_result_id: &str) -> Valu
         json!({
             "experimental": true,
             "resultId": gateway_result_id,
-            "fullRetrievalAvailable": true
+            "fullRetrievalAvailable": false
         }),
     );
     value
@@ -1184,6 +1305,17 @@ mod product_tests {
                 "content": [{ "type": "text", "text": "same" }],
                 "structuredContent": { "value": "same" }
             }))
+        }
+    }
+
+    impl RepositoryEpochProviderV1 for SlowRepositoryProviderV1 {
+        fn execute_with_epoch(
+            &self,
+            _epoch: &WorkspaceExecutionEpochV1,
+            call: ProviderCall,
+            secrets: EphemeralSecrets<'_>,
+        ) -> Result<Value, ProviderError> {
+            self.execute(call, secrets)
         }
     }
 
