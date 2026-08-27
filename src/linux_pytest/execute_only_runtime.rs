@@ -313,12 +313,19 @@ const fn terminal_is_logically_executable_v1(mode: u32) -> bool {
 pub(super) fn validate_x86_64_elf_v1(
     bytes: &[u8],
 ) -> Result<(), FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
-    validate_x86_64_elf_role_v1(bytes, true)
+    validate_x86_64_elf_role_v1(bytes, ElfObjectRoleV1::RootExecutable)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ElfObjectRoleV1 {
+    RootExecutable,
+    Interpreter,
+    DependencyDso,
 }
 
 fn validate_x86_64_elf_role_v1(
     bytes: &[u8],
-    require_executable_entry: bool,
+    role: ElfObjectRoleV1,
 ) -> Result<(), FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
     if bytes.len() < ELF64_HEADER_BYTES {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfTooSmall);
@@ -341,7 +348,14 @@ fn validate_x86_64_elf_role_v1(
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfOsAbi);
     }
     let elf_type = u16::from_le_bytes(bytes[16..18].try_into().expect("bounded ELF header"));
-    if elf_type != ET_EXEC && elf_type != ET_DYN {
+    // Linux's x86_64 dynamic interpreter (ld-linux) is an ET_DYN image with
+    // its own executable entry. DT_NEEDED children are shared objects, not
+    // alternate executables. Only the admitted root may be ET_EXEC.
+    let valid_type = match role {
+        ElfObjectRoleV1::RootExecutable => elf_type == ET_EXEC || elf_type == ET_DYN,
+        ElfObjectRoleV1::Interpreter | ElfObjectRoleV1::DependencyDso => elf_type == ET_DYN,
+    };
+    if !valid_type {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfType);
     }
     if u16::from_le_bytes(bytes[18..20].try_into().expect("bounded ELF header")) != EM_X86_64 {
@@ -480,7 +494,11 @@ fn validate_x86_64_elf_role_v1(
     if !has_load {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfNoLoadSegment);
     }
-    if require_executable_entry && !entry_is_executable {
+    if matches!(
+        role,
+        ElfObjectRoleV1::RootExecutable | ElfObjectRoleV1::Interpreter
+    ) && !entry_is_executable
+    {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEntryPoint);
     }
     Ok(())
@@ -688,15 +706,15 @@ fn parse_runtime_closure_request_v1(
     bytes: &[u8],
     memory: &RuntimeMemoryEscrowV1,
 ) -> Result<RuntimeClosureRequestV1, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
-    parse_runtime_object_request_v1(bytes, memory, true)
+    parse_runtime_object_request_v1(bytes, memory, ElfObjectRoleV1::RootExecutable)
 }
 
 fn parse_runtime_object_request_v1(
     bytes: &[u8],
     memory: &RuntimeMemoryEscrowV1,
-    is_executable: bool,
+    role: ElfObjectRoleV1,
 ) -> Result<RuntimeClosureRequestV1, FirstExecuteOnlyRuntimeCheckpointRefusalV1> {
-    validate_x86_64_elf_role_v1(bytes, is_executable)?;
+    validate_x86_64_elf_role_v1(bytes, role)?;
     let headers = program_headers_v1(bytes)?;
     let mut interpreter = None;
     let mut dynamic = None;
@@ -716,8 +734,8 @@ fn parse_runtime_object_request_v1(
             _ => {}
         }
     }
-    let interpreter_path = match (is_executable, interpreter) {
-        (true, Some(interpreter)) => {
+    let interpreter_path = match (role, interpreter) {
+        (ElfObjectRoleV1::RootExecutable, Some(interpreter)) => {
             let interpreter_range = bounded_segment_file_range_v1(
                 interpreter,
                 bytes,
@@ -726,7 +744,7 @@ fn parse_runtime_object_request_v1(
             )?;
             canonical_interpreter_path_v1(&bytes[interpreter_range])?
         }
-        (false, None) => &[],
+        (ElfObjectRoleV1::Interpreter | ElfObjectRoleV1::DependencyDso, None) => &[],
         _ => return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfInterpreter),
     };
 
@@ -787,7 +805,7 @@ fn parse_runtime_object_request_v1(
             _ => {}
         }
     }
-    if !terminated || (is_executable && needed_count == 0) {
+    if !terminated || (role == ElfObjectRoleV1::RootExecutable && needed_count == 0) {
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfDynamic);
     }
     let string_table_address =
@@ -1100,6 +1118,7 @@ struct RuntimeForestPlanV1 {
     digest: Blake3Digest,
     total_bytes: u64,
     lookup_attempt_count: u32,
+    root_binding: Option<RuntimeForestRootBindingV1>,
 }
 
 impl fmt::Debug for RuntimeForestPlanV1 {
@@ -1281,7 +1300,7 @@ struct RuntimeForestNodeInputV1 {
     path: Vec<u8>,
     observed: RuntimeForestObservedObjectV1,
     depth: u16,
-    is_executable: bool,
+    role: ElfObjectRoleV1,
 }
 
 fn push_runtime_forest_node_v1(
@@ -1297,8 +1316,7 @@ fn push_runtime_forest_node_v1(
         return Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::RuntimeForestDepthLimit);
     }
     checked_runtime_forest_total_bytes_v1(total_bytes, input.observed.bytes.len())?;
-    let request =
-        parse_runtime_object_request_v1(&input.observed.bytes, memory, input.is_executable)?;
+    let request = parse_runtime_object_request_v1(&input.observed.bytes, memory, input.role)?;
     let content_digest = Blake3Digest::derive(
         "again runtime forest object content v1",
         &[&input.observed.bytes],
@@ -1471,7 +1489,7 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
             path: executable_path,
             observed: executable,
             depth: 0,
-            is_executable: true,
+            role: ElfObjectRoleV1::RootExecutable,
         },
         memory,
         &mut total_bytes,
@@ -1507,7 +1525,7 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
             path: interpreter_path,
             observed: interpreter_observed,
             depth: 1,
-            is_executable: false,
+            role: ElfObjectRoleV1::Interpreter,
         },
         memory,
         &mut total_bytes,
@@ -1551,7 +1569,7 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
                         path,
                         observed,
                         depth: child_depth,
-                        is_executable: false,
+                        role: ElfObjectRoleV1::DependencyDso,
                     },
                     memory,
                     &mut total_bytes,
@@ -1579,8 +1597,8 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
     // Candidate lookup attempts are retained as bounded diagnostics but are
     // excluded from the semantic digest. Syscall retry ceilings belong to the
     // publication leaf and are not misreported as this high-level count.
-    let canonical =
-        encode_runtime_forest_v1(&nodes, &edges, total_bytes, reader.root_binding(), memory)?;
+    let root_binding = reader.root_binding();
+    let canonical = encode_runtime_forest_v1(&nodes, &edges, total_bytes, root_binding, memory)?;
     let digest = Blake3Digest::derive(RUNTIME_FOREST_DOMAIN_V1, &[&canonical]);
     Ok(RuntimeForestPlanV1 {
         nodes,
@@ -1589,6 +1607,7 @@ fn build_runtime_forest_plan_v1<R: RuntimeForestReaderV1>(
         digest,
         total_bytes,
         lookup_attempt_count,
+        root_binding,
     })
 }
 
@@ -1624,6 +1643,20 @@ impl FirstExecuteOnlyRuntimeStructuralInventoryV1<'_> {
 
     pub(super) const fn lookup_attempt_count(&self) -> u32 {
         self.plan.lookup_attempt_count
+    }
+
+    pub(super) fn workspace_root_digest(&self) -> NodeDigest {
+        self.plan
+            .root_binding
+            .expect("published inventory retains root binding")
+            .workspace_digest
+    }
+
+    pub(super) fn runtime_root_digest(&self) -> NodeDigest {
+        self.plan
+            .root_binding
+            .expect("published inventory retains root binding")
+            .runtime_digest
     }
 
     pub(super) const fn loader_authority(&self) -> bool {
@@ -1803,6 +1836,24 @@ impl RuntimeForestReaderV1 for PublishedRuntimeInventoryReaderV1<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::linux_pytest::execute_only_admission::FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::linux_pytest::snapshot_connector::connect_snapshot_pipeline;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::linux_pytest::snapshot_policy::{
+        SnapshotPipelineResourcesV1, SnapshotResourcePolicyV1,
+    };
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use crate::linux_pytest::snapshot_tree::QualifiedNoAtimeSourceViewV1;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::fs::{self, File};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::fd::AsFd;
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    use std::os::unix::fs::PermissionsExt;
 
     const RUNTIME_FIXTURE_BASE: u64 = 0x40_0000;
     const RUNTIME_FIXTURE_INTERP_OFFSET: usize = 0x100;
@@ -1978,10 +2029,11 @@ mod tests {
         bytes[start + 8..start + 16].copy_from_slice(&value.to_le_bytes());
     }
 
-    fn forest_elf_fixture(interpreter: Option<&[u8]>, needed: &[&[u8]]) -> Vec<u8> {
+    fn forest_elf_fixture(role: ElfObjectRoleV1, needed: &[&[u8]]) -> Vec<u8> {
         const INTERPRETER_OFFSET: usize = 0x200;
         const DYNAMIC_OFFSET: usize = 0x400;
         const STRING_TABLE_OFFSET: usize = 0x1000;
+        const INTERPRETER: &[u8] = b"/lib64/ld-linux-x86-64.so.2";
 
         let mut string_table = vec![0u8];
         let mut offsets = Vec::new();
@@ -1992,6 +2044,7 @@ mod tests {
         }
         let dynamic_count = needed.len() + 3;
         let dynamic_bytes = dynamic_count * ELF64_DYNAMIC_ENTRY_BYTES;
+        let interpreter = (role == ElfObjectRoleV1::RootExecutable).then_some(INTERPRETER);
         let interpreter_bytes = interpreter.map_or(0, |path| path.len() + 1);
         let file_bytes = 8192usize
             .max(DYNAMIC_OFFSET + dynamic_bytes)
@@ -2007,7 +2060,10 @@ mod tests {
         bytes[16..18].copy_from_slice(&ET_DYN.to_le_bytes());
         bytes[18..20].copy_from_slice(&EM_X86_64.to_le_bytes());
         bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-        let entry = if interpreter.is_some() {
+        let entry = if matches!(
+            role,
+            ElfObjectRoleV1::RootExecutable | ElfObjectRoleV1::Interpreter
+        ) {
             RUNTIME_FIXTURE_BASE + 0x100
         } else {
             0
@@ -2163,7 +2219,7 @@ mod tests {
                 RuntimeForestRootV1::Workspace,
                 FIRST_EXECUTE_ONLY_EXECUTABLE_V1,
                 forest_elf_fixture(
-                    Some(b"/lib64/ld-linux-x86-64.so.2"),
+                    ElfObjectRoleV1::RootExecutable,
                     &[b"libc.so.6", b"libm.so.6"],
                 ),
             ),
@@ -2171,25 +2227,25 @@ mod tests {
                 2,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/ld-linux-x86-64.so.2",
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]),
             ),
             fake_forest_entry(
                 3,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/libc.so.6",
-                forest_elf_fixture(None, &[b"libdl.so.2"]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[b"libdl.so.2"]),
             ),
             fake_forest_entry(
                 4,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/libm.so.6",
-                forest_elf_fixture(None, &[b"libc.so.6"]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[b"libc.so.6"]),
             ),
             fake_forest_entry(
                 5,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/libdl.so.2",
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[]),
             ),
         ]
     }
@@ -2384,25 +2440,25 @@ mod tests {
                 1,
                 RuntimeForestRootV1::Workspace,
                 FIRST_EXECUTE_ONLY_EXECUTABLE_V1,
-                forest_elf_fixture(Some(b"/lib64/ld-linux-x86-64.so.2"), &[b"liba.so"]),
+                forest_elf_fixture(ElfObjectRoleV1::RootExecutable, &[b"liba.so"]),
             ),
             fake_forest_entry(
                 2,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/ld-linux-x86-64.so.2",
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]),
             ),
             fake_forest_entry(
                 3,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/liba.so",
-                forest_elf_fixture(None, &[b"libb.so"]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[b"libb.so"]),
             ),
             fake_forest_entry(
                 4,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/libb.so",
-                forest_elf_fixture(None, &[b"liba.so"]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[b"liba.so"]),
             ),
         ];
         assert_eq!(
@@ -2479,13 +2535,13 @@ mod tests {
                 1,
                 RuntimeForestRootV1::Workspace,
                 FIRST_EXECUTE_ONLY_EXECUTABLE_V1,
-                forest_elf_fixture(Some(b"/lib64/ld-linux-x86-64.so.2"), &[b"lib00.so"]),
+                forest_elf_fixture(ElfObjectRoleV1::RootExecutable, &[b"lib00.so"]),
             ),
             fake_forest_entry(
                 2,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/ld-linux-x86-64.so.2",
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]),
             ),
         ];
         for index in 0..=RUNTIME_FOREST_MAX_DEPTH_V1 {
@@ -2500,7 +2556,7 @@ mod tests {
                 u8::try_from(index + 3).unwrap(),
                 RuntimeForestRootV1::Runtime,
                 format!("lib64/{name}").as_bytes(),
-                forest_elf_fixture(None, &needed),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &needed),
             ));
         }
         assert_eq!(
@@ -2530,13 +2586,13 @@ mod tests {
                 1,
                 RuntimeForestRootV1::Workspace,
                 FIRST_EXECUTE_ONLY_EXECUTABLE_V1,
-                forest_elf_fixture(Some(b"/lib64/ld-linux-x86-64.so.2"), &root_needed),
+                forest_elf_fixture(ElfObjectRoleV1::RootExecutable, &root_needed),
             ),
             fake_forest_entry(
                 2,
                 RuntimeForestRootV1::Runtime,
                 b"lib64/ld-linux-x86-64.so.2",
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]),
             ),
         ];
         for (index, name) in root_names.iter().enumerate() {
@@ -2549,7 +2605,7 @@ mod tests {
                 u8::try_from(index + 3).unwrap(),
                 RuntimeForestRootV1::Runtime,
                 format!("lib64/{name}").as_bytes(),
-                forest_elf_fixture(None, needed),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, needed),
             ));
         }
         for (index, name) in child_names.iter().enumerate() {
@@ -2557,7 +2613,7 @@ mod tests {
                 u8::try_from(index + 80).unwrap(),
                 RuntimeForestRootV1::Runtime,
                 format!("lib64/{name}").as_bytes(),
-                forest_elf_fixture(None, &[]),
+                forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[]),
             ));
         }
         assert_eq!(
@@ -2646,38 +2702,272 @@ mod tests {
     }
 
     #[test]
-    fn shared_objects_and_interpreters_may_have_zero_entry_but_root_may_not() {
-        let object = forest_elf_fixture(None, &[]);
+    fn object_roles_enforce_type_and_entry_semantics() {
+        let object = forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[]);
         assert_eq!(&object[24..32], &0u64.to_le_bytes());
-        assert_eq!(validate_x86_64_elf_role_v1(&object, false), Ok(()));
         assert_eq!(
-            validate_x86_64_elf_role_v1(&object, true),
+            validate_x86_64_elf_role_v1(&object, ElfObjectRoleV1::DependencyDso),
+            Ok(())
+        );
+        assert_eq!(
+            validate_x86_64_elf_role_v1(&object, ElfObjectRoleV1::RootExecutable),
             Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfEntryPoint)
         );
+        let interpreter = forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]);
+        assert_ne!(&interpreter[24..32], &0u64.to_le_bytes());
+        assert_eq!(
+            validate_x86_64_elf_role_v1(&interpreter, ElfObjectRoleV1::Interpreter),
+            Ok(())
+        );
+        let mut executable_interpreter = interpreter;
+        executable_interpreter[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        assert_eq!(
+            validate_x86_64_elf_role_v1(&executable_interpreter, ElfObjectRoleV1::Interpreter,),
+            Err(FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfType)
+        );
         assert!(build_representative_forest(representative_forest_entries()).is_ok());
+    }
+
+    #[test]
+    fn dependency_et_exec_is_rejected_as_elf_type() {
+        let mut entries = representative_forest_entries();
+        entries[2].bytes[16..18].copy_from_slice(&ET_EXEC.to_le_bytes());
+        assert_eq!(
+            build_representative_forest(entries).unwrap_err(),
+            FirstExecuteOnlyRuntimeCheckpointRefusalV1::ElfType
+        );
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn representative_system_interpreter_and_dso_pass_object_role_validation() {
-        let mut checked = 0usize;
+        let mut interpreter_checked = false;
         for path in [
             "/lib64/ld-linux-x86-64.so.2",
             "/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2",
+        ] {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            validate_x86_64_elf_role_v1(&bytes, ElfObjectRoleV1::Interpreter).unwrap_or_else(
+                |error| panic!("representative interpreter {path} refused: {error:?}"),
+            );
+            interpreter_checked = true;
+            break;
+        }
+        let mut dso_checked = false;
+        for path in [
             "/lib/x86_64-linux-gnu/libc.so.6",
             "/usr/lib/x86_64-linux-gnu/libc.so.6",
         ] {
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
-            validate_x86_64_elf_role_v1(&bytes, false)
-                .unwrap_or_else(|error| panic!("representative ELF {path} refused: {error:?}"));
-            checked += 1;
+            validate_x86_64_elf_role_v1(&bytes, ElfObjectRoleV1::DependencyDso)
+                .unwrap_or_else(|error| panic!("representative DSO {path} refused: {error:?}"));
+            dso_checked = true;
+            break;
         }
         assert!(
-            checked >= 2,
-            "expected an interpreter and DSO fixture on Linux x86_64"
+            interpreter_checked && dso_checked,
+            "expected representative interpreter and DSO fixtures on Linux x86_64"
         );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn runtime_publication_resources() -> SnapshotPipelineResourcesV1 {
+        let policy = SnapshotResourcePolicyV1::checked(
+            8,
+            NonZeroU32::new(64).unwrap(),
+            NonZeroU16::new(255).unwrap(),
+            16 * 1024,
+            16 * 1024,
+            16 * 1024 * 1024,
+            64 * 1024 * 1024,
+            64,
+            4_096,
+            64,
+            4_096,
+            255,
+            64 * 1024,
+            64 * 1024,
+            1024 * 1024,
+            NonZeroU64::new(8 * 1024 * 1024).unwrap(),
+            16 * 1024 * 1024,
+            1024 * 1024,
+            NonZeroU64::new(1_000_000).unwrap(),
+            NonZeroU8::new(4).unwrap(),
+            NonZeroU8::new(3).unwrap(),
+            NonZeroU8::new(4).unwrap(),
+        )
+        .unwrap();
+        SnapshotPipelineResourcesV1::preflight(policy, 0, u64::MAX, u64::MAX).unwrap()
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn make_published_tree_owner_writable(path: &std::path::Path) {
+        let Ok(metadata) = fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.is_dir() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    make_published_tree_owner_writable(&entry.path());
+                }
+            }
+        } else if metadata.is_file() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn run_real_publication_inventory_case(mutate_runtime_after_publication: bool) {
+        let workspace_source = tempfile::tempdir().unwrap();
+        let workspace_root = workspace_source.path().join("root");
+        fs::create_dir_all(workspace_root.join(".venv/bin")).unwrap();
+        fs::create_dir_all(workspace_root.join("tests")).unwrap();
+        fs::write(
+            workspace_root.join(".venv/bin/python"),
+            forest_elf_fixture(ElfObjectRoleV1::RootExecutable, &[b"libc.so.6"]),
+        )
+        .unwrap();
+        fs::set_permissions(
+            workspace_root.join(".venv/bin/python"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        fs::write(
+            workspace_root.join("tests/test_smoke.py"),
+            FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1,
+        )
+        .unwrap();
+
+        let runtime_source = tempfile::tempdir().unwrap();
+        let runtime_root = runtime_source.path().join("root");
+        fs::create_dir_all(runtime_root.join("lib64")).unwrap();
+        fs::write(
+            runtime_root.join("lib64/ld-linux-x86-64.so.2"),
+            forest_elf_fixture(ElfObjectRoleV1::Interpreter, &[]),
+        )
+        .unwrap();
+        fs::write(
+            runtime_root.join("lib64/libc.so.6"),
+            forest_elf_fixture(ElfObjectRoleV1::DependencyDso, &[]),
+        )
+        .unwrap();
+
+        let workspace_source_fd = File::open(workspace_source.path()).unwrap();
+        let runtime_source_fd = File::open(runtime_source.path()).unwrap();
+        let workspace_publication = tempfile::tempdir().unwrap();
+        let runtime_publication = tempfile::tempdir().unwrap();
+        let workspace_publication_fd = File::open(workspace_publication.path()).unwrap();
+        let runtime_publication_fd = File::open(runtime_publication.path()).unwrap();
+        let workspace_connector =
+            connect_snapshot_pipeline(runtime_publication_resources()).unwrap();
+        let runtime_connector = connect_snapshot_pipeline(runtime_publication_resources()).unwrap();
+        let argv = [
+            b".venv/bin/python".as_slice(),
+            b"-I",
+            b"-m",
+            b"pytest",
+            b"tests/test_smoke.py::test_smoke",
+        ];
+        let lexical =
+            super::super::execute_only_admission::parse_first_execute_only_argv_v1(&argv).unwrap();
+        let workspace_s1 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                workspace_source_fd.as_fd(),
+            )
+        };
+        let workspace_s2 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                workspace_source_fd.as_fd(),
+            )
+        };
+        let workspace_binding = workspace_connector
+            .materialize_first_execute_only_workspace_tree_and_publish_at(
+                lexical,
+                workspace_publication_fd.as_fd(),
+                c".again-snapshot-stage-11111111111111111111111111111111",
+                c"workspace-final",
+                workspace_s1,
+                workspace_s2,
+                c"root",
+            )
+            .unwrap();
+        let checkpoint = qualify_first_execute_only_runtime_checkpoint_v1(workspace_binding)
+            .expect("real workspace publication must reach the descriptor-bound checkpoint");
+
+        let runtime_s1 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                runtime_source_fd.as_fd(),
+            )
+        };
+        let runtime_s2 = unsafe {
+            QualifiedNoAtimeSourceViewV1::from_functionally_verified_mount_for_test(
+                runtime_source_fd.as_fd(),
+            )
+        };
+        let runtime_publication_token = runtime_connector
+            .materialize_first_execute_only_runtime_inventory_tree_and_publish_at(
+                runtime_publication_fd.as_fd(),
+                c".again-snapshot-stage-22222222222222222222222222222222",
+                c"runtime-final",
+                runtime_s1,
+                runtime_s2,
+                c"root",
+            )
+            .unwrap();
+        let expected_workspace_root = checkpoint.workspace_root_digest();
+        let expected_runtime_root = runtime_publication_token.root_digest();
+
+        if mutate_runtime_after_publication {
+            fs::set_permissions(
+                runtime_publication
+                    .path()
+                    .join("runtime-final/root/lib64/libc.so.6"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            assert_eq!(
+                inventory_first_execute_only_runtime_structure_v1(
+                    checkpoint,
+                    runtime_publication_token,
+                )
+                .unwrap_err(),
+                FirstExecuteOnlyRuntimeCheckpointRefusalV1::ManifestMetadataMismatch
+            );
+        } else {
+            let inventory = inventory_first_execute_only_runtime_structure_v1(
+                checkpoint,
+                runtime_publication_token,
+            )
+            .expect("two connector publications must form a structural inventory");
+            assert_ne!(inventory.digest().as_bytes(), &[0; 32]);
+            assert_eq!(inventory.workspace_root_digest(), expected_workspace_root);
+            assert_eq!(inventory.runtime_root_digest(), expected_runtime_root);
+            assert_eq!(inventory.node_count(), 3);
+            assert_eq!(inventory.edge_count(), 2);
+            assert!(!inventory.loader_authority());
+            assert!(!inventory.execution_authority());
+            assert!(!inventory.profile_authority());
+            assert!(!inventory.isolation_authority());
+            assert!(!inventory.command_authority());
+            assert!(!inventory.candidate_authority());
+            assert!(!inventory.replay_authority());
+            assert!(!inventory.reuse_authority());
+        }
+
+        make_published_tree_owner_writable(workspace_publication.path());
+        make_published_tree_owner_writable(runtime_publication.path());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn real_connector_publications_bind_runtime_inventory_and_refuse_later_mutation() {
+        run_real_publication_inventory_case(false);
+        run_real_publication_inventory_case(true);
     }
 
     #[test]
