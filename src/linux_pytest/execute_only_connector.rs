@@ -102,10 +102,12 @@ mod supported {
 
     use super::super::execute_only_isolation::{
         BlockedExecuteOnlyIsolationFailureV1, ExecuteOnlyIsolationCancellationFailureV1,
-        FirstExecuteOnlyIsolationReadyPermitV1,
-        begin_blocked_execute_only_isolation_with_profile_stdio_v1,
     };
-    use super::super::execute_only_runtime::FirstExecuteOnlyRuntimeStructuralInventoryV1;
+    use super::super::execute_only_runtime::{
+        FirstExecuteOnlyRuntimeFilesystemReadyChildV1,
+        FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1, FirstExecuteOnlyRuntimeRetainedRootPairV1,
+        split_first_execute_only_runtime_filesystem_roots_v1,
+    };
     use super::super::execute_only_stdio::{
         LinuxProfileStdioSyscallsV1, ParentStdioDrainV1, ProfileStdioDrainReportV1,
         ProfileStdioFailureV1, open_profile_owned_stdio_v1,
@@ -123,6 +125,7 @@ mod supported {
     /// checkpoint. Cleanup state is recorded separately on the wrapper.
     pub(in crate::linux_pytest) enum CommandFreeSetupPrimaryV1 {
         Stdio(ProfileStdioFailureV1),
+        Runtime(FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1),
         Isolation(BlockedExecuteOnlyIsolationFailureV1),
     }
 
@@ -130,6 +133,7 @@ mod supported {
         pub(in crate::linux_pytest) const fn subsystem(&self) -> &'static str {
             match self {
                 Self::Stdio(_) => "stdio",
+                Self::Runtime(_) => "runtime",
                 Self::Isolation(_) => "isolation",
             }
         }
@@ -139,6 +143,7 @@ mod supported {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Stdio(failure) => formatter.debug_tuple("Stdio").field(failure).finish(),
+                Self::Runtime(failure) => formatter.debug_tuple("Runtime").field(failure).finish(),
                 Self::Isolation(failure) => {
                     formatter.debug_tuple("Isolation").field(failure).finish()
                 }
@@ -194,6 +199,17 @@ mod supported {
                 stdio_cleanup_complete,
             }
         }
+
+        fn from_runtime(
+            primary: FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1,
+            stdio_cleanup_complete: bool,
+        ) -> Self {
+            Self {
+                primary: CommandFreeSetupPrimaryV1::Runtime(primary),
+                isolation_cleanup_complete: None,
+                stdio_cleanup_complete,
+            }
+        }
     }
 
     impl fmt::Debug for CommandFreeSetupFailureV1 {
@@ -213,18 +229,17 @@ mod supported {
     /// Opaque, linear command-free owner. The two-publication structural
     /// inventory is retained solely to preserve the complete runtime admission
     /// chain while the child remains live.
-    pub(in crate::linux_pytest) struct FirstExecuteOnlyCommandFreeCheckpointV1<'resources> {
-        _inventory: FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
-        isolation: Option<FirstExecuteOnlyIsolationReadyPermitV1>,
+    pub(in crate::linux_pytest) struct FirstExecuteOnlyFilesystemReadyCheckpointV1<'resources> {
+        runtime_child: Option<FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources>>,
         stdio: Option<ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>>,
     }
 
-    impl fmt::Debug for FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
+    impl fmt::Debug for FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter
-                .debug_struct("FirstExecuteOnlyCommandFreeCheckpointV1")
-                .field("runtime_inventory", &"<retained-redacted>")
-                .field("child", &"<isolation-ready-cleanup-owned>")
+                .debug_struct("FirstExecuteOnlyFilesystemReadyCheckpointV1")
+                .field("runtime_anchor", &"<full-inventory-publications-retained>")
+                .field("child", &"<filesystem-ready-cleanup-owned>")
                 .field("stdio", &"<profile-owned-redacted>")
                 .field("command", &"<none>")
                 .field("authority", &"<none>")
@@ -232,13 +247,13 @@ mod supported {
         }
     }
 
-    impl Drop for FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
+    impl Drop for FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
         fn drop(&mut self) {
             drop_cleanup_flow_v1(self);
         }
     }
 
-    impl CommandFreeCancellationDriverV1 for FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
+    impl CommandFreeCancellationDriverV1 for FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
         type IsolationFailure = ExecuteOnlyIsolationCancellationFailureV1;
         type StdioFailure = ProfileStdioFailureV1;
         type Report = ProfileStdioDrainReportV1;
@@ -246,16 +261,16 @@ mod supported {
         fn terminate_and_reap_v1(
             &mut self,
         ) -> Result<(), IsolationCancellationStepFailureV1<Self::IsolationFailure>> {
-            let Some(isolation) = self.isolation.take() else {
+            let Some(runtime_child) = self.runtime_child.take() else {
                 return Ok(());
             };
-            isolation
-                .cancel_and_reap_v1()
-                .map_err(|primary| IsolationCancellationStepFailureV1 {
+            runtime_child.cancel_and_reap_v1().map_err(|primary| {
+                IsolationCancellationStepFailureV1 {
                     terminal_reap_complete: primary.terminal_reap_complete(),
                     cleanup_complete: primary.cleanup_complete(),
                     primary,
-                })
+                }
+            })
         }
 
         fn drain_stdio_v1(
@@ -280,18 +295,28 @@ mod supported {
 
     /// Prepare the command-free child. No release or command is accepted and
     /// the returned child remains at the isolation protocol's ready barrier.
-    pub(in crate::linux_pytest) fn prepare_first_execute_only_command_free_checkpoint_v1<
+    pub(in crate::linux_pytest) fn prepare_first_execute_only_filesystem_ready_checkpoint_v1<
         'resources,
     >(
-        inventory: FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
-    ) -> Result<FirstExecuteOnlyCommandFreeCheckpointV1<'resources>, CommandFreeSetupFailureV1>
+        roots: FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>,
+    ) -> Result<FirstExecuteOnlyFilesystemReadyCheckpointV1<'resources>, CommandFreeSetupFailureV1>
     {
         let session =
             open_profile_owned_stdio_v1().map_err(CommandFreeSetupFailureV1::from_stdio)?;
         let (parent, child) = session
             .split_for_isolation_v1()
             .map_err(CommandFreeSetupFailureV1::from_stdio)?;
-        let blocked = match begin_blocked_execute_only_isolation_with_profile_stdio_v1(child) {
+        let split = match split_first_execute_only_runtime_filesystem_roots_v1(roots) {
+            Ok(split) => split,
+            Err(primary) => {
+                let _parent_stdio_cleanup_complete = parent.close_without_capture_v1();
+                // The child half is raw-close Drop-cleaned, but those close
+                // results are unobservable. Do not claim complete stdio
+                // cleanup on this pre-clone refusal.
+                return Err(CommandFreeSetupFailureV1::from_runtime(primary, false));
+            }
+        };
+        let blocked = match split.begin_with_profile_stdio_v1(child) {
             Ok(blocked) => blocked,
             Err(primary) => {
                 let isolation_cleanup_complete = primary.cleanup_complete();
@@ -299,32 +324,24 @@ mod supported {
                     setup_failure_cleanup_v1(primary, Some(isolation_cleanup_complete), || {
                         parent.close_without_capture_v1()
                     });
-                return Err(CommandFreeSetupFailureV1::from_isolation(
-                    primary,
-                    stdio_cleanup_complete,
-                ));
+                let _parent_stdio_cleanup_complete = stdio_cleanup_complete;
+                return Err(CommandFreeSetupFailureV1::from_isolation(primary, false));
             }
         };
-        let isolation = match blocked
-            .into_continuation_permit()
-            .continue_to_isolation_ready_v1()
-        {
-            Ok(isolation) => isolation,
+        let runtime_child = match blocked.continue_to_filesystem_ready_v1() {
+            Ok(runtime_child) => runtime_child,
             Err(primary) => {
                 let isolation_cleanup_complete = primary.cleanup_complete();
                 let (primary, _, stdio_cleanup_complete) =
                     setup_failure_cleanup_v1(primary, Some(isolation_cleanup_complete), || {
                         parent.close_without_capture_v1()
                     });
-                return Err(CommandFreeSetupFailureV1::from_isolation(
-                    primary,
-                    stdio_cleanup_complete,
-                ));
+                let _parent_stdio_cleanup_complete = stdio_cleanup_complete;
+                return Err(CommandFreeSetupFailureV1::from_isolation(primary, false));
             }
         };
-        Ok(FirstExecuteOnlyCommandFreeCheckpointV1 {
-            _inventory: inventory,
-            isolation: Some(isolation),
+        Ok(FirstExecuteOnlyFilesystemReadyCheckpointV1 {
+            runtime_child: Some(runtime_child),
             stdio: Some(parent),
         })
     }
@@ -445,7 +462,7 @@ mod supported {
         }
     }
 
-    impl FirstExecuteOnlyCommandFreeCheckpointV1<'_> {
+    impl FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
         /// Cancel and reap the child first, then require exact stdout/stderr
         /// EOF. If terminal cleanup is uncertain, close the streams immediately
         /// rather than waiting on a potentially live writer.
@@ -499,16 +516,16 @@ mod supported {
 
         #[test]
         fn command_free_owner_is_linear_and_constructor_requires_structural_inventory() {
-            <FirstExecuteOnlyCommandFreeCheckpointV1<'static> as AmbiguousIfClone<_>>::probe();
-            <FirstExecuteOnlyCommandFreeCheckpointV1<'static> as AmbiguousIfCopy<_>>::probe();
-            <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfClone<_>>::probe();
-            <FirstExecuteOnlyRuntimeStructuralInventoryV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <FirstExecuteOnlyFilesystemReadyCheckpointV1<'static> as AmbiguousIfClone<_>>::probe();
+            <FirstExecuteOnlyFilesystemReadyCheckpointV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
+            <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
             let _constructor: fn(
-                FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
+                FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
             ) -> Result<
-                FirstExecuteOnlyCommandFreeCheckpointV1<'static>,
+                FirstExecuteOnlyFilesystemReadyCheckpointV1<'static>,
                 CommandFreeSetupFailureV1,
-            > = prepare_first_execute_only_command_free_checkpoint_v1;
+            > = prepare_first_execute_only_filesystem_ready_checkpoint_v1;
         }
     }
 }

@@ -22,6 +22,10 @@ use super::execute_only_admission::{
     FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1, FirstExecuteOnlyLexicalAdmissionV1,
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::execute_only_runtime::FirstExecuteOnlyRuntimeRootSplitSealV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::isolation_qualification::IsolationChildOnlyBrandV1;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_connector::{
     SnapshotChargedErrorV1, SnapshotConnectorV1, SnapshotPipelineFourViewErrorV1,
 };
@@ -37,15 +41,18 @@ use super::snapshot_policy::{
 };
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
-    BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, RuntimeMemoryEscrowV1,
+    BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, ForkChildPublishedRootV1,
+    RuntimeMemoryEscrowV1, SnapshotChildAttachFailureV1, SnapshotChildRootRoleV1,
     SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
     ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
-    consume_bound_published_snapshot_root_projection_v1, read_bound_regular_bytes_v1,
+    attach_fork_child_published_roots_v1, consume_bound_published_snapshot_root_projection_v1,
+    prepare_fork_child_published_root_v1, read_bound_regular_bytes_v1,
     revalidate_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
     validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
+    SnapshotChildAttachOperationV1, attach_fork_child_published_roots_with_test_fault_v1,
     bound_published_snapshot_directory_fd, bound_published_snapshot_root_fd,
 };
 use super::snapshot_tree::{
@@ -130,6 +137,34 @@ impl<'resources, 'evidence> SnapshotPreparedPublishedChildBindV1<'resources, 'ev
 pub(super) struct SnapshotPreparedRetainedRootProjectionV1<'evidence> {
     root_name: &'evidence CStr,
     expected_root_statx_commitment: [u8; 102],
+}
+
+/// Manifest-sealed input for one parent-to-child descriptor split. The root
+/// basename, role, and commitment cannot be supplied independently.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct SnapshotPreparedForkChildRootV1<'evidence> {
+    role: SnapshotChildRootRoleV1,
+    root_name: &'evidence CStr,
+    expected_root_statx_commitment: [u8; 102],
+}
+
+/// Manifest-private forwarding seal proving that the caller consumed the
+/// isolation module's authenticated fork-child brand. The syscall leaf cannot
+/// be invoked with publication provenance alone.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct SnapshotChildMountNamespaceSealV1 {
+    _private: (),
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<'evidence> SnapshotPreparedForkChildRootV1<'evidence> {
+    pub(super) fn into_leaf_parts(self) -> (SnapshotChildRootRoleV1, &'evidence CStr, [u8; 102]) {
+        (
+            self.role,
+            self.root_name,
+            self.expected_root_statx_commitment,
+        )
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -341,6 +376,139 @@ pub(super) enum FirstExecuteOnlyRootPairObjectRefusalV1 {
 pub(super) struct FirstExecuteOnlyRetainedPublishedRootStorageV1<'resources> {
     workspace: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
     runtime: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
+}
+
+/// Fork-safe child-only exact workspace/runtime descriptors. Construction
+/// additionally requires the outer-runtime seal, so this lower manifest
+/// storage cannot mint the pair by itself. No descriptor or path accessor is
+/// exposed; the only operation consumes both roots into the fixed attachment
+/// leaf.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[must_use = "the child root pair must enter the fixed attachment leaf or be dropped"]
+pub(super) struct FirstExecuteOnlyForkChildRootPairV1 {
+    workspace: ForkChildPublishedRootV1,
+    runtime: ForkChildPublishedRootV1,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyForkChildRootPairV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyForkChildRootPairV1")
+            .field("workspace", &"<child-only-redacted>")
+            .field("runtime", &"<child-only-redacted>")
+            .finish()
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyForkChildRootPairRefusalV1 {
+    WorkspaceIdentityDrift,
+    WorkspaceIo,
+    RuntimeIdentityDrift,
+    RuntimeIo,
+}
+
+/// Consume the child-only pair into the fixed `/workspace` and `/runtime`
+/// attachment leaf. This is callable only from the branded fork-child
+/// continuation and never exposes either descriptor.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_first_execute_only_fork_child_roots_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    _child_brand: IsolationChildOnlyBrandV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    attach_fork_child_published_roots_v1(
+        roots.workspace,
+        roots.runtime,
+        SnapshotChildMountNamespaceSealV1 { _private: () },
+    )
+}
+
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_first_execute_only_fork_child_roots_with_test_fault_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    _child_brand: IsolationChildOnlyBrandV1,
+    role: SnapshotChildRootRoleV1,
+    operation: SnapshotChildAttachOperationV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    attach_fork_child_published_roots_with_test_fault_v1(
+        roots.workspace,
+        roots.runtime,
+        SnapshotChildMountNamespaceSealV1 { _private: () },
+        role,
+        operation,
+    )
+}
+
+/// Prepare both child halves while the complete outer runtime owner is being
+/// consumed. The unforgeable seal prevents the lower storage from being an
+/// alternate constructor surface.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prepare_first_execute_only_fork_child_roots_v1(
+    storage: &FirstExecuteOnlyRetainedPublishedRootStorageV1<'_>,
+    _outer_seal: FirstExecuteOnlyRuntimeRootSplitSealV1,
+) -> Result<FirstExecuteOnlyForkChildRootPairV1, FirstExecuteOnlyForkChildRootPairRefusalV1> {
+    let workspace = prepare_fork_child_root_from_tree_v1(
+        &storage.workspace.binding.workspace,
+        SnapshotChildRootRoleV1::Workspace,
+    )
+    .map_err(|error| {
+        map_fork_child_root_refusal_v1(error, FirstExecuteOnlyInventoryRootV1::Workspace)
+    })?;
+    let runtime = prepare_fork_child_root_from_tree_v1(
+        &storage.runtime.tree,
+        SnapshotChildRootRoleV1::Runtime,
+    )
+    .map_err(|error| {
+        map_fork_child_root_refusal_v1(error, FirstExecuteOnlyInventoryRootV1::Runtime)
+    })?;
+    Ok(FirstExecuteOnlyForkChildRootPairV1 { workspace, runtime })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn prepare_fork_child_root_from_tree_v1(
+    tree: &PublishedCanonicalTreeV1<'_>,
+    role: SnapshotChildRootRoleV1,
+) -> Result<ForkChildPublishedRootV1, BoundRegularReadRefusalV1> {
+    const LINUX_NAME_MAX_V1: usize = 255;
+    let root_name = tree.manifest.root_name();
+    if root_name.is_empty() || root_name.len() > LINUX_NAME_MAX_V1 || root_name.contains(&0) {
+        return Err(BoundRegularReadRefusalV1::InvalidPath);
+    }
+    let mut nul_terminated = [0u8; LINUX_NAME_MAX_V1 + 1];
+    nul_terminated[..root_name.len()].copy_from_slice(root_name);
+    let root_name = CStr::from_bytes_with_nul(&nul_terminated[..root_name.len() + 1])
+        .map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
+    prepare_fork_child_published_root_v1(
+        &tree.physical,
+        SnapshotPreparedForkChildRootV1 {
+            role,
+            root_name,
+            expected_root_statx_commitment: *tree.manifest.destination_root_statx_commitment_v1(),
+        },
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_fork_child_root_refusal_v1(
+    refusal: BoundRegularReadRefusalV1,
+    role: FirstExecuteOnlyInventoryRootV1,
+) -> FirstExecuteOnlyForkChildRootPairRefusalV1 {
+    match (role, refusal) {
+        (FirstExecuteOnlyInventoryRootV1::Workspace, BoundRegularReadRefusalV1::Io) => {
+            FirstExecuteOnlyForkChildRootPairRefusalV1::WorkspaceIo
+        }
+        (FirstExecuteOnlyInventoryRootV1::Workspace, _) => {
+            FirstExecuteOnlyForkChildRootPairRefusalV1::WorkspaceIdentityDrift
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, BoundRegularReadRefusalV1::Io) => {
+            FirstExecuteOnlyForkChildRootPairRefusalV1::RuntimeIo
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, _) => {
+            FirstExecuteOnlyForkChildRootPairRefusalV1::RuntimeIdentityDrift
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3957,6 +4125,13 @@ mod tests {
             <PublishedCanonicalTreeV1<'static> as AmbiguousIfCopy<_>>::probe();
             <FirstExecuteOnlyWorkspaceTreeBindingV1<'static> as AmbiguousIfClone<_>>::probe();
             <FirstExecuteOnlyWorkspaceTreeBindingV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <FirstExecuteOnlyForkChildRootPairV1 as AmbiguousIfClone<_>>::probe();
+            <FirstExecuteOnlyForkChildRootPairV1 as AmbiguousIfCopy<_>>::probe();
+            let _branded_attachment: fn(
+                FirstExecuteOnlyForkChildRootPairV1,
+                IsolationChildOnlyBrandV1,
+            ) -> Result<(), SnapshotChildAttachFailureV1> =
+                attach_first_execute_only_fork_child_roots_v1;
             assert!(std::mem::needs_drop::<
                 SnapshotPreparedPublishedChildBindV1<'static, 'static>,
             >());

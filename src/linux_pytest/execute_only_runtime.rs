@@ -18,14 +18,42 @@
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::ExecutableChainDigest;
+
+fn release_or_quarantine_parent_anchor_v1<T>(anchor: T, terminal_reap_proven: bool) {
+    if terminal_reap_proven {
+        drop(anchor);
+    } else {
+        std::mem::forget(anchor);
+    }
+}
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::execute_only_isolation::{
+    BlockedExecuteOnlyIsolationFailureV1, BlockedExecuteOnlyIsolationV1,
+    ExecuteOnlyIsolationCancellationFailureV1, FirstExecuteOnlyIsolationReadyPermitV1,
+    begin_blocked_execute_only_isolation_with_filesystem_stdio_v1,
+};
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::execute_only_stdio::ProfileStdioIsolationChildV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
+    FirstExecuteOnlyForkChildRootPairRefusalV1, FirstExecuteOnlyForkChildRootPairV1,
     FirstExecuteOnlyPublishedRootPairRefusalV1, FirstExecuteOnlyPublishedRuntimeTreeV1,
     FirstExecuteOnlyRetainedPublishedRootStorageV1, FirstExecuteOnlyRootPairObjectRefusalV1,
     FirstExecuteOnlyRuntimeInventoryObjectV1, FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
     FirstExecuteOnlyWorkspaceRuntimeEvidenceV1, FirstExecuteOnlyWorkspaceTreeBindingV1,
     consume_first_execute_only_retained_published_root_storage_v1,
     consume_first_execute_only_workspace_runtime_evidence_v1,
+    prepare_first_execute_only_fork_child_roots_v1,
     read_first_execute_only_runtime_inventory_object_v1,
     read_first_execute_only_workspace_inventory_object_v1,
     revalidate_first_execute_only_root_pair_inventory_object_v1,
@@ -35,6 +63,8 @@ use super::snapshot_manifest::{
 use super::snapshot_publish::RuntimeMemoryEscrowV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::VerifiedBoundNodeKindV1;
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::snapshot_publish::{SnapshotChildAttachOperationV1, SnapshotChildRootRoleV1};
 use super::{Blake3Digest, FileContentDigest, NodeDigest};
 use std::fmt;
 
@@ -1754,6 +1784,329 @@ pub(super) struct FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources> {
     _plan: RuntimeForestPlanV1,
 }
 
+/// Unforgeable proof that the complete outer structural-inventory owner is
+/// crossing its one-shot fork-child filesystem split. Only this module can
+/// construct the seal; the lower manifest storage cannot issue one.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FirstExecuteOnlyRuntimeRootSplitSealV1 {
+    _private: (),
+}
+
+/// Stable refusal while consuming the complete retained-root pair into its
+/// parent anchor and fork-safe child halves.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1 {
+    InventoryOwnerMissing,
+    WorkspaceSelectedObjectIdentityDrift,
+    WorkspaceSelectedObjectIo,
+    RuntimeSelectedObjectIdentityDrift,
+    RuntimeSelectedObjectIo,
+    WorkspaceRootIdentityDrift,
+    WorkspaceRootIo,
+    RuntimeRootIdentityDrift,
+    RuntimeRootIo,
+}
+
+/// Linear result of the outer-only split. The parent anchor retains the full
+/// inventory and publication owners; the child pair has no operation except a
+/// branded attachment in namespace PID 1.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[must_use = "the parent anchor and fork-child roots must remain paired"]
+pub(super) struct FirstExecuteOnlyRuntimeFilesystemSplitV1<'resources> {
+    parent_anchor: FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>,
+    child_roots: FirstExecuteOnlyForkChildRootPairV1,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyRuntimeFilesystemSplitV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyRuntimeFilesystemSplitV1")
+            .field("parent_anchor", &"<full-inventory-retained>")
+            .field("child_roots", &"<fork-child-redacted>")
+            .field("authority", &false)
+            .finish()
+    }
+}
+
+/// Runtime-owned blocked composition. The child roots never escape this
+/// module independently of the complete parent anchor.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) struct FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources> {
+    blocked: Option<BlockedExecuteOnlyIsolationV1>,
+    parent_anchor: Option<FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>>,
+}
+
+/// Runtime-owned ready composition. Explicit cancellation and Drop both keep
+/// the publication anchor until terminal child reaping is proved.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) struct FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources> {
+    isolation: Option<FirstExecuteOnlyIsolationReadyPermitV1>,
+    parent_anchor: Option<FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl<'resources> FirstExecuteOnlyRuntimeFilesystemSplitV1<'resources> {
+    pub(super) fn begin_with_profile_stdio_v1(
+        self,
+        stdio: ProfileStdioIsolationChildV1,
+    ) -> Result<
+        FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources>,
+        BlockedExecuteOnlyIsolationFailureV1,
+    > {
+        let Self {
+            parent_anchor,
+            child_roots,
+        } = self;
+        let blocked =
+            match begin_blocked_execute_only_isolation_with_filesystem_stdio_v1(child_roots, stdio)
+            {
+                Ok(blocked) => blocked,
+                Err(failure) => {
+                    release_or_quarantine_parent_anchor_v1(
+                        parent_anchor,
+                        failure.cleanup_complete(),
+                    );
+                    return Err(failure);
+                }
+            };
+        Ok(FirstExecuteOnlyRuntimeBlockedFilesystemChildV1 {
+            blocked: Some(blocked),
+            parent_anchor: Some(parent_anchor),
+        })
+    }
+
+    #[cfg(test)]
+    fn begin_with_profile_stdio_test_fault_v1(
+        self,
+        stdio: ProfileStdioIsolationChildV1,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> Result<
+        FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources>,
+        BlockedExecuteOnlyIsolationFailureV1,
+    > {
+        let Self {
+            parent_anchor,
+            child_roots,
+        } = self;
+        let blocked = match super::execute_only_isolation::begin_blocked_execute_only_isolation_with_filesystem_stdio_test_fault_v1(
+            child_roots,
+            stdio,
+            role,
+            operation,
+        ) {
+            Ok(blocked) => blocked,
+            Err(failure) => {
+                release_or_quarantine_parent_anchor_v1(parent_anchor, failure.cleanup_complete());
+                return Err(failure);
+            }
+        };
+        Ok(FirstExecuteOnlyRuntimeBlockedFilesystemChildV1 {
+            blocked: Some(blocked),
+            parent_anchor: Some(parent_anchor),
+        })
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl<'resources> FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources> {
+    pub(super) fn continue_to_filesystem_ready_v1(
+        mut self,
+    ) -> Result<
+        FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources>,
+        BlockedExecuteOnlyIsolationFailureV1,
+    > {
+        let blocked = self
+            .blocked
+            .take()
+            .expect("runtime blocked owner retains one isolation guard");
+        let parent_anchor = self
+            .parent_anchor
+            .take()
+            .expect("runtime blocked owner retains one publication anchor");
+        let isolation = match blocked
+            .into_continuation_permit()
+            .continue_to_isolation_ready_v1()
+        {
+            Ok(isolation) => isolation,
+            Err(failure) => {
+                release_or_quarantine_parent_anchor_v1(parent_anchor, failure.cleanup_complete());
+                return Err(failure);
+            }
+        };
+        Ok(FirstExecuteOnlyRuntimeFilesystemReadyChildV1 {
+            isolation: Some(isolation),
+            parent_anchor: Some(parent_anchor),
+        })
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'_> {
+    pub(super) fn cancel_and_reap_v1(
+        mut self,
+    ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
+        let isolation = self
+            .isolation
+            .take()
+            .expect("runtime ready owner retains one isolation guard");
+        let parent_anchor = self
+            .parent_anchor
+            .take()
+            .expect("runtime ready owner retains one publication anchor");
+        let result = isolation.cancel_and_reap_v1();
+        let terminal_reap_proven = match result.as_ref() {
+            Ok(()) => true,
+            Err(failure) => failure.terminal_reap_complete(),
+        };
+        release_or_quarantine_parent_anchor_v1(parent_anchor, terminal_reap_proven);
+        result
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl Drop for FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'_> {
+    fn drop(&mut self) {
+        if let Some(blocked) = self.blocked.take() {
+            drop(blocked);
+        }
+        if let Some(parent_anchor) = self.parent_anchor.take() {
+            release_or_quarantine_parent_anchor_v1(parent_anchor, false);
+        }
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl Drop for FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'_> {
+    fn drop(&mut self) {
+        let isolation = self.isolation.take();
+        let parent_anchor = self.parent_anchor.take();
+        match (isolation, parent_anchor) {
+            (Some(isolation), Some(parent_anchor)) => {
+                let terminal_reap_proven = match isolation.cancel_and_reap_v1() {
+                    Ok(()) => true,
+                    Err(failure) => failure.terminal_reap_complete(),
+                };
+                release_or_quarantine_parent_anchor_v1(parent_anchor, terminal_reap_proven);
+            }
+            (None, Some(parent_anchor)) => {
+                release_or_quarantine_parent_anchor_v1(parent_anchor, false);
+            }
+            (Some(isolation), None) => {
+                let _ = isolation.cancel_and_reap_v1();
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+/// Consume only the complete outer retained-root owner, revalidate every
+/// selected object once more, then duplicate and authenticate both exact
+/// published-name/root relationships for the fork child. Failure drops every
+/// partially duplicated descriptor and the consumed outer owner.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn split_first_execute_only_runtime_filesystem_roots_v1<'resources>(
+    pair: FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>,
+) -> Result<
+    FirstExecuteOnlyRuntimeFilesystemSplitV1<'resources>,
+    FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1,
+> {
+    for node in &pair._plan.nodes {
+        let object = node
+            .publication
+            .as_ref()
+            .ok_or(FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::InventoryOwnerMissing)?;
+        revalidate_first_execute_only_root_pair_inventory_object_v1(&pair._roots, object)
+            .map_err(map_filesystem_split_object_refusal_v1)?;
+    }
+    let child_roots = prepare_first_execute_only_fork_child_roots_v1(
+        &pair._roots,
+        FirstExecuteOnlyRuntimeRootSplitSealV1 { _private: () },
+    )
+    .map_err(map_filesystem_split_root_refusal_v1)?;
+    Ok(FirstExecuteOnlyRuntimeFilesystemSplitV1 {
+        parent_anchor: pair,
+        child_roots,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_filesystem_split_object_refusal_v1(
+    refusal: FirstExecuteOnlyRootPairObjectRefusalV1,
+) -> FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1 {
+    match refusal {
+        FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIdentityDrift => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::WorkspaceSelectedObjectIdentityDrift
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIo => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::WorkspaceSelectedObjectIo
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIdentityDrift => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::RuntimeSelectedObjectIdentityDrift
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIo => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::RuntimeSelectedObjectIo
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_filesystem_split_root_refusal_v1(
+    refusal: FirstExecuteOnlyForkChildRootPairRefusalV1,
+) -> FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1 {
+    match refusal {
+        FirstExecuteOnlyForkChildRootPairRefusalV1::WorkspaceIdentityDrift => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::WorkspaceRootIdentityDrift
+        }
+        FirstExecuteOnlyForkChildRootPairRefusalV1::WorkspaceIo => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::WorkspaceRootIo
+        }
+        FirstExecuteOnlyForkChildRootPairRefusalV1::RuntimeIdentityDrift => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::RuntimeRootIdentityDrift
+        }
+        FirstExecuteOnlyForkChildRootPairRefusalV1::RuntimeIo => {
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1::RuntimeRootIo
+        }
+    }
+}
+
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 impl FirstExecuteOnlyRuntimeRetainedRootPairV1<'_> {
     pub(super) const fn loader_authority(&self) -> bool {
@@ -2048,6 +2401,24 @@ impl RuntimeForestReaderV1 for PublishedRuntimeInventoryReaderV1<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn parent_anchor_is_released_only_after_terminal_reap_proof() {
+        static DROPS: AtomicUsize = AtomicUsize::new(0);
+        struct DropProbe;
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                DROPS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        DROPS.store(0, Ordering::SeqCst);
+        release_or_quarantine_parent_anchor_v1(DropProbe, true);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+        release_or_quarantine_parent_anchor_v1(DropProbe, false);
+        assert_eq!(DROPS.load(Ordering::SeqCst), 1);
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     use crate::linux_pytest::execute_only_admission::FIRST_EXECUTE_ONLY_FIXTURE_BYTES_V1;
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -3084,6 +3455,18 @@ mod tests {
                 failure.regular_stage(),
                 failure.errno()
             ),
+            Err(
+                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Publication(
+                        failure,
+                    ),
+                ),
+            ) => panic!(
+                "{label} publication failure: kind={:?} stage={:?} errno={:?}",
+                failure.kind(),
+                failure.stage(),
+                failure.errno()
+            ),
             Err(error) => panic!("{label} publication failure: {error:?}"),
         }
     }
@@ -3092,6 +3475,20 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RealPublicationMutationV1 {
         None,
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_pointer_width = "64"
+        ))]
+        FilesystemReadyAndCancel,
+        #[cfg(all(
+            target_os = "linux",
+            target_arch = "x86_64",
+            target_env = "gnu",
+            target_pointer_width = "64"
+        ))]
+        RuntimeMountFailureAfterWorkspace,
         RuntimeObjectBeforeInventory,
         WorkspaceRootBeforeProjection,
         RuntimeRootBeforeProjection,
@@ -3266,6 +3663,72 @@ mod tests {
                     assert!(!roots.replay_authority());
                     assert!(!roots.reuse_authority());
                 }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    target_env = "gnu",
+                    target_pointer_width = "64"
+                ))]
+                RealPublicationMutationV1::FilesystemReadyAndCancel => {
+                    assert_ne!(
+                        unsafe { libc::getuid() },
+                        0,
+                        "the rootless isolation profile intentionally refuses host uid 0"
+                    );
+                    let roots = project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                        .expect("unchanged publications must form the one-shot root pair");
+                    let ready = super::super::execute_only_connector::prepare_first_execute_only_filesystem_ready_checkpoint_v1(roots)
+                        .expect("the provisioned runner must attach both exact snapshot roots and reach the command-free barrier");
+                    let report = ready.cancel_and_finish_v1().expect(
+                        "cancellation must terminate/reap the namespace child and drain exact EOF",
+                    );
+                    assert!(report.capture_complete());
+                    assert!(!report.requires_execute_only_classification());
+                }
+                #[cfg(all(
+                    target_os = "linux",
+                    target_arch = "x86_64",
+                    target_env = "gnu",
+                    target_pointer_width = "64"
+                ))]
+                RealPublicationMutationV1::RuntimeMountFailureAfterWorkspace => {
+                    assert_ne!(
+                        unsafe { libc::getuid() },
+                        0,
+                        "the rootless isolation profile intentionally refuses host uid 0"
+                    );
+                    let roots = project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                        .expect("unchanged publications must form the one-shot root pair");
+                    let split = split_first_execute_only_runtime_filesystem_roots_v1(roots)
+                        .expect("both roots must be sealed for the child");
+                    let stdio = super::super::execute_only_stdio::open_profile_owned_stdio_v1()
+                        .expect("profile stdio setup must succeed");
+                    let (parent_stdio, child_stdio) = stdio
+                        .split_for_isolation_v1()
+                        .expect("profile stdio split must succeed");
+                    let blocked = split
+                        .begin_with_profile_stdio_test_fault_v1(
+                            child_stdio,
+                            SnapshotChildRootRoleV1::Runtime,
+                            SnapshotChildAttachOperationV1::OpenTree,
+                        )
+                        .expect("the child remains blocked until authenticated release");
+                    let failure = match blocked.continue_to_filesystem_ready_v1() {
+                        Err(failure) => failure,
+                        Ok(ready) => {
+                            let _ = ready.cancel_and_reap_v1();
+                            panic!("runtime open_tree fault follows successful workspace mount");
+                        }
+                    };
+                    assert_eq!(failure.stage(), "child_filesystem_attachment");
+                    assert_eq!(failure.primary_errno(), Some(libc::EIO));
+                    assert!(
+                        failure.cleanup_complete(),
+                        "parent cleanup must kill/reap and prove final ECHILD"
+                    );
+                    assert_eq!(failure.cleanup_errno(), None);
+                    assert!(parent_stdio.close_without_capture_v1());
+                }
                 RealPublicationMutationV1::WorkspaceRootBeforeProjection => {
                     fs::set_permissions(
                         workspace_publication.path().join("workspace-final/root"),
@@ -3344,6 +3807,32 @@ mod tests {
         );
         run_real_publication_inventory_case(
             RealPublicationMutationV1::RuntimeObjectBeforeProjection,
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    #[ignore = "requires a provisioned non-root Linux runner with user/mount namespace support"]
+    fn provisioned_two_root_filesystem_ready_then_cancel_and_reap() {
+        run_real_publication_inventory_case(RealPublicationMutationV1::FilesystemReadyAndCancel);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    #[ignore = "requires a provisioned non-root Linux runner with user/mount namespace support"]
+    fn provisioned_runtime_mount_fault_after_workspace_mount_reaps_to_final_echild() {
+        run_real_publication_inventory_case(
+            RealPublicationMutationV1::RuntimeMountFailureAfterWorkspace,
         );
     }
 
@@ -4077,6 +4566,10 @@ mod tests {
         >());
         <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
         <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlyRuntimeFilesystemSplitV1<'static> as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyRuntimeFilesystemSplitV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlyForkChildRootPairV1 as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyForkChildRootPairV1 as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<
             FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
         >());
@@ -4091,6 +4584,12 @@ mod tests {
             FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
             FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1,
         > = project_first_execute_only_runtime_retained_root_pair_v1;
+        let _outer_only_filesystem_split: fn(
+            FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
+        ) -> Result<
+            FirstExecuteOnlyRuntimeFilesystemSplitV1<'static>,
+            FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1,
+        > = split_first_execute_only_runtime_filesystem_roots_v1;
         let _typed_root_roles: fn(
             FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'static>,
             FirstExecuteOnlyPublishedRuntimeTreeV1<'static>,

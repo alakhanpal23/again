@@ -39,6 +39,13 @@ use super::isolation_qualification::{
     IsolationCancellationFailureV1, IsolationCancellationOperationV1,
     IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1,
 };
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::snapshot_manifest::FirstExecuteOnlyForkChildRootPairV1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BlockedIsolationPhaseV1 {
@@ -312,6 +319,52 @@ pub(super) fn begin_blocked_execute_only_isolation_with_profile_stdio_v1(
 ) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
     finish_blocked_execute_only_isolation_v1(
         isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_profile_stdio_v1(
+            continuation,
+        ),
+    )
+}
+
+/// Compose the exact child-only workspace/runtime roots and profile stdio into
+/// the one authenticated namespace child. The root pair is consumed before
+/// capability elimination; stdio is placed afterward.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_execute_only_isolation_with_filesystem_stdio_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
+    let continuation =
+        isolation_qualification::compose_filesystem_profile_isolation_child_v1(roots, stdio);
+    finish_blocked_execute_only_isolation_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_filesystem_stdio_v1(
+            continuation,
+        ),
+    )
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_execute_only_isolation_with_filesystem_stdio_test_fault_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+    role: super::snapshot_publish::SnapshotChildRootRoleV1,
+    operation: super::snapshot_publish::SnapshotChildAttachOperationV1,
+) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
+    let continuation =
+        isolation_qualification::compose_filesystem_profile_isolation_child_with_test_fault_v1(
+            roots, stdio, role, operation,
+        );
+    finish_blocked_execute_only_isolation_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_filesystem_stdio_v1(
             continuation,
         ),
     )

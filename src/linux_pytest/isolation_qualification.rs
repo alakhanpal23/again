@@ -45,6 +45,20 @@ use std::fmt;
     target_pointer_width = "64"
 ))]
 use super::execute_only_stdio::ProfileStdioIsolationChildV1;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::snapshot_manifest::{
+    FirstExecuteOnlyForkChildRootPairV1, attach_first_execute_only_fork_child_roots_v1,
+};
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+use super::{
+    snapshot_manifest::attach_first_execute_only_fork_child_roots_with_test_fault_v1,
+    snapshot_publish::{SnapshotChildAttachOperationV1, SnapshotChildRootRoleV1},
+};
 
 const PROTOCOL_VERSION_V2: u16 = 2;
 
@@ -73,11 +87,26 @@ enum IsolationChildStdioStateV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IsolationChildContinuationFailureV1 {
     errno: Option<i32>,
+    filesystem: bool,
+    unsupported: bool,
 }
 
 impl IsolationChildContinuationFailureV1 {
     const fn new(errno: Option<i32>) -> Self {
-        Self { errno }
+        Self {
+            errno,
+            filesystem: false,
+            unsupported: false,
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    const fn filesystem(failure: super::snapshot_publish::SnapshotChildAttachFailureV1) -> Self {
+        Self {
+            errno: failure.errno(),
+            filesystem: true,
+            unsupported: failure.unsupported(),
+        }
     }
 }
 
@@ -106,8 +135,26 @@ unsafe trait IsolationChildContinuationV1: Sized {
     /// previously qualified bootstrap transcript and does not request this
     /// stronger Gate 3 precondition.
     const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool;
+    const PROVIDES_FILESYSTEM_READY_V1: bool;
 
-    fn continue_in_child_v1(
+    type PostCapabilityV1: IsolationChildPostCapabilityContinuationV1;
+
+    fn continue_before_capability_elimination_v1(
+        self,
+        brand: IsolationChildOnlyBrandV1,
+    ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1>;
+}
+
+/// Child-only remainder that becomes usable only after capability elimination.
+///
+/// # Safety
+///
+/// Implementations retain the parent trait's complete fork-safety,
+/// async-signal-safety, child-half-only ownership, and raw-syscall Drop
+/// contract. They must not acquire parent cleanup authority or shared parent
+/// endpoints.
+unsafe trait IsolationChildPostCapabilityContinuationV1: Sized {
+    fn continue_after_capability_elimination_v1(
         self,
         brand: IsolationChildOnlyBrandV1,
     ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1>;
@@ -125,14 +172,126 @@ unsafe trait IsolationChildContinuationV1: Sized {
 ))]
 unsafe impl IsolationChildContinuationV1 for ProfileStdioIsolationChildV1 {
     const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+    const PROVIDES_FILESYSTEM_READY_V1: bool = false;
+    type PostCapabilityV1 = Self;
 
-    fn continue_in_child_v1(
+    fn continue_before_capability_elimination_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1> {
+        Ok(self)
+    }
+}
+
+// SAFETY: the stdio child half owns only its three pipe endpoints and uses raw
+// descriptor syscalls after capability elimination.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildPostCapabilityContinuationV1 for ProfileStdioIsolationChildV1 {
+    fn continue_after_capability_elimination_v1(
         self,
         brand: IsolationChildOnlyBrandV1,
     ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
         self.continue_in_authenticated_child_v1(brand)
             .map(|()| IsolationChildStdioStateV1::PlacedAndAuthenticated)
             .map_err(|errno| IsolationChildContinuationFailureV1::new(Some(errno)))
+    }
+}
+
+/// Concrete product continuation: exact snapshot roots before capability
+/// elimination, then the existing profile-owned stdio child half afterward.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) struct FilesystemProfileIsolationChildV1 {
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+    #[cfg(test)]
+    test_fault: Option<(SnapshotChildRootRoleV1, SnapshotChildAttachOperationV1)>,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn compose_filesystem_profile_isolation_child_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+) -> FilesystemProfileIsolationChildV1 {
+    FilesystemProfileIsolationChildV1 {
+        roots,
+        stdio,
+        #[cfg(test)]
+        test_fault: None,
+    }
+}
+
+#[cfg(all(
+    test,
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn compose_filesystem_profile_isolation_child_with_test_fault_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+    role: SnapshotChildRootRoleV1,
+    operation: SnapshotChildAttachOperationV1,
+) -> FilesystemProfileIsolationChildV1 {
+    FilesystemProfileIsolationChildV1 {
+        roots,
+        stdio,
+        test_fault: Some((role, operation)),
+    }
+}
+
+// SAFETY: both fields are child-only raw-descriptor owners with fork-safe
+// Drop. The branded pre-capability call consumes the root pair into the fixed
+// attachment leaf and returns only the stdio remainder.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildContinuationV1 for FilesystemProfileIsolationChildV1 {
+    const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+    const PROVIDES_FILESYSTEM_READY_V1: bool = true;
+    type PostCapabilityV1 = ProfileStdioIsolationChildV1;
+
+    fn continue_before_capability_elimination_v1(
+        self,
+        brand: IsolationChildOnlyBrandV1,
+    ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1> {
+        let Self {
+            roots,
+            stdio,
+            #[cfg(test)]
+            test_fault,
+        } = self;
+        #[cfg(test)]
+        let attached = if let Some((role, operation)) = test_fault {
+            attach_first_execute_only_fork_child_roots_with_test_fault_v1(
+                roots, brand, role, operation,
+            )
+        } else {
+            attach_first_execute_only_fork_child_roots_v1(roots, brand)
+        };
+        #[cfg(not(test))]
+        let attached = attach_first_execute_only_fork_child_roots_v1(roots, brand);
+        attached
+            .map(|()| stdio)
+            .map_err(IsolationChildContinuationFailureV1::filesystem)
     }
 }
 
@@ -150,8 +309,27 @@ struct CloseInheritedStdioV1;
 ))]
 unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
     const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = false;
+    const PROVIDES_FILESYSTEM_READY_V1: bool = false;
+    type PostCapabilityV1 = Self;
 
-    fn continue_in_child_v1(
+    fn continue_before_capability_elimination_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1> {
+        Ok(self)
+    }
+}
+
+// SAFETY: the zero-sized diagnostic continuation owns no resource and uses
+// only raw close/fcntl syscalls after capability elimination.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+unsafe impl IsolationChildPostCapabilityContinuationV1 for CloseInheritedStdioV1 {
+    fn continue_after_capability_elimination_v1(
         self,
         _brand: IsolationChildOnlyBrandV1,
     ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
@@ -183,8 +361,26 @@ unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
 )))]
 unsafe impl IsolationChildContinuationV1 for CloseInheritedStdioV1 {
     const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = false;
+    const PROVIDES_FILESYSTEM_READY_V1: bool = false;
+    type PostCapabilityV1 = Self;
 
-    fn continue_in_child_v1(
+    fn continue_before_capability_elimination_v1(
+        self,
+        _brand: IsolationChildOnlyBrandV1,
+    ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1> {
+        Ok(self)
+    }
+}
+
+// SAFETY: unsupported platform leaves never invoke the post-capability stage.
+#[cfg(not(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+)))]
+unsafe impl IsolationChildPostCapabilityContinuationV1 for CloseInheritedStdioV1 {
+    fn continue_after_capability_elimination_v1(
         self,
         _brand: IsolationChildOnlyBrandV1,
     ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1> {
@@ -225,10 +421,13 @@ enum IsolationQualificationStageV1 {
     SendControl,
     ReceiveChildProof,
     VerifyChildProof,
+    ReceiveFilesystemReady,
+    VerifyFilesystemReady,
     ReceiveIsolationReady,
     VerifyIsolationReady,
     ChildUtsConfiguration,
     ChildMountRoot,
+    ChildFilesystemAttachment,
     ChildDescriptorScrub,
     ChildCredentialNormalization,
     ChildCapabilityDrop,
@@ -268,10 +467,13 @@ impl IsolationQualificationStageV1 {
             Self::SendControl => "send_control",
             Self::ReceiveChildProof => "receive_child_proof",
             Self::VerifyChildProof => "verify_child_proof",
+            Self::ReceiveFilesystemReady => "receive_filesystem_ready",
+            Self::VerifyFilesystemReady => "verify_filesystem_ready",
             Self::ReceiveIsolationReady => "receive_isolation_ready",
             Self::VerifyIsolationReady => "verify_isolation_ready",
             Self::ChildUtsConfiguration => "child_uts_configuration",
             Self::ChildMountRoot => "child_mount_root",
+            Self::ChildFilesystemAttachment => "child_filesystem_attachment",
             Self::ChildDescriptorScrub => "child_descriptor_scrub",
             Self::ChildCredentialNormalization => "child_credential_normalization",
             Self::ChildCapabilityDrop => "child_capability_drop",
@@ -471,6 +673,16 @@ impl IsolationQualificationFailureV1 {
         ) {
             return true;
         }
+        if matches!(
+            (self.stage, self.reason),
+            (
+                IsolationQualificationStageV1::ChildFilesystemAttachment,
+                IsolationQualificationReasonV1::KernelCapabilityUnavailable
+                    | IsolationQualificationReasonV1::AdministrativePolicy,
+            )
+        ) {
+            return self.cleanup_complete();
+        }
         matches!(
             (self.stage, self.reason),
             (
@@ -647,6 +859,18 @@ fn begin_blocked_rootless_namespace_bootstrap_with_continuation_v1<
 ))]
 pub(super) fn begin_blocked_rootless_namespace_bootstrap_with_profile_stdio_v1(
     continuation: ProfileStdioIsolationChildV1,
+) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
+    begin_blocked_rootless_namespace_bootstrap_with_continuation_v1(continuation)
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_rootless_namespace_bootstrap_with_filesystem_stdio_v1(
+    continuation: FilesystemProfileIsolationChildV1,
 ) -> Result<BlockedRootlessNamespaceBootstrapV1, IsolationQualificationFailureV1> {
     begin_blocked_rootless_namespace_bootstrap_with_continuation_v1(continuation)
 }
@@ -879,12 +1103,14 @@ mod platform {
     const RELEASE_MAGIC_V1: &[u8; 8] = b"AGNNRL01";
     const PROOF_MAGIC_V1: &[u8; 8] = b"AGNNPF01";
     const ISOLATION_RELEASE_MAGIC_V1: &[u8; 8] = b"AGNNIR01";
+    const FILESYSTEM_READY_MAGIC_V1: &[u8; 8] = b"AGNNFS01";
     const ISOLATION_READY_MAGIC_V1: &[u8; 8] = b"AGNNID01";
     const PHASE_READY_V1: u8 = 1;
     const PHASE_RELEASE_V1: u8 = 2;
     const PHASE_PROOF_V1: u8 = 3;
     const PHASE_ISOLATION_RELEASE_V1: u8 = 4;
     const PHASE_ISOLATION_READY_V1: u8 = 5;
+    const PHASE_FILESYSTEM_READY_V1: u8 = 6;
     const PROOF_STATUS_SUCCESS_V1: u8 = 0;
     const PROOF_STATUS_OS_ERROR_V1: u8 = 1;
     const PROOF_STATUS_INVARIANT_V1: u8 = 2;
@@ -900,8 +1126,11 @@ mod platform {
     const PROOF_STATUS_SECCOMP_UNAVAILABLE_V1: u8 = 12;
     const PROOF_STATUS_SECCOMP_BROKEN_V1: u8 = 13;
     const PROOF_STATUS_CREDENTIAL_NORMALIZATION_V1: u8 = 14;
+    const PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1: u8 = 15;
+    const PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1: u8 = 16;
     const PROOF_FLAGS_V1: u16 = 0x01ff;
     const ISOLATION_READY_FLAGS_V1: u16 = 0x020f;
+    const FILESYSTEM_READY_FLAGS_V1: u16 = 0x0003;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -939,6 +1168,7 @@ mod platform {
     const OLD_ROOT_NAME_V1: &CStr = c".oldroot";
     const OLD_ROOT_PATH_V1: &CStr = c"/.oldroot";
     const WORKSPACE_NAME_V1: &CStr = c"workspace";
+    const RUNTIME_NAME_V1: &CStr = c"runtime";
     const TMP_NAME_V1: &CStr = c"tmp";
     const RUN_NAME_V1: &CStr = c"run";
     const HOME_NAME_V1: &CStr = c"home";
@@ -967,6 +1197,7 @@ mod platform {
     const PROC_SELF_NAME_V1: &CStr = c"self";
     const PROC_SUBSET_ABSENT_NAMES_V1: [&CStr; 2] = [SYS_NAME_V1, MEMINFO_NAME_V1];
     const WORKSPACE_MODE_V1: libc::mode_t = 0o755;
+    const RUNTIME_MODE_V1: libc::mode_t = 0o755;
     const TMP_MODE_V1: libc::mode_t = 0o1777;
     const RUN_MODE_V1: libc::mode_t = 0o755;
     const HOME_MODE_V1: libc::mode_t = 0o755;
@@ -2010,6 +2241,7 @@ mod platform {
         guard: ProbeChildGuardV1,
         deadline: MonotonicDeadlineV1,
         nonce: [u8; NONCE_BYTES_V1],
+        expects_filesystem_ready: bool,
     }
 
     pub(super) struct IsolationReadyRootlessNamespaceV1 {
@@ -2260,6 +2492,7 @@ mod platform {
             guard,
             deadline,
             nonce,
+            expects_filesystem_ready: C::PROVIDES_FILESYSTEM_READY_V1,
         })
     }
 
@@ -2326,6 +2559,19 @@ mod platform {
                 &release,
                 deadline,
             ));
+            if self.expects_filesystem_ready {
+                let filesystem_ready = guarded!(read_parent_frame(
+                    report_fd,
+                    child_pidfd,
+                    deadline,
+                    false,
+                    IsolationQualificationStageV1::ReceiveFilesystemReady,
+                ));
+                guarded!(verify_filesystem_ready_or_failure_frame(
+                    &filesystem_ready,
+                    &nonce,
+                ));
+            }
             let ready = guarded!(read_parent_frame(
                 report_fd,
                 child_pidfd,
@@ -3939,6 +4185,46 @@ mod platform {
                 (errno != 0).then_some(errno),
             ));
         }
+        if matches!(
+            status,
+            PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1 | PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1
+        ) {
+            let canonical_errno = if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
+                matches!(
+                    errno,
+                    libc::ENOSYS | libc::EOPNOTSUPP | libc::EPERM | libc::EACCES
+                )
+            } else {
+                (0..=MAX_LINUX_ERRNO_V1).contains(&errno)
+            };
+            if flags != 0 || !canonical_errno || !identity_is_exact {
+                return Err(protocol_failure(
+                    stage,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return Err(failure(
+                if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
+                    RefusalCode::RequiredKernelCapabilityMissing
+                } else {
+                    RefusalCode::MountRootFailed
+                },
+                IsolationQualificationStageV1::ChildFilesystemAttachment,
+                if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
+                    if matches!(errno, libc::EPERM | libc::EACCES) {
+                        IsolationQualificationReasonV1::AdministrativePolicy
+                    } else {
+                        IsolationQualificationReasonV1::KernelCapabilityUnavailable
+                    }
+                } else if errno == 0 {
+                    IsolationQualificationReasonV1::ChildInvariantFailed
+                } else {
+                    IsolationQualificationReasonV1::Io
+                },
+                (errno != 0).then_some(errno),
+            ));
+        }
         if status == PROOF_STATUS_CLOSE_RANGE_OS_V1 {
             if flags != 0 || !(1..=MAX_LINUX_ERRNO_V1).contains(&errno) || !identity_is_exact {
                 return Err(protocol_failure(
@@ -4059,9 +4345,63 @@ mod platform {
         nonce: &[u8; NONCE_BYTES_V1],
     ) -> Result<(), IsolationQualificationFailureV1> {
         if &frame[FRAME_MAGIC_OFFSET_V1..FRAME_VERSION_OFFSET_V1] == PROOF_MAGIC_V1 {
+            if frame[FRAME_STATUS_OFFSET_V1] == PROOF_STATUS_SUCCESS_V1 {
+                return Err(protocol_failure(
+                    IsolationQualificationStageV1::VerifyIsolationReady,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
             return verify_proof_frame(frame, nonce);
         }
         verify_isolation_ready_frame(frame, nonce)
+    }
+
+    fn verify_filesystem_ready_or_failure_frame(
+        frame: &[u8; FRAME_BYTES_V1],
+        nonce: &[u8; NONCE_BYTES_V1],
+    ) -> Result<(), IsolationQualificationFailureV1> {
+        if &frame[FRAME_MAGIC_OFFSET_V1..FRAME_VERSION_OFFSET_V1] == PROOF_MAGIC_V1 {
+            if frame[FRAME_STATUS_OFFSET_V1] == PROOF_STATUS_SUCCESS_V1 {
+                return Err(protocol_failure(
+                    IsolationQualificationStageV1::VerifyFilesystemReady,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch,
+                    None,
+                ));
+            }
+            return verify_proof_frame(frame, nonce);
+        }
+        let stage = IsolationQualificationStageV1::VerifyFilesystemReady;
+        verify_common_frame(
+            frame,
+            FILESYSTEM_READY_MAGIC_V1,
+            PHASE_FILESYSTEM_READY_V1,
+            nonce,
+            stage,
+        )?;
+        let identity_is_exact = decode_u32(frame, FRAME_PID_OFFSET_V1) == 1
+            && decode_u32(frame, FRAME_UID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_EUID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_GID_OFFSET_V1) == 0
+            && decode_u32(frame, FRAME_EGID_OFFSET_V1) == 0;
+        if frame[FRAME_STATUS_OFFSET_V1] != PROOF_STATUS_SUCCESS_V1
+            || decode_u16(frame, FRAME_FLAGS_OFFSET_V1) != FILESYSTEM_READY_FLAGS_V1
+            || decode_i32(frame, FRAME_ERROR_OFFSET_V1) != 0
+            || !identity_is_exact
+            || frame[FRAME_FLAGS_END_V1..FRAME_NONCE_OFFSET_V1]
+                .iter()
+                .any(|byte| *byte != 0)
+            || frame[FRAME_RESERVED_OFFSET_V1..]
+                .iter()
+                .any(|byte| *byte != 0)
+        {
+            return Err(protocol_failure(
+                stage,
+                IsolationQualificationReasonV1::ChildInvariantFailed,
+                None,
+            ));
+        }
+        Ok(())
     }
 
     fn verify_isolation_ready_frame(
@@ -4899,13 +5239,6 @@ mod platform {
         if let Err(error) = child_normalize_and_verify_credentials_v1(operations) {
             child_credential_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
         }
-        if let Err(error) = child_eliminate_capabilities_v1(
-            ISOLATION_REPORT_DESCRIPTOR_V1,
-            &report_identity,
-            operations,
-        ) {
-            child_capability_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
-        }
         if operations
             .check(IsolationOperationV1::ChildContinuation)
             .is_err()
@@ -4917,19 +5250,55 @@ mod platform {
                 deadline,
             );
         }
-        let stdio_state =
-            match continuation.continue_in_child_v1(IsolationChildOnlyBrandV1 { _private: () }) {
-                Ok(state) => state,
-                Err(error) => child_descriptor_fail_v1(
-                    ISOLATION_REPORT_DESCRIPTOR_V1,
-                    nonce,
-                    error
-                        .errno
-                        .map(ChildDescriptorFailureV1::Os)
-                        .unwrap_or(ChildDescriptorFailureV1::Invariant),
-                    deadline,
-                ),
-            };
+        let post_capability = match continuation
+            .continue_before_capability_elimination_v1(IsolationChildOnlyBrandV1 { _private: () })
+        {
+            Ok(remainder) => remainder,
+            Err(error) if error.filesystem => {
+                child_filesystem_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline)
+            }
+            Err(error) => child_descriptor_fail_v1(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                error
+                    .errno
+                    .map(ChildDescriptorFailureV1::Os)
+                    .unwrap_or(ChildDescriptorFailureV1::Invariant),
+                deadline,
+            ),
+        };
+        if C::PROVIDES_FILESYSTEM_READY_V1 {
+            let filesystem_ready = child_encode_checkpoint_frame_v1(
+                FILESYSTEM_READY_MAGIC_V1,
+                PHASE_FILESYSTEM_READY_V1,
+                nonce,
+                FILESYSTEM_READY_FLAGS_V1,
+            );
+            if !child_write_frame(ISOLATION_REPORT_DESCRIPTOR_V1, &filesystem_ready, deadline) {
+                child_exit(CHILD_EXIT_PROOF_FAILED_V1);
+            }
+        }
+        if let Err(error) = child_eliminate_capabilities_v1(
+            ISOLATION_REPORT_DESCRIPTOR_V1,
+            &report_identity,
+            operations,
+        ) {
+            child_capability_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
+        }
+        let stdio_state = match post_capability
+            .continue_after_capability_elimination_v1(IsolationChildOnlyBrandV1 { _private: () })
+        {
+            Ok(state) => state,
+            Err(error) => child_descriptor_fail_v1(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                error
+                    .errno
+                    .map(ChildDescriptorFailureV1::Os)
+                    .unwrap_or(ChildDescriptorFailureV1::Invariant),
+                deadline,
+            ),
+        };
         if let Err(error) = child_scrub_and_audit_isolation_descriptors_v1(
             &report_identity,
             &control_identity,
@@ -5277,6 +5646,7 @@ mod platform {
         let _ = unsafe { libc::syscall(libc::SYS_umask, 0_u32) };
 
         let workspace = child_create_directory_at_v1(root, WORKSPACE_NAME_V1, WORKSPACE_MODE_V1)?;
+        let runtime = child_create_directory_at_v1(root, RUNTIME_NAME_V1, RUNTIME_MODE_V1)?;
         let tmp_target = child_create_directory_at_v1(root, TMP_NAME_V1, TMP_MODE_V1)?;
         let run_target = child_create_directory_at_v1(root, RUN_NAME_V1, RUN_MODE_V1)?;
         let home = child_create_directory_at_v1(root, HOME_NAME_V1, HOME_MODE_V1)?;
@@ -5286,8 +5656,10 @@ mod platform {
         let dev = child_create_directory_at_v1(root, DEV_NAME_V1, DEV_MODE_V1)?;
 
         let workspace_closed = child_close_mount_fd_v1(workspace);
+        let runtime_closed = child_close_mount_fd_v1(runtime);
         let dev_closed = child_close_mount_fd_v1(dev);
         workspace_closed?;
+        runtime_closed?;
         dev_closed?;
 
         operations
@@ -5723,6 +6095,7 @@ mod platform {
             return Err(ChildMountRootFailureV1::Invariant);
         }
         child_verify_base_directory_v1(root, WORKSPACE_NAME_V1, WORKSPACE_MODE_V1, root_identity)?;
+        child_verify_base_directory_v1(root, RUNTIME_NAME_V1, RUNTIME_MODE_V1, root_identity)?;
         let home = child_open_same_mount_directory_at_v1(root, HOME_NAME_V1)?;
         if !child_directory_matches_root_v1(
             &child_path_identity_v1(home)?,
@@ -7640,6 +8013,26 @@ mod platform {
         child_fail(report_write, nonce, status, errno, deadline)
     }
 
+    fn child_filesystem_fail_v1(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        failure: IsolationChildContinuationFailureV1,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let status = if failure.unsupported {
+            PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1
+        } else {
+            PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1
+        };
+        child_fail(
+            report_write,
+            nonce,
+            status,
+            failure.errno.unwrap_or(0),
+            deadline,
+        )
+    }
+
     fn child_capability_fail_v1(
         report_write: RawFd,
         nonce: &[u8; NONCE_BYTES_V1],
@@ -8093,13 +8486,14 @@ mod platform {
         // the Gate 3 empty-supplementary-group handshake.
         unsafe impl IsolationChildContinuationV1 for EmptyGroupsTestContinuationV1 {
             const REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1: bool = true;
+            const PROVIDES_FILESYSTEM_READY_V1: bool = false;
+            type PostCapabilityV1 = CloseInheritedStdioV1;
 
-            fn continue_in_child_v1(
+            fn continue_before_capability_elimination_v1(
                 self,
-                brand: IsolationChildOnlyBrandV1,
-            ) -> Result<IsolationChildStdioStateV1, IsolationChildContinuationFailureV1>
-            {
-                CloseInheritedStdioV1.continue_in_child_v1(brand)
+                _brand: IsolationChildOnlyBrandV1,
+            ) -> Result<Self::PostCapabilityV1, IsolationChildContinuationFailureV1> {
+                Ok(CloseInheritedStdioV1)
             }
         }
 
@@ -8609,6 +9003,7 @@ mod platform {
             assert_eq!(
                 [
                     (WORKSPACE_NAME_V1.to_bytes(), WORKSPACE_MODE_V1),
+                    (RUNTIME_NAME_V1.to_bytes(), RUNTIME_MODE_V1),
                     (TMP_NAME_V1.to_bytes(), TMP_MODE_V1),
                     (RUN_NAME_V1.to_bytes(), RUN_MODE_V1),
                     (HOME_NAME_V1.to_bytes(), HOME_MODE_V1),
@@ -8618,6 +9013,7 @@ mod platform {
                 ],
                 [
                     (b"workspace".as_slice(), 0o755),
+                    (b"runtime".as_slice(), 0o755),
                     (b"tmp".as_slice(), 0o1777),
                     (b"run".as_slice(), 0o755),
                     (b"home".as_slice(), 0o755),
@@ -9766,6 +10162,79 @@ mod platform {
                 assert!(verify_isolation_ready_frame(&changed, &nonce).is_err());
             }
             assert!(verify_isolation_ready_frame(&ready, &[0x93_u8; NONCE_BYTES_V1]).is_err());
+        }
+
+        #[test]
+        fn filesystem_ready_is_a_distinct_exact_phase_before_isolation_ready() {
+            let nonce = [0x4d_u8; NONCE_BYTES_V1];
+            let filesystem = child_encode_checkpoint_frame_v1(
+                FILESYSTEM_READY_MAGIC_V1,
+                PHASE_FILESYSTEM_READY_V1,
+                &nonce,
+                FILESYSTEM_READY_FLAGS_V1,
+            );
+            let isolation = child_encode_checkpoint_frame_v1(
+                ISOLATION_READY_MAGIC_V1,
+                PHASE_ISOLATION_READY_V1,
+                &nonce,
+                ISOLATION_READY_FLAGS_V1,
+            );
+            assert!(verify_filesystem_ready_or_failure_frame(&filesystem, &nonce).is_ok());
+            assert!(verify_isolation_ready_or_failure_frame(&isolation, &nonce).is_ok());
+            assert!(verify_filesystem_ready_or_failure_frame(&isolation, &nonce).is_err());
+            assert!(verify_isolation_ready_or_failure_frame(&filesystem, &nonce).is_err());
+            let generic_success =
+                child_encode_proof_frame(&nonce, PROOF_STATUS_SUCCESS_V1, PROOF_FLAGS_V1, 0);
+            assert!(verify_filesystem_ready_or_failure_frame(&generic_success, &nonce).is_err());
+            assert!(verify_isolation_ready_or_failure_frame(&generic_success, &nonce).is_err());
+            for offset in [
+                0,
+                FRAME_VERSION_OFFSET_V1,
+                FRAME_PHASE_OFFSET_V1,
+                FRAME_STATUS_OFFSET_V1,
+                FRAME_FLAGS_OFFSET_V1,
+                FRAME_ERROR_OFFSET_V1,
+                FRAME_PID_OFFSET_V1,
+                FRAME_RESERVED_OFFSET_V1,
+            ] {
+                let mut changed = filesystem;
+                changed[offset] ^= 1;
+                assert!(verify_filesystem_ready_or_failure_frame(&changed, &nonce).is_err());
+            }
+        }
+
+        #[test]
+        fn filesystem_attachment_failures_map_to_typed_stage_and_unavailable_nonpass() {
+            let nonce = [0x6b_u8; NONCE_BYTES_V1];
+            let invariant =
+                child_encode_proof_frame(&nonce, PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1, 0, 0);
+            let failure = verify_filesystem_ready_or_failure_frame(&invariant, &nonce)
+                .expect_err("filesystem invariant cannot become ready");
+            assert_eq!(
+                failure.stage,
+                IsolationQualificationStageV1::ChildFilesystemAttachment
+            );
+            assert_eq!(
+                failure.reason,
+                IsolationQualificationReasonV1::ChildInvariantFailed
+            );
+            assert!(!failure.is_expected_unavailable());
+
+            for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EACCES] {
+                let unavailable = child_encode_proof_frame(
+                    &nonce,
+                    PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1,
+                    0,
+                    errno,
+                );
+                let failure = verify_filesystem_ready_or_failure_frame(&unavailable, &nonce)
+                    .expect_err("unsupported filesystem attachment cannot become ready");
+                assert_eq!(
+                    failure.stage,
+                    IsolationQualificationStageV1::ChildFilesystemAttachment
+                );
+                assert_eq!(failure.errno, Some(errno));
+            }
         }
 
         #[test]

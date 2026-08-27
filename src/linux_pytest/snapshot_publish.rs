@@ -31,6 +31,7 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
+    SnapshotChildMountNamespaceSealV1, SnapshotPreparedForkChildRootV1,
     SnapshotPreparedPublishedChildBindV1, SnapshotPreparedRetainedRootProjectionV1,
 };
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
@@ -110,6 +111,67 @@ pub(super) enum BoundRegularReadRefusalV1 {
     OperationBudget,
     MemoryBudget,
     UnsupportedPlatform,
+}
+
+/// Fixed role of one descriptor selected from the two-publication inventory.
+/// The role is sealed by `snapshot_manifest`; callers cannot retag a root.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotChildRootRoleV1 {
+    Workspace,
+    Runtime,
+}
+
+/// Stable child-only filesystem attachment operation. These values are
+/// diagnostics and fault-injection coordinates, never attachment authority.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotChildAttachOperationV1 {
+    ValidateSource,
+    OpenTree,
+    SetRecursiveAttributes,
+    OpenTarget,
+    MoveMount,
+    ReopenTarget,
+    VerifyTarget,
+    FinalTargetRevalidation,
+    FinalSourceRevalidation,
+    CloseKnownDescriptors,
+}
+
+/// Typed refusal from the fork-child attachment leaf. It is intentionally
+/// operation- and role-specific, but remains private and non-authoritative.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SnapshotChildAttachFailureV1 {
+    Unsupported {
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+        errno: i32,
+    },
+    Os {
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+        errno: i32,
+    },
+    Invariant {
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    },
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl SnapshotChildAttachFailureV1 {
+    pub(super) const fn errno(self) -> Option<i32> {
+        match self {
+            Self::Unsupported { errno, .. } | Self::Os { errno, .. } => Some(errno),
+            Self::Invariant { .. } => None,
+        }
+    }
+
+    pub(super) const fn unsupported(self) -> bool {
+        matches!(self, Self::Unsupported { .. })
+    }
 }
 
 /// One non-clonable aggregate budget for every runtime-resolution allocation.
@@ -931,6 +993,50 @@ pub(super) type PublishedSnapshotDirectoryV1 = platform::PublishedSnapshotDirect
 /// or descendants immutable nor grants isolation, execution, or reuse.
 pub(super) type BoundPublishedSnapshotChildV1 = platform::BoundPublishedSnapshotChildV1;
 
+/// Fork-safe child half of one exact publication root. It has no descriptor
+/// accessor and its Drop implementation is one raw `close(2)` syscall.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) type ForkChildPublishedRootV1 = platform::ForkChildPublishedRootV1;
+
+/// Duplicate and independently revalidate one manifest-sealed publication
+/// root for the fork child. The original descriptor remains retained by the
+/// parent inventory owner; no generic descriptor is returned.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn prepare_fork_child_published_root_v1(
+    bound: &BoundPublishedSnapshotChildV1,
+    prepared: SnapshotPreparedForkChildRootV1,
+) -> Result<ForkChildPublishedRootV1, BoundRegularReadRefusalV1> {
+    let (role, root_name, expected) = prepared.into_leaf_parts();
+    platform::prepare_fork_child_published_root_v1(bound, role, root_name, expected)
+}
+
+/// Attach exactly the workspace and runtime child halves at the fixed
+/// `/workspace` and `/runtime` targets. The operation runs only in namespace
+/// PID 1 before capability elimination and consumes both descriptors.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_fork_child_published_roots_v1(
+    workspace: ForkChildPublishedRootV1,
+    runtime: ForkChildPublishedRootV1,
+    _child_namespace_seal: SnapshotChildMountNamespaceSealV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    platform::attach_fork_child_published_roots_v1(workspace, runtime)
+}
+
+/// Test-only injection at one real child attachment operation. This enters
+/// the same production leaf and is unavailable to non-test siblings.
+#[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_fork_child_published_roots_with_test_fault_v1(
+    workspace: ForkChildPublishedRootV1,
+    runtime: ForkChildPublishedRootV1,
+    _child_namespace_seal: SnapshotChildMountNamespaceSealV1,
+    role: SnapshotChildRootRoleV1,
+    operation: SnapshotChildAttachOperationV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    platform::attach_fork_child_published_roots_with_test_fault_v1(
+        workspace, runtime, role, operation,
+    )
+}
+
 /// Test-only inspection of the pinned published-container descriptor. This is
 /// deliberately absent from production because `BorrowedFd` can be cloned to
 /// an owned descriptor in safe Rust.
@@ -1016,7 +1122,7 @@ pub(super) fn create_staged_snapshot_directory_at<'parent>(
 mod platform {
     use std::ffi::CString;
     use std::mem::{self, MaybeUninit};
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
     use super::*;
 
@@ -1432,6 +1538,65 @@ mod platform {
         published: OwnedFd,
         root: OwnedFd,
         retained_root_projection_admitted: Cell<bool>,
+    }
+
+    /// Raw child half only. `clone3` copies it into both processes; the parent
+    /// copy is dropped immediately, so destruction must stay fork-safe.
+    pub(in crate::linux_pytest) struct ForkChildPublishedRootV1 {
+        published_descriptor: RawFd,
+        root_descriptor: RawFd,
+        root_name: [u8; MAX_BASENAME_BYTES + 1],
+        root_name_len: u16,
+        /// Exact host-user-namespace commitment authenticated before clone.
+        /// It is retained as provenance but is never compared to the child
+        /// namespace's remapped ownership view.
+        _expected_host_statx_commitment: [u8; 102],
+        /// Separately typed child-user-namespace view. Only uid/gid differ
+        /// from the host commitment, and both are normalized to namespace 0
+        /// after authenticating the host owner against the exact single-ID
+        /// map inputs.
+        expected_child_statx_commitment: ChildMappedStatxCommitmentV1,
+        role: SnapshotChildRootRoleV1,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    struct ChildMappedStatxCommitmentV1([u8; 102]);
+
+    fn child_mapped_statx_commitment_v1(
+        host: [u8; 102],
+        mapped_host_uid: u32,
+        mapped_host_gid: u32,
+    ) -> Option<ChildMappedStatxCommitmentV1> {
+        let observed_uid = u32::from_le_bytes(host[29..33].try_into().ok()?);
+        let observed_gid = u32::from_le_bytes(host[33..37].try_into().ok()?);
+        if observed_uid != mapped_host_uid || observed_gid != mapped_host_gid {
+            return None;
+        }
+        let mut child = host;
+        child[29..33].copy_from_slice(&0_u32.to_le_bytes());
+        child[33..37].copy_from_slice(&0_u32.to_le_bytes());
+        Some(ChildMappedStatxCommitmentV1(child))
+    }
+
+    impl Drop for ForkChildPublishedRootV1 {
+        fn drop(&mut self) {
+            for descriptor in [&mut self.root_descriptor, &mut self.published_descriptor] {
+                if *descriptor >= 0 {
+                    let _ = unsafe { libc::syscall(libc::SYS_close, *descriptor) };
+                    *descriptor = -1;
+                }
+            }
+        }
+    }
+
+    impl fmt::Debug for ForkChildPublishedRootV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("ForkChildPublishedRootV1")
+                .field("role", &self.role)
+                .field("descriptor", &"<child-only-redacted>")
+                .finish()
+        }
     }
 
     impl fmt::Debug for VerifiedReadySnapshotDirectoryV1<'_> {
@@ -1857,6 +2022,643 @@ mod platform {
             return Err(BoundRegularReadRefusalV1::IdentityDrift);
         }
         Ok(())
+    }
+
+    pub(super) fn prepare_fork_child_published_root_v1(
+        bound: &BoundPublishedSnapshotChildV1,
+        role: SnapshotChildRootRoleV1,
+        root_name: &CStr,
+        expected_statx_commitment: [u8; 102],
+    ) -> Result<ForkChildPublishedRootV1, BoundRegularReadRefusalV1> {
+        if !valid_raw_basename(root_name) {
+            return Err(BoundRegularReadRefusalV1::InvalidPath);
+        }
+        let named_before = node_statx_at_name_v1(bound.published.as_fd(), root_name)?;
+        let root_before = node_statx_v1(bound.root.as_fd())?;
+        if named_before.commitment_bytes_v1() != expected_statx_commitment
+            || root_before.commitment_bytes_v1() != expected_statx_commitment
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let expected_child_statx_commitment = child_mapped_statx_commitment_v1(
+            expected_statx_commitment,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+        .ok_or(BoundRegularReadRefusalV1::IdentityDrift)?;
+
+        let published_raw =
+            unsafe { libc::fcntl(bound.published.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if published_raw < 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let published = unsafe { OwnedFd::from_raw_fd(published_raw) };
+        let root_raw = unsafe { libc::fcntl(bound.root.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 5) };
+        if root_raw < 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let root = unsafe { OwnedFd::from_raw_fd(root_raw) };
+
+        let named_duplicate = node_statx_at_name_v1(published.as_fd(), root_name)?;
+        let root_duplicate = node_statx_v1(root.as_fd())?;
+        let named_after = node_statx_at_name_v1(bound.published.as_fd(), root_name)?;
+        let root_after = node_statx_v1(bound.root.as_fd())?;
+        if named_duplicate.commitment_bytes_v1() != expected_statx_commitment
+            || root_duplicate.commitment_bytes_v1() != expected_statx_commitment
+            || named_after.commitment_bytes_v1() != expected_statx_commitment
+            || root_after.commitment_bytes_v1() != expected_statx_commitment
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let name = root_name.to_bytes();
+        let mut root_name_bytes = [0_u8; MAX_BASENAME_BYTES + 1];
+        root_name_bytes[..name.len()].copy_from_slice(name);
+        let root_name_len =
+            u16::try_from(name.len()).map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
+        Ok(ForkChildPublishedRootV1 {
+            published_descriptor: published.into_raw_fd(),
+            root_descriptor: root.into_raw_fd(),
+            root_name: root_name_bytes,
+            root_name_len,
+            _expected_host_statx_commitment: expected_statx_commitment,
+            expected_child_statx_commitment,
+            role,
+        })
+    }
+
+    const OPEN_TREE_CLONE_V1: libc::c_uint = 1;
+    const OPEN_TREE_CLOEXEC_V1: libc::c_uint = libc::O_CLOEXEC as libc::c_uint;
+    const AT_RECURSIVE_V1: libc::c_uint = 0x8000;
+    const MOVE_MOUNT_F_EMPTY_PATH_V1: libc::c_uint = 0x0000_0004;
+    const MOVE_MOUNT_T_EMPTY_PATH_V1: libc::c_uint = 0x0000_0040;
+    const MOUNT_ATTR_RDONLY_V1: u64 = 0x0000_0001;
+    const MOUNT_ATTR_NOSUID_V1: u64 = 0x0000_0002;
+    const MOUNT_ATTR_NODEV_V1: u64 = 0x0000_0004;
+    const REQUIRED_ATTACHED_STATFS_FLAGS_V1: libc::c_ulong =
+        (libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV) as libc::c_ulong;
+    const EMPTY_PATH_V1: &CStr = c"";
+    const WORKSPACE_TARGET_V1: &CStr = c"/workspace";
+    const RUNTIME_TARGET_V1: &CStr = c"/runtime";
+
+    #[repr(C)]
+    struct LinuxMountAttrV1 {
+        attr_set: u64,
+        attr_clr: u64,
+        propagation: u64,
+        userns_fd: u64,
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ChildAttachOperationPlanV1 {
+        failures: [Option<(SnapshotChildRootRoleV1, SnapshotChildAttachOperationV1)>; 2],
+    }
+
+    impl ChildAttachOperationPlanV1 {
+        #[cfg(test)]
+        const fn fail(
+            role: SnapshotChildRootRoleV1,
+            operation: SnapshotChildAttachOperationV1,
+        ) -> Self {
+            Self {
+                failures: [Some((role, operation)), None],
+            }
+        }
+
+        fn check(
+            self,
+            role: SnapshotChildRootRoleV1,
+            operation: SnapshotChildAttachOperationV1,
+        ) -> Result<(), SnapshotChildAttachFailureV1> {
+            if self.failures.contains(&Some((role, operation))) {
+                Err(SnapshotChildAttachFailureV1::Os {
+                    role,
+                    operation,
+                    errno: libc::EIO,
+                })
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    struct ChildTrackedAttachFdV1 {
+        descriptor: RawFd,
+    }
+
+    impl ChildTrackedAttachFdV1 {
+        fn from_syscall(
+            result: libc::c_long,
+            role: SnapshotChildRootRoleV1,
+            operation: SnapshotChildAttachOperationV1,
+        ) -> Result<Self, SnapshotChildAttachFailureV1> {
+            let descriptor = i32::try_from(result)
+                .ok()
+                .filter(|fd| *fd >= 0)
+                .ok_or_else(|| child_attach_os_failure_v1(role, operation))?;
+            Ok(Self { descriptor })
+        }
+
+        fn close(
+            &mut self,
+            role: SnapshotChildRootRoleV1,
+        ) -> Result<(), SnapshotChildAttachFailureV1> {
+            if self.descriptor < 0 {
+                return Ok(());
+            }
+            let descriptor = self.descriptor;
+            self.descriptor = -1;
+            if unsafe { libc::syscall(libc::SYS_close, descriptor) } == 0 {
+                Ok(())
+            } else {
+                Err(child_attach_os_failure_v1(
+                    role,
+                    SnapshotChildAttachOperationV1::CloseKnownDescriptors,
+                ))
+            }
+        }
+    }
+
+    impl Drop for ChildTrackedAttachFdV1 {
+        fn drop(&mut self) {
+            if self.descriptor >= 0 {
+                let _ = unsafe { libc::syscall(libc::SYS_close, self.descriptor) };
+                self.descriptor = -1;
+            }
+        }
+    }
+
+    pub(super) fn attach_fork_child_published_roots_v1(
+        mut workspace: ForkChildPublishedRootV1,
+        mut runtime: ForkChildPublishedRootV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        attach_fork_child_published_roots_with_plan_v1(
+            &mut workspace,
+            &mut runtime,
+            ChildAttachOperationPlanV1::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(super) fn attach_fork_child_published_roots_with_test_fault_v1(
+        mut workspace: ForkChildPublishedRootV1,
+        mut runtime: ForkChildPublishedRootV1,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        attach_fork_child_published_roots_with_plan_v1(
+            &mut workspace,
+            &mut runtime,
+            ChildAttachOperationPlanV1::fail(role, operation),
+        )
+    }
+
+    fn attach_fork_child_published_roots_with_plan_v1(
+        workspace: &mut ForkChildPublishedRootV1,
+        runtime: &mut ForkChildPublishedRootV1,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        if workspace.role != SnapshotChildRootRoleV1::Workspace {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role: SnapshotChildRootRoleV1::Workspace,
+                operation: SnapshotChildAttachOperationV1::ValidateSource,
+            });
+        }
+        if runtime.role != SnapshotChildRootRoleV1::Runtime {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role: SnapshotChildRootRoleV1::Runtime,
+                operation: SnapshotChildAttachOperationV1::ValidateSource,
+            });
+        }
+        if workspace.expected_child_statx_commitment.0[1..25]
+            == runtime.expected_child_statx_commitment.0[1..25]
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role: SnapshotChildRootRoleV1::Runtime,
+                operation: SnapshotChildAttachOperationV1::ValidateSource,
+            });
+        }
+        child_attach_validate_source_v1(workspace, plan)?;
+        child_attach_validate_source_v1(runtime, plan)?;
+        let workspace_target = child_attach_one_root_v1(workspace, WORKSPACE_TARGET_V1, plan)?;
+        let runtime_target = child_attach_one_root_v1(runtime, RUNTIME_TARGET_V1, plan)?;
+        child_verify_final_attached_target_v1(
+            SnapshotChildRootRoleV1::Workspace,
+            WORKSPACE_TARGET_V1,
+            workspace_target,
+            plan,
+        )?;
+        child_verify_final_attached_target_v1(
+            SnapshotChildRootRoleV1::Runtime,
+            RUNTIME_TARGET_V1,
+            runtime_target,
+            plan,
+        )?;
+        child_attach_final_source_revalidation_v1(workspace, plan)?;
+        child_attach_final_source_revalidation_v1(runtime, plan)?;
+        child_attach_close_root_v1(workspace, plan)?;
+        child_attach_close_root_v1(runtime, plan)?;
+        Ok(())
+    }
+
+    fn child_attach_validate_source_v1(
+        root: &ForkChildPublishedRootV1,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        let role = root.role;
+        plan.check(role, SnapshotChildAttachOperationV1::ValidateSource)?;
+        let name = child_root_name_v1(root).ok_or(SnapshotChildAttachFailureV1::Invariant {
+            role,
+            operation: SnapshotChildAttachOperationV1::ValidateSource,
+        })?;
+        let named = child_statx_at_name_v1(
+            root.published_descriptor,
+            name,
+            role,
+            SnapshotChildAttachOperationV1::ValidateSource,
+        )?;
+        let selected = child_statx_fd_v1(
+            root.root_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::ValidateSource,
+        )?;
+        if named != root.expected_child_statx_commitment.0
+            || selected != root.expected_child_statx_commitment.0
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::ValidateSource,
+            });
+        }
+        Ok(())
+    }
+
+    fn child_attach_one_root_v1(
+        root: &ForkChildPublishedRootV1,
+        target: &CStr,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<[u8; 102], SnapshotChildAttachFailureV1> {
+        let role = root.role;
+        plan.check(role, SnapshotChildAttachOperationV1::OpenTree)?;
+        let clone_result = unsafe {
+            libc::syscall(
+                libc::SYS_open_tree,
+                root.root_descriptor,
+                EMPTY_PATH_V1.as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint | OPEN_TREE_CLONE_V1 | OPEN_TREE_CLOEXEC_V1,
+            )
+        };
+        let mut detached = ChildTrackedAttachFdV1::from_syscall(
+            clone_result,
+            role,
+            SnapshotChildAttachOperationV1::OpenTree,
+        )?;
+        let detached_identity = child_statx_fd_v1(
+            detached.descriptor,
+            role,
+            SnapshotChildAttachOperationV1::OpenTree,
+        )?;
+        if detached_identity[9..] != root.expected_child_statx_commitment.0[9..] {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::OpenTree,
+            });
+        }
+
+        plan.check(role, SnapshotChildAttachOperationV1::SetRecursiveAttributes)?;
+        let attributes = LinuxMountAttrV1 {
+            attr_set: MOUNT_ATTR_RDONLY_V1 | MOUNT_ATTR_NOSUID_V1 | MOUNT_ATTR_NODEV_V1,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: 0,
+        };
+        if unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                detached.descriptor,
+                EMPTY_PATH_V1.as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint | AT_RECURSIVE_V1,
+                &attributes,
+                std::mem::size_of::<LinuxMountAttrV1>(),
+            )
+        } != 0
+        {
+            return Err(child_attach_os_failure_v1(
+                role,
+                SnapshotChildAttachOperationV1::SetRecursiveAttributes,
+            ));
+        }
+
+        plan.check(role, SnapshotChildAttachOperationV1::OpenTarget)?;
+        let target_result = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0_u32,
+            )
+        };
+        let mut target_before = ChildTrackedAttachFdV1::from_syscall(
+            target_result,
+            role,
+            SnapshotChildAttachOperationV1::OpenTarget,
+        )?;
+        let target_before_identity = child_statx_fd_v1(
+            target_before.descriptor,
+            role,
+            SnapshotChildAttachOperationV1::OpenTarget,
+        )?;
+        if target_before_identity[25..29] != (libc::S_IFDIR | 0o755_u32).to_le_bytes() {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::OpenTarget,
+            });
+        }
+
+        plan.check(role, SnapshotChildAttachOperationV1::MoveMount)?;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_move_mount,
+                detached.descriptor,
+                EMPTY_PATH_V1.as_ptr(),
+                target_before.descriptor,
+                EMPTY_PATH_V1.as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH_V1 | MOVE_MOUNT_T_EMPTY_PATH_V1,
+            )
+        } != 0
+        {
+            return Err(child_attach_os_failure_v1(
+                role,
+                SnapshotChildAttachOperationV1::MoveMount,
+            ));
+        }
+
+        plan.check(role, SnapshotChildAttachOperationV1::ReopenTarget)?;
+        let target_after_result = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0_u32,
+            )
+        };
+        let mut target_after = ChildTrackedAttachFdV1::from_syscall(
+            target_after_result,
+            role,
+            SnapshotChildAttachOperationV1::ReopenTarget,
+        )?;
+        plan.check(role, SnapshotChildAttachOperationV1::VerifyTarget)?;
+        let target_after_identity = child_statx_fd_v1(
+            target_after.descriptor,
+            role,
+            SnapshotChildAttachOperationV1::VerifyTarget,
+        )?;
+        if target_after_identity != detached_identity {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::VerifyTarget,
+            });
+        }
+        let mut filesystem = MaybeUninit::<libc::statfs64>::zeroed();
+        if unsafe {
+            libc::syscall(
+                libc::SYS_fstatfs,
+                target_after.descriptor,
+                filesystem.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_attach_os_failure_v1(
+                role,
+                SnapshotChildAttachOperationV1::VerifyTarget,
+            ));
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        if filesystem.f_flags as libc::c_ulong & REQUIRED_ATTACHED_STATFS_FLAGS_V1
+            != REQUIRED_ATTACHED_STATFS_FLAGS_V1
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::VerifyTarget,
+            });
+        }
+        target_after.close(role)?;
+        target_before.close(role)?;
+        detached.close(role)?;
+        Ok(detached_identity)
+    }
+
+    fn child_verify_final_attached_target_v1(
+        role: SnapshotChildRootRoleV1,
+        target: &CStr,
+        expected: [u8; 102],
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        plan.check(
+            role,
+            SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+        )?;
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_openat,
+                libc::AT_FDCWD,
+                target.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0_u32,
+            )
+        };
+        let mut target = ChildTrackedAttachFdV1::from_syscall(
+            result,
+            role,
+            SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+        )?;
+        if child_statx_fd_v1(
+            target.descriptor,
+            role,
+            SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+        )? != expected
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+            });
+        }
+        let mut filesystem = MaybeUninit::<libc::statfs64>::zeroed();
+        if unsafe {
+            libc::syscall(
+                libc::SYS_fstatfs,
+                target.descriptor,
+                filesystem.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_attach_os_failure_v1(
+                role,
+                SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+            ));
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        if filesystem.f_flags as libc::c_ulong & REQUIRED_ATTACHED_STATFS_FLAGS_V1
+            != REQUIRED_ATTACHED_STATFS_FLAGS_V1
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+            });
+        }
+        target.close(role)
+    }
+
+    fn child_attach_final_source_revalidation_v1(
+        root: &ForkChildPublishedRootV1,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        let role = root.role;
+        plan.check(
+            role,
+            SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+        )?;
+        let name = child_root_name_v1(root).ok_or(SnapshotChildAttachFailureV1::Invariant {
+            role,
+            operation: SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+        })?;
+        let named = child_statx_at_name_v1(
+            root.published_descriptor,
+            name,
+            role,
+            SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+        )?;
+        let selected = child_statx_fd_v1(
+            root.root_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+        )?;
+        if named != root.expected_child_statx_commitment.0
+            || selected != root.expected_child_statx_commitment.0
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant {
+                role,
+                operation: SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+            });
+        }
+        Ok(())
+    }
+
+    fn child_attach_close_root_v1(
+        root: &mut ForkChildPublishedRootV1,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        let role = root.role;
+        plan.check(role, SnapshotChildAttachOperationV1::CloseKnownDescriptors)?;
+        for descriptor in [&mut root.root_descriptor, &mut root.published_descriptor] {
+            let raw = *descriptor;
+            *descriptor = -1;
+            if raw >= 0 && unsafe { libc::syscall(libc::SYS_close, raw) } != 0 {
+                return Err(child_attach_os_failure_v1(
+                    role,
+                    SnapshotChildAttachOperationV1::CloseKnownDescriptors,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn child_root_name_v1(root: &ForkChildPublishedRootV1) -> Option<&CStr> {
+        let length = usize::from(root.root_name_len);
+        if length == 0 || length > MAX_BASENAME_BYTES || root.root_name[length] != 0 {
+            return None;
+        }
+        CStr::from_bytes_with_nul(&root.root_name[..=length]).ok()
+    }
+
+    fn child_statx_fd_v1(
+        descriptor: RawFd,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> Result<[u8; 102], SnapshotChildAttachFailureV1> {
+        child_statx_v1(
+            descriptor,
+            EMPTY_PATH_V1,
+            libc::AT_EMPTY_PATH,
+            role,
+            operation,
+        )
+    }
+
+    fn child_statx_at_name_v1(
+        descriptor: RawFd,
+        name: &CStr,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> Result<[u8; 102], SnapshotChildAttachFailureV1> {
+        child_statx_v1(descriptor, name, libc::AT_SYMLINK_NOFOLLOW, role, operation)
+    }
+
+    fn child_statx_v1(
+        descriptor: RawFd,
+        path: &CStr,
+        flags: libc::c_int,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> Result<[u8; 102], SnapshotChildAttachFailureV1> {
+        let mut raw = MaybeUninit::<libc::statx>::zeroed();
+        if unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                descriptor,
+                path.as_ptr(),
+                flags,
+                SOURCE_TREE_REQUESTED_STATX_MASK_V1,
+                raw.as_mut_ptr(),
+            )
+        } != 0
+        {
+            return Err(child_attach_os_failure_v1(role, operation));
+        }
+        let raw = unsafe { raw.assume_init() };
+        SourceStatxV1::from_linux_statx_v1(&raw)
+            .map(|value| value.commitment_bytes_v1())
+            .map_err(|error| {
+                child_attach_error_from_errno_v1(role, operation, error.raw_os_error())
+            })
+    }
+
+    fn child_attach_os_failure_v1(
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+    ) -> SnapshotChildAttachFailureV1 {
+        child_attach_error_from_errno_v1(role, operation, io::Error::last_os_error().raw_os_error())
+    }
+
+    fn child_attach_error_from_errno_v1(
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+        errno: Option<i32>,
+    ) -> SnapshotChildAttachFailureV1 {
+        let Some(errno) = errno.filter(|errno| (1..=4095).contains(errno)) else {
+            return SnapshotChildAttachFailureV1::Invariant { role, operation };
+        };
+        if matches!(errno, libc::ENOSYS | libc::EOPNOTSUPP)
+            || (matches!(
+                operation,
+                SnapshotChildAttachOperationV1::OpenTree
+                    | SnapshotChildAttachOperationV1::SetRecursiveAttributes
+                    | SnapshotChildAttachOperationV1::MoveMount
+            ) && matches!(errno, libc::EPERM | libc::EACCES))
+        {
+            SnapshotChildAttachFailureV1::Unsupported {
+                role,
+                operation,
+                errno,
+            }
+        } else {
+            SnapshotChildAttachFailureV1::Os {
+                role,
+                operation,
+                errno,
+            }
+        }
     }
 
     fn split_bound_path_v1(
@@ -5473,6 +6275,127 @@ mod platform {
             assert_eq!(unsafe { libc::fcntl(published_raw, libc::F_GETFD) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
             assert_eq!(unsafe { libc::fcntl(root_raw.get(), libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+
+        fn fake_fork_child_root(
+            role: SnapshotChildRootRoleV1,
+            identity_byte: u8,
+        ) -> ForkChildPublishedRootV1 {
+            let mut expected = [0_u8; 102];
+            expected[0] = 1;
+            expected[1..25].fill(identity_byte);
+            let mut root_name = [0_u8; MAX_BASENAME_BYTES + 1];
+            root_name[..4].copy_from_slice(b"root");
+            ForkChildPublishedRootV1 {
+                published_descriptor: -1,
+                root_descriptor: -1,
+                root_name,
+                root_name_len: 4,
+                _expected_host_statx_commitment: expected,
+                expected_child_statx_commitment: ChildMappedStatxCommitmentV1(expected),
+                role,
+            }
+        }
+
+        #[test]
+        fn child_namespace_commitment_requires_exact_mapped_owner_and_normalizes_only_owner() {
+            let mut host = [0_u8; 102];
+            host[0] = 1;
+            host[1..29].fill(0x51);
+            host[29..33].copy_from_slice(&1001_u32.to_le_bytes());
+            host[33..37].copy_from_slice(&1002_u32.to_le_bytes());
+            host[37..].fill(0xa7);
+
+            assert!(child_mapped_statx_commitment_v1(host, 1000, 1002).is_none());
+            assert!(child_mapped_statx_commitment_v1(host, 1001, 1000).is_none());
+            let child = child_mapped_statx_commitment_v1(host, 1001, 1002)
+                .expect("the exact single-ID map owner is admitted")
+                .0;
+            assert_eq!(&child[..29], &host[..29]);
+            assert_eq!(&child[29..37], &[0_u8; 8]);
+            assert_eq!(&child[37..], &host[37..]);
+        }
+
+        #[test]
+        fn fork_child_pair_rejects_role_swap_and_duplicate_before_any_mount_syscall() {
+            let mut swapped_workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 1);
+            let mut swapped_runtime = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 2);
+            assert_eq!(
+                attach_fork_child_published_roots_with_plan_v1(
+                    &mut swapped_workspace,
+                    &mut swapped_runtime,
+                    ChildAttachOperationPlanV1::default(),
+                ),
+                Err(SnapshotChildAttachFailureV1::Invariant {
+                    role: SnapshotChildRootRoleV1::Workspace,
+                    operation: SnapshotChildAttachOperationV1::ValidateSource,
+                })
+            );
+
+            let mut workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 9);
+            let mut duplicate = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 9);
+            assert_eq!(
+                attach_fork_child_published_roots_with_plan_v1(
+                    &mut workspace,
+                    &mut duplicate,
+                    ChildAttachOperationPlanV1::default(),
+                ),
+                Err(SnapshotChildAttachFailureV1::Invariant {
+                    role: SnapshotChildRootRoleV1::Runtime,
+                    operation: SnapshotChildAttachOperationV1::ValidateSource,
+                })
+            );
+        }
+
+        #[test]
+        fn fixed_capacity_fault_plan_addresses_every_mount_leaf_for_both_roles() {
+            const OPERATIONS: [SnapshotChildAttachOperationV1; 10] = [
+                SnapshotChildAttachOperationV1::ValidateSource,
+                SnapshotChildAttachOperationV1::OpenTree,
+                SnapshotChildAttachOperationV1::SetRecursiveAttributes,
+                SnapshotChildAttachOperationV1::OpenTarget,
+                SnapshotChildAttachOperationV1::MoveMount,
+                SnapshotChildAttachOperationV1::ReopenTarget,
+                SnapshotChildAttachOperationV1::VerifyTarget,
+                SnapshotChildAttachOperationV1::FinalTargetRevalidation,
+                SnapshotChildAttachOperationV1::FinalSourceRevalidation,
+                SnapshotChildAttachOperationV1::CloseKnownDescriptors,
+            ];
+            for role in [
+                SnapshotChildRootRoleV1::Workspace,
+                SnapshotChildRootRoleV1::Runtime,
+            ] {
+                for operation in OPERATIONS {
+                    let plan = ChildAttachOperationPlanV1::fail(role, operation);
+                    assert_eq!(
+                        plan.check(role, operation),
+                        Err(SnapshotChildAttachFailureV1::Os {
+                            role,
+                            operation,
+                            errno: libc::EIO,
+                        })
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn tracked_child_attachment_descriptor_drop_is_raw_close_and_idempotent() {
+            let mut descriptors = [-1_i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let first = descriptors[0];
+            let second = descriptors[1];
+            let mut tracked = ChildTrackedAttachFdV1 { descriptor: first };
+            tracked.close(SnapshotChildRootRoleV1::Workspace).unwrap();
+            drop(tracked);
+            assert_eq!(unsafe { libc::fcntl(first, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            drop(ChildTrackedAttachFdV1 { descriptor: second });
+            assert_eq!(unsafe { libc::fcntl(second, libc::F_GETFD) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
 
