@@ -2,13 +2,13 @@
 
 ## Exact promise
 
-> Again makes a narrow, policy-admitted set of explicit local read-only commands fast while returning their exact full streams. Prefix the command with `again run --`; explicitly use `again reference --` only when the complete unchanged result is already visible. Commands outside the policy are not cached.
+> Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
-This sentence is both the product pitch and the reuse boundary. “Policy-admitted” means only that a command matches the active versioned observation model and current checks; it is not a general safety or equivalence certification. Two executions printing the same bytes is not sufficient.
+This sentence is both the product pitch and the reuse boundary. The stable explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The experimental MCP path currently controls only the built-in `repo.read` and `repo.search` tools. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, and dependency observations satisfy a versioned deterministic policy; matching text or semantic similarity is never sufficient.
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex locally on a repository where agent runs repeatedly search or inspect the same material and can invoke `again run -- <argv...>`. The initial job is narrower: remove repeated repository-read latency without asking the developer to declare a build graph, and avoid resending already-visible bytes through an explicit verified reference.
+The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The experimental gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative stable path.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
@@ -28,6 +28,17 @@ again reference -- rg --no-ignore --sort=path needle src
 `again setup --codex` installs an instruction-only skill at `$HOME/.agents/skills/again` by default. `again setup --codex --project` instead installs `<repo>/.agents/skills/again`; scoped `--remove` reverses an unchanged owned install. The skill tells Codex when to use explicit `again run --`, when an explicit `again reference --` is context-safe, and to rerun an ineligible command unchanged outside Again. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
 
 Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
+
+The experimental MCP onboarding path is explicit and workspace-bound:
+
+```bash
+again mcp setup --client codex --workspace /canonical/repository
+again mcp setup --client claude --workspace /canonical/repository
+```
+
+Both commands are dry runs unless `--install-owned-config ABSOLUTE_PATH` is supplied. The generated server argv contains the exact canonical repository path. Installation can create only a wholly Again-owned absent config plus its ownership record, or verify the exact owned pair; an unowned or conflicting file is never overwritten. The gateway uses bounded concurrent stdio, serializes complete responses, propagates cancellation to the matching physical attempt, and fails closed on malformed or oversized JSON-RPC.
+
+Current gateway limits are part of the product truth: there is no general upstream MCP proxy, authenticated result-ID retrieval, automatic compact cross-agent delivery, semantic reuse, task-quality qualification, or production Linux command backend. Unknown or incomplete state executes normally. Mutating, network, credential, deployment, payment, and unknown tools are not reused.
 
 On Unix, disposable local state defaults to `${TMPDIR}/again-<euid>/workspaces/<BLAKE3(canonical-workspace-path)>`, with private app-owned directory levels, so the first run never mutates the observed repository. `AGAIN_HOME` selects one exact persistent root; it must be absolute and outside the active workspace, and an existing root must already satisfy the owned-real-`0700` policy. Every canonical ancestor must be a real directory owned by the current uid or root, with sticky protection if group/world writable. Path checks and creation are still raceable by the same user or root.
 
@@ -77,9 +88,10 @@ The repository still contains a context-keyed delivery ledger and `PreCompact`/`
 
 ## Product stages
 
-1. **Explicit local exact reads:** `again run`, conservative command parser, audited executable identity, scoped fingerprint, local SQLite/CAS, exact full-stream replay, explainability.
-2. **Trace-backed local effects:** Linux rootless isolation, complete descendant/effect observation, COW execution, preconditioned effect replay, 100% initial shadow validation.
-3. **Team reuse:** encrypted namespaced CAS, signed provenance, equivalent execution profiles, local verification, revocation, CI and policy.
+1. **Repository-aware agent gateway:** exact built-in repository reads/searches, concurrent in-flight joining, dependency-bound reuse, bounded MCP transport, explicit agent setup, and honest full-result delivery.
+2. **Explicit local exact reads:** `again run`, conservative command parser, audited executable identity, scoped fingerprint, local SQLite/CAS, exact full-stream replay, explainability.
+3. **Trace-backed local effects:** Linux rootless isolation, complete descendant/effect observation, COW execution, preconditioned effect replay, 100% initial shadow validation.
+4. **Team reuse:** encrypted namespaced CAS, signed provenance, equivalent execution profiles, local verification, revocation, CI and policy.
 
 ## North-star and guardrails
 

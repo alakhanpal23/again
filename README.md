@@ -1,6 +1,6 @@
 # Again
 
-Again is an open-source execution layer for coding-agent tool calls. For a deliberately narrow set of explicit local read-only commands, it can reuse an exact successful result when its versioned, scoped observations still match. An ineligible explicit call exits with an error without running the command; the caller then reruns the original command unchanged outside Again.
+Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The stable local engine currently applies that rule to a deliberately narrow set of explicit read-only commands; an experimental MCP gateway applies it to bounded built-in repository reads and searches.
 
 ```bash
 # Redirect all three standard streams so this terminal demonstration is non-TTY.
@@ -13,6 +13,18 @@ cmp /tmp/again-first.err /tmp/again-second.err
 ```
 
 The second eligible invocation can be a cache hit and still returns the same complete streams. An agent that already has those complete bytes in its active context may instead explicitly request a compact, content-addressed proof with `again reference -- <same argv...>`; that command never executes on a miss. If any standard stream is a TTY, as in a normal interactive terminal invocation, `again run` instead executes the audited command once uncached with inherited streams. The current repository is an early conservative implementation; arbitrary commands are not safe to cache.
+
+## Experimental agent gateway
+
+`again mcp serve` exposes `repo.read` and `repo.search` over bounded MCP stdio. Exact repository, task, provider, schema, environment, and authorization-scope bindings control reuse. Concurrent identical calls can join one in-flight execution; later exact calls can reuse its verified result. Relevant repository changes invalidate it. Unknown state and every non-read-only or unknown tool execute normally rather than manufacturing a hit.
+
+```bash
+repo_root="$(pwd -P)"
+again mcp setup --client codex --workspace "$repo_root"
+# Review the printed command, then add it using the agent's own configuration flow.
+```
+
+Setup is a dry run by default and emits a command containing the exact canonical workspace. `--install-owned-config ABSOLUTE_PATH` may create a wholly Again-owned, previously absent configuration and ownership record; it never merges into or overwrites an existing user-managed file. The gateway is experimental: it is not a general MCP proxy, semantic similarity creates no reuse authority, compact cross-agent delivery is disabled, and no Linux command-execution backend is exposed.
 
 ## Product promise
 
@@ -32,13 +44,15 @@ Local v0 does not classify credentials or secret-tainted output. Admitted path o
 
 ## First user
 
-The beachhead is an individual Codex user working in a medium or large local repository whose agent can prefix repeated reads and searches with `again run --`, then use `again reference --` for an unchanged result whose complete bytes remain in the active context. Where avoided work exceeds fingerprint overhead, the first release accelerates a deliberately narrow set of policy-admitted read-only calls while defaulting to exact full streams. Test/build reuse and transparent hooks are later profiles and do not ship until their semantics are observable and their isolation/differential gates pass.
+The beachhead is an individual Codex or Claude user working in a medium or large local repository where agents repeatedly read and search the same state. The experimental gateway removes duplicate provider calls without asking every agent to remember prior commands; the stable explicit path remains `again run --`, with `again reference --` available only when the complete bytes remain visible. Test/build reuse and transparent interception are later profiles and do not ship until their semantics are observable and their isolation/differential gates pass.
 
 ## Install during development
 
 ```bash
 cargo install --path .
 again setup --codex
+# Optional experimental MCP gateway dry run for the current canonical repository:
+again mcp setup --client codex --workspace "$(pwd -P)"
 # Start a new Codex session, then Codex can use:
 again run -- cat path/to/file
 # For the same call only when its full bytes are still visible:
@@ -79,6 +93,10 @@ again team run --profile <absolute-profile> -- <bare argv...>
                           Use the manually provisioned encrypted team alpha
 again team inspect --profile <absolute-profile> --json -- <bare argv...>
                           Print its offline, unsigned trust bootstrap bindings
+again mcp serve --workspace <canonical-repository>
+                          Serve experimental bounded repository tools over MCP stdio
+again mcp setup --client <codex|claude> --workspace <canonical-repository>
+                          Print an ownership-checked, dry-run agent configuration
 again setup --codex       Install the instruction-only personal Codex skill
 again setup --codex --project
                           Install the skill in the current repository

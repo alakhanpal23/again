@@ -2,7 +2,7 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
-Current integrated checkpoint: source commit
+Current hosted evidence checkpoint: source commit
 `dfaf4eeb7ae3ee3f816c438f99f4a019d62e769b` passed exact-SHA hosted
 [`CI run 33001488042`](https://github.com/alakhanpal23/again/actions/runs/33001488042)
 on 2026-08-26. Gate 2 retains a narrower live-evidence checkpoint: source
@@ -23,6 +23,7 @@ it grants no Python, EffectIR, profile, execution, or reuse authority.
 
 | Capability | Status | Evidence / limitation |
 |---|---|---|
+| Experimental repository-aware MCP gateway | implemented local vertical slice; not production-qualified | `again mcp serve` exposes bounded built-in `repo.read` and `repo.search`; canonical request translation, descriptor-retained workspace observation, exact dependency-bound reuse, cross-call SQLite/CAS coordination, bounded concurrent stdio, cancellation, serialized responses, and workspace-bound Codex/Claude setup are integrated. Unit E2Es prove one provider execution for two concurrent identical calls, later exact reuse, relevant-change invalidation, proven-irrelevant-change preservation, cancellation lease release, parser bounds, and panic cleanup. Full retrieval by result ID, compact cross-agent delivery, semantic reuse, arbitrary upstream MCP providers, real-agent/task-quality evaluation, and production qualification remain absent. All Linux execution and reuse authority remains disabled. |
 | Explicit local CLI | implemented MVP path | `again run -- <argv...>` observes actual cwd/streams/environment, enforces `strict-read-v0.5`, returns full streams, and executes audited TTY calls once uncached with inherited streams |
 | Explicit compact reference | implemented opt-in path | `again reference -- <argv...>` performs the same live request/runtime/executable/proof/blob validation, emits bounded content-addressed JSON on an existing hit, records actual bytes omitted, and never executes on a miss; context visibility remains the caller's explicit assertion |
 | Instruction-only Codex skill | implemented onboarding path | `again setup --codex` manages the personal `$HOME/.agents/skills/again` skill by default or project `<repo>/.agents/skills/again` with `--project`; ownership-checked removal is reversible, no hooks are installed, and doctor reports both scopes plus duplication |

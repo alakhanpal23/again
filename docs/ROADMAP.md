@@ -7,22 +7,54 @@ runtime artifact.
 
 ## Product objective
 
-Again should eliminate repeated agent wait time without serving a result whose
-inputs, execution profile, or effects are not proven equivalent. The product
-advances through three user-visible stages:
+Again should eliminate repeated agent wait time and context without serving a
+result whose inputs, execution profile, or effects are not proven equivalent.
+The product definition is: “Again is a repository-aware execution memory and
+tool-call control plane for coding agents. It skips only work proven redundant,
+executes uncertain work, and returns the smallest useful verified observation.”
+The product advances through four user-visible stages:
 
-1. **Explicit local exact reads:** accelerate a deliberately narrow set of
+1. **Repository-aware agent gateway:** deduplicate exact repository tool calls
+   across agent sessions and return bounded verified observations.
+2. **Explicit local exact reads:** accelerate a deliberately narrow set of
    audited read-only commands while preserving complete streams.
-2. **Trace-backed local pytest:** execute one frozen pytest invocation shape in
+3. **Trace-backed local pytest:** execute one frozen pytest invocation shape in
    an isolated Linux profile, then admit reuse only after complete observation
    and independent shadow agreement.
-3. **Managed team reuse:** share encrypted, signed results only across equivalent
+4. **Managed team reuse:** share encrypted, signed results only across equivalent
    repository and execution profiles with local verification.
 
-The current product is in stage 1. Stage-2 snapshot, isolation, seccomp, ptrace,
-and wire foundations exist, but no Linux pytest command can execute through the
-profile and no Linux reuse authority exists. Stage 3 has a manually provisioned
+The current product has an experimental stage-1 gateway and the narrower
+stage-2 explicit CLI. Stage-3 snapshot, isolation, seccomp, ptrace, and wire
+foundations exist, but no Linux pytest command can execute through the profile
+and no Linux reuse authority exists. Stage 4 has a manually provisioned
 client/service foundation, not a deployed product.
+
+## Agent gateway fast track
+
+The experimental local vertical slice now includes a real bounded MCP stdio
+server, `repo.read` and `repo.search`, descriptor-retained repository authority,
+exact dependency-bound reuse, SQLite/CAS coordination, in-flight joining,
+cancellation, and explicit workspace-bound Codex/Claude setup. It remains
+pre-alpha until these gates close:
+
+1. Replace every caller-constructible routing observation with a store-issued,
+   one-use proof whose lifecycle generation, dependency binding, and freshness
+   are checked at consumption.
+2. Add authenticated delivery receipts before counting bytes or execution time
+   as saved. A content address must never act as a bearer authorization token.
+3. Add full-result retrieval only through an authorization-scope and
+   recipient-bound grant; then add compact references only after that exact
+   recipient has received the full result in the current uncompacted context.
+4. Keep semantic/AI routing suggestion-only until deterministic validation
+   binds the complete state and a trusted validity interval.
+5. Run the production binary with real Codex and Claude sessions on retained,
+   network-controlled repository fixtures. Measure provider calls avoided,
+   latency, bytes and estimated tokens omitted, false-hit count, task outcome,
+   cancellation, restart recovery, and store corruption.
+6. Only after those gates, broaden from built-in repository tools to an
+   allowlisted upstream MCP proxy. Side effects, credentials, deployments,
+   payments, and unknown tools continue to bypass reuse.
 
 ## Critical path
 

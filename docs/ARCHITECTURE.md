@@ -32,6 +32,7 @@ apply across the local, Linux trace-backed, and team paths:
 
 | Plane | Current implementation | Missing authority/product step |
 |---|---|---|
+| Agent tool-call gateway | Experimental bounded MCP stdio server with canonical tool translation, descriptor-retained repository authority, built-in `repo.read`/`repo.search`, SQLite/CAS coordination, exact reuse, in-flight joining, cancellation, and workspace-bound Codex/Claude setup | general provider proxying, authenticated full-result retrieval, delivery receipts and safe compact references, semantic-candidate validation, real-agent evaluation, and production qualification |
 | Explicit local reads | Working macOS MVP with strict policy, exact executable/profile checks, SQLite/CAS, double-run admission, complete-stream replay, explicit references, and reversible Codex skill | audited multi-host profile registry, signed distribution, and outside-alpha evidence |
 | Linux snapshots | Descriptor-stable enumeration, charged materialization, canonical workspace/runtime-tree publication, reopened-child binding, a descriptor-bound `.venv/bin/python` checkpoint, and a bounded two-publication structural runtime inventory exist internally | model complete loader search/cache/preload/hwcaps semantics, content-addressed snapshot identity, live connector composition, and `SnapshotProvider` |
 | Linux isolation | Private-root, bounded scratch/procfs, descriptor scrub, credential normalization, capability elimination, authenticated child-only continuation, Landlock, terminal seccomp, and fixed ptrace diagnostics exist as hidden leaves; a command-free connector now consumes the real runtime checkpoint, concrete isolation-ready child, and split stdio ownership with terminate/reap-before-drain cancellation | compose descriptor-selected workspace/runtime and `/dev`, Landlock, workload seccomp, supervisor, command release, foreground presentation, and one cleanup owner in a real provisioned launch |
@@ -41,6 +42,25 @@ apply across the local, Linux trace-backed, and team paths:
 
 The status of each row is normative only through [STATUS.md](STATUS.md). The
 phase ordering and exit gates are in [ROADMAP.md](ROADMAP.md).
+
+## Experimental gateway authority chain
+
+```text
+MCP JSON-RPC frame
+  -> bounded canonical GatewayToolCallV1
+  -> descriptor-retained WorkspaceExecutionEpochV1
+  -> repository/task/environment dependency binding
+  -> store-issued exact route proof or in-flight lease
+  -> provider execution when proof is absent or stale
+  -> exact revalidation before delivery
+  -> full bounded MCP result
+```
+
+The content address is identity, not authorization. The authorization scope is
+bound into the request, and the current server does not expose retrieval by
+result ID. AI or embedding systems may suggest work for deterministic checking
+in a future layer, but cannot issue an exact-hit, join, replay, or delivery
+permit.
 
 ## Target Linux authority chain
 
