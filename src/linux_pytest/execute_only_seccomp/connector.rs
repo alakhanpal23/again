@@ -11,6 +11,11 @@
 //! no second task and no runnable signal handler, no in-process actor can race
 //! the diagnostic child's reaping policy. Hosts that need to run this from a
 //! multithreaded process must delegate to an owned single-threaded helper.
+//! On refusal, the old signal mask is restored only after the saved PID is no
+//! longer signalable and terminal ownership is proved or explicitly lost; a
+//! pending-signal drift leaves the conservative blocked mask in place. This
+//! protects the child identity, but does not claim to suppress safe ambient
+//! handlers after a fully authenticated restoration.
 
 use core::fmt;
 
@@ -547,7 +552,11 @@ fn drive_stopped_child_v1(
         Ok(witness) => Ok(witness),
         Err(first) => {
             let cleanup_complete = cleanup_after_failure_v1(operations)
-                && first.reason != WorkloadSeccompConnectorReasonV1::SignalStateChanged;
+                && !matches!(
+                    first.reason,
+                    WorkloadSeccompConnectorReasonV1::SignalStateChanged
+                        | WorkloadSeccompConnectorReasonV1::ReapingOwnershipLost
+                );
             Err(first.with_cleanup(cleanup_complete))
         }
     }
@@ -634,10 +643,16 @@ mod platform {
         old_mask: u64,
         initial_pending: u64,
         initial_sigchld: Option<SigchldDispositionV1>,
+        pending_safe_for_restore: bool,
         signal_blocked: bool,
         reaped: bool,
+        reaping_ownership_lost: bool,
+        pid_signaling_suppressed: bool,
+        final_echild_proven: bool,
         #[cfg(test)]
         fault_once: Option<(ConnectorOperationV1, OperationErrorV1)>,
+        #[cfg(test)]
+        kill_syscall_attempts: usize,
     }
 
     impl LiveStoppedChildOperationsV1 {
@@ -648,10 +663,16 @@ mod platform {
                 old_mask: 0,
                 initial_pending: 0,
                 initial_sigchld: None,
+                pending_safe_for_restore: false,
                 signal_blocked: false,
                 reaped: false,
+                reaping_ownership_lost: false,
+                pid_signaling_suppressed: false,
+                final_echild_proven: false,
                 #[cfg(test)]
                 fault_once: None,
+                #[cfg(test)]
+                kill_syscall_attempts: 0,
             }
         }
 
@@ -756,7 +777,8 @@ mod platform {
             Ok(0)
         }
 
-        fn verify_blocked_pending(&self) -> Result<i64, OperationErrorV1> {
+        fn verify_blocked_pending(&mut self) -> Result<i64, OperationErrorV1> {
+            self.pending_safe_for_restore = false;
             let mut pending_after = 0_u64;
             if unsafe {
                 libc::syscall(
@@ -766,13 +788,16 @@ mod platform {
                 )
             } != 0
                 || pending_after != self.initial_pending
+                || self.initial_pending & !self.old_mask != 0
             {
                 return Err(OperationErrorV1::SignalStateChanged);
             }
+            self.pending_safe_for_restore = true;
             Ok(0)
         }
 
-        fn verify_pending_signals(&self) -> Result<i64, OperationErrorV1> {
+        fn verify_pending_signals(&mut self) -> Result<i64, OperationErrorV1> {
+            self.pending_safe_for_restore = false;
             let mut observed = 0_u64;
             if unsafe {
                 libc::syscall(
@@ -784,9 +809,10 @@ mod platform {
             {
                 return Err(OperationErrorV1::Failed);
             }
-            if observed != self.initial_pending {
+            if observed != self.initial_pending || self.initial_pending & !self.old_mask != 0 {
                 return Err(OperationErrorV1::SignalStateChanged);
             }
+            self.pending_safe_for_restore = true;
             Ok(0)
         }
 
@@ -824,7 +850,7 @@ mod platform {
             Ok(0)
         }
 
-        fn wait_for_stop(&self, expected_signal: i32) -> Result<i64, OperationErrorV1> {
+        fn wait_for_stop(&mut self, expected_signal: i32) -> Result<i64, OperationErrorV1> {
             let child = self.child()?;
             let deadline = Instant::now() + WAIT_BOUND_V1;
             loop {
@@ -835,9 +861,18 @@ mod platform {
                     if libc::WIFSTOPPED(status) && libc::WSTOPSIG(status) == expected_signal {
                         return Ok(0);
                     }
+                    if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                        self.reaped = true;
+                        self.pid_signaling_suppressed = true;
+                    }
                     return Err(OperationErrorV1::Failed);
                 }
                 if waited < 0 {
+                    if last_errno_v1() == libc::ECHILD {
+                        self.reaping_ownership_lost = true;
+                        self.pid_signaling_suppressed = true;
+                        return Err(OperationErrorV1::ReapingOwnershipLost);
+                    }
                     return Err(OperationErrorV1::Failed);
                 }
                 if Instant::now() >= deadline {
@@ -947,6 +982,9 @@ mod platform {
             if self.reaped || self.child.is_none() {
                 return Ok(0);
             }
+            if self.reaping_ownership_lost {
+                return Err(OperationErrorV1::ReapingOwnershipLost);
+            }
             let child = self.child()?;
             let deadline = Instant::now() + WAIT_BOUND_V1;
             loop {
@@ -955,6 +993,7 @@ mod platform {
                 if waited == child {
                     if libc::WIFSIGNALED(status) || libc::WIFEXITED(status) {
                         self.reaped = true;
+                        self.pid_signaling_suppressed = true;
                     }
                     return if (cleanup && self.reaped)
                         || (self.reaped
@@ -969,6 +1008,8 @@ mod platform {
                 if waited < 0 {
                     let error = last_errno_v1();
                     if error == libc::ECHILD {
+                        self.reaping_ownership_lost = true;
+                        self.pid_signaling_suppressed = true;
                         return Err(OperationErrorV1::ReapingOwnershipLost);
                     }
                     return Err(OperationErrorV1::Failed);
@@ -980,25 +1021,49 @@ mod platform {
             }
         }
 
-        fn prove_echild(&self) -> Result<i64, OperationErrorV1> {
+        fn prove_echild(&mut self) -> Result<i64, OperationErrorV1> {
             let Some(child) = self.child else {
+                self.final_echild_proven = true;
                 return Ok(0);
             };
             let mut status = 0;
             let waited = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
             if waited < 0 && last_errno_v1() == libc::ECHILD {
-                Ok(0)
+                if self.reaped {
+                    self.final_echild_proven = true;
+                    Ok(0)
+                } else {
+                    self.reaping_ownership_lost = true;
+                    self.pid_signaling_suppressed = true;
+                    Err(OperationErrorV1::ReapingOwnershipLost)
+                }
+            } else if waited == child && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
+                // Even though this operation expected ECHILD, it consumed the
+                // terminal status. Retire the saved PID before returning the
+                // typed mismatch so cleanup can never signal a recycled PID.
+                self.reaped = true;
+                self.pid_signaling_suppressed = true;
+                Err(OperationErrorV1::Failed)
             } else {
                 Err(OperationErrorV1::Failed)
             }
         }
 
-        fn kill(&self) -> Result<i64, OperationErrorV1> {
-            if self.reaped || self.child.is_none() {
+        fn kill(&mut self) -> Result<i64, OperationErrorV1> {
+            if self.pid_signaling_suppressed
+                || self.reaped
+                || self.reaping_ownership_lost
+                || self.child.is_none()
+            {
                 return Ok(0);
+            }
+            #[cfg(test)]
+            {
+                self.kill_syscall_attempts = self.kill_syscall_attempts.saturating_add(1);
             }
             let result = unsafe { libc::kill(self.child()?, libc::SIGKILL) };
             if result == 0 || (result < 0 && last_errno_v1() == libc::ESRCH) {
+                self.pid_signaling_suppressed = true;
                 Ok(0)
             } else {
                 Err(OperationErrorV1::Failed)
@@ -1008,6 +1073,12 @@ mod platform {
         fn restore_signal(&mut self) -> Result<i64, OperationErrorV1> {
             if !self.signal_blocked {
                 return Ok(0);
+            }
+            let child_is_not_signalable = self.child.is_none()
+                || (self.reaped && self.final_echild_proven)
+                || self.reaping_ownership_lost;
+            if !child_is_not_signalable || !self.pending_safe_for_restore {
+                return Err(OperationErrorV1::SignalStateChanged);
             }
             if unsafe {
                 libc::syscall(
@@ -1128,6 +1199,8 @@ mod platform {
             // independently recorded cleanup uncertainty to success.
             let _ = self.kill();
             let _ = self.reap(true);
+            let _ = self.prove_echild();
+            let _ = self.verify_pending_signals();
             let _ = self.restore_signal();
             let _ = self.verify_restored_signal_mask();
             let _ = self.verify_initial_sigchld_unchanged();
@@ -1263,7 +1336,9 @@ mod platform {
         operations.child = Some(child);
         operations.kill().is_ok()
             && operations.reap(true) == Err(OperationErrorV1::ReapingOwnershipLost)
-            && operations.prove_echild().is_ok()
+            && operations.kill().is_ok()
+            && operations.kill_syscall_attempts == 1
+            && operations.prove_echild() == Err(OperationErrorV1::ReapingOwnershipLost)
     }
 
     #[cfg(test)]
@@ -1285,7 +1360,10 @@ mod platform {
             return false;
         }
         let mut operations = LiveStoppedChildOperationsV1::new();
-        if operations.block_signal().is_err() {
+        if operations.read_initial_pending().is_err()
+            || operations.block_signal().is_err()
+            || operations.verify_blocked_pending().is_err()
+        {
             return false;
         }
         let child = unsafe { libc::fork() };
@@ -1341,6 +1419,7 @@ mod platform {
         let mut operations = LiveStoppedChildOperationsV1::new();
         if operations.read_initial_pending().is_err()
             || operations.block_signal().is_err()
+            || operations.verify_blocked_pending().is_err()
             || operations.restore_signal().is_err()
         {
             return false;
@@ -1406,6 +1485,119 @@ mod platform {
             )
         } == 0;
         readback_ok && restored_mask == original_mask && !refusal.cleanup_complete()
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_early_terminal_wait_retires_saved_pid_v1() -> bool {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return false;
+        }
+        if child == 0 {
+            unsafe { libc::_exit(125) };
+        }
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        operations.child = Some(child);
+        operations.wait_for_stop(libc::SIGSTOP) == Err(OperationErrorV1::Failed)
+            && operations.reaped
+            && operations.kill().is_ok()
+            && operations.kill_syscall_attempts == 0
+            && operations.prove_echild().is_ok()
+            && operations.final_echild_proven
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_wait_for_stop_echild_suppresses_saved_pid_v1() -> bool {
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return false;
+        }
+        if child == 0 {
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        if unsafe { libc::waitpid(child, &mut status, 0) } != child {
+            return false;
+        }
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        operations.child = Some(child);
+        operations.wait_for_stop(libc::SIGSTOP) == Err(OperationErrorV1::ReapingOwnershipLost)
+            && operations.reaping_ownership_lost
+            && operations.kill().is_ok()
+            && operations.kill_syscall_attempts == 0
+            && operations.prove_echild() == Err(OperationErrorV1::ReapingOwnershipLost)
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_pending_handler_stays_blocked_across_cleanup_reap_failure_v1() -> bool {
+        AMBIENT_HANDLER_CALLS_V1.store(0, Ordering::Relaxed);
+        let signal_mask = signal_bit_v1(libc::SIGUSR1);
+        let mut original_mask = 0_u64;
+        if unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigprocmask,
+                libc::SIG_BLOCK,
+                &signal_mask,
+                &mut original_mask,
+                KERNEL_SIGNAL_SET_BYTES_V1,
+            )
+        } != 0
+        {
+            return false;
+        }
+        let mut original_action = unsafe { core::mem::zeroed::<libc::sigaction>() };
+        let mut custom = unsafe { core::mem::zeroed::<libc::sigaction>() };
+        custom.sa_sigaction = ambient_handler_v1 as usize;
+        if unsafe { libc::sigemptyset(&mut custom.sa_mask) } != 0
+            || unsafe { libc::sigaction(libc::SIGUSR1, ptr::null(), &mut original_action) } != 0
+            || unsafe { libc::sigaction(libc::SIGUSR1, &custom, ptr::null_mut()) } != 0
+            || unsafe { libc::raise(libc::SIGUSR1) } != 0
+        {
+            return false;
+        }
+
+        let mut operations = LiveStoppedChildOperationsV1::new();
+        if operations.record_initial_sigchld().is_err()
+            || operations.read_initial_pending().is_err()
+            || operations.block_signal().is_err()
+            || operations.verify_blocked_pending().is_err()
+        {
+            return false;
+        }
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return false;
+        }
+        if child == 0 {
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
+        operations.child = Some(child);
+        operations.fault_once = Some((ConnectorOperationV1::CleanupReap, OperationErrorV1::Failed));
+        let cleanup_complete = cleanup_after_failure_v1(&mut operations);
+        let stayed_blocked =
+            operations.signal_blocked && AMBIENT_HANDLER_CALLS_V1.load(Ordering::Relaxed) == 0;
+        drop(operations);
+
+        let mut ignore = unsafe { core::mem::zeroed::<libc::sigaction>() };
+        ignore.sa_sigaction = libc::SIG_IGN;
+        let restored = unsafe { libc::sigemptyset(&mut ignore.sa_mask) } == 0
+            && unsafe { libc::sigaction(libc::SIGUSR1, &ignore, ptr::null_mut()) } == 0
+            && unsafe {
+                libc::syscall(
+                    libc::SYS_rt_sigprocmask,
+                    libc::SIG_SETMASK,
+                    &original_mask,
+                    ptr::null_mut::<u64>(),
+                    KERNEL_SIGNAL_SET_BYTES_V1,
+                )
+            } == 0
+            && unsafe { libc::sigaction(libc::SIGUSR1, &original_action, ptr::null_mut()) } == 0;
+        !cleanup_complete
+            && stayed_blocked
+            && restored
+            && AMBIENT_HANDLER_CALLS_V1.load(Ordering::Relaxed) == 0
     }
 
     #[cfg(test)]
@@ -1535,6 +1727,75 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum AbstractWaitEffectV1 {
+        TerminalStatusConsumed,
+        ReapingOwnershipLost,
+    }
+
+    struct AbstractWaitStateOperationsV1 {
+        effect: AbstractWaitEffectV1,
+        child_signalable: bool,
+        terminal_observed: bool,
+        ownership_lost: bool,
+        kill_attempts: usize,
+        operations: Vec<ConnectorOperationV1>,
+    }
+
+    impl AbstractWaitStateOperationsV1 {
+        fn new(effect: AbstractWaitEffectV1) -> Self {
+            Self {
+                effect,
+                child_signalable: false,
+                terminal_observed: false,
+                ownership_lost: false,
+                kill_attempts: 0,
+                operations: Vec::new(),
+            }
+        }
+    }
+
+    impl StoppedChildOperationsV1 for AbstractWaitStateOperationsV1 {
+        fn perform(
+            &mut self,
+            operation: ConnectorOperationV1,
+            _readback: Option<&mut [WorkloadSockFilterV1]>,
+        ) -> Result<i64, OperationErrorV1> {
+            self.operations.push(operation);
+            match operation {
+                ConnectorOperationV1::SpawnChild => {
+                    self.child_signalable = true;
+                    Ok(0)
+                }
+                ConnectorOperationV1::WaitInitialStop => {
+                    self.child_signalable = false;
+                    match self.effect {
+                        AbstractWaitEffectV1::TerminalStatusConsumed => {
+                            self.terminal_observed = true;
+                            Err(OperationErrorV1::Failed)
+                        }
+                        AbstractWaitEffectV1::ReapingOwnershipLost => {
+                            self.ownership_lost = true;
+                            Err(OperationErrorV1::ReapingOwnershipLost)
+                        }
+                    }
+                }
+                ConnectorOperationV1::CleanupKill => {
+                    if self.child_signalable {
+                        self.kill_attempts = self.kill_attempts.saturating_add(1);
+                    }
+                    Ok(0)
+                }
+                ConnectorOperationV1::CleanupReap | ConnectorOperationV1::CleanupFinalEchild
+                    if self.ownership_lost =>
+                {
+                    Err(OperationErrorV1::ReapingOwnershipLost)
+                }
+                _ => Ok(InjectedOperationsV1::expected_value(operation)),
+            }
+        }
+    }
+
     fn permit_v1() -> StoppedChildPermitV1 {
         StoppedChildPermitV1 {
             _seal: StoppedChildPermitSealV1,
@@ -1640,6 +1901,39 @@ mod tests {
     }
 
     #[test]
+    fn abstract_terminal_wait_effect_retires_signaling_before_cleanup() {
+        let mut operations =
+            AbstractWaitStateOperationsV1::new(AbstractWaitEffectV1::TerminalStatusConsumed);
+        let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
+        assert_eq!(
+            failure.stage(),
+            WorkloadSeccompConnectorStageV1::WaitInitialStop
+        );
+        assert!(failure.cleanup_complete());
+        assert!(operations.terminal_observed);
+        assert_eq!(operations.kill_attempts, 0);
+    }
+
+    #[test]
+    fn abstract_echild_effect_suppresses_signaling_but_never_proves_cleanup() {
+        let mut operations =
+            AbstractWaitStateOperationsV1::new(AbstractWaitEffectV1::ReapingOwnershipLost);
+        let failure = drive_stopped_child_v1(permit_v1(), &mut operations).unwrap_err();
+        assert_eq!(
+            failure.reason(),
+            WorkloadSeccompConnectorReasonV1::ReapingOwnershipLost
+        );
+        assert!(!failure.cleanup_complete());
+        assert!(operations.ownership_lost);
+        assert_eq!(operations.kill_attempts, 0);
+        assert!(
+            operations
+                .operations
+                .contains(&ConnectorOperationV1::CleanupFinalEchild)
+        );
+    }
+
+    #[test]
     fn injected_kernel_policy_refusal_is_typed_and_still_cleans() {
         let mut operations = InjectedOperationsV1 {
             forward_failure: Some(ConnectorOperationV1::InstallTsyncFilter),
@@ -1693,7 +1987,7 @@ mod tests {
             failure.reason(),
             WorkloadSeccompConnectorReasonV1::ReapingOwnershipLost
         );
-        assert!(failure.cleanup_complete());
+        assert!(!failure.cleanup_complete());
     }
 
     #[test]
@@ -1893,6 +2187,41 @@ mod tests {
     fn live_drop_cleanup_retry_cannot_upgrade_recorded_uncertainty() {
         assert_isolated_linux_case_v1(
             platform::test_drop_retry_cannot_upgrade_recorded_uncertainty_v1,
+        );
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_early_terminal_wait_retires_saved_pid_before_cleanup_kill() {
+        assert_isolated_linux_case_v1(platform::test_early_terminal_wait_retires_saved_pid_v1);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_wait_echild_suppresses_saved_pid_before_cleanup_kill() {
+        assert_isolated_linux_case_v1(platform::test_wait_for_stop_echild_suppresses_saved_pid_v1);
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ))]
+    #[test]
+    fn live_pending_handler_stays_blocked_when_cleanup_reap_is_uncertain() {
+        assert_isolated_linux_case_v1(
+            platform::test_pending_handler_stays_blocked_across_cleanup_reap_failure_v1,
         );
     }
 
