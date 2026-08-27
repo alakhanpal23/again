@@ -30,6 +30,7 @@ const STDIO_RESPONSE_QUEUE_V1: usize = STDIO_MAX_INFLIGHT_V1 * 2;
 struct StdioActivationV1 {
     sender: SyncSender<()>,
     signalled: AtomicBool,
+    session_id: u64,
 }
 
 impl StdioActivationV1 {
@@ -679,19 +680,48 @@ struct ActiveCall {
     provider_identity: String,
     schema_identity: String,
     effect: EffectClass,
+    stdio_session_id: Option<u64>,
+    cancellation_requested: bool,
 }
 
 struct ActiveCallRegistration<'a> {
     active: &'a Mutex<BTreeMap<JsonRpcId, ActiveCall>>,
     request_id: JsonRpcId,
+    physical_attempt_id: PhysicalAttemptId,
+    registered: bool,
+}
+
+impl ActiveCallRegistration<'_> {
+    fn complete(mut self) -> bool {
+        let cancellation_requested =
+            remove_matching_active_call(self.active, &self.request_id, self.physical_attempt_id)
+                .is_some_and(|active| active.cancellation_requested);
+        self.registered = false;
+        cancellation_requested
+    }
 }
 
 impl Drop for ActiveCallRegistration<'_> {
     fn drop(&mut self) {
-        self.active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&self.request_id);
+        if self.registered {
+            remove_matching_active_call(self.active, &self.request_id, self.physical_attempt_id);
+        }
+    }
+}
+
+fn remove_matching_active_call(
+    active: &Mutex<BTreeMap<JsonRpcId, ActiveCall>>,
+    request_id: &JsonRpcId,
+    physical_attempt_id: PhysicalAttemptId,
+) -> Option<ActiveCall> {
+    let mut active = active.lock().unwrap_or_else(|poison| poison.into_inner());
+    if active
+        .get(request_id)
+        .is_some_and(|call| call.cancellation.physical_attempt_id == physical_attempt_id)
+    {
+        active.remove(request_id)
+    } else {
+        None
     }
 }
 
@@ -734,6 +764,7 @@ pub struct McpGateway {
     initialized: AtomicBool,
     next_physical_attempt: AtomicU64,
     next_stdio_logical_call: AtomicU64,
+    next_stdio_session: AtomicU64,
     active: Mutex<BTreeMap<JsonRpcId, ActiveCall>>,
     audit: Arc<dyn GatewayAuditSink>,
 }
@@ -820,6 +851,7 @@ impl McpGateway {
             initialized: AtomicBool::new(false),
             next_physical_attempt: AtomicU64::new(1),
             next_stdio_logical_call: AtomicU64::new(1),
+            next_stdio_session: AtomicU64::new(1),
             active: Mutex::new(BTreeMap::new()),
             audit: Arc::new(NoopAuditSink),
         })
@@ -888,6 +920,7 @@ impl McpGateway {
             activation: Arc<StdioActivationV1>,
         }
 
+        let session_id = self.next_stdio_session.fetch_add(1, Ordering::Relaxed);
         thread::scope(|scope| {
             let (job_sender, job_receiver) =
                 mpsc::sync_channel::<StdioJobV1>(STDIO_MAX_INFLIGHT_V1);
@@ -897,12 +930,18 @@ impl McpGateway {
             let inflight = Arc::new(AtomicUsize::new(0));
 
             let writer_handle = scope.spawn(move || -> io::Result<()> {
-                while let Ok(response) = response_receiver.recv() {
-                    writer.write_all(&response)?;
-                    writer.write_all(b"\n")?;
-                    writer.flush()?;
+                let result = (|| {
+                    while let Ok(response) = response_receiver.recv() {
+                        writer.write_all(&response)?;
+                        writer.write_all(b"\n")?;
+                        writer.flush()?;
+                    }
+                    Ok(())
+                })();
+                if result.is_err() {
+                    self.cancel_stdio_session(session_id);
                 }
-                Ok(())
+                result
             });
 
             let mut workers = Vec::new();
@@ -978,12 +1017,7 @@ impl McpGateway {
                                         ),
                                     ))
                                     .expect("JSON-RPC error values are serializable");
-                                    response_sender.send(response).map_err(|_| {
-                                        io::Error::new(
-                                            io::ErrorKind::BrokenPipe,
-                                            "stdio response writer stopped",
-                                        )
-                                    })?;
+                                    enqueue_stdio_response(&response_sender, response)?;
                                     continue;
                                 }
                                 let (activation_sender, activation_receiver) =
@@ -991,6 +1025,7 @@ impl McpGateway {
                                 let activation = Arc::new(StdioActivationV1 {
                                     sender: activation_sender,
                                     signalled: AtomicBool::new(false),
+                                    session_id,
                                 });
                                 let job = StdioJobV1 {
                                     bytes,
@@ -1014,12 +1049,7 @@ impl McpGateway {
                             } else if let Some(response) =
                                 self.process_bytes(&bytes, &context, secrets)
                             {
-                                response_sender.send(response).map_err(|_| {
-                                    io::Error::new(
-                                        io::ErrorKind::BrokenPipe,
-                                        "stdio response writer stopped",
-                                    )
-                                })?;
+                                enqueue_stdio_response(&response_sender, response)?;
                             }
                         }
                         Err(error) => {
@@ -1028,18 +1058,18 @@ impl McpGateway {
                                 input_error_to_mcp(&error),
                             ))
                             .expect("JSON-RPC error values are serializable");
-                            response_sender.send(response).map_err(|_| {
-                                io::Error::new(
-                                    io::ErrorKind::BrokenPipe,
-                                    "stdio response writer stopped",
-                                )
-                            })?;
+                            enqueue_stdio_response(&response_sender, response)?;
                         }
                     }
                 }
                 Ok(())
             })();
 
+            // EOF, reader failure, and response backpressure all close this
+            // stdio session. Provider cancellation is cooperative, but the
+            // gateway immediately marks every still-active session call as
+            // cancelled and asks its exact physical attempt to stop.
+            self.cancel_stdio_session(session_id);
             drop(job_sender);
             for worker in workers {
                 if worker.join().is_err() && read_result.is_ok() {
@@ -1182,7 +1212,23 @@ impl McpGateway {
                 McpError::typed(McpErrorCode::InvalidParams, "unknown tool"),
             ));
         };
-        let freshness = route.provider.freshness();
+        let freshness = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            route.provider.freshness()
+        })) {
+            Ok(freshness) => freshness,
+            Err(_) => {
+                self.audit.record(GatewayAuditEvent {
+                    logical_call_id: context.logical_call_id.0.clone(),
+                    physical_attempt_id: None,
+                    authorization_scope: context.authorization_scope.0.clone(),
+                    provider_identity: Some(route.provider_identity.clone()),
+                    tool_schema_identity: Some(route.schema_identity.clone()),
+                    effect: Some(route.effect),
+                    outcome: AuditOutcome::Rejected,
+                });
+                return Some(error_response(response_id, provider_panic_error()));
+            }
+        };
         if let Err(error) = validate_freshness(&freshness, self.limits) {
             self.audit.record(GatewayAuditEvent {
                 logical_call_id: context.logical_call_id.0.clone(),
@@ -1208,6 +1254,8 @@ impl McpGateway {
             provider_identity: route.provider_identity.clone(),
             schema_identity: route.schema_identity.clone(),
             effect: route.effect,
+            stdio_session_id: activation.map(|activation| activation.session_id),
+            cancellation_requested: false,
         };
         {
             let mut active = self
@@ -1229,9 +1277,11 @@ impl McpGateway {
                 }
             }
         }
-        let _active_registration = ActiveCallRegistration {
+        let active_registration = ActiveCallRegistration {
             active: &self.active,
             request_id: request_id.clone(),
+            physical_attempt_id,
+            registered: true,
         };
         if let Some(activation) = activation {
             activation.signal();
@@ -1250,66 +1300,115 @@ impl McpGateway {
             effect: route.effect,
             translation,
         };
-        let upstream = route
-            .provider
-            .execute(call, secrets)
-            .and_then(|result| route.provider.capture_result(result));
+        enum CallResult {
+            Success(Value),
+            Error(McpError),
+        }
 
-        match upstream {
-            Ok(captured) => {
+        let upstream = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            route
+                .provider
+                .execute(call, secrets)
+                .and_then(|result| route.provider.capture_result(result))
+        }));
+        let (mut result, mut outcome) = match upstream {
+            Ok(Ok(captured)) => {
                 let exact = captured.into_exact();
-                if let Err(error) = validate_tool_result(&exact, self.limits) {
-                    self.record_call_audit(
-                        context,
-                        &route,
-                        physical_attempt_id,
-                        AuditOutcome::Rejected,
-                    );
-                    return Some(error_response(response_id, error));
+                match validate_tool_result(&exact, self.limits) {
+                    Ok(()) => (CallResult::Success(exact), AuditOutcome::Succeeded),
+                    Err(error) => (CallResult::Error(error), AuditOutcome::Rejected),
                 }
-                self.record_call_audit(
-                    context,
-                    &route,
-                    physical_attempt_id,
-                    AuditOutcome::Succeeded,
-                );
-                Some(success_response(response_id, exact))
             }
-            Err(error) => {
-                let (outcome, forwarded) = if validate_provider_error(&error.0, self.limits) {
-                    (AuditOutcome::ProviderError, error.0)
+            Ok(Err(error)) => {
+                if validate_provider_error(&error.0, self.limits) {
+                    (CallResult::Error(error.0), AuditOutcome::ProviderError)
                 } else {
                     (
-                        AuditOutcome::Rejected,
-                        McpError::typed(
+                        CallResult::Error(McpError::typed(
                             McpErrorCode::LimitExceeded,
                             "upstream provider error exceeded gateway limits",
-                        ),
+                        )),
+                        AuditOutcome::Rejected,
                     )
-                };
-                self.record_call_audit(context, &route, physical_attempt_id, outcome);
-                Some(error_response(response_id, forwarded))
+                }
             }
+            Err(_) => (
+                CallResult::Error(provider_panic_error()),
+                AuditOutcome::Rejected,
+            ),
+        };
+
+        if active_registration.complete() && matches!(result, CallResult::Success(_)) {
+            result = CallResult::Error(McpError::typed(
+                McpErrorCode::RequestCancelled,
+                "request was cancelled",
+            ));
+            outcome = AuditOutcome::Rejected;
         }
+        self.record_call_audit(context, &route, physical_attempt_id, outcome);
+        Some(match result {
+            CallResult::Success(exact) => success_response(response_id, exact),
+            CallResult::Error(error) => error_response(response_id, error),
+        })
     }
 
     fn cancel(&self, params: Option<Value>, context: &GatewayRequestContext) {
         let Some(request_id) = parse_cancellation_id(params) else {
             return;
         };
-        let active = self
-            .active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&request_id)
-            .cloned();
+        let active = self.request_cancellation(&request_id, Some(&context.authorization_scope));
         let Some(active) = active else {
             return;
         };
-        if active.authorization_scope != context.authorization_scope {
-            return;
+        self.propagate_cancellation(active);
+    }
+
+    fn cancel_stdio_session(&self, session_id: u64) {
+        let active = {
+            let mut calls = self
+                .active
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            calls
+                .values_mut()
+                .filter_map(|call| {
+                    if call.stdio_session_id == Some(session_id) && !call.cancellation_requested {
+                        call.cancellation_requested = true;
+                        Some(call.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for call in active {
+            self.propagate_cancellation(call);
         }
-        let _ = active.provider.cancel(active.cancellation.clone());
+    }
+
+    fn request_cancellation(
+        &self,
+        request_id: &JsonRpcId,
+        authorization_scope: Option<&AuthorizationScopeId>,
+    ) -> Option<ActiveCall> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let active = active.get_mut(request_id)?;
+        if authorization_scope.is_some_and(|scope| scope != &active.authorization_scope)
+            || active.cancellation_requested
+        {
+            return None;
+        }
+        active.cancellation_requested = true;
+        Some(active.clone())
+    }
+
+    fn propagate_cancellation(&self, active: ActiveCall) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = active.provider.cancel(active.cancellation.clone());
+        }));
         self.audit.record(GatewayAuditEvent {
             logical_call_id: active.cancellation.logical_call_id.0,
             physical_attempt_id: Some(active.cancellation.physical_attempt_id.0),
@@ -1462,8 +1561,21 @@ fn parse_tool_call_params(
 }
 
 fn parse_cancellation_id(params: Option<Value>) -> Option<JsonRpcId> {
-    let params = params?.as_object()?.get("requestId")?.clone();
-    JsonRpcId::from_value(&params).ok()
+    let params = params?;
+    let object = params.as_object()?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "requestId" | "reason"))
+    {
+        return None;
+    }
+    if object
+        .get("reason")
+        .is_some_and(|reason| reason.as_str().is_none_or(|reason| reason.len() > 1_024))
+    {
+        return None;
+    }
+    JsonRpcId::from_value(object.get("requestId")?).ok()
 }
 
 fn success_response(id: Value, result: Value) -> Value {
@@ -1472,6 +1584,16 @@ fn success_response(id: Value, result: Value) -> Value {
 
 fn error_response(id: Value, error: McpError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
+}
+
+fn provider_panic_error() -> McpError {
+    McpError::typed(McpErrorCode::InternalError, "upstream provider failed")
+}
+
+fn enqueue_stdio_response(sender: &SyncSender<Vec<u8>>, response: Vec<u8>) -> io::Result<()> {
+    sender
+        .send(response)
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdio response writer stopped"))
 }
 
 fn input_error_to_mcp(error: &GatewayInputError) -> McpError {
@@ -1713,22 +1835,10 @@ fn canonical_json_bytes(value: &Value) -> Vec<u8> {
 
 fn effective_effect(
     declared: EffectClass,
-    annotations: Option<&Value>,
-    annotations_trusted: bool,
+    _annotations: Option<&Value>,
+    _annotations_trusted: bool,
 ) -> EffectClass {
-    if declared != EffectClass::Unknown || !annotations_trusted {
-        return declared;
-    }
-    let Some(annotations) = annotations.and_then(Value::as_object) else {
-        return EffectClass::Unknown;
-    };
-    if annotations.get("readOnlyHint").and_then(Value::as_bool) == Some(true) {
-        EffectClass::ReadOnly
-    } else if annotations.get("openWorldHint").and_then(Value::as_bool) == Some(true) {
-        EffectClass::ExternalSideEffect
-    } else {
-        EffectClass::Mutating
-    }
+    declared
 }
 
 fn validate_freshness(freshness: &Freshness, limits: GatewayLimits) -> Result<(), McpError> {

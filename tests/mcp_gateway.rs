@@ -1,10 +1,14 @@
+#![allow(dead_code)]
+
 #[path = "../src/mcp_gateway.rs"]
 mod mcp_gateway;
 
-use std::collections::BTreeMap;
-use std::io::{BufReader, Cursor};
-use std::sync::{Arc, Condvar, Mutex};
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, BufReader, Cursor, Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecret, EphemeralSecrets,
@@ -31,6 +35,9 @@ struct FakeProvider {
     cancellations: Mutex<Vec<ProviderCancellation>>,
     block: Option<Arc<BlockState>>,
     panics: bool,
+    freshness_panics: bool,
+    capture_panics: bool,
+    cancellation_panics: bool,
     observed_secret: Mutex<Option<Vec<u8>>>,
     freshness: Freshness,
 }
@@ -51,6 +58,9 @@ impl FakeProvider {
             cancellations: Mutex::new(Vec::new()),
             block: None,
             panics: false,
+            freshness_panics: false,
+            capture_panics: false,
+            cancellation_panics: false,
             observed_secret: Mutex::new(None),
             freshness: Freshness {
                 revision: "fake-revision-7".into(),
@@ -76,6 +86,21 @@ impl FakeProvider {
 
     fn panicking(mut self) -> Self {
         self.panics = true;
+        self
+    }
+
+    fn panicking_freshness(mut self) -> Self {
+        self.freshness_panics = true;
+        self
+    }
+
+    fn panicking_capture(mut self) -> Self {
+        self.capture_panics = true;
+        self
+    }
+
+    fn panicking_cancellation(mut self) -> Self {
+        self.cancellation_panics = true;
         self
     }
 
@@ -124,12 +149,14 @@ impl ToolCancellation for FakeProvider {
         if let Some(block) = &self.block {
             block.changed.notify_all();
         }
+        assert!(!self.cancellation_panics, "injected cancellation panic");
         Ok(())
     }
 }
 
 impl FreshnessMetadata for FakeProvider {
     fn freshness(&self) -> Freshness {
+        assert!(!self.freshness_panics, "injected freshness panic");
         self.freshness.clone()
     }
 }
@@ -145,7 +172,234 @@ impl SideEffectClassification for FakeProvider {
 
 impl StructuredResultCapture for FakeProvider {
     fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
+        assert!(!self.capture_panics, "injected capture panic");
         Ok(CapturedToolResult::exact(result))
+    }
+}
+
+#[derive(Default)]
+struct AttemptState {
+    started: BTreeSet<u64>,
+    cancelled: BTreeSet<u64>,
+    completed: BTreeSet<u64>,
+}
+
+struct AttemptProvider {
+    calls: Mutex<Vec<ProviderCall>>,
+    cancellations: Mutex<Vec<ProviderCancellation>>,
+    state: Mutex<AttemptState>,
+    changed: Condvar,
+    blocking: AtomicBool,
+}
+
+impl AttemptProvider {
+    fn new() -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            cancellations: Mutex::new(Vec::new()),
+            state: Mutex::new(AttemptState::default()),
+            changed: Condvar::new(),
+            blocking: AtomicBool::new(true),
+        }
+    }
+
+    fn wait_for_started(&self, count: usize) {
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
+            .changed
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                state.started.len() < count
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "provider did not start {count} calls");
+        assert!(state.started.len() >= count);
+    }
+
+    fn wait_for_cancellations(&self, count: usize) {
+        let cancellations = self.cancellations.lock().unwrap();
+        let (cancellations, timeout) = self
+            .changed
+            .wait_timeout_while(cancellations, Duration::from_secs(5), |cancellations| {
+                cancellations.len() < count
+            })
+            .unwrap();
+        assert!(
+            !timeout.timed_out(),
+            "provider did not receive {count} cancellations"
+        );
+        assert!(cancellations.len() >= count);
+    }
+
+    fn stop_blocking(&self) {
+        self.blocking.store(false, Ordering::Release);
+        self.changed.notify_all();
+    }
+}
+
+impl ToolDiscovery for AttemptProvider {
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: "attempts".into(),
+            implementation: "attempt-gate".into(),
+            version: "1.0.0".into(),
+            endpoint_identity: "test://attempt-gate".into(),
+        }
+    }
+
+    fn discover_tools(&self) -> Result<Vec<ProviderTool>, ProviderError> {
+        Ok(vec![tool("fast"), tool("wait")])
+    }
+}
+
+impl ToolExecution for AttemptProvider {
+    fn execute(
+        &self,
+        call: ProviderCall,
+        _secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        let physical = call.physical_attempt_id.get();
+        let fast = call.upstream_tool_name == "fast";
+        self.calls.lock().unwrap().push(call);
+        let mut state = self.state.lock().unwrap();
+        state.started.insert(physical);
+        self.changed.notify_all();
+        while !fast && self.blocking.load(Ordering::Acquire) && !state.cancelled.contains(&physical)
+        {
+            state = self.changed.wait(state).unwrap();
+        }
+        state.completed.insert(physical);
+        self.changed.notify_all();
+        Ok(json!({ "content": [] }))
+    }
+}
+
+impl ToolCancellation for AttemptProvider {
+    fn cancel(&self, cancellation: ProviderCancellation) -> Result<(), ProviderError> {
+        let physical = cancellation.physical_attempt_id.get();
+        self.cancellations.lock().unwrap().push(cancellation);
+        self.state.lock().unwrap().cancelled.insert(physical);
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl FreshnessMetadata for AttemptProvider {
+    fn freshness(&self) -> Freshness {
+        Freshness {
+            revision: "attempt-revision".into(),
+            observed_at_unix_ms: Some(321),
+        }
+    }
+}
+
+impl SideEffectClassification for AttemptProvider {
+    fn classify_effect(&self, _upstream_tool_name: &str) -> EffectClass {
+        EffectClass::ReadOnly
+    }
+}
+
+impl StructuredResultCapture for AttemptProvider {
+    fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
+        Ok(CapturedToolResult::exact(result))
+    }
+}
+
+struct ChannelReader {
+    receiver: mpsc::Receiver<Vec<u8>>,
+    current: Cursor<Vec<u8>>,
+}
+
+impl ChannelReader {
+    fn new(receiver: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            receiver,
+            current: Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        loop {
+            let read = self.current.read(output)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            match self.receiver.recv() {
+                Ok(bytes) => self.current = Cursor::new(bytes),
+                Err(_) => return Ok(0),
+            }
+        }
+    }
+}
+
+struct LineWriter {
+    pending: Vec<u8>,
+    lines: mpsc::Sender<Vec<u8>>,
+}
+
+impl Write for LineWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        for byte in input {
+            if *byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                self.lines
+                    .send(line)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test receiver"))?;
+            } else {
+                self.pending.push(*byte);
+            }
+        }
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct WriterGateState {
+    entered: bool,
+    released: bool,
+}
+
+struct BlockingWriter {
+    gate: Arc<(Mutex<WriterGateState>, Condvar)>,
+    bytes: Vec<u8>,
+}
+
+impl Write for BlockingWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        let (state, changed) = &*self.gate;
+        let mut state = state.lock().unwrap();
+        state.entered = true;
+        changed.notify_all();
+        while !state.released {
+            state = changed.wait(state).unwrap();
+        }
+        drop(state);
+        self.bytes.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct FailingWriter;
+
+impl Write for FailingWriter {
+    fn write(&mut self, _input: &[u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "injected writer failure",
+        ))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -189,6 +443,34 @@ fn invoke(gateway: &McpGateway, request: Value, context: &GatewayRequestContext)
     ))
 }
 
+fn encoded_line(value: Value) -> Vec<u8> {
+    let mut bytes = serde_json::to_vec(&value).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+fn decoded_lines(bytes: &[u8]) -> Vec<Value> {
+    bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect()
+}
+
+fn cancel_string_id(gateway: &McpGateway, request_id: &str) {
+    let response = gateway.process_bytes(
+        &serde_json::to_vec(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": request_id }
+        }))
+        .unwrap(),
+        &context("logical:test-cancellation"),
+        EphemeralSecrets::empty(),
+    );
+    assert!(response.is_none());
+}
+
 fn initialize(gateway: &McpGateway) {
     let response = invoke(
         gateway,
@@ -208,6 +490,14 @@ fn initialize(gateway: &McpGateway) {
 }
 
 fn gateway(provider: Arc<FakeProvider>) -> McpGateway {
+    McpGateway::new(
+        vec![ProviderRegistration::untrusted(provider)],
+        GatewayLimits::default(),
+    )
+    .unwrap()
+}
+
+fn attempt_gateway(provider: Arc<AttemptProvider>) -> McpGateway {
     McpGateway::new(
         vec![ProviderRegistration::untrusted(provider)],
         GatewayLimits::default(),
@@ -776,7 +1066,7 @@ fn non_read_only_tools_transparently_bypass_reuse_and_reach_the_provider() {
 }
 
 #[test]
-fn untrusted_annotations_cannot_make_an_unknown_tool_replayable() {
+fn annotations_cannot_make_unknown_or_mutating_tools_replayable() {
     let mut annotated = tool("annotated");
     annotated.annotations = Some(json!({
         "readOnlyHint": true,
@@ -788,13 +1078,18 @@ fn untrusted_annotations_cannot_make_an_unknown_tool_replayable() {
             .with_effect("annotated", EffectClass::Unknown),
     );
     let trusted_provider = Arc::new(
-        FakeProvider::new("trusted", vec![annotated])
+        FakeProvider::new("trusted", vec![annotated.clone()])
             .with_effect("annotated", EffectClass::Unknown),
+    );
+    let mutating_provider = Arc::new(
+        FakeProvider::new("mutating", vec![annotated])
+            .with_effect("annotated", EffectClass::Mutating),
     );
     let gateway = McpGateway::new(
         vec![
             ProviderRegistration::untrusted(untrusted_provider),
             ProviderRegistration::trusted_annotations(trusted_provider),
+            ProviderRegistration::trusted_annotations(mutating_provider),
         ],
         GatewayLimits::default(),
     )
@@ -806,18 +1101,15 @@ fn untrusted_annotations_cannot_make_an_unknown_tool_replayable() {
         &context("logical:list-annotations"),
     );
     let tools = listed["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools[0]["name"], "trusted.annotated");
-    assert_eq!(tools[0]["_meta"]["again.dev/effectClass"], "read_only");
-    assert_eq!(
-        tools[0]["_meta"]["again.dev/reuseDisposition"],
-        "eligible_for_state_evaluation"
-    );
-    assert_eq!(tools[1]["name"], "untrusted.annotated");
+    assert_eq!(tools[0]["name"], "mutating.annotated");
+    assert_eq!(tools[0]["_meta"]["again.dev/effectClass"], "mutating");
+    assert_eq!(tools[1]["name"], "trusted.annotated");
     assert_eq!(tools[1]["_meta"]["again.dev/effectClass"], "unknown");
-    assert_eq!(
-        tools[1]["_meta"]["again.dev/reuseDisposition"],
-        "bypass_reuse"
-    );
+    assert_eq!(tools[2]["name"], "untrusted.annotated");
+    assert_eq!(tools[2]["_meta"]["again.dev/effectClass"], "unknown");
+    for tool in tools {
+        assert_eq!(tool["_meta"]["again.dev/reuseDisposition"], "bypass_reuse");
+    }
 }
 
 fn identities_for(provider: FakeProvider) -> (String, String) {
@@ -997,23 +1289,32 @@ fn stdio_reads_cancellation_while_the_provider_call_is_running() {
 }
 
 #[test]
-fn provider_panic_does_not_leave_request_id_permanently_active() {
-    let provider = Arc::new(FakeProvider::new("fake", vec![tool("panic")]).panicking());
-    let gateway = gateway(provider);
-    initialize(&gateway);
-    let request = serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": "same",
-        "method": "tools/call",
-        "params": { "name": "fake.panic", "arguments": {} }
-    }))
-    .unwrap();
-
-    for logical in ["logical:panic-1", "logical:panic-2"] {
-        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            gateway.process_bytes(&request, &context(logical), EphemeralSecrets::empty())
-        }));
-        assert!(unwind.is_err());
+fn provider_panics_before_capture_during_execution_and_during_capture_are_contained() {
+    let providers = [
+        FakeProvider::new("fake", vec![tool("panic")]).panicking_freshness(),
+        FakeProvider::new("fake", vec![tool("panic")]).panicking(),
+        FakeProvider::new("fake", vec![tool("panic")]).panicking_capture(),
+    ];
+    for provider in providers {
+        let gateway = gateway(Arc::new(provider));
+        initialize(&gateway);
+        for logical in ["logical:panic-1", "logical:panic-2"] {
+            let response = invoke(
+                &gateway,
+                json!({
+                    "jsonrpc": "2.0", "id": "same", "method": "tools/call",
+                    "params": { "name": "fake.panic", "arguments": {} }
+                }),
+                &context(logical),
+            );
+            assert_eq!(response["id"], "same");
+            assert_eq!(
+                response["error"]["code"],
+                McpErrorCode::InternalError as i64
+            );
+            assert_eq!(response["error"]["message"], "upstream provider failed");
+            assert!(response["error"].get("data").is_none());
+        }
     }
 }
 
@@ -1040,7 +1341,7 @@ fn stdio_contains_provider_panic_as_payload_free_internal_error() {
         response["error"]["code"],
         McpErrorCode::InternalError as i64
     );
-    assert_eq!(response["error"]["message"], "gateway worker failed");
+    assert_eq!(response["error"]["message"], "upstream provider failed");
     assert!(response["error"].get("data").is_none());
 }
 
