@@ -1,3 +1,8 @@
+#[path = "../src/agent_gateway/protocol.rs"]
+pub mod agent_gateway_protocol;
+mod agent_gateway {
+    pub use crate::agent_gateway_protocol as protocol;
+}
 #[path = "../src/mcp_gateway.rs"]
 mod mcp_gateway;
 

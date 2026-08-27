@@ -10,8 +10,8 @@ use again::store::{
     GatewayAgentContext, GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion,
     GatewayCoordinatorInputV1, GatewayDependencyV1, GatewayExecutionStart, GatewayFailure,
     GatewayFailureReason, GatewayFollowerCancellation, GatewayFreshnessEvidenceV1,
-    GatewayOperationDispositionV1, GatewayPresentation, GatewayRefusalReason, GatewayServedRouteV1,
-    Store, StoredResult, ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayOperationDispositionV1, GatewayRefusalReason, GatewayServedRouteV1, Store, StoredResult,
+    ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -508,18 +508,23 @@ fn delivery_and_cleanup_accounting_are_isolated() {
     let gateway_result_id = complete(&store, &lease, "owner", &result);
     let first = GatewayAgentContext::new("session", "turn", "agent", 0);
     let second = GatewayAgentContext::new("session", "turn", "agent", 1);
-    assert!(
-        store
-            .record_gateway_delivery(&first, &gateway_result_id, GatewayPresentation::Full)
-            .unwrap()
-    );
-    assert!(
-        store
-            .record_gateway_delivery(&second, &gateway_result_id, GatewayPresentation::Full)
-            .unwrap()
-    );
-    assert_eq!(store.clear_gateway_deliveries(&first).unwrap(), 1);
     let connection = Connection::open(root.join("again.sqlite")).unwrap();
+    for context in [&first, &second] {
+        connection
+            .execute(
+                "INSERT INTO gateway_deliveries (session_id, turn_id, agent_id, compaction_epoch, gateway_result_id, presentation, estimated_tokens_avoided, delivered_ms) VALUES (?1, ?2, ?3, ?4, ?5, 'full', 0, ?6)",
+                params![
+                    context.session_id,
+                    context.turn_id,
+                    context.agent_id,
+                    context.compaction_epoch,
+                    gateway_result_id,
+                    now_ms()
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(store.clear_gateway_deliveries(&first).unwrap(), 1);
     connection
         .execute(
             "INSERT INTO gateway_events (event_type, estimated_tokens_avoided, created_ms) VALUES ('old_test_event', 0, 0)",

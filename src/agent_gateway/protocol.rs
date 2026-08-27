@@ -26,6 +26,9 @@ pub const MAX_GATEWAY_TOOL_CALL_BYTES: usize = 80 * 1024;
 pub const MAX_GATEWAY_TOOL_CALL_DEPTH: usize = MAX_CANONICAL_JSON_DEPTH + 8;
 /// The envelope permits the bounded arguments nodes plus its fixed fields.
 pub const MAX_GATEWAY_TOOL_CALL_NODES: usize = MAX_CANONICAL_JSON_NODES + 128;
+pub const DELIVERY_CHALLENGE_SCHEMA_VERSION: u16 = 1;
+pub const DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 1;
+pub const MAX_DELIVERY_IDENTIFIER_BYTES_V1: usize = 128;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.request.v1\0";
 const ADAPTER_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.adapter.v1\0";
@@ -578,6 +581,10 @@ impl DigestReferenceV1 {
         Ok(digest)
     }
 
+    #[allow(
+        dead_code,
+        reason = "standalone protocol consumers do not construct complete gateway calls"
+    )]
     pub(crate) fn validate_bounded(&self) -> Result<(), GatewayProtocolError> {
         validate_digest(self, "digest algorithm", "digest value")
     }
@@ -714,6 +721,321 @@ pub enum PresentationMode {
     DeterministicExcerpt,
     CompactReference,
     FullRetrievalRequired,
+}
+
+/// Payload-free outcomes for recipient-bound delivery authority. These are
+/// deliberately distinct from reuse and execution decisions.
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeliveryAuthorityRefusalV1 {
+    #[error("unsupported_recipient_authority")]
+    UnsupportedRecipientAuthority,
+    #[error("invalid_delivery_binding")]
+    InvalidBinding,
+    #[error("malformed_acknowledgement")]
+    MalformedAcknowledgement,
+    #[error("wrong_connection")]
+    WrongConnection,
+    #[error("wrong_authorization_scope")]
+    WrongAuthorizationScope,
+    #[error("wrong_recipient")]
+    WrongRecipient,
+    #[error("wrong_turn")]
+    WrongTurn,
+    #[error("wrong_call")]
+    WrongCall,
+    #[error("wrong_result")]
+    WrongResult,
+    #[error("wrong_streams")]
+    WrongStreams,
+    #[error("stale_compaction_generation")]
+    StaleCompactionGeneration,
+    #[error("acknowledgement_replayed")]
+    AcknowledgementReplayed,
+    #[error("delivery_authority_retired")]
+    Retired,
+    #[error("delivery_challenge_capacity")]
+    ChallengeCapacity,
+}
+
+impl DeliveryAuthorityRefusalV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::UnsupportedRecipientAuthority => "unsupported_recipient_authority",
+            Self::InvalidBinding => "invalid_delivery_binding",
+            Self::MalformedAcknowledgement => "malformed_acknowledgement",
+            Self::WrongConnection => "wrong_connection",
+            Self::WrongAuthorizationScope => "wrong_authorization_scope",
+            Self::WrongRecipient => "wrong_recipient",
+            Self::WrongTurn => "wrong_turn",
+            Self::WrongCall => "wrong_call",
+            Self::WrongResult => "wrong_result",
+            Self::WrongStreams => "wrong_streams",
+            Self::StaleCompactionGeneration => "stale_compaction_generation",
+            Self::AcknowledgementReplayed => "acknowledgement_replayed",
+            Self::Retired => "delivery_authority_retired",
+            Self::ChallengeCapacity => "delivery_challenge_capacity",
+        }
+    }
+}
+
+/// Complete exact-result status and stream identity acknowledged by a
+/// recipient. Digests are bounded lowercase BLAKE3 hex strings.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryStreamsV1 {
+    exact_status: i32,
+    stdout_digest: String,
+    stdout_bytes: u64,
+    stderr_digest: String,
+    stderr_bytes: u64,
+}
+
+impl DeliveryStreamsV1 {
+    pub fn new(
+        exact_status: i32,
+        stdout_digest: &str,
+        stdout_bytes: u64,
+        stderr_digest: &str,
+        stderr_bytes: u64,
+    ) -> Result<Self, DeliveryAuthorityRefusalV1> {
+        for digest in [stdout_digest, stderr_digest] {
+            validate_delivery_digest_v1(digest)?;
+        }
+        Ok(Self {
+            exact_status,
+            stdout_digest: stdout_digest.to_owned(),
+            stdout_bytes,
+            stderr_digest: stderr_digest.to_owned(),
+            stderr_bytes,
+        })
+    }
+
+    pub const fn exact_status(&self) -> i32 {
+        self.exact_status
+    }
+
+    pub fn stdout_digest(&self) -> &str {
+        &self.stdout_digest
+    }
+
+    pub const fn stdout_bytes(&self) -> u64 {
+        self.stdout_bytes
+    }
+
+    pub fn stderr_digest(&self) -> &str {
+        &self.stderr_digest
+    }
+
+    pub const fn stderr_bytes(&self) -> u64 {
+        self.stderr_bytes
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), DeliveryAuthorityRefusalV1> {
+        validate_delivery_digest_v1(&self.stdout_digest)?;
+        validate_delivery_digest_v1(&self.stderr_digest)
+    }
+}
+
+/// All non-secret fields to which a delivery challenge and its one-use
+/// acknowledgment are bound.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryBindingV1 {
+    authorization_scope_digest: String,
+    connection_digest: String,
+    agent_id: String,
+    session_id: String,
+    turn_id: String,
+    call_digest: String,
+    result_digest: String,
+    streams: DeliveryStreamsV1,
+    compaction_generation: u64,
+}
+
+impl DeliveryBindingV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue(
+        authorization_scope_digest: String,
+        connection_digest: String,
+        agent_id: String,
+        session_id: String,
+        turn_id: String,
+        call_digest: String,
+        result_digest: String,
+        streams: DeliveryStreamsV1,
+        compaction_generation: u64,
+    ) -> Result<Self, DeliveryAuthorityRefusalV1> {
+        for digest in [
+            &authorization_scope_digest,
+            &connection_digest,
+            &call_digest,
+            &result_digest,
+        ] {
+            validate_delivery_digest_v1(digest)?;
+        }
+        for identity in [&agent_id, &session_id, &turn_id] {
+            validate_delivery_identifier_v1(identity)?;
+        }
+        streams.validate()?;
+        Ok(Self {
+            authorization_scope_digest,
+            connection_digest,
+            agent_id,
+            session_id,
+            turn_id,
+            call_digest,
+            result_digest,
+            streams,
+            compaction_generation,
+        })
+    }
+
+    pub fn authorization_scope_digest(&self) -> &str {
+        &self.authorization_scope_digest
+    }
+
+    pub fn connection_digest(&self) -> &str {
+        &self.connection_digest
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn call_digest(&self) -> &str {
+        &self.call_digest
+    }
+
+    pub fn result_digest(&self) -> &str {
+        &self.result_digest
+    }
+
+    pub const fn streams(&self) -> &DeliveryStreamsV1 {
+        &self.streams
+    }
+
+    pub const fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
+    }
+}
+
+/// Wire challenge. The acknowledgment token is not bearer authority: it is
+/// accepted only on the issuing live connection and only once.
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryChallengeV1 {
+    schema_version: u16,
+    challenge_id: String,
+    acknowledgement_token: String,
+    binding: DeliveryBindingV1,
+}
+
+impl DeliveryChallengeV1 {
+    pub(crate) fn issue(
+        challenge_id: String,
+        acknowledgement_token: String,
+        binding: DeliveryBindingV1,
+    ) -> Result<Self, DeliveryAuthorityRefusalV1> {
+        validate_delivery_identifier_v1(&challenge_id)?;
+        validate_delivery_digest_v1(&acknowledgement_token)?;
+        Ok(Self {
+            schema_version: DELIVERY_CHALLENGE_SCHEMA_VERSION,
+            challenge_id,
+            acknowledgement_token,
+            binding,
+        })
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn challenge_id(&self) -> &str {
+        &self.challenge_id
+    }
+
+    pub fn acknowledgement_token(&self) -> &str {
+        &self.acknowledgement_token
+    }
+
+    pub const fn binding(&self) -> &DeliveryBindingV1 {
+        &self.binding
+    }
+}
+
+/// Strict acknowledgment of every challenge binding field. Echoing a result
+/// ID or digest alone is intentionally insufficient.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeliveryAcknowledgementV1 {
+    schema_version: u16,
+    challenge_id: String,
+    acknowledgement_token: String,
+    binding: DeliveryBindingV1,
+}
+
+impl DeliveryAcknowledgementV1 {
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn challenge_id(&self) -> &str {
+        &self.challenge_id
+    }
+
+    pub fn acknowledgement_token(&self) -> &str {
+        &self.acknowledgement_token
+    }
+
+    pub const fn binding(&self) -> &DeliveryBindingV1 {
+        &self.binding
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), DeliveryAuthorityRefusalV1> {
+        if self.schema_version != DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION {
+            return Err(DeliveryAuthorityRefusalV1::MalformedAcknowledgement);
+        }
+        validate_delivery_identifier_v1(&self.challenge_id)?;
+        validate_delivery_digest_v1(&self.acknowledgement_token)?;
+        self.binding.streams.validate()
+    }
+}
+
+impl_redacted_debug!(
+    DeliveryStreamsV1,
+    DeliveryBindingV1,
+    DeliveryChallengeV1,
+    DeliveryAcknowledgementV1,
+);
+
+fn validate_delivery_digest_v1(value: &str) -> Result<(), DeliveryAuthorityRefusalV1> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(DeliveryAuthorityRefusalV1::InvalidBinding);
+    }
+    Ok(())
+}
+
+fn validate_delivery_identifier_v1(value: &str) -> Result<(), DeliveryAuthorityRefusalV1> {
+    if value.is_empty()
+        || value.len() > MAX_DELIVERY_IDENTIFIER_BYTES_V1
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(DeliveryAuthorityRefusalV1::InvalidBinding);
+    }
+    Ok(())
 }
 
 /// Construction input for a validated [`GatewayToolCallV1`].

@@ -11,11 +11,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::agent_gateway::protocol::{
-    EffectClass, FreshnessRequirementV1, GatewayToolCallV1, RequestDigestV1,
+    DeliveryAuthorityRefusalV1, EffectClass, FreshnessRequirementV1, GatewayToolCallV1,
+    RequestDigestV1,
 };
 use crate::fingerprint::{FileDigestCache, FileIdentity};
+use crate::mcp_gateway::ConfirmedDeliveryV1;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -419,31 +421,6 @@ impl GatewayAgentContext {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum GatewayPresentation {
-    Full,
-    Compact { estimated_tokens_avoided: u64 },
-}
-
-impl GatewayPresentation {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Full => "full",
-            Self::Compact { .. } => "compact",
-        }
-    }
-
-    fn estimated_tokens_avoided(self) -> u64 {
-        match self {
-            Self::Full => 0,
-            Self::Compact {
-                estimated_tokens_avoided,
-            } => estimated_tokens_avoided,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct GatewayStats {
@@ -704,7 +681,7 @@ impl Store {
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
         };
         store.migrate()?;
-        store.verify_gateway_schema_v7()?;
+        store.verify_gateway_schema_v8()?;
         store.maybe_cleanup()?;
         set_private_file(&database)?;
         set_private_file(&store.root.join("again.sqlite-wal"))?;
@@ -1018,11 +995,45 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 8 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE gateway_delivery_receipts (
+                    challenge_id TEXT PRIMARY KEY CHECK(length(challenge_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    connection_digest TEXT NOT NULL CHECK(length(connection_digest) = 64),
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
+                    agent_id TEXT NOT NULL CHECK(length(agent_id) BETWEEN 1 AND 128),
+                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
+                    call_digest TEXT NOT NULL CHECK(length(call_digest) = 64),
+                    gateway_result_id TEXT NOT NULL CHECK(length(gateway_result_id) = 64),
+                    result_digest TEXT NOT NULL CHECK(length(result_digest) = 64),
+                    exact_status INTEGER NOT NULL,
+                    stdout_digest TEXT NOT NULL CHECK(length(stdout_digest) = 64),
+                    stdout_bytes INTEGER NOT NULL CHECK(stdout_bytes >= 0),
+                    stderr_digest TEXT NOT NULL CHECK(length(stderr_digest) = 64),
+                    stderr_bytes INTEGER NOT NULL CHECK(stderr_bytes >= 0),
+                    acknowledged_ms INTEGER NOT NULL,
+                    FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id)
+                        ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                CREATE INDEX gateway_delivery_receipts_context_idx
+                    ON gateway_delivery_receipts(
+                        authorization_scope_digest, session_id, turn_id, agent_id,
+                        compaction_generation, gateway_result_id
+                    );
+                PRAGMA user_version = 8;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
-    fn verify_gateway_schema_v7(&self) -> Result<()> {
-        verify_gateway_schema_v7(&self.conn)
+    fn verify_gateway_schema_v8(&self) -> Result<()> {
+        verify_gateway_schema_v8(&self.conn)
     }
 
     pub fn create_call(
@@ -2368,51 +2379,110 @@ impl Store {
         Ok(true)
     }
 
-    pub fn record_gateway_delivery(
+    /// Persist complete recipient delivery only from an opaque confirmation
+    /// issued by the live MCP connection ledger. Callers cannot construct this
+    /// authority from a result ID or content digest.
+    pub(crate) fn confirm_gateway_delivery_v1(
         &self,
-        agent_context: &GatewayAgentContext,
-        gateway_result_id: &str,
-        presentation: GatewayPresentation,
+        delivery: &ConfirmedDeliveryV1,
     ) -> Result<bool> {
-        if !agent_context.is_valid() || agent_context.compaction_epoch > i64::MAX as u64 {
-            bail!(GatewayRefusalReason::InvalidAgentContext.as_str());
+        let binding = delivery.binding();
+        validate_digest(delivery.gateway_result_id(), "gateway result digest")?;
+        if delivery.gateway_result_id() != binding.result_digest()
+            || binding.compaction_generation() > i64::MAX as u64
+            || binding.streams().stdout_bytes() > i64::MAX as u64
+            || binding.streams().stderr_bytes() > i64::MAX as u64
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
-        validate_digest(gateway_result_id, "gateway result digest")?;
         let now = now_ms();
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let visible: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready')",
-            [gateway_result_id],
-            |row| row.get(0),
-        )?;
-        if !visible {
+        let stored = transaction
+            .query_row(
+                "SELECT gateway_results.status, gateway_results.stdout_digest, gateway_results.stdout_bytes, gateway_results.stderr_digest, gateway_results.stderr_bytes, results.exit_code, results.quarantined, results.stdout_digest, results.stdout_bytes, results.stderr_digest, results.stderr_bytes FROM gateway_results JOIN results ON results.id = gateway_results.result_id WHERE gateway_results.gateway_result_id = ?1",
+                [delivery.gateway_result_id()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, u64>(4)?,
+                        row.get::<_, i32>(5)?,
+                        row.get::<_, bool>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, u64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, u64>(10)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            status,
+            gateway_stdout_digest,
+            gateway_stdout_bytes,
+            gateway_stderr_digest,
+            gateway_stderr_bytes,
+            exit_code,
+            source_quarantined,
+            source_stdout_digest,
+            source_stdout_bytes,
+            source_stderr_digest,
+            source_stderr_bytes,
+        )) = stored
+        else {
             transaction.commit()?;
             bail!(GatewayRefusalReason::ResultNotFound.as_str());
+        };
+        let streams = binding.streams();
+        if status != "ready"
+            || source_quarantined
+            || exit_code != streams.exact_status()
+            || gateway_stdout_digest != streams.stdout_digest()
+            || gateway_stdout_bytes != streams.stdout_bytes()
+            || gateway_stderr_digest != streams.stderr_digest()
+            || gateway_stderr_bytes != streams.stderr_bytes()
+            || source_stdout_digest != streams.stdout_digest()
+            || source_stdout_bytes != streams.stdout_bytes()
+            || source_stderr_digest != streams.stderr_digest()
+            || source_stderr_bytes != streams.stderr_bytes()
+        {
+            transaction.commit()?;
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
-        let tokens = presentation.estimated_tokens_avoided();
         let inserted = transaction.execute(
-            "INSERT OR IGNORE INTO gateway_deliveries (session_id, turn_id, agent_id, compaction_epoch, gateway_result_id, presentation, estimated_tokens_avoided, delivered_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT OR IGNORE INTO gateway_delivery_receipts (challenge_id, authorization_scope_digest, connection_digest, session_id, turn_id, agent_id, compaction_generation, call_digest, gateway_result_id, result_digest, exact_status, stdout_digest, stdout_bytes, stderr_digest, stderr_bytes, acknowledged_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
-                agent_context.session_id,
-                agent_context.turn_id,
-                agent_context.agent_id,
-                agent_context.compaction_epoch,
-                gateway_result_id,
-                presentation.as_str(),
-                tokens,
+                delivery.challenge_id(),
+                binding.authorization_scope_digest(),
+                binding.connection_digest(),
+                binding.session_id(),
+                binding.turn_id(),
+                binding.agent_id(),
+                binding.compaction_generation(),
+                binding.call_digest(),
+                delivery.gateway_result_id(),
+                binding.result_digest(),
+                streams.exact_status(),
+                streams.stdout_digest(),
+                streams.stdout_bytes(),
+                streams.stderr_digest(),
+                streams.stderr_bytes(),
                 now
             ],
         )? == 1;
-        if inserted && matches!(presentation, GatewayPresentation::Compact { .. }) {
-            record_gateway_event_v1_tx(
-                &transaction,
-                None,
-                None,
-                Some(gateway_result_id),
-                "compact_delivery",
-                None,
-                tokens,
-                now,
+        if inserted {
+            transaction.execute(
+                "INSERT OR IGNORE INTO gateway_deliveries (session_id, turn_id, agent_id, compaction_epoch, gateway_result_id, presentation, estimated_tokens_avoided, delivered_ms) VALUES (?1, ?2, ?3, ?4, ?5, 'full', 0, ?6)",
+                params![
+                    binding.session_id(),
+                    binding.turn_id(),
+                    binding.agent_id(),
+                    binding.compaction_generation(),
+                    delivery.gateway_result_id(),
+                    now
+                ],
             )?;
         }
         transaction.commit()?;
@@ -2423,7 +2493,17 @@ impl Store {
         if !agent_context.is_valid() || agent_context.compaction_epoch > i64::MAX as u64 {
             bail!(GatewayRefusalReason::InvalidAgentContext.as_str());
         }
-        Ok(self.conn.execute(
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "DELETE FROM gateway_delivery_receipts WHERE session_id = ?1 AND turn_id = ?2 AND agent_id = ?3 AND compaction_generation = ?4",
+            params![
+                agent_context.session_id,
+                agent_context.turn_id,
+                agent_context.agent_id,
+                agent_context.compaction_epoch
+            ],
+        )?;
+        let cleared = transaction.execute(
             "DELETE FROM gateway_deliveries WHERE session_id = ?1 AND turn_id = ?2 AND agent_id = ?3 AND compaction_epoch = ?4",
             params![
                 agent_context.session_id,
@@ -2431,7 +2511,9 @@ impl Store {
                 agent_context.agent_id,
                 agent_context.compaction_epoch
             ],
-        )? as u64)
+        )? as u64;
+        transaction.commit()?;
+        Ok(cleared)
     }
 
     pub fn gateway_stats(&self) -> Result<GatewayStats> {
@@ -3252,6 +3334,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "stdout_bytes"
             | "stderr_bytes"
             | "exit_code"
+            | "exact_status"
             | "duration_ms"
             | "created_ms"
             | "updated_ms"
@@ -3262,8 +3345,10 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "completed_ms"
             | "lifecycle_generation"
             | "compaction_epoch"
+            | "compaction_generation"
             | "estimated_tokens_avoided"
             | "delivered_ms"
+            | "acknowledged_ms"
     ) || (table == "gateway_events" && column == "id");
     let nullable = matches!(
         (table, column),
@@ -3287,7 +3372,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
     (if integer { "INTEGER" } else { "TEXT" }, !nullable)
 }
 
-fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
+fn verify_gateway_schema_v8(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         bail!("Again gateway schema verification requires version {SCHEMA_VERSION}, got {version}");
@@ -3390,6 +3475,27 @@ fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
             ],
         ),
         (
+            "gateway_delivery_receipts",
+            &[
+                "challenge_id",
+                "authorization_scope_digest",
+                "connection_digest",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "call_digest",
+                "gateway_result_id",
+                "result_digest",
+                "exact_status",
+                "stdout_digest",
+                "stdout_bytes",
+                "stderr_digest",
+                "stderr_bytes",
+                "acknowledged_ms",
+            ],
+        ),
+        (
             "gateway_events",
             &[
                 "id",
@@ -3478,6 +3584,20 @@ fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
             false,
         ),
         (
+            "gateway_delivery_receipts",
+            "gateway_delivery_receipts_context_idx",
+            &[
+                "authorization_scope_digest",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "gateway_result_id",
+            ],
+            false,
+            false,
+        ),
+        (
             "gateway_events",
             "gateway_events_created_idx",
             &["created_ms"],
@@ -3555,6 +3675,22 @@ fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
         ),
         ("gateway_deliveries", "CHECK(compaction_epoch >= 0)"),
         (
+            "gateway_delivery_receipts",
+            "CHECK(length(authorization_scope_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(connection_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(compaction_generation >= 0)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "FOREIGN KEY (gateway_result_id) REFERENCES gateway_results",
+        ),
+        (
             "gateway_deliveries",
             "FOREIGN KEY (gateway_result_id) REFERENCES gateway_results",
         ),
@@ -3584,6 +3720,15 @@ fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
         ),
         (
             "result_dependencies",
+            &[(
+                "gateway_results",
+                "gateway_result_id",
+                "gateway_result_id",
+                "CASCADE",
+            )],
+        ),
+        (
+            "gateway_delivery_receipts",
             &[(
                 "gateway_results",
                 "gateway_result_id",

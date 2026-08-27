@@ -22,18 +22,19 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use crate::agent_gateway::protocol::{
-    AgentCallIdentityV1, CanonicalArguments, DigestReferenceV1, EffectClass as CoreEffectClass,
-    FreshnessRequirementV1, GatewayToolCallInputV1, GatewayToolCallV1, ModelIdentityV1,
-    PermissionClass, PresentationMode, ProviderIdentityV1, RepositoryEnvironmentStateV1,
-    StateDigestReferenceV1, TaskIdentityV1, ToolIdentityV1, WorkspaceIdentityV1,
+    AgentCallIdentityV1, CanonicalArguments, DeliveryAuthorityRefusalV1, DeliveryStreamsV1,
+    DigestReferenceV1, EffectClass as CoreEffectClass, FreshnessRequirementV1,
+    GatewayToolCallInputV1, GatewayToolCallV1, ModelIdentityV1, PermissionClass, PresentationMode,
+    ProviderIdentityV1, RepositoryEnvironmentStateV1, StateDigestReferenceV1, TaskIdentityV1,
+    ToolIdentityV1, WorkspaceIdentityV1,
 };
 use crate::agent_gateway::router::{GatewayDecision, RoutingCandidatesV1, route};
 use crate::mcp_gateway::{
-    AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecrets, Freshness,
-    FreshnessMetadata, GatewayLimits, McpError, McpErrorCode, McpGateway, ProviderCall,
-    ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration, ProviderTool,
-    SideEffectClassification, StructuredResultCapture, ToolCancellation, ToolDiscovery,
-    ToolExecution, UpstreamProvider,
+    AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
+    EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, GatewayLimits, McpError,
+    McpErrorCode, McpGateway, ProviderCall, ProviderCancellation, ProviderDescriptor,
+    ProviderError, ProviderRegistration, ProviderTool, SideEffectClassification,
+    StructuredResultCapture, ToolCancellation, ToolDiscovery, ToolExecution, UpstreamProvider,
 };
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
@@ -232,7 +233,11 @@ impl GatewayControlledProviderV1 {
         };
         let value: Value = serde_json::from_slice(&result.stdout)
             .context("decode exact gateway provider result")?;
-        Ok(Some(attach_result_reference_v1(value, gateway_result_id)))
+        Ok(Some(attach_result_reference_v1(
+            value,
+            gateway_result_id,
+            &result.result,
+        )))
     }
 
     fn execute_as_leader(
@@ -353,7 +358,10 @@ impl GatewayControlledProviderV1 {
                     })
                     | Ok(GatewayCompletion::AlreadyCompleted {
                         gateway_result_id, ..
-                    }) => Ok(attach_result_reference_v1(value, &gateway_result_id)),
+                    }) => match self.load_exact(resolved, &gateway_result_id) {
+                        Ok(Some(exact)) => Ok(exact),
+                        Ok(None) | Err(_) => Ok(value),
+                    },
                     Ok(_) | Err(_) => Ok(value),
                 }
             }
@@ -468,7 +476,19 @@ impl SideEffectClassification for GatewayControlledProviderV1 {
 
 impl StructuredResultCapture for GatewayControlledProviderV1 {
     fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
-        self.inner.capture_result(result)
+        let delivery = delivery_capture_v1(&result);
+        let exact = self.inner.capture_result(result)?.into_exact();
+        match delivery {
+            Some((gateway_result_id, result_digest, streams)) => {
+                Ok(CapturedToolResult::exact_with_delivery(
+                    exact,
+                    gateway_result_id,
+                    result_digest,
+                    streams,
+                ))
+            }
+            None => Ok(CapturedToolResult::exact(exact)),
+        }
     }
 }
 
@@ -790,6 +810,29 @@ pub struct ExperimentalMcpGatewayV1 {
     store: Arc<Mutex<Store>>,
 }
 
+struct StoreDeliveryConfirmationSinkV1 {
+    store: Arc<Mutex<Store>>,
+}
+
+impl DeliveryConfirmationSink for StoreDeliveryConfirmationSinkV1 {
+    fn confirm_delivery(
+        &self,
+        delivery: &ConfirmedDeliveryV1,
+    ) -> Result<(), DeliveryAuthorityRefusalV1> {
+        let stored = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .confirm_gateway_delivery_v1(delivery)
+            .map_err(|_| DeliveryAuthorityRefusalV1::InvalidBinding)?;
+        if stored {
+            Ok(())
+        } else {
+            Err(DeliveryAuthorityRefusalV1::AcknowledgementReplayed)
+        }
+    }
+}
+
 impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
@@ -803,7 +846,10 @@ impl ExperimentalMcpGatewayV1 {
         let gateway = McpGateway::new(
             vec![ProviderRegistration::trusted_annotations(controlled)],
             GatewayLimits::default(),
-        )?;
+        )?
+        .with_delivery_confirmation_sink(Arc::new(StoreDeliveryConfirmationSinkV1 {
+            store: Arc::clone(&store),
+        }));
         Ok(Self { gateway, store })
     }
 
@@ -1185,7 +1231,11 @@ fn argument_path_v1(arguments: &Value, default_dot: bool) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn attach_result_reference_v1(mut value: Value, gateway_result_id: &str) -> Value {
+fn attach_result_reference_v1(
+    mut value: Value,
+    gateway_result_id: &str,
+    result: &crate::store::StoredResult,
+) -> Value {
     let Some(object) = value.as_object_mut() else {
         return value;
     };
@@ -1200,10 +1250,39 @@ fn attach_result_reference_v1(mut value: Value, gateway_result_id: &str) -> Valu
         json!({
             "experimental": true,
             "resultId": gateway_result_id,
-            "fullRetrievalAvailable": false
+            "fullRetrievalAvailable": false,
+            "delivery": {
+                "resultDigest": gateway_result_id,
+                "exactStatus": result.exit_code,
+                "stdoutDigest": result.stdout_digest,
+                "stdoutBytes": result.stdout_bytes,
+                "stderrDigest": result.stderr_digest,
+                "stderrBytes": result.stderr_bytes
+            }
         }),
     );
     value
+}
+
+fn delivery_capture_v1(value: &Value) -> Option<(String, String, DeliveryStreamsV1)> {
+    let again = value.get("_meta")?.get("again")?.as_object()?;
+    let gateway_result_id = again.get("resultId")?.as_str()?.to_owned();
+    let delivery = again.get("delivery")?.as_object()?;
+    let result_digest = delivery.get("resultDigest")?.as_str()?.to_owned();
+    let exact_status = i32::try_from(delivery.get("exactStatus")?.as_i64()?).ok()?;
+    let stdout_digest = delivery.get("stdoutDigest")?.as_str()?;
+    let stdout_bytes = delivery.get("stdoutBytes")?.as_u64()?;
+    let stderr_digest = delivery.get("stderrDigest")?.as_str()?;
+    let stderr_bytes = delivery.get("stderrBytes")?.as_u64()?;
+    let streams = DeliveryStreamsV1::new(
+        exact_status,
+        stdout_digest,
+        stdout_bytes,
+        stderr_digest,
+        stderr_bytes,
+    )
+    .ok()?;
+    Some((gateway_result_id, result_digest, streams))
 }
 
 fn canonical_json_bytes_v1(value: &Value) -> Vec<u8> {
