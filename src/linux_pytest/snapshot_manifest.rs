@@ -40,8 +40,9 @@ use super::snapshot_publish::{
     BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, RuntimeMemoryEscrowV1,
     SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
     ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
-    read_bound_regular_bytes_v1, revalidate_bound_regular_bytes_v1,
-    seal_publish_and_bind_snapshot_child_at, validate_snapshot_final_name,
+    read_bound_regular_bytes_v1, revalidate_bound_published_snapshot_root_v1,
+    revalidate_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
+    validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
@@ -285,6 +286,105 @@ impl FirstExecuteOnlyPublishedRuntimeTreeV1<'_> {
 impl fmt::Debug for FirstExecuteOnlyPublishedRuntimeTreeV1<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("FirstExecuteOnlyPublishedRuntimeTreeV1(<opaque-publication>)")
+    }
+}
+
+/// Stable, payload-free root-pair revalidation failures. The role remains
+/// explicit so a workspace root can never be silently substituted for the
+/// independently published runtime root.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyPublishedRootPairRefusalV1 {
+    WorkspaceIdentityDrift,
+    WorkspaceIo,
+    RuntimeIdentityDrift,
+    RuntimeIo,
+}
+
+/// Opaque, linear ownership of the two role-separated publication composites.
+/// The physical roots remain reachable only inside this module, so a future
+/// sealed attachment leaf can consume this type and perform its syscalls here
+/// without adding a raw descriptor/path accessor or arbitrary callback seam.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[must_use = "the two publication-root owners must be consumed or explicitly dropped"]
+pub(super) struct FirstExecuteOnlyRetainedPublishedRootPairV1<'resources> {
+    workspace: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
+    runtime: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyRetainedPublishedRootPairV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyRetainedPublishedRootPairV1")
+            .field("workspace_root", &"<retained-redacted>")
+            .field("runtime_root", &"<retained-redacted>")
+            .finish()
+    }
+}
+
+/// Consume and revalidate both typed publication roots into the only
+/// operation-specific owner that a future manifest-local attachment leaf may
+/// accept. Descriptors, root names, and host paths never escape. This remains
+/// a point-in-time same-process proof and does not claim protection against
+/// same-UID peers or host root; the attachment leaf must revalidate again at
+/// its own irreversible boundary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn consume_first_execute_only_retained_published_root_pair_v1<'resources>(
+    workspace: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
+    runtime: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
+) -> Result<
+    FirstExecuteOnlyRetainedPublishedRootPairV1<'resources>,
+    FirstExecuteOnlyPublishedRootPairRefusalV1,
+> {
+    revalidate_first_execute_only_published_tree_root_v1(&workspace.binding.workspace).map_err(
+        |error| map_root_pair_refusal_v1(error, FirstExecuteOnlyInventoryRootV1::Workspace),
+    )?;
+    revalidate_first_execute_only_published_tree_root_v1(&runtime.tree).map_err(|error| {
+        map_root_pair_refusal_v1(error, FirstExecuteOnlyInventoryRootV1::Runtime)
+    })?;
+    Ok(FirstExecuteOnlyRetainedPublishedRootPairV1 { workspace, runtime })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+fn revalidate_first_execute_only_published_tree_root_v1(
+    tree: &PublishedCanonicalTreeV1<'_>,
+) -> Result<(), BoundRegularReadRefusalV1> {
+    const LINUX_NAME_MAX_V1: usize = 255;
+    let root_name = tree.manifest.root_name();
+    if root_name.is_empty() || root_name.len() > LINUX_NAME_MAX_V1 || root_name.contains(&0) {
+        return Err(BoundRegularReadRefusalV1::InvalidPath);
+    }
+    let mut nul_terminated = [0u8; LINUX_NAME_MAX_V1 + 1];
+    nul_terminated[..root_name.len()].copy_from_slice(root_name);
+    let root_name = CStr::from_bytes_with_nul(&nul_terminated[..root_name.len() + 1])
+        .map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
+    revalidate_bound_published_snapshot_root_v1(
+        &tree.physical,
+        root_name,
+        *tree.manifest.destination_root_statx_commitment_v1(),
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_root_pair_refusal_v1(
+    refusal: BoundRegularReadRefusalV1,
+    role: FirstExecuteOnlyInventoryRootV1,
+) -> FirstExecuteOnlyPublishedRootPairRefusalV1 {
+    let identity = !matches!(refusal, BoundRegularReadRefusalV1::Io);
+    match (role, identity) {
+        (FirstExecuteOnlyInventoryRootV1::Workspace, true) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIdentityDrift
+        }
+        (FirstExecuteOnlyInventoryRootV1::Workspace, false) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIo
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, true) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIdentityDrift
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, false) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIo
+        }
     }
 }
 
@@ -725,6 +825,32 @@ pub(super) fn revalidate_first_execute_only_runtime_inventory_object_v1(
         FirstExecuteOnlyInventoryRootV1::Runtime,
         object,
     )
+}
+
+/// Revalidate one already-role-tagged inventory object through the sealed root
+/// pair. The object's private role selects the matching publication owner;
+/// callers cannot swap roles or obtain either descriptor.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn revalidate_first_execute_only_root_pair_inventory_object_v1(
+    roots: &FirstExecuteOnlyRetainedPublishedRootPairV1<'_>,
+    object: &FirstExecuteOnlyRuntimeInventoryObjectV1,
+) -> Result<(), FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1> {
+    match object.root {
+        FirstExecuteOnlyInventoryRootV1::Workspace => {
+            revalidate_first_execute_only_inventory_object_v1(
+                &roots.workspace.binding.workspace,
+                FirstExecuteOnlyInventoryRootV1::Workspace,
+                object,
+            )
+        }
+        FirstExecuteOnlyInventoryRootV1::Runtime => {
+            revalidate_first_execute_only_inventory_object_v1(
+                &roots.runtime.tree,
+                FirstExecuteOnlyInventoryRootV1::Runtime,
+                object,
+            )
+        }
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]

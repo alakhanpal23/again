@@ -469,6 +469,24 @@ pub(super) fn revalidate_bound_regular_bytes_v1(
     platform::revalidate_bound_regular_bytes_v1(bound, verified)
 }
 
+/// Reopen one already-bound published child by its connector-retained role
+/// name and prove that the selected directory and the pinned root descriptor
+/// still name the exact expected inode. No descriptor or pathname escapes.
+/// This is only a point-in-time revalidation; same-UID peers and host root
+/// remain outside the v1 threat model.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn revalidate_bound_published_snapshot_root_v1(
+    bound: &BoundPublishedSnapshotChildV1,
+    child_name: &CStr,
+    expected_root_statx_commitment: [u8; 102],
+) -> Result<(), BoundRegularReadRefusalV1> {
+    platform::revalidate_bound_published_snapshot_root_v1(
+        bound,
+        child_name,
+        expected_root_statx_commitment,
+    )
+}
+
 const fn cleanup_fd_peak(max_cleanup_depth: u16) -> u32 {
     max_cleanup_depth as u32 * CLEANUP_FDS_PER_DEPTH + CLEANUP_FIXED_FDS
 }
@@ -1812,6 +1830,40 @@ mod platform {
             return Err(BoundRegularReadRefusalV1::IdentityDrift);
         }
         revalidate_bound_ancestors_v1(bound, verified.root_statx_commitment, &verified.pinned_fds)
+    }
+
+    pub(super) fn revalidate_bound_published_snapshot_root_v1(
+        bound: &BoundPublishedSnapshotChildV1,
+        child_name: &CStr,
+        expected_root_statx_commitment: [u8; 102],
+    ) -> Result<(), BoundRegularReadRefusalV1> {
+        if !valid_raw_basename(child_name) {
+            return Err(BoundRegularReadRefusalV1::InvalidPath);
+        }
+        let published_before = node_statx_v1(bound.published.as_fd())?;
+        let root_before = node_statx_v1(bound.root.as_fd())?;
+        if published_before.mode() & libc::S_IFMT != libc::S_IFDIR
+            || root_before.mode() & libc::S_IFMT != libc::S_IFDIR
+            || root_before.commitment_bytes_v1() != expected_root_statx_commitment
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let reopened = open_bound_component_v1(
+            bound.published.as_fd(),
+            child_name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        let reopened_identity = node_statx_v1(reopened.as_fd())?;
+        let root_after = node_statx_v1(bound.root.as_fd())?;
+        let published_after = node_statx_v1(bound.published.as_fd())?;
+        if reopened_identity.mode() & libc::S_IFMT != libc::S_IFDIR
+            || reopened_identity.commitment_bytes_v1() != expected_root_statx_commitment
+            || root_after.commitment_bytes_v1() != expected_root_statx_commitment
+            || published_after.commitment_bytes_v1() != published_before.commitment_bytes_v1()
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        Ok(())
     }
 
     fn split_bound_path_v1(
@@ -5254,6 +5306,37 @@ mod platform {
             );
             drop(bound);
             assert!(fixture.final_path().join("root").is_dir());
+        }
+
+        #[test]
+        fn retained_root_revalidation_reopens_exact_role_name_and_refuses_drift() {
+            let fixture = Fixture::new();
+            let published = fixture.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let reservation = resources
+                .reserve_published_child_bind_attempts(
+                    policy().published_child_bind_operation_attempt_bound(),
+                )
+                .unwrap();
+            let bound =
+                bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap();
+
+            assert_eq!(
+                super::revalidate_bound_published_snapshot_root_v1(&bound, ROOT, expected),
+                Ok(())
+            );
+            fs::set_permissions(
+                fixture
+                    .final_path()
+                    .join(OsStr::from_bytes(ROOT.to_bytes())),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+            assert_eq!(
+                super::revalidate_bound_published_snapshot_root_v1(&bound, ROOT, expected),
+                Err(BoundRegularReadRefusalV1::IdentityDrift)
+            );
         }
 
         fn read_bound_for_test(

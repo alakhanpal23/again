@@ -20,12 +20,15 @@
 use super::ExecutableChainDigest;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
-    FirstExecuteOnlyPublishedRuntimeTreeV1, FirstExecuteOnlyRuntimeInventoryObjectV1,
+    FirstExecuteOnlyPublishedRootPairRefusalV1, FirstExecuteOnlyPublishedRuntimeTreeV1,
+    FirstExecuteOnlyRetainedPublishedRootPairV1, FirstExecuteOnlyRuntimeInventoryObjectV1,
     FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1, FirstExecuteOnlyWorkspaceRuntimeEvidenceV1,
     FirstExecuteOnlyWorkspaceTreeBindingV1,
+    consume_first_execute_only_retained_published_root_pair_v1,
     consume_first_execute_only_workspace_runtime_evidence_v1,
     read_first_execute_only_runtime_inventory_object_v1,
     read_first_execute_only_workspace_inventory_object_v1,
+    revalidate_first_execute_only_root_pair_inventory_object_v1,
     revalidate_first_execute_only_runtime_inventory_object_v1,
     revalidate_first_execute_only_workspace_inventory_object_v1,
 };
@@ -1708,6 +1711,167 @@ impl fmt::Debug for FirstExecuteOnlyRuntimeStructuralInventoryV1<'_> {
     }
 }
 
+/// Stable, payload-free refusal while consuming the structural inventory into
+/// its retained role-specific physical root pair. None is a success-like or
+/// unsupported-profile classification.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
+    SelectedObjectDrift,
+    WorkspaceRootIdentityDrift,
+    WorkspaceRootIo,
+    RuntimeRootIdentityDrift,
+    RuntimeRootIo,
+}
+
+/// Opaque, linear, one-shot ownership of the independently published
+/// workspace and runtime roots. The complete structural inventory, canonical
+/// manifests, descriptor pins, and resource owners remain retained inside;
+/// no descriptor, pathname, bytes, or generic attachment accessor exists.
+///
+/// This is a precursor for a future operation-specific child attachment leaf,
+/// not mount, loader, isolation, command, execution, candidate, replay, or
+/// reuse authority. The v1 same-UID/host-root nonclaim remains unchanged.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[must_use = "the linear publication-root owners must be consumed or explicitly dropped"]
+pub(super) struct FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources> {
+    _roots: FirstExecuteOnlyRetainedPublishedRootPairV1<'resources>,
+    _runtime_closure_request: RuntimeClosureRequestV1,
+    _checkpoint_canonical_bytes: Box<[u8]>,
+    _checkpoint_chain_digest: ExecutableChainDigest,
+    _workspace_root_digest: NodeDigest,
+    _terminal_node_digest: NodeDigest,
+    _terminal_content_digest: FileContentDigest,
+    _checkpoint_node_count: u8,
+    _checkpoint_symlink_hop_count: u8,
+    _plan: RuntimeForestPlanV1,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FirstExecuteOnlyRuntimeRetainedRootPairV1<'_> {
+    pub(super) const fn loader_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn profile_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn isolation_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn attachment_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn command_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn execution_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn candidate_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn replay_authority(&self) -> bool {
+        false
+    }
+
+    pub(super) const fn reuse_authority(&self) -> bool {
+        false
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl fmt::Debug for FirstExecuteOnlyRuntimeRetainedRootPairV1<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlyRuntimeRetainedRootPairV1")
+            .field("workspace_root", &"<retained-redacted>")
+            .field("runtime_root", &"<retained-redacted>")
+            .field("attachment_authority", &false)
+            .field("execution_authority", &false)
+            .finish()
+    }
+}
+
+/// Consume the only two-publication structural inventory, revalidate every
+/// retained selected-object pin and both typed publication roots, then retain
+/// the complete owner inside a one-shot role pair. The projection cannot be
+/// repeated because success consumes the inventory and the result is neither
+/// cloneable nor copyable.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn project_first_execute_only_runtime_retained_root_pair_v1<'resources>(
+    inventory: FirstExecuteOnlyRuntimeStructuralInventoryV1<'resources>,
+) -> Result<
+    FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>,
+    FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1,
+> {
+    let FirstExecuteOnlyRuntimeStructuralInventoryV1 {
+        _checkpoint,
+        _runtime_publication,
+        plan,
+    } = inventory;
+    let FirstExecuteOnlyRuntimeCheckpointV1 {
+        _evidence,
+        _runtime_closure_request,
+        _canonical_bytes,
+        chain_digest,
+        workspace_root_digest,
+        terminal_node_digest,
+        terminal_content_digest,
+        node_count,
+        symlink_hop_count,
+    } = _checkpoint;
+    let roots =
+        consume_first_execute_only_retained_published_root_pair_v1(_evidence, _runtime_publication)
+            .map_err(map_published_root_pair_refusal_v1)?;
+    for node in &plan.nodes {
+        let object = node
+            .publication
+            .as_ref()
+            .ok_or(FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift)?;
+        revalidate_first_execute_only_root_pair_inventory_object_v1(&roots, object)
+            .map_err(|_| FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift)?;
+    }
+    Ok(FirstExecuteOnlyRuntimeRetainedRootPairV1 {
+        _roots: roots,
+        _runtime_closure_request,
+        _checkpoint_canonical_bytes: _canonical_bytes,
+        _checkpoint_chain_digest: chain_digest,
+        _workspace_root_digest: workspace_root_digest,
+        _terminal_node_digest: terminal_node_digest,
+        _terminal_content_digest: terminal_content_digest,
+        _checkpoint_node_count: node_count,
+        _checkpoint_symlink_hop_count: symlink_hop_count,
+        _plan: plan,
+    })
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_published_root_pair_refusal_v1(
+    refusal: FirstExecuteOnlyPublishedRootPairRefusalV1,
+) -> FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
+    match refusal {
+        FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIdentityDrift => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceRootIdentityDrift
+        }
+        FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIo => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceRootIo
+        }
+        FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIdentityDrift => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootIdentityDrift
+        }
+        FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIo => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootIo
+        }
+    }
+}
+
 /// Consume the descriptor-bound executable checkpoint and one actual runtime
 /// publication into a non-authoritative structural inventory. This function
 /// does not model ld.so search, cache, preload, environment, RUNPATH/RPATH, or
@@ -2890,7 +3054,17 @@ mod tests {
     }
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    fn run_real_publication_inventory_case(mutate_runtime_after_publication: bool) {
+    #[derive(Clone, Copy)]
+    enum RealPublicationMutationV1 {
+        None,
+        RuntimeObjectBeforeInventory,
+        WorkspaceRootBeforeProjection,
+        RuntimeRootBeforeProjection,
+        RuntimeObjectBeforeProjection,
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn run_real_publication_inventory_case(mutation: RealPublicationMutationV1) {
         let workspace_source = tempfile::tempdir().unwrap();
         let workspace_root = workspace_source.path().join("root");
         fs::create_dir_all(workspace_root.join(".venv/bin")).unwrap();
@@ -2999,7 +3173,10 @@ mod tests {
         let expected_workspace_root = checkpoint.workspace_root_digest();
         let expected_runtime_root = runtime_publication_token.root_digest();
 
-        if mutate_runtime_after_publication {
+        if matches!(
+            mutation,
+            RealPublicationMutationV1::RuntimeObjectBeforeInventory
+        ) {
             fs::set_permissions(
                 runtime_publication
                     .path()
@@ -3034,6 +3211,67 @@ mod tests {
             assert!(!inventory.candidate_authority());
             assert!(!inventory.replay_authority());
             assert!(!inventory.reuse_authority());
+
+            match mutation {
+                RealPublicationMutationV1::None => {
+                    let roots = project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                        .expect("unchanged publications must form the one-shot root pair");
+                    let debug = format!("{roots:?}");
+                    assert!(debug.contains("<retained-redacted>"));
+                    assert!(!debug.contains("workspace-final"));
+                    assert!(!debug.contains("runtime-final"));
+                    assert!(!roots.loader_authority());
+                    assert!(!roots.profile_authority());
+                    assert!(!roots.isolation_authority());
+                    assert!(!roots.attachment_authority());
+                    assert!(!roots.command_authority());
+                    assert!(!roots.execution_authority());
+                    assert!(!roots.candidate_authority());
+                    assert!(!roots.replay_authority());
+                    assert!(!roots.reuse_authority());
+                }
+                RealPublicationMutationV1::WorkspaceRootBeforeProjection => {
+                    fs::set_permissions(
+                        workspace_publication.path().join("workspace-final/root"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                            .unwrap_err(),
+                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceRootIdentityDrift
+                    );
+                }
+                RealPublicationMutationV1::RuntimeRootBeforeProjection => {
+                    fs::set_permissions(
+                        runtime_publication.path().join("runtime-final/root"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                            .unwrap_err(),
+                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootIdentityDrift
+                    );
+                }
+                RealPublicationMutationV1::RuntimeObjectBeforeProjection => {
+                    fs::set_permissions(
+                        runtime_publication
+                            .path()
+                            .join("runtime-final/root/lib64/libc.so.6"),
+                        fs::Permissions::from_mode(0o600),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                            .unwrap_err(),
+                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift
+                    );
+                }
+                RealPublicationMutationV1::RuntimeObjectBeforeInventory => {
+                    unreachable!("pre-inventory mutation handled above")
+                }
+            }
         }
 
         make_published_tree_owner_writable(workspace_publication.path());
@@ -3043,8 +3281,17 @@ mod tests {
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
     fn real_connector_publications_bind_runtime_inventory_and_refuse_later_mutation() {
-        run_real_publication_inventory_case(false);
-        run_real_publication_inventory_case(true);
+        run_real_publication_inventory_case(RealPublicationMutationV1::None);
+        run_real_publication_inventory_case(
+            RealPublicationMutationV1::RuntimeObjectBeforeInventory,
+        );
+        run_real_publication_inventory_case(
+            RealPublicationMutationV1::WorkspaceRootBeforeProjection,
+        );
+        run_real_publication_inventory_case(RealPublicationMutationV1::RuntimeRootBeforeProjection);
+        run_real_publication_inventory_case(
+            RealPublicationMutationV1::RuntimeObjectBeforeProjection,
+        );
     }
 
     #[test]
@@ -3730,5 +3977,28 @@ mod tests {
         assert!(std::mem::needs_drop::<
             FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
         >());
+        <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<
+            FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
+        >());
+        <FirstExecuteOnlyRetainedPublishedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyRetainedPublishedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
+        assert!(std::mem::needs_drop::<
+            FirstExecuteOnlyRetainedPublishedRootPairV1<'static>,
+        >());
+        let _one_shot_projection: fn(
+            FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
+        ) -> Result<
+            FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1,
+        > = project_first_execute_only_runtime_retained_root_pair_v1;
+        let _typed_root_roles: fn(
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'static>,
+            FirstExecuteOnlyPublishedRuntimeTreeV1<'static>,
+        ) -> Result<
+            FirstExecuteOnlyRetainedPublishedRootPairV1<'static>,
+            FirstExecuteOnlyPublishedRootPairRefusalV1,
+        > = consume_first_execute_only_retained_published_root_pair_v1;
     }
 }
