@@ -6,6 +6,7 @@ use super::protocol::{
     DigestReferenceV1, EffectClass, FreshnessRequirementV1, GatewayAdapterToolCallV1,
     GatewayToolCallV1, PermissionClass, RepositoryEnvironmentStateV1, RequestDigestV1,
 };
+use crate::store::{StoreExactResultProofV1, StoreInflightJoinProofV1};
 
 const MAX_ORIGIN_IDENTIFIER_BYTES_V1: usize = 128;
 
@@ -138,6 +139,7 @@ enum VerifiedCandidateOriginV1 {
         model_id: String,
         model_version: String,
     },
+    LegacyUntrustedStoreObservation,
 }
 
 impl fmt::Debug for VerifiedCandidateOriginV1 {
@@ -146,6 +148,7 @@ impl fmt::Debug for VerifiedCandidateOriginV1 {
             Self::RecordedExecution { .. } => "recorded_execution",
             Self::DeterministicCoverage { .. } => "deterministic_coverage",
             Self::SemanticOrAiGenerated { .. } => "semantic_or_ai_generated",
+            Self::LegacyUntrustedStoreObservation => "legacy_untrusted_store_observation",
         };
         formatter
             .debug_struct("VerifiedCandidateOriginV1")
@@ -163,7 +166,7 @@ pub enum CandidateFreshnessV1 {
 
 /// Opaque candidate. Public callers can create only semantic/AI retrieval
 /// candidates, which can never satisfy either serve branch.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub struct ReuseCandidateV1 {
     request_digest: RequestDigestV1,
     result_digest: DigestReferenceV1,
@@ -259,9 +262,7 @@ pub(crate) fn issue_recorded_candidate_v1(
     Ok(ReuseCandidateV1 {
         request_digest: evidence.request_digest,
         result_digest: evidence.result_digest,
-        origin: VerifiedCandidateOriginV1::RecordedExecution {
-            store_record_digest: evidence.store_record_digest,
-        },
+        origin: VerifiedCandidateOriginV1::LegacyUntrustedStoreObservation,
         freshness: evidence.freshness,
     })
 }
@@ -307,7 +308,7 @@ pub(crate) fn issue_coverage_candidate_v1(
     })
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub(crate) struct InflightJoinEvidenceV1 {
     request_digest: RequestDigestV1,
     effect_class: EffectClass,
@@ -375,11 +376,11 @@ pub(crate) fn issue_inflight_join_evidence_v1(
     })
 }
 
-#[derive(Clone, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct RoutingCandidatesV1 {
-    exact: Option<ReuseCandidateV1>,
+    store_exact: Option<StoreExactResultProofV1>,
     deterministic_coverage: Option<ReuseCandidateV1>,
-    inflight: Option<InflightJoinEvidenceV1>,
+    store_inflight: Option<StoreInflightJoinProofV1>,
     semantic: Option<ReuseCandidateV1>,
 }
 
@@ -400,13 +401,14 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    pub(crate) fn with_exact(mut self, candidate: ReuseCandidateV1) -> Self {
-        if matches!(
-            candidate.origin,
-            VerifiedCandidateOriginV1::RecordedExecution { .. }
-        ) {
-            self.exact = Some(candidate);
-        }
+    pub(crate) fn with_exact(self, _candidate: ReuseCandidateV1) -> Self {
+        // Compatibility only: caller-described evidence can no longer enter
+        // the exact-serve slot. Store transactions issue the sealed proof.
+        self
+    }
+
+    pub fn with_store_exact_proof(mut self, proof: StoreExactResultProofV1) -> Self {
+        self.store_exact = Some(proof);
         self
     }
 
@@ -421,8 +423,14 @@ impl RoutingCandidatesV1 {
         self
     }
 
-    pub(crate) fn with_inflight(mut self, evidence: InflightJoinEvidenceV1) -> Self {
-        self.inflight = Some(evidence);
+    pub(crate) fn with_inflight(self, _evidence: InflightJoinEvidenceV1) -> Self {
+        // Compatibility only; synthesized lifecycle observations do not grant
+        // join authority.
+        self
+    }
+
+    pub fn with_store_inflight_proof(mut self, proof: StoreInflightJoinProofV1) -> Self {
+        self.store_inflight = Some(proof);
         self
     }
 }
@@ -446,13 +454,8 @@ pub fn route(call: &GatewayToolCallV1, candidates: &RoutingCandidatesV1) -> Gate
     }
 
     let request_digest = call.request_digest();
-    if let Some(candidate) = &candidates.exact
-        && candidate.request_digest == request_digest
-        && matches!(
-            candidate.origin,
-            VerifiedCandidateOriginV1::RecordedExecution { .. }
-        )
-        && freshness_satisfies(call.freshness(), candidate.freshness)
+    if let Some(proof) = &candidates.store_exact
+        && proof.authorizes_router_call_v1(call)
     {
         return GatewayDecision::ServeExact;
     }
@@ -466,13 +469,8 @@ pub fn route(call: &GatewayToolCallV1, candidates: &RoutingCandidatesV1) -> Gate
     {
         return GatewayDecision::ServeDeterministicCoverage;
     }
-    if let Some(inflight) = &candidates.inflight
-        && inflight.lifecycle_generation == inflight.observed_generation
-        && inflight.lifecycle_generation != 0
-        && inflight.request_digest == request_digest
-        && inflight.effect_class == call.effect_class()
-        && inflight_freshness_is_bound_v1(inflight)
-        && freshness_satisfies(call.freshness(), inflight.freshness)
+    if let Some(proof) = &candidates.store_inflight
+        && proof.authorizes_router_call_v1(call)
     {
         return GatewayDecision::JoinInflight;
     }
@@ -481,23 +479,6 @@ pub fn route(call: &GatewayToolCallV1, candidates: &RoutingCandidatesV1) -> Gate
     } else {
         GatewayDecision::Execute
     }
-}
-
-fn inflight_freshness_is_bound_v1(evidence: &InflightJoinEvidenceV1) -> bool {
-    let Some(age) = evidence
-        .observed_at_millis
-        .checked_sub(evidence.started_at_millis)
-    else {
-        return false;
-    };
-    let derived = if evidence.revalidated_at_generation == Some(evidence.lifecycle_generation) {
-        CandidateFreshnessV1::Revalidated
-    } else if evidence.effect_class == EffectClass::SnapshotRead {
-        CandidateFreshnessV1::ExactSnapshot
-    } else {
-        CandidateFreshnessV1::AgeMillis(age)
-    };
-    evidence.freshness == derived
 }
 
 fn freshness_satisfies(
@@ -576,7 +557,7 @@ mod authority_tests {
     }
 
     #[test]
-    fn private_store_and_coverage_issuers_bind_all_authority_inputs() {
+    fn legacy_store_observations_cannot_serve_but_coverage_stays_sealed() {
         let call = call(EffectClass::SnapshotRead, FreshnessRequirementV1::Snapshot);
         let exact = issue_recorded_candidate_v1(VerifiedStoreCandidateEvidenceV1 {
             request_digest: call.request_digest(),
@@ -587,7 +568,7 @@ mod authority_tests {
         .unwrap();
         assert_eq!(
             route(&call, &RoutingCandidatesV1::default().with_exact(exact)),
-            GatewayDecision::ServeExact
+            GatewayDecision::Execute
         );
         let coverage = issue_coverage_candidate_v1(VerifiedCoverageEvidenceV1 {
             request_digest: call.request_digest(),
@@ -610,7 +591,7 @@ mod authority_tests {
     }
 
     #[test]
-    fn coordinator_evidence_enforces_generation_effect_and_every_freshness_mode() {
+    fn legacy_coordinator_observations_cannot_join() {
         let bounded_call = call(
             EffectClass::FreshnessBoundRead,
             FreshnessRequirementV1::MaxAgeMillis(50),
@@ -630,7 +611,7 @@ mod authority_tests {
                 &bounded_call,
                 &RoutingCandidatesV1::default().with_inflight(fresh)
             ),
-            GatewayDecision::JoinInflight
+            GatewayDecision::Execute
         );
         let stale = issue_inflight_join_evidence_v1(observation(51, false)).unwrap();
         assert_eq!(
@@ -660,7 +641,7 @@ mod authority_tests {
                 &revalidation_call,
                 &RoutingCandidatesV1::default().with_inflight(evidence)
             ),
-            GatewayDecision::JoinInflight
+            GatewayDecision::Execute
         );
     }
 

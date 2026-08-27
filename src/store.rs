@@ -10,9 +10,12 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent_gateway::protocol::{
+    EffectClass, FreshnessRequirementV1, GatewayToolCallV1, RequestDigestV1,
+};
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -460,6 +463,146 @@ pub struct GatewayFullResultV1 {
     pub dependencies: Vec<GatewayDependencyV1>,
 }
 
+/// Store-transaction-issued, one-shot exact result authority. The private
+/// fields, lack of `Clone` and lack of `Deserialize` prevent caller-created or
+/// duplicated serve claims.
+pub struct StoreExactResultProofV1 {
+    used: std::cell::Cell<bool>,
+    request_digest: RequestDigestV1,
+    binding_digest: String,
+    state_digest: String,
+    policy_digest: String,
+    dependency_digest: String,
+    effect: EffectClass,
+    freshness: FreshnessRequirementV1,
+    lifecycle_generation: u64,
+    observed_generation: u64,
+    execution_started_ms: u64,
+    observed_at_ms: u64,
+    gateway_result_id: String,
+    store_record_digest: String,
+}
+
+impl std::fmt::Debug for StoreExactResultProofV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreExactResultProofV1(<redacted>)")
+    }
+}
+
+impl StoreExactResultProofV1 {
+    pub fn gateway_result_id(&self) -> &str {
+        &self.gateway_result_id
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub(crate) fn authorizes_router_call_v1(&self, call: &GatewayToolCallV1) -> bool {
+        !self.used.replace(true)
+            && self.proof_invariants_hold_v1()
+            && self.request_digest == call.request_digest()
+            && self.effect == call.effect_class()
+            && self.freshness == call.freshness()
+            && freshness_requirement_holds_v1(
+                self.freshness,
+                self.execution_started_ms,
+                self.observed_at_ms,
+            )
+    }
+
+    fn proof_invariants_hold_v1(&self) -> bool {
+        self.lifecycle_generation != 0
+            && self.lifecycle_generation == self.observed_generation
+            && self.execution_started_ms <= self.observed_at_ms
+            && valid_digest_v1(&self.binding_digest)
+            && valid_digest_v1(&self.state_digest)
+            && valid_digest_v1(&self.policy_digest)
+            && valid_digest_v1(&self.dependency_digest)
+            && valid_digest_v1(&self.gateway_result_id)
+            && valid_digest_v1(&self.store_record_digest)
+    }
+}
+
+/// Store-transaction-issued, one-shot authority to join one actual active
+/// lease generation. It never carries result serve authority.
+pub struct StoreInflightJoinProofV1 {
+    used: std::cell::Cell<bool>,
+    request_digest: RequestDigestV1,
+    binding_digest: String,
+    state_digest: String,
+    policy_digest: String,
+    dependency_digest: String,
+    effect: EffectClass,
+    freshness: FreshnessRequirementV1,
+    lifecycle_generation: u64,
+    observed_generation: u64,
+    execution_started_ms: u64,
+    observed_at_ms: u64,
+    lease_record_digest: String,
+}
+
+impl std::fmt::Debug for StoreInflightJoinProofV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("StoreInflightJoinProofV1(<redacted>)")
+    }
+}
+
+impl StoreInflightJoinProofV1 {
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub(crate) fn authorizes_router_call_v1(&self, call: &GatewayToolCallV1) -> bool {
+        !self.used.replace(true)
+            && self.lifecycle_generation != 0
+            && self.lifecycle_generation == self.observed_generation
+            && self.execution_started_ms <= self.observed_at_ms
+            && valid_digest_v1(&self.binding_digest)
+            && valid_digest_v1(&self.state_digest)
+            && valid_digest_v1(&self.policy_digest)
+            && valid_digest_v1(&self.dependency_digest)
+            && valid_digest_v1(&self.lease_record_digest)
+            && self.request_digest == call.request_digest()
+            && self.effect == call.effect_class()
+            && self.freshness == call.freshness()
+            && freshness_requirement_holds_v1(
+                self.freshness,
+                self.execution_started_ms,
+                self.observed_at_ms,
+            )
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayRouteProofUnavailableV1 {
+    Missing,
+    ExecutionNotStarted,
+    BindingMismatch,
+    Freshness,
+    Quarantined,
+}
+
+pub enum GatewayRouteProofObservationV1 {
+    Exact(StoreExactResultProofV1),
+    Inflight(StoreInflightJoinProofV1),
+    Unavailable(GatewayRouteProofUnavailableV1),
+}
+
+impl std::fmt::Debug for GatewayRouteProofObservationV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = match self {
+            Self::Exact(_) => "exact",
+            Self::Inflight(_) => "inflight",
+            Self::Unavailable(_) => "unavailable",
+        };
+        formatter
+            .debug_struct("GatewayRouteProofObservationV1")
+            .field("kind", &kind)
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Store {
     root: PathBuf,
     blobs: PathBuf,
@@ -531,7 +674,7 @@ impl Store {
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
         };
         store.migrate()?;
-        store.verify_gateway_schema_v6()?;
+        store.verify_gateway_schema_v7()?;
         store.maybe_cleanup()?;
         set_private_file(&database)?;
         set_private_file(&store.root.join("again.sqlite-wal"))?;
@@ -818,11 +961,38 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 7 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE inflight_leases
+                    ADD COLUMN lifecycle_generation INTEGER NOT NULL DEFAULT 1
+                    CHECK(lifecycle_generation > 0);
+                UPDATE inflight_leases AS current
+                SET lifecycle_generation = (
+                    SELECT COUNT(*)
+                    FROM inflight_leases AS prior
+                    WHERE prior.binding_digest = current.binding_digest
+                      AND (
+                          prior.acquired_ms < current.acquired_ms
+                          OR (
+                              prior.acquired_ms = current.acquired_ms
+                              AND prior.lease_id <= current.lease_id
+                          )
+                      )
+                );
+                CREATE UNIQUE INDEX inflight_leases_generation_idx
+                    ON inflight_leases(binding_digest, lifecycle_generation);
+                PRAGMA user_version = 7;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
-    fn verify_gateway_schema_v6(&self) -> Result<()> {
-        verify_gateway_schema_v6(&self.conn)
+    fn verify_gateway_schema_v7(&self) -> Result<()> {
+        verify_gateway_schema_v7(&self.conn)
     }
 
     pub fn create_call(
@@ -1244,6 +1414,15 @@ impl Store {
         }
 
         let lease_id = format!("gl_{}", Uuid::new_v4().simple());
+        let prior_generation = transaction.query_row(
+            "SELECT COALESCE(MAX(lifecycle_generation), 0) FROM inflight_leases WHERE binding_digest = ?1",
+            [binding.binding_digest()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let lifecycle_generation = prior_generation
+            .checked_add(1)
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| anyhow!("gateway lease lifecycle generation exhausted"))?;
         let expires_at_ms = now
             .saturating_add(GATEWAY_LEASE_TTL_MS)
             .min(binding.input.freshness.valid_until_ms);
@@ -1260,7 +1439,7 @@ impl Store {
             now,
         )?;
         transaction.execute(
-            "INSERT INTO inflight_leases (lease_id, call_id, request_digest, state_digest, policy_digest, binding_digest, freshness_valid_until_ms, owner, status, acquired_ms, heartbeat_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9, ?10)",
+            "INSERT INTO inflight_leases (lease_id, call_id, request_digest, state_digest, policy_digest, binding_digest, freshness_valid_until_ms, owner, status, acquired_ms, heartbeat_ms, expires_ms, lifecycle_generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'active', ?9, ?9, ?10, ?11)",
             params![
                 lease_id,
                 call_id,
@@ -1271,7 +1450,8 @@ impl Store {
                 binding.input.freshness.valid_until_ms,
                 owner,
                 now,
-                expires_at_ms
+                expires_at_ms,
+                lifecycle_generation
             ],
         )?;
         record_gateway_event_v1_tx(
@@ -1469,6 +1649,199 @@ impl Store {
                 None => GatewayCallObservation::Missing,
             },
         )
+    }
+
+    /// Observe one validated binding and issue at most one transaction-time
+    /// router proof from the exact committed store rows. This does not load or
+    /// present result bytes and grants no authority by itself.
+    pub fn observe_gateway_route_proof_v1(
+        &self,
+        binding: &ValidatedGatewayReadV1,
+        call: &GatewayToolCallV1,
+    ) -> Result<GatewayRouteProofObservationV1> {
+        if call.request_digest().as_str() != binding.request_digest()
+            || !matches!(
+                call.effect_class(),
+                EffectClass::SnapshotRead
+                    | EffectClass::FreshnessBoundRead
+                    | EffectClass::DeterministicCompute
+            )
+        {
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::BindingMismatch,
+            ));
+        }
+        let now = now_ms();
+        if !freshness_is_current(binding, now) {
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::Freshness,
+            ));
+        }
+        let observed_at_ms = u64::try_from(now)
+            .map_err(|_| anyhow!("gateway proof observation time is negative"))?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        expire_gateway_leases_v1_tx(&transaction, now, Some(binding.binding_digest()))?;
+        let quarantined: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_results WHERE binding_digest = ?1 AND status = 'quarantined')",
+            [binding.binding_digest()],
+            |row| row.get(0),
+        )?;
+        if quarantined {
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::Quarantined,
+            ));
+        }
+        let ready = transaction
+            .query_row(
+                "SELECT gateway_result_id, lease_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                [binding.binding_digest()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((gateway_result_id, lease_id)) = ready {
+            if !gateway_result_row_valid_v1(&transaction, binding, &gateway_result_id)? {
+                transaction.commit()?;
+                return Ok(GatewayRouteProofObservationV1::Unavailable(
+                    GatewayRouteProofUnavailableV1::BindingMismatch,
+                ));
+            }
+            let Some(lease) = gateway_lease_row_v1(&transaction, &lease_id)? else {
+                transaction.commit()?;
+                return Ok(GatewayRouteProofObservationV1::Unavailable(
+                    GatewayRouteProofUnavailableV1::BindingMismatch,
+                ));
+            };
+            let Some(started_at_ms) = lease
+                .execution_started_ms
+                .and_then(|value| value.try_into().ok())
+            else {
+                transaction.commit()?;
+                return Ok(GatewayRouteProofObservationV1::Unavailable(
+                    GatewayRouteProofUnavailableV1::ExecutionNotStarted,
+                ));
+            };
+            let Some(completed_at_ms) = lease
+                .completed_ms
+                .and_then(|value| u64::try_from(value).ok())
+            else {
+                transaction.commit()?;
+                return Ok(GatewayRouteProofObservationV1::Unavailable(
+                    GatewayRouteProofUnavailableV1::BindingMismatch,
+                ));
+            };
+            let current_generation = transaction.query_row(
+                "SELECT MAX(lifecycle_generation) FROM inflight_leases WHERE binding_digest = ?1",
+                [binding.binding_digest()],
+                |row| row.get::<_, u64>(0),
+            )?;
+            if lease.status != "completed"
+                || lease.gateway_result_id.as_deref() != Some(&gateway_result_id)
+                || lease.request_digest != binding.input.request_digest
+                || lease.state_digest != binding.input.state_digest
+                || lease.policy_digest != binding.input.policy_digest
+                || lease.binding_digest != binding.binding_digest
+                || current_generation != lease.lifecycle_generation
+                || completed_at_ms < started_at_ms
+                || completed_at_ms > observed_at_ms
+                || !freshness_requirement_holds_v1(call.freshness(), started_at_ms, observed_at_ms)
+            {
+                transaction.commit()?;
+                return Ok(GatewayRouteProofObservationV1::Unavailable(
+                    GatewayRouteProofUnavailableV1::Freshness,
+                ));
+            }
+            let dependency_digest = gateway_dependency_digest_v1(&binding.input.dependencies);
+            let store_record_digest = exact_store_record_digest_v1(
+                binding,
+                &lease,
+                &gateway_result_id,
+                &dependency_digest,
+            );
+            let proof = StoreExactResultProofV1 {
+                used: std::cell::Cell::new(false),
+                request_digest: call.request_digest(),
+                binding_digest: binding.binding_digest.clone(),
+                state_digest: binding.input.state_digest.clone(),
+                policy_digest: binding.input.policy_digest.clone(),
+                dependency_digest,
+                effect: call.effect_class(),
+                freshness: call.freshness(),
+                lifecycle_generation: lease.lifecycle_generation,
+                observed_generation: current_generation,
+                execution_started_ms: started_at_ms,
+                observed_at_ms,
+                gateway_result_id,
+                store_record_digest,
+            };
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Exact(proof));
+        }
+
+        let active_lease_id = transaction
+            .query_row(
+                "SELECT lease_id FROM inflight_leases WHERE binding_digest = ?1 AND status = 'active'",
+                [binding.binding_digest()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(active_lease_id) = active_lease_id else {
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::Missing,
+            ));
+        };
+        let Some(lease) = gateway_lease_row_v1(&transaction, &active_lease_id)? else {
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::Missing,
+            ));
+        };
+        let Some(started_at_ms) = lease
+            .execution_started_ms
+            .and_then(|value| value.try_into().ok())
+        else {
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::ExecutionNotStarted,
+            ));
+        };
+        let current_generation = transaction.query_row(
+            "SELECT MAX(lifecycle_generation) FROM inflight_leases WHERE binding_digest = ?1",
+            [binding.binding_digest()],
+            |row| row.get::<_, u64>(0),
+        )?;
+        if current_generation != lease.lifecycle_generation
+            || lease.request_digest != binding.input.request_digest
+            || lease.state_digest != binding.input.state_digest
+            || lease.policy_digest != binding.input.policy_digest
+            || !freshness_requirement_holds_v1(call.freshness(), started_at_ms, observed_at_ms)
+        {
+            transaction.commit()?;
+            return Ok(GatewayRouteProofObservationV1::Unavailable(
+                GatewayRouteProofUnavailableV1::Freshness,
+            ));
+        }
+        let dependency_digest = gateway_dependency_digest_v1(&binding.input.dependencies);
+        let lease_record_digest =
+            inflight_store_record_digest_v1(binding, &lease, observed_at_ms, &dependency_digest);
+        let proof = StoreInflightJoinProofV1 {
+            used: std::cell::Cell::new(false),
+            request_digest: call.request_digest(),
+            binding_digest: binding.binding_digest.clone(),
+            state_digest: binding.input.state_digest.clone(),
+            policy_digest: binding.input.policy_digest.clone(),
+            dependency_digest,
+            effect: call.effect_class(),
+            freshness: call.freshness(),
+            lifecycle_generation: lease.lifecycle_generation,
+            observed_generation: current_generation,
+            execution_started_ms: started_at_ms,
+            observed_at_ms,
+            lease_record_digest,
+        };
+        transaction.commit()?;
+        Ok(GatewayRouteProofObservationV1::Inflight(proof))
     }
 
     pub fn complete_gateway_call(
@@ -2082,6 +2455,7 @@ impl Store {
 
 #[derive(Debug)]
 struct GatewayLeaseRowV1 {
+    lease_id: String,
     call_id: String,
     request_digest: String,
     state_digest: String,
@@ -2093,6 +2467,8 @@ struct GatewayLeaseRowV1 {
     gateway_result_id: Option<String>,
     expires_ms: i64,
     execution_started_ms: Option<i64>,
+    completed_ms: Option<i64>,
+    lifecycle_generation: u64,
 }
 
 fn validate_digest(value: &str, label: &str) -> Result<()> {
@@ -2156,27 +2532,112 @@ fn freshness_is_current(binding: &ValidatedGatewayReadV1, now: i64) -> bool {
             <= GATEWAY_FRESHNESS_MAX_MS
 }
 
+fn freshness_requirement_holds_v1(
+    requirement: FreshnessRequirementV1,
+    execution_started_ms: u64,
+    observed_at_ms: u64,
+) -> bool {
+    let Some(age) = observed_at_ms.checked_sub(execution_started_ms) else {
+        return false;
+    };
+    match requirement {
+        FreshnessRequirementV1::Snapshot | FreshnessRequirementV1::RequireRevalidation => true,
+        FreshnessRequirementV1::MaxAgeMillis(maximum) => age <= maximum,
+    }
+}
+
+fn valid_digest_v1(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn gateway_dependency_digest_v1(dependencies: &[GatewayDependencyV1]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.dependencies.v1\0");
+    hasher.update(&(dependencies.len() as u64).to_le_bytes());
+    for dependency in dependencies {
+        hash_field(&mut hasher, dependency.key_digest.as_bytes());
+        hash_field(&mut hasher, dependency.value_digest.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn exact_store_record_digest_v1(
+    binding: &ValidatedGatewayReadV1,
+    lease: &GatewayLeaseRowV1,
+    gateway_result_id: &str,
+    dependency_digest: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.exact-store-record.v1\0");
+    for value in [
+        binding.request_digest(),
+        binding.state_digest(),
+        binding.policy_digest(),
+        binding.binding_digest(),
+        dependency_digest,
+        lease.lease_id.as_str(),
+        gateway_result_id,
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&lease.lifecycle_generation.to_le_bytes());
+    hasher.update(&lease.execution_started_ms.unwrap_or(-1).to_le_bytes());
+    hasher.update(&lease.completed_ms.unwrap_or(-1).to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn inflight_store_record_digest_v1(
+    binding: &ValidatedGatewayReadV1,
+    lease: &GatewayLeaseRowV1,
+    observed_at_ms: u64,
+    dependency_digest: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.inflight-store-record.v1\0");
+    for value in [
+        binding.request_digest(),
+        binding.state_digest(),
+        binding.policy_digest(),
+        binding.binding_digest(),
+        dependency_digest,
+        lease.lease_id.as_str(),
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&lease.lifecycle_generation.to_le_bytes());
+    hasher.update(&lease.execution_started_ms.unwrap_or(-1).to_le_bytes());
+    hasher.update(&observed_at_ms.to_le_bytes());
+    hasher.update(&lease.expires_ms.to_le_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn gateway_lease_row_v1(
     transaction: &Transaction<'_>,
     lease_id: &str,
 ) -> Result<Option<GatewayLeaseRowV1>> {
     transaction
         .query_row(
-            "SELECT call_id, request_digest, state_digest, policy_digest, binding_digest, freshness_valid_until_ms, owner, status, gateway_result_id, expires_ms, execution_started_ms FROM inflight_leases WHERE lease_id = ?1",
+            "SELECT lease_id, call_id, request_digest, state_digest, policy_digest, binding_digest, freshness_valid_until_ms, owner, status, gateway_result_id, expires_ms, execution_started_ms, completed_ms, lifecycle_generation FROM inflight_leases WHERE lease_id = ?1",
             [lease_id],
             |row| {
                 Ok(GatewayLeaseRowV1 {
-                    call_id: row.get(0)?,
-                    request_digest: row.get(1)?,
-                    state_digest: row.get(2)?,
-                    policy_digest: row.get(3)?,
-                    binding_digest: row.get(4)?,
-                    freshness_valid_until_ms: row.get(5)?,
-                    owner: row.get(6)?,
-                    status: row.get(7)?,
-                    gateway_result_id: row.get(8)?,
-                    expires_ms: row.get(9)?,
-                    execution_started_ms: row.get(10)?,
+                    lease_id: row.get(0)?,
+                    call_id: row.get(1)?,
+                    request_digest: row.get(2)?,
+                    state_digest: row.get(3)?,
+                    policy_digest: row.get(4)?,
+                    binding_digest: row.get(5)?,
+                    freshness_valid_until_ms: row.get(6)?,
+                    owner: row.get(7)?,
+                    status: row.get(8)?,
+                    gateway_result_id: row.get(9)?,
+                    expires_ms: row.get(10)?,
+                    execution_started_ms: row.get(11)?,
+                    completed_ms: row.get(12)?,
+                    lifecycle_generation: row.get(13)?,
                 })
             },
         )
@@ -2406,6 +2867,7 @@ fn load_gateway_result_snapshot_v1(
     }
     let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
     let synthetic_lease = GatewayLeaseRowV1 {
+        lease_id: String::new(),
         call_id: String::new(),
         request_digest,
         state_digest,
@@ -2417,6 +2879,8 @@ fn load_gateway_result_snapshot_v1(
         gateway_result_id: Some(gateway_result_id.to_owned()),
         expires_ms: 0,
         execution_started_ms: Some(0),
+        completed_ms: Some(0),
+        lifecycle_generation: 1,
     };
     if gateway_result_content_digest(&synthetic_lease, &result, &dependencies) != gateway_result_id
     {
@@ -2532,6 +2996,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "expires_ms"
             | "execution_started_ms"
             | "completed_ms"
+            | "lifecycle_generation"
             | "compaction_epoch"
             | "estimated_tokens_avoided"
             | "delivered_ms"
@@ -2558,7 +3023,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
     (if integer { "INTEGER" } else { "TEXT" }, !nullable)
 }
 
-fn verify_gateway_schema_v6(connection: &Connection) -> Result<()> {
+fn verify_gateway_schema_v7(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         bail!("Again gateway schema verification requires version {SCHEMA_VERSION}, got {version}");
@@ -2644,6 +3109,7 @@ fn verify_gateway_schema_v6(connection: &Connection) -> Result<()> {
                 "expires_ms",
                 "execution_started_ms",
                 "completed_ms",
+                "lifecycle_generation",
             ],
         ),
         (
@@ -2738,6 +3204,13 @@ fn verify_gateway_schema_v6(connection: &Connection) -> Result<()> {
             "inflight_leases_expiry_idx",
             &["status", "expires_ms"],
             false,
+            false,
+        ),
+        (
+            "inflight_leases",
+            "inflight_leases_generation_idx",
+            &["binding_digest", "lifecycle_generation"],
+            true,
             false,
         ),
         (

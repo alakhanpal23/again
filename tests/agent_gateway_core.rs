@@ -1,3 +1,29 @@
+// This legacy path-based module test predates the library wiring. Supply only
+// the opaque store-proof type surface required to compile the pure router; no
+// test constructor exists and these stubs can never authorize a route.
+mod store {
+    pub struct StoreExactResultProofV1;
+    pub struct StoreInflightJoinProofV1;
+
+    impl StoreExactResultProofV1 {
+        pub(crate) fn authorizes_router_call_v1(
+            &self,
+            _call: &crate::agent_gateway::GatewayToolCallV1,
+        ) -> bool {
+            false
+        }
+    }
+
+    impl StoreInflightJoinProofV1 {
+        pub(crate) fn authorizes_router_call_v1(
+            &self,
+            _call: &crate::agent_gateway::GatewayToolCallV1,
+        ) -> bool {
+            false
+        }
+    }
+}
+
 #[allow(dead_code, unused_imports)]
 #[path = "../src/agent_gateway.rs"]
 mod agent_gateway;
