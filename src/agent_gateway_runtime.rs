@@ -59,6 +59,8 @@ const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
 const MAX_SEARCH_RESULTS_V1: usize = 500;
+const MAX_SEARCH_LINE_BYTES_V1: usize = 4 * 1024;
+const MAX_SEARCH_OUTPUT_BYTES_V1: usize = 512 * 1024;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -852,6 +854,8 @@ fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, Pr
     files.sort();
     let mut scanned = 0_u64;
     let mut matches = Vec::new();
+    let mut rendered_bytes = 0_usize;
+    let mut truncated = false;
     'files: for file in files {
         let metadata = fs::symlink_metadata(&file).map_err(provider_io_v1)?;
         scanned = scanned.saturating_add(metadata.len());
@@ -871,12 +875,25 @@ fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, Pr
         };
         for (index, line) in text.lines().enumerate() {
             if line.contains(pattern) {
+                let snippet = bounded_utf8_prefix_v1(line, MAX_SEARCH_LINE_BYTES_V1);
+                let path_text = path_text_v1(relative_file);
+                let estimated = path_text
+                    .len()
+                    .saturating_add(snippet.len())
+                    .saturating_add(32);
+                if rendered_bytes.saturating_add(estimated) > MAX_SEARCH_OUTPUT_BYTES_V1 {
+                    truncated = true;
+                    break 'files;
+                }
+                rendered_bytes = rendered_bytes.saturating_add(estimated);
                 matches.push(json!({
-                    "path": path_text_v1(relative_file),
+                    "path": path_text,
                     "line": index + 1,
-                    "text": line
+                    "text": snippet,
+                    "lineTruncated": snippet.len() != line.len()
                 }));
                 if matches.len() >= maximum {
+                    truncated = true;
                     break 'files;
                 }
             }
@@ -900,9 +917,20 @@ fn repository_search_v1(workspace: &Path, arguments: &Value) -> Result<Value, Pr
             "pattern": pattern,
             "path": path_text_v1(&relative),
             "matches": matches,
-            "truncated": matches.len() == maximum
+            "truncated": truncated
         }
     }))
+}
+
+fn bounded_utf8_prefix_v1(value: &str, maximum_bytes: usize) -> &str {
+    if value.len() <= maximum_bytes {
+        return value;
+    }
+    let mut end = maximum_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn collect_regular_files_v1(
