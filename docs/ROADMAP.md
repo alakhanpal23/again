@@ -252,35 +252,38 @@ four-view workspace tree, verify the fixed selector's regular-file type,
 length, single-link manifest topology, and content digest before publication
 escrow or rename, and return one opaque linear workspace-tree binding.
 
-That binding can now be consumed by a descriptor-bound runtime checkpoint for
-`.venv/bin/python`. It pins and revalidates each ancestor and symlink, checks
-live metadata against the charged manifest, uses one fallible aggregate memory
-escrow, and validates a conservative kernel-loadable x86_64 ELF `PT_LOAD`
-envelope. The checkpoint now also extracts a bounded, canonical `PT_INTERP`
-and ordered `DT_NEEDED` request, rejects ambiguous page mappings and unmodeled
-loader-search flags, and retains that unresolved request under the same memory
-escrow. It deliberately does not resolve or qualify the interpreter,
-dependencies, runtime forest, virtual environment, or pytest.
+That binding can now be consumed with a second, independently published runtime
+tree. The resulting structural inventory binds both publication roots, pins and
+revalidates every selected object, distinguishes the root executable,
+interpreter, and dependency-DSO ELF roles, and rejects `ET_EXEC` outside the
+root. Its fixed six-directory lookup resolves the frozen `PT_INTERP` and ordered
+`DT_NEEDED` graph under explicit node, depth, byte, lookup, descriptor, and
+memory bounds. This is deliberately not a loader proof: loader cache, preload,
+environment, `RPATH`/`RUNPATH`, glibc-hwcaps, virtual-environment, and pytest
+semantics remain unmodeled. A native dual-publication test exists but still
+requires execution on hosted Ubuntu; the local x86_64 QEMU attempt timed out
+before the test ran and is not positive evidence.
 
-The stdio and isolation owners now compose at their linear ownership boundary.
-All pipe endpoints are authenticated and relocated above protocol descriptors
-3/4 before the pre-clone split; the child-only continuation requires empty
-supplementary groups and places stdin/stdout/stderr, while the parent retains
-bounded exact EOF capture, cancellation, cleanup, and presentation evidence.
-There is still no orchestrator that launches this continuation through the
-qualified namespace path. The isolation owner otherwise retains namespace PID
-1, private-root, scratch/procfs, descriptor-scrub, credential, capability, and
-`no_new_privs` invariants behind parent-owned kill/reap authority.
+The runtime, stdio, and isolation owners now meet at one command-free connector
+checkpoint. It requires the real runtime checkpoint and concrete
+isolation-ready child, authenticates and splits all pipe ownership, and retains
+bounded parent capture. Cancellation terminates and reaps before EOF draining;
+uncertain reap closes without capture, and split/setup failures retain their
+first error separately from cleanup completeness. The connector exposes no
+release frame, command, PID, descriptor, execution, candidate, replay, or reuse
+authority. There is still no orchestrator that launches this continuation
+through the qualified namespace path.
 
-A separate provisional workload-seccomp plan is also integrated. Its exact
-223-instruction cBPF program traces every admitted and control syscall with a
-distinct cookie, kills wrong-architecture, x32, and unlisted calls, and is
-bound by canonical bytes plus a domain-separated BLAKE3 digest. Production
-cannot mint an installed-filter witness: connector-owned stopped-child install
-and readback evidence, supervisor cookie handling, and qualification against
-the pinned Python workload remain future composition work. No component
-accepts a command or grants execution, profile, candidate, replay, hit, or
-reuse authority.
+A separate live workload-seccomp diagnostic is also integrated. It installs and
+reads back the exact 223-instruction cBPF program in one disposable single-task
+child, retires the child identity on every terminal/ownership-loss path, and
+returns only after kill, reap, final `ECHILD`, pending-signal continuity, and
+signal restoration. Its result is intentionally a completed-probe record, not
+a live installed-filter witness: the diagnostic child is already gone and can
+never accept a command. Supervisor cookie handling, filter installation in the
+real isolation child, and qualification against pinned Python remain future
+composition work. No component grants execution, profile, candidate, replay,
+hit, or reuse authority.
 
 A separate bounded reference snapshot oracle records the fixed workspace
 fixture and exact argv while marking source, binary, and qualified-tuple
