@@ -1774,8 +1774,17 @@ impl RuntimeForestReaderV1 for PublishedRuntimeInventoryReaderV1<'_, '_> {
                 memory,
             ),
         }
-        .map_err(|refusal| {
-            RuntimeForestReadRefusalV1::Checkpoint(map_workspace_evidence_refusal_v1(refusal))
+        .map_err(|refusal| match refusal {
+            // A fixed-directory lookup must inspect every candidate so a
+            // second copy is rejected as ambiguous. Absence is therefore an
+            // ordinary reader miss; every other publication refusal retains
+            // its exact fail-closed checkpoint classification.
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MissingNode => {
+                RuntimeForestReadRefusalV1::Missing
+            }
+            refusal => {
+                RuntimeForestReadRefusalV1::Checkpoint(map_workspace_evidence_refusal_v1(refusal))
+            }
         })?;
         self.pinned_fds = self
             .pinned_fds
