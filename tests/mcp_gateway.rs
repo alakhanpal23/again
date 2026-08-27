@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 struct BlockState {
     started: Mutex<bool>,
     changed: Condvar,
+    cancelled: AtomicBool,
 }
 
 struct FakeProvider {
@@ -133,7 +134,7 @@ impl ToolExecution for FakeProvider {
             let mut started = block.started.lock().unwrap();
             *started = true;
             block.changed.notify_all();
-            while self.cancellations.lock().unwrap().is_empty() {
+            while !block.cancelled.load(Ordering::Acquire) {
                 started = block.changed.wait(started).unwrap();
             }
         }
@@ -145,6 +146,8 @@ impl ToolCancellation for FakeProvider {
     fn cancel(&self, cancellation: ProviderCancellation) -> Result<(), ProviderError> {
         self.cancellations.lock().unwrap().push(cancellation);
         if let Some(block) = &self.block {
+            let _started = block.started.lock().unwrap();
+            block.cancelled.store(true, Ordering::Release);
             block.changed.notify_all();
         }
         assert!(!self.cancellation_panics, "injected cancellation panic");

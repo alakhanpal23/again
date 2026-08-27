@@ -69,10 +69,6 @@ enum WorkerOutcome {
     Open {
         opened: bool,
     },
-    Attempt {
-        succeeded: bool,
-        elapsed_ms: u64,
-    },
     LockReleased,
 }
 
@@ -172,23 +168,6 @@ fn multiprocess_worker() {
         wait_for_gate(Path::new(&env_value(RELEASE_ENV)));
         connection.execute_batch("COMMIT").unwrap();
         emit(&output, &WorkerOutcome::LockReleased);
-        return;
-    }
-    if action == "try_acquire" {
-        let started = Instant::now();
-        let outcome = Store::open(&root).and_then(|store| {
-            store.acquire_gateway_call(
-                &binding(&env_value(REQUEST_ENV), &env_value(STATE_ENV)),
-                &env_value(OWNER_ENV),
-            )
-        });
-        emit(
-            &output,
-            &WorkerOutcome::Attempt {
-                succeeded: outcome.is_ok(),
-                elapsed_ms: started.elapsed().as_millis().try_into().unwrap(),
-            },
-        );
         return;
     }
 
@@ -885,11 +864,10 @@ fn distinct_bindings_elect_independent_process_leaders() {
 fn sqlite_write_lock_contention_obeys_bounded_busy_timeout() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("state");
-    drop(Store::open(&root).unwrap());
+    let store = Store::open(&root).unwrap();
     let ready = temp.path().join("lock-ready");
     let release = temp.path().join("lock-release");
     let lock_output = temp.path().join("lock-output");
-    let attempt_output = temp.path().join("attempt-output");
     let release_string = release.to_string_lossy().into_owned();
     let holder = spawn_worker(
         &root,
@@ -900,34 +878,26 @@ fn sqlite_write_lock_contention_obeys_bounded_busy_timeout() {
         None,
     );
     wait_for_file(&ready, Duration::from_secs(15));
-    let attempt = run_worker(
-        &root,
-        &attempt_output,
-        "try_acquire",
-        &[(OWNER_ENV, "blocked")],
-    );
+    let started = Instant::now();
+    let attempt = store.acquire_gateway_call(&binding("request", "state"), "blocked");
+    let elapsed_ms: u64 = started.elapsed().as_millis().try_into().unwrap();
     fs::write(&release, b"release").unwrap();
     assert!(matches!(
         wait_worker(holder, &lock_output),
         WorkerOutcome::LockReleased
     ));
-    match attempt {
-        WorkerOutcome::Attempt {
-            succeeded,
-            elapsed_ms,
-        } => {
-            assert!(!succeeded, "contended write unexpectedly bypassed the lock");
-            assert!(
-                elapsed_ms >= 4_000,
-                "busy timeout returned too early: {elapsed_ms}ms"
-            );
-            assert!(
-                elapsed_ms < 8_000,
-                "busy timeout was unbounded: {elapsed_ms}ms"
-            );
-        }
-        other => panic!("expected bounded attempt, got {other:?}"),
-    }
+    assert!(
+        attempt.is_err(),
+        "contended write unexpectedly bypassed the lock"
+    );
+    assert!(
+        elapsed_ms >= 4_000,
+        "busy timeout returned too early: {elapsed_ms}ms"
+    );
+    assert!(
+        elapsed_ms < 8_000,
+        "busy timeout was unbounded: {elapsed_ms}ms"
+    );
 }
 
 #[test]

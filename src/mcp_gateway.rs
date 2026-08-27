@@ -1296,8 +1296,8 @@ impl McpGateway {
             registered: true,
         };
         if let Some(activation) = activation {
-            activation.signal();
             if activation.session_closed.load(Ordering::Acquire) {
+                activation.signal();
                 let _ = active_registration.complete();
                 self.record_call_audit(
                     context,
@@ -1310,6 +1310,11 @@ impl McpGateway {
                     McpError::typed(McpErrorCode::RequestCancelled, "stdio session closed"),
                 ));
             }
+            // The reader may treat EOF as session cancellation only after this
+            // worker has made its pre-existing admission decision. Signalling
+            // before the closed check would let EOF race an already-admitted
+            // call into a synthetic pre-execution refusal.
+            activation.signal();
         }
 
         let translation = translate_tool_call_v1(&route, &arguments, context, &freshness);
