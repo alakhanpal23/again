@@ -1,25 +1,64 @@
 //! Pure selection rules for presenting an already-selected exact result.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::Serialize;
 
 use super::protocol::{DigestReferenceV1, GatewayToolCallV1, PresentationMode};
 
-/// Delivery-receipt schema version.
 pub const DELIVERY_RECEIPT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_PRESENTATION_STREAM_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONTEXT_IDENTIFIER_BYTES_V1: usize = 128;
 
-/// The exact conversational context into which bytes were delivered.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Exact conversational context. Fields are private so deserialization or a
+/// struct literal cannot manufacture a context that bypasses validation.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentContextIdentityV1 {
-    pub agent_id: String,
-    pub session_id: String,
-    pub turn_id: String,
-    /// Generation token changed by the owner whenever context is compacted.
-    pub compaction_generation: u64,
+    agent_id: String,
+    session_id: String,
+    turn_id: String,
+    compaction_generation: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl fmt::Debug for AgentContextIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AgentContextIdentityV1(<redacted>)")
+    }
+}
+
+impl AgentContextIdentityV1 {
+    pub fn new(
+        agent_id: &str,
+        session_id: &str,
+        turn_id: &str,
+        compaction_generation: u64,
+    ) -> Result<Self, PresentationRefusalV1> {
+        for value in [agent_id, session_id, turn_id] {
+            validate_context_identifier(value)?;
+        }
+        Ok(Self {
+            agent_id: agent_id.to_owned(),
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            compaction_generation,
+        })
+    }
+
+    pub fn after_compaction(&self) -> Result<Self, PresentationRefusalV1> {
+        let generation = self
+            .compaction_generation
+            .checked_add(1)
+            .ok_or(PresentationRefusalV1::CompactionGenerationExhausted)?;
+        Self::new(&self.agent_id, &self.session_id, &self.turn_id, generation)
+    }
+
+    pub const fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PresentationContextV1 {
     session_id: String,
     turn_id: String,
@@ -28,6 +67,13 @@ pub struct PresentationContextV1 {
     cwd_identity: [u8; 32],
     tty: bool,
     output_ceiling: u64,
+    compaction_generation: u64,
+}
+
+impl fmt::Debug for PresentationContextV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("PresentationContextV1(<redacted>)")
+    }
 }
 
 impl PresentationContextV1 {
@@ -40,12 +86,34 @@ impl PresentationContextV1 {
         tty: bool,
         output_ceiling: u64,
     ) -> Result<Self, PresentationRefusalV1> {
-        if !valid_context_identifier(session_id)
-            || !valid_context_identifier(turn_id)
-            || !valid_context_identifier(environment_id)
-            || agent_id.is_some_and(|agent| !valid_context_identifier(agent))
-        {
-            return Err(PresentationRefusalV1::InvalidIdentifier);
+        Self::new_at_generation(
+            session_id,
+            turn_id,
+            agent_id,
+            environment_id,
+            cwd_identity,
+            tty,
+            output_ceiling,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_at_generation(
+        session_id: &str,
+        turn_id: &str,
+        agent_id: Option<&str>,
+        environment_id: &str,
+        cwd_identity: [u8; 32],
+        tty: bool,
+        output_ceiling: u64,
+        compaction_generation: u64,
+    ) -> Result<Self, PresentationRefusalV1> {
+        for value in [session_id, turn_id, environment_id] {
+            validate_context_identifier(value)?;
+        }
+        if let Some(agent_id) = agent_id {
+            validate_context_identifier(agent_id)?;
         }
         Ok(Self {
             session_id: session_id.to_owned(),
@@ -55,10 +123,28 @@ impl PresentationContextV1 {
             cwd_identity,
             tty,
             output_ceiling,
+            compaction_generation,
         })
     }
 
-    pub fn output_ceiling(&self) -> u64 {
+    pub fn after_compaction(&self) -> Result<Self, PresentationRefusalV1> {
+        let generation = self
+            .compaction_generation
+            .checked_add(1)
+            .ok_or(PresentationRefusalV1::CompactionGenerationExhausted)?;
+        Self::new_at_generation(
+            &self.session_id,
+            &self.turn_id,
+            self.agent_id.as_deref(),
+            &self.environment_id,
+            self.cwd_identity,
+            self.tty,
+            self.output_ceiling,
+            generation,
+        )
+    }
+
+    pub const fn output_ceiling(&self) -> u64 {
         self.output_ceiling
     }
 
@@ -71,7 +157,7 @@ impl PresentationContextV1 {
                 .to_owned(),
             session_id: self.session_id.clone(),
             turn_id: self.turn_id.clone(),
-            compaction_generation: 0,
+            compaction_generation: self.compaction_generation,
         }
     }
 }
@@ -81,6 +167,8 @@ pub enum PresentationRefusalV1 {
     InvalidIdentifier,
     InvalidDeliveryCount,
     StreamBoundExceeded,
+    IncompleteDelivery,
+    CompactionGenerationExhausted,
 }
 
 impl PresentationRefusalV1 {
@@ -89,17 +177,25 @@ impl PresentationRefusalV1 {
             Self::InvalidIdentifier => "invalid_identifier",
             Self::InvalidDeliveryCount => "invalid_delivery_count",
             Self::StreamBoundExceeded => "stream_bound_exceeded",
+            Self::IncompleteDelivery => "incomplete_delivery",
+            Self::CompactionGenerationExhausted => "compaction_generation_exhausted",
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayResultIdentityV1 {
     exit_code: i32,
     stdout_bytes: u64,
     stderr_bytes: u64,
     digest: [u8; 32],
+}
+
+impl fmt::Debug for GatewayResultIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("GatewayResultIdentityV1(<redacted>)")
+    }
 }
 
 impl GatewayResultIdentityV1 {
@@ -138,7 +234,7 @@ impl GatewayResultIdentityV1 {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DetailedDeliveryV1 {
     context: PresentationContextV1Wire,
@@ -150,7 +246,7 @@ struct DetailedDeliveryV1 {
     completion_confirmed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PresentationContextV1Wire {
     session_id: String,
@@ -160,6 +256,7 @@ struct PresentationContextV1Wire {
     cwd_identity: [u8; 32],
     tty: bool,
     output_ceiling: u64,
+    compaction_generation: u64,
 }
 
 impl From<&PresentationContextV1> for PresentationContextV1Wire {
@@ -172,6 +269,7 @@ impl From<&PresentationContextV1> for PresentationContextV1Wire {
             cwd_identity: context.cwd_identity,
             tty: context.tty,
             output_ceiling: context.output_ceiling,
+            compaction_generation: context.compaction_generation,
         }
     }
 }
@@ -185,82 +283,41 @@ impl PartialEq<PresentationContextV1> for PresentationContextV1Wire {
             && self.cwd_identity == other.cwd_identity
             && self.tty == other.tty
             && self.output_ceiling == other.output_ceiling
+            && self.compaction_generation == other.compaction_generation
     }
 }
 
-impl AgentContextIdentityV1 {
-    pub fn after_compaction(&self) -> Self {
-        let mut compacted = self.clone();
-        compacted.compaction_generation = compacted.compaction_generation.wrapping_add(1);
-        compacted
-    }
-}
-
-/// Evidence that the exact result bytes reached one exact agent context.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// Presenter-issued evidence. It is serializable for display/storage but has
+/// no `Deserialize` implementation and no public constructor.
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeliveryReceiptV1 {
     schema_version: u16,
     context: AgentContextIdentityV1,
     exact_result: DigestReferenceV1,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    detailed: Option<DetailedDeliveryV1>,
+    detailed: DetailedDeliveryV1,
+}
+
+impl fmt::Debug for DeliveryReceiptV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("DeliveryReceiptV1(<redacted>)")
+    }
 }
 
 impl DeliveryReceiptV1 {
-    pub fn for_exact_delivery(
-        context: AgentContextIdentityV1,
-        exact_result: DigestReferenceV1,
-    ) -> Self {
-        Self {
-            schema_version: DELIVERY_RECEIPT_SCHEMA_VERSION,
-            context,
-            exact_result,
-            detailed: None,
-        }
-    }
-
-    pub fn new(
-        context: &PresentationContextV1,
-        call: &GatewayToolCallV1,
-        result: GatewayResultIdentityV1,
-        stdout_delivered: u64,
-        stderr_delivered: u64,
-        status_delivered: bool,
-        completion_confirmed: bool,
-    ) -> Result<Self, PresentationRefusalV1> {
-        if stdout_delivered > result.stdout_bytes || stderr_delivered > result.stderr_bytes {
-            return Err(PresentationRefusalV1::InvalidDeliveryCount);
-        }
-        Ok(Self {
-            schema_version: DELIVERY_RECEIPT_SCHEMA_VERSION,
-            context: context.compact_identity(),
-            exact_result: result.digest_reference(),
-            detailed: Some(DetailedDeliveryV1 {
-                context: context.into(),
-                call_digest: call.digest(),
-                result,
-                stdout_delivered,
-                stderr_delivered,
-                status_delivered,
-                completion_confirmed,
-            }),
-        })
-    }
-
-    pub fn schema_version(&self) -> u16 {
+    pub const fn schema_version(&self) -> u16 {
         self.schema_version
     }
 
-    pub fn context(&self) -> &AgentContextIdentityV1 {
+    pub const fn context(&self) -> &AgentContextIdentityV1 {
         &self.context
     }
 
-    pub fn exact_result(&self) -> &DigestReferenceV1 {
+    pub const fn exact_result(&self) -> &DigestReferenceV1 {
         &self.exact_result
     }
 
-    pub fn authorizes_compact_reference(
+    fn authorizes_compact_reference(
         &self,
         context: &AgentContextIdentityV1,
         exact_result: &DigestReferenceV1,
@@ -268,7 +325,48 @@ impl DeliveryReceiptV1 {
         self.schema_version == DELIVERY_RECEIPT_SCHEMA_VERSION
             && self.context == *context
             && self.exact_result == *exact_result
+            && self.detailed.stdout_delivered == self.detailed.result.stdout_bytes
+            && self.detailed.stderr_delivered == self.detailed.result.stderr_bytes
+            && self.detailed.status_delivered
+            && self.detailed.completion_confirmed
     }
+}
+
+/// Narrow crate-private presenter completion boundary. Callers cannot mint a
+/// receipt until exact stream counts, status delivery, and completion all hold.
+pub(crate) fn presenter_complete_exact_delivery_v1(
+    context: &PresentationContextV1,
+    call: &GatewayToolCallV1,
+    result: GatewayResultIdentityV1,
+    stdout_delivered: u64,
+    stderr_delivered: u64,
+    status_delivered: bool,
+    completion_confirmed: bool,
+) -> Result<DeliveryReceiptV1, PresentationRefusalV1> {
+    if stdout_delivered > result.stdout_bytes || stderr_delivered > result.stderr_bytes {
+        return Err(PresentationRefusalV1::InvalidDeliveryCount);
+    }
+    if stdout_delivered != result.stdout_bytes
+        || stderr_delivered != result.stderr_bytes
+        || !status_delivered
+        || !completion_confirmed
+    {
+        return Err(PresentationRefusalV1::IncompleteDelivery);
+    }
+    Ok(DeliveryReceiptV1 {
+        schema_version: DELIVERY_RECEIPT_SCHEMA_VERSION,
+        context: context.compact_identity(),
+        exact_result: result.digest_reference(),
+        detailed: DetailedDeliveryV1 {
+            context: context.into(),
+            call_digest: call.digest(),
+            result,
+            stdout_delivered,
+            stderr_delivered,
+            status_delivered,
+            completion_confirmed,
+        },
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,7 +387,7 @@ pub fn decide_presentation_v1(
     result: GatewayResultIdentityV1,
     receipt: Option<&DeliveryReceiptV1>,
 ) -> PresentationDecisionV1 {
-    let Some(delivery) = receipt.and_then(|receipt| receipt.detailed.as_ref()) else {
+    let Some(delivery) = receipt.map(|receipt| &receipt.detailed) else {
         return PresentationDecisionV1::FullResult;
     };
     if delivery.context == *context
@@ -306,10 +404,6 @@ pub fn decide_presentation_v1(
     }
 }
 
-/// Resolve a requested presentation without fetching or rendering any bytes.
-///
-/// Compact references fail closed to full retrieval unless the caller supplies
-/// an exact-delivery receipt for this result and this un-compacted context.
 pub fn select_presentation(
     requested: PresentationMode,
     context: &AgentContextIdentityV1,
@@ -327,11 +421,134 @@ pub fn select_presentation(
     }
 }
 
-fn valid_context_identifier(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 128 && value.bytes().all(|byte| byte.is_ascii_graphic())
+fn validate_context_identifier(value: &str) -> Result<(), PresentationRefusalV1> {
+    if value.is_empty()
+        || value.len() > MAX_CONTEXT_IDENTIFIER_BYTES_V1
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(PresentationRefusalV1::InvalidIdentifier);
+    }
+    Ok(())
 }
 
 fn put_stream(hasher: &mut blake3::Hasher, stream: &[u8]) {
     hasher.update(&(stream.len() as u64).to_be_bytes());
     hasher.update(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_gateway::protocol::{
+        AgentCallIdentityV1, CanonicalArguments, EffectClass, FreshnessRequirementV1,
+        GatewayToolCallInputV1, ModelIdentityV1, PermissionClass, ProviderIdentityV1,
+        RepositoryEnvironmentStateV1, ToolIdentityV1, WorkspaceIdentityV1,
+    };
+
+    fn call() -> GatewayToolCallV1 {
+        GatewayToolCallV1::from_input(GatewayToolCallInputV1 {
+            schema_version: 1,
+            provider: ProviderIdentityV1 {
+                id: "provider".to_owned(),
+                version: "1".to_owned(),
+            },
+            model: ModelIdentityV1 {
+                id: "model".to_owned(),
+                version: "1".to_owned(),
+            },
+            tool: ToolIdentityV1 {
+                id: "tool".to_owned(),
+                version: "1".to_owned(),
+            },
+            arguments: CanonicalArguments::from_json_str("{}").unwrap(),
+            workspace: WorkspaceIdentityV1 {
+                workspace_id: "workspace".to_owned(),
+                cwd: ".".to_owned(),
+            },
+            call: AgentCallIdentityV1 {
+                agent_id: "agent".to_owned(),
+                session_id: "session".to_owned(),
+                turn_id: "turn".to_owned(),
+                call_id: "call".to_owned(),
+            },
+            task: None,
+            state: RepositoryEnvironmentStateV1::Unknown,
+            permission_class: PermissionClass::Preapproved,
+            effect_class: EffectClass::SnapshotRead,
+            freshness: FreshnessRequirementV1::Snapshot,
+            presentation: PresentationMode::Exact,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn both_presentation_apis_refuse_after_compaction() {
+        let context = PresentationContextV1::new(
+            "session",
+            "turn",
+            Some("agent"),
+            "local",
+            [1; 32],
+            false,
+            4096,
+        )
+        .unwrap();
+        let call = call();
+        let result = GatewayResultIdentityV1::from_streams(0, b"out", b"err").unwrap();
+        let receipt =
+            presenter_complete_exact_delivery_v1(&context, &call, result, 3, 3, true, true)
+                .unwrap();
+        let compacted = context.after_compaction().unwrap();
+        assert_eq!(
+            decide_presentation_v1(&compacted, &call, result, Some(&receipt)),
+            PresentationDecisionV1::FullResult
+        );
+        let compact_identity = compacted.compact_identity();
+        assert_eq!(
+            select_presentation(
+                PresentationMode::CompactReference,
+                &compact_identity,
+                receipt.exact_result(),
+                Some(&receipt)
+            ),
+            PresentationMode::FullRetrievalRequired
+        );
+    }
+
+    #[test]
+    fn presenter_refuses_every_incomplete_delivery_shape() {
+        let context =
+            PresentationContextV1::new("session", "turn", None, "local", [0; 32], false, 4096)
+                .unwrap();
+        let call = call();
+        let result = GatewayResultIdentityV1::from_streams(0, b"out", b"err").unwrap();
+        for arguments in [
+            (2, 3, true, true),
+            (3, 2, true, true),
+            (3, 3, false, true),
+            (3, 3, true, false),
+        ] {
+            assert_eq!(
+                presenter_complete_exact_delivery_v1(
+                    &context,
+                    &call,
+                    result,
+                    arguments.0,
+                    arguments.1,
+                    arguments.2,
+                    arguments.3,
+                ),
+                Err(PresentationRefusalV1::IncompleteDelivery)
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_generation_overflow_fails_closed() {
+        let identity = AgentContextIdentityV1::new("agent", "session", "turn", u64::MAX).unwrap();
+        assert_eq!(
+            identity.after_compaction(),
+            Err(PresentationRefusalV1::CompactionGenerationExhausted)
+        );
+    }
 }

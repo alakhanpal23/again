@@ -28,31 +28,35 @@ pub const MAX_GATEWAY_TOOL_CALL_DEPTH: usize = MAX_CANONICAL_JSON_DEPTH + 8;
 pub const MAX_GATEWAY_TOOL_CALL_NODES: usize = MAX_CANONICAL_JSON_NODES + 128;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.request.v1\0";
+const ADAPTER_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.adapter.v1\0";
+const MAX_IDENTITY_BYTES_V1: usize = 256;
+const MAX_DIGEST_ALGORITHM_BYTES_V1: usize = 32;
+const MAX_DIGEST_VALUE_BYTES_V1: usize = 256;
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum CanonicalJsonError {
-    #[error("JSON input is {actual} bytes; the limit is {limit}")]
-    InputTooLarge { actual: usize, limit: usize },
-    #[error("canonical JSON is {actual} bytes; the limit is {limit}")]
-    EncodedTooLarge { actual: usize, limit: usize },
-    #[error("JSON depth exceeds the limit of {limit}")]
-    DepthLimitExceeded { limit: usize },
-    #[error("JSON node count exceeds the limit of {limit}")]
-    NodeLimitExceeded { limit: usize },
-    #[error("duplicate JSON object key {0:?}")]
-    DuplicateKey(String),
-    #[error("malformed JSON: {0}")]
-    Malformed(String),
+    #[error("input_too_large")]
+    InputTooLarge,
+    #[error("encoded_too_large")]
+    EncodedTooLarge,
+    #[error("depth_limit_exceeded")]
+    DepthLimitExceeded,
+    #[error("node_limit_exceeded")]
+    NodeLimitExceeded,
+    #[error("duplicate_key")]
+    DuplicateKey,
+    #[error("malformed_json")]
+    Malformed,
 }
 
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum GatewayProtocolError {
-    #[error("unsupported gateway schema version {0}")]
-    UnsupportedSchemaVersion(u16),
-    #[error("{0} must not be empty")]
-    EmptyField(&'static str),
-    #[error("malformed gateway envelope: {0}")]
-    MalformedEnvelope(String),
+    #[error("unsupported_schema_version")]
+    UnsupportedSchemaVersion,
+    #[error("invalid_field")]
+    InvalidField,
+    #[error("malformed_envelope")]
+    MalformedEnvelope,
     #[error(transparent)]
     CanonicalJson(#[from] CanonicalJsonError),
 }
@@ -134,7 +138,7 @@ impl CanonicalNumber {
         let value = number
             .as_f64()
             .filter(|value| value.is_finite())
-            .ok_or_else(|| CanonicalJsonError::Malformed("non-finite number".to_owned()))?;
+            .ok_or(CanonicalJsonError::Malformed)?;
         Ok(Self(canonical_f64(value)))
     }
 }
@@ -225,7 +229,7 @@ const ENVELOPE_LIMITS: JsonLimits = JsonLimits {
 enum ParseFailure {
     Depth,
     Nodes,
-    Duplicate(String),
+    Duplicate,
 }
 
 struct ParseState {
@@ -341,7 +345,7 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
         let mut seen = BTreeSet::new();
         while let Some(key) = source.next_key::<String>()? {
             if !seen.insert(key.clone()) {
-                self.state.failure = Some(ParseFailure::Duplicate(key));
+                self.state.failure = Some(ParseFailure::Duplicate);
                 return Err(de::Error::custom("duplicate JSON object key"));
             }
             let value = source.next_value_seed(NodeSeed {
@@ -356,10 +360,7 @@ impl<'de> Visitor<'de> for NodeVisitor<'_> {
 
 fn parse_canonical(input: &[u8], limits: JsonLimits) -> Result<CanonicalNode, CanonicalJsonError> {
     if input.len() > limits.bytes {
-        return Err(CanonicalJsonError::InputTooLarge {
-            actual: input.len(),
-            limit: limits.bytes,
-        });
+        return Err(CanonicalJsonError::InputTooLarge);
     }
     let mut state = ParseState {
         limits,
@@ -374,28 +375,21 @@ fn parse_canonical(input: &[u8], limits: JsonLimits) -> Result<CanonicalNode, Ca
     .deserialize(&mut deserializer);
     let node = match parsed {
         Ok(node) => node,
-        Err(error) => {
+        Err(_error) => {
             return Err(match state.failure {
-                Some(ParseFailure::Depth) => CanonicalJsonError::DepthLimitExceeded {
-                    limit: limits.depth,
-                },
-                Some(ParseFailure::Nodes) => CanonicalJsonError::NodeLimitExceeded {
-                    limit: limits.nodes,
-                },
-                Some(ParseFailure::Duplicate(key)) => CanonicalJsonError::DuplicateKey(key),
-                None => CanonicalJsonError::Malformed(error.to_string()),
+                Some(ParseFailure::Depth) => CanonicalJsonError::DepthLimitExceeded,
+                Some(ParseFailure::Nodes) => CanonicalJsonError::NodeLimitExceeded,
+                Some(ParseFailure::Duplicate) => CanonicalJsonError::DuplicateKey,
+                None => CanonicalJsonError::Malformed,
             });
         }
     };
     deserializer
         .end()
-        .map_err(|error| CanonicalJsonError::Malformed(error.to_string()))?;
+        .map_err(|_| CanonicalJsonError::Malformed)?;
     let encoded = encode_node(&node);
     if encoded.len() > limits.bytes {
-        return Err(CanonicalJsonError::EncodedTooLarge {
-            actual: encoded.len(),
-            limit: limits.bytes,
-        });
+        return Err(CanonicalJsonError::EncodedTooLarge);
     }
     Ok(node)
 }
@@ -408,15 +402,11 @@ fn node_from_value(value: Value, limits: JsonLimits) -> Result<CanonicalNode, Ca
         limits: JsonLimits,
     ) -> Result<CanonicalNode, CanonicalJsonError> {
         if depth > limits.depth {
-            return Err(CanonicalJsonError::DepthLimitExceeded {
-                limit: limits.depth,
-            });
+            return Err(CanonicalJsonError::DepthLimitExceeded);
         }
         *nodes = nodes.saturating_add(1);
         if *nodes > limits.nodes {
-            return Err(CanonicalJsonError::NodeLimitExceeded {
-                limit: limits.nodes,
-            });
+            return Err(CanonicalJsonError::NodeLimitExceeded);
         }
         Ok(match value {
             Value::Null => CanonicalNode::Null,
@@ -444,10 +434,7 @@ fn node_from_value(value: Value, limits: JsonLimits) -> Result<CanonicalNode, Ca
     let node = convert(value, 1, &mut nodes, limits)?;
     let encoded = encode_node(&node);
     if encoded.len() > limits.bytes {
-        return Err(CanonicalJsonError::EncodedTooLarge {
-            actual: encoded.len(),
-            limit: limits.bytes,
-        });
+        return Err(CanonicalJsonError::EncodedTooLarge);
     }
     Ok(node)
 }
@@ -494,9 +481,15 @@ fn encode_node(node: &CanonicalNode) -> Vec<u8> {
 }
 
 /// Parsed structured arguments with canonical ordering and enforced bounds.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct CanonicalArguments(CanonicalNode);
+
+impl fmt::Debug for CanonicalArguments {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CanonicalArguments(<redacted>)")
+    }
+}
 
 impl CanonicalArguments {
     pub fn from_json_slice(input: &[u8]) -> Result<Self, CanonicalJsonError> {
@@ -520,35 +513,35 @@ impl CanonicalArguments {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderIdentityV1 {
     pub id: String,
     pub version: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelIdentityV1 {
     pub id: String,
     pub version: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolIdentityV1 {
     pub id: String,
     pub version: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceIdentityV1 {
     pub workspace_id: String,
     pub cwd: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCallIdentityV1 {
     pub agent_id: String,
@@ -557,7 +550,7 @@ pub struct AgentCallIdentityV1 {
     pub call_id: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TaskIdentityV1 {
     pub task_id: String,
@@ -565,7 +558,7 @@ pub struct TaskIdentityV1 {
 }
 
 /// Algorithm-qualified digest reference. The protocol does not dereference it.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DigestReferenceV1 {
     pub algorithm: String,
@@ -584,9 +577,13 @@ impl DigestReferenceV1 {
         validate_digest(&digest, "digest algorithm", "digest value")?;
         Ok(digest)
     }
+
+    pub(crate) fn validate_bounded(&self) -> Result<(), GatewayProtocolError> {
+        validate_digest(self, "digest algorithm", "digest value")
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateDigestReferenceV1 {
     pub schema_version: u16,
@@ -594,12 +591,36 @@ pub struct StateDigestReferenceV1 {
     pub environment: DigestReferenceV1,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum RepositoryEnvironmentStateV1 {
     Known { reference: StateDigestReferenceV1 },
     Unknown,
 }
+
+macro_rules! impl_redacted_debug {
+    ($($type:ty),+ $(,)?) => {
+        $(
+            impl fmt::Debug for $type {
+                fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str(concat!(stringify!($type), "(<redacted>)"))
+                }
+            }
+        )+
+    };
+}
+
+impl_redacted_debug!(
+    ProviderIdentityV1,
+    ModelIdentityV1,
+    ToolIdentityV1,
+    WorkspaceIdentityV1,
+    AgentCallIdentityV1,
+    TaskIdentityV1,
+    DigestReferenceV1,
+    StateDigestReferenceV1,
+    RepositoryEnvironmentStateV1,
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -667,21 +688,14 @@ impl GatewayEffectClassV1 {
         )
     }
 
+    pub const fn is_unknown(self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
     fn parse(value: &str) -> Option<Self> {
         Self::ALL
             .into_iter()
             .find(|candidate| candidate.as_str() == value)
-    }
-
-    const fn protocol_effect(self) -> EffectClass {
-        match self {
-            Self::Pure => EffectClass::DeterministicCompute,
-            Self::WorkspaceRead => EffectClass::SnapshotRead,
-            Self::ExternalRead => EffectClass::FreshnessBoundRead,
-            Self::WorkspaceWrite => EffectClass::Mutation,
-            Self::ExternalWrite | Self::Privileged => EffectClass::ExternalSideEffect,
-            Self::Unknown => EffectClass::Unknown,
-        }
     }
 }
 
@@ -703,7 +717,7 @@ pub enum PresentationMode {
 }
 
 /// Construction input for a validated [`GatewayToolCallV1`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GatewayToolCallInputV1 {
     pub schema_version: u16,
     pub provider: ProviderIdentityV1,
@@ -721,7 +735,7 @@ pub struct GatewayToolCallInputV1 {
 }
 
 /// Canonical, immutable, bounded gateway request envelope.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GatewayToolCallV1 {
     schema_version: u16,
     provider: ProviderIdentityV1,
@@ -730,19 +744,58 @@ pub struct GatewayToolCallV1 {
     arguments: CanonicalArguments,
     workspace: WorkspaceIdentityV1,
     call: AgentCallIdentityV1,
-    #[serde(skip_serializing_if = "Option::is_none")]
     task: Option<TaskIdentityV1>,
     state: RepositoryEnvironmentStateV1,
     permission_class: PermissionClass,
     effect_class: EffectClass,
     freshness: FreshnessRequirementV1,
     presentation: PresentationMode,
-    #[serde(skip)]
-    adapter_effect: GatewayEffectClassV1,
-    #[serde(skip)]
     canonical_argument_bytes: Vec<u8>,
-    #[serde(skip)]
     canonical_bytes: Vec<u8>,
+}
+
+impl Serialize for GatewayToolCallV1 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = GatewayToolCallSerializeV1 {
+            schema_version: self.schema_version,
+            provider: &self.provider,
+            model: &self.model,
+            tool: &self.tool,
+            arguments: &self.arguments,
+            workspace: &self.workspace,
+            call: &self.call,
+            task: self.task.as_ref(),
+            state: &self.state,
+            permission_class: self.permission_class,
+            effect_class: self.effect_class,
+            freshness: self.freshness,
+            presentation: self.presentation,
+        };
+        let value = serde_json::to_value(wire).map_err(serde::ser::Error::custom)?;
+        let node = node_from_value(value, ENVELOPE_LIMITS).map_err(serde::ser::Error::custom)?;
+        node.serialize(serializer)
+    }
+}
+
+#[derive(Serialize)]
+struct GatewayToolCallSerializeV1<'a> {
+    schema_version: u16,
+    provider: &'a ProviderIdentityV1,
+    model: &'a ModelIdentityV1,
+    tool: &'a ToolIdentityV1,
+    arguments: &'a CanonicalArguments,
+    workspace: &'a WorkspaceIdentityV1,
+    call: &'a AgentCallIdentityV1,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task: Option<&'a TaskIdentityV1>,
+    state: &'a RepositoryEnvironmentStateV1,
+    permission_class: PermissionClass,
+    effect_class: EffectClass,
+    freshness: FreshnessRequirementV1,
+    presentation: PresentationMode,
 }
 
 #[derive(Deserialize)]
@@ -764,56 +817,6 @@ struct GatewayToolCallWireV1 {
 }
 
 impl GatewayToolCallV1 {
-    /// Parse the compact untrusted-input form used at an AI/tool boundary.
-    pub fn new(
-        call_id: &str,
-        tool: &str,
-        effect: GatewayEffectClassV1,
-        arguments: &[u8],
-    ) -> Result<Self, GatewayProtocolRefusalV1> {
-        if !valid_identifier(call_id, false) || !valid_identifier(tool, true) {
-            return Err(GatewayProtocolRefusalV1::InvalidIdentifier);
-        }
-        let arguments = strict_adapter_arguments(arguments)?;
-        let canonical_argument_bytes = arguments.canonical_bytes();
-        let canonical_bytes = compact_envelope_bytes(call_id, tool, effect, arguments.0.clone());
-        Ok(Self {
-            schema_version: GATEWAY_TOOL_CALL_SCHEMA_VERSION,
-            provider: ProviderIdentityV1 {
-                id: "unattributed".to_owned(),
-                version: "1".to_owned(),
-            },
-            model: ModelIdentityV1 {
-                id: "unattributed".to_owned(),
-                version: "1".to_owned(),
-            },
-            tool: ToolIdentityV1 {
-                id: tool.to_owned(),
-                version: "unversioned".to_owned(),
-            },
-            arguments,
-            workspace: WorkspaceIdentityV1 {
-                workspace_id: "unattributed".to_owned(),
-                cwd: ".".to_owned(),
-            },
-            call: AgentCallIdentityV1 {
-                agent_id: "unattributed".to_owned(),
-                session_id: "unattributed".to_owned(),
-                turn_id: "unattributed".to_owned(),
-                call_id: call_id.to_owned(),
-            },
-            task: None,
-            state: RepositoryEnvironmentStateV1::Unknown,
-            permission_class: PermissionClass::Preapproved,
-            effect_class: effect.protocol_effect(),
-            freshness: FreshnessRequirementV1::Snapshot,
-            presentation: PresentationMode::Exact,
-            adapter_effect: effect,
-            canonical_argument_bytes,
-            canonical_bytes,
-        })
-    }
-
     /// Construct the complete canonical gateway envelope.
     pub fn from_input(input: GatewayToolCallInputV1) -> Result<Self, GatewayProtocolError> {
         validate_input(&input)?;
@@ -832,7 +835,6 @@ impl GatewayToolCallV1 {
             effect_class: input.effect_class,
             freshness: input.freshness,
             presentation: input.presentation,
-            adapter_effect: adapter_effect(input.effect_class),
             canonical_argument_bytes,
             canonical_bytes: Vec::new(),
         };
@@ -845,7 +847,7 @@ impl GatewayToolCallV1 {
         let node = parse_canonical(input, ENVELOPE_LIMITS)?;
         let canonical = encode_node(&node);
         let wire: GatewayToolCallWireV1 = serde_json::from_slice(&canonical)
-            .map_err(|error| GatewayProtocolError::MalformedEnvelope(error.to_string()))?;
+            .map_err(|_| GatewayProtocolError::MalformedEnvelope)?;
         Self::from_input(GatewayToolCallInputV1 {
             schema_version: wire.schema_version,
             provider: wire.provider,
@@ -919,10 +921,6 @@ impl GatewayToolCallV1 {
         self.effect_class
     }
 
-    pub fn effect(&self) -> GatewayEffectClassV1 {
-        self.adapter_effect
-    }
-
     pub fn freshness(&self) -> FreshnessRequirementV1 {
         self.freshness
     }
@@ -950,9 +948,44 @@ impl GatewayToolCallV1 {
     pub fn digest(&self) -> [u8; 32] {
         *domain_digest(REQUEST_DIGEST_DOMAIN, &self.canonical_bytes).as_bytes()
     }
+}
 
-    /// Decode only the compact canonical adapter envelope. Alternate JSON
-    /// spellings are refused even when they represent the same value.
+/// Compact untrusted-boundary call. It is deliberately a different type from
+/// the complete [`GatewayToolCallV1`] so each type has one wire schema, one
+/// canonical byte string, and one digest domain.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayAdapterToolCallV1 {
+    call_id: String,
+    tool: String,
+    effect: GatewayEffectClassV1,
+    arguments: CanonicalArguments,
+    canonical_argument_bytes: Vec<u8>,
+    canonical_bytes: Vec<u8>,
+}
+
+impl GatewayAdapterToolCallV1 {
+    pub fn new(
+        call_id: &str,
+        tool: &str,
+        effect: GatewayEffectClassV1,
+        arguments: &[u8],
+    ) -> Result<Self, GatewayProtocolRefusalV1> {
+        if !valid_identifier(call_id, false) || !valid_identifier(tool, true) {
+            return Err(GatewayProtocolRefusalV1::InvalidIdentifier);
+        }
+        let arguments = strict_adapter_arguments(arguments)?;
+        let canonical_argument_bytes = arguments.canonical_bytes();
+        let canonical_bytes = compact_envelope_bytes(call_id, tool, effect, arguments.0.clone());
+        Ok(Self {
+            call_id: call_id.to_owned(),
+            tool: tool.to_owned(),
+            effect,
+            arguments,
+            canonical_argument_bytes,
+            canonical_bytes,
+        })
+    }
+
     pub fn from_canonical_bytes(input: &[u8]) -> Result<Self, GatewayProtocolRefusalV1> {
         let parsed = parse_canonical(input, ENVELOPE_LIMITS).map_err(map_canonical_refusal)?;
         if encode_node(&parsed) != input {
@@ -1005,13 +1038,46 @@ impl GatewayToolCallV1 {
         }
         Ok(call)
     }
+
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub fn tool(&self) -> &str {
+        &self.tool
+    }
+
+    pub const fn effect(&self) -> GatewayEffectClassV1 {
+        self.effect
+    }
+
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    pub fn canonical_argument_bytes(&self) -> &[u8] {
+        &self.canonical_argument_bytes
+    }
+
+    pub fn digest(&self) -> [u8; 32] {
+        *domain_digest(ADAPTER_DIGEST_DOMAIN, &self.canonical_bytes).as_bytes()
+    }
+}
+
+impl fmt::Debug for GatewayAdapterToolCallV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GatewayAdapterToolCallV1")
+            .field("digest", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for GatewayToolCallV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GatewayToolCallV1")
-            .field("request_digest", &self.request_digest().as_str())
+            .field("request_digest", &"<redacted>")
             .finish_non_exhaustive()
     }
 }
@@ -1058,13 +1124,13 @@ fn strict_adapter_arguments(input: &[u8]) -> Result<CanonicalArguments, GatewayP
 
 fn map_canonical_refusal(error: CanonicalJsonError) -> GatewayProtocolRefusalV1 {
     match error {
-        CanonicalJsonError::InputTooLarge { .. } | CanonicalJsonError::EncodedTooLarge { .. } => {
+        CanonicalJsonError::InputTooLarge | CanonicalJsonError::EncodedTooLarge => {
             GatewayProtocolRefusalV1::ArgumentTooLarge
         }
-        CanonicalJsonError::DepthLimitExceeded { .. } => GatewayProtocolRefusalV1::DepthExceeded,
-        CanonicalJsonError::NodeLimitExceeded { .. } => GatewayProtocolRefusalV1::NodeLimitExceeded,
-        CanonicalJsonError::DuplicateKey(_) => GatewayProtocolRefusalV1::DuplicateKey,
-        CanonicalJsonError::Malformed(_) => GatewayProtocolRefusalV1::InvalidJson,
+        CanonicalJsonError::DepthLimitExceeded => GatewayProtocolRefusalV1::DepthExceeded,
+        CanonicalJsonError::NodeLimitExceeded => GatewayProtocolRefusalV1::NodeLimitExceeded,
+        CanonicalJsonError::DuplicateKey => GatewayProtocolRefusalV1::DuplicateKey,
+        CanonicalJsonError::Malformed => GatewayProtocolRefusalV1::InvalidJson,
     }
 }
 
@@ -1103,17 +1169,6 @@ fn compact_envelope_bytes(
     encode_node(&CanonicalNode::Object(values))
 }
 
-fn adapter_effect(effect: EffectClass) -> GatewayEffectClassV1 {
-    match effect {
-        EffectClass::SnapshotRead => GatewayEffectClassV1::WorkspaceRead,
-        EffectClass::FreshnessBoundRead => GatewayEffectClassV1::ExternalRead,
-        EffectClass::DeterministicCompute => GatewayEffectClassV1::Pure,
-        EffectClass::Mutation => GatewayEffectClassV1::WorkspaceWrite,
-        EffectClass::ExternalSideEffect => GatewayEffectClassV1::ExternalWrite,
-        EffectClass::Unknown => GatewayEffectClassV1::Unknown,
-    }
-}
-
 fn domain_digest(domain: &[u8], payload: &[u8]) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
@@ -1123,9 +1178,15 @@ fn domain_digest(domain: &[u8], payload: &[u8]) -> blake3::Hash {
 }
 
 /// Domain-locked digest of the complete canonical request envelope.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
 pub struct RequestDigestV1(String);
+
+impl fmt::Debug for RequestDigestV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RequestDigestV1(<redacted>)")
+    }
+}
 
 impl RequestDigestV1 {
     pub fn as_str(&self) -> &str {
@@ -1137,17 +1198,14 @@ fn canonicalize_serializable<T: Serialize>(
     value: &T,
     limits: JsonLimits,
 ) -> Result<Vec<u8>, CanonicalJsonError> {
-    let value = serde_json::to_value(value)
-        .map_err(|error| CanonicalJsonError::Malformed(error.to_string()))?;
+    let value = serde_json::to_value(value).map_err(|_| CanonicalJsonError::Malformed)?;
     let node = node_from_value(value, limits)?;
     Ok(encode_node(&node))
 }
 
 fn validate_input(input: &GatewayToolCallInputV1) -> Result<(), GatewayProtocolError> {
     if input.schema_version != GATEWAY_TOOL_CALL_SCHEMA_VERSION {
-        return Err(GatewayProtocolError::UnsupportedSchemaVersion(
-            input.schema_version,
-        ));
+        return Err(GatewayProtocolError::UnsupportedSchemaVersion);
     }
     validate_identity(&input.provider.id, "provider id")?;
     validate_identity(&input.provider.version, "provider version")?;
@@ -1167,9 +1225,7 @@ fn validate_input(input: &GatewayToolCallInputV1) -> Result<(), GatewayProtocolE
     }
     if let RepositoryEnvironmentStateV1::Known { reference } = &input.state {
         if reference.schema_version != GATEWAY_TOOL_CALL_SCHEMA_VERSION {
-            return Err(GatewayProtocolError::UnsupportedSchemaVersion(
-                reference.schema_version,
-            ));
+            return Err(GatewayProtocolError::UnsupportedSchemaVersion);
         }
         validate_digest(
             &reference.repository,
@@ -1187,16 +1243,30 @@ fn validate_input(input: &GatewayToolCallInputV1) -> Result<(), GatewayProtocolE
 
 fn validate_digest(
     digest: &DigestReferenceV1,
-    algorithm_field: &'static str,
-    value_field: &'static str,
+    _algorithm_field: &'static str,
+    _value_field: &'static str,
 ) -> Result<(), GatewayProtocolError> {
-    validate_identity(&digest.algorithm, algorithm_field)?;
-    validate_identity(&digest.value, value_field)
+    if digest.algorithm.is_empty()
+        || digest.algorithm.len() > MAX_DIGEST_ALGORITHM_BYTES_V1
+        || !digest
+            .algorithm
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        || digest.value.is_empty()
+        || digest.value.len() > MAX_DIGEST_VALUE_BYTES_V1
+        || !digest.value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(GatewayProtocolError::InvalidField);
+    }
+    Ok(())
 }
 
-fn validate_identity(value: &str, field: &'static str) -> Result<(), GatewayProtocolError> {
-    if value.trim().is_empty() {
-        return Err(GatewayProtocolError::EmptyField(field));
+fn validate_identity(value: &str, _field: &'static str) -> Result<(), GatewayProtocolError> {
+    if value.is_empty()
+        || value.len() > MAX_IDENTITY_BYTES_V1
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(GatewayProtocolError::InvalidField);
     }
     Ok(())
 }

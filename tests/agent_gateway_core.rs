@@ -4,25 +4,26 @@ mod agent_gateway;
 
 use std::collections::BTreeSet;
 
+use agent_gateway::context::presenter_complete_exact_delivery_v1;
 use agent_gateway::protocol::{
     GATEWAY_TOOL_CALL_SCHEMA_VERSION, MAX_CANONICAL_JSON_BYTES, MAX_CANONICAL_JSON_DEPTH,
     MAX_CANONICAL_JSON_NODES,
 };
 use agent_gateway::{
-    AgentCallIdentityV1, AgentContextIdentityV1, CandidateFreshnessV1, CandidateOriginV1,
-    CanonicalArguments, CanonicalJsonError, DeliveryReceiptV1, DigestReferenceV1, EffectClass,
-    FreshnessRequirementV1, GatewayCandidateKindV1, GatewayCandidateRequestV1, GatewayDecision,
-    GatewayEffectClassV1, GatewayProtocolRefusalV1, GatewayResultIdentityV1,
+    AgentCallIdentityV1, AgentContextIdentityV1, CandidateFreshnessV1, CanonicalArguments,
+    CanonicalJsonError, DigestReferenceV1, EffectClass, FreshnessRequirementV1,
+    GatewayAdapterToolCallV1, GatewayCandidateKindV1, GatewayCandidateRequestV1, GatewayDecision,
+    GatewayEffectClassV1, GatewayProtocolError, GatewayProtocolRefusalV1, GatewayResultIdentityV1,
     GatewayRouteDecisionV1, GatewayRouteRefusalV1, GatewayToolCallInputV1, GatewayToolCallV1,
-    InflightRequestV1, ModelIdentityV1, PermissionClass, PresentationContextV1,
-    PresentationDecisionV1, PresentationMode, PresentationRefusalV1, ProviderIdentityV1,
-    RepositoryEnvironmentStateV1, ReuseCandidateV1, RoutingCandidatesV1, StateDigestReferenceV1,
-    TaskIdentityV1, ToolIdentityV1, WorkspaceIdentityV1, decide_presentation_v1, route,
-    route_gateway_candidate_v1, select_presentation,
+    ModelIdentityV1, PermissionClass, PresentationContextV1, PresentationDecisionV1,
+    PresentationMode, PresentationRefusalV1, ProviderIdentityV1, RepositoryEnvironmentStateV1,
+    ReuseCandidateV1, RoutingCandidatesV1, StateDigestReferenceV1, TaskIdentityV1, ToolIdentityV1,
+    WorkspaceIdentityV1, decide_presentation_v1, route, route_gateway_candidate_v1,
+    select_presentation,
 };
 
-fn call(effect: GatewayEffectClassV1) -> GatewayToolCallV1 {
-    GatewayToolCallV1::new(
+fn call(effect: GatewayEffectClassV1) -> GatewayAdapterToolCallV1 {
+    GatewayAdapterToolCallV1::new(
         "call_01",
         "exec_command",
         effect,
@@ -45,7 +46,7 @@ fn canonical_call_sorts_every_object_and_round_trips_exactly() {
         call.canonical_bytes(),
         br#"{"arguments":{"a":{"first":null,"second":true},"z":[3,2,1]},"call_id":"call_01","effect":"workspace_read","schema":"again.gateway-tool-call.v1","tool":"exec_command"}"#
     );
-    let decoded = GatewayToolCallV1::from_canonical_bytes(call.canonical_bytes()).unwrap();
+    let decoded = GatewayAdapterToolCallV1::from_canonical_bytes(call.canonical_bytes()).unwrap();
     assert_eq!(decoded, call);
     assert_eq!(decoded.digest(), call.digest());
 }
@@ -58,7 +59,7 @@ fn duplicate_keys_are_refused_at_top_level_and_at_every_nested_shape() {
         br#"{"outer":[{"x":1,"x":2}]}"#.as_slice(),
     ] {
         assert_eq!(
-            GatewayToolCallV1::new("call", "tool", GatewayEffectClassV1::Pure, malformed)
+            GatewayAdapterToolCallV1::new("call", "tool", GatewayEffectClassV1::Pure, malformed)
                 .unwrap_err(),
             GatewayProtocolRefusalV1::DuplicateKey
         );
@@ -66,7 +67,7 @@ fn duplicate_keys_are_refused_at_top_level_and_at_every_nested_shape() {
 
     let duplicate_envelope = br#"{"arguments":{},"call_id":"a","effect":"pure","schema":"again.gateway-tool-call.v1","tool":"x","tool":"y"}"#;
     assert_eq!(
-        GatewayToolCallV1::from_canonical_bytes(duplicate_envelope).unwrap_err(),
+        GatewayAdapterToolCallV1::from_canonical_bytes(duplicate_envelope).unwrap_err(),
         GatewayProtocolRefusalV1::DuplicateKey
     );
 }
@@ -79,7 +80,7 @@ fn canonical_decoder_rejects_alternate_bytes_for_the_same_value() {
         br#"{"arguments":{"n":-0},"call_id":"a","effect":"pure","schema":"again.gateway-tool-call.v1","tool":"x"}"#.as_slice(),
     ] {
         assert_eq!(
-            GatewayToolCallV1::from_canonical_bytes(noncanonical).unwrap_err(),
+            GatewayAdapterToolCallV1::from_canonical_bytes(noncanonical).unwrap_err(),
             GatewayProtocolRefusalV1::NonCanonical
         );
     }
@@ -116,7 +117,7 @@ fn envelope_schema_fields_and_types_are_closed() {
     ];
     for (wire, expected) in cases {
         assert_eq!(
-            GatewayToolCallV1::from_canonical_bytes(wire).unwrap_err(),
+            GatewayAdapterToolCallV1::from_canonical_bytes(wire).unwrap_err(),
             *expected
         );
     }
@@ -126,20 +127,25 @@ fn envelope_schema_fields_and_types_are_closed() {
 fn identifiers_are_ascii_bounded_and_tool_grammar_is_explicit() {
     for invalid_call_id in ["", "has space", "é", &"a".repeat(129)] {
         assert_eq!(
-            GatewayToolCallV1::new(invalid_call_id, "tool", GatewayEffectClassV1::Pure, b"{}")
-                .unwrap_err(),
+            GatewayAdapterToolCallV1::new(
+                invalid_call_id,
+                "tool",
+                GatewayEffectClassV1::Pure,
+                b"{}",
+            )
+            .unwrap_err(),
             GatewayProtocolRefusalV1::InvalidIdentifier
         );
     }
     for invalid_tool in ["", "has space", "tool?", "é"] {
         assert_eq!(
-            GatewayToolCallV1::new("id", invalid_tool, GatewayEffectClassV1::Pure, b"{}")
+            GatewayAdapterToolCallV1::new("id", invalid_tool, GatewayEffectClassV1::Pure, b"{}",)
                 .unwrap_err(),
             GatewayProtocolRefusalV1::InvalidIdentifier
         );
     }
     assert!(
-        GatewayToolCallV1::new(
+        GatewayAdapterToolCallV1::new(
             "id-_9",
             "mcp__server/tool.name:v1",
             GatewayEffectClassV1::Pure,
@@ -152,7 +158,7 @@ fn identifiers_are_ascii_bounded_and_tool_grammar_is_explicit() {
 #[test]
 fn json_numbers_depth_collections_nodes_strings_and_wire_bytes_are_bounded() {
     assert_eq!(
-        GatewayToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, br#"{"x":1.0}"#)
+        GatewayAdapterToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, br#"{"x":1.0}"#,)
             .unwrap_err(),
         GatewayProtocolRefusalV1::NonIntegralNumber
     );
@@ -167,7 +173,7 @@ fn json_numbers_depth_collections_nodes_strings_and_wire_bytes_are_bounded() {
     }
     deep.push('}');
     assert_eq!(
-        GatewayToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, deep.as_bytes())
+        GatewayAdapterToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, deep.as_bytes(),)
             .unwrap_err(),
         GatewayProtocolRefusalV1::DepthExceeded
     );
@@ -179,7 +185,7 @@ fn json_numbers_depth_collections_nodes_strings_and_wire_bytes_are_bounded() {
             .join(",")
     );
     assert_eq!(
-        GatewayToolCallV1::new(
+        GatewayAdapterToolCallV1::new(
             "id",
             "tool",
             GatewayEffectClassV1::Pure,
@@ -203,14 +209,14 @@ fn json_numbers_depth_collections_nodes_strings_and_wire_bytes_are_bounded() {
             .join(",")
     );
     assert_eq!(
-        GatewayToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, nodes.as_bytes())
+        GatewayAdapterToolCallV1::new("id", "tool", GatewayEffectClassV1::Pure, nodes.as_bytes(),)
             .unwrap_err(),
         GatewayProtocolRefusalV1::NodeLimitExceeded
     );
 
     let large_string = format!("{{\"x\":\"{}\"}}", "a".repeat(49 * 1024));
     assert_eq!(
-        GatewayToolCallV1::new(
+        GatewayAdapterToolCallV1::new(
             "id",
             "tool",
             GatewayEffectClassV1::Pure,
@@ -221,7 +227,7 @@ fn json_numbers_depth_collections_nodes_strings_and_wire_bytes_are_bounded() {
     );
 
     assert_eq!(
-        GatewayToolCallV1::new(
+        GatewayAdapterToolCallV1::new(
             "id",
             "tool",
             GatewayEffectClassV1::Pure,
@@ -345,9 +351,11 @@ fn context(
 #[test]
 fn presentation_requires_exact_context_call_result_counts_status_and_confirmation() {
     let active_context = context("session", "turn", Some("agent"), "local", 1, false, 4096);
-    let call = call(GatewayEffectClassV1::WorkspaceRead);
+    let call = rich_call();
     let result = GatewayResultIdentityV1::from_streams(0, b"stdout", b"stderr").unwrap();
-    let exact = DeliveryReceiptV1::new(&active_context, &call, result, 6, 6, true, true).unwrap();
+    let exact =
+        presenter_complete_exact_delivery_v1(&active_context, &call, result, 6, 6, true, true)
+            .unwrap();
     assert_eq!(
         decide_presentation_v1(&active_context, &call, result, Some(&exact)),
         PresentationDecisionV1::ExactPriorDeliveryReference
@@ -371,13 +379,9 @@ fn presentation_requires_exact_context_call_result_counts_status_and_confirmatio
         );
     }
 
-    let other_call = GatewayToolCallV1::new(
-        "other",
-        "exec_command",
-        GatewayEffectClassV1::WorkspaceRead,
-        b"{}",
-    )
-    .unwrap();
+    let mut other_input = rich_input();
+    other_input.call.call_id = "other".to_owned();
+    let other_call = GatewayToolCallV1::from_input(other_input).unwrap();
     assert_eq!(
         decide_presentation_v1(&active_context, &other_call, result, Some(&exact)),
         PresentationDecisionV1::FullResult
@@ -388,15 +392,23 @@ fn presentation_requires_exact_context_call_result_counts_status_and_confirmatio
         PresentationDecisionV1::FullResult
     );
 
-    for receipt in [
-        DeliveryReceiptV1::new(&active_context, &call, result, 5, 6, true, true).unwrap(),
-        DeliveryReceiptV1::new(&active_context, &call, result, 6, 5, true, true).unwrap(),
-        DeliveryReceiptV1::new(&active_context, &call, result, 6, 6, false, true).unwrap(),
-        DeliveryReceiptV1::new(&active_context, &call, result, 6, 6, true, false).unwrap(),
+    for delivery in [
+        (5, 6, true, true),
+        (6, 5, true, true),
+        (6, 6, false, true),
+        (6, 6, true, false),
     ] {
         assert_eq!(
-            decide_presentation_v1(&active_context, &call, result, Some(&receipt)),
-            PresentationDecisionV1::FullResult
+            presenter_complete_exact_delivery_v1(
+                &active_context,
+                &call,
+                result,
+                delivery.0,
+                delivery.1,
+                delivery.2,
+                delivery.3,
+            ),
+            Err(PresentationRefusalV1::IncompleteDelivery)
         );
     }
     assert_eq!(
@@ -416,10 +428,11 @@ fn delivery_counts_context_identifiers_and_streams_are_bounded() {
     }
     let context = context("session", "turn", None, "local", 0, false, 1);
     assert_eq!(context.output_ceiling(), 1);
-    let call = call(GatewayEffectClassV1::Pure);
+    let call = rich_call();
     let result = GatewayResultIdentityV1::from_streams(0, b"x", b"").unwrap();
     assert_eq!(
-        DeliveryReceiptV1::new(&context, &call, result, 2, 0, true, true).unwrap_err(),
+        presenter_complete_exact_delivery_v1(&context, &call, result, 2, 0, true, true)
+            .unwrap_err(),
         PresentationRefusalV1::InvalidDeliveryCount
     );
     assert_eq!(
@@ -431,7 +444,7 @@ fn delivery_counts_context_identifiers_and_streams_are_bounded() {
 #[test]
 fn mutations_partition_call_and_result_identity_and_debug_is_redacted() {
     let first = call(GatewayEffectClassV1::Pure);
-    let second = GatewayToolCallV1::new(
+    let second = GatewayAdapterToolCallV1::new(
         "call_01",
         "exec_command",
         GatewayEffectClassV1::Pure,
@@ -520,15 +533,6 @@ fn rich_input() -> GatewayToolCallInputV1 {
 
 fn rich_call() -> GatewayToolCallV1 {
     GatewayToolCallV1::from_input(rich_input()).unwrap()
-}
-
-fn recorded(call: &GatewayToolCallV1) -> ReuseCandidateV1 {
-    ReuseCandidateV1::new(
-        call.request_digest(),
-        digest_ref("result"),
-        CandidateOriginV1::RecordedExecution,
-        CandidateFreshnessV1::ExactSnapshot,
-    )
 }
 
 #[test]
@@ -664,9 +668,30 @@ fn rich_canonical_numbers_strings_and_owned_round_trip_are_stable() {
     );
 
     let call = rich_call();
+    let serialized = serde_json::to_vec(&call).unwrap();
+    assert_eq!(serialized, call.canonical_bytes());
     let decoded = GatewayToolCallV1::from_json_slice(call.canonical_bytes()).unwrap();
     assert_eq!(call, decoded);
     assert_eq!(call.request_digest(), decoded.request_digest());
+}
+
+#[test]
+fn rich_metadata_is_bounded_and_errors_and_debug_are_payload_free() {
+    let mut oversized = rich_input();
+    oversized.provider.id = "sensitive".repeat(40);
+    let error = GatewayToolCallV1::from_input(oversized).unwrap_err();
+    assert_eq!(error, GatewayProtocolError::InvalidField);
+    assert_eq!(format!("{error:?}"), "InvalidField");
+
+    assert_eq!(
+        DigestReferenceV1::new("blake3", "x".repeat(257)).unwrap_err(),
+        GatewayProtocolError::InvalidField
+    );
+    let call = rich_call();
+    let debug = format!("{call:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("diamond"));
+    assert!(!debug.contains(call.request_digest().as_str()));
 }
 
 #[test]
@@ -674,12 +699,10 @@ fn rich_router_executes_unknown_state_and_never_replays_mutations() {
     let mut unknown = rich_input();
     unknown.state = RepositoryEnvironmentStateV1::Unknown;
     let unknown = GatewayToolCallV1::from_input(unknown).unwrap();
-    let candidates = RoutingCandidatesV1 {
-        exact: Some(recorded(&unknown)),
-        inflight: Some(InflightRequestV1::new(unknown.request_digest(), true)),
-        ..RoutingCandidatesV1::default()
-    };
-    assert_eq!(route(&unknown, &candidates), GatewayDecision::Execute);
+    assert_eq!(
+        route(&unknown, &RoutingCandidatesV1::default()),
+        GatewayDecision::Execute
+    );
 
     for effect in [
         EffectClass::Mutation,
@@ -690,60 +713,14 @@ fn rich_router_executes_unknown_state_and_never_replays_mutations() {
         input.effect_class = effect;
         let call = GatewayToolCallV1::from_input(input).unwrap();
         assert_eq!(
-            route(
-                &call,
-                &RoutingCandidatesV1 {
-                    exact: Some(recorded(&call)),
-                    ..RoutingCandidatesV1::default()
-                }
-            ),
+            route(&call, &RoutingCandidatesV1::default()),
             GatewayDecision::ExecuteNonReplayable
         );
     }
 }
 
 #[test]
-fn rich_router_covers_exact_deterministic_inflight_and_permission_decisions() {
-    let call = rich_call();
-    assert_eq!(
-        route(
-            &call,
-            &RoutingCandidatesV1 {
-                exact: Some(recorded(&call)),
-                ..RoutingCandidatesV1::default()
-            }
-        ),
-        GatewayDecision::ServeExact
-    );
-    assert_eq!(
-        route(
-            &call,
-            &RoutingCandidatesV1 {
-                deterministic_coverage: Some(ReuseCandidateV1::new(
-                    call.request_digest(),
-                    digest_ref("coverage"),
-                    CandidateOriginV1::DeterministicDerivation {
-                        rule_id: "excerpt".to_owned(),
-                        rule_version: "1".to_owned(),
-                    },
-                    CandidateFreshnessV1::ExactSnapshot,
-                )),
-                ..RoutingCandidatesV1::default()
-            }
-        ),
-        GatewayDecision::ServeDeterministicCoverage
-    );
-    assert_eq!(
-        route(
-            &call,
-            &RoutingCandidatesV1 {
-                inflight: Some(InflightRequestV1::new(call.request_digest(), true)),
-                ..RoutingCandidatesV1::default()
-            }
-        ),
-        GatewayDecision::JoinInflight
-    );
-
+fn rich_router_covers_permission_decisions_without_public_authority_constructors() {
     let mut approval = rich_input();
     approval.permission_class = PermissionClass::RequiresApproval;
     assert_eq!(
@@ -768,67 +745,33 @@ fn rich_router_covers_exact_deterministic_inflight_and_permission_decisions() {
 fn rich_semantic_candidates_can_only_request_validation() {
     let call = rich_call();
     let semantic = || {
-        ReuseCandidateV1::new(
+        ReuseCandidateV1::semantic_or_ai_candidate(
             call.request_digest(),
             digest_ref("semantic"),
-            CandidateOriginV1::SemanticOrAiGenerated {
-                provider_id: "provider".to_owned(),
-                model_id: "model".to_owned(),
-                model_version: "1".to_owned(),
-            },
+            "provider",
+            "model",
+            "1",
             CandidateFreshnessV1::Revalidated,
         )
+        .unwrap()
     };
-    for candidates in [
-        RoutingCandidatesV1 {
-            exact: Some(semantic()),
-            ..RoutingCandidatesV1::default()
-        },
-        RoutingCandidatesV1 {
-            deterministic_coverage: Some(semantic()),
-            ..RoutingCandidatesV1::default()
-        },
-        RoutingCandidatesV1 {
-            semantic: Some(semantic()),
-            ..RoutingCandidatesV1::default()
-        },
-    ] {
-        assert_eq!(
-            route(&call, &candidates),
-            GatewayDecision::ValidateSemanticCandidate
-        );
-    }
-}
-
-#[test]
-fn rich_freshness_bound_reads_reject_stale_results() {
-    let mut input = rich_input();
-    input.effect_class = EffectClass::FreshnessBoundRead;
-    input.freshness = FreshnessRequirementV1::MaxAgeMillis(50);
-    let call = GatewayToolCallV1::from_input(input).unwrap();
-    let candidate = |age| RoutingCandidatesV1 {
-        exact: Some(ReuseCandidateV1::new(
-            call.request_digest(),
-            digest_ref("result"),
-            CandidateOriginV1::RecordedExecution,
-            CandidateFreshnessV1::AgeMillis(age),
-        )),
-        ..RoutingCandidatesV1::default()
-    };
-    assert_eq!(route(&call, &candidate(51)), GatewayDecision::Execute);
-    assert_eq!(route(&call, &candidate(50)), GatewayDecision::ServeExact);
+    let candidates = RoutingCandidatesV1::default().with_semantic_candidate(semantic());
+    assert_eq!(
+        route(&call, &candidates),
+        GatewayDecision::ValidateSemanticCandidate
+    );
 }
 
 #[test]
 fn compact_receipts_separate_agent_session_turn_result_and_compaction() {
-    let original = AgentContextIdentityV1 {
-        agent_id: "agent".to_owned(),
-        session_id: "session".to_owned(),
-        turn_id: "turn".to_owned(),
-        compaction_generation: 0,
-    };
-    let result = digest_ref("result");
-    let receipt = DeliveryReceiptV1::for_exact_delivery(original.clone(), result.clone());
+    let presentation = context("session", "turn", Some("agent"), "local", 1, false, 4096);
+    let call = rich_call();
+    let identity = GatewayResultIdentityV1::from_streams(0, b"out", b"err").unwrap();
+    let receipt =
+        presenter_complete_exact_delivery_v1(&presentation, &call, identity, 3, 3, true, true)
+            .unwrap();
+    let original = receipt.context().clone();
+    let result = receipt.exact_result().clone();
     assert_eq!(
         select_presentation(
             PresentationMode::CompactReference,
@@ -839,19 +782,10 @@ fn compact_receipts_separate_agent_session_turn_result_and_compaction() {
         PresentationMode::CompactReference
     );
     let contexts = [
-        AgentContextIdentityV1 {
-            agent_id: "other".to_owned(),
-            ..original.clone()
-        },
-        AgentContextIdentityV1 {
-            session_id: "other".to_owned(),
-            ..original.clone()
-        },
-        AgentContextIdentityV1 {
-            turn_id: "other".to_owned(),
-            ..original.clone()
-        },
-        original.after_compaction(),
+        AgentContextIdentityV1::new("other", "session", "turn", 0).unwrap(),
+        AgentContextIdentityV1::new("agent", "other", "turn", 0).unwrap(),
+        AgentContextIdentityV1::new("agent", "session", "other", 0).unwrap(),
+        original.after_compaction().unwrap(),
     ];
     for context in contexts {
         assert_eq!(
@@ -883,7 +817,7 @@ fn canonical_argument_boundaries_and_malformed_numbers_fail_closed() {
     CanonicalArguments::from_json_str(&nested(MAX_CANONICAL_JSON_DEPTH)).unwrap();
     assert!(matches!(
         CanonicalArguments::from_json_str(&nested(MAX_CANONICAL_JSON_DEPTH + 1)),
-        Err(CanonicalJsonError::DepthLimitExceeded { .. })
+        Err(CanonicalJsonError::DepthLimitExceeded)
     ));
 
     let boundary = format!("[{}]", vec!["null"; MAX_CANONICAL_JSON_NODES - 1].join(","));
@@ -891,19 +825,19 @@ fn canonical_argument_boundaries_and_malformed_numbers_fail_closed() {
     let over = format!("[{}]", vec!["null"; MAX_CANONICAL_JSON_NODES].join(","));
     assert!(matches!(
         CanonicalArguments::from_json_str(&over),
-        Err(CanonicalJsonError::NodeLimitExceeded { .. })
+        Err(CanonicalJsonError::NodeLimitExceeded)
     ));
 
     assert!(matches!(
         CanonicalArguments::from_value(serde_json::Value::String(
             "x".repeat(MAX_CANONICAL_JSON_BYTES)
         )),
-        Err(CanonicalJsonError::EncodedTooLarge { .. })
+        Err(CanonicalJsonError::EncodedTooLarge)
     ));
     for malformed in ["{", r#"{"x":NaN}"#, r#"{"x":Infinity}"#, "null null"] {
         assert!(matches!(
             CanonicalArguments::from_json_str(malformed),
-            Err(CanonicalJsonError::Malformed(_))
+            Err(CanonicalJsonError::Malformed)
         ));
     }
 }
