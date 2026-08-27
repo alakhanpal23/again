@@ -128,6 +128,7 @@ pub enum GatewayRefusalReason {
     ExecutionNotStarted,
     BindingMismatch,
     FreshnessExpired,
+    ResultCorrupt,
 }
 
 impl GatewayRefusalReason {
@@ -149,6 +150,7 @@ impl GatewayRefusalReason {
             Self::ExecutionNotStarted => "execution_not_started",
             Self::BindingMismatch => "binding_mismatch",
             Self::FreshnessExpired => "freshness_expired",
+            Self::ResultCorrupt => "result_corrupt",
         }
     }
 }
@@ -1268,6 +1270,75 @@ impl Store {
         Ok(removed as u64)
     }
 
+    /// Validate every durable authority edge before a ready row can be
+    /// classified as a hit. A process crash leaves rows behind but cannot leave
+    /// an in-memory capability, so reopen reconstructs authority from the exact
+    /// completed lease generation and the bounded CAS bytes. A result id or a
+    /// syntactically valid row is deliberately insufficient.
+    fn gateway_result_is_servable_v1(
+        &self,
+        transaction: &Transaction<'_>,
+        binding: &ValidatedGatewayReadV1,
+        gateway_result_id: &str,
+    ) -> Result<bool> {
+        let result = match self.load_gateway_result_with_origin_v1(
+            transaction,
+            binding,
+            gateway_result_id,
+        ) {
+            Ok(Some(result)) => result,
+            Ok(None) | Err(_) => return Ok(false),
+        };
+        Ok(source_result_blobs_valid_v1(self, &result))
+    }
+
+    fn load_gateway_result_with_origin_v1(
+        &self,
+        transaction: &Transaction<'_>,
+        binding: &ValidatedGatewayReadV1,
+        gateway_result_id: &str,
+    ) -> Result<Option<StoredResult>> {
+        let Some(result) =
+            load_gateway_result_snapshot_v1(transaction, binding, gateway_result_id)?
+        else {
+            return Ok(None);
+        };
+        let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
+        if dependencies != binding.input.dependencies {
+            return Ok(None);
+        }
+        let lease_id = transaction
+            .query_row(
+                "SELECT lease_id FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
+                [gateway_result_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(lease_id) = lease_id else {
+            return Ok(None);
+        };
+        let Some(lease) = gateway_lease_row_v1(transaction, &lease_id)? else {
+            return Ok(None);
+        };
+        let current_generation = transaction.query_row(
+            "SELECT MAX(lifecycle_generation) FROM inflight_leases WHERE binding_digest = ?1",
+            [binding.binding_digest()],
+            |row| row.get::<_, Option<u64>>(0),
+        )?;
+        let valid_completion = lease.status == "completed"
+            && lease.gateway_result_id.as_deref() == Some(gateway_result_id)
+            && lease.request_digest == binding.input.request_digest
+            && lease.state_digest == binding.input.state_digest
+            && lease.policy_digest == binding.input.policy_digest
+            && lease.binding_digest == binding.binding_digest
+            && current_generation == Some(lease.lifecycle_generation)
+            && matches!(
+                (lease.execution_started_ms, lease.completed_ms),
+                (Some(started), Some(completed)) if started >= 0 && completed >= started
+            );
+        Ok(valid_completion.then_some(result))
+    }
+
     pub fn acquire_gateway_call(
         &self,
         binding: &ValidatedGatewayReadV1,
@@ -1292,7 +1363,7 @@ impl Store {
             )
             .optional()?;
         if let Some(gateway_result_id) = ready {
-            if gateway_result_row_valid_v1(&transaction, binding, &gateway_result_id)? {
+            if self.gateway_result_is_servable_v1(&transaction, binding, &gateway_result_id)? {
                 insert_gateway_request_v1(
                     &transaction,
                     &call_id,
@@ -1331,18 +1402,10 @@ impl Store {
                     gateway_result_id,
                 });
             }
-            transaction.execute(
-                "UPDATE gateway_results SET status = 'quarantined', quarantine_reason = 'binding_mismatch', updated_ms = ?2 WHERE gateway_result_id = ?1 AND status = 'ready'",
-                params![gateway_result_id, now],
-            )?;
-            record_gateway_event_v1_tx(
+            quarantine_invalid_gateway_result_v1_tx(
                 &transaction,
                 Some(&call_id),
-                None,
-                Some(&gateway_result_id),
-                "binding_quarantined",
-                Some(GatewayRefusalReason::BindingMismatch.as_str()),
-                0,
+                &gateway_result_id,
                 now,
             )?;
             transaction.commit()?;
@@ -1615,6 +1678,18 @@ impl Store {
             )
             .optional()?;
         if let Some(gateway_result_id) = ready {
+            if !self.gateway_result_is_servable_v1(&transaction, binding, &gateway_result_id)? {
+                quarantine_invalid_gateway_result_v1_tx(
+                    &transaction,
+                    None,
+                    &gateway_result_id,
+                    now,
+                )?;
+                transaction.commit()?;
+                return Ok(GatewayCallObservation::Quarantined {
+                    reason: GatewayRefusalReason::ResultCorrupt.as_str().to_owned(),
+                });
+            }
             transaction.commit()?;
             return Ok(GatewayCallObservation::Ready { gateway_result_id });
         }
@@ -1707,10 +1782,16 @@ impl Store {
             )
             .optional()?;
         if let Some((gateway_result_id, lease_id)) = ready {
-            if !gateway_result_row_valid_v1(&transaction, binding, &gateway_result_id)? {
+            if !self.gateway_result_is_servable_v1(&transaction, binding, &gateway_result_id)? {
+                quarantine_invalid_gateway_result_v1_tx(
+                    &transaction,
+                    None,
+                    &gateway_result_id,
+                    now,
+                )?;
                 transaction.commit()?;
                 return Ok(GatewayRouteProofObservationV1::Unavailable(
-                    GatewayRouteProofUnavailableV1::BindingMismatch,
+                    GatewayRouteProofUnavailableV1::Quarantined,
                 ));
             }
             let Some(lease) = gateway_lease_row_v1(&transaction, &lease_id)? else {
@@ -1872,6 +1953,12 @@ impl Store {
                 reason: GatewayRefusalReason::ResultNotFound,
             });
         };
+        if !source_result_blobs_valid_v1(self, &result) {
+            transaction.commit()?;
+            return Ok(GatewayCompletion::Refused {
+                reason: GatewayRefusalReason::ResultCorrupt,
+            });
+        }
         let dependencies = load_request_dependencies_v1(&transaction, &lease.call_id)?;
         let gateway_result_id = gateway_result_content_digest(&lease, &result, &dependencies);
         if lease.status == "completed" {
@@ -2124,16 +2211,22 @@ impl Store {
     ) -> Result<Option<GatewayFullResultV1>> {
         validate_digest(gateway_result_id, "gateway result digest")?;
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
-        let Some(result) =
-            load_gateway_result_snapshot_v1(&transaction, binding, gateway_result_id)?
-        else {
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready')",
+            [gateway_result_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
             transaction.commit()?;
             return Ok(None);
-        };
-        let dependencies = load_result_dependencies_v1(&transaction, gateway_result_id)?;
-        if dependencies != binding.input.dependencies {
-            bail!("gateway result dependency binding mismatch");
         }
+        let result =
+            match self.load_gateway_result_with_origin_v1(&transaction, binding, gateway_result_id)
+            {
+                Ok(Some(result)) => result,
+                Ok(None) | Err(_) => bail!(GatewayRefusalReason::ResultCorrupt.as_str()),
+            };
+        let dependencies = load_result_dependencies_v1(&transaction, gateway_result_id)?;
         let stdout = self.get_blob(&result.stdout_digest)?;
         let stderr = self.get_blob(&result.stderr_digest)?;
         if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
@@ -2901,16 +2994,50 @@ fn load_gateway_result_snapshot_v1(
     Ok(Some(result))
 }
 
-fn gateway_result_row_valid_v1(
+fn source_result_blobs_valid_v1(store: &Store, result: &StoredResult) -> bool {
+    let Ok(stdout) = store.get_blob(&result.stdout_digest) else {
+        return false;
+    };
+    let Ok(stderr) = store.get_blob(&result.stderr_digest) else {
+        return false;
+    };
+    stdout.len() as u64 == result.stdout_bytes && stderr.len() as u64 == result.stderr_bytes
+}
+
+/// Quarantine the complete ready binding in the same transaction that detected
+/// invalid durable authority. This prevents another process from observing a
+/// transient hit between CAS/lease validation failure and quarantine.
+fn quarantine_invalid_gateway_result_v1_tx(
     transaction: &Transaction<'_>,
-    binding: &ValidatedGatewayReadV1,
+    call_id: Option<&str>,
     gateway_result_id: &str,
-) -> Result<bool> {
-    match load_gateway_result_snapshot_v1(transaction, binding, gateway_result_id) {
-        Ok(Some(_)) => Ok(true),
-        Ok(None) => Ok(false),
-        Err(_) => Ok(false),
+    now: i64,
+) -> Result<()> {
+    let changed = transaction.execute(
+        "UPDATE gateway_results SET status = 'quarantined', quarantine_reason = 'result_corrupt', updated_ms = ?2 WHERE gateway_result_id = ?1 AND status = 'ready'",
+        params![gateway_result_id, now],
+    )?;
+    if changed == 0 {
+        return Ok(());
     }
+    transaction.execute(
+        "UPDATE inflight_leases SET status = 'quarantined', reason = 'result_corrupt', completed_ms = ?2 WHERE gateway_result_id = ?1 AND status = 'completed'",
+        params![gateway_result_id, now],
+    )?;
+    transaction.execute(
+        "UPDATE gateway_requests SET status = 'quarantined', reason = 'result_corrupt', updated_ms = ?2 WHERE gateway_result_id = ?1 AND status = 'ready'",
+        params![gateway_result_id, now],
+    )?;
+    record_gateway_event_v1_tx(
+        transaction,
+        call_id,
+        None,
+        Some(gateway_result_id),
+        "binding_quarantined",
+        Some(GatewayRefusalReason::ResultCorrupt.as_str()),
+        0,
+        now,
+    )
 }
 
 fn expire_gateway_leases_v1_tx(
