@@ -1,0 +1,3381 @@
+//! Bounded, read-only authority over the state on which one tool result depends.
+//!
+//! An authority is minted only from an explicit observation plan. Paths outside
+//! that plan are deliberately unobserved and therefore cannot be claimed as
+//! dependencies. Filesystem notifications may tell a caller when to re-run an
+//! observation, but they are never accepted as evidence by this module.
+
+use std::collections::BTreeSet;
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, Metadata};
+use std::io::{self, Read};
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Component, Path, PathBuf};
+
+use blake3::Hasher;
+
+pub const WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
+
+/// Hard limits applied before an observation can mint authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceAuthorityLimitsV1 {
+    pub max_plan_entries: usize,
+    pub max_path_bytes: usize,
+    pub max_file_bytes: u64,
+    pub max_total_bytes: u64,
+    pub max_tree_entries: u64,
+    pub max_tree_depth: usize,
+    pub max_directory_entries: u64,
+    pub max_environment_entries: usize,
+    pub max_environment_name_bytes: usize,
+    pub max_environment_value_bytes: usize,
+    pub max_identity_bytes: usize,
+    pub max_task_field_bytes: usize,
+    pub max_external_dependencies: usize,
+    pub max_external_token_bytes: usize,
+}
+
+impl Default for WorkspaceAuthorityLimitsV1 {
+    fn default() -> Self {
+        Self {
+            max_plan_entries: 1_024,
+            max_path_bytes: 4_096,
+            max_file_bytes: 256 * 1024 * 1024,
+            max_total_bytes: 1024 * 1024 * 1024,
+            max_tree_entries: 100_000,
+            max_tree_depth: 256,
+            max_directory_entries: 16_384,
+            max_environment_entries: 256,
+            max_environment_name_bytes: 256,
+            max_environment_value_bytes: 1024 * 1024,
+            max_identity_bytes: 16 * 1024,
+            max_task_field_bytes: 64 * 1024,
+            max_external_dependencies: 256,
+            max_external_token_bytes: 1024 * 1024,
+        }
+    }
+}
+
+/// A deterministic, domain-separated BLAKE3 state digest.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct StateDigestV1([u8; 32]);
+
+impl StateDigestV1 {
+    pub fn from_domain_and_bytes(domain: &'static [u8], value: &[u8]) -> Self {
+        let mut encoder = CanonicalEncoder::new(domain);
+        encoder.bytes(value);
+        encoder.finish()
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn to_hex(self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StateDimensionV1 {
+    Repository,
+    RepositoryGit,
+    RepositoryIndex,
+    RepositoryContent,
+    OperatingSystem,
+    Architecture,
+    Kernel,
+    Executables,
+    WorkingDirectory,
+    EnvironmentValues,
+    ResourceProfile,
+    SandboxBackend,
+    McpProviderToolSchema,
+    AuthorizationScope,
+    Task,
+    ExternalFreshness,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncompleteReasonCodeV1 {
+    UnknownRelevantState,
+    UnreadableRelevantState,
+    InvalidObservationPlan,
+    InputLimitExceeded,
+    SymlinkRefused,
+    SpecialFileRefused,
+    SparseCheckoutAmbiguous,
+    ConcurrentMutation,
+    RepositoryReplaced,
+    GitStateChanged,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncompleteReasonV1 {
+    code: IncompleteReasonCodeV1,
+    dimension: StateDimensionV1,
+    path: Option<PathBuf>,
+    operation: &'static str,
+}
+
+impl IncompleteReasonV1 {
+    pub fn code(&self) -> IncompleteReasonCodeV1 {
+        self.code
+    }
+
+    pub fn dimension(&self) -> StateDimensionV1 {
+        self.dimension
+    }
+
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    pub fn operation(&self) -> &'static str {
+        self.operation
+    }
+}
+
+/// A fail-closed result. This type intentionally has no authority-producing
+/// method; only [`CompleteToolStateV1`] can mint reusable authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IncompleteToolStateV1 {
+    schema_version: u16,
+    reasons: Vec<IncompleteReasonV1>,
+}
+
+impl IncompleteToolStateV1 {
+    fn single(
+        code: IncompleteReasonCodeV1,
+        dimension: StateDimensionV1,
+        path: Option<PathBuf>,
+        operation: &'static str,
+    ) -> Self {
+        Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            reasons: vec![IncompleteReasonV1 {
+                code,
+                dimension,
+                path,
+                operation,
+            }],
+        }
+    }
+
+    pub fn unknown(dimension: StateDimensionV1, operation: &'static str) -> Self {
+        Self::single(
+            IncompleteReasonCodeV1::UnknownRelevantState,
+            dimension,
+            None,
+            operation,
+        )
+    }
+
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn reasons(&self) -> &[IncompleteReasonV1] {
+        &self.reasons
+    }
+
+    pub fn primary_code(&self) -> IncompleteReasonCodeV1 {
+        self.reasons[0].code
+    }
+}
+
+pub type AuthorityResult<T> = Result<T, IncompleteToolStateV1>;
+
+fn incomplete_io(
+    dimension: StateDimensionV1,
+    path: &Path,
+    operation: &'static str,
+    _error: io::Error,
+) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::UnreadableRelevantState,
+        dimension,
+        Some(path.to_path_buf()),
+        operation,
+    )
+}
+
+fn incomplete_limit(
+    dimension: StateDimensionV1,
+    path: Option<&Path>,
+    operation: &'static str,
+) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::InputLimitExceeded,
+        dimension,
+        path.map(Path::to_path_buf),
+        operation,
+    )
+}
+
+fn incomplete_plan(
+    dimension: StateDimensionV1,
+    path: Option<&Path>,
+    operation: &'static str,
+) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::InvalidObservationPlan,
+        dimension,
+        path.map(Path::to_path_buf),
+        operation,
+    )
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryObservationPlanV1 {
+    /// Exact regular files whose metadata and content are relevant.
+    content_paths: Vec<PathBuf>,
+    /// Exact recursive trees. Every entry is included regardless of Git
+    /// tracking or ignore status, so relevant untracked inputs are bound.
+    recursive_trees: Vec<PathBuf>,
+    /// One-level directory name, type, and metadata observations.
+    directory_listings: Vec<PathBuf>,
+    /// Existence observations, including an explicit absent state.
+    negative_dependencies: Vec<PathBuf>,
+}
+
+impl RepositoryObservationPlanV1 {
+    pub fn new(
+        content_paths: Vec<PathBuf>,
+        recursive_trees: Vec<PathBuf>,
+        directory_listings: Vec<PathBuf>,
+        negative_dependencies: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            content_paths,
+            recursive_trees,
+            directory_listings,
+            negative_dependencies,
+        }
+    }
+
+    pub fn content_paths(&self) -> &[PathBuf] {
+        &self.content_paths
+    }
+
+    pub fn recursive_trees(&self) -> &[PathBuf] {
+        &self.recursive_trees
+    }
+
+    pub fn directory_listings(&self) -> &[PathBuf] {
+        &self.directory_listings
+    }
+
+    pub fn negative_dependencies(&self) -> &[PathBuf] {
+        &self.negative_dependencies
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RepositoryObservationKindV1 {
+    ContentPath,
+    RecursiveTree,
+    DirectoryListing,
+    NegativeDependency,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryObservationV1 {
+    kind: RepositoryObservationKindV1,
+    path: PathBuf,
+    digest: StateDigestV1,
+    entries: u64,
+    bytes: u64,
+    present: bool,
+}
+
+impl RepositoryObservationV1 {
+    pub fn kind(&self) -> RepositoryObservationKindV1 {
+        self.kind
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+
+    pub fn entries(&self) -> u64 {
+        self.entries
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn is_present(&self) -> bool {
+        self.present
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RepositoryGitStateV1 {
+    NotGitRepository,
+    Git {
+        worktree_root: PathBuf,
+        git_directory: PathBuf,
+        head_ref: Option<String>,
+        head_object: Option<String>,
+        head_digest: StateDigestV1,
+        index_digest: Option<StateDigestV1>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RepositoryEpochV1 {
+    schema_version: u16,
+    canonical_workspace: PathBuf,
+    workspace_identity: FilesystemIdentityV1,
+    git: RepositoryGitStateV1,
+    plan: RepositoryObservationPlanV1,
+    observations: Vec<RepositoryObservationV1>,
+    digest: StateDigestV1,
+}
+
+impl RepositoryEpochV1 {
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn canonical_workspace(&self) -> &Path {
+        &self.canonical_workspace
+    }
+
+    pub fn workspace_identity_digest(&self) -> StateDigestV1 {
+        let mut encoder = CanonicalEncoder::new(b"again.workspace-identity.v1");
+        encoder.path(&self.canonical_workspace);
+        self.workspace_identity.encode_authority(&mut encoder);
+        encoder.finish()
+    }
+
+    pub fn git_state(&self) -> &RepositoryGitStateV1 {
+        &self.git
+    }
+
+    pub fn plan(&self) -> &RepositoryObservationPlanV1 {
+        &self.plan
+    }
+
+    pub fn observations(&self) -> &[RepositoryObservationV1] {
+        &self.observations
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        encode_repository_epoch(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FilesystemIdentityV1 {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    size: u64,
+    mtime_sec: i64,
+    mtime_nsec: i64,
+    ctime_sec: i64,
+    ctime_nsec: i64,
+}
+
+impl FilesystemIdentityV1 {
+    fn from_metadata(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            size: metadata.len(),
+            mtime_sec: metadata.mtime(),
+            mtime_nsec: metadata.mtime_nsec(),
+            ctime_sec: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        }
+    }
+
+    fn encode_full(self, encoder: &mut CanonicalEncoder) {
+        self.encode_authority(encoder);
+        encoder.u64(self.size);
+        encoder.i64(self.mtime_sec);
+        encoder.i64(self.mtime_nsec);
+        encoder.i64(self.ctime_sec);
+        encoder.i64(self.ctime_nsec);
+    }
+
+    fn same_object(self, other: Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+
+    /// Stable identity omits mutable timestamps and directory size. Those are
+    /// still checked at every pre/open/post race boundary, but excluding them
+    /// from the authority lets explicitly unobserved paths remain irrelevant.
+    fn encode_authority(self, encoder: &mut CanonicalEncoder) {
+        encoder.u64(self.device);
+        encoder.u64(self.inode);
+        encoder.u32(self.mode);
+        encoder.u32(self.uid);
+        encoder.u32(self.gid);
+    }
+}
+
+#[derive(Default)]
+struct ObservationLedger {
+    bytes: u64,
+    entries: u64,
+}
+
+impl ObservationLedger {
+    fn add_bytes(
+        &mut self,
+        amount: u64,
+        limits: &WorkspaceAuthorityLimitsV1,
+        dimension: StateDimensionV1,
+        path: &Path,
+    ) -> AuthorityResult<()> {
+        self.bytes = self
+            .bytes
+            .checked_add(amount)
+            .ok_or_else(|| incomplete_limit(dimension, Some(path), "sum observed bytes"))?;
+        if self.bytes > limits.max_total_bytes {
+            return Err(incomplete_limit(
+                dimension,
+                Some(path),
+                "observe total bytes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn add_entry(
+        &mut self,
+        limits: &WorkspaceAuthorityLimitsV1,
+        path: &Path,
+    ) -> AuthorityResult<()> {
+        self.entries = self.entries.checked_add(1).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "sum observed entries",
+            )
+        })?;
+        if self.entries > limits.max_tree_entries {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "observe tree entries",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Observe a repository without writing to it. The same plan is sampled twice
+/// and all path, Git, index, and workspace identities must remain stable.
+pub fn observe_repository_v1(
+    workspace: &Path,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<RepositoryEpochV1> {
+    observe_repository_inner(workspace, plan, limits, || {})
+}
+
+fn observe_repository_inner<F>(
+    workspace: &Path,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+    between_samples: F,
+) -> AuthorityResult<RepositoryEpochV1>
+where
+    F: FnOnce(),
+{
+    validate_limits(limits)?;
+    let plan = normalize_plan(plan, limits)?;
+    let input_metadata = fs::symlink_metadata(workspace).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::Repository,
+            workspace,
+            "inspect workspace",
+            error,
+        )
+    })?;
+    if input_metadata.file_type().is_symlink() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SymlinkRefused,
+            StateDimensionV1::Repository,
+            Some(workspace.to_path_buf()),
+            "open workspace",
+        ));
+    }
+    if !input_metadata.is_dir() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SpecialFileRefused,
+            StateDimensionV1::Repository,
+            Some(workspace.to_path_buf()),
+            "open workspace",
+        ));
+    }
+    let canonical_workspace = fs::canonicalize(workspace).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::Repository,
+            workspace,
+            "canonicalize workspace",
+            error,
+        )
+    })?;
+    check_path_bound(&canonical_workspace, limits, StateDimensionV1::Repository)?;
+    let root_handle = File::open(&canonical_workspace).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::Repository,
+            &canonical_workspace,
+            "open workspace directory",
+            error,
+        )
+    })?;
+    let root_before =
+        FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "inspect open workspace",
+                error,
+            )
+        })?);
+    let path_before = FilesystemIdentityV1::from_metadata(
+        &fs::symlink_metadata(&canonical_workspace).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "inspect workspace path",
+                error,
+            )
+        })?,
+    );
+    if root_before != path_before {
+        return Err(concurrent(
+            StateDimensionV1::Repository,
+            &canonical_workspace,
+            "open workspace identity",
+        ));
+    }
+
+    let git_before = observe_git_state(&canonical_workspace, limits)?;
+    let observations_before = observe_plan_once(&canonical_workspace, &plan, limits)?;
+    between_samples();
+    let root_after_hook = FilesystemIdentityV1::from_metadata(
+        &fs::symlink_metadata(&canonical_workspace).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "reinspect workspace after observation seam",
+                error,
+            )
+        })?,
+    );
+    if !root_before.same_object(root_after_hook) {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::RepositoryReplaced,
+            StateDimensionV1::Repository,
+            Some(canonical_workspace),
+            "verify repository identity after observation seam",
+        ));
+    }
+    if root_before != root_after_hook {
+        return Err(concurrent(
+            StateDimensionV1::Repository,
+            &canonical_workspace,
+            "verify repository stability after observation seam",
+        ));
+    }
+    let observations_after = observe_plan_once(&canonical_workspace, &plan, limits)?;
+    if observations_before != observations_after {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            &canonical_workspace,
+            "compare repository observation samples",
+        ));
+    }
+    let git_after = observe_git_state(&canonical_workspace, limits)?;
+    if git_before != git_after {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::GitStateChanged,
+            StateDimensionV1::RepositoryGit,
+            Some(canonical_workspace.join(".git")),
+            "compare Git samples",
+        ));
+    }
+
+    let root_after_handle =
+        FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "reinspect open workspace",
+                error,
+            )
+        })?);
+    let root_after_path = FilesystemIdentityV1::from_metadata(
+        &fs::symlink_metadata(&canonical_workspace).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "reinspect workspace path",
+                error,
+            )
+        })?,
+    );
+    let canonical_after = fs::canonicalize(workspace).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::Repository,
+            workspace,
+            "recanonicalize workspace",
+            error,
+        )
+    })?;
+    if !root_before.same_object(root_after_handle)
+        || !root_before.same_object(root_after_path)
+        || canonical_workspace != canonical_after
+    {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::RepositoryReplaced,
+            StateDimensionV1::Repository,
+            Some(canonical_workspace),
+            "verify repository identity",
+        ));
+    }
+    if root_before != root_after_handle || root_before != root_after_path {
+        return Err(concurrent(
+            StateDimensionV1::Repository,
+            &canonical_workspace,
+            "verify repository stability",
+        ));
+    }
+
+    let mut epoch = RepositoryEpochV1 {
+        schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+        canonical_workspace,
+        workspace_identity: root_before,
+        git: git_before,
+        plan,
+        observations: observations_before,
+        digest: StateDigestV1([0; 32]),
+    };
+    epoch.digest = digest_encoded(
+        b"again.repository-epoch.v1",
+        &encode_repository_epoch(&epoch),
+    );
+    Ok(epoch)
+}
+
+#[cfg(test)]
+pub fn observe_repository_with_test_hook_v1<F>(
+    workspace: &Path,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+    between_samples: F,
+) -> AuthorityResult<RepositoryEpochV1>
+where
+    F: FnOnce(),
+{
+    observe_repository_inner(workspace, plan, limits, between_samples)
+}
+
+fn validate_limits(limits: &WorkspaceAuthorityLimitsV1) -> AuthorityResult<()> {
+    let valid = limits.max_plan_entries > 0
+        && limits.max_path_bytes > 0
+        && limits.max_file_bytes > 0
+        && limits.max_total_bytes > 0
+        && limits.max_tree_entries > 0
+        && limits.max_tree_depth > 0
+        && limits.max_directory_entries > 0
+        && limits.max_environment_entries > 0
+        && limits.max_environment_name_bytes > 0
+        && limits.max_environment_value_bytes > 0
+        && limits.max_identity_bytes > 0
+        && limits.max_task_field_bytes > 0
+        && limits.max_external_dependencies > 0
+        && limits.max_external_token_bytes > 0;
+    if !valid || limits.max_file_bytes > limits.max_total_bytes {
+        return Err(incomplete_plan(
+            StateDimensionV1::Repository,
+            None,
+            "validate authority limits",
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_plan(
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<RepositoryObservationPlanV1> {
+    let total = plan
+        .content_paths
+        .len()
+        .checked_add(plan.recursive_trees.len())
+        .and_then(|value| value.checked_add(plan.directory_listings.len()))
+        .and_then(|value| value.checked_add(plan.negative_dependencies.len()))
+        .ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                None,
+                "count observation plan entries",
+            )
+        })?;
+    if total > limits.max_plan_entries {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            None,
+            "bound observation plan entries",
+        ));
+    }
+
+    Ok(RepositoryObservationPlanV1 {
+        content_paths: normalize_path_set(&plan.content_paths, false, limits)?,
+        recursive_trees: normalize_path_set(&plan.recursive_trees, true, limits)?,
+        directory_listings: normalize_path_set(&plan.directory_listings, true, limits)?,
+        negative_dependencies: normalize_path_set(&plan.negative_dependencies, false, limits)?,
+    })
+}
+
+fn normalize_path_set(
+    paths: &[PathBuf],
+    allow_empty: bool,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<Vec<PathBuf>> {
+    let mut normalized = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.as_os_str().as_bytes().len() > limits.max_path_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "bound observation path",
+            ));
+        }
+        let mut value = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::Normal(component) => value.push(component),
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(incomplete_plan(
+                        StateDimensionV1::RepositoryContent,
+                        Some(path),
+                        "normalize observation path",
+                    ));
+                }
+            }
+        }
+        if !allow_empty && value.as_os_str().is_empty() {
+            return Err(incomplete_plan(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "require nonempty observation path",
+            ));
+        }
+        normalized.push(value);
+    }
+    normalized.sort_by(|left, right| {
+        left.as_os_str()
+            .as_bytes()
+            .cmp(right.as_os_str().as_bytes())
+    });
+    if normalized.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(incomplete_plan(
+            StateDimensionV1::RepositoryContent,
+            None,
+            "reject duplicate observation paths",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn observe_plan_once(
+    root: &Path,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<Vec<RepositoryObservationV1>> {
+    let mut ledger = ObservationLedger::default();
+    let mut observations = Vec::new();
+    for relative in &plan.content_paths {
+        observations.push(observe_content_path(root, relative, limits, &mut ledger)?);
+    }
+    for relative in &plan.recursive_trees {
+        observations.push(observe_recursive_tree(root, relative, limits, &mut ledger)?);
+    }
+    for relative in &plan.directory_listings {
+        observations.push(observe_directory_listing(
+            root,
+            relative,
+            limits,
+            &mut ledger,
+        )?);
+    }
+    for relative in &plan.negative_dependencies {
+        observations.push(observe_negative_dependency(
+            root,
+            relative,
+            limits,
+            &mut ledger,
+        )?);
+    }
+    observations.sort_by(|left, right| {
+        observation_kind_tag(left.kind)
+            .cmp(&observation_kind_tag(right.kind))
+            .then_with(|| {
+                left.path
+                    .as_os_str()
+                    .as_bytes()
+                    .cmp(right.path.as_os_str().as_bytes())
+            })
+    });
+    Ok(observations)
+}
+
+fn observe_content_path(
+    root: &Path,
+    relative: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+) -> AuthorityResult<RepositoryObservationV1> {
+    ensure_scoped_components(root, relative, false)?;
+    let path = root.join(relative);
+    let metadata = fs::symlink_metadata(&path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            &path,
+            "inspect selected content",
+            error,
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(symlink(&path, "observe selected content"));
+    }
+    if !metadata.is_file() {
+        return Err(special(&path, "observe selected content"));
+    }
+    let file = observe_regular_file(&path, limits, ledger)?;
+    let mut encoder = CanonicalEncoder::new(b"again.repository-content-path.v1");
+    encoder.path(relative);
+    file.encode(&mut encoder);
+    Ok(RepositoryObservationV1 {
+        kind: RepositoryObservationKindV1::ContentPath,
+        path: relative.to_path_buf(),
+        digest: encoder.finish(),
+        entries: 1,
+        bytes: file.bytes,
+        present: true,
+    })
+}
+
+fn observe_recursive_tree(
+    root: &Path,
+    relative: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+) -> AuthorityResult<RepositoryObservationV1> {
+    ensure_scoped_components(root, relative, false)?;
+    let tree_root = root.join(relative);
+    let root_metadata = fs::symlink_metadata(&tree_root).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            &tree_root,
+            "inspect recursive tree",
+            error,
+        )
+    })?;
+    if root_metadata.file_type().is_symlink() {
+        return Err(symlink(&tree_root, "observe recursive tree"));
+    }
+    if !root_metadata.is_dir() {
+        return Err(special(&tree_root, "observe recursive tree"));
+    }
+
+    let entries_before = ledger.entries;
+    let bytes_before = ledger.bytes;
+    let mut encoder = CanonicalEncoder::new(b"again.repository-recursive-tree.v1");
+    encoder.path(relative);
+    encode_tree(
+        root,
+        &tree_root,
+        Path::new(""),
+        0,
+        limits,
+        ledger,
+        &mut encoder,
+    )?;
+    Ok(RepositoryObservationV1 {
+        kind: RepositoryObservationKindV1::RecursiveTree,
+        path: relative.to_path_buf(),
+        digest: encoder.finish(),
+        entries: ledger.entries - entries_before,
+        bytes: ledger.bytes - bytes_before,
+        present: true,
+    })
+}
+
+fn encode_tree(
+    repository_root: &Path,
+    tree_root: &Path,
+    tree_relative: &Path,
+    depth: usize,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+    encoder: &mut CanonicalEncoder,
+) -> AuthorityResult<()> {
+    let path = tree_root.join(tree_relative);
+    if depth > limits.max_tree_depth {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(&path),
+            "bound recursive tree depth",
+        ));
+    }
+    ledger.add_entry(limits, &path)?;
+    let (identity, names) = stable_directory_listing(&path, limits)?;
+    encoder.u8(1);
+    encoder.path(tree_relative);
+    identity.encode_full(encoder);
+    encoder.u64(names.len() as u64);
+    for name in names {
+        let child_relative = tree_relative.join(&name);
+        let child = tree_root.join(&child_relative);
+        check_path_bound(
+            child.strip_prefix(repository_root).unwrap_or(&child),
+            limits,
+            StateDimensionV1::RepositoryContent,
+        )?;
+        let metadata = fs::symlink_metadata(&child).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                &child,
+                "inspect recursive tree entry",
+                error,
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(symlink(&child, "observe recursive tree entry"));
+        }
+        if metadata.is_dir() {
+            encode_tree(
+                repository_root,
+                tree_root,
+                &child_relative,
+                depth + 1,
+                limits,
+                ledger,
+                encoder,
+            )?;
+        } else if metadata.is_file() {
+            ledger.add_entry(limits, &child)?;
+            let observed = observe_regular_file(&child, limits, ledger)?;
+            encoder.u8(2);
+            encoder.path(&child_relative);
+            observed.encode(encoder);
+        } else {
+            return Err(special(&child, "observe recursive tree entry"));
+        }
+    }
+    Ok(())
+}
+
+fn observe_directory_listing(
+    root: &Path,
+    relative: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+) -> AuthorityResult<RepositoryObservationV1> {
+    ensure_scoped_components(root, relative, false)?;
+    let path = root.join(relative);
+    let entries_before = ledger.entries;
+    let (identity, names) = stable_directory_listing(&path, limits)?;
+    ledger.add_entry(limits, &path)?;
+    let mut encoder = CanonicalEncoder::new(b"again.repository-directory-listing.v1");
+    encoder.path(relative);
+    identity.encode_full(&mut encoder);
+    encoder.u64(names.len() as u64);
+    for name in names {
+        let child = path.join(&name);
+        ledger.add_entry(limits, &child)?;
+        let before = fs::symlink_metadata(&child).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                &child,
+                "inspect directory entry",
+                error,
+            )
+        })?;
+        if before.file_type().is_symlink() {
+            return Err(symlink(&child, "observe directory entry"));
+        }
+        if !before.is_dir() && !before.is_file() {
+            return Err(special(&child, "observe directory entry"));
+        }
+        let identity_before = FilesystemIdentityV1::from_metadata(&before);
+        let identity_after = FilesystemIdentityV1::from_metadata(
+            &fs::symlink_metadata(&child).map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    &child,
+                    "reinspect directory entry",
+                    error,
+                )
+            })?,
+        );
+        if identity_before != identity_after {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                &child,
+                "observe directory entry",
+            ));
+        }
+        encoder.os_str(&name);
+        encoder.u8(if before.is_dir() { 1 } else { 2 });
+        identity_before.encode_full(&mut encoder);
+    }
+    Ok(RepositoryObservationV1 {
+        kind: RepositoryObservationKindV1::DirectoryListing,
+        path: relative.to_path_buf(),
+        digest: encoder.finish(),
+        entries: ledger.entries - entries_before,
+        bytes: 0,
+        present: true,
+    })
+}
+
+fn observe_negative_dependency(
+    root: &Path,
+    relative: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+) -> AuthorityResult<RepositoryObservationV1> {
+    let components_present = ensure_scoped_components(root, relative, true)?;
+    let path = root.join(relative);
+    let parent = path.parent().unwrap_or(root);
+    let parent_identity_before = if components_present {
+        FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(parent).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                parent,
+                "inspect negative dependency parent",
+                error,
+            )
+        })?)
+    } else {
+        FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(root).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                root,
+                "inspect repository root",
+                error,
+            )
+        })?)
+    };
+
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) if components_present => Some(metadata),
+        Ok(_) => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                &path,
+                "inspect negative dependency",
+                error,
+            ));
+        }
+    };
+    let mut encoder = CanonicalEncoder::new(b"again.repository-negative-dependency.v1");
+    encoder.path(relative);
+    parent_identity_before.encode_authority(&mut encoder);
+    let present = if let Some(metadata) = metadata {
+        if metadata.file_type().is_symlink() {
+            return Err(symlink(&path, "observe negative dependency"));
+        }
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(special(&path, "observe negative dependency"));
+        }
+        let identity = FilesystemIdentityV1::from_metadata(&metadata);
+        let after =
+            FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(&path).map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    &path,
+                    "reinspect negative dependency",
+                    error,
+                )
+            })?);
+        if identity != after {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                &path,
+                "observe negative dependency",
+            ));
+        }
+        encoder.bool(true);
+        encoder.u8(if metadata.is_dir() { 1 } else { 2 });
+        identity.encode_full(&mut encoder);
+        true
+    } else {
+        encoder.bool(false);
+        false
+    };
+    ledger.add_entry(limits, &path)?;
+    Ok(RepositoryObservationV1 {
+        kind: RepositoryObservationKindV1::NegativeDependency,
+        path: relative.to_path_buf(),
+        digest: encoder.finish(),
+        entries: 1,
+        bytes: 0,
+        present,
+    })
+}
+
+fn ensure_scoped_components(
+    root: &Path,
+    relative: &Path,
+    missing_allowed: bool,
+) -> AuthorityResult<bool> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(incomplete_plan(
+                StateDimensionV1::RepositoryContent,
+                Some(relative),
+                "walk observation path",
+            ));
+        };
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(symlink(&current, "walk observation path"));
+            }
+            Ok(metadata) if !metadata.is_dir() && current != root.join(relative) => {
+                return Err(special(&current, "walk observation path"));
+            }
+            Ok(_) => {}
+            Err(error) if missing_allowed && error.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(error) => {
+                return Err(incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    &current,
+                    "walk observation path",
+                    error,
+                ));
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn stable_directory_listing(
+    path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<(FilesystemIdentityV1, Vec<OsString>)> {
+    let before_metadata = fs::symlink_metadata(path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "inspect directory",
+            error,
+        )
+    })?;
+    if before_metadata.file_type().is_symlink() {
+        return Err(symlink(path, "list directory"));
+    }
+    if !before_metadata.is_dir() {
+        return Err(special(path, "list directory"));
+    }
+    let before = FilesystemIdentityV1::from_metadata(&before_metadata);
+    let handle = File::open(path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "open directory",
+            error,
+        )
+    })?;
+    let opened = FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "inspect open directory",
+            error,
+        )
+    })?);
+    if before != opened {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "open directory",
+        ));
+    }
+    let mut names = Vec::new();
+    let entries = fs::read_dir(path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "read directory",
+            error,
+        )
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                path,
+                "read directory entry",
+                error,
+            )
+        })?;
+        if names.len() as u64 >= limits.max_directory_entries {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "bound directory entries",
+            ));
+        }
+        let name = entry.file_name();
+        if name.as_bytes().len() > limits.max_path_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "bound directory entry name",
+            ));
+        }
+        names.push(name);
+    }
+    names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    let after_handle =
+        FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                path,
+                "reinspect open directory",
+                error,
+            )
+        })?);
+    let after_path =
+        FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(path).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                path,
+                "reinspect directory path",
+                error,
+            )
+        })?);
+    if before != after_handle || before != after_path {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "list directory",
+        ));
+    }
+    Ok((before, names))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ObservedFileV1 {
+    identity: FilesystemIdentityV1,
+    content_digest: StateDigestV1,
+    bytes: u64,
+}
+
+impl ObservedFileV1 {
+    fn encode(self, encoder: &mut CanonicalEncoder) {
+        self.identity.encode_full(encoder);
+        encoder.digest(self.content_digest);
+        encoder.u64(self.bytes);
+    }
+}
+
+fn observe_regular_file(
+    path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+) -> AuthorityResult<ObservedFileV1> {
+    let before_metadata = fs::symlink_metadata(path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "inspect regular file",
+            error,
+        )
+    })?;
+    if before_metadata.file_type().is_symlink() {
+        return Err(symlink(path, "read regular file"));
+    }
+    if !before_metadata.is_file() {
+        return Err(special(path, "read regular file"));
+    }
+    if before_metadata.len() > limits.max_file_bytes {
+        return Err(incomplete_limit(
+            StateDimensionV1::RepositoryContent,
+            Some(path),
+            "bound regular file",
+        ));
+    }
+    let before = FilesystemIdentityV1::from_metadata(&before_metadata);
+    let mut file = File::open(path).map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "open regular file",
+            error,
+        )
+    })?;
+    let opened = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "inspect open regular file",
+            error,
+        )
+    })?);
+    if before != opened {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "open regular file",
+        ));
+    }
+    let mut hasher = Hasher::new();
+    hasher.update(b"again.observed-file.v1");
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut bytes = 0_u64;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                path,
+                "read regular file",
+                error,
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        bytes = bytes.checked_add(read as u64).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "sum regular file bytes",
+            )
+        })?;
+        if bytes > limits.max_file_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(path),
+                "read bounded regular file",
+            ));
+        }
+        ledger.add_bytes(
+            read as u64,
+            limits,
+            StateDimensionV1::RepositoryContent,
+            path,
+        )?;
+        hasher.update(&buffer[..read]);
+    }
+    let after_handle = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "reinspect open regular file",
+            error,
+        )
+    })?);
+    let after_path =
+        FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(path).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                path,
+                "reinspect regular file path",
+                error,
+            )
+        })?);
+    if before != after_handle || before != after_path || before.size != bytes {
+        return Err(concurrent(
+            StateDimensionV1::RepositoryContent,
+            path,
+            "read regular file",
+        ));
+    }
+    Ok(ObservedFileV1 {
+        identity: before,
+        content_digest: StateDigestV1(*hasher.finalize().as_bytes()),
+        bytes,
+    })
+}
+
+fn symlink(path: &Path, operation: &'static str) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::SymlinkRefused,
+        StateDimensionV1::RepositoryContent,
+        Some(path.to_path_buf()),
+        operation,
+    )
+}
+
+fn special(path: &Path, operation: &'static str) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::SpecialFileRefused,
+        StateDimensionV1::RepositoryContent,
+        Some(path.to_path_buf()),
+        operation,
+    )
+}
+
+fn concurrent(
+    dimension: StateDimensionV1,
+    path: &Path,
+    operation: &'static str,
+) -> IncompleteToolStateV1 {
+    IncompleteToolStateV1::single(
+        IncompleteReasonCodeV1::ConcurrentMutation,
+        dimension,
+        Some(path.to_path_buf()),
+        operation,
+    )
+}
+
+fn observe_git_state(
+    workspace: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<RepositoryGitStateV1> {
+    let Some((worktree_root, dot_git, dot_git_metadata)) = find_git_marker(workspace)? else {
+        return Ok(RepositoryGitStateV1::NotGitRepository);
+    };
+    check_path_bound(&worktree_root, limits, StateDimensionV1::RepositoryGit)?;
+    if dot_git_metadata.file_type().is_symlink() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SymlinkRefused,
+            StateDimensionV1::RepositoryGit,
+            Some(dot_git),
+            "resolve Git directory",
+        ));
+    }
+
+    let git_directory = if dot_git_metadata.is_dir() {
+        dot_git
+    } else if dot_git_metadata.is_file() {
+        let bytes = read_bounded_stable_file(
+            &dot_git,
+            limits.max_path_bytes as u64 + 16,
+            StateDimensionV1::RepositoryGit,
+        )?;
+        let prefix = b"gitdir: ";
+        let trimmed = trim_ascii_space(&bytes);
+        let raw = trimmed.strip_prefix(prefix).ok_or_else(|| {
+            incomplete_plan(
+                StateDimensionV1::RepositoryGit,
+                Some(&dot_git),
+                "parse Git worktree pointer",
+            )
+        })?;
+        if raw.is_empty() || raw.contains(&0) {
+            return Err(incomplete_plan(
+                StateDimensionV1::RepositoryGit,
+                Some(&dot_git),
+                "parse Git worktree pointer",
+            ));
+        }
+        let pointed = PathBuf::from(OsString::from_vec(raw.to_vec()));
+        if pointed.is_absolute() {
+            pointed
+        } else {
+            worktree_root.join(pointed)
+        }
+    } else {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SpecialFileRefused,
+            StateDimensionV1::RepositoryGit,
+            Some(dot_git),
+            "resolve Git directory",
+        ));
+    };
+
+    let git_directory = canonical_directory(
+        &git_directory,
+        limits,
+        StateDimensionV1::RepositoryGit,
+        "canonicalize Git directory",
+    )?;
+    let common_directory = observe_common_git_directory(&git_directory, limits)?;
+    refuse_sparse_checkout(&git_directory, &common_directory, limits)?;
+
+    let head_path = git_directory.join("HEAD");
+    let head_bytes = read_bounded_stable_file(
+        &head_path,
+        limits.max_identity_bytes as u64,
+        StateDimensionV1::RepositoryGit,
+    )?;
+    let head_digest = digest_encoded(b"again.git-head-file.v1", &head_bytes);
+    let head_text = std::str::from_utf8(trim_ascii_space(&head_bytes)).map_err(|_| {
+        incomplete_plan(
+            StateDimensionV1::RepositoryGit,
+            Some(&head_path),
+            "parse Git HEAD",
+        )
+    })?;
+    let (head_ref, head_object) = if let Some(reference) = head_text.strip_prefix("ref: ") {
+        validate_git_reference(reference, &head_path, limits)?;
+        let object = resolve_git_reference(&git_directory, &common_directory, reference, limits)?;
+        (Some(reference.to_owned()), object)
+    } else {
+        validate_git_object(head_text, &head_path)?;
+        (None, Some(head_text.to_owned()))
+    };
+
+    let index_path = git_directory.join("index");
+    let index_digest = match fs::symlink_metadata(&index_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SymlinkRefused,
+                    StateDimensionV1::RepositoryIndex,
+                    Some(index_path),
+                    "observe Git index",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SpecialFileRefused,
+                    StateDimensionV1::RepositoryIndex,
+                    Some(index_path),
+                    "observe Git index",
+                ));
+            }
+            let bytes = read_bounded_stable_file(
+                &index_path,
+                limits.max_file_bytes,
+                StateDimensionV1::RepositoryIndex,
+            )?;
+            Some(digest_encoded(b"again.git-index.v1", &bytes))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(incomplete_io(
+                StateDimensionV1::RepositoryIndex,
+                &index_path,
+                "inspect Git index",
+                error,
+            ));
+        }
+    };
+
+    Ok(RepositoryGitStateV1::Git {
+        worktree_root,
+        git_directory,
+        head_ref,
+        head_object,
+        head_digest,
+        index_digest,
+    })
+}
+
+fn find_git_marker(workspace: &Path) -> AuthorityResult<Option<(PathBuf, PathBuf, Metadata)>> {
+    let mut current = Some(workspace);
+    while let Some(directory) = current {
+        let marker = directory.join(".git");
+        match fs::symlink_metadata(&marker) {
+            Ok(metadata) => {
+                return Ok(Some((directory.to_path_buf(), marker, metadata)));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(incomplete_io(
+                    StateDimensionV1::RepositoryGit,
+                    &marker,
+                    "discover Git worktree",
+                    error,
+                ));
+            }
+        }
+        current = directory.parent();
+    }
+    Ok(None)
+}
+
+fn observe_common_git_directory(
+    git_directory: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<PathBuf> {
+    let commondir_path = git_directory.join("commondir");
+    match fs::symlink_metadata(&commondir_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SymlinkRefused,
+                    StateDimensionV1::RepositoryGit,
+                    Some(commondir_path),
+                    "resolve common Git directory",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SpecialFileRefused,
+                    StateDimensionV1::RepositoryGit,
+                    Some(commondir_path),
+                    "resolve common Git directory",
+                ));
+            }
+            let bytes = read_bounded_stable_file(
+                &commondir_path,
+                limits.max_path_bytes as u64,
+                StateDimensionV1::RepositoryGit,
+            )?;
+            let raw = trim_ascii_space(&bytes);
+            if raw.is_empty() || raw.contains(&0) {
+                return Err(incomplete_plan(
+                    StateDimensionV1::RepositoryGit,
+                    Some(&commondir_path),
+                    "parse common Git directory",
+                ));
+            }
+            let path = PathBuf::from(OsString::from_vec(raw.to_vec()));
+            let path = if path.is_absolute() {
+                path
+            } else {
+                git_directory.join(path)
+            };
+            canonical_directory(
+                &path,
+                limits,
+                StateDimensionV1::RepositoryGit,
+                "canonicalize common Git directory",
+            )
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(git_directory.to_path_buf()),
+        Err(error) => Err(incomplete_io(
+            StateDimensionV1::RepositoryGit,
+            &commondir_path,
+            "inspect common Git directory",
+            error,
+        )),
+    }
+}
+
+fn refuse_sparse_checkout(
+    git_directory: &Path,
+    common_directory: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<()> {
+    let mut candidates = vec![
+        git_directory.join("info/sparse-checkout"),
+        common_directory.join("info/sparse-checkout"),
+    ];
+    candidates.sort();
+    candidates.dedup();
+    for path in candidates {
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SparseCheckoutAmbiguous,
+                    StateDimensionV1::RepositoryGit,
+                    Some(path),
+                    "reject sparse checkout",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(incomplete_io(
+                    StateDimensionV1::RepositoryGit,
+                    &path,
+                    "inspect sparse checkout marker",
+                    error,
+                ));
+            }
+        }
+    }
+
+    for path in [
+        common_directory.join("config"),
+        git_directory.join("config.worktree"),
+    ] {
+        let bytes = match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(IncompleteToolStateV1::single(
+                        IncompleteReasonCodeV1::SymlinkRefused,
+                        StateDimensionV1::RepositoryGit,
+                        Some(path),
+                        "inspect Git configuration",
+                    ));
+                }
+                if !metadata.is_file() {
+                    return Err(IncompleteToolStateV1::single(
+                        IncompleteReasonCodeV1::SpecialFileRefused,
+                        StateDimensionV1::RepositoryGit,
+                        Some(path),
+                        "inspect Git configuration",
+                    ));
+                }
+                read_bounded_stable_file(
+                    &path,
+                    limits
+                        .max_file_bytes
+                        .min(limits.max_identity_bytes as u64 * 16),
+                    StateDimensionV1::RepositoryGit,
+                )?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(incomplete_io(
+                    StateDimensionV1::RepositoryGit,
+                    &path,
+                    "inspect Git configuration",
+                    error,
+                ));
+            }
+        };
+        if git_config_enables_sparse(&bytes) {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::SparseCheckoutAmbiguous,
+                StateDimensionV1::RepositoryGit,
+                Some(path),
+                "reject sparse Git configuration",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_config_enables_sparse(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut core = false;
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = line[1..line.len() - 1].trim().to_ascii_lowercase();
+            core = section == "core";
+            continue;
+        }
+        if !core || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        let value = value.trim().to_ascii_lowercase();
+        if matches!(key.as_str(), "sparsecheckout" | "sparseindex")
+            && matches!(value.as_str(), "true" | "yes" | "on" | "1")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_git_reference(
+    reference: &str,
+    head_path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<()> {
+    let valid = reference.starts_with("refs/")
+        && reference.len() <= limits.max_path_bytes
+        && !reference.as_bytes().contains(&0)
+        && !reference.contains("..")
+        && !reference.contains("//")
+        && !reference.starts_with('/')
+        && !reference.ends_with('/');
+    if !valid {
+        return Err(incomplete_plan(
+            StateDimensionV1::RepositoryGit,
+            Some(head_path),
+            "validate Git HEAD reference",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_git_object(object: &str, path: &Path) -> AuthorityResult<()> {
+    if !matches!(object.len(), 40 | 64) || !object.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(incomplete_plan(
+            StateDimensionV1::RepositoryGit,
+            Some(path),
+            "validate Git object identity",
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_git_reference(
+    git_directory: &Path,
+    common_directory: &Path,
+    reference: &str,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<Option<String>> {
+    let mut loose_candidates = vec![
+        git_directory.join(reference),
+        common_directory.join(reference),
+    ];
+    loose_candidates.sort();
+    loose_candidates.dedup();
+    for path in loose_candidates {
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(IncompleteToolStateV1::single(
+                        IncompleteReasonCodeV1::SymlinkRefused,
+                        StateDimensionV1::RepositoryGit,
+                        Some(path),
+                        "resolve loose Git reference",
+                    ));
+                }
+                if !metadata.is_file() {
+                    return Err(IncompleteToolStateV1::single(
+                        IncompleteReasonCodeV1::SpecialFileRefused,
+                        StateDimensionV1::RepositoryGit,
+                        Some(path),
+                        "resolve loose Git reference",
+                    ));
+                }
+                let bytes = read_bounded_stable_file(
+                    &path,
+                    limits.max_identity_bytes as u64,
+                    StateDimensionV1::RepositoryGit,
+                )?;
+                let object = std::str::from_utf8(trim_ascii_space(&bytes)).map_err(|_| {
+                    incomplete_plan(
+                        StateDimensionV1::RepositoryGit,
+                        Some(&path),
+                        "parse loose Git reference",
+                    )
+                })?;
+                validate_git_object(object, &path)?;
+                return Ok(Some(object.to_owned()));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(incomplete_io(
+                    StateDimensionV1::RepositoryGit,
+                    &path,
+                    "inspect loose Git reference",
+                    error,
+                ));
+            }
+        }
+    }
+
+    let packed_path = common_directory.join("packed-refs");
+    let bytes = match fs::symlink_metadata(&packed_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SymlinkRefused,
+                    StateDimensionV1::RepositoryGit,
+                    Some(packed_path),
+                    "resolve packed Git reference",
+                ));
+            }
+            if !metadata.is_file() {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SpecialFileRefused,
+                    StateDimensionV1::RepositoryGit,
+                    Some(packed_path),
+                    "resolve packed Git reference",
+                ));
+            }
+            read_bounded_stable_file(
+                &packed_path,
+                limits.max_file_bytes,
+                StateDimensionV1::RepositoryGit,
+            )?
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(incomplete_io(
+                StateDimensionV1::RepositoryGit,
+                &packed_path,
+                "inspect packed Git references",
+                error,
+            ));
+        }
+    };
+    let text = std::str::from_utf8(&bytes).map_err(|_| {
+        incomplete_plan(
+            StateDimensionV1::RepositoryGit,
+            Some(&packed_path),
+            "parse packed Git references",
+        )
+    })?;
+    for line in text.lines() {
+        if line.starts_with('#') || line.starts_with('^') || line.trim().is_empty() {
+            continue;
+        }
+        let Some((object, name)) = line.split_once(' ') else {
+            return Err(incomplete_plan(
+                StateDimensionV1::RepositoryGit,
+                Some(&packed_path),
+                "parse packed Git reference",
+            ));
+        };
+        if name == reference {
+            validate_git_object(object, &packed_path)?;
+            return Ok(Some(object.to_owned()));
+        }
+    }
+    Ok(None)
+}
+
+fn canonical_directory(
+    path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    dimension: StateDimensionV1,
+    operation: &'static str,
+) -> AuthorityResult<PathBuf> {
+    let before = fs::symlink_metadata(path)
+        .map_err(|error| incomplete_io(dimension, path, operation, error))?;
+    if before.file_type().is_symlink() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SymlinkRefused,
+            dimension,
+            Some(path.to_path_buf()),
+            operation,
+        ));
+    }
+    if !before.is_dir() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SpecialFileRefused,
+            dimension,
+            Some(path.to_path_buf()),
+            operation,
+        ));
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|error| incomplete_io(dimension, path, operation, error))?;
+    check_path_bound(&canonical, limits, dimension)?;
+    Ok(canonical)
+}
+
+fn read_bounded_stable_file(
+    path: &Path,
+    max_bytes: u64,
+    dimension: StateDimensionV1,
+) -> AuthorityResult<Vec<u8>> {
+    let before_metadata = fs::symlink_metadata(path)
+        .map_err(|error| incomplete_io(dimension, path, "inspect bounded state file", error))?;
+    if before_metadata.file_type().is_symlink() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SymlinkRefused,
+            dimension,
+            Some(path.to_path_buf()),
+            "read bounded state file",
+        ));
+    }
+    if !before_metadata.is_file() {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::SpecialFileRefused,
+            dimension,
+            Some(path.to_path_buf()),
+            "read bounded state file",
+        ));
+    }
+    if before_metadata.len() > max_bytes {
+        return Err(incomplete_limit(dimension, Some(path), "bound state file"));
+    }
+    let before = FilesystemIdentityV1::from_metadata(&before_metadata);
+    let mut file = File::open(path)
+        .map_err(|error| incomplete_io(dimension, path, "open bounded state file", error))?;
+    let opened = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(dimension, path, "inspect open bounded state file", error)
+    })?);
+    if before != opened {
+        return Err(concurrent(dimension, path, "open bounded state file"));
+    }
+    let capacity = usize::try_from(before.size)
+        .map_err(|_| incomplete_limit(dimension, Some(path), "allocate bounded state file"))?;
+    let mut bytes = Vec::with_capacity(capacity);
+    file.by_ref()
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| incomplete_io(dimension, path, "read bounded state file", error))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(incomplete_limit(
+            dimension,
+            Some(path),
+            "read bounded state file",
+        ));
+    }
+    let after_handle = FilesystemIdentityV1::from_metadata(&file.metadata().map_err(|error| {
+        incomplete_io(dimension, path, "reinspect open bounded state file", error)
+    })?);
+    let after_path =
+        FilesystemIdentityV1::from_metadata(&fs::symlink_metadata(path).map_err(|error| {
+            incomplete_io(dimension, path, "reinspect bounded state file", error)
+        })?);
+    if before != after_handle || before != after_path || before.size != bytes.len() as u64 {
+        return Err(concurrent(dimension, path, "read bounded state file"));
+    }
+    Ok(bytes)
+}
+
+fn trim_ascii_space(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+/// One allowlisted environment value. Plaintext is digested immediately and
+/// is never retained by this type or by an authority.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentValueDigestV1 {
+    name: OsString,
+    value_digest: StateDigestV1,
+}
+
+impl EnvironmentValueDigestV1 {
+    pub fn from_value(
+        name: &OsStr,
+        value: &OsStr,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        if name.as_bytes().len() > limits.max_environment_name_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::EnvironmentValues,
+                None,
+                "bound allowlisted environment name",
+            ));
+        }
+        if name.as_bytes().is_empty()
+            || name.as_bytes().contains(&b'=')
+            || name.as_bytes().contains(&0)
+        {
+            return Err(incomplete_plan(
+                StateDimensionV1::EnvironmentValues,
+                None,
+                "validate allowlisted environment name",
+            ));
+        }
+        if value.as_bytes().len() > limits.max_environment_value_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::EnvironmentValues,
+                None,
+                "bound allowlisted environment value",
+            ));
+        }
+        let mut encoder = CanonicalEncoder::new(b"again.environment-value.v1");
+        encoder.os_str(name);
+        encoder.os_str(value);
+        Ok(Self {
+            name: name.to_os_string(),
+            value_digest: encoder.finish(),
+        })
+    }
+
+    pub fn name(&self) -> &OsStr {
+        &self.name
+    }
+
+    pub fn value_digest(&self) -> StateDigestV1 {
+        self.value_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutableObservationRequestV1 {
+    label: String,
+    path: PathBuf,
+    version_identity_digest: StateDigestV1,
+}
+
+impl ExecutableObservationRequestV1 {
+    /// `version_identity` is hashed immediately. It should be obtained by the
+    /// caller through the same declared tool-selection boundary used for the
+    /// eventual invocation.
+    pub fn new(
+        label: impl Into<String>,
+        path: impl Into<PathBuf>,
+        version_identity: &[u8],
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        let label = label.into();
+        let path = path.into();
+        check_identity_text(
+            &label,
+            limits,
+            StateDimensionV1::Executables,
+            "validate executable label",
+        )?;
+        check_path_bound(&path, limits, StateDimensionV1::Executables)?;
+        if version_identity.is_empty() || version_identity.len() > limits.max_identity_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::Executables,
+                Some(&path),
+                "bound executable version identity",
+            ));
+        }
+        Ok(Self {
+            label,
+            path,
+            version_identity_digest: StateDigestV1::from_domain_and_bytes(
+                b"again.executable-version-identity.v1",
+                version_identity,
+            ),
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct McpIdentityV1 {
+    provider_id: String,
+    tool_schema_version: String,
+}
+
+impl McpIdentityV1 {
+    pub fn new(provider_id: impl Into<String>, tool_schema_version: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            tool_schema_version: tool_schema_version.into(),
+        }
+    }
+}
+
+/// Declares the only environment dimensions that may influence the authority.
+/// A dimension absent from both the observed fields and `unknown_dimensions`
+/// is explicitly excluded. A declared unknown makes observation incomplete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentObservationPlanV1 {
+    include_operating_system: bool,
+    include_architecture: bool,
+    kernel_identity: Option<String>,
+    executables: Vec<ExecutableObservationRequestV1>,
+    cwd: Option<PathBuf>,
+    environment_values: Vec<EnvironmentValueDigestV1>,
+    resource_profile_id: Option<String>,
+    sandbox_backend_id: Option<String>,
+    mcp_identity: Option<McpIdentityV1>,
+    authorization_scope_digest: Option<StateDigestV1>,
+    unknown_dimensions: BTreeSet<StateDimensionV1>,
+}
+
+impl EnvironmentObservationPlanV1 {
+    pub fn new() -> Self {
+        Self {
+            include_operating_system: false,
+            include_architecture: false,
+            kernel_identity: None,
+            executables: Vec::new(),
+            cwd: None,
+            environment_values: Vec::new(),
+            resource_profile_id: None,
+            sandbox_backend_id: None,
+            mcp_identity: None,
+            authorization_scope_digest: None,
+            unknown_dimensions: BTreeSet::new(),
+        }
+    }
+
+    pub fn with_operating_system(mut self) -> Self {
+        self.include_operating_system = true;
+        self
+    }
+
+    pub fn with_architecture(mut self) -> Self {
+        self.include_architecture = true;
+        self
+    }
+
+    pub fn with_kernel_identity(mut self, identity: impl Into<String>) -> Self {
+        self.kernel_identity = Some(identity.into());
+        self
+    }
+
+    pub fn with_executable(mut self, executable: ExecutableObservationRequestV1) -> Self {
+        self.executables.push(executable);
+        self
+    }
+
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn with_environment_value(mut self, value: EnvironmentValueDigestV1) -> Self {
+        self.environment_values.push(value);
+        self
+    }
+
+    pub fn with_resource_profile_id(mut self, identity: impl Into<String>) -> Self {
+        self.resource_profile_id = Some(identity.into());
+        self
+    }
+
+    pub fn with_sandbox_backend_id(mut self, identity: impl Into<String>) -> Self {
+        self.sandbox_backend_id = Some(identity.into());
+        self
+    }
+
+    pub fn with_mcp_identity(mut self, identity: McpIdentityV1) -> Self {
+        self.mcp_identity = Some(identity);
+        self
+    }
+
+    /// The identifier is domain-separated and immediately digested so this
+    /// structure cannot accidentally persist a credential or bearer token.
+    pub fn with_authorization_scope_identifier(
+        mut self,
+        identifier: &[u8],
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        if identifier.is_empty() || identifier.len() > limits.max_identity_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::AuthorizationScope,
+                None,
+                "bound authorization-scope identifier",
+            ));
+        }
+        self.authorization_scope_digest = Some(StateDigestV1::from_domain_and_bytes(
+            b"again.authorization-scope.v1",
+            identifier,
+        ));
+        Ok(self)
+    }
+
+    pub fn with_unknown_dimension(mut self, dimension: StateDimensionV1) -> Self {
+        self.unknown_dimensions.insert(dimension);
+        self
+    }
+}
+
+impl Default for EnvironmentObservationPlanV1 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentObservationV1 {
+    dimension: StateDimensionV1,
+    label: Vec<u8>,
+    digest: StateDigestV1,
+}
+
+impl EnvironmentObservationV1 {
+    pub fn dimension(&self) -> StateDimensionV1 {
+        self.dimension
+    }
+
+    pub fn label(&self) -> &[u8] {
+        &self.label
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EnvironmentAuthorityV1 {
+    schema_version: u16,
+    observed_dimensions: Vec<StateDimensionV1>,
+    explicitly_excluded_dimensions: Vec<StateDimensionV1>,
+    observations: Vec<EnvironmentObservationV1>,
+    digest: StateDigestV1,
+}
+
+impl EnvironmentAuthorityV1 {
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn observed_dimensions(&self) -> &[StateDimensionV1] {
+        &self.observed_dimensions
+    }
+
+    pub fn explicitly_excluded_dimensions(&self) -> &[StateDimensionV1] {
+        &self.explicitly_excluded_dimensions
+    }
+
+    pub fn observations(&self) -> &[EnvironmentObservationV1] {
+        &self.observations
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        encode_environment_authority(self)
+    }
+}
+
+pub fn observe_environment_v1(
+    plan: &EnvironmentObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<EnvironmentAuthorityV1> {
+    validate_limits(limits)?;
+    validate_environment_plan(plan, limits)?;
+    if let Some(dimension) = plan.unknown_dimensions.iter().next().copied() {
+        return Err(IncompleteToolStateV1::unknown(
+            dimension,
+            "observe declared environment dimension",
+        ));
+    }
+
+    let before = observe_environment_once(plan, limits)?;
+    let after = observe_environment_once(plan, limits)?;
+    if before != after {
+        return Err(IncompleteToolStateV1::single(
+            IncompleteReasonCodeV1::ConcurrentMutation,
+            StateDimensionV1::Executables,
+            None,
+            "compare environment samples",
+        ));
+    }
+    let mut observed_dimensions = before
+        .iter()
+        .map(|observation| observation.dimension)
+        .collect::<Vec<_>>();
+    observed_dimensions.sort();
+    observed_dimensions.dedup();
+    let all = environment_dimensions();
+    let explicitly_excluded_dimensions = all
+        .into_iter()
+        .filter(|dimension| !observed_dimensions.contains(dimension))
+        .collect();
+    let mut authority = EnvironmentAuthorityV1 {
+        schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+        observed_dimensions,
+        explicitly_excluded_dimensions,
+        observations: before,
+        digest: StateDigestV1([0; 32]),
+    };
+    authority.digest = digest_encoded(
+        b"again.environment-authority.v1",
+        &encode_environment_authority(&authority),
+    );
+    Ok(authority)
+}
+
+fn validate_environment_plan(
+    plan: &EnvironmentObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<()> {
+    let entry_count = plan
+        .executables
+        .len()
+        .checked_add(plan.environment_values.len())
+        .ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::EnvironmentValues,
+                None,
+                "count environment observations",
+            )
+        })?;
+    if entry_count > limits.max_environment_entries {
+        return Err(incomplete_limit(
+            StateDimensionV1::EnvironmentValues,
+            None,
+            "bound environment observations",
+        ));
+    }
+    for (dimension, observed) in [
+        (
+            StateDimensionV1::OperatingSystem,
+            plan.include_operating_system,
+        ),
+        (StateDimensionV1::Architecture, plan.include_architecture),
+        (StateDimensionV1::Kernel, plan.kernel_identity.is_some()),
+        (StateDimensionV1::Executables, !plan.executables.is_empty()),
+        (StateDimensionV1::WorkingDirectory, plan.cwd.is_some()),
+        (
+            StateDimensionV1::EnvironmentValues,
+            !plan.environment_values.is_empty(),
+        ),
+        (
+            StateDimensionV1::ResourceProfile,
+            plan.resource_profile_id.is_some(),
+        ),
+        (
+            StateDimensionV1::SandboxBackend,
+            plan.sandbox_backend_id.is_some(),
+        ),
+        (
+            StateDimensionV1::McpProviderToolSchema,
+            plan.mcp_identity.is_some(),
+        ),
+        (
+            StateDimensionV1::AuthorizationScope,
+            plan.authorization_scope_digest.is_some(),
+        ),
+    ] {
+        if observed && plan.unknown_dimensions.contains(&dimension) {
+            return Err(incomplete_plan(
+                dimension,
+                None,
+                "reject observed and unknown environment dimension",
+            ));
+        }
+    }
+    if plan
+        .unknown_dimensions
+        .iter()
+        .any(|dimension| !environment_dimensions().contains(dimension))
+    {
+        return Err(incomplete_plan(
+            StateDimensionV1::EnvironmentValues,
+            None,
+            "reject non-environment unknown dimension",
+        ));
+    }
+    for value in [
+        plan.kernel_identity.as_deref(),
+        plan.resource_profile_id.as_deref(),
+        plan.sandbox_backend_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        check_identity_text(
+            value,
+            limits,
+            StateDimensionV1::EnvironmentValues,
+            "validate environment identity",
+        )?;
+    }
+    if let Some(mcp) = &plan.mcp_identity {
+        check_identity_text(
+            &mcp.provider_id,
+            limits,
+            StateDimensionV1::McpProviderToolSchema,
+            "validate MCP provider identity",
+        )?;
+        check_identity_text(
+            &mcp.tool_schema_version,
+            limits,
+            StateDimensionV1::McpProviderToolSchema,
+            "validate MCP tool schema version",
+        )?;
+    }
+
+    let mut labels = BTreeSet::new();
+    for executable in &plan.executables {
+        if !labels.insert(executable.label.as_bytes()) {
+            return Err(incomplete_plan(
+                StateDimensionV1::Executables,
+                Some(&executable.path),
+                "reject duplicate executable label",
+            ));
+        }
+    }
+    let mut names = BTreeSet::new();
+    for value in &plan.environment_values {
+        if !names.insert(value.name.as_bytes()) {
+            return Err(incomplete_plan(
+                StateDimensionV1::EnvironmentValues,
+                None,
+                "reject duplicate allowlisted environment name",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observe_environment_once(
+    plan: &EnvironmentObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<Vec<EnvironmentObservationV1>> {
+    let mut observations = Vec::new();
+    if plan.include_operating_system {
+        observations.push(environment_identity_observation(
+            StateDimensionV1::OperatingSystem,
+            b"os",
+            std::env::consts::OS.as_bytes(),
+        ));
+    }
+    if plan.include_architecture {
+        observations.push(environment_identity_observation(
+            StateDimensionV1::Architecture,
+            b"architecture",
+            std::env::consts::ARCH.as_bytes(),
+        ));
+    }
+    if let Some(kernel) = &plan.kernel_identity {
+        observations.push(environment_identity_observation(
+            StateDimensionV1::Kernel,
+            b"kernel",
+            kernel.as_bytes(),
+        ));
+    }
+
+    let mut executables = plan.executables.iter().collect::<Vec<_>>();
+    executables.sort_by(|left, right| left.label.as_bytes().cmp(right.label.as_bytes()));
+    let mut ledger = ObservationLedger::default();
+    for executable in executables {
+        let input_metadata = fs::symlink_metadata(&executable.path).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Executables,
+                &executable.path,
+                "inspect executable",
+                error,
+            )
+        })?;
+        if input_metadata.file_type().is_symlink() {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::SymlinkRefused,
+                StateDimensionV1::Executables,
+                Some(executable.path.clone()),
+                "observe executable",
+            ));
+        }
+        if !input_metadata.is_file() {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::SpecialFileRefused,
+                StateDimensionV1::Executables,
+                Some(executable.path.clone()),
+                "observe executable",
+            ));
+        }
+        let canonical = fs::canonicalize(&executable.path).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Executables,
+                &executable.path,
+                "canonicalize executable",
+                error,
+            )
+        })?;
+        check_path_bound(&canonical, limits, StateDimensionV1::Executables)?;
+        let observed =
+            observe_regular_file(&canonical, limits, &mut ledger).map_err(|mut state| {
+                for reason in &mut state.reasons {
+                    reason.dimension = StateDimensionV1::Executables;
+                }
+                state
+            })?;
+        let mut encoder = CanonicalEncoder::new(b"again.environment-executable.v1");
+        encoder.bytes(executable.label.as_bytes());
+        encoder.path(&canonical);
+        observed.encode(&mut encoder);
+        encoder.digest(executable.version_identity_digest);
+        observations.push(EnvironmentObservationV1 {
+            dimension: StateDimensionV1::Executables,
+            label: executable.label.as_bytes().to_vec(),
+            digest: encoder.finish(),
+        });
+    }
+
+    if let Some(cwd) = &plan.cwd {
+        let input_metadata = fs::symlink_metadata(cwd).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::WorkingDirectory,
+                cwd,
+                "inspect working directory",
+                error,
+            )
+        })?;
+        if input_metadata.file_type().is_symlink() {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::SymlinkRefused,
+                StateDimensionV1::WorkingDirectory,
+                Some(cwd.clone()),
+                "observe working directory",
+            ));
+        }
+        if !input_metadata.is_dir() {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::SpecialFileRefused,
+                StateDimensionV1::WorkingDirectory,
+                Some(cwd.clone()),
+                "observe working directory",
+            ));
+        }
+        let canonical = fs::canonicalize(cwd).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::WorkingDirectory,
+                cwd,
+                "canonicalize working directory",
+                error,
+            )
+        })?;
+        check_path_bound(&canonical, limits, StateDimensionV1::WorkingDirectory)?;
+        let handle = File::open(&canonical).map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::WorkingDirectory,
+                &canonical,
+                "open working directory",
+                error,
+            )
+        })?;
+        let opened = FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::WorkingDirectory,
+                &canonical,
+                "inspect open working directory",
+                error,
+            )
+        })?);
+        let path_identity = FilesystemIdentityV1::from_metadata(
+            &fs::symlink_metadata(&canonical).map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::WorkingDirectory,
+                    &canonical,
+                    "reinspect working directory",
+                    error,
+                )
+            })?,
+        );
+        if opened != path_identity {
+            return Err(concurrent(
+                StateDimensionV1::WorkingDirectory,
+                &canonical,
+                "observe working directory",
+            ));
+        }
+        let mut encoder = CanonicalEncoder::new(b"again.environment-cwd.v1");
+        encoder.path(&canonical);
+        opened.encode_authority(&mut encoder);
+        observations.push(EnvironmentObservationV1 {
+            dimension: StateDimensionV1::WorkingDirectory,
+            label: b"cwd".to_vec(),
+            digest: encoder.finish(),
+        });
+    }
+
+    let mut environment_values = plan.environment_values.iter().collect::<Vec<_>>();
+    environment_values.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    for value in environment_values {
+        let mut encoder = CanonicalEncoder::new(b"again.environment-allowlisted.v1");
+        encoder.os_str(&value.name);
+        encoder.digest(value.value_digest);
+        observations.push(EnvironmentObservationV1 {
+            dimension: StateDimensionV1::EnvironmentValues,
+            label: value.name.as_bytes().to_vec(),
+            digest: encoder.finish(),
+        });
+    }
+    if let Some(identity) = &plan.resource_profile_id {
+        observations.push(environment_identity_observation(
+            StateDimensionV1::ResourceProfile,
+            b"resource-profile",
+            identity.as_bytes(),
+        ));
+    }
+    if let Some(identity) = &plan.sandbox_backend_id {
+        observations.push(environment_identity_observation(
+            StateDimensionV1::SandboxBackend,
+            b"sandbox-backend",
+            identity.as_bytes(),
+        ));
+    }
+    if let Some(identity) = &plan.mcp_identity {
+        let mut encoder = CanonicalEncoder::new(b"again.environment-mcp.v1");
+        encoder.bytes(identity.provider_id.as_bytes());
+        encoder.bytes(identity.tool_schema_version.as_bytes());
+        observations.push(EnvironmentObservationV1 {
+            dimension: StateDimensionV1::McpProviderToolSchema,
+            label: b"mcp".to_vec(),
+            digest: encoder.finish(),
+        });
+    }
+    if let Some(scope) = plan.authorization_scope_digest {
+        let mut encoder = CanonicalEncoder::new(b"again.environment-authorization-scope.v1");
+        encoder.digest(scope);
+        observations.push(EnvironmentObservationV1 {
+            dimension: StateDimensionV1::AuthorizationScope,
+            label: b"authorization-scope".to_vec(),
+            digest: encoder.finish(),
+        });
+    }
+    observations.sort_by(|left, right| {
+        dimension_tag(left.dimension)
+            .cmp(&dimension_tag(right.dimension))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    Ok(observations)
+}
+
+fn environment_identity_observation(
+    dimension: StateDimensionV1,
+    label: &[u8],
+    value: &[u8],
+) -> EnvironmentObservationV1 {
+    let mut encoder = CanonicalEncoder::new(b"again.environment-identity.v1");
+    encoder.u8(dimension_tag(dimension));
+    encoder.bytes(label);
+    encoder.bytes(value);
+    EnvironmentObservationV1 {
+        dimension,
+        label: label.to_vec(),
+        digest: encoder.finish(),
+    }
+}
+
+fn environment_dimensions() -> [StateDimensionV1; 10] {
+    [
+        StateDimensionV1::OperatingSystem,
+        StateDimensionV1::Architecture,
+        StateDimensionV1::Kernel,
+        StateDimensionV1::Executables,
+        StateDimensionV1::WorkingDirectory,
+        StateDimensionV1::EnvironmentValues,
+        StateDimensionV1::ResourceProfile,
+        StateDimensionV1::SandboxBackend,
+        StateDimensionV1::McpProviderToolSchema,
+        StateDimensionV1::AuthorizationScope,
+    ]
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskStateInputV1 {
+    pub task_id: String,
+    pub task_revision: u64,
+    pub user_goal_digest: StateDigestV1,
+    pub accepted_constraints_digest: StateDigestV1,
+    pub branch_identity: String,
+    pub worktree_identity: String,
+    pub patch_digest: StateDigestV1,
+    pub plan_revision: u64,
+    pub compaction_epoch: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaskStateV1 {
+    schema_version: u16,
+    task_id: String,
+    task_revision: u64,
+    user_goal_digest: StateDigestV1,
+    accepted_constraints_digest: StateDigestV1,
+    branch_identity: String,
+    worktree_identity: String,
+    patch_digest: StateDigestV1,
+    plan_revision: u64,
+    compaction_epoch: u64,
+    digest: StateDigestV1,
+}
+
+impl TaskStateV1 {
+    pub fn from_input(
+        input: TaskStateInputV1,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        for value in [
+            input.task_id.as_str(),
+            input.branch_identity.as_str(),
+            input.worktree_identity.as_str(),
+        ] {
+            if value.is_empty() || value.len() > limits.max_task_field_bytes {
+                return Err(incomplete_limit(
+                    StateDimensionV1::Task,
+                    None,
+                    "bound task identity field",
+                ));
+            }
+        }
+        let mut state = Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            task_id: input.task_id,
+            task_revision: input.task_revision,
+            user_goal_digest: input.user_goal_digest,
+            accepted_constraints_digest: input.accepted_constraints_digest,
+            branch_identity: input.branch_identity,
+            worktree_identity: input.worktree_identity,
+            patch_digest: input.patch_digest,
+            plan_revision: input.plan_revision,
+            compaction_epoch: input.compaction_epoch,
+            digest: StateDigestV1([0; 32]),
+        };
+        state.digest = digest_encoded(b"again.task-state.v1", &encode_task_state(&state));
+        Ok(state)
+    }
+
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn task_revision(&self) -> u64 {
+        self.task_revision
+    }
+
+    pub fn user_goal_digest(&self) -> StateDigestV1 {
+        self.user_goal_digest
+    }
+
+    pub fn accepted_constraints_digest(&self) -> StateDigestV1 {
+        self.accepted_constraints_digest
+    }
+
+    pub fn branch_identity(&self) -> &str {
+        &self.branch_identity
+    }
+
+    pub fn worktree_identity(&self) -> &str {
+        &self.worktree_identity
+    }
+
+    pub fn patch_digest(&self) -> StateDigestV1 {
+        self.patch_digest
+    }
+
+    pub fn plan_revision(&self) -> u64 {
+        self.plan_revision
+    }
+
+    pub fn compaction_epoch(&self) -> u64 {
+        self.compaction_epoch
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        encode_task_state(self)
+    }
+}
+
+/// A freshness token supplied by the named external provider. Token bytes and
+/// authorization material are never retained; only domain-separated digests
+/// are stored. This binds the observed token but does not independently claim
+/// that a provider omitted a mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalDependencyObservationV1 {
+    provider_id: String,
+    resource_id_digest: StateDigestV1,
+    freshness_token_digest: StateDigestV1,
+}
+
+impl ExternalDependencyObservationV1 {
+    pub fn from_token(
+        provider_id: impl Into<String>,
+        resource_identifier: &[u8],
+        freshness_token: &[u8],
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        let provider_id = provider_id.into();
+        check_identity_text(
+            &provider_id,
+            limits,
+            StateDimensionV1::ExternalFreshness,
+            "validate external provider identity",
+        )?;
+        if resource_identifier.is_empty() || resource_identifier.len() > limits.max_identity_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::ExternalFreshness,
+                None,
+                "bound external resource identity",
+            ));
+        }
+        if freshness_token.is_empty() || freshness_token.len() > limits.max_external_token_bytes {
+            return Err(incomplete_limit(
+                StateDimensionV1::ExternalFreshness,
+                None,
+                "bound external freshness token",
+            ));
+        }
+        Ok(Self {
+            provider_id,
+            resource_id_digest: StateDigestV1::from_domain_and_bytes(
+                b"again.external-resource-id.v1",
+                resource_identifier,
+            ),
+            freshness_token_digest: StateDigestV1::from_domain_and_bytes(
+                b"again.external-freshness-token.v1",
+                freshness_token,
+            ),
+        })
+    }
+
+    pub fn provider_id(&self) -> &str {
+        &self.provider_id
+    }
+
+    pub fn resource_id_digest(&self) -> StateDigestV1 {
+        self.resource_id_digest
+    }
+
+    pub fn freshness_token_digest(&self) -> StateDigestV1 {
+        self.freshness_token_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExternalFreshnessV1 {
+    schema_version: u16,
+    external_state_explicitly_excluded: bool,
+    dependencies: Vec<ExternalDependencyObservationV1>,
+    digest: StateDigestV1,
+}
+
+impl ExternalFreshnessV1 {
+    pub fn no_external_dependencies() -> Self {
+        let mut value = Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            external_state_explicitly_excluded: true,
+            dependencies: Vec::new(),
+            digest: StateDigestV1([0; 32]),
+        };
+        value.digest = digest_encoded(
+            b"again.external-freshness.v1",
+            &encode_external_freshness(&value),
+        );
+        value
+    }
+
+    pub fn from_observations(
+        mut dependencies: Vec<ExternalDependencyObservationV1>,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Self> {
+        if dependencies.is_empty() {
+            return Err(incomplete_plan(
+                StateDimensionV1::ExternalFreshness,
+                None,
+                "require observed external dependencies",
+            ));
+        }
+        if dependencies.len() > limits.max_external_dependencies {
+            return Err(incomplete_limit(
+                StateDimensionV1::ExternalFreshness,
+                None,
+                "bound external dependencies",
+            ));
+        }
+        dependencies.sort_by(|left, right| {
+            left.provider_id
+                .as_bytes()
+                .cmp(right.provider_id.as_bytes())
+                .then_with(|| left.resource_id_digest.cmp(&right.resource_id_digest))
+        });
+        if dependencies.windows(2).any(|pair| {
+            pair[0].provider_id == pair[1].provider_id
+                && pair[0].resource_id_digest == pair[1].resource_id_digest
+        }) {
+            return Err(incomplete_plan(
+                StateDimensionV1::ExternalFreshness,
+                None,
+                "reject duplicate external dependency",
+            ));
+        }
+        let mut value = Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            external_state_explicitly_excluded: false,
+            dependencies,
+            digest: StateDigestV1([0; 32]),
+        };
+        value.digest = digest_encoded(
+            b"again.external-freshness.v1",
+            &encode_external_freshness(&value),
+        );
+        Ok(value)
+    }
+
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn external_state_explicitly_excluded(&self) -> bool {
+        self.external_state_explicitly_excluded
+    }
+
+    pub fn dependencies(&self) -> &[ExternalDependencyObservationV1] {
+        &self.dependencies
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentContextEpochV1 {
+    schema_version: u16,
+    repository: RepositoryEpochV1,
+    environment: EnvironmentAuthorityV1,
+    task: TaskStateV1,
+    digest: StateDigestV1,
+}
+
+impl AgentContextEpochV1 {
+    pub fn new(
+        repository: RepositoryEpochV1,
+        environment: EnvironmentAuthorityV1,
+        task: TaskStateV1,
+    ) -> Self {
+        let mut value = Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            repository,
+            environment,
+            task,
+            digest: StateDigestV1([0; 32]),
+        };
+        value.digest = digest_encoded(
+            b"again.agent-context-epoch.v1",
+            &encode_agent_context(&value),
+        );
+        value
+    }
+
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn repository(&self) -> &RepositoryEpochV1 {
+        &self.repository
+    }
+
+    pub fn environment(&self) -> &EnvironmentAuthorityV1 {
+        &self.environment
+    }
+
+    pub fn task(&self) -> &TaskStateV1 {
+        &self.task
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+}
+
+/// Capability handed to a reuse decision. Its private field prevents callers
+/// from minting one out of an incomplete state or an arbitrary digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReusableToolAuthorityV1 {
+    complete_state_digest: StateDigestV1,
+}
+
+impl ReusableToolAuthorityV1 {
+    pub fn complete_state_digest(&self) -> StateDigestV1 {
+        self.complete_state_digest
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompleteToolStateV1 {
+    schema_version: u16,
+    agent_context: AgentContextEpochV1,
+    external_freshness: ExternalFreshnessV1,
+    digest: StateDigestV1,
+}
+
+impl CompleteToolStateV1 {
+    pub fn new(
+        repository: RepositoryEpochV1,
+        environment: EnvironmentAuthorityV1,
+        task: TaskStateV1,
+        external_freshness: ExternalFreshnessV1,
+    ) -> Self {
+        let mut value = Self {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            agent_context: AgentContextEpochV1::new(repository, environment, task),
+            external_freshness,
+            digest: StateDigestV1([0; 32]),
+        };
+        value.digest = digest_encoded(
+            b"again.complete-tool-state.v1",
+            &encode_complete_tool_state(&value),
+        );
+        value
+    }
+
+    pub fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+
+    pub fn agent_context(&self) -> &AgentContextEpochV1 {
+        &self.agent_context
+    }
+
+    pub fn external_freshness(&self) -> &ExternalFreshnessV1 {
+        &self.external_freshness
+    }
+
+    pub fn digest(&self) -> StateDigestV1 {
+        self.digest
+    }
+
+    pub fn reusable_authority(&self) -> ReusableToolAuthorityV1 {
+        ReusableToolAuthorityV1 {
+            complete_state_digest: self.digest,
+        }
+    }
+
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        encode_complete_tool_state(self)
+    }
+}
+
+fn check_identity_text(
+    value: &str,
+    limits: &WorkspaceAuthorityLimitsV1,
+    dimension: StateDimensionV1,
+    operation: &'static str,
+) -> AuthorityResult<()> {
+    if value.is_empty() || value.len() > limits.max_identity_bytes || value.as_bytes().contains(&0)
+    {
+        return Err(incomplete_limit(dimension, None, operation));
+    }
+    Ok(())
+}
+
+fn check_path_bound(
+    path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    dimension: StateDimensionV1,
+) -> AuthorityResult<()> {
+    if path.as_os_str().as_bytes().len() > limits.max_path_bytes {
+        return Err(incomplete_limit(
+            dimension,
+            Some(path),
+            "bound filesystem path",
+        ));
+    }
+    Ok(())
+}
+
+fn encode_repository_epoch(epoch: &RepositoryEpochV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.repository-epoch-encoding.v1");
+    encoder.u16(epoch.schema_version);
+    encoder.path(&epoch.canonical_workspace);
+    epoch.workspace_identity.encode_authority(&mut encoder);
+    match &epoch.git {
+        RepositoryGitStateV1::NotGitRepository => encoder.u8(0),
+        RepositoryGitStateV1::Git {
+            worktree_root,
+            git_directory,
+            head_ref,
+            head_object,
+            head_digest,
+            index_digest,
+        } => {
+            encoder.u8(1);
+            encoder.path(worktree_root);
+            encoder.path(git_directory);
+            encoder.optional_bytes(head_ref.as_ref().map(String::as_bytes));
+            encoder.optional_bytes(head_object.as_ref().map(String::as_bytes));
+            encoder.digest(*head_digest);
+            encoder.optional_digest(*index_digest);
+        }
+    }
+    encode_repository_plan(&epoch.plan, &mut encoder);
+    encoder.u64(epoch.observations.len() as u64);
+    for observation in &epoch.observations {
+        encoder.u8(observation_kind_tag(observation.kind));
+        encoder.path(&observation.path);
+        encoder.digest(observation.digest);
+        encoder.u64(observation.entries);
+        encoder.u64(observation.bytes);
+        encoder.bool(observation.present);
+    }
+    encoder.into_bytes()
+}
+
+fn encode_repository_plan(plan: &RepositoryObservationPlanV1, encoder: &mut CanonicalEncoder) {
+    for paths in [
+        &plan.content_paths,
+        &plan.recursive_trees,
+        &plan.directory_listings,
+        &plan.negative_dependencies,
+    ] {
+        encoder.u64(paths.len() as u64);
+        for path in paths {
+            encoder.path(path);
+        }
+    }
+}
+
+fn encode_environment_authority(authority: &EnvironmentAuthorityV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.environment-authority-encoding.v1");
+    encoder.u16(authority.schema_version);
+    encoder.u64(authority.observed_dimensions.len() as u64);
+    for dimension in &authority.observed_dimensions {
+        encoder.u8(dimension_tag(*dimension));
+    }
+    encoder.u64(authority.explicitly_excluded_dimensions.len() as u64);
+    for dimension in &authority.explicitly_excluded_dimensions {
+        encoder.u8(dimension_tag(*dimension));
+    }
+    encoder.u64(authority.observations.len() as u64);
+    for observation in &authority.observations {
+        encoder.u8(dimension_tag(observation.dimension));
+        encoder.bytes(&observation.label);
+        encoder.digest(observation.digest);
+    }
+    encoder.into_bytes()
+}
+
+fn encode_task_state(task: &TaskStateV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.task-state-encoding.v1");
+    encoder.u16(task.schema_version);
+    encoder.bytes(task.task_id.as_bytes());
+    encoder.u64(task.task_revision);
+    encoder.digest(task.user_goal_digest);
+    encoder.digest(task.accepted_constraints_digest);
+    encoder.bytes(task.branch_identity.as_bytes());
+    encoder.bytes(task.worktree_identity.as_bytes());
+    encoder.digest(task.patch_digest);
+    encoder.u64(task.plan_revision);
+    encoder.u64(task.compaction_epoch);
+    encoder.into_bytes()
+}
+
+fn encode_external_freshness(external: &ExternalFreshnessV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.external-freshness-encoding.v1");
+    encoder.u16(external.schema_version);
+    encoder.bool(external.external_state_explicitly_excluded);
+    encoder.u64(external.dependencies.len() as u64);
+    for dependency in &external.dependencies {
+        encoder.bytes(dependency.provider_id.as_bytes());
+        encoder.digest(dependency.resource_id_digest);
+        encoder.digest(dependency.freshness_token_digest);
+    }
+    encoder.into_bytes()
+}
+
+fn encode_agent_context(context: &AgentContextEpochV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.agent-context-encoding.v1");
+    encoder.u16(context.schema_version);
+    encoder.digest(context.repository.digest());
+    encoder.digest(context.environment.digest());
+    encoder.digest(context.task.digest());
+    encoder.into_bytes()
+}
+
+fn encode_complete_tool_state(state: &CompleteToolStateV1) -> Vec<u8> {
+    let mut encoder = CanonicalEncoder::new(b"again.complete-tool-state-encoding.v1");
+    encoder.u16(state.schema_version);
+    encoder.digest(state.agent_context.digest());
+    encoder.digest(state.external_freshness.digest());
+    encoder.into_bytes()
+}
+
+fn observation_kind_tag(kind: RepositoryObservationKindV1) -> u8 {
+    match kind {
+        RepositoryObservationKindV1::ContentPath => 1,
+        RepositoryObservationKindV1::RecursiveTree => 2,
+        RepositoryObservationKindV1::DirectoryListing => 3,
+        RepositoryObservationKindV1::NegativeDependency => 4,
+    }
+}
+
+fn dimension_tag(dimension: StateDimensionV1) -> u8 {
+    match dimension {
+        StateDimensionV1::Repository => 1,
+        StateDimensionV1::RepositoryGit => 2,
+        StateDimensionV1::RepositoryIndex => 3,
+        StateDimensionV1::RepositoryContent => 4,
+        StateDimensionV1::OperatingSystem => 5,
+        StateDimensionV1::Architecture => 6,
+        StateDimensionV1::Kernel => 7,
+        StateDimensionV1::Executables => 8,
+        StateDimensionV1::WorkingDirectory => 9,
+        StateDimensionV1::EnvironmentValues => 10,
+        StateDimensionV1::ResourceProfile => 11,
+        StateDimensionV1::SandboxBackend => 12,
+        StateDimensionV1::McpProviderToolSchema => 13,
+        StateDimensionV1::AuthorizationScope => 14,
+        StateDimensionV1::Task => 15,
+        StateDimensionV1::ExternalFreshness => 16,
+    }
+}
+
+fn digest_encoded(domain: &'static [u8], bytes: &[u8]) -> StateDigestV1 {
+    StateDigestV1::from_domain_and_bytes(domain, bytes)
+}
+
+struct CanonicalEncoder {
+    bytes: Vec<u8>,
+}
+
+impl CanonicalEncoder {
+    fn new(domain: &'static [u8]) -> Self {
+        let mut value = Self { bytes: Vec::new() };
+        value.bytes(domain);
+        value
+    }
+
+    fn u8(&mut self, value: u8) {
+        self.bytes.push(value);
+    }
+
+    fn bool(&mut self, value: bool) {
+        self.u8(u8::from(value));
+    }
+
+    fn u16(&mut self, value: u16) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u32(&mut self, value: u32) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn u64(&mut self, value: u64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn i64(&mut self, value: i64) {
+        self.bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn bytes(&mut self, value: &[u8]) {
+        self.u64(value.len() as u64);
+        self.bytes.extend_from_slice(value);
+    }
+
+    fn os_str(&mut self, value: &OsStr) {
+        self.bytes(value.as_bytes());
+    }
+
+    fn path(&mut self, value: &Path) {
+        self.os_str(value.as_os_str());
+    }
+
+    fn digest(&mut self, value: StateDigestV1) {
+        self.bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn optional_digest(&mut self, value: Option<StateDigestV1>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.digest(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn optional_bytes(&mut self, value: Option<&[u8]>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.bytes(value);
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn finish(self) -> StateDigestV1 {
+        let mut hasher = Hasher::new();
+        hasher.update(&self.bytes);
+        StateDigestV1(*hasher.finalize().as_bytes())
+    }
+
+    fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
