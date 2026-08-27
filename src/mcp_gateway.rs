@@ -31,6 +31,7 @@ struct StdioActivationV1 {
     sender: SyncSender<()>,
     signalled: AtomicBool,
     session_id: u64,
+    session_closed: Arc<AtomicBool>,
 }
 
 impl StdioActivationV1 {
@@ -928,6 +929,8 @@ impl McpGateway {
             let (response_sender, response_receiver) =
                 mpsc::sync_channel::<Vec<u8>>(STDIO_RESPONSE_QUEUE_V1);
             let inflight = Arc::new(AtomicUsize::new(0));
+            let session_closed = Arc::new(AtomicBool::new(false));
+            let writer_session_closed = Arc::clone(&session_closed);
 
             let writer_handle = scope.spawn(move || -> io::Result<()> {
                 let result = (|| {
@@ -939,6 +942,7 @@ impl McpGateway {
                     Ok(())
                 })();
                 if result.is_err() {
+                    writer_session_closed.store(true, Ordering::Release);
                     self.cancel_stdio_session(session_id);
                 }
                 result
@@ -993,6 +997,12 @@ impl McpGateway {
 
             let read_result = (|| -> io::Result<()> {
                 while let Some(frame) = read_bounded_frame(reader, self.limits.max_message_bytes)? {
+                    if session_closed.load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "stdio response writer stopped",
+                        ));
+                    }
                     let logical_number =
                         self.next_stdio_logical_call.fetch_add(1, Ordering::Relaxed);
                     let context = GatewayRequestContext::new(
@@ -1026,6 +1036,7 @@ impl McpGateway {
                                     sender: activation_sender,
                                     signalled: AtomicBool::new(false),
                                     session_id,
+                                    session_closed: Arc::clone(&session_closed),
                                 });
                                 let job = StdioJobV1 {
                                     bytes,
@@ -1069,6 +1080,7 @@ impl McpGateway {
             // stdio session. Provider cancellation is cooperative, but the
             // gateway immediately marks every still-active session call as
             // cancelled and asks its exact physical attempt to stop.
+            session_closed.store(true, Ordering::Release);
             self.cancel_stdio_session(session_id);
             drop(job_sender);
             for worker in workers {
@@ -1285,6 +1297,19 @@ impl McpGateway {
         };
         if let Some(activation) = activation {
             activation.signal();
+            if activation.session_closed.load(Ordering::Acquire) {
+                let _ = active_registration.complete();
+                self.record_call_audit(
+                    context,
+                    &route,
+                    physical_attempt_id,
+                    AuditOutcome::Rejected,
+                );
+                return Some(error_response(
+                    response_id,
+                    McpError::typed(McpErrorCode::RequestCancelled, "stdio session closed"),
+                ));
+            }
         }
 
         let translation = translate_tool_call_v1(&route, &arguments, context, &freshness);

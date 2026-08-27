@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 #[path = "../src/mcp_gateway.rs"]
 mod mcp_gateway;
 
@@ -216,18 +214,18 @@ impl AttemptProvider {
     }
 
     fn wait_for_cancellations(&self, count: usize) {
-        let cancellations = self.cancellations.lock().unwrap();
-        let (cancellations, timeout) = self
+        let state = self.state.lock().unwrap();
+        let (state, timeout) = self
             .changed
-            .wait_timeout_while(cancellations, Duration::from_secs(5), |cancellations| {
-                cancellations.len() < count
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                state.cancelled.len() < count
             })
             .unwrap();
         assert!(
             !timeout.timed_out(),
             "provider did not receive {count} cancellations"
         );
-        assert!(cancellations.len() >= count);
+        assert!(state.cancelled.len() >= count);
     }
 
     fn stop_blocking(&self) {
@@ -447,14 +445,6 @@ fn encoded_line(value: Value) -> Vec<u8> {
     let mut bytes = serde_json::to_vec(&value).unwrap();
     bytes.push(b'\n');
     bytes
-}
-
-fn decoded_lines(bytes: &[u8]) -> Vec<Value> {
-    bytes
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect()
 }
 
 fn cancel_string_id(gateway: &McpGateway, request_id: &str) {
@@ -1343,6 +1333,245 @@ fn stdio_contains_provider_panic_as_payload_free_internal_error() {
     );
     assert_eq!(response["error"]["message"], "upstream provider failed");
     assert!(response["error"].get("data").is_none());
+}
+
+#[test]
+fn stdio_eof_cancels_the_exact_active_attempt_and_drains_the_response() {
+    let provider = Arc::new(AttemptProvider::new());
+    let gateway = Arc::new(attempt_gateway(Arc::clone(&provider)));
+    initialize(&gateway);
+    let (input_sender, input_receiver) = mpsc::channel();
+    let (line_sender, line_receiver) = mpsc::channel();
+    let serving_gateway = Arc::clone(&gateway);
+    let server = thread::spawn(move || {
+        let mut reader = BufReader::new(ChannelReader::new(input_receiver));
+        let mut writer = LineWriter {
+            pending: Vec::new(),
+            lines: line_sender,
+        };
+        serving_gateway.serve_stdio(
+            &mut reader,
+            &mut writer,
+            &AuthorizationScopeId::new("scope:stdio-eof").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+    });
+
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"active", "method":"tools/call",
+            "params":{"name":"attempts.wait","arguments":{}}
+        })))
+        .unwrap();
+    provider.wait_for_started(1);
+    drop(input_sender);
+    provider.wait_for_cancellations(1);
+    server.join().unwrap().unwrap();
+
+    let response: Value =
+        serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+            .unwrap();
+    assert_eq!(response["id"], "active");
+    assert_eq!(
+        response["error"]["code"],
+        McpErrorCode::RequestCancelled as i64
+    );
+    assert!(line_receiver.try_recv().is_err());
+    let calls = provider.calls.lock().unwrap();
+    let cancellations = provider.cancellations.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(cancellations.len(), 1);
+    assert_eq!(
+        calls[0].physical_attempt_id,
+        cancellations[0].physical_attempt_id
+    );
+}
+
+#[test]
+fn writer_failure_cancels_active_work_and_rejects_later_frames() {
+    let provider = Arc::new(AttemptProvider::new());
+    let gateway = Arc::new(attempt_gateway(Arc::clone(&provider)));
+    initialize(&gateway);
+    let (input_sender, input_receiver) = mpsc::channel();
+    let serving_gateway = Arc::clone(&gateway);
+    let server = thread::spawn(move || {
+        let mut reader = BufReader::new(ChannelReader::new(input_receiver));
+        let mut writer = FailingWriter;
+        serving_gateway.serve_stdio(
+            &mut reader,
+            &mut writer,
+            &AuthorizationScopeId::new("scope:stdio-writer-failure").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+    });
+
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"waiting", "method":"tools/call",
+            "params":{"name":"attempts.wait","arguments":{}}
+        })))
+        .unwrap();
+    provider.wait_for_started(1);
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"trigger", "method":"tools/call",
+            "params":{"name":"attempts.fast","arguments":{}}
+        })))
+        .unwrap();
+    provider.wait_for_started(2);
+    provider.wait_for_cancellations(1);
+
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"must-not-run", "method":"tools/call",
+            "params":{"name":"attempts.fast","arguments":{}}
+        })))
+        .unwrap();
+    drop(input_sender);
+    let error = server.join().unwrap().unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(provider.calls.lock().unwrap().len(), 2);
+    assert_eq!(provider.state.lock().unwrap().started.len(), 2);
+}
+
+#[test]
+fn stdio_saturation_refuses_the_seventeenth_provider_execution() {
+    let provider = Arc::new(AttemptProvider::new());
+    let gateway = Arc::new(attempt_gateway(Arc::clone(&provider)));
+    initialize(&gateway);
+    let mut input = Vec::new();
+    for id in 0..17 {
+        input.extend(encoded_line(json!({
+            "jsonrpc":"2.0", "id":id, "method":"tools/call",
+            "params":{"name":"attempts.wait","arguments":{}}
+        })));
+    }
+    let gate = Arc::new((Mutex::new(WriterGateState::default()), Condvar::new()));
+    let server_gate = Arc::clone(&gate);
+    let serving_gateway = Arc::clone(&gateway);
+    let server = thread::spawn(move || {
+        let mut reader = BufReader::new(Cursor::new(input));
+        let mut writer = BlockingWriter {
+            gate: server_gate,
+            bytes: Vec::new(),
+        };
+        serving_gateway.serve_stdio(
+            &mut reader,
+            &mut writer,
+            &AuthorizationScopeId::new("scope:stdio-saturation").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+    });
+
+    provider.wait_for_started(16);
+    let (state, changed) = &*gate;
+    let state = state.lock().unwrap();
+    let (mut state, timeout) = changed
+        .wait_timeout_while(state, Duration::from_secs(5), |state| !state.entered)
+        .unwrap();
+    assert!(!timeout.timed_out(), "writer never observed a response");
+    assert_eq!(provider.calls.lock().unwrap().len(), 16);
+    state.released = true;
+    changed.notify_all();
+    drop(state);
+
+    server.join().unwrap().unwrap();
+    provider.wait_for_cancellations(16);
+    assert_eq!(provider.calls.lock().unwrap().len(), 16);
+}
+
+#[test]
+fn completed_cancellation_does_not_poison_a_reused_request_id() {
+    let provider = Arc::new(AttemptProvider::new());
+    let gateway = Arc::new(attempt_gateway(Arc::clone(&provider)));
+    initialize(&gateway);
+    let first_gateway = Arc::clone(&gateway);
+    let first = thread::spawn(move || {
+        invoke(
+            &first_gateway,
+            json!({
+                "jsonrpc":"2.0", "id":"reused", "method":"tools/call",
+                "params":{"name":"attempts.wait","arguments":{}}
+            }),
+            &context("logical:first-attempt"),
+        )
+    });
+    provider.wait_for_started(1);
+    cancel_string_id(&gateway, "reused");
+    let first = first.join().unwrap();
+    assert_eq!(
+        first["error"]["code"],
+        McpErrorCode::RequestCancelled as i64
+    );
+
+    let second_gateway = Arc::clone(&gateway);
+    let second = thread::spawn(move || {
+        invoke(
+            &second_gateway,
+            json!({
+                "jsonrpc":"2.0", "id":"reused", "method":"tools/call",
+                "params":{"name":"attempts.wait","arguments":{}}
+            }),
+            &context("logical:second-attempt"),
+        )
+    });
+    provider.wait_for_started(2);
+    provider.stop_blocking();
+    assert!(second.join().unwrap().get("result").is_some());
+
+    let calls = provider.calls.lock().unwrap();
+    let cancellations = provider.cancellations.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(cancellations.len(), 1);
+    assert_eq!(
+        cancellations[0].physical_attempt_id,
+        calls[0].physical_attempt_id
+    );
+    assert_ne!(calls[0].physical_attempt_id, calls[1].physical_attempt_id);
+}
+
+#[test]
+fn provider_cancellation_panic_is_contained_and_active_id_is_released() {
+    let block = Arc::new(BlockState::default());
+    let provider = Arc::new(
+        FakeProvider::new("fake", vec![tool("wait")])
+            .blocking(Arc::clone(&block))
+            .panicking_cancellation(),
+    );
+    let gateway = Arc::new(gateway(Arc::clone(&provider)));
+    initialize(&gateway);
+    let calling_gateway = Arc::clone(&gateway);
+    let call = thread::spawn(move || {
+        invoke(
+            &calling_gateway,
+            json!({
+                "jsonrpc":"2.0", "id":"panic-cancel", "method":"tools/call",
+                "params":{"name":"fake.wait","arguments":{}}
+            }),
+            &context("logical:panic-cancel"),
+        )
+    });
+    let mut started = block.started.lock().unwrap();
+    while !*started {
+        started = block.changed.wait(started).unwrap();
+    }
+    drop(started);
+    cancel_string_id(&gateway, "panic-cancel");
+    let response = call.join().unwrap();
+    assert_eq!(
+        response["error"]["code"],
+        McpErrorCode::RequestCancelled as i64
+    );
+
+    let retried = invoke(
+        &gateway,
+        json!({
+            "jsonrpc":"2.0", "id":"panic-cancel", "method":"tools/call",
+            "params":{"name":"fake.wait","arguments":{}}
+        }),
+        &context("logical:after-panic-cancel"),
+    );
+    assert!(retried.get("result").is_some());
 }
 
 #[test]
