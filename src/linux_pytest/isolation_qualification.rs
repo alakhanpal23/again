@@ -53,6 +53,7 @@ use super::execute_only_stdio::ProfileStdioIsolationChildV1;
 ))]
 use super::snapshot_manifest::{
     FirstExecuteOnlyForkChildRootPairV1, attach_first_execute_only_fork_child_roots_v1,
+    attach_first_execute_only_fork_child_roots_with_fixed_runtime_refusal_v1,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::{
@@ -75,7 +76,60 @@ pub(super) struct CompletedRootlessNamespaceProbeV1 {
 /// this module; a sibling such as the stdio owner may only consume it when the
 /// isolation child invokes that sibling's implementation.
 pub(super) struct IsolationChildOnlyBrandV1 {
-    _private: (),
+    old_root_descriptor: i32,
+}
+
+/// Reopen one pre-clone absolute publication path through the copy of the host
+/// mount tree that belongs to the child's private mount namespace. Inherited
+/// descriptors still refer to the parent's mount objects and modern kernels
+/// reject cloning those foreign objects. The unforgeable child brand and the
+/// still-attached old-root descriptor make this a narrow rebind, not a generic
+/// path or descriptor API.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn reopen_isolation_child_publication_path_v1(
+    brand: &IsolationChildOnlyBrandV1,
+    path: &std::ffi::CStr,
+) -> Result<i32, i32> {
+    #[repr(C)]
+    struct OpenHowV1 {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+
+    let bytes = path.to_bytes();
+    if brand.old_root_descriptor < 0
+        || bytes.len() < 2
+        || bytes[0] != b'/'
+        || bytes.ends_with(b" (deleted)")
+    {
+        return Err(libc::EINVAL);
+    }
+    let how = OpenHowV1 {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: 0x02 | 0x04 | 0x08,
+    };
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            brand.old_root_descriptor,
+            path.as_ptr().add(1),
+            &how,
+            std::mem::size_of::<OpenHowV1>(),
+        )
+    };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO));
+    }
+    i32::try_from(result).map_err(|_| libc::EOVERFLOW)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -89,6 +143,7 @@ struct IsolationChildContinuationFailureV1 {
     errno: Option<i32>,
     filesystem: bool,
     unsupported: bool,
+    fixed_runtime_open_tree_injection: bool,
 }
 
 impl IsolationChildContinuationFailureV1 {
@@ -97,6 +152,7 @@ impl IsolationChildContinuationFailureV1 {
             errno,
             filesystem: false,
             unsupported: false,
+            fixed_runtime_open_tree_injection: false,
         }
     }
 
@@ -106,6 +162,7 @@ impl IsolationChildContinuationFailureV1 {
             errno: failure.errno(),
             filesystem: true,
             unsupported: failure.unsupported(),
+            fixed_runtime_open_tree_injection: failure.is_fixed_runtime_open_tree_injection(),
         }
     }
 }
@@ -213,8 +270,20 @@ unsafe impl IsolationChildPostCapabilityContinuationV1 for ProfileStdioIsolation
 pub(super) struct FilesystemProfileIsolationChildV1 {
     roots: FirstExecuteOnlyForkChildRootPairV1,
     stdio: ProfileStdioIsolationChildV1,
+    attachment: FilesystemAttachmentModeV1,
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+enum FilesystemAttachmentModeV1 {
+    Normal,
+    FixedRuntimeRefusal,
     #[cfg(test)]
-    test_fault: Option<(SnapshotChildRootRoleV1, SnapshotChildAttachOperationV1)>,
+    TestFault(SnapshotChildRootRoleV1, SnapshotChildAttachOperationV1),
 }
 
 #[cfg(all(
@@ -230,8 +299,26 @@ pub(super) fn compose_filesystem_profile_isolation_child_v1(
     FilesystemProfileIsolationChildV1 {
         roots,
         stdio,
-        #[cfg(test)]
-        test_fault: None,
+        attachment: FilesystemAttachmentModeV1::Normal,
+    }
+}
+
+/// Fixed command-free partial-attachment diagnostic constructor. It carries
+/// no caller-selected operation and can only refuse runtime `open_tree(2)`.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn compose_filesystem_profile_isolation_child_with_fixed_runtime_refusal_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+) -> FilesystemProfileIsolationChildV1 {
+    FilesystemProfileIsolationChildV1 {
+        roots,
+        stdio,
+        attachment: FilesystemAttachmentModeV1::FixedRuntimeRefusal,
     }
 }
 
@@ -251,7 +338,7 @@ pub(super) fn compose_filesystem_profile_isolation_child_with_test_fault_v1(
     FilesystemProfileIsolationChildV1 {
         roots,
         stdio,
-        test_fault: Some((role, operation)),
+        attachment: FilesystemAttachmentModeV1::TestFault(role, operation),
     }
 }
 
@@ -276,19 +363,24 @@ unsafe impl IsolationChildContinuationV1 for FilesystemProfileIsolationChildV1 {
         let Self {
             roots,
             stdio,
-            #[cfg(test)]
-            test_fault,
+            attachment,
         } = self;
-        #[cfg(test)]
-        let attached = if let Some((role, operation)) = test_fault {
-            attach_first_execute_only_fork_child_roots_with_test_fault_v1(
-                roots, brand, role, operation,
-            )
-        } else {
-            attach_first_execute_only_fork_child_roots_v1(roots, brand)
+        let attached = match attachment {
+            FilesystemAttachmentModeV1::Normal => {
+                attach_first_execute_only_fork_child_roots_v1(roots, brand)
+            }
+            FilesystemAttachmentModeV1::FixedRuntimeRefusal => {
+                attach_first_execute_only_fork_child_roots_with_fixed_runtime_refusal_v1(
+                    roots, brand,
+                )
+            }
+            #[cfg(test)]
+            FilesystemAttachmentModeV1::TestFault(role, operation) => {
+                attach_first_execute_only_fork_child_roots_with_test_fault_v1(
+                    roots, brand, role, operation,
+                )
+            }
         };
-        #[cfg(not(test))]
-        let attached = attach_first_execute_only_fork_child_roots_v1(roots, brand);
         attached
             .map(|()| stdio)
             .map_err(IsolationChildContinuationFailureV1::filesystem)
@@ -396,6 +488,9 @@ enum IsolationQualificationStageV1 {
     )]
     Platform,
     DedicatedHelper,
+    HostOverflowIdPreflight,
+    HostSwapPreflight,
+    HostSwapRevalidation,
     HostCredentials,
     SupplementaryGroups,
     ParentNamespaces,
@@ -442,6 +537,9 @@ impl IsolationQualificationStageV1 {
         match self {
             Self::Platform => "platform",
             Self::DedicatedHelper => "dedicated_helper",
+            Self::HostOverflowIdPreflight => "host_overflow_id_preflight",
+            Self::HostSwapPreflight => "host_swap_preflight",
+            Self::HostSwapRevalidation => "host_swap_revalidation",
             Self::HostCredentials => "host_credentials",
             Self::SupplementaryGroups => "supplementary_groups",
             Self::ParentNamespaces => "parent_namespaces",
@@ -506,6 +604,10 @@ enum IsolationQualificationReasonV1 {
     MultipleTasks,
     SignalDisposition,
     HostCredentialMismatch,
+    HostOverflowIdentity,
+    FixedRuntimeOpenTreeRefusal,
+    HostSupplementaryGroups,
+    HostSwapEnabled,
     BoundExceeded,
     UnstableObservation,
     KernelCapabilityUnavailable,
@@ -538,6 +640,10 @@ impl IsolationQualificationReasonV1 {
             Self::MultipleTasks => "multiple_tasks",
             Self::SignalDisposition => "signal_disposition",
             Self::HostCredentialMismatch => "host_credential_mismatch",
+            Self::HostOverflowIdentity => "host_overflow_identity",
+            Self::FixedRuntimeOpenTreeRefusal => "fixed_runtime_open_tree_refusal",
+            Self::HostSupplementaryGroups => "host_supplementary_groups",
+            Self::HostSwapEnabled => "host_swap_enabled",
             Self::BoundExceeded => "bound_exceeded",
             Self::UnstableObservation => "unstable_observation",
             Self::KernelCapabilityUnavailable => "kernel_capability_unavailable",
@@ -704,6 +810,19 @@ impl IsolationQualificationFailureV1 {
                     | IsolationQualificationStageV1::OpenChildProc,
                 IsolationQualificationReasonV1::AdministrativePolicy
                     | IsolationQualificationReasonV1::KernelCapabilityUnavailable,
+            ) | (
+                IsolationQualificationStageV1::DedicatedHelper,
+                IsolationQualificationReasonV1::HostSupplementaryGroups,
+            ) | (
+                IsolationQualificationStageV1::HostOverflowIdPreflight,
+                IsolationQualificationReasonV1::HostOverflowIdentity,
+            ) | (
+                IsolationQualificationStageV1::DedicatedHelper,
+                IsolationQualificationReasonV1::HostSwapEnabled,
+            ) | (
+                IsolationQualificationStageV1::HostSwapPreflight
+                    | IsolationQualificationStageV1::HostSwapRevalidation,
+                IsolationQualificationReasonV1::HostSwapEnabled,
             )
         )
     }
@@ -1076,6 +1195,73 @@ mod contract_tests {
         assert!(!cleanup.cleanup_complete());
         assert!(!cleanup.is_expected_unavailable());
     }
+
+    #[test]
+    fn nonempty_host_groups_are_a_preclone_typed_unavailable_refusal() {
+        let refusal = IsolationQualificationFailureV1::new(
+            RefusalCode::IsolationPreflightFailed,
+            IsolationQualificationStageV1::DedicatedHelper,
+            IsolationQualificationReasonV1::HostSupplementaryGroups,
+            None,
+        );
+        assert_eq!(refusal.stage(), "dedicated_helper");
+        assert_eq!(refusal.reason(), "host_supplementary_groups");
+        assert!(refusal.cleanup_complete());
+        assert!(refusal.is_expected_unavailable());
+    }
+
+    #[test]
+    fn environmental_nonpass_matrix_does_not_hide_broken_failures() {
+        let swap_enabled = IsolationQualificationFailureV1::new(
+            RefusalCode::IsolationPreflightFailed,
+            IsolationQualificationStageV1::HostSwapPreflight,
+            IsolationQualificationReasonV1::HostSwapEnabled,
+            None,
+        );
+        assert!(swap_enabled.is_expected_unavailable());
+
+        for broken in [
+            IsolationQualificationFailureV1::new(
+                RefusalCode::IsolationPreflightFailed,
+                IsolationQualificationStageV1::HostSwapPreflight,
+                IsolationQualificationReasonV1::MalformedKernelResponse,
+                None,
+            ),
+            IsolationQualificationFailureV1::new(
+                RefusalCode::IsolationPreflightFailed,
+                IsolationQualificationStageV1::HostSwapPreflight,
+                IsolationQualificationReasonV1::UnstableObservation,
+                None,
+            ),
+            IsolationQualificationFailureV1::new(
+                RefusalCode::MountRootFailed,
+                IsolationQualificationStageV1::ChildMountRoot,
+                IsolationQualificationReasonV1::ChildInvariantFailed,
+                None,
+            ),
+            IsolationQualificationFailureV1::new(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::VerifyChildProof,
+                IsolationQualificationReasonV1::MalformedKernelResponse,
+                None,
+            ),
+        ] {
+            assert!(!broken.is_expected_unavailable());
+        }
+
+        let uts_policy = IsolationQualificationFailureV1::new(
+            RefusalCode::RequiredNamespaceFailed,
+            IsolationQualificationStageV1::ChildUtsConfiguration,
+            IsolationQualificationReasonV1::AdministrativePolicy,
+            Some(libc::EPERM),
+        );
+        assert!(uts_policy.is_expected_unavailable());
+        assert!(
+            !uts_policy
+                .with_cleanup_uncertain(Some(libc::ETIMEDOUT))
+                .is_expected_unavailable()
+        );
+    }
 }
 
 #[cfg(all(
@@ -1094,6 +1280,8 @@ mod platform {
 
     const MAX_SUPPLEMENTARY_GROUPS_V1: usize = 256;
     const MAX_PROC_MAP_BYTES_V1: usize = 4 * 1024;
+    const MAX_PROC_SWAPS_BYTES_V1: usize = 64 * 1024;
+    const MAX_PROC_SYSCTL_BYTES_V1: usize = 32;
     const MAX_PROC_STATUS_BYTES_V1: usize = 64 * 1024;
     const PROBE_PROTOCOL_SECONDS_V1: i64 = 8;
     const PROBE_HARD_SECONDS_V1: i64 = 10;
@@ -1131,6 +1319,7 @@ mod platform {
     const PROOF_FLAGS_V1: u16 = 0x01ff;
     const ISOLATION_READY_FLAGS_V1: u16 = 0x020f;
     const FILESYSTEM_READY_FLAGS_V1: u16 = 0x0003;
+    const FIXED_RUNTIME_OPEN_TREE_REFUSAL_FLAG_V1: u16 = 0x8000;
     const CHILD_EXIT_PROOF_FAILED_V1: i32 = 125;
     const FRAME_MAGIC_OFFSET_V1: usize = 0;
     const FRAME_VERSION_OFFSET_V1: usize = 8;
@@ -1148,6 +1337,7 @@ mod platform {
     const FRAME_RESERVED_OFFSET_V1: usize = 56;
     const NSFS_MAGIC_V1: libc::c_long = 0x6e73_6673;
     const PROC_SUPER_MAGIC_V1: libc::c_long = 0x0000_9fa0;
+    const PROC_ROOT_OVERFLOW_ID_V1: u32 = 65_534;
     const RESOLVE_NO_XDEV_V1: u64 = 0x01;
     const RESOLVE_NO_MAGICLINKS_V1: u64 = 0x02;
     const RESOLVE_NO_SYMLINKS_V1: u64 = 0x04;
@@ -1162,7 +1352,7 @@ mod platform {
     const ROOT_TMPFS_BYTES_V1: u64 = 16 * 1024 * 1024;
     const ROOT_TMPFS_INODES_V1: u64 = 4_096;
     const ROOT_TMPFS_TYPE_V1: &CStr = c"tmpfs";
-    const ROOT_TMPFS_OPTIONS_V1: &CStr = c"size=16777216,nr_inodes=4096,mode=0755,noswap";
+    const ROOT_TMPFS_OPTIONS_V1: &CStr = c"size=16777216,nr_inodes=4096,mode=0755";
     const ROOT_PATH_V1: &CStr = c"/";
     const CURRENT_DIRECTORY_V1: &CStr = c".";
     const OLD_ROOT_NAME_V1: &CStr = c".oldroot";
@@ -1179,16 +1369,17 @@ mod platform {
     const MEMINFO_NAME_V1: &CStr = c"meminfo";
     const ABSENT_ROOT_NAMES_V1: [&CStr; 4] =
         [OLD_ROOT_NAME_V1, PROC_NAME_V1, DEV_NAME_V1, SYS_NAME_V1];
+    const POST_PIVOT_ABSENT_ROOT_NAMES_V1: [&CStr; 2] = [DEV_NAME_V1, SYS_NAME_V1];
     const TMP_PATH_V1: &CStr = c"/tmp";
     const RUN_PATH_V1: &CStr = c"/run";
     const AGAIN_HOME_PATH_V1: &CStr = c"/home/again";
-    const PROC_PATH_V1: &CStr = c"/proc";
+    const PRE_PIVOT_PROC_PATH_V1: &CStr = c"/tmp/proc";
     const PROC_FD_AUDIT_PATH_V1: &CStr = c"proc/1/fd";
     const SCRATCH_TMPFS_BYTES_V1: u64 = 4 * 1024 * 1024;
     const SCRATCH_TMPFS_INODES_V1: u64 = 1_024;
-    const TMP_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=1777,noswap";
-    const RUN_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=0755,noswap";
-    const AGAIN_HOME_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=0700,noswap";
+    const TMP_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=1777";
+    const RUN_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=0755";
+    const AGAIN_HOME_TMPFS_OPTIONS_V1: &CStr = c"size=4194304,nr_inodes=1024,mode=0700";
     const PROCFS_OPTIONS_V1: &CStr = c"subset=pid";
     const ACTIVE_PID_NAMESPACE_PATH_V1: &CStr = c"/proc/self/ns/pid";
     const PROC_PID_ONE_NAME_V1: &CStr = c"1";
@@ -1462,6 +1653,7 @@ mod platform {
         root: ChildPathIdentityV1,
         tmp: ChildPathIdentityV1,
         run: ChildPathIdentityV1,
+        again_home: ChildPathIdentityV1,
         proc: ChildPathIdentityV1,
     }
 
@@ -2239,6 +2431,7 @@ mod platform {
 
     pub(super) struct BlockedRootlessNamespaceBootstrapV1 {
         guard: ProbeChildGuardV1,
+        host_proc_root: OwnedFd,
         deadline: MonotonicDeadlineV1,
         nonce: [u8; NONCE_BYTES_V1],
         expects_filesystem_ready: bool,
@@ -2271,6 +2464,7 @@ mod platform {
         let proc_root = pin_proc_root()?;
         let host_pid = unsafe { libc::getpid() };
         verify_proc_self_target(proc_root.as_raw_fd(), host_pid)?;
+        verify_host_overflow_ids_v1(proc_root.as_raw_fd())?;
         let self_proc = open_pid_directory_at(
             proc_root.as_raw_fd(),
             host_pid,
@@ -2281,10 +2475,19 @@ mod platform {
         verify_signal_dispositions()?;
         let (deadline, cleanup_deadline) = probe_deadlines()?;
         let credentials = host_credentials(self_proc.as_raw_fd())?;
-        // Bound the inherited set before cloning. The child must clear and
-        // authenticate it before the parent irreversibly writes
-        // `setgroups=deny` and the gid map.
+        // Bound the inherited set before cloning. An unprivileged child cannot
+        // repair a nonempty inherited set after entering a fresh user
+        // namespace: the parent must write `setgroups=deny` before the GID
+        // map, after which every child `setgroups(2)` call is forbidden.
         let host_supplementary_groups = capture_supplementary_groups()?;
+        if C::REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1 && !host_supplementary_groups.is_empty() {
+            return Err(failure(
+                RefusalCode::IsolationPreflightFailed,
+                IsolationQualificationStageV1::DedicatedHelper,
+                IsolationQualificationReasonV1::HostSupplementaryGroups,
+                None,
+            ));
+        }
         let parent_namespaces = NamespaceFdSetV1::open_at(
             self_proc.as_raw_fd(),
             IsolationQualificationStageV1::ParentNamespaces,
@@ -2297,6 +2500,15 @@ mod platform {
         let nonce = protocol_nonce(deadline)?;
         let channels = create_channels()?;
         deadline.ensure_open(IsolationQualificationStageV1::CloneNamespaces)?;
+        // Linux rejects tmpfs `noswap` for every noninitial user namespace.
+        // This rootless bootstrap instead requires the trusted host
+        // administrator to keep swap disabled for the child's lifetime. Take
+        // the final stable observation immediately before clone and retain the
+        // pinned procfs root for a post-ready revalidation.
+        verify_host_swap_disabled_v1(
+            proc_root.as_raw_fd(),
+            IsolationQualificationStageV1::HostSwapPreflight,
+        )?;
 
         let mut continuation = Some(continuation);
         let mut pidfd_raw = -1_i32;
@@ -2490,6 +2702,7 @@ mod platform {
 
         Ok(BlockedRootlessNamespaceBootstrapV1 {
             guard,
+            host_proc_root: proc_root,
             deadline,
             nonce,
             expects_filesystem_ready: C::PROVIDES_FILESYSTEM_READY_V1,
@@ -2586,6 +2799,10 @@ mod platform {
                 deadline,
                 IsolationQualificationStageV1::VerifyIsolationReady,
             ));
+            guarded!(verify_host_swap_disabled_v1(
+                self.host_proc_root.as_raw_fd(),
+                IsolationQualificationStageV1::HostSwapRevalidation,
+            ));
             self.guard.refresh_deadline_on_cleanup = true;
             Ok(IsolationReadyRootlessNamespaceV1 {
                 _guard: self.guard,
@@ -2647,6 +2864,10 @@ mod platform {
             guarded!(expect_report_eof(report_fd, child_pidfd, deadline,));
             self.guard.report_read.take();
             guarded!(verify_proof_frame(&proof, &nonce));
+            guarded!(verify_host_swap_disabled_v1(
+                self.host_proc_root.as_raw_fd(),
+                IsolationQualificationStageV1::HostSwapRevalidation,
+            ));
             if let Err(error) = self.guard.reap_success(deadline) {
                 return Err(self.guard.refuse(error));
             }
@@ -4008,6 +4229,164 @@ mod platform {
         read_bounded_fd(fd.as_raw_fd(), maximum)
     }
 
+    fn verify_host_swap_disabled_v1(
+        proc_root: RawFd,
+        stage: IsolationQualificationStageV1,
+    ) -> Result<(), IsolationQualificationFailureV1> {
+        fn observe(
+            proc_root: RawFd,
+            stage: IsolationQualificationStageV1,
+        ) -> Result<Vec<u8>, IsolationQualificationFailureV1> {
+            read_bounded_file_at(proc_root, c"swaps", MAX_PROC_SWAPS_BYTES_V1).map_err(|error| {
+                failure(
+                    RefusalCode::IsolationPreflightFailed,
+                    stage,
+                    if matches!(error.raw_os_error(), Some(libc::E2BIG)) {
+                        IsolationQualificationReasonV1::BoundExceeded
+                    } else {
+                        IsolationQualificationReasonV1::Io
+                    },
+                    error.raw_os_error(),
+                )
+            })
+        }
+
+        let first = observe(proc_root, stage)?;
+        let second = observe(proc_root, stage)?;
+        if first != second {
+            return Err(failure(
+                RefusalCode::IsolationPreflightFailed,
+                stage,
+                IsolationQualificationReasonV1::UnstableObservation,
+                None,
+            ));
+        }
+        let disabled = parse_host_swap_disabled_v1(&first).ok_or_else(|| {
+            failure(
+                RefusalCode::IsolationPreflightFailed,
+                stage,
+                IsolationQualificationReasonV1::MalformedKernelResponse,
+                None,
+            )
+        })?;
+        if !disabled {
+            return Err(failure(
+                RefusalCode::IsolationPreflightFailed,
+                stage,
+                IsolationQualificationReasonV1::HostSwapEnabled,
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_host_overflow_ids_v1(
+        proc_root: RawFd,
+    ) -> Result<(), IsolationQualificationFailureV1> {
+        let stage = IsolationQualificationStageV1::HostOverflowIdPreflight;
+        for name in [c"sys/kernel/overflowuid", c"sys/kernel/overflowgid"] {
+            let observe = || {
+                read_bounded_file_at(proc_root, name, MAX_PROC_SYSCTL_BYTES_V1).map_err(|error| {
+                    failure(
+                        RefusalCode::IsolationPreflightFailed,
+                        stage,
+                        if matches!(error.raw_os_error(), Some(libc::E2BIG)) {
+                            IsolationQualificationReasonV1::BoundExceeded
+                        } else {
+                            IsolationQualificationReasonV1::Io
+                        },
+                        error.raw_os_error(),
+                    )
+                })
+            };
+            let first = observe()?;
+            let second = observe()?;
+            if first != second {
+                return Err(failure(
+                    RefusalCode::IsolationPreflightFailed,
+                    stage,
+                    IsolationQualificationReasonV1::UnstableObservation,
+                    None,
+                ));
+            }
+            if first != b"65534\n" {
+                return Err(failure(
+                    RefusalCode::IsolationPreflightFailed,
+                    stage,
+                    if parse_host_overflow_id_v1(&first).is_some() {
+                        IsolationQualificationReasonV1::HostOverflowIdentity
+                    } else {
+                        IsolationQualificationReasonV1::MalformedKernelResponse
+                    },
+                    None,
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_host_overflow_id_v1(bytes: &[u8]) -> Option<u32> {
+        let digits = bytes.strip_suffix(b"\n")?;
+        if digits.is_empty()
+            || digits.len() > 10
+            || (digits.len() > 1 && digits[0] == b'0')
+            || !digits.iter().all(u8::is_ascii_digit)
+        {
+            return None;
+        }
+        let mut value = 0_u32;
+        for digit in digits {
+            value = value
+                .checked_mul(10)?
+                .checked_add(u32::from(*digit - b'0'))?;
+        }
+        Some(value)
+    }
+
+    fn parse_host_swap_disabled_v1(bytes: &[u8]) -> Option<bool> {
+        if !bytes.ends_with(b"\n") || bytes.contains(&b'\r') || bytes.contains(&0) {
+            return None;
+        }
+        let newline = bytes.iter().position(|byte| *byte == b'\n')?;
+        let header = &bytes[..newline];
+        let mut columns = header
+            .split(|byte| matches!(byte, b' ' | b'\t'))
+            .filter(|column| !column.is_empty());
+        for expected in [
+            b"Filename".as_slice(),
+            b"Type",
+            b"Size",
+            b"Used",
+            b"Priority",
+        ] {
+            if columns.next() != Some(expected) {
+                return None;
+            }
+        }
+        if columns.next().is_some() {
+            return None;
+        }
+        if header
+            .iter()
+            .any(|byte| !byte.is_ascii_graphic() && !matches!(byte, b' ' | b'\t'))
+        {
+            return None;
+        }
+        let records = &bytes[newline + 1..];
+        if records.is_empty() {
+            return Some(true);
+        }
+        let records = records.strip_suffix(b"\n")?;
+        if records.is_empty()
+            || records
+                .split(|byte| *byte == b'\n')
+                .any(|record| record.is_empty())
+        {
+            return None;
+        }
+        Some(false)
+    }
+
     fn read_bounded_fd(fd: RawFd, maximum: usize) -> io::Result<Vec<u8>> {
         let capacity = maximum
             .checked_add(1)
@@ -4189,6 +4568,9 @@ mod platform {
             status,
             PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1 | PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1
         ) {
+            let fixed_runtime_open_tree_refusal = status == PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1
+                && flags == FIXED_RUNTIME_OPEN_TREE_REFUSAL_FLAG_V1
+                && errno == libc::EIO;
             let canonical_errno = if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
                 matches!(
                     errno,
@@ -4197,7 +4579,10 @@ mod platform {
             } else {
                 (0..=MAX_LINUX_ERRNO_V1).contains(&errno)
             };
-            if flags != 0 || !canonical_errno || !identity_is_exact {
+            if (!fixed_runtime_open_tree_refusal && flags != 0)
+                || !canonical_errno
+                || !identity_is_exact
+            {
                 return Err(protocol_failure(
                     stage,
                     IsolationQualificationReasonV1::ProtocolFrameMismatch,
@@ -4211,7 +4596,9 @@ mod platform {
                     RefusalCode::MountRootFailed
                 },
                 IsolationQualificationStageV1::ChildFilesystemAttachment,
-                if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
+                if fixed_runtime_open_tree_refusal {
+                    IsolationQualificationReasonV1::FixedRuntimeOpenTreeRefusal
+                } else if status == PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1 {
                     if matches!(errno, libc::EPERM | libc::EACCES) {
                         IsolationQualificationReasonV1::AdministrativePolicy
                     } else {
@@ -4881,9 +5268,10 @@ mod platform {
             );
         }
 
-        // This must happen before the parent writes `setgroups=deny`. GID
-        // normalization does not clear supplementary groups, and after the
-        // deny handshake the child can no longer repair an inherited set.
+        // The dedicated parent proved this inherited set empty before clone.
+        // Authenticate it again in the child before the parent irreversibly
+        // writes `setgroups=deny`; do not issue the impossible post-userns
+        // `setgroups(2)` call when no repair is required.
         if C::REQUIRES_EMPTY_SUPPLEMENTARY_GROUPS_V1 {
             if let Err(error) = child_clear_and_verify_supplementary_groups_v1(operations) {
                 child_credential_fail_v1(report_write, &nonce, error, deadline);
@@ -5041,25 +5429,26 @@ mod platform {
             child_fail(report_write, &nonce, PROOF_STATUS_INVARIANT_V1, 0, deadline);
         }
 
-        let private_root = match child_enter_private_tmpfs_root_v1(operations) {
-            Ok(evidence) => evidence,
-            Err(error) => match error {
-                ChildMountRootFailureV1::Os(errno) => child_fail(
-                    report_write,
-                    &nonce,
-                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
-                    errno,
-                    deadline,
-                ),
-                ChildMountRootFailureV1::Invariant => child_fail(
-                    report_write,
-                    &nonce,
-                    PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
-                    0,
-                    deadline,
-                ),
-            },
-        };
+        let private_root =
+            match child_enter_private_tmpfs_root_v1(operations, C::PROVIDES_FILESYSTEM_READY_V1) {
+                Ok(evidence) => evidence,
+                Err(error) => match error {
+                    ChildMountRootFailureV1::Os(errno) => child_fail(
+                        report_write,
+                        &nonce,
+                        PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                        errno,
+                        deadline,
+                    ),
+                    ChildMountRootFailureV1::Invariant => child_fail(
+                        report_write,
+                        &nonce,
+                        PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
+                        0,
+                        deadline,
+                    ),
+                },
+            };
 
         if isolation_continuation {
             child_enter_isolation_ready_hold_v1(
@@ -5068,6 +5457,7 @@ mod platform {
                 &nonce,
                 deadline,
                 continuation,
+                private_root,
                 operations,
             );
         }
@@ -5153,6 +5543,7 @@ mod platform {
         nonce: &[u8; NONCE_BYTES_V1],
         deadline: MonotonicDeadlineV1,
         continuation: C,
+        private_root: ChildPrivateRootEvidenceV1,
         operations: IsolationOperationPlanV1,
     ) -> ! {
         if control_read <= ISOLATION_CONTROL_DESCRIPTOR_V1
@@ -5250,9 +5641,34 @@ mod platform {
                 deadline,
             );
         }
-        let post_capability = match continuation
-            .continue_before_capability_elimination_v1(IsolationChildOnlyBrandV1 { _private: () })
-        {
+        let rebind_old_root = if C::PROVIDES_FILESYSTEM_READY_V1 {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_openat,
+                    libc::AT_FDCWD,
+                    OLD_ROOT_PATH_V1.as_ptr(),
+                    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0_u32,
+                )
+            };
+            match i32::try_from(result) {
+                Ok(descriptor) if descriptor >= 0 => descriptor,
+                _ => child_fail(
+                    ISOLATION_REPORT_DESCRIPTOR_V1,
+                    nonce,
+                    PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                    child_errno(),
+                    deadline,
+                ),
+            }
+        } else {
+            -1
+        };
+        let post_capability = match continuation.continue_before_capability_elimination_v1(
+            IsolationChildOnlyBrandV1 {
+                old_root_descriptor: rebind_old_root,
+            },
+        ) {
             Ok(remainder) => remainder,
             Err(error) if error.filesystem => {
                 child_filesystem_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline)
@@ -5267,7 +5683,34 @@ mod platform {
                 deadline,
             ),
         };
+        if rebind_old_root >= 0 && !child_close(rebind_old_root) {
+            child_fail(
+                ISOLATION_REPORT_DESCRIPTOR_V1,
+                nonce,
+                PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                child_errno(),
+                deadline,
+            );
+        }
         if C::PROVIDES_FILESYSTEM_READY_V1 {
+            if let Err(error) = child_detach_old_root_and_revalidate_v1(&private_root, operations) {
+                match error {
+                    ChildMountRootFailureV1::Os(errno) => child_fail(
+                        ISOLATION_REPORT_DESCRIPTOR_V1,
+                        nonce,
+                        PROOF_STATUS_MOUNT_ROOT_OS_V1,
+                        errno,
+                        deadline,
+                    ),
+                    ChildMountRootFailureV1::Invariant => child_fail(
+                        ISOLATION_REPORT_DESCRIPTOR_V1,
+                        nonce,
+                        PROOF_STATUS_MOUNT_ROOT_INVARIANT_V1,
+                        0,
+                        deadline,
+                    ),
+                }
+            }
             let filesystem_ready = child_encode_checkpoint_frame_v1(
                 FILESYSTEM_READY_MAGIC_V1,
                 PHASE_FILESYSTEM_READY_V1,
@@ -5285,9 +5728,11 @@ mod platform {
         ) {
             child_capability_fail_v1(ISOLATION_REPORT_DESCRIPTOR_V1, nonce, error, deadline);
         }
-        let stdio_state = match post_capability
-            .continue_after_capability_elimination_v1(IsolationChildOnlyBrandV1 { _private: () })
-        {
+        let stdio_state = match post_capability.continue_after_capability_elimination_v1(
+            IsolationChildOnlyBrandV1 {
+                old_root_descriptor: -1,
+            },
+        ) {
             Ok(state) => state,
             Err(error) => child_descriptor_fail_v1(
                 ISOLATION_REPORT_DESCRIPTOR_V1,
@@ -5394,6 +5839,7 @@ mod platform {
     /// this result can never authorize execution.
     fn child_enter_private_tmpfs_root_v1(
         operations: IsolationOperationPlanV1,
+        defer_old_root_detach: bool,
     ) -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
         let active_pid_namespace = child_pin_active_pid_namespace_v1()?;
         let old_root = child_open_absolute_root_v1()?;
@@ -5439,6 +5885,23 @@ mod platform {
         if mounted_identity.mount_id == old_target_identity.mount_id {
             return Err(ChildMountRootFailureV1::Invariant);
         }
+        for name in ABSENT_ROOT_NAMES_V1 {
+            child_require_absent_at_v1(new_root, name)?;
+        }
+        let _ = unsafe { libc::syscall(libc::SYS_umask, 0_u32) };
+        let proc_target = child_create_directory_at_v1(new_root, PROC_NAME_V1, PROC_MODE_V1)?;
+        // A noninitial-user-namespace process may mount restricted procfs only
+        // while an existing procfs view remains fully visible. Mount into the
+        // new root before pivot, then authenticate the same mount again after
+        // the old root has been detached.
+        let proc_identity = child_mount_procfs_v1(
+            new_root,
+            proc_target,
+            &mounted_identity,
+            &active_pid_namespace,
+            PRE_PIVOT_PROC_PATH_V1,
+            operations,
+        )?;
 
         if unsafe { libc::syscall(libc::SYS_fchdir, new_root) } != 0 {
             return Err(child_mount_os_failure_v1());
@@ -5465,9 +5928,6 @@ mod platform {
         {
             return Err(child_mount_os_failure_v1());
         }
-        operations
-            .check(IsolationOperationV1::DetachOldRoot)
-            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_pivot_root,
@@ -5481,6 +5941,44 @@ mod platform {
         if unsafe { libc::syscall(libc::SYS_chdir, ROOT_PATH_V1.as_ptr()) } != 0 {
             return Err(child_mount_os_failure_v1());
         }
+        if !defer_old_root_detach {
+            child_detach_old_root_v1(new_root, operations)?;
+        }
+
+        let pivoted_root = child_open_absolute_root_v1()?;
+        let pivoted_identity = child_path_identity_v1(pivoted_root)?;
+        if pivoted_identity != mounted_identity
+            || !child_root_matches_policy_v1(pivoted_root, &pivoted_identity)?
+        {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        for name in POST_PIVOT_ABSENT_ROOT_NAMES_V1 {
+            child_require_absent_at_v1(pivoted_root, name)?;
+        }
+        let evidence = child_build_fixed_mount_layout_v1(
+            pivoted_root,
+            &pivoted_identity,
+            &active_pid_namespace,
+            &proc_identity,
+            !defer_old_root_detach,
+            operations,
+        )?;
+        let retained_root_closed = child_close_mount_fd_v1(new_root);
+        let pivoted_root_closed = child_close_mount_fd_v1(pivoted_root);
+        let active_pid_namespace_closed = child_close_mount_fd_v1(active_pid_namespace.descriptor);
+        retained_root_closed?;
+        pivoted_root_closed?;
+        active_pid_namespace_closed?;
+        Ok(evidence)
+    }
+
+    fn child_detach_old_root_v1(
+        root: RawFd,
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildMountRootFailureV1> {
+        operations
+            .check(IsolationOperationV1::DetachOldRoot)
+            .map_err(ChildMountRootFailureV1::Os)?;
         if unsafe {
             libc::syscall(
                 libc::SYS_umount2,
@@ -5494,7 +5992,7 @@ mod platform {
         if unsafe {
             libc::syscall(
                 libc::SYS_unlinkat,
-                new_root,
+                root,
                 OLD_ROOT_NAME_V1.as_ptr(),
                 libc::AT_REMOVEDIR,
             )
@@ -5502,30 +6000,25 @@ mod platform {
         {
             return Err(child_mount_os_failure_v1());
         }
+        Ok(())
+    }
 
-        let pivoted_root = child_open_absolute_root_v1()?;
-        let pivoted_identity = child_path_identity_v1(pivoted_root)?;
-        if pivoted_identity != mounted_identity
-            || !child_root_matches_policy_v1(pivoted_root, &pivoted_identity)?
-        {
-            return Err(ChildMountRootFailureV1::Invariant);
-        }
-        for name in ABSENT_ROOT_NAMES_V1 {
-            child_require_absent_at_v1(pivoted_root, name)?;
-        }
-        let evidence = child_build_fixed_mount_layout_v1(
-            pivoted_root,
-            &pivoted_identity,
-            &active_pid_namespace,
-            operations,
-        )?;
-        let retained_root_closed = child_close_mount_fd_v1(new_root);
-        let pivoted_root_closed = child_close_mount_fd_v1(pivoted_root);
-        let active_pid_namespace_closed = child_close_mount_fd_v1(active_pid_namespace.descriptor);
-        retained_root_closed?;
-        pivoted_root_closed?;
-        active_pid_namespace_closed?;
-        Ok(evidence)
+    fn child_detach_old_root_and_revalidate_v1(
+        evidence: &ChildPrivateRootEvidenceV1,
+        operations: IsolationOperationPlanV1,
+    ) -> Result<(), ChildMountRootFailureV1> {
+        let root = child_open_absolute_root_v1()?;
+        child_detach_old_root_v1(root, operations)?;
+        child_close_mount_fd_v1(root)?;
+        child_verify_final_mount_layout_v1(
+            &evidence.root,
+            &evidence.tmp,
+            &evidence.run,
+            &evidence.again_home,
+            &evidence.proc,
+            true,
+            true,
+        )
     }
 
     fn child_open_absolute_root_v1() -> Result<RawFd, ChildMountRootFailureV1> {
@@ -5641,10 +6134,10 @@ mod platform {
         root: RawFd,
         root_identity: &ChildPathIdentityV1,
         active_pid_namespace: &ChildPinnedPidNamespaceV1,
+        expected_proc_identity: &ChildPathIdentityV1,
+        require_old_root_absent: bool,
         operations: IsolationOperationPlanV1,
     ) -> Result<ChildPrivateRootEvidenceV1, ChildMountRootFailureV1> {
-        let _ = unsafe { libc::syscall(libc::SYS_umask, 0_u32) };
-
         let workspace = child_create_directory_at_v1(root, WORKSPACE_NAME_V1, WORKSPACE_MODE_V1)?;
         let runtime = child_create_directory_at_v1(root, RUNTIME_NAME_V1, RUNTIME_MODE_V1)?;
         let tmp_target = child_create_directory_at_v1(root, TMP_NAME_V1, TMP_MODE_V1)?;
@@ -5652,7 +6145,6 @@ mod platform {
         let home = child_create_directory_at_v1(root, HOME_NAME_V1, HOME_MODE_V1)?;
         let again_home_target =
             child_create_directory_at_v1(home, AGAIN_NAME_V1, AGAIN_HOME_MODE_V1)?;
-        let proc_target = child_create_directory_at_v1(root, PROC_NAME_V1, PROC_MODE_V1)?;
         let dev = child_create_directory_at_v1(root, DEV_NAME_V1, DEV_MODE_V1)?;
 
         let workspace_closed = child_close_mount_fd_v1(workspace);
@@ -5719,24 +6211,22 @@ mod platform {
             return Err(ChildMountRootFailureV1::Invariant);
         }
 
-        let proc_identity = child_mount_procfs_v1(
-            root,
-            proc_target,
-            root_identity,
-            active_pid_namespace,
-            operations,
-        )?;
+        let proc_identity =
+            child_revalidate_procfs_v1(root, expected_proc_identity, active_pid_namespace)?;
         child_verify_final_mount_layout_v1(
             root_identity,
             &tmp_identity,
             &run_identity,
             &again_home_identity,
             &proc_identity,
+            require_old_root_absent,
+            false,
         )?;
         Ok(ChildPrivateRootEvidenceV1 {
             root: *root_identity,
             tmp: tmp_identity,
             run: run_identity,
+            again_home: again_home_identity,
             proc: proc_identity,
         })
     }
@@ -5906,6 +6396,7 @@ mod platform {
         pre_target: RawFd,
         root_identity: &ChildPathIdentityV1,
         active_pid_namespace: &ChildPinnedPidNamespaceV1,
+        absolute_path: &CStr,
         operations: IsolationOperationPlanV1,
     ) -> Result<ChildPathIdentityV1, ChildMountRootFailureV1> {
         let pre_identity = child_path_identity_v1(pre_target)?;
@@ -5919,7 +6410,7 @@ mod platform {
             libc::syscall(
                 libc::SYS_mount,
                 PROC_NAME_V1.as_ptr(),
-                PROC_PATH_V1.as_ptr(),
+                absolute_path.as_ptr(),
                 PROC_NAME_V1.as_ptr(),
                 PROC_MOUNT_FLAGS_V1,
                 PROCFS_OPTIONS_V1.as_ptr(),
@@ -5953,14 +6444,46 @@ mod platform {
         Ok(identity)
     }
 
+    fn child_revalidate_procfs_v1(
+        root: RawFd,
+        expected_identity: &ChildPathIdentityV1,
+        active_pid_namespace: &ChildPinnedPidNamespaceV1,
+    ) -> Result<ChildPathIdentityV1, ChildMountRootFailureV1> {
+        let proc_directory = child_open_mounted_directory_at_v1(root, PROC_NAME_V1)?;
+        let identity = child_path_identity_v1(proc_directory)?;
+        if &identity != expected_identity
+            || !child_procfs_matches_policy_v1(proc_directory, &identity)?
+            || !child_proc_self_is_pid_one_v1(proc_directory)?
+        {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        for absent in PROC_SUBSET_ABSENT_NAMES_V1 {
+            child_require_absent_at_v1(proc_directory, absent)?;
+        }
+        let mounted_pid_namespace = child_pin_proc_pid_namespace_v1(proc_directory)?;
+        if mounted_pid_namespace.identity != active_pid_namespace.identity {
+            return Err(ChildMountRootFailureV1::Invariant);
+        }
+        let proc_directory_closed = child_close_mount_fd_v1(proc_directory);
+        let mounted_pid_namespace_closed =
+            child_close_mount_fd_v1(mounted_pid_namespace.descriptor);
+        proc_directory_closed?;
+        mounted_pid_namespace_closed?;
+        Ok(identity)
+    }
+
     fn child_procfs_matches_policy_v1(
         descriptor: RawFd,
         identity: &ChildPathIdentityV1,
     ) -> Result<bool, ChildMountRootFailureV1> {
         if u32::from(identity.mode) & libc::S_IFMT != libc::S_IFDIR
             || u32::from(identity.mode) & 0o7777 != PROC_MODE_V1
-            || identity.uid != 0
-            || identity.gid != 0
+            // procfs root inodes carry init-user-namespace uid/gid 0. Those
+            // IDs are deliberately unmapped in this one-ID user namespace and
+            // therefore must appear as the provisioned host's fixed overflow
+            // identity, never as namespace root.
+            || identity.uid != PROC_ROOT_OVERFLOW_ID_V1
+            || identity.gid != PROC_ROOT_OVERFLOW_ID_V1
         {
             return Ok(false);
         }
@@ -6086,6 +6609,8 @@ mod platform {
         run_identity: &ChildPathIdentityV1,
         again_home_identity: &ChildPathIdentityV1,
         proc_identity: &ChildPathIdentityV1,
+        require_old_root_absent: bool,
+        workspace_runtime_attached: bool,
     ) -> Result<(), ChildMountRootFailureV1> {
         let root = child_open_absolute_root_v1()?;
         let observed_root_identity = child_path_identity_v1(root)?;
@@ -6094,8 +6619,23 @@ mod platform {
         {
             return Err(ChildMountRootFailureV1::Invariant);
         }
-        child_verify_base_directory_v1(root, WORKSPACE_NAME_V1, WORKSPACE_MODE_V1, root_identity)?;
-        child_verify_base_directory_v1(root, RUNTIME_NAME_V1, RUNTIME_MODE_V1, root_identity)?;
+        if !workspace_runtime_attached {
+            child_verify_base_directory_v1(
+                root,
+                WORKSPACE_NAME_V1,
+                WORKSPACE_MODE_V1,
+                root_identity,
+            )?;
+            child_verify_base_directory_v1(root, RUNTIME_NAME_V1, RUNTIME_MODE_V1, root_identity)?;
+        } else {
+            let workspace =
+                child_verify_attached_root_mount_v1(root, WORKSPACE_NAME_V1, root_identity)?;
+            let runtime =
+                child_verify_attached_root_mount_v1(root, RUNTIME_NAME_V1, root_identity)?;
+            if workspace.mount_id == runtime.mount_id {
+                return Err(ChildMountRootFailureV1::Invariant);
+            }
+        }
         let home = child_open_same_mount_directory_at_v1(root, HOME_NAME_V1)?;
         if !child_directory_matches_root_v1(
             &child_path_identity_v1(home)?,
@@ -6114,13 +6654,37 @@ mod platform {
             again_home_identity,
         )?;
         child_verify_final_procfs_v1(root, proc_identity)?;
-        child_require_absent_at_v1(root, OLD_ROOT_NAME_V1)?;
+        if require_old_root_absent {
+            child_require_absent_at_v1(root, OLD_ROOT_NAME_V1)?;
+        }
         child_require_absent_at_v1(root, SYS_NAME_V1)?;
         let home_closed = child_close_mount_fd_v1(home);
         let root_closed = child_close_mount_fd_v1(root);
         home_closed?;
         root_closed?;
         Ok(())
+    }
+
+    fn child_verify_attached_root_mount_v1(
+        root: RawFd,
+        name: &CStr,
+        root_identity: &ChildPathIdentityV1,
+    ) -> Result<ChildPathIdentityV1, ChildMountRootFailureV1> {
+        let descriptor = child_open_mounted_directory_at_v1(root, name)?;
+        let identity = child_path_identity_v1(descriptor)?;
+        let filesystem = child_filesystem_status_v1(descriptor)?;
+        let required = libc::ST_RDONLY | libc::ST_NOSUID | libc::ST_NODEV;
+        let valid = filesystem.f_flags >= 0
+            && identity.mount_id != root_identity.mount_id
+            && child_device_tuple_v1(&identity) != child_device_tuple_v1(root_identity)
+            && u32::from(identity.mode) & libc::S_IFMT == libc::S_IFDIR
+            && (filesystem.f_flags as u64) & required == required;
+        child_close_mount_fd_v1(descriptor)?;
+        if valid {
+            Ok(identity)
+        } else {
+            Err(ChildMountRootFailureV1::Invariant)
+        }
     }
 
     fn child_verify_base_directory_v1(
@@ -6692,14 +7256,26 @@ mod platform {
         operations
             .check(IsolationOperationV1::ClearSupplementaryGroups)
             .map_err(ChildCapabilityFailureV1::Os)?;
-        let cleared = unsafe {
+        let inherited = unsafe {
             libc::syscall(
-                libc::SYS_setgroups,
+                libc::SYS_getgroups,
                 0_usize,
-                std::ptr::null::<libc::gid_t>(),
+                std::ptr::null_mut::<libc::gid_t>(),
             )
         };
-        child_require_exact_zero_capability_result_v1(cleared)?;
+        if inherited < 0 {
+            return Err(ChildCapabilityFailureV1::Os(child_errno()));
+        }
+        if inherited != 0 {
+            let cleared = unsafe {
+                libc::syscall(
+                    libc::SYS_setgroups,
+                    0_usize,
+                    std::ptr::null::<libc::gid_t>(),
+                )
+            };
+            child_require_exact_zero_capability_result_v1(cleared)?;
+        }
         operations
             .check(IsolationOperationV1::AuthenticateSupplementaryGroups)
             .map_err(ChildCapabilityFailureV1::Os)?;
@@ -8024,10 +8600,16 @@ mod platform {
         } else {
             PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1
         };
-        child_fail(
+        let flags = if failure.fixed_runtime_open_tree_injection {
+            FIXED_RUNTIME_OPEN_TREE_REFUSAL_FLAG_V1
+        } else {
+            0
+        };
+        child_fail_with_flags(
             report_write,
             nonce,
             status,
+            flags,
             failure.errno.unwrap_or(0),
             deadline,
         )
@@ -8110,7 +8692,18 @@ mod platform {
         errno: i32,
         deadline: MonotonicDeadlineV1,
     ) -> ! {
-        let proof = child_encode_proof_frame(nonce, status, 0, errno);
+        child_fail_with_flags(report_write, nonce, status, 0, errno, deadline)
+    }
+
+    fn child_fail_with_flags(
+        report_write: RawFd,
+        nonce: &[u8; NONCE_BYTES_V1],
+        status: u8,
+        flags: u16,
+        errno: i32,
+        deadline: MonotonicDeadlineV1,
+    ) -> ! {
+        let proof = child_encode_proof_frame(nonce, status, flags, errno);
         let _ = child_write_frame(report_write, &proof, deadline);
         let _ = child_close(report_write);
         child_exit(CHILD_EXIT_PROOF_FAILED_V1)
@@ -8904,6 +9497,49 @@ mod platform {
         }
 
         #[test]
+        fn host_swap_observation_requires_exact_header_and_no_entries() {
+            assert_eq!(
+                parse_host_swap_disabled_v1(b"Filename\tType\tSize\tUsed\tPriority\n"),
+                Some(true)
+            );
+            assert_eq!(
+                parse_host_swap_disabled_v1(
+                    b"Filename Type Size Used Priority\n/dev/zram0 partition 1024 0 100\n"
+                ),
+                Some(false)
+            );
+            for malformed in [
+                b"".as_slice(),
+                b"Filename Type Size Used\n".as_slice(),
+                b"Filename Type Size Used Priority Extra\n".as_slice(),
+                b"filename Type Size Used Priority\n".as_slice(),
+                b"Filename Type Size Used Priority".as_slice(),
+                b"Filename Type Size Used Priority\r\n".as_slice(),
+                b"Filename Type Size Used Priority\0\n".as_slice(),
+                b"Filename Type Size Used Priority\n\n".as_slice(),
+                b"Filename Type Size Used Priority\n/dev/zram0 x 1 0 1\n\n".as_slice(),
+            ] {
+                assert_eq!(parse_host_swap_disabled_v1(malformed), None);
+            }
+        }
+
+        #[test]
+        fn host_overflow_identity_requires_canonical_u32_text() {
+            assert_eq!(parse_host_overflow_id_v1(b"65534\n"), Some(65_534));
+            assert_eq!(parse_host_overflow_id_v1(b"4294967295\n"), Some(u32::MAX));
+            for malformed in [
+                b"".as_slice(),
+                b"65534",
+                b"065534\n",
+                b"-1\n",
+                b"4294967296\n",
+                b"65534\r\n",
+            ] {
+                assert_eq!(parse_host_overflow_id_v1(malformed), None);
+            }
+        }
+
+        #[test]
         fn malformed_clone_pid_never_becomes_signal_target() {
             assert_eq!(checked_child_pid(1), Some(1));
             assert_eq!(checked_child_pid(0), None);
@@ -8973,7 +9609,7 @@ mod platform {
         fn fixed_tmpfs_policy_is_bounded_and_exact() {
             assert_eq!(
                 ROOT_TMPFS_OPTIONS_V1.to_bytes_with_nul(),
-                b"size=16777216,nr_inodes=4096,mode=0755,noswap\0"
+                b"size=16777216,nr_inodes=4096,mode=0755\0"
             );
             assert!(child_statfs_matches_policy_v1(&policy_statfs()));
 
@@ -9026,15 +9662,15 @@ mod platform {
             assert_eq!(SCRATCH_TMPFS_INODES_V1, 1_024);
             assert_eq!(
                 TMP_TMPFS_OPTIONS_V1.to_bytes_with_nul(),
-                b"size=4194304,nr_inodes=1024,mode=1777,noswap\0"
+                b"size=4194304,nr_inodes=1024,mode=1777\0"
             );
             assert_eq!(
                 RUN_TMPFS_OPTIONS_V1.to_bytes_with_nul(),
-                b"size=4194304,nr_inodes=1024,mode=0755,noswap\0"
+                b"size=4194304,nr_inodes=1024,mode=0755\0"
             );
             assert_eq!(
                 AGAIN_HOME_TMPFS_OPTIONS_V1.to_bytes_with_nul(),
-                b"size=4194304,nr_inodes=1024,mode=0700,noswap\0"
+                b"size=4194304,nr_inodes=1024,mode=0700\0"
             );
             assert_eq!(PROCFS_OPTIONS_V1.to_bytes_with_nul(), b"subset=pid\0");
             assert_eq!(PROC_FD_AUDIT_PATH_V1.to_bytes_with_nul(), b"proc/1/fd\0");
@@ -10219,6 +10855,38 @@ mod platform {
                 IsolationQualificationReasonV1::ChildInvariantFailed
             );
             assert!(!failure.is_expected_unavailable());
+
+            let fixed_runtime_open = child_encode_proof_frame(
+                &nonce,
+                PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1,
+                FIXED_RUNTIME_OPEN_TREE_REFUSAL_FLAG_V1,
+                libc::EIO,
+            );
+            let failure = verify_filesystem_ready_or_failure_frame(&fixed_runtime_open, &nonce)
+                .expect_err("the fixed diagnostic refusal cannot become ready");
+            assert_eq!(
+                failure.reason,
+                IsolationQualificationReasonV1::FixedRuntimeOpenTreeRefusal
+            );
+            assert!(!failure.is_expected_unavailable());
+
+            for (status, errno) in [
+                (PROOF_STATUS_FILESYSTEM_ATTACHMENT_V1, libc::EPERM),
+                (PROOF_STATUS_FILESYSTEM_UNSUPPORTED_V1, libc::EIO),
+            ] {
+                let mismatched = child_encode_proof_frame(
+                    &nonce,
+                    status,
+                    FIXED_RUNTIME_OPEN_TREE_REFUSAL_FLAG_V1,
+                    errno,
+                );
+                let failure = verify_filesystem_ready_or_failure_frame(&mismatched, &nonce)
+                    .expect_err("a mismatched fixed-fault witness was accepted");
+                assert_eq!(
+                    failure.reason,
+                    IsolationQualificationReasonV1::ProtocolFrameMismatch
+                );
+            }
 
             for errno in [libc::ENOSYS, libc::EOPNOTSUPP, libc::EPERM, libc::EACCES] {
                 let unavailable = child_encode_proof_frame(

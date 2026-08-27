@@ -38,6 +38,126 @@ use super::{ExtentV1, FileContentDigest, RefusalCode, TimespecV1};
 #[path = "snapshot_qualification.rs"]
 mod snapshot_qualification;
 
+fn fixed_diagnostic_source_failure_expected_unavailable_v1(
+    reason: snapshot_qualification::SourceViewQualificationReasonV1,
+) -> bool {
+    use snapshot_qualification::SourceViewQualificationReasonV1 as R;
+    matches!(
+        reason,
+        R::RequiredKernelCapability
+            | R::FilesystemNotQualified
+            | R::MountDoesNotSuppressAtime
+            | R::MissingXattr
+    )
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct FixedDiagnosticSourceViewFailureV1 {
+    code: RefusalCode,
+    reason: &'static str,
+    errno: Option<i32>,
+    expected_unavailable: bool,
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl FixedDiagnosticSourceViewFailureV1 {
+    pub(super) const fn code(&self) -> RefusalCode {
+        self.code
+    }
+
+    pub(super) const fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub(super) const fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+
+    pub(super) const fn is_expected_unavailable(&self) -> bool {
+        self.expected_unavailable
+    }
+}
+
+/// Run the production no-atime qualifier with the diagnostic's one fixed set
+/// of probe names. The caller cannot choose a probe surface or mint the source
+/// capability without the complete functional qualification.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn qualify_fixed_diagnostic_no_atime_source_view_v1(
+    trusted_parent: BorrowedFd<'_>,
+) -> Result<QualifiedNoAtimeSourceViewV1<'_>, FixedDiagnosticSourceViewFailureV1> {
+    use snapshot_qualification::SourceViewQualificationReasonV1 as R;
+
+    let probes = snapshot_qualification::SourceViewQualificationProbesV1::checked(
+        c"probe-directory",
+        c"probe-regular",
+        c"probe-symlink",
+        c"user.again.source-view-probe-v1",
+    )
+    .expect("fixed source-view probe names are valid");
+    snapshot_qualification::qualify_no_atime_source_view_at(trusted_parent, &probes).map_err(
+        |failure| {
+            let reason = match failure.reason() {
+                R::RequiredKernelCapability => "required_kernel_capability",
+                R::FilesystemNotQualified => "filesystem_not_qualified",
+                R::MountDoesNotSuppressAtime => "mount_does_not_suppress_atime",
+                R::MountChanged => "mount_changed",
+                R::MountCrossing => "mount_crossing",
+                R::WrongObjectKind => "wrong_object_kind",
+                R::EmptyProbe => "empty_probe",
+                R::MissingXattr => "missing_xattr",
+                R::AtimeChanged => "atime_changed",
+                R::SourceChanged => "source_changed",
+                R::MalformedKernelResponse => "malformed_kernel_response",
+                R::ProbeExceedsBound => "probe_exceeds_bound",
+                R::Io => "io",
+            };
+            FixedDiagnosticSourceViewFailureV1 {
+                code: failure.code(),
+                reason,
+                errno: failure.errno(),
+                expected_unavailable: fixed_diagnostic_source_failure_expected_unavailable_v1(
+                    failure.reason(),
+                ),
+            }
+        },
+    )
+}
+
+#[cfg(test)]
+mod fixed_diagnostic_failure_tests {
+    use super::*;
+    use snapshot_qualification::SourceViewQualificationReasonV1 as R;
+
+    #[test]
+    fn unsupported_source_profiles_do_not_hide_fixture_or_kernel_drift() {
+        for unavailable in [
+            R::RequiredKernelCapability,
+            R::FilesystemNotQualified,
+            R::MountDoesNotSuppressAtime,
+            R::MissingXattr,
+        ] {
+            assert!(fixed_diagnostic_source_failure_expected_unavailable_v1(
+                unavailable
+            ));
+        }
+        for broken in [
+            R::MountChanged,
+            R::MountCrossing,
+            R::WrongObjectKind,
+            R::EmptyProbe,
+            R::AtimeChanged,
+            R::SourceChanged,
+            R::MalformedKernelResponse,
+            R::ProbeExceedsBound,
+            R::Io,
+        ] {
+            assert!(!fixed_diagnostic_source_failure_expected_unavailable_v1(
+                broken
+            ));
+        }
+    }
+}
+
 const HARD_MAX_DEPTH: u16 = 256;
 const HARD_MAX_NAME_BYTES: u16 = 255;
 const HARD_MAX_PATH_BYTES: u32 = 1024 * 1024;

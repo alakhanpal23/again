@@ -5,9 +5,10 @@
 //! `ST_NOATIME`. The qualifier then exercises the ordinary (non-`O_NOATIME`)
 //! read surfaces used by capture: directory enumeration, regular-file bytes,
 //! a symlink target, xattr-list calls on authenticated readable directory and
-//! regular-file descriptors, and the symlink `O_PATH` capability probe. It
-//! proves that every readable descriptor matches its pinned `O_PATH` identity
-//! before and after the operation. A mount flag alone is not enough, and an
+//! regular-file descriptors, and a descriptor-relative symlink xattr-list
+//! bracketed by pinned and reopened identity checks. It proves that every
+//! observed object matches its pinned `O_PATH` identity before and after the
+//! operation. A mount flag alone is not enough, and an
 //! `O_NOATIME` open is not accepted as a substitute: the eventual traversal
 //! intentionally uses ordinary reads so that root-owned runtime files remain
 //! readable without `CAP_FOWNER`.
@@ -462,24 +463,36 @@ mod platform {
             name: &CStr,
             probe: &PinnedProbeV1,
         ) -> io::Result<ReadExerciseV1> {
-            let readable = match probe.observation.mode & libc::S_IFMT {
-                libc::S_IFDIR => Some(openat2_owned(
-                    parent,
-                    name,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )?),
-                libc::S_IFLNK => None,
-                _ => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
-            };
-            let fd = readable.as_ref().map_or(probe.fd.as_fd(), |fd| fd.as_fd());
-            let before = raw_node_observation(fd)?;
-            if before != probe.observation {
-                return Err(io::Error::from_raw_os_error(libc::ESTALE));
+            match probe.observation.mode & libc::S_IFMT {
+                libc::S_IFDIR => {
+                    let readable = openat2_owned(
+                        parent,
+                        name,
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )?;
+                    let before = raw_node_observation(readable.as_fd())?;
+                    if before != probe.observation {
+                        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    let mut buffer = [0u8; XATTR_BUFFER_BYTES];
+                    bounded_xattr_list(readable.as_raw_fd(), &mut buffer)?;
+                    let after = raw_node_observation(readable.as_fd())?;
+                    Ok(ReadExerciseV1 { before, after })
+                }
+                libc::S_IFLNK => {
+                    let before = raw_node_observation(probe.fd.as_fd())?;
+                    if before != probe.observation {
+                        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+                    }
+                    require_reopened_probe_identity_v1(parent, name, probe.observation)?;
+                    let mut buffer = [0u8; XATTR_BUFFER_BYTES];
+                    bounded_xattr_list_at(parent.as_raw_fd(), name, &mut buffer)?;
+                    require_reopened_probe_identity_v1(parent, name, probe.observation)?;
+                    let after = raw_node_observation(probe.fd.as_fd())?;
+                    Ok(ReadExerciseV1 { before, after })
+                }
+                _ => Err(io::Error::from_raw_os_error(libc::EINVAL)),
             }
-            let mut buffer = [0u8; XATTR_BUFFER_BYTES];
-            bounded_xattr_list(fd.as_raw_fd(), &mut buffer)?;
-            let after = raw_node_observation(fd)?;
-            Ok(ReadExerciseV1 { before, after })
         }
 
         fn exercise_regular_xattr(
@@ -861,13 +874,6 @@ mod platform {
                 RefusalCode::SnapshotRequiredObjectUnsupported,
                 SourceViewQualificationReasonV1::MissingXattr,
             )
-        } else if stage == SourceViewQualificationStageV1::ReadSymlinkXattrList
-            && errno == Some(libc::EBADF)
-        {
-            (
-                RefusalCode::RequiredKernelCapabilityMissing,
-                SourceViewQualificationReasonV1::RequiredKernelCapability,
-            )
         } else if matches!(
             stage,
             SourceViewQualificationStageV1::ReadDirectoryXattrList
@@ -992,7 +998,28 @@ mod platform {
         Err(last)
     }
 
-    fn raw_list_xattrs(fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+    fn require_reopened_probe_identity_v1(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        expected: NodeObservationV1,
+    ) -> io::Result<()> {
+        let reopened = openat2_owned(
+            parent,
+            name,
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )?;
+        if raw_node_observation(reopened.as_fd())? != expected {
+            return Err(io::Error::from_raw_os_error(libc::ESTALE));
+        }
+        Ok(())
+    }
+
+    fn raw_list_xattrs_at(
+        fd: RawFd,
+        path: &CStr,
+        flags: i32,
+        output: Option<&mut [u8]>,
+    ) -> io::Result<usize> {
         let (pointer, length) = output
             .map(|buffer| (buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()))
             .unwrap_or((std::ptr::null_mut(), 0));
@@ -1000,8 +1027,8 @@ mod platform {
             libc::syscall(
                 SYS_LISTXATTRAT_X86_64,
                 fd,
-                c"".as_ptr(),
-                AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+                path.as_ptr(),
+                flags,
                 pointer,
                 length,
             )
@@ -1009,15 +1036,36 @@ mod platform {
         syscall_size(result)
     }
 
+    fn raw_list_xattrs(fd: RawFd, output: Option<&mut [u8]>) -> io::Result<usize> {
+        raw_list_xattrs_at(fd, c"", AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW, output)
+    }
+
     fn bounded_xattr_list(fd: RawFd, buffer: &mut [u8; XATTR_BUFFER_BYTES]) -> io::Result<usize> {
-        let required = raw_list_xattrs(fd, None)?;
+        bounded_xattr_list_with_v1(buffer, |output| raw_list_xattrs(fd, output))
+    }
+
+    fn bounded_xattr_list_at(
+        parent: RawFd,
+        name: &CStr,
+        buffer: &mut [u8; XATTR_BUFFER_BYTES],
+    ) -> io::Result<usize> {
+        bounded_xattr_list_with_v1(buffer, |output| {
+            raw_list_xattrs_at(parent, name, libc::AT_SYMLINK_NOFOLLOW, output)
+        })
+    }
+
+    fn bounded_xattr_list_with_v1(
+        buffer: &mut [u8; XATTR_BUFFER_BYTES],
+        mut list: impl FnMut(Option<&mut [u8]>) -> io::Result<usize>,
+    ) -> io::Result<usize> {
+        let required = list(None)?;
         if required > buffer.len() {
             return Err(io::Error::from_raw_os_error(libc::E2BIG));
         }
         if required == 0 {
             return Ok(0);
         }
-        let listed = raw_list_xattrs(fd, Some(&mut buffer[..required]))?;
+        let listed = list(Some(&mut buffer[..required]))?;
         if listed != required {
             return Err(io::Error::from_raw_os_error(libc::ESTALE));
         }
@@ -1531,7 +1579,7 @@ mod platform {
         }
 
         #[test]
-        fn only_symlink_o_path_ebadf_is_a_typed_capability_refusal() {
+        fn xattr_list_ebadf_is_an_io_refusal_for_every_object_kind() {
             let file = File::open("/dev/null").unwrap();
             let directory_hooks = MockHooksV1::stable();
             directory_hooks
@@ -1554,11 +1602,8 @@ mod platform {
                 failure.stage(),
                 SourceViewQualificationStageV1::ReadSymlinkXattrList
             );
-            assert_eq!(
-                failure.reason(),
-                SourceViewQualificationReasonV1::RequiredKernelCapability
-            );
-            assert_eq!(failure.code(), RefusalCode::RequiredKernelCapabilityMissing);
+            assert_eq!(failure.reason(), SourceViewQualificationReasonV1::Io);
+            assert_eq!(failure.code(), RefusalCode::SnapshotConstructionFailed);
         }
 
         #[test]

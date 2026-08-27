@@ -35,6 +35,7 @@ fn release_or_quarantine_parent_anchor_v1<T>(anchor: T, terminal_reap_proven: bo
 use super::execute_only_isolation::{
     BlockedExecuteOnlyIsolationFailureV1, BlockedExecuteOnlyIsolationV1,
     ExecuteOnlyIsolationCancellationFailureV1, FirstExecuteOnlyIsolationReadyPermitV1,
+    begin_blocked_execute_only_isolation_with_filesystem_stdio_fixed_runtime_refusal_v1,
     begin_blocked_execute_only_isolation_with_filesystem_stdio_v1,
 };
 #[cfg(all(
@@ -1892,6 +1893,38 @@ impl<'resources> FirstExecuteOnlyRuntimeFilesystemSplitV1<'resources> {
         })
     }
 
+    /// Enter the same live child path with the one fixed runtime-open refusal
+    /// used by the command-free provisioned diagnostic.
+    pub(super) fn begin_with_profile_stdio_fixed_runtime_refusal_v1(
+        self,
+        stdio: ProfileStdioIsolationChildV1,
+    ) -> Result<
+        FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources>,
+        BlockedExecuteOnlyIsolationFailureV1,
+    > {
+        let Self {
+            parent_anchor,
+            child_roots,
+        } = self;
+        let blocked = match begin_blocked_execute_only_isolation_with_filesystem_stdio_fixed_runtime_refusal_v1(
+            child_roots,
+            stdio,
+        ) {
+            Ok(blocked) => blocked,
+            Err(failure) => {
+                release_or_quarantine_parent_anchor_v1(
+                    parent_anchor,
+                    failure.cleanup_complete(),
+                );
+                return Err(failure);
+            }
+        };
+        Ok(FirstExecuteOnlyRuntimeBlockedFilesystemChildV1 {
+            blocked: Some(blocked),
+            parent_anchor: Some(parent_anchor),
+        })
+    }
+
     #[cfg(test)]
     fn begin_with_profile_stdio_test_fault_v1(
         self,
@@ -3475,20 +3508,6 @@ mod tests {
     #[derive(Clone, Copy)]
     enum RealPublicationMutationV1 {
         None,
-        #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu",
-            target_pointer_width = "64"
-        ))]
-        FilesystemReadyAndCancel,
-        #[cfg(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu",
-            target_pointer_width = "64"
-        ))]
-        RuntimeMountFailureAfterWorkspace,
         RuntimeObjectBeforeInventory,
         WorkspaceRootBeforeProjection,
         RuntimeRootBeforeProjection,
@@ -3663,72 +3682,6 @@ mod tests {
                     assert!(!roots.replay_authority());
                     assert!(!roots.reuse_authority());
                 }
-                #[cfg(all(
-                    target_os = "linux",
-                    target_arch = "x86_64",
-                    target_env = "gnu",
-                    target_pointer_width = "64"
-                ))]
-                RealPublicationMutationV1::FilesystemReadyAndCancel => {
-                    assert_ne!(
-                        unsafe { libc::getuid() },
-                        0,
-                        "the rootless isolation profile intentionally refuses host uid 0"
-                    );
-                    let roots = project_first_execute_only_runtime_retained_root_pair_v1(inventory)
-                        .expect("unchanged publications must form the one-shot root pair");
-                    let ready = super::super::execute_only_connector::prepare_first_execute_only_filesystem_ready_checkpoint_v1(roots)
-                        .expect("the provisioned runner must attach both exact snapshot roots and reach the command-free barrier");
-                    let report = ready.cancel_and_finish_v1().expect(
-                        "cancellation must terminate/reap the namespace child and drain exact EOF",
-                    );
-                    assert!(report.capture_complete());
-                    assert!(!report.requires_execute_only_classification());
-                }
-                #[cfg(all(
-                    target_os = "linux",
-                    target_arch = "x86_64",
-                    target_env = "gnu",
-                    target_pointer_width = "64"
-                ))]
-                RealPublicationMutationV1::RuntimeMountFailureAfterWorkspace => {
-                    assert_ne!(
-                        unsafe { libc::getuid() },
-                        0,
-                        "the rootless isolation profile intentionally refuses host uid 0"
-                    );
-                    let roots = project_first_execute_only_runtime_retained_root_pair_v1(inventory)
-                        .expect("unchanged publications must form the one-shot root pair");
-                    let split = split_first_execute_only_runtime_filesystem_roots_v1(roots)
-                        .expect("both roots must be sealed for the child");
-                    let stdio = super::super::execute_only_stdio::open_profile_owned_stdio_v1()
-                        .expect("profile stdio setup must succeed");
-                    let (parent_stdio, child_stdio) = stdio
-                        .split_for_isolation_v1()
-                        .expect("profile stdio split must succeed");
-                    let blocked = split
-                        .begin_with_profile_stdio_test_fault_v1(
-                            child_stdio,
-                            SnapshotChildRootRoleV1::Runtime,
-                            SnapshotChildAttachOperationV1::OpenTree,
-                        )
-                        .expect("the child remains blocked until authenticated release");
-                    let failure = match blocked.continue_to_filesystem_ready_v1() {
-                        Err(failure) => failure,
-                        Ok(ready) => {
-                            let _ = ready.cancel_and_reap_v1();
-                            panic!("runtime open_tree fault follows successful workspace mount");
-                        }
-                    };
-                    assert_eq!(failure.stage(), "child_filesystem_attachment");
-                    assert_eq!(failure.primary_errno(), Some(libc::EIO));
-                    assert!(
-                        failure.cleanup_complete(),
-                        "parent cleanup must kill/reap and prove final ECHILD"
-                    );
-                    assert_eq!(failure.cleanup_errno(), None);
-                    assert!(parent_stdio.close_without_capture_v1());
-                }
                 RealPublicationMutationV1::WorkspaceRootBeforeProjection => {
                     fs::set_permissions(
                         workspace_publication.path().join("workspace-final/root"),
@@ -3807,32 +3760,6 @@ mod tests {
         );
         run_real_publication_inventory_case(
             RealPublicationMutationV1::RuntimeObjectBeforeProjection,
-        );
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu",
-        target_pointer_width = "64"
-    ))]
-    #[test]
-    #[ignore = "requires a provisioned non-root Linux runner with user/mount namespace support"]
-    fn provisioned_two_root_filesystem_ready_then_cancel_and_reap() {
-        run_real_publication_inventory_case(RealPublicationMutationV1::FilesystemReadyAndCancel);
-    }
-
-    #[cfg(all(
-        target_os = "linux",
-        target_arch = "x86_64",
-        target_env = "gnu",
-        target_pointer_width = "64"
-    ))]
-    #[test]
-    #[ignore = "requires a provisioned non-root Linux runner with user/mount namespace support"]
-    fn provisioned_runtime_mount_fault_after_workspace_mount_reaps_to_final_echild() {
-        run_real_publication_inventory_case(
-            RealPublicationMutationV1::RuntimeMountFailureAfterWorkspace,
         );
     }
 

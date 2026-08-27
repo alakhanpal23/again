@@ -28,6 +28,10 @@ use std::io;
 use std::num::{NonZeroU8, NonZeroU16, NonZeroU32, NonZeroU64};
 use std::os::fd::{BorrowedFd, OwnedFd};
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use super::isolation_qualification::{
+    IsolationChildOnlyBrandV1, reopen_isolation_child_publication_path_v1,
+};
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
@@ -50,6 +54,7 @@ const STAGING_NONCE_HEX_BYTES: usize = 32;
 const MAX_STAGING_NAME_WITH_NUL: u64 =
     (STAGING_NAME_PREFIX.len() + STAGING_NONCE_HEX_BYTES + 1) as u64;
 const MAX_BASENAME_BYTES: usize = 255;
+const CHILD_NAMESPACE_PATH_BYTES_V1: usize = 4096;
 // Two names per frame are the smallest batch that preserves the frozen
 // getdents/operation bounds under maximally partial positive directory reads.
 // Keeping the batch fixed and small also bounds recursive stack retention.
@@ -144,6 +149,11 @@ pub(super) enum SnapshotChildAttachOperationV1 {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotChildAttachFailureV1 {
+    Injected {
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+        errno: i32,
+    },
     Unsupported {
         role: SnapshotChildRootRoleV1,
         operation: SnapshotChildAttachOperationV1,
@@ -164,13 +174,26 @@ pub(super) enum SnapshotChildAttachFailureV1 {
 impl SnapshotChildAttachFailureV1 {
     pub(super) const fn errno(self) -> Option<i32> {
         match self {
-            Self::Unsupported { errno, .. } | Self::Os { errno, .. } => Some(errno),
+            Self::Injected { errno, .. }
+            | Self::Unsupported { errno, .. }
+            | Self::Os { errno, .. } => Some(errno),
             Self::Invariant { .. } => None,
         }
     }
 
     pub(super) const fn unsupported(self) -> bool {
         matches!(self, Self::Unsupported { .. })
+    }
+
+    pub(super) const fn is_fixed_runtime_open_tree_injection(self) -> bool {
+        matches!(
+            self,
+            Self::Injected {
+                role: SnapshotChildRootRoleV1::Runtime,
+                operation: SnapshotChildAttachOperationV1::OpenTree,
+                errno: libc::EIO,
+            }
+        )
     }
 }
 
@@ -1018,8 +1041,30 @@ pub(super) fn attach_fork_child_published_roots_v1(
     workspace: ForkChildPublishedRootV1,
     runtime: ForkChildPublishedRootV1,
     _child_namespace_seal: SnapshotChildMountNamespaceSealV1,
+    child_brand: IsolationChildOnlyBrandV1,
 ) -> Result<(), SnapshotChildAttachFailureV1> {
-    platform::attach_fork_child_published_roots_v1(workspace, runtime)
+    platform::attach_fork_child_published_roots_v1(workspace, runtime, &child_brand)
+}
+
+/// Fixed command-free diagnostic refusal after the workspace root has been
+/// attached and immediately before the runtime `open_tree(2)` operation.
+///
+/// This is deliberately not a generic fault-injection surface: callers cannot
+/// select a role, operation, errno, descriptor, path, or command. The only
+/// outcome it can introduce is the frozen `EIO` refusal used to prove cleanup
+/// of the partially attached child on a provisioned kernel.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_fork_child_published_roots_with_fixed_runtime_refusal_v1(
+    workspace: ForkChildPublishedRootV1,
+    runtime: ForkChildPublishedRootV1,
+    _child_namespace_seal: SnapshotChildMountNamespaceSealV1,
+    child_brand: IsolationChildOnlyBrandV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    platform::attach_fork_child_published_roots_with_fixed_runtime_refusal_v1(
+        workspace,
+        runtime,
+        &child_brand,
+    )
 }
 
 /// Test-only injection at one real child attachment operation. This enters
@@ -1029,11 +1074,16 @@ pub(super) fn attach_fork_child_published_roots_with_test_fault_v1(
     workspace: ForkChildPublishedRootV1,
     runtime: ForkChildPublishedRootV1,
     _child_namespace_seal: SnapshotChildMountNamespaceSealV1,
+    child_brand: IsolationChildOnlyBrandV1,
     role: SnapshotChildRootRoleV1,
     operation: SnapshotChildAttachOperationV1,
 ) -> Result<(), SnapshotChildAttachFailureV1> {
     platform::attach_fork_child_published_roots_with_test_fault_v1(
-        workspace, runtime, role, operation,
+        workspace,
+        runtime,
+        &child_brand,
+        role,
+        operation,
     )
 }
 
@@ -1547,6 +1597,10 @@ mod platform {
         root_descriptor: RawFd,
         root_name: [u8; MAX_BASENAME_BYTES + 1],
         root_name_len: u16,
+        published_namespace_path: [u8; CHILD_NAMESPACE_PATH_BYTES_V1],
+        published_namespace_path_len: u16,
+        root_namespace_path: [u8; CHILD_NAMESPACE_PATH_BYTES_V1],
+        root_namespace_path_len: u16,
         /// Exact host-user-namespace commitment authenticated before clone.
         /// It is retained as provenance but is never compared to the child
         /// namespace's remapped ownership view.
@@ -2033,6 +2087,8 @@ mod platform {
         if !valid_raw_basename(root_name) {
             return Err(BoundRegularReadRefusalV1::InvalidPath);
         }
+        let published_path_before = namespace_path_for_descriptor_v1(bound.published.as_raw_fd())?;
+        let root_path_before = namespace_path_for_descriptor_v1(bound.root.as_raw_fd())?;
         let named_before = node_statx_at_name_v1(bound.published.as_fd(), root_name)?;
         let root_before = node_statx_v1(bound.root.as_fd())?;
         if named_before.commitment_bytes_v1() != expected_statx_commitment
@@ -2063,10 +2119,14 @@ mod platform {
         let root_duplicate = node_statx_v1(root.as_fd())?;
         let named_after = node_statx_at_name_v1(bound.published.as_fd(), root_name)?;
         let root_after = node_statx_v1(bound.root.as_fd())?;
+        let published_path_after = namespace_path_for_descriptor_v1(bound.published.as_raw_fd())?;
+        let root_path_after = namespace_path_for_descriptor_v1(bound.root.as_raw_fd())?;
         if named_duplicate.commitment_bytes_v1() != expected_statx_commitment
             || root_duplicate.commitment_bytes_v1() != expected_statx_commitment
             || named_after.commitment_bytes_v1() != expected_statx_commitment
             || root_after.commitment_bytes_v1() != expected_statx_commitment
+            || published_path_before != published_path_after
+            || root_path_before != root_path_after
         {
             return Err(BoundRegularReadRefusalV1::IdentityDrift);
         }
@@ -2080,10 +2140,94 @@ mod platform {
             root_descriptor: root.into_raw_fd(),
             root_name: root_name_bytes,
             root_name_len,
+            published_namespace_path: published_path_before.0,
+            published_namespace_path_len: published_path_before.1,
+            root_namespace_path: root_path_before.0,
+            root_namespace_path_len: root_path_before.1,
             _expected_host_statx_commitment: expected_statx_commitment,
             expected_child_statx_commitment,
             role,
         })
+    }
+
+    fn namespace_path_for_descriptor_v1(
+        descriptor: RawFd,
+    ) -> Result<([u8; CHILD_NAMESPACE_PATH_BYTES_V1], u16), BoundRegularReadRefusalV1> {
+        if descriptor < 0 {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let proc_root = authenticated_proc_root_for_namespace_path_v1()?;
+        let proc_path = CString::new(format!("self/fd/{descriptor}"))
+            .map_err(|_| BoundRegularReadRefusalV1::IdentityDrift)?;
+        let mut bytes = [0_u8; CHILD_NAMESPACE_PATH_BYTES_V1];
+        let count = unsafe {
+            libc::readlinkat(
+                proc_root.as_raw_fd(),
+                proc_path.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        finish_namespace_path_capture_v1(bytes, count)
+    }
+
+    fn authenticated_proc_root_for_namespace_path_v1() -> Result<OwnedFd, BoundRegularReadRefusalV1>
+    {
+        const PROC_SUPER_MAGIC_V1: libc::c_long = 0x0000_9fa0;
+        let raw = unsafe {
+            libc::open(
+                c"/proc".as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let proc_root = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut filesystem = MaybeUninit::<libc::statfs>::zeroed();
+        if unsafe { libc::fstatfs(proc_root.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let filesystem = unsafe { filesystem.assume_init() };
+        if filesystem.f_type != PROC_SUPER_MAGIC_V1 {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        let mut self_link = [0_u8; 32];
+        let count = unsafe {
+            libc::readlinkat(
+                proc_root.as_raw_fd(),
+                c"self".as_ptr(),
+                self_link.as_mut_ptr().cast(),
+                self_link.len(),
+            )
+        };
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count > 0 && *count < self_link.len())
+            .ok_or(BoundRegularReadRefusalV1::IdentityDrift)?;
+        if self_link[..count] != unsafe { libc::getpid() }.to_string().as_bytes()[..] {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        Ok(proc_root)
+    }
+
+    fn finish_namespace_path_capture_v1(
+        mut bytes: [u8; CHILD_NAMESPACE_PATH_BYTES_V1],
+        count: isize,
+    ) -> Result<([u8; CHILD_NAMESPACE_PATH_BYTES_V1], u16), BoundRegularReadRefusalV1> {
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|count| *count > 1 && *count < bytes.len())
+            .ok_or(BoundRegularReadRefusalV1::IdentityDrift)?;
+        if bytes[0] != b'/'
+            || bytes[..count].contains(&0)
+            || bytes[..count].ends_with(b" (deleted)")
+        {
+            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        }
+        bytes[count] = 0;
+        let count = u16::try_from(count).map_err(|_| BoundRegularReadRefusalV1::IdentityDrift)?;
+        Ok((bytes, count))
     }
 
     const OPEN_TREE_CLONE_V1: libc::c_uint = 1;
@@ -2114,7 +2258,6 @@ mod platform {
     }
 
     impl ChildAttachOperationPlanV1 {
-        #[cfg(test)]
         const fn fail(
             role: SnapshotChildRootRoleV1,
             operation: SnapshotChildAttachOperationV1,
@@ -2130,7 +2273,7 @@ mod platform {
             operation: SnapshotChildAttachOperationV1,
         ) -> Result<(), SnapshotChildAttachFailureV1> {
             if self.failures.contains(&Some((role, operation))) {
-                Err(SnapshotChildAttachFailureV1::Os {
+                Err(SnapshotChildAttachFailureV1::Injected {
                     role,
                     operation,
                     errno: libc::EIO,
@@ -2190,10 +2333,12 @@ mod platform {
     pub(super) fn attach_fork_child_published_roots_v1(
         mut workspace: ForkChildPublishedRootV1,
         mut runtime: ForkChildPublishedRootV1,
+        child_brand: &IsolationChildOnlyBrandV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
         attach_fork_child_published_roots_with_plan_v1(
             &mut workspace,
             &mut runtime,
+            child_brand,
             ChildAttachOperationPlanV1::default(),
         )
     }
@@ -2202,20 +2347,69 @@ mod platform {
     pub(super) fn attach_fork_child_published_roots_with_test_fault_v1(
         mut workspace: ForkChildPublishedRootV1,
         mut runtime: ForkChildPublishedRootV1,
+        child_brand: &IsolationChildOnlyBrandV1,
         role: SnapshotChildRootRoleV1,
         operation: SnapshotChildAttachOperationV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
         attach_fork_child_published_roots_with_plan_v1(
             &mut workspace,
             &mut runtime,
+            child_brand,
             ChildAttachOperationPlanV1::fail(role, operation),
+        )
+    }
+
+    pub(super) fn attach_fork_child_published_roots_with_fixed_runtime_refusal_v1(
+        mut workspace: ForkChildPublishedRootV1,
+        mut runtime: ForkChildPublishedRootV1,
+        child_brand: &IsolationChildOnlyBrandV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        attach_fork_child_published_roots_with_plan_v1(
+            &mut workspace,
+            &mut runtime,
+            child_brand,
+            ChildAttachOperationPlanV1::fail(
+                SnapshotChildRootRoleV1::Runtime,
+                SnapshotChildAttachOperationV1::OpenTree,
+            ),
         )
     }
 
     fn attach_fork_child_published_roots_with_plan_v1(
         workspace: &mut ForkChildPublishedRootV1,
         runtime: &mut ForkChildPublishedRootV1,
+        child_brand: &IsolationChildOnlyBrandV1,
         plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        child_validate_fork_child_root_pair_v1(workspace, runtime)?;
+        child_rebind_source_in_current_mount_namespace_v1(workspace, child_brand)?;
+        child_rebind_source_in_current_mount_namespace_v1(runtime, child_brand)?;
+        child_attach_validate_source_v1(workspace, plan)?;
+        child_attach_validate_source_v1(runtime, plan)?;
+        let workspace_target = child_attach_one_root_v1(workspace, WORKSPACE_TARGET_V1, plan)?;
+        let runtime_target = child_attach_one_root_v1(runtime, RUNTIME_TARGET_V1, plan)?;
+        child_verify_final_attached_target_v1(
+            SnapshotChildRootRoleV1::Workspace,
+            WORKSPACE_TARGET_V1,
+            workspace_target,
+            plan,
+        )?;
+        child_verify_final_attached_target_v1(
+            SnapshotChildRootRoleV1::Runtime,
+            RUNTIME_TARGET_V1,
+            runtime_target,
+            plan,
+        )?;
+        child_attach_final_source_revalidation_v1(workspace, plan)?;
+        child_attach_final_source_revalidation_v1(runtime, plan)?;
+        child_attach_close_root_v1(workspace, plan)?;
+        child_attach_close_root_v1(runtime, plan)?;
+        Ok(())
+    }
+
+    fn child_validate_fork_child_root_pair_v1(
+        workspace: &ForkChildPublishedRootV1,
+        runtime: &ForkChildPublishedRootV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
         if workspace.role != SnapshotChildRootRoleV1::Workspace {
             return Err(SnapshotChildAttachFailureV1::Invariant {
@@ -2237,26 +2431,64 @@ mod platform {
                 operation: SnapshotChildAttachOperationV1::ValidateSource,
             });
         }
-        child_attach_validate_source_v1(workspace, plan)?;
-        child_attach_validate_source_v1(runtime, plan)?;
-        let workspace_target = child_attach_one_root_v1(workspace, WORKSPACE_TARGET_V1, plan)?;
-        let runtime_target = child_attach_one_root_v1(runtime, RUNTIME_TARGET_V1, plan)?;
-        child_verify_final_attached_target_v1(
-            SnapshotChildRootRoleV1::Workspace,
-            WORKSPACE_TARGET_V1,
-            workspace_target,
-            plan,
+        Ok(())
+    }
+
+    fn child_rebind_source_in_current_mount_namespace_v1(
+        root: &mut ForkChildPublishedRootV1,
+        child_brand: &IsolationChildOnlyBrandV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        let operation = SnapshotChildAttachOperationV1::ValidateSource;
+        let role = root.role;
+        let published_end = usize::from(root.published_namespace_path_len)
+            .checked_add(1)
+            .filter(|end| *end <= root.published_namespace_path.len())
+            .ok_or(SnapshotChildAttachFailureV1::Invariant { role, operation })?;
+        let root_end = usize::from(root.root_namespace_path_len)
+            .checked_add(1)
+            .filter(|end| *end <= root.root_namespace_path.len())
+            .ok_or(SnapshotChildAttachFailureV1::Invariant { role, operation })?;
+        let published_path =
+            CStr::from_bytes_with_nul(&root.published_namespace_path[..published_end])
+                .map_err(|_| SnapshotChildAttachFailureV1::Invariant { role, operation })?;
+        let root_path = CStr::from_bytes_with_nul(&root.root_namespace_path[..root_end])
+            .map_err(|_| SnapshotChildAttachFailureV1::Invariant { role, operation })?;
+        let published = reopen_isolation_child_publication_path_v1(child_brand, published_path)
+            .map_err(|errno| child_attach_error_from_errno_v1(role, operation, Some(errno)))?;
+        let mut published = ChildTrackedAttachFdV1 {
+            descriptor: published,
+        };
+        let rebound_root = reopen_isolation_child_publication_path_v1(child_brand, root_path)
+            .map_err(|errno| child_attach_error_from_errno_v1(role, operation, Some(errno)))?;
+        let mut rebound_root = ChildTrackedAttachFdV1 {
+            descriptor: rebound_root,
+        };
+        let rebound_named = child_statx_at_name_v1(
+            published.descriptor,
+            child_root_name_v1(root)
+                .ok_or(SnapshotChildAttachFailureV1::Invariant { role, operation })?,
+            role,
+            operation,
         )?;
-        child_verify_final_attached_target_v1(
-            SnapshotChildRootRoleV1::Runtime,
-            RUNTIME_TARGET_V1,
-            runtime_target,
-            plan,
-        )?;
-        child_attach_final_source_revalidation_v1(workspace, plan)?;
-        child_attach_final_source_revalidation_v1(runtime, plan)?;
-        child_attach_close_root_v1(workspace, plan)?;
-        child_attach_close_root_v1(runtime, plan)?;
+        let rebound_selected = child_statx_fd_v1(rebound_root.descriptor, role, operation)?;
+        if rebound_named != rebound_selected
+            || rebound_named[1..9] == 0_u64.to_le_bytes()
+            || rebound_named[0] != root.expected_child_statx_commitment.0[0]
+            || rebound_named[9..] != root.expected_child_statx_commitment.0[9..]
+        {
+            return Err(SnapshotChildAttachFailureV1::Invariant { role, operation });
+        }
+        root.expected_child_statx_commitment.0[1..9].copy_from_slice(&rebound_named[1..9]);
+        for descriptor in [&mut root.root_descriptor, &mut root.published_descriptor] {
+            if *descriptor < 0 || unsafe { libc::syscall(libc::SYS_close, *descriptor) } != 0 {
+                return Err(child_attach_os_failure_v1(role, operation));
+            }
+            *descriptor = -1;
+        }
+        root.published_descriptor = published.descriptor;
+        published.descriptor = -1;
+        root.root_descriptor = rebound_root.descriptor;
+        rebound_root.descriptor = -1;
         Ok(())
     }
 
@@ -6292,6 +6524,10 @@ mod platform {
                 root_descriptor: -1,
                 root_name,
                 root_name_len: 4,
+                published_namespace_path: [0_u8; CHILD_NAMESPACE_PATH_BYTES_V1],
+                published_namespace_path_len: 0,
+                root_namespace_path: [0_u8; CHILD_NAMESPACE_PATH_BYTES_V1],
+                root_namespace_path_len: 0,
                 _expected_host_statx_commitment: expected,
                 expected_child_statx_commitment: ChildMappedStatxCommitmentV1(expected),
                 role,
@@ -6318,29 +6554,42 @@ mod platform {
         }
 
         #[test]
-        fn fork_child_pair_rejects_role_swap_and_duplicate_before_any_mount_syscall() {
-            let mut swapped_workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 1);
-            let mut swapped_runtime = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 2);
+        fn namespace_path_capture_accepts_exact_capacity_minus_terminator() {
+            let mut bytes = [b'a'; CHILD_NAMESPACE_PATH_BYTES_V1];
+            bytes[0] = b'/';
+            let count = isize::try_from(bytes.len() - 1).unwrap();
+            let (captured, captured_len) = finish_namespace_path_capture_v1(bytes, count).unwrap();
+            assert_eq!(usize::from(captured_len), CHILD_NAMESPACE_PATH_BYTES_V1 - 1);
+            assert_eq!(captured[CHILD_NAMESPACE_PATH_BYTES_V1 - 1], 0);
+        }
+
+        #[test]
+        fn namespace_path_capture_rejects_full_buffer_truncation_signal() {
+            let mut bytes = [b'a'; CHILD_NAMESPACE_PATH_BYTES_V1];
+            bytes[0] = b'/';
+            let count = isize::try_from(bytes.len()).unwrap();
             assert_eq!(
-                attach_fork_child_published_roots_with_plan_v1(
-                    &mut swapped_workspace,
-                    &mut swapped_runtime,
-                    ChildAttachOperationPlanV1::default(),
-                ),
+                finish_namespace_path_capture_v1(bytes, count),
+                Err(BoundRegularReadRefusalV1::IdentityDrift)
+            );
+        }
+
+        #[test]
+        fn fork_child_pair_rejects_role_swap_and_duplicate_before_any_mount_syscall() {
+            let swapped_workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 1);
+            let swapped_runtime = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 2);
+            assert_eq!(
+                child_validate_fork_child_root_pair_v1(&swapped_workspace, &swapped_runtime,),
                 Err(SnapshotChildAttachFailureV1::Invariant {
                     role: SnapshotChildRootRoleV1::Workspace,
                     operation: SnapshotChildAttachOperationV1::ValidateSource,
                 })
             );
 
-            let mut workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 9);
-            let mut duplicate = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 9);
+            let workspace = fake_fork_child_root(SnapshotChildRootRoleV1::Workspace, 9);
+            let duplicate = fake_fork_child_root(SnapshotChildRootRoleV1::Runtime, 9);
             assert_eq!(
-                attach_fork_child_published_roots_with_plan_v1(
-                    &mut workspace,
-                    &mut duplicate,
-                    ChildAttachOperationPlanV1::default(),
-                ),
+                child_validate_fork_child_root_pair_v1(&workspace, &duplicate),
                 Err(SnapshotChildAttachFailureV1::Invariant {
                     role: SnapshotChildRootRoleV1::Runtime,
                     operation: SnapshotChildAttachOperationV1::ValidateSource,
@@ -6370,7 +6619,7 @@ mod platform {
                     let plan = ChildAttachOperationPlanV1::fail(role, operation);
                     assert_eq!(
                         plan.check(role, operation),
-                        Err(SnapshotChildAttachFailureV1::Os {
+                        Err(SnapshotChildAttachFailureV1::Injected {
                             role,
                             operation,
                             errno: libc::EIO,

@@ -67,9 +67,10 @@ not for a private root, command execution, profile qualification, or reuse.
 The subsequent fixed child contains the first no-command private-root
 implementation slice: after the namespace, identity, UTS, and parent-death
 checks, it makes
-mount propagation recursively private; mounts a fixed 16 MiB/4096-inode
-`nodev,nosuid,noswap` tmpfs over descriptor-checked `/tmp`; pivots into it;
-detaches the old-root pathname; reopens absolute `/`; and binds the final
+mount propagation recursively private; requires two stable, bounded observations
+of the pinned host `/proc/swaps` showing no active swap; mounts a fixed 16
+MiB/4096-inode `nodev,nosuid` tmpfs over descriptor-checked `/tmp`; pivots into it;
+detaches the old-root pathname in the root-only lane; reopens absolute `/`; and binds the final
 tmpfs identity, flags, limits, ownership, mode, and reserved-path absence into
 an exact new success bit. Dedicated canonical OS and invariant failures map to
 `mount_root_failed` and are never expected-unavailable. This source compiles
@@ -89,11 +90,18 @@ Commit `883a0a6` extends that same fixed child through the layout frozen in the
 normative profile without adding a command or authority surface. It uses
 child-local umask `0` for construction, then sets and verifies final umask
 `0077`. `/tmp`, `/run`, and `/home/again` become three independent writable
-`nodev,nosuid,noexec,noswap` tmpfs mounts, each capped at 4 MiB and 1024
+`nodev,nosuid,noexec` tmpfs mounts, each capped at 4 MiB and 1024
 inodes. A fresh read-only `nodev,nosuid,noexec` procfs uses `subset=pid`,
 reports exact `self -> 1`, and must expose `/proc/1/ns/pid` as the same NSFS
-`CLONE_NEWPID` device/inode pinned from `/proc/self/ns/pid` before pivot. A
-final absolute-root reopen revalidates every constructed fixed path and mount.
+`CLONE_NEWPID` device/inode pinned from `/proc/self/ns/pid` before pivot. It is
+mounted into the new root before pivot while the existing procfs is fully
+visible, then reauthenticated afterward with exact unmapped `65534:65534`
+ownership. The parent first reads the descriptor-pinned host procfs
+`kernel/overflowuid` and `kernel/overflowgid` values twice and requires exact
+canonical `65534` policy; a different configured identity is a typed
+provisioned-host non-pass, while malformed, unstable, or unreadable sysctl
+evidence is broken. A final absolute-root reopen revalidates every constructed
+fixed path and mount.
 The success frame adds one combined layout/scratch/proc bit; OS and invariant
 failures retain the existing `mount_root_failed` / `child_mount_root` mapping.
 
@@ -651,21 +659,36 @@ result. This is not yet a workload or a before-Python composition proof.
 Inside the new mount namespace:
 
 1. Make `/` recursively private with `MS_REC|MS_PRIVATE`.
-2. Mount a new tmpfs root with explicit `size=`, `nr_inodes=`, `mode=0755`,
-   `nodev,nosuid,noswap`.
+2. Require stable pre-clone and post-ready observations of the descriptor-pinned
+   host `/proc/swaps` showing no active swap, then mount a new tmpfs root with
+   explicit `size=`, `nr_inodes=`, `mode=0755`, `nodev,nosuid`.
 3. Attach descriptor-selected trees with
    [`open_tree`](https://man7.org/linux/man-pages/man2/open_tree.2.html),
    [`mount_setattr`](https://man7.org/linux/man-pages/man2/mount_setattr.2.html),
    and [`move_mount`](https://man7.org/linux/man-pages/man2/move_mount.2.html),
    using `OPEN_TREE_CLONE|AT_EMPTY_PATH`:
-   - branch at `/workspace`, read-write with `nodev,nosuid`;
-   - sealed `.venv` and runtime forest, recursively read-only with
+   - sealed workspace branch at `/workspace`, recursively read-only with
+     `nodev,nosuid`;
+   - sealed runtime forest at `/runtime`, recursively read-only with
      `nodev,nosuid`;
    - `/tmp`, `/run`, and `/home/again`, separate bounded tmpfs mounts,
      preferably `noexec`.
-4. Mount fresh procfs from PID 1 with `nodev,nosuid,noexec,ro,subset=pid`.
-5. `chdir(newroot)`, create `.oldroot`, `pivot_root(".", ".oldroot")`,
-   `chdir("/")`, detach `/.oldroot`, remove it, and close every old-root FD.
+
+Linux deliberately rejects the tmpfs `noswap` option in a noninitial user
+namespace. These observational checks are therefore a provisioned-host policy,
+not a kernel-enforced per-mount `noswap` guarantee: init-user-namespace root,
+which is outside the v1 threat model, must keep swap disabled for the complete
+child lifetime. Any active, malformed, unstable, oversized, or unreadable swap
+observation refuses before authority is issued.
+4. Before pivot, mount fresh procfs for PID 1 into the new root with
+   `nodev,nosuid,noexec,ro,subset=pid`; authenticate the exact same mount again
+   after pivot.
+5. `chdir(newroot)`, create `.oldroot`, `pivot_root(".", ".oldroot")`, and
+   `chdir("/")`. The filesystem-ready lane retains exactly one private branded
+   descriptor for `/.oldroot` while it reopens the pre-clone publication paths
+   in the child's mount namespace, attaches and authenticates both roots, then
+   closes that descriptor, detaches `/.oldroot`, and removes it. The root-only
+   lane detaches immediately.
 6. Verify root type, mount flags, and absence of host state, host home, `/sys`,
    and host procfs.
 

@@ -45,10 +45,11 @@ use super::snapshot_publish::{
     RuntimeMemoryEscrowV1, SnapshotChildAttachFailureV1, SnapshotChildRootRoleV1,
     SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
     ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
-    attach_fork_child_published_roots_v1, consume_bound_published_snapshot_root_projection_v1,
-    prepare_fork_child_published_root_v1, read_bound_regular_bytes_v1,
-    revalidate_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
-    validate_snapshot_final_name,
+    attach_fork_child_published_roots_v1,
+    attach_fork_child_published_roots_with_fixed_runtime_refusal_v1,
+    consume_bound_published_snapshot_root_projection_v1, prepare_fork_child_published_root_v1,
+    read_bound_regular_bytes_v1, revalidate_bound_regular_bytes_v1,
+    seal_publish_and_bind_snapshot_child_at, validate_snapshot_final_name,
 };
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_publish::{
@@ -416,19 +417,35 @@ pub(super) enum FirstExecuteOnlyForkChildRootPairRefusalV1 {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn attach_first_execute_only_fork_child_roots_v1(
     roots: FirstExecuteOnlyForkChildRootPairV1,
-    _child_brand: IsolationChildOnlyBrandV1,
+    child_brand: IsolationChildOnlyBrandV1,
 ) -> Result<(), SnapshotChildAttachFailureV1> {
     attach_fork_child_published_roots_v1(
         roots.workspace,
         roots.runtime,
         SnapshotChildMountNamespaceSealV1 { _private: () },
+        child_brand,
+    )
+}
+
+/// Consume the exact root pair through the one fixed partial-attachment
+/// diagnostic. No caller-controlled fault coordinate crosses this boundary.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) fn attach_first_execute_only_fork_child_roots_with_fixed_runtime_refusal_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    child_brand: IsolationChildOnlyBrandV1,
+) -> Result<(), SnapshotChildAttachFailureV1> {
+    attach_fork_child_published_roots_with_fixed_runtime_refusal_v1(
+        roots.workspace,
+        roots.runtime,
+        SnapshotChildMountNamespaceSealV1 { _private: () },
+        child_brand,
     )
 }
 
 #[cfg(all(test, target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn attach_first_execute_only_fork_child_roots_with_test_fault_v1(
     roots: FirstExecuteOnlyForkChildRootPairV1,
-    _child_brand: IsolationChildOnlyBrandV1,
+    child_brand: IsolationChildOnlyBrandV1,
     role: SnapshotChildRootRoleV1,
     operation: SnapshotChildAttachOperationV1,
 ) -> Result<(), SnapshotChildAttachFailureV1> {
@@ -436,6 +453,7 @@ pub(super) fn attach_first_execute_only_fork_child_roots_with_test_fault_v1(
         roots.workspace,
         roots.runtime,
         SnapshotChildMountNamespaceSealV1 { _private: () },
+        child_brand,
         role,
         operation,
     )

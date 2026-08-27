@@ -125,11 +125,13 @@ pub(super) struct BlockedExecuteOnlyIsolationFailureV1 {
     primary_errno: Option<i32>,
     cleanup_complete: bool,
     cleanup_errno: Option<i32>,
+    expected_unavailable: bool,
 }
 
 impl BlockedExecuteOnlyIsolationFailureV1 {
     fn from_qualification(failure: IsolationQualificationFailureV1) -> Self {
         let cleanup_complete = failure.cleanup_complete();
+        let expected_unavailable = failure.is_expected_unavailable();
         Self {
             code: failure.code(),
             stage: failure.stage(),
@@ -137,6 +139,7 @@ impl BlockedExecuteOnlyIsolationFailureV1 {
             primary_errno: failure.errno(),
             cleanup_complete,
             cleanup_errno: failure.cleanup_errno(),
+            expected_unavailable,
         }
     }
 
@@ -162,6 +165,10 @@ impl BlockedExecuteOnlyIsolationFailureV1 {
 
     pub(super) const fn cleanup_errno(&self) -> Option<i32> {
         self.cleanup_errno
+    }
+
+    pub(super) const fn is_expected_unavailable(&self) -> bool {
+        self.expected_unavailable
     }
 }
 
@@ -339,6 +346,28 @@ pub(super) fn begin_blocked_execute_only_isolation_with_filesystem_stdio_v1(
 ) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
     let continuation =
         isolation_qualification::compose_filesystem_profile_isolation_child_v1(roots, stdio);
+    finish_blocked_execute_only_isolation_v1(
+        isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_filesystem_stdio_v1(
+            continuation,
+        ),
+    )
+}
+
+/// Begin the same live child with the one fixed runtime-open refusal used by
+/// the provisioned command-free cleanup diagnostic.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) fn begin_blocked_execute_only_isolation_with_filesystem_stdio_fixed_runtime_refusal_v1(
+    roots: FirstExecuteOnlyForkChildRootPairV1,
+    stdio: ProfileStdioIsolationChildV1,
+) -> Result<BlockedExecuteOnlyIsolationV1, BlockedExecuteOnlyIsolationFailureV1> {
+    let continuation = isolation_qualification::compose_filesystem_profile_isolation_child_with_fixed_runtime_refusal_v1(
+        roots, stdio,
+    );
     finish_blocked_execute_only_isolation_v1(
         isolation_qualification::begin_blocked_rootless_namespace_bootstrap_with_filesystem_stdio_v1(
             continuation,

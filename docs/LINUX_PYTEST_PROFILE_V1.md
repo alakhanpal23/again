@@ -27,9 +27,10 @@ outside the shared resource ledger. Upstream Linux xattr syscalls reject
 the identity anchor, opens a second non-following readable descriptor for each
 regular file and directory, and requires exact `statx` equality before and
 after xattr capture. Every added open and identity check is charged. The
-qualifier's deliberate symlink-xattr probe remains `O_PATH`-only and produces
-a typed missing-capability non-pass on upstream `EBADF`; it never falls back to
-a raceable parent/name lookup. The production and legacy test adapters
+qualifier's deliberate symlink-xattr probe instead uses descriptor-relative
+`listxattrat(..., AT_SYMLINK_NOFOLLOW)` on the pinned parent, bracketed by
+exact non-following reopened-identity checks before and after the syscall; it
+does not accept an unbound pathname lookup. The production and legacy test adapters
 refuse every symlink before creating it because durable replay of
 symlink xattrs and timestamps still requires a qualified dedicated staging
 filesystem and a final bounded `syncfs`. Before any destination-tree
@@ -487,23 +488,51 @@ execution authority.
 
 After the verified child configures its fixed UTS state, the diagnostic's
 fixed no-command root slice makes the mount tree recursively private and uses
-the pre-existing `/tmp` only as a descriptor-checked mountpoint. It mounts a
-new 16 MiB/4096-inode `nodev,nosuid,noswap` tmpfs there, enters it by pinned
-descriptor, pivots, detaches and removes the old-root pathname, reopens
-absolute `/`, and verifies the exact mount identity, tmpfs type, mode,
-ownership, flags, limits, and initial absence of `.oldroot`, `/proc`, `/dev`,
-and `/sys`.
+the pre-existing `/tmp` only as a descriptor-checked mountpoint. Immediately
+before clone it requires two identical, bounded reads beneath a pinned host
+procfs root to show a header-only `/proc/swaps`, and revalidates that condition
+after the child's ready proof. It then mounts a new 16 MiB/4096-inode
+`nodev,nosuid` tmpfs there, enters it by pinned
+descriptor, verifies the exact mount identity, tmpfs type, mode, ownership,
+flags, limits, and initial reserved-path absence, builds the fixed layout and
+restricted procfs mount, and pivots. The root-only lane then detaches and
+removes the old-root pathname immediately; the filesystem-ready continuation
+uses the narrower deferred sequence below.
 
 Before pivot, the child pins `/proc/self/ns/pid` and requires NSFS plus
-`NS_GET_NSTYPE == CLONE_NEWPID`, retaining its exact device/inode identity.
+`NS_GET_NSTYPE == CLONE_NEWPID`, retaining its exact device/inode identity. It
+mounts the restricted read-only `subset=pid` procfs into the new root while the
+host procfs remains fully visible, as required by Linux's rootless
+mount-revelation check, then reauthenticates that exact mount after pivot. Its
+root must have the provisioned unmapped initial-namespace identity
+`65534:65534`, never namespace-root ownership. Before clone, the launcher
+reads both descriptor-pinned host procfs sysctls twice and requires canonical
+`kernel.overflowuid=65534` and `kernel.overflowgid=65534`; a different stable
+configuration is an environmental non-pass, while malformed, unstable, or
+unreadable evidence is broken.
+
+The filesystem-ready continuation deliberately defers old-root detachment for
+one bounded phase. Pre-clone publication and selected-root descriptors still
+refer to mount objects from the parent's namespace, so the child reopens their
+twice-captured canonical absolute paths beneath a private branded
+`/.oldroot` descriptor with `openat2`
+`RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_SYMLINKS`. It reauthenticates
+the named and selected roots, permits only the namespace-local mount-ID bytes
+of their commitments to change, closes the inherited descriptors, clones and
+attaches both roots, and authenticates both targets. It then closes the only
+old-root descriptor, detaches and removes `/.oldroot`, and revalidates the
+complete private layout and attached mounts before emitting the
+filesystem-ready frame. No path, descriptor, or release operation escapes
+that child-only continuation.
+
 Inside the new root, child-local umask is set to `0` while it creates the fixed
 directories `/workspace` `0755`, `/tmp` `01777`, `/run` `0755`, `/home`
 `0755`, `/home/again` `0700`, `/proc` `0555`, and `/dev` `0755`; it then
 sets and verifies the final `0077` policy. `/tmp`, `/run`, and `/home/again`
 are separate writable tmpfs mounts, each capped at 4 MiB and 1024 inodes, with
-`nodev,nosuid,noexec,noswap`. Each must differ from its pre-mount target, and
+`nodev,nosuid,noexec`. Each must differ from its pre-mount target, and
 all three must have distinct nonzero mount IDs and device tuples. The child
-mounts a fresh read-only `nodev,nosuid,noexec` procfs with `subset=pid`,
+uses that fresh read-only `nodev,nosuid,noexec` procfs with `subset=pid`,
 requires its exact `self` link to be `1`, and verifies that `/proc/1/ns/pid` is
 the same NSFS `CLONE_NEWPID` device/inode pinned before pivot. A final absolute
 root reopen rechecks every constructed fixed path and mount, plus the absence
@@ -513,6 +542,14 @@ The exact success frame first added a combined layout/scratch/proc bit; stale
 root-only success frames remain rejected. OS and invariant failures in that
 slice reuse `mount_root_failed` at `child_mount_root`; there is no
 caller-selected mount interface.
+
+Linux rejects tmpfs `noswap` in a noninitial user namespace. The host swap
+observations do not emulate that per-mount kernel guarantee and cannot prevent
+init-user-namespace root from enabling swap later. Host root is outside the v1
+threat model and the provisioned-host contract requires it to keep swap
+disabled for the entire child lifetime; active or unstable observations are a
+typed environmental non-pass, while malformed or unreadable evidence is a
+broken preflight.
 
 The next fixed no-command slice authenticates the nonblocking, close-on-exec
 report FIFO, duplicates its write end to fd 0, and requires the duplicate to

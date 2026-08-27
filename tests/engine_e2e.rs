@@ -174,6 +174,77 @@ fn rootless_namespace_probe_is_closed_and_non_qualifying() {
 }
 
 #[test]
+fn filesystem_ready_probe_is_closed_redacted_and_non_authoritative() {
+    let temp = TempDir::new().unwrap();
+    let output = run_again(
+        temp.path(),
+        &["__linux-pytest-filesystem-ready-probe-v1"],
+        None,
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "probe wrote unexpected stderr: {:?}",
+        output.stderr
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["schema"],
+        "again.linux-pytest-filesystem-ready-probe.v1"
+    );
+    assert_eq!(report["profile_id"], "linux-pytest-v1");
+    assert_eq!(
+        report["scope"],
+        json!({
+            "kind": "fixed_no_command_filesystem_ready",
+            "profile_qualification": false,
+            "accepts_command": false,
+            "filesystem_checkpoint_authority": false,
+            "execution_authority": false,
+            "candidate_authority": false,
+            "replay_authority": false,
+            "reuse_authority": false,
+        })
+    );
+    match output.status.code() {
+        Some(0) => {
+            assert_eq!(report["status"], "completed");
+            assert!(report["refusal"].is_null());
+            assert_eq!(report["result"]["successful_attachment_count"], 1);
+            assert_eq!(report["result"]["injected_refusal_count"], 1);
+            assert_eq!(report["result"]["terminal_reap_count"], 2);
+            assert_eq!(report["result"]["cleanup_complete"], true);
+        }
+        Some(77) => {
+            assert_eq!(report["status"], "unavailable");
+            assert!(report["result"].is_null());
+            assert_eq!(report["refusal"]["cleanup_complete"], true);
+            assert!(report["refusal"]["code"].is_string());
+            assert!(report["refusal"]["stage"].is_string());
+            assert!(report["refusal"]["reason"].is_string());
+        }
+        status => panic!("probe returned broken status {status:?}: {report}"),
+    }
+    assert!(!state_dir(temp.path()).exists());
+
+    let rejected = run_again(
+        temp.path(),
+        &[
+            "__linux-pytest-filesystem-ready-probe-v1",
+            "unexpected-command",
+        ],
+        None,
+    );
+    assert_eq!(rejected.status.code(), Some(2));
+    assert!(rejected.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("unexpected argument"),
+        "unexpected rejection: {:?}",
+        rejected.stderr
+    );
+    assert!(!state_dir(temp.path()).exists());
+}
+
+#[test]
 fn ptrace_transport_probe_is_closed_redacted_and_non_authoritative() {
     let temp = TempDir::new().unwrap();
     let output = run_again(

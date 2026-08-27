@@ -75,6 +75,7 @@ mod execute_only_isolation;
 mod execute_only_runtime;
 mod execute_only_seccomp;
 mod execute_only_stdio;
+mod filesystem_ready_diagnostic;
 mod identity;
 mod isolation_qualification;
 mod ptrace_transport_qualification;
@@ -106,6 +107,10 @@ mod tracer_supervisor_state;
 mod tracer_syscall_info;
 mod tracer_task_state;
 mod tracer_wait_status;
+
+pub(crate) use filesystem_ready_diagnostic::{
+    FixedFilesystemReadyProbeDiagnosticV1, diagnose_fixed_filesystem_ready_v1,
+};
 
 /// Diagnostic-only result for the fixed rootless namespace probe.
 ///

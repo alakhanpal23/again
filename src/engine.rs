@@ -73,6 +73,9 @@ enum CommandName {
     /// Run the fixed no-command Linux two-task supervisor diagnostic.
     #[command(name = "__linux-pytest-supervisor-tree-probe-v1", hide = true)]
     LinuxPytestSupervisorTreeProbeV1,
+    /// Run the fixed no-command Linux filesystem-ready diagnostic.
+    #[command(name = "__linux-pytest-filesystem-ready-probe-v1", hide = true)]
+    LinuxPytestFilesystemReadyProbeV1,
 }
 
 #[derive(Debug, Args)]
@@ -391,6 +394,36 @@ struct FixedSupervisorTreeProbeRefusal {
     cleanup_errno: Option<i32>,
 }
 
+#[derive(Serialize)]
+struct FixedFilesystemReadyProbeReport {
+    schema: &'static str,
+    profile_id: &'static str,
+    scope: FixedFilesystemReadyProbeScope,
+    status: &'static str,
+    result: Option<FixedFilesystemReadyProbeResult>,
+    refusal: Option<FixedProbeRefusal>,
+}
+
+#[derive(Serialize)]
+struct FixedFilesystemReadyProbeScope {
+    kind: &'static str,
+    profile_qualification: bool,
+    accepts_command: bool,
+    filesystem_checkpoint_authority: bool,
+    execution_authority: bool,
+    candidate_authority: bool,
+    replay_authority: bool,
+    reuse_authority: bool,
+}
+
+#[derive(Serialize)]
+struct FixedFilesystemReadyProbeResult {
+    successful_attachment_count: u8,
+    injected_refusal_count: u8,
+    terminal_reap_count: u8,
+    cleanup_complete: bool,
+}
+
 pub fn run_cli() -> Result<i32> {
     let cli = Cli::parse_from(normalized_args());
     match cli.command {
@@ -412,6 +445,7 @@ pub fn run_cli() -> Result<i32> {
         CommandName::LinuxPytestNamespaceProbeV1 => linux_pytest_namespace_probe_v1(),
         CommandName::LinuxPytestPtraceTransportProbeV1 => linux_pytest_ptrace_transport_probe_v1(),
         CommandName::LinuxPytestSupervisorTreeProbeV1 => linux_pytest_supervisor_tree_probe_v1(),
+        CommandName::LinuxPytestFilesystemReadyProbeV1 => linux_pytest_filesystem_ready_probe_v1(),
     }
 }
 
@@ -452,6 +486,81 @@ fn linux_pytest_namespace_probe_v1() -> Result<i32> {
                 } else {
                     "broken"
                 },
+                refusal: Some(FixedProbeRefusal {
+                    code: code.as_str(),
+                    stage,
+                    reason,
+                    errno,
+                    cleanup_complete,
+                }),
+            },
+            if expected_unavailable { 77 } else { 1 },
+        ),
+    };
+
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer(&mut output, &report)?;
+    output.write_all(b"\n")?;
+    Ok(exit_code)
+}
+
+fn linux_pytest_filesystem_ready_probe_v1() -> Result<i32> {
+    use crate::linux_pytest::{
+        FixedFilesystemReadyProbeDiagnosticV1, LINUX_PYTEST_PROFILE_ID,
+        diagnose_fixed_filesystem_ready_v1,
+    };
+
+    let scope = FixedFilesystemReadyProbeScope {
+        kind: "fixed_no_command_filesystem_ready",
+        profile_qualification: false,
+        accepts_command: false,
+        filesystem_checkpoint_authority: false,
+        execution_authority: false,
+        candidate_authority: false,
+        replay_authority: false,
+        reuse_authority: false,
+    };
+    let (report, exit_code) = match diagnose_fixed_filesystem_ready_v1() {
+        FixedFilesystemReadyProbeDiagnosticV1::Completed {
+            successful_attachment_count,
+            injected_refusal_count,
+            terminal_reap_count,
+            cleanup_complete,
+        } => (
+            FixedFilesystemReadyProbeReport {
+                schema: "again.linux-pytest-filesystem-ready-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: "completed",
+                result: Some(FixedFilesystemReadyProbeResult {
+                    successful_attachment_count,
+                    injected_refusal_count,
+                    terminal_reap_count,
+                    cleanup_complete,
+                }),
+                refusal: None,
+            },
+            0,
+        ),
+        FixedFilesystemReadyProbeDiagnosticV1::Refused {
+            code,
+            stage,
+            reason,
+            errno,
+            cleanup_complete,
+            expected_unavailable,
+        } => (
+            FixedFilesystemReadyProbeReport {
+                schema: "again.linux-pytest-filesystem-ready-probe.v1",
+                profile_id: LINUX_PYTEST_PROFILE_ID,
+                scope,
+                status: if expected_unavailable {
+                    "unavailable"
+                } else {
+                    "broken"
+                },
+                result: None,
                 refusal: Some(FixedProbeRefusal {
                     code: code.as_str(),
                     stage,
