@@ -643,6 +643,16 @@ def validate_credential_environment_name(value: str) -> str:
     return value
 
 
+def validate_credential_value(value: str) -> str:
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except UnicodeEncodeError as error:
+        raise HarnessRefusal("credential_value", "credential is not valid UTF-8") from error
+    if not 8 <= len(encoded) <= 16 * 1024 or "\0" in value:
+        raise HarnessRefusal("credential_value", "credential value is outside its private bound")
+    return value
+
+
 def validate_client_capabilities(
     client: str,
     version_output: str,
@@ -934,6 +944,57 @@ def repository_diff(
         "changed": changed,
         "mode_changed": mode_changed,
         "snapshot_sha256": sha256_bytes(canonical_json_bytes(dict(current))),
+    }
+
+
+def repository_git_identity(
+    root: pathlib.Path,
+    environment: Mapping[str, str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    git_directory = root / ".git"
+    try:
+        git_metadata = git_directory.lstat()
+    except OSError as error:
+        raise HarnessRefusal("repository_git", "fixture Git directory is unreadable") from error
+    if stat.S_ISLNK(git_metadata.st_mode) or not stat.S_ISDIR(git_metadata.st_mode):
+        raise HarnessRefusal("repository_git", "fixture Git directory is unsafe")
+    git_environment = dict(environment)
+    git_environment.update({"GIT_CONFIG_NOSYSTEM": "1", "GIT_OPTIONAL_LOCKS": "0"})
+    head_result = run_bounded_command(
+        ("/usr/bin/git", "rev-parse", "HEAD"),
+        cwd=root,
+        environment=git_environment,
+        timeout_seconds=timeout_seconds,
+        stdout_limit=1024,
+        stderr_limit=1024,
+    )
+    status_result = run_bounded_command(
+        (
+            "/usr/bin/git",
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ),
+        cwd=root,
+        environment=git_environment,
+        timeout_seconds=timeout_seconds,
+        stdout_limit=MAX_HELP_BYTES,
+        stderr_limit=1024,
+    )
+    head = require_checked_command(head_result, "fixture Git HEAD").decode("ascii").strip()
+    status_bytes = require_checked_command(status_result, "fixture Git status")
+    if not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise HarnessRefusal("repository_git", "fixture Git HEAD is malformed")
+    head_path = git_directory / "HEAD"
+    index_path = git_directory / "index"
+    return {
+        "head_commit": head,
+        "head_file_sha256": file_sha256(head_path, 64 * 1024),
+        "index_sha256": file_sha256(index_path, MAX_HELP_BYTES),
+        "status_clean": status_bytes == b"",
+        "status_sha256": sha256_bytes(status_bytes),
     }
 
 
@@ -1660,6 +1721,14 @@ def execute_live_pair(
     )
     if not initial_repository_diff["clean"]:
         raise HarnessRefusal("fixture_dirty", "fresh pair fixture is not exact")
+    initial_git_identity = repository_git_identity(
+        pair_repository, bootstrap_environment, timeout_seconds
+    )
+    if (
+        not initial_git_identity["status_clean"]
+        or initial_git_identity["head_commit"] != pair_fixture["git_sha"]
+    ):
+        raise HarnessRefusal("fixture_dirty", "fresh pair Git state is not exact")
     again_home = task_root / "again-state"
     again_home.mkdir(mode=0o700)
     baseline_again_home = task_root / "baseline-state"
@@ -1707,10 +1776,18 @@ def execute_live_pair(
         final_repository_diff = repository_diff(
             pair_fixture["file_sha256"], snapshot_repository_contents(pair_repository)
         )
+        final_git_identity = repository_git_identity(
+            pair_repository, bootstrap_environment, timeout_seconds
+        )
         if not final_repository_diff["clean"]:
             raise HarnessRefusal(
                 "unexpected_repository_mutation",
                 "agent condition changed the retained fixture repository",
+            )
+        if final_git_identity != initial_git_identity:
+            raise HarnessRefusal(
+                "unexpected_repository_mutation",
+                "agent condition changed the retained fixture Git state",
             )
         if condition == "baseline" and any(delta.values()):
             raise HarnessRefusal(
@@ -1721,6 +1798,7 @@ def execute_live_pair(
             "runs": runs,
             "gateway_stats_delta": delta,
             "repository_diff": final_repository_diff,
+            "repository_git_identity": final_git_identity,
         }
         if condition_setup is not None:
             setup_summary = condition_setup
@@ -1741,6 +1819,7 @@ def execute_live_pair(
         "fresh_isolated_state": True,
         "fixture_git_sha": pair_fixture["git_sha"],
         "initial_repository_diff": initial_repository_diff,
+        "initial_repository_git_identity": initial_git_identity,
         "baseline": condition_records["baseline"],
         "again_enabled": {
             **condition_records["again_enabled"],
@@ -1834,7 +1913,7 @@ def evaluate(
                 raise HarnessRefusal(
                     "credential_missing", f"live {client} credential environment variable is absent"
                 )
-            credentials[client] = value
+            credentials[client] = validate_credential_value(value)
 
     with tempfile.TemporaryDirectory(prefix="again-real-agent-eval-") as temporary:
         private = pathlib.Path(temporary).resolve()
@@ -2091,6 +2170,7 @@ def evaluate(
                 "fixture_repository_is_temporary": True,
                 "fresh_configuration_state_and_repository_per_pair": True,
                 "repository_contents_verified_after_each_condition": True,
+                "repository_head_index_and_status_verified_after_each_condition": True,
                 "measurement_definitions": {
                     "response_bytes": (
                         "canonical bytes of redacted Again tool results observable in client events"
@@ -2141,9 +2221,29 @@ def evaluate(
 def write_json_exclusive(
     path: pathlib.Path, value: Mapping[str, Any], credentials: Sequence[bytes] = ()
 ) -> None:
+    def contains_credential(node: Any, credential: str) -> bool:
+        if isinstance(node, str):
+            return credential in node
+        if isinstance(node, Mapping):
+            return any(
+                contains_credential(key, credential) or contains_credential(item, credential)
+                for key, item in node.items()
+            )
+        if isinstance(node, Sequence) and not isinstance(node, (str, bytes, bytearray)):
+            return any(contains_credential(item, credential) for item in node)
+        return False
+
     encoded = canonical_json_bytes(dict(value)) + b"\n"
     for credential in credentials:
-        if credential and (credential in encoded or sha256_bytes(credential).encode("ascii") in encoded):
+        try:
+            credential_text = credential.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise HarnessRefusal(
+                "credential_persistence", "credential guard received non-UTF-8 material"
+            ) from error
+        if credential and (
+            credential in encoded or contains_credential(value, credential_text)
+        ):
             raise HarnessRefusal(
                 "credential_persistence", "refusing evidence containing credential material"
             )

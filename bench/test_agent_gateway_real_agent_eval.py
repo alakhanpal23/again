@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from typing import Any
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("agent_gateway_real_agent_eval.py")
@@ -195,20 +196,25 @@ class RealAgentEvalTests(unittest.TestCase):
         real_eval.write_json_exclusive(safe_output, {"diagnostic": redacted.decode()}, (secret,))
         encoded = safe_output.read_bytes()
         self.assertNotIn(secret, encoded)
-        self.assertNotIn(hashlib.sha256(secret).hexdigest().encode(), encoded)
 
         with self.assertRaises(real_eval.HarnessRefusal) as raw_refusal:
             real_eval.write_json_exclusive(
                 self.root / "raw.json", {"credential": secret.decode()}, (secret,)
             )
         self.assertEqual(raw_refusal.exception.code, "credential_persistence")
-        with self.assertRaises(real_eval.HarnessRefusal) as hash_refusal:
-            real_eval.write_json_exclusive(
-                self.root / "hash.json",
-                {"credential_hash": hashlib.sha256(secret).hexdigest()},
-                (secret,),
-            )
-        self.assertEqual(hash_refusal.exception.code, "credential_persistence")
+        escaped_secret = b'unit-test-"quoted"-credential'
+        with self.assertRaises(real_eval.HarnessRefusal) as escaped_refusal:
+            with mock.patch.object(
+                real_eval.hashlib,
+                "sha256",
+                side_effect=AssertionError("credential guard must not hash credentials"),
+            ):
+                real_eval.write_json_exclusive(
+                    self.root / "escaped.json",
+                    {"nested": [{"credential": escaped_secret.decode()}]},
+                    (escaped_secret,),
+                )
+        self.assertEqual(escaped_refusal.exception.code, "credential_persistence")
 
     def test_paired_run_reconciliation_separates_gateway_events(self) -> None:
         baseline = [run_observation()]
@@ -296,6 +302,34 @@ class RealAgentEvalTests(unittest.TestCase):
         with self.assertRaises(real_eval.HarnessRefusal) as unsafe:
             real_eval.snapshot_repository_contents(repository)
         self.assertEqual(unsafe.exception.code, "repository_unsafe")
+
+    def test_git_identity_detects_index_only_mutation(self) -> None:
+        repository = self.root / "git-identity-repository"
+        fixture = real_eval.create_fixture_repository(repository, self.environment, 5)
+        initial = real_eval.repository_git_identity(repository, self.environment, 5)
+        self.assertTrue(initial["status_clean"])
+        self.assertEqual(initial["head_commit"], fixture["git_sha"])
+
+        path = repository / "facts" / "primary.txt"
+        path.write_text("index-only mutation\n")
+        path.chmod(0o600)
+        added = real_eval.run_bounded_command(
+            ("/usr/bin/git", "add", "facts/primary.txt"),
+            cwd=repository,
+            environment={**self.environment, "GIT_OPTIONAL_LOCKS": "0"},
+            timeout_seconds=5,
+        )
+        real_eval.require_checked_command(added, "test index mutation")
+        path.write_text(real_eval.FIXTURE_FILES["facts/primary.txt"])
+        path.chmod(0o600)
+
+        content_diff = real_eval.repository_diff(
+            fixture["file_sha256"], real_eval.snapshot_repository_contents(repository)
+        )
+        changed_git = real_eval.repository_git_identity(repository, self.environment, 5)
+        self.assertTrue(content_diff["clean"])
+        self.assertNotEqual(changed_git, initial)
+        self.assertNotEqual(changed_git["index_sha256"], initial["index_sha256"])
 
     def test_unsupported_client_versions_are_refused(self) -> None:
         codex_help = "Codex CLI --version"
