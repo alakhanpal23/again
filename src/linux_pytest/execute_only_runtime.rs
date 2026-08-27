@@ -2895,7 +2895,23 @@ mod tests {
                 workspace_s2,
                 c"root",
             )
-            .unwrap();
+            .unwrap_or_else(|error| match error {
+                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Materialization(
+                        super::super::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
+                            failure,
+                        ),
+                    ),
+                ) => panic!(
+                    "workspace materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
+                    failure.code(),
+                    failure.stage(),
+                    failure.kind(),
+                    failure.regular_stage(),
+                    failure.errno()
+                ),
+                error => panic!("workspace publication failure: {error:?}"),
+            });
         let checkpoint = qualify_first_execute_only_runtime_checkpoint_v1(workspace_binding)
             .expect("real workspace publication must reach the descriptor-bound checkpoint");
 
@@ -2918,7 +2934,23 @@ mod tests {
                 runtime_s2,
                 c"root",
             )
-            .unwrap();
+            .unwrap_or_else(|error| match error {
+                super::super::snapshot_manifest::SnapshotPublishedCanonicalTreeErrorV1::FourView(
+                    super::super::snapshot_connector::SnapshotPipelineFourViewErrorV1::Materialization(
+                        super::super::snapshot_materialize::SnapshotTreeMaterializeErrorV1::Materializer(
+                            failure,
+                        ),
+                    ),
+                ) => panic!(
+                    "runtime materializer failure: code={:?} stage={:?} kind={:?} regular_stage={:?} errno={:?}",
+                    failure.code(),
+                    failure.stage(),
+                    failure.kind(),
+                    failure.regular_stage(),
+                    failure.errno()
+                ),
+                error => panic!("runtime publication failure: {error:?}"),
+            });
         let expected_workspace_root = checkpoint.workspace_root_digest();
         let expected_runtime_root = runtime_publication_token.root_digest();
 
