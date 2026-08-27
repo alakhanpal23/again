@@ -30,7 +30,9 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 
 use super::snapshot_connector::{SnapshotChargedErrorV1, SnapshotPublicationSessionV1};
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-use super::snapshot_manifest::SnapshotPreparedPublishedChildBindV1;
+use super::snapshot_manifest::{
+    SnapshotPreparedPublishedChildBindV1, SnapshotPreparedRetainedRootProjectionV1,
+};
 use super::snapshot_policy::SnapshotPipelineResourceErrorV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_policy::{
@@ -64,7 +66,10 @@ const SEALED_DIRECTORY_MODE: u32 = 0o500;
 const PUBLICATION_CONTAINER_LEVELS: u16 = 2;
 const HARD_MAX_CLEANUP_DEPTH: u16 = HARD_MAX_SOURCE_TREE_DEPTH + PUBLICATION_CONTAINER_LEVELS;
 // One descriptor pins an unpublished staging directory. Publication briefly
-// owns that descriptor plus the constrained reopen of its final name.
+// owns that descriptor plus the constrained reopen of its final name. The
+// later retained-root projection uses one name-relative `statx` through the
+// already-pinned publication descriptor and opens no third descriptor, so the
+// exact retained/projection peak remains two.
 const MAX_LIVE_STAGED_FDS: u32 = 1;
 const MAX_LIVE_PUBLICATION_FDS: u32 = 2;
 // Cleanup retains the original staging descriptor and its current-name
@@ -102,6 +107,7 @@ pub(super) enum BoundRegularReadRefusalV1 {
     ByteLimit,
     ShortRead,
     Io,
+    OperationBudget,
     MemoryBudget,
     UnsupportedPlatform,
 }
@@ -469,18 +475,16 @@ pub(super) fn revalidate_bound_regular_bytes_v1(
     platform::revalidate_bound_regular_bytes_v1(bound, verified)
 }
 
-/// Reopen one already-bound published child by its connector-retained role
-/// name and prove that the selected directory and the pinned root descriptor
-/// still name the exact expected inode. No descriptor or pathname escapes.
-/// This is only a point-in-time revalidation; same-UID peers and host root
-/// remain outside the v1 threat model.
+/// Consume the manifest-sealed one-attempt projection for one already-bound
+/// published root. The leaf performs exactly one non-retrying name-relative
+/// `statx`, opens no descriptor, and exposes no generic name/commitment seam.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) fn revalidate_bound_published_snapshot_root_v1(
+pub(super) fn consume_bound_published_snapshot_root_projection_v1(
     bound: &BoundPublishedSnapshotChildV1,
-    child_name: &CStr,
-    expected_root_statx_commitment: [u8; 102],
+    prepared: SnapshotPreparedRetainedRootProjectionV1<'_>,
 ) -> Result<(), BoundRegularReadRefusalV1> {
-    platform::revalidate_bound_published_snapshot_root_v1(
+    let (child_name, expected_root_statx_commitment) = prepared.into_leaf_parts();
+    platform::consume_bound_published_snapshot_root_projection_v1(
         bound,
         child_name,
         expected_root_statx_commitment,
@@ -640,10 +644,11 @@ impl SnapshotPublishPolicyV1 {
     }
 
     /// Exact post-publication child-binding escrow: at most `O` constrained
-    /// `openat2` attempts followed by exactly one descriptor-based `statx`.
+    /// `openat2` attempts, one descriptor-based bind `statx`, and one permit
+    /// precharge for the later exact, non-retrying root-name `statx`.
     pub(super) fn published_child_bind_operation_attempt_bound(self) -> NonZeroU64 {
-        NonZeroU64::new(u64::from(self.openat2_attempts.get()) + 1)
-            .expect("a nonzero u8 retry count plus one is nonzero")
+        NonZeroU64::new(u64::from(self.openat2_attempts.get()) + 2)
+            .expect("a nonzero u8 retry count plus two is nonzero")
     }
 
     /// Descriptor retained while the caller builds and seals the stage.
@@ -656,7 +661,8 @@ impl SnapshotPublishPolicyV1 {
         cleanup_fd_peak(self.max_cleanup_depth)
     }
 
-    /// Descriptor peak while the final published name is reopened and bound.
+    /// Descriptor peak while the final name is bound and while the later
+    /// no-new-FD retained-root projection runs.
     pub(super) const fn max_live_publication_fds(self) -> u32 {
         MAX_LIVE_PUBLICATION_FDS
     }
@@ -1425,6 +1431,7 @@ mod platform {
     pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
         published: OwnedFd,
         root: OwnedFd,
+        retained_root_projection_admitted: Cell<bool>,
     }
 
     impl fmt::Debug for VerifiedReadySnapshotDirectoryV1<'_> {
@@ -1832,7 +1839,7 @@ mod platform {
         revalidate_bound_ancestors_v1(bound, verified.root_statx_commitment, &verified.pinned_fds)
     }
 
-    pub(super) fn revalidate_bound_published_snapshot_root_v1(
+    pub(super) fn consume_bound_published_snapshot_root_projection_v1(
         bound: &BoundPublishedSnapshotChildV1,
         child_name: &CStr,
         expected_root_statx_commitment: [u8; 102],
@@ -1840,26 +1847,12 @@ mod platform {
         if !valid_raw_basename(child_name) {
             return Err(BoundRegularReadRefusalV1::InvalidPath);
         }
-        let published_before = node_statx_v1(bound.published.as_fd())?;
-        let root_before = node_statx_v1(bound.root.as_fd())?;
-        if published_before.mode() & libc::S_IFMT != libc::S_IFDIR
-            || root_before.mode() & libc::S_IFMT != libc::S_IFDIR
-            || root_before.commitment_bytes_v1() != expected_root_statx_commitment
-        {
-            return Err(BoundRegularReadRefusalV1::IdentityDrift);
+        if !bound.retained_root_projection_admitted.replace(false) {
+            return Err(BoundRegularReadRefusalV1::OperationBudget);
         }
-        let reopened = open_bound_component_v1(
-            bound.published.as_fd(),
-            child_name,
-            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )?;
-        let reopened_identity = node_statx_v1(reopened.as_fd())?;
-        let root_after = node_statx_v1(bound.root.as_fd())?;
-        let published_after = node_statx_v1(bound.published.as_fd())?;
-        if reopened_identity.mode() & libc::S_IFMT != libc::S_IFDIR
-            || reopened_identity.commitment_bytes_v1() != expected_root_statx_commitment
-            || root_after.commitment_bytes_v1() != expected_root_statx_commitment
-            || published_after.commitment_bytes_v1() != published_before.commitment_bytes_v1()
+        let named = node_statx_at_name_v1(bound.published.as_fd(), child_name)?;
+        if named.mode() & libc::S_IFMT != libc::S_IFDIR
+            || named.commitment_bytes_v1() != expected_root_statx_commitment
         {
             return Err(BoundRegularReadRefusalV1::IdentityDrift);
         }
@@ -1993,6 +1986,28 @@ mod platform {
         SourceStatxV1::from_linux_statx_v1(&raw).map_err(map_bound_io_v1)
     }
 
+    fn node_statx_at_name_v1(
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+    ) -> Result<SourceStatxV1, BoundRegularReadRefusalV1> {
+        let mut raw = MaybeUninit::<libc::statx>::zeroed();
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                SOURCE_TREE_REQUESTED_STATX_MASK_V1,
+                raw.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(map_bound_io_v1(io::Error::last_os_error()));
+        }
+        let raw = unsafe { raw.assume_init() };
+        SourceStatxV1::from_linux_statx_v1(&raw).map_err(map_bound_io_v1)
+    }
+
     fn map_bound_io_v1(error: io::Error) -> BoundRegularReadRefusalV1 {
         match error.raw_os_error() {
             Some(libc::ENOENT) | Some(libc::ENOTDIR) => BoundRegularReadRefusalV1::MissingNode,
@@ -2010,6 +2025,25 @@ mod platform {
         expected_statx_commitment: [u8; 102],
         reservation: SnapshotPublishedChildBindReservationV1<'_>,
     ) -> Result<BoundPublishedSnapshotChildV1, SnapshotPublishedChildBindErrorV1> {
+        bind_published_snapshot_child_at_with_projection_hook(
+            published,
+            child_name,
+            expected_statx_commitment,
+            reservation,
+            |_| {},
+        )
+    }
+
+    fn bind_published_snapshot_child_at_with_projection_hook<F>(
+        published: PublishedSnapshotDirectoryV1,
+        child_name: &CStr,
+        expected_statx_commitment: [u8; 102],
+        reservation: SnapshotPublishedChildBindReservationV1<'_>,
+        projection_hook: F,
+    ) -> Result<BoundPublishedSnapshotChildV1, SnapshotPublishedChildBindErrorV1>
+    where
+        F: FnOnce(BorrowedFd<'_>),
+    {
         if !valid_raw_basename(child_name) {
             return Err(SnapshotPublishedChildBindErrorV1::leaf(
                 SnapshotPublishErrorKindV1::InvalidPublishedChildName,
@@ -2067,10 +2101,19 @@ mod platform {
                 None,
             ));
         }
+        projection_hook(root.as_fd());
+
+        // Consume one already-escrowed attempt as the non-forgeable permit
+        // for the later exact, non-retrying name-relative root `statx`. No raw
+        // operation runs here; the private marker can authorize the leaf once.
+        reservation
+            .run_attempt(|| ())
+            .map_err(SnapshotPublishedChildBindErrorV1::resource)?;
 
         Ok(BoundPublishedSnapshotChildV1 {
             published: directory,
             root,
+            retained_root_projection_admitted: Cell::new(true),
         })
     }
 
@@ -4147,7 +4190,7 @@ mod platform {
             let before = authority
                 .remaining_attempts(PublisherAttemptBucketV1::Forward)
                 .unwrap();
-            let exact = u64::from(staged.cleanup.policy().openat2_attempts()) + 1;
+            let exact = u64::from(staged.cleanup.policy().openat2_attempts()) + 2;
             let fstats_before = DIRECTORY_FSTAT_CALLS.with(|calls| calls.get());
             PUBLISHED_CHILD_STATX_CALLS.with(|calls| calls.set(0));
 
@@ -5276,16 +5319,17 @@ mod platform {
                 .unwrap();
             assert_eq!(
                 resources.forward_attempts_remaining_for_test(),
-                before - u64::from(policy().openat2_attempts()) - 1
+                before - u64::from(policy().openat2_attempts()) - 2
             );
 
             let bound =
                 bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap();
 
-            // The first constrained open and the one statx are the only raw
-            // attempts on the successful path; the unused open retry suffix
-            // has already returned to the shared ledger.
-            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 2);
+            // The first constrained open and bind statx are the only raw
+            // attempts so far. One additional attempt was consumed as the
+            // one-shot projection permit; the unused open retry suffix was
+            // returned to the shared ledger.
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 3);
             assert_eq!(
                 fstat_raw(bound_published_snapshot_root_fd(&bound))
                     .unwrap()
@@ -5308,9 +5352,9 @@ mod platform {
             assert!(fixture.final_path().join("root").is_dir());
         }
 
-        #[test]
-        fn retained_root_revalidation_reopens_exact_role_name_and_refuses_drift() {
-            let fixture = Fixture::new();
+        fn bound_root_for_projection(
+            fixture: &Fixture,
+        ) -> (BoundPublishedSnapshotChildV1, [u8; 102]) {
             let published = fixture.publish_root();
             let expected = published_child_commitment(&published, ROOT);
             let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
@@ -5319,24 +5363,117 @@ mod platform {
                     policy().published_child_bind_operation_attempt_bound(),
                 )
                 .unwrap();
-            let bound =
-                bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap();
+            (
+                bind_published_snapshot_child_at(published, ROOT, expected, reservation).unwrap(),
+                expected,
+            )
+        }
+
+        #[test]
+        fn retained_root_projection_is_one_shot_and_refuses_missing_replacement_and_drift() {
+            let fixture = Fixture::new();
+            let (bound, expected) = bound_root_for_projection(&fixture);
 
             assert_eq!(
-                super::revalidate_bound_published_snapshot_root_v1(&bound, ROOT, expected),
+                super::consume_bound_published_snapshot_root_projection_v1(&bound, ROOT, expected,),
                 Ok(())
             );
-            fs::set_permissions(
-                fixture
+            assert_eq!(
+                super::consume_bound_published_snapshot_root_projection_v1(&bound, ROOT, expected,),
+                Err(BoundRegularReadRefusalV1::OperationBudget)
+            );
+
+            let missing = Fixture::new();
+            let (missing_bound, missing_expected) = bound_root_for_projection(&missing);
+            fs::rename(
+                missing
                     .final_path()
                     .join(OsStr::from_bytes(ROOT.to_bytes())),
+                missing.final_path().join("root-moved"),
+            )
+            .unwrap();
+            assert_eq!(
+                super::consume_bound_published_snapshot_root_projection_v1(
+                    &missing_bound,
+                    ROOT,
+                    missing_expected,
+                ),
+                Err(BoundRegularReadRefusalV1::MissingNode)
+            );
+
+            let replacement = Fixture::new();
+            let (replacement_bound, replacement_expected) = bound_root_for_projection(&replacement);
+            fs::rename(
+                replacement
+                    .final_path()
+                    .join(OsStr::from_bytes(ROOT.to_bytes())),
+                replacement.final_path().join("root-moved"),
+            )
+            .unwrap();
+            fs::create_dir(
+                replacement
+                    .final_path()
+                    .join(OsStr::from_bytes(ROOT.to_bytes())),
+            )
+            .unwrap();
+            assert_eq!(
+                super::consume_bound_published_snapshot_root_projection_v1(
+                    &replacement_bound,
+                    ROOT,
+                    replacement_expected,
+                ),
+                Err(BoundRegularReadRefusalV1::IdentityDrift)
+            );
+
+            let drift = Fixture::new();
+            let (drift_bound, drift_expected) = bound_root_for_projection(&drift);
+            fs::set_permissions(
+                drift.final_path().join(OsStr::from_bytes(ROOT.to_bytes())),
                 fs::Permissions::from_mode(0o700),
             )
             .unwrap();
             assert_eq!(
-                super::revalidate_bound_published_snapshot_root_v1(&bound, ROOT, expected),
+                super::consume_bound_published_snapshot_root_projection_v1(
+                    &drift_bound,
+                    ROOT,
+                    drift_expected,
+                ),
                 Err(BoundRegularReadRefusalV1::IdentityDrift)
             );
+        }
+
+        #[test]
+        fn projection_permit_exhaustion_closes_both_bound_descriptors() {
+            let fixture = Fixture::new();
+            let published = fixture.publish_root();
+            let expected = published_child_commitment(&published, ROOT);
+            let published_raw = published.directory().as_raw_fd();
+            let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
+            let before = resources.forward_attempts_remaining_for_test();
+            let reservation = resources
+                .reserve_published_child_bind_attempts(NonZeroU64::new(2).unwrap())
+                .unwrap();
+            let root_raw = Cell::new(-1);
+            let error = bind_published_snapshot_child_at_with_projection_hook(
+                published,
+                ROOT,
+                expected,
+                reservation,
+                |root| root_raw.set(root.as_raw_fd()),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error.failure(),
+                SnapshotPublishedChildBindFailureV1::Resource(
+                    SnapshotPipelineResourceErrorV1::OperationBudgetExhausted { .. }
+                )
+            ));
+            assert_eq!(resources.forward_attempts_remaining_for_test(), before - 2);
+            assert_ne!(root_raw.get(), -1);
+            assert_eq!(unsafe { libc::fcntl(published_raw, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            assert_eq!(unsafe { libc::fcntl(root_raw.get(), libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
         }
 
         fn read_bound_for_test(
@@ -6010,6 +6147,7 @@ mod platform {
     pub(in crate::linux_pytest) struct BoundPublishedSnapshotChildV1 {
         published: OwnedFd,
         root: OwnedFd,
+        retained_root_projection_admitted: Cell<bool>,
     }
 
     impl<'parent> StagedSnapshotDirectoryV1<'parent> {
@@ -6187,12 +6325,12 @@ mod portable_tests {
     }
 
     #[test]
-    fn published_child_bind_bound_is_exactly_open_retries_plus_one_statx() {
+    fn published_child_bind_bound_adds_bind_statx_and_one_shot_projection_permit() {
         for openat2_attempts in [1, 4, HARD_MAX_OPENAT2_ATTEMPTS] {
             let policy = checked_policy(openat2_attempts, 1, 0, 1, 1, 4096).unwrap();
             assert_eq!(
                 policy.published_child_bind_operation_attempt_bound().get(),
-                u64::from(openat2_attempts) + 1
+                u64::from(openat2_attempts) + 2
             );
         }
     }

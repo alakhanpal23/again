@@ -21,10 +21,10 @@ use super::ExecutableChainDigest;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
     FirstExecuteOnlyPublishedRootPairRefusalV1, FirstExecuteOnlyPublishedRuntimeTreeV1,
-    FirstExecuteOnlyRetainedPublishedRootPairV1, FirstExecuteOnlyRuntimeInventoryObjectV1,
-    FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1, FirstExecuteOnlyWorkspaceRuntimeEvidenceV1,
-    FirstExecuteOnlyWorkspaceTreeBindingV1,
-    consume_first_execute_only_retained_published_root_pair_v1,
+    FirstExecuteOnlyRetainedPublishedRootStorageV1, FirstExecuteOnlyRootPairObjectRefusalV1,
+    FirstExecuteOnlyRuntimeInventoryObjectV1, FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+    FirstExecuteOnlyWorkspaceRuntimeEvidenceV1, FirstExecuteOnlyWorkspaceTreeBindingV1,
+    consume_first_execute_only_retained_published_root_storage_v1,
     consume_first_execute_only_workspace_runtime_evidence_v1,
     read_first_execute_only_runtime_inventory_object_v1,
     read_first_execute_only_workspace_inventory_object_v1,
@@ -991,6 +991,7 @@ fn map_workspace_evidence_refusal_v1(
         Input::ByteLimit => Output::ByteLimit,
         Input::ShortRead => Output::ShortRead,
         Input::Io => Output::Io,
+        Input::OperationBudget => Output::RuntimeForestOperationBudget,
         Input::ManifestNodeMissing => Output::ManifestNodeMissing,
         Input::ManifestNodeAmbiguous => Output::ManifestNodeAmbiguous,
         Input::ManifestKindMismatch => Output::ManifestKindMismatch,
@@ -1717,11 +1718,17 @@ impl fmt::Debug for FirstExecuteOnlyRuntimeStructuralInventoryV1<'_> {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
-    SelectedObjectDrift,
+    InventoryOwnerMissing,
+    WorkspaceSelectedObjectIdentityDrift,
+    WorkspaceSelectedObjectIo,
+    RuntimeSelectedObjectIdentityDrift,
+    RuntimeSelectedObjectIo,
     WorkspaceRootIdentityDrift,
     WorkspaceRootIo,
+    WorkspaceRootOperationBudget,
     RuntimeRootIdentityDrift,
     RuntimeRootIo,
+    RuntimeRootOperationBudget,
 }
 
 /// Opaque, linear, one-shot ownership of the independently published
@@ -1735,7 +1742,7 @@ pub(super) enum FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[must_use = "the linear publication-root owners must be consumed or explicitly dropped"]
 pub(super) struct FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources> {
-    _roots: FirstExecuteOnlyRetainedPublishedRootPairV1<'resources>,
+    _roots: FirstExecuteOnlyRetainedPublishedRootStorageV1<'resources>,
     _runtime_closure_request: RuntimeClosureRequestV1,
     _checkpoint_canonical_bytes: Box<[u8]>,
     _checkpoint_chain_digest: ExecutableChainDigest,
@@ -1827,16 +1834,18 @@ pub(super) fn project_first_execute_only_runtime_retained_root_pair_v1<'resource
         node_count,
         symlink_hop_count,
     } = _checkpoint;
-    let roots =
-        consume_first_execute_only_retained_published_root_pair_v1(_evidence, _runtime_publication)
-            .map_err(map_published_root_pair_refusal_v1)?;
+    let roots = consume_first_execute_only_retained_published_root_storage_v1(
+        _evidence,
+        _runtime_publication,
+    )
+    .map_err(map_published_root_pair_refusal_v1)?;
     for node in &plan.nodes {
         let object = node
             .publication
             .as_ref()
-            .ok_or(FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift)?;
+            .ok_or(FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::InventoryOwnerMissing)?;
         revalidate_first_execute_only_root_pair_inventory_object_v1(&roots, object)
-            .map_err(|_| FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift)?;
+            .map_err(map_root_pair_object_refusal_v1)?;
     }
     Ok(FirstExecuteOnlyRuntimeRetainedRootPairV1 {
         _roots: roots,
@@ -1853,6 +1862,26 @@ pub(super) fn project_first_execute_only_runtime_retained_root_pair_v1<'resource
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_root_pair_object_refusal_v1(
+    refusal: FirstExecuteOnlyRootPairObjectRefusalV1,
+) -> FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
+    match refusal {
+        FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIdentityDrift => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceSelectedObjectIdentityDrift
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIo => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceSelectedObjectIo
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIdentityDrift => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeSelectedObjectIdentityDrift
+        }
+        FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIo => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeSelectedObjectIo
+        }
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 const fn map_published_root_pair_refusal_v1(
     refusal: FirstExecuteOnlyPublishedRootPairRefusalV1,
 ) -> FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 {
@@ -1863,11 +1892,17 @@ const fn map_published_root_pair_refusal_v1(
         FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIo => {
             FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceRootIo
         }
+        FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceOperationBudget => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceRootOperationBudget
+        }
         FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIdentityDrift => {
             FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootIdentityDrift
         }
         FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIo => {
             FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootIo
+        }
+        FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeOperationBudget => {
+            FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeRootOperationBudget
         }
     }
 }
@@ -3060,6 +3095,7 @@ mod tests {
         RuntimeObjectBeforeInventory,
         WorkspaceRootBeforeProjection,
         RuntimeRootBeforeProjection,
+        WorkspaceObjectBeforeProjection,
         RuntimeObjectBeforeProjection,
     }
 
@@ -3265,7 +3301,21 @@ mod tests {
                     assert_eq!(
                         project_first_execute_only_runtime_retained_root_pair_v1(inventory)
                             .unwrap_err(),
-                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::SelectedObjectDrift
+                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::RuntimeSelectedObjectIdentityDrift
+                    );
+                }
+                RealPublicationMutationV1::WorkspaceObjectBeforeProjection => {
+                    fs::set_permissions(
+                        workspace_publication
+                            .path()
+                            .join("workspace-final/root/.venv/bin/python"),
+                        fs::Permissions::from_mode(0o700),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        project_first_execute_only_runtime_retained_root_pair_v1(inventory)
+                            .unwrap_err(),
+                        FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1::WorkspaceSelectedObjectIdentityDrift
                     );
                 }
                 RealPublicationMutationV1::RuntimeObjectBeforeInventory => {
@@ -3289,6 +3339,9 @@ mod tests {
             RealPublicationMutationV1::WorkspaceRootBeforeProjection,
         );
         run_real_publication_inventory_case(RealPublicationMutationV1::RuntimeRootBeforeProjection);
+        run_real_publication_inventory_case(
+            RealPublicationMutationV1::WorkspaceObjectBeforeProjection,
+        );
         run_real_publication_inventory_case(
             RealPublicationMutationV1::RuntimeObjectBeforeProjection,
         );
@@ -3956,6 +4009,51 @@ mod tests {
 
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     #[test]
+    fn retained_root_refusal_mapping_preserves_role_cause_and_operation_budget() {
+        use FirstExecuteOnlyPublishedRootPairRefusalV1 as RootInput;
+        use FirstExecuteOnlyRootPairObjectRefusalV1 as ObjectInput;
+        use FirstExecuteOnlyRuntimeRetainedRootPairRefusalV1 as Output;
+
+        for (input, expected) in [
+            (
+                RootInput::WorkspaceIdentityDrift,
+                Output::WorkspaceRootIdentityDrift,
+            ),
+            (RootInput::WorkspaceIo, Output::WorkspaceRootIo),
+            (
+                RootInput::WorkspaceOperationBudget,
+                Output::WorkspaceRootOperationBudget,
+            ),
+            (
+                RootInput::RuntimeIdentityDrift,
+                Output::RuntimeRootIdentityDrift,
+            ),
+            (RootInput::RuntimeIo, Output::RuntimeRootIo),
+            (
+                RootInput::RuntimeOperationBudget,
+                Output::RuntimeRootOperationBudget,
+            ),
+        ] {
+            assert_eq!(map_published_root_pair_refusal_v1(input), expected);
+        }
+        for (input, expected) in [
+            (
+                ObjectInput::WorkspaceIdentityDrift,
+                Output::WorkspaceSelectedObjectIdentityDrift,
+            ),
+            (ObjectInput::WorkspaceIo, Output::WorkspaceSelectedObjectIo),
+            (
+                ObjectInput::RuntimeIdentityDrift,
+                Output::RuntimeSelectedObjectIdentityDrift,
+            ),
+            (ObjectInput::RuntimeIo, Output::RuntimeSelectedObjectIo),
+        ] {
+            assert_eq!(map_root_pair_object_refusal_v1(input), expected);
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
     fn checkpoint_is_linear_non_clone_non_copy() {
         trait AmbiguousIfClone<A> {
             fn probe() {}
@@ -3982,10 +4080,10 @@ mod tests {
         assert!(std::mem::needs_drop::<
             FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
         >());
-        <FirstExecuteOnlyRetainedPublishedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
-        <FirstExecuteOnlyRetainedPublishedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlyRetainedPublishedRootStorageV1<'static> as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlyRetainedPublishedRootStorageV1<'static> as AmbiguousIfCopy<_>>::probe();
         assert!(std::mem::needs_drop::<
-            FirstExecuteOnlyRetainedPublishedRootPairV1<'static>,
+            FirstExecuteOnlyRetainedPublishedRootStorageV1<'static>,
         >());
         let _one_shot_projection: fn(
             FirstExecuteOnlyRuntimeStructuralInventoryV1<'static>,
@@ -3997,8 +4095,8 @@ mod tests {
             FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'static>,
             FirstExecuteOnlyPublishedRuntimeTreeV1<'static>,
         ) -> Result<
-            FirstExecuteOnlyRetainedPublishedRootPairV1<'static>,
+            FirstExecuteOnlyRetainedPublishedRootStorageV1<'static>,
             FirstExecuteOnlyPublishedRootPairRefusalV1,
-        > = consume_first_execute_only_retained_published_root_pair_v1;
+        > = consume_first_execute_only_retained_published_root_storage_v1;
     }
 }

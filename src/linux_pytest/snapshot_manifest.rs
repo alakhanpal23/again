@@ -40,7 +40,7 @@ use super::snapshot_publish::{
     BoundPublishedSnapshotChildV1, BoundRegularReadRefusalV1, RuntimeMemoryEscrowV1,
     SnapshotPublishAndBindErrorV1, SnapshotPublishErrorV1, SnapshotPublishedChildBindErrorV1,
     ValidatedBoundRelativePathV1, VerifiedBoundNodeKindV1, VerifiedBoundRegularBytesV1,
-    read_bound_regular_bytes_v1, revalidate_bound_published_snapshot_root_v1,
+    consume_bound_published_snapshot_root_projection_v1, read_bound_regular_bytes_v1,
     revalidate_bound_regular_bytes_v1, seal_publish_and_bind_snapshot_child_at,
     validate_snapshot_final_name,
 };
@@ -123,6 +123,22 @@ impl<'resources, 'evidence> SnapshotPreparedPublishedChildBindV1<'resources, 'ev
     }
 }
 
+/// One manifest-sealed, role-specific input for the already-precharged root
+/// projection leaf. Private fields prevent any sibling from supplying a name
+/// or commitment independently of its retained canonical tree.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+pub(super) struct SnapshotPreparedRetainedRootProjectionV1<'evidence> {
+    root_name: &'evidence CStr,
+    expected_root_statx_commitment: [u8; 102],
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+impl<'evidence> SnapshotPreparedRetainedRootProjectionV1<'evidence> {
+    pub(super) fn into_leaf_parts(self) -> (&'evidence CStr, [u8; 102]) {
+        (self.root_name, self.expected_root_statx_commitment)
+    }
+}
+
 /// Physical published-tree descriptors paired with the exact charged
 /// canonical manifest that proved their D2 root identity. Physical fields are
 /// dropped first. This remains snapshot evidence, not execution/reuse
@@ -201,6 +217,7 @@ pub(super) enum FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1 {
     ByteLimit,
     ShortRead,
     Io,
+    OperationBudget,
     MemoryBudget,
     ManifestNodeMissing,
     ManifestNodeAmbiguous,
@@ -297,44 +314,59 @@ impl fmt::Debug for FirstExecuteOnlyPublishedRuntimeTreeV1<'_> {
 pub(super) enum FirstExecuteOnlyPublishedRootPairRefusalV1 {
     WorkspaceIdentityDrift,
     WorkspaceIo,
+    WorkspaceOperationBudget,
+    RuntimeIdentityDrift,
+    RuntimeIo,
+    RuntimeOperationBudget,
+}
+
+/// Stable selected-object revalidation failures that retain the object's
+/// private root role and distinguish kernel I/O from identity drift.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FirstExecuteOnlyRootPairObjectRefusalV1 {
+    WorkspaceIdentityDrift,
+    WorkspaceIo,
     RuntimeIdentityDrift,
     RuntimeIo,
 }
 
-/// Opaque, linear ownership of the two role-separated publication composites.
-/// The physical roots remain reachable only inside this module, so a future
-/// sealed attachment leaf can consume this type and perform its syscalls here
-/// without adding a raw descriptor/path accessor or arbitrary callback seam.
+/// Opaque, linear storage for the two role-separated publication composites.
+/// This lower value is not an attachment checkpoint and must never be accepted
+/// alone by an attachment leaf. The future leaf must consume the outer full-
+/// inventory owner or an unforgeable seal that owner issues, then perform its
+/// descriptor syscalls inside this module or a private child module.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[must_use = "the two publication-root owners must be consumed or explicitly dropped"]
-pub(super) struct FirstExecuteOnlyRetainedPublishedRootPairV1<'resources> {
+pub(super) struct FirstExecuteOnlyRetainedPublishedRootStorageV1<'resources> {
     workspace: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
     runtime: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-impl fmt::Debug for FirstExecuteOnlyRetainedPublishedRootPairV1<'_> {
+impl fmt::Debug for FirstExecuteOnlyRetainedPublishedRootStorageV1<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("FirstExecuteOnlyRetainedPublishedRootPairV1")
+            .debug_struct("FirstExecuteOnlyRetainedPublishedRootStorageV1")
             .field("workspace_root", &"<retained-redacted>")
             .field("runtime_root", &"<retained-redacted>")
             .finish()
     }
 }
 
-/// Consume and revalidate both typed publication roots into the only
-/// operation-specific owner that a future manifest-local attachment leaf may
-/// accept. Descriptors, root names, and host paths never escape. This remains
-/// a point-in-time same-process proof and does not claim protection against
-/// same-UID peers or host root; the attachment leaf must revalidate again at
-/// its own irreversible boundary.
+/// Consume and revalidate both typed publication roots into private retained
+/// storage for the outer complete-inventory owner. This lower storage is not
+/// accepted by a future attachment leaf; that leaf must consume the outer
+/// owner or an unforgeable seal it issues. Descriptors, root names, and host
+/// paths never escape. This remains a point-in-time same-process proof and does
+/// not claim protection against same-UID peers or host root; the attachment
+/// leaf must revalidate again at its own irreversible boundary.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-pub(super) fn consume_first_execute_only_retained_published_root_pair_v1<'resources>(
+pub(super) fn consume_first_execute_only_retained_published_root_storage_v1<'resources>(
     workspace: FirstExecuteOnlyWorkspaceRuntimeEvidenceV1<'resources>,
     runtime: FirstExecuteOnlyPublishedRuntimeTreeV1<'resources>,
 ) -> Result<
-    FirstExecuteOnlyRetainedPublishedRootPairV1<'resources>,
+    FirstExecuteOnlyRetainedPublishedRootStorageV1<'resources>,
     FirstExecuteOnlyPublishedRootPairRefusalV1,
 > {
     revalidate_first_execute_only_published_tree_root_v1(&workspace.binding.workspace).map_err(
@@ -343,7 +375,7 @@ pub(super) fn consume_first_execute_only_retained_published_root_pair_v1<'resour
     revalidate_first_execute_only_published_tree_root_v1(&runtime.tree).map_err(|error| {
         map_root_pair_refusal_v1(error, FirstExecuteOnlyInventoryRootV1::Runtime)
     })?;
-    Ok(FirstExecuteOnlyRetainedPublishedRootPairV1 { workspace, runtime })
+    Ok(FirstExecuteOnlyRetainedPublishedRootStorageV1 { workspace, runtime })
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -359,10 +391,12 @@ fn revalidate_first_execute_only_published_tree_root_v1(
     nul_terminated[..root_name.len()].copy_from_slice(root_name);
     let root_name = CStr::from_bytes_with_nul(&nul_terminated[..root_name.len() + 1])
         .map_err(|_| BoundRegularReadRefusalV1::InvalidPath)?;
-    revalidate_bound_published_snapshot_root_v1(
+    consume_bound_published_snapshot_root_projection_v1(
         &tree.physical,
-        root_name,
-        *tree.manifest.destination_root_statx_commitment_v1(),
+        SnapshotPreparedRetainedRootProjectionV1 {
+            root_name,
+            expected_root_statx_commitment: *tree.manifest.destination_root_statx_commitment_v1(),
+        },
     )
 }
 
@@ -371,19 +405,25 @@ const fn map_root_pair_refusal_v1(
     refusal: BoundRegularReadRefusalV1,
     role: FirstExecuteOnlyInventoryRootV1,
 ) -> FirstExecuteOnlyPublishedRootPairRefusalV1 {
-    let identity = !matches!(refusal, BoundRegularReadRefusalV1::Io);
-    match (role, identity) {
-        (FirstExecuteOnlyInventoryRootV1::Workspace, true) => {
-            FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIdentityDrift
-        }
-        (FirstExecuteOnlyInventoryRootV1::Workspace, false) => {
+    match (role, refusal) {
+        (FirstExecuteOnlyInventoryRootV1::Workspace, BoundRegularReadRefusalV1::Io) => {
             FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIo
         }
-        (FirstExecuteOnlyInventoryRootV1::Runtime, true) => {
-            FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIdentityDrift
+        (
+            FirstExecuteOnlyInventoryRootV1::Workspace,
+            BoundRegularReadRefusalV1::OperationBudget,
+        ) => FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceOperationBudget,
+        (FirstExecuteOnlyInventoryRootV1::Workspace, _) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::WorkspaceIdentityDrift
         }
-        (FirstExecuteOnlyInventoryRootV1::Runtime, false) => {
+        (FirstExecuteOnlyInventoryRootV1::Runtime, BoundRegularReadRefusalV1::Io) => {
             FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIo
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, BoundRegularReadRefusalV1::OperationBudget) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeOperationBudget
+        }
+        (FirstExecuteOnlyInventoryRootV1::Runtime, _) => {
+            FirstExecuteOnlyPublishedRootPairRefusalV1::RuntimeIdentityDrift
         }
     }
 }
@@ -832,10 +872,11 @@ pub(super) fn revalidate_first_execute_only_runtime_inventory_object_v1(
 /// callers cannot swap roles or obtain either descriptor.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub(super) fn revalidate_first_execute_only_root_pair_inventory_object_v1(
-    roots: &FirstExecuteOnlyRetainedPublishedRootPairV1<'_>,
+    roots: &FirstExecuteOnlyRetainedPublishedRootStorageV1<'_>,
     object: &FirstExecuteOnlyRuntimeInventoryObjectV1,
-) -> Result<(), FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1> {
-    match object.root {
+) -> Result<(), FirstExecuteOnlyRootPairObjectRefusalV1> {
+    let role = object.root;
+    let result = match role {
         FirstExecuteOnlyInventoryRootV1::Workspace => {
             revalidate_first_execute_only_inventory_object_v1(
                 &roots.workspace.binding.workspace,
@@ -849,6 +890,30 @@ pub(super) fn revalidate_first_execute_only_root_pair_inventory_object_v1(
                 FirstExecuteOnlyInventoryRootV1::Runtime,
                 object,
             )
+        }
+    };
+    result.map_err(|refusal| map_root_pair_object_refusal_v1(refusal, role))
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const fn map_root_pair_object_refusal_v1(
+    refusal: FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1,
+    role: FirstExecuteOnlyInventoryRootV1,
+) -> FirstExecuteOnlyRootPairObjectRefusalV1 {
+    match (role, refusal) {
+        (
+            FirstExecuteOnlyInventoryRootV1::Workspace,
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+        ) => FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIo,
+        (FirstExecuteOnlyInventoryRootV1::Workspace, _) => {
+            FirstExecuteOnlyRootPairObjectRefusalV1::WorkspaceIdentityDrift
+        }
+        (
+            FirstExecuteOnlyInventoryRootV1::Runtime,
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+        ) => FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIo,
+        (FirstExecuteOnlyInventoryRootV1::Runtime, _) => {
+            FirstExecuteOnlyRootPairObjectRefusalV1::RuntimeIdentityDrift
         }
     }
 }
@@ -938,6 +1003,9 @@ fn map_bound_regular_refusal_v1(
             FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::ShortRead
         }
         BoundRegularReadRefusalV1::Io => FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+        BoundRegularReadRefusalV1::OperationBudget => {
+            FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::OperationBudget
+        }
         BoundRegularReadRefusalV1::MemoryBudget => {
             FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::MemoryBudget
         }
@@ -3795,6 +3863,73 @@ mod tests {
         assert_eq!(error, SnapshotManifestCompileErrorV1::MalformedPlan);
         assert_eq!(resources.persistent_manifest_heap_live_for_test(), 0);
         assert_eq!(resources.retained_view_heap_live_for_test(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn retained_root_leaf_mapping_preserves_role_and_failure_class() {
+        use FirstExecuteOnlyInventoryRootV1 as Role;
+        use FirstExecuteOnlyPublishedRootPairRefusalV1 as RootOutput;
+        use FirstExecuteOnlyRootPairObjectRefusalV1 as ObjectOutput;
+
+        for (input, role, expected) in [
+            (
+                BoundRegularReadRefusalV1::IdentityDrift,
+                Role::Workspace,
+                RootOutput::WorkspaceIdentityDrift,
+            ),
+            (
+                BoundRegularReadRefusalV1::Io,
+                Role::Workspace,
+                RootOutput::WorkspaceIo,
+            ),
+            (
+                BoundRegularReadRefusalV1::OperationBudget,
+                Role::Workspace,
+                RootOutput::WorkspaceOperationBudget,
+            ),
+            (
+                BoundRegularReadRefusalV1::IdentityDrift,
+                Role::Runtime,
+                RootOutput::RuntimeIdentityDrift,
+            ),
+            (
+                BoundRegularReadRefusalV1::Io,
+                Role::Runtime,
+                RootOutput::RuntimeIo,
+            ),
+            (
+                BoundRegularReadRefusalV1::OperationBudget,
+                Role::Runtime,
+                RootOutput::RuntimeOperationBudget,
+            ),
+        ] {
+            assert_eq!(map_root_pair_refusal_v1(input, role), expected);
+        }
+        for (input, role, expected) in [
+            (
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::IdentityDrift,
+                Role::Workspace,
+                ObjectOutput::WorkspaceIdentityDrift,
+            ),
+            (
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+                Role::Workspace,
+                ObjectOutput::WorkspaceIo,
+            ),
+            (
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::IdentityDrift,
+                Role::Runtime,
+                ObjectOutput::RuntimeIdentityDrift,
+            ),
+            (
+                FirstExecuteOnlyWorkspaceRuntimeEvidenceRefusalV1::Io,
+                Role::Runtime,
+                ObjectOutput::RuntimeIo,
+            ),
+        ] {
+            assert_eq!(map_root_pair_object_refusal_v1(input, role), expected);
+        }
     }
 
     #[test]
