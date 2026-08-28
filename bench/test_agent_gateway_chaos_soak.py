@@ -263,11 +263,23 @@ class ChaosSoakHarnessTests(unittest.TestCase):
         response = {
             "jsonrpc": "2.0",
             "id": "request-7",
-            "error": {"code": -32021, "message": "bounded refusal"},
+            "error": {
+                "code": -32021,
+                "message": "bounded refusal",
+                "data": {"reason": "bounded"},
+            },
         }
-        harness._require_error(response, "request-7", -32021, "bounded refusal")
+        harness._require_error(
+            response,
+            "request-7",
+            -32021,
+            "bounded refusal",
+            {"reason": "bounded"},
+        )
         with self.assertRaises(harness.HarnessRefusal) as refused:
-            harness._require_error(response, "request-7", -32021, "changed")
+            harness._require_error(
+                response, "request-7", -32021, "changed", {"reason": "bounded"}
+            )
         self.assertEqual(refused.exception.code, "transport_error_mismatch")
 
     def test_invalid_seed_is_refused_before_environmental_work(self) -> None:
