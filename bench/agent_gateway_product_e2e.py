@@ -52,6 +52,22 @@ LEASE_TTL_SECONDS = 30.0
 RECOVERY_GRACE_SECONDS = 6.0
 PROCESS_STOP_SECONDS = 2.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
+EXPECTED_ADVERTISED_TOOLS = (
+    "git.blame",
+    "git.diff",
+    "git.log",
+    "git.show",
+    "git.status",
+    "repo.glob",
+    "repo.list",
+    "repo.manifest",
+    "repo.read",
+    "repo.references",
+    "repo.search",
+    "repo.stat",
+    "repo.tree",
+)
+E2E_EXERCISED_TOOLS = frozenset(("repo.read", "repo.search"))
 
 
 class HarnessRefusal(RuntimeError):
@@ -586,7 +602,7 @@ class McpSession:
         if not isinstance(tools, list):
             raise HarnessRefusal("tools_list_invalid", f"{self.label} returned invalid tools list")
         names = [item.get("name") for item in tools if isinstance(item, dict)]
-        if names != ["repo.read", "repo.search"]:
+        if names != list(EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("tools_list_unexpected", f"unexpected advertised tools: {names!r}")
         self.advertised_tools = set(names)
         return {"initialize": initialized, "tools_list": listing}
@@ -598,7 +614,7 @@ class McpSession:
         arguments: Mapping[str, Any],
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        if tool not in self.advertised_tools or tool not in {"repo.read", "repo.search"}:
+        if tool not in self.advertised_tools or tool not in E2E_EXERCISED_TOOLS:
             raise HarnessRefusal("tool_not_advertised", f"refusing unadvertised tool: {tool}")
         return self.request(
             {
@@ -1519,7 +1535,7 @@ def run_product_e2e(
                     "again_home_external_to_fixture": True,
                     "private_mode": "0700",
                     "network_policy": {
-                        "product_operations": ["repo.read", "repo.search"],
+                        "product_operations": sorted(E2E_EXERCISED_TOOLS),
                         "git_protocol_allowlist": "file",
                         "proxy_endpoint": NETWORK_BLOCK_ENDPOINT,
                         "network_client_code_in_harness": False,
@@ -1534,7 +1550,7 @@ def run_product_e2e(
                 },
                 "mcp": {
                     "protocol_version": MCP_PROTOCOL_VERSION,
-                    "advertised_tools": ["repo.read", "repo.search"],
+                    "advertised_tools": list(EXPECTED_ADVERTISED_TOOLS),
                     "processes": process_evidence,
                 },
                 "scenarios": scenarios,
