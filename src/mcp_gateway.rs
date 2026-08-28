@@ -49,6 +49,7 @@ const MAX_UPSTREAM_TOOL_PAGES_V1: usize = 32;
 const UPSTREAM_RESPONSE_QUEUE_V1: usize = 32;
 const MAX_REASONING_DELIVERY_ACKNOWLEDGMENTS_V1: usize = 128;
 const INTERNAL_DELIVERY_FIELD_V2: &str = "__again_internal_delivery_v2";
+const INTERNAL_REASONING_DELIVERY_FIELD_V2: &str = "__again_internal_reasoning_delivery_v2";
 
 /// Construction seal owned only by the live transport. Protocol bindings can
 /// require this type, but no caller or sibling module can manufacture one from
@@ -647,6 +648,7 @@ struct CapturedDeliveryV1 {
 pub struct ConfirmedDeliveryV1 {
     challenge_id: String,
     gateway_result_id: String,
+    reasoning_delivery_id: Option<String>,
     binding: DeliveryBindingV1,
 }
 
@@ -718,6 +720,7 @@ impl RecipientRetrievalAuthorityV2 {
     pub(crate) fn gateway_result_id(&self) -> &str {
         &self.gateway_result_id
     }
+
     pub(crate) const fn expires_at_ms(&self) -> i64 {
         self.expires_at_ms
     }
@@ -825,6 +828,10 @@ impl ConfirmedDeliveryV1 {
         &self.gateway_result_id
     }
 
+    fn reasoning_delivery_id(&self) -> Option<&str> {
+        self.reasoning_delivery_id.as_deref()
+    }
+
     pub(crate) const fn binding(&self) -> &DeliveryBindingV1 {
         &self.binding
     }
@@ -871,6 +878,7 @@ pub(crate) fn confirmed_delivery_for_test_v1(
     ConfirmedDeliveryV1 {
         challenge_id: challenge_id.to_owned(),
         gateway_result_id: gateway_result_id.to_owned(),
+        reasoning_delivery_id: None,
         binding,
     }
 }
@@ -2189,6 +2197,7 @@ struct PendingDeliveryV1 {
     stdio_session_id: u64,
     request_id: JsonRpcId,
     gateway_result_id: String,
+    reasoning_delivery_id: Option<String>,
     challenge: DeliveryChallengeV1,
 }
 
@@ -2213,6 +2222,7 @@ impl DeliveryLedgerV1 {
         call_digest: [u8; 32],
         captured: CapturedDeliveryV1,
         response_envelope_digest: String,
+        reasoning_delivery_id: Option<String>,
     ) -> Result<DeliveryChallengeV1, DeliveryAuthorityRefusalV1> {
         if self.pending.len() >= MAX_OUTSTANDING_DELIVERY_CHALLENGES_V1 {
             return Err(DeliveryAuthorityRefusalV1::ChallengeCapacity);
@@ -2255,6 +2265,7 @@ impl DeliveryLedgerV1 {
                 stdio_session_id: connection.session_id,
                 request_id: request_id.clone(),
                 gateway_result_id: captured.gateway_result_id,
+                reasoning_delivery_id,
                 challenge: challenge.clone(),
             },
         );
@@ -2334,6 +2345,7 @@ impl DeliveryLedgerV1 {
                 Ok(ConfirmedDeliveryV1 {
                     challenge_id: challenge_id.clone(),
                     gateway_result_id: pending.gateway_result_id,
+                    reasoning_delivery_id: pending.reasoning_delivery_id,
                     binding: expected.clone(),
                 })
             }
@@ -2461,6 +2473,7 @@ impl ReasoningDeliveryLedgerV1 {
 }
 
 struct ReasoningWriteCompletionV1 {
+    stdio_session_id: u64,
     key: ReasoningDeliveryKeyV1,
     recipient: ReasoningTransportRecipientV1,
     completion: Box<dyn ReasoningDeliveryCompletionV1>,
@@ -2469,7 +2482,6 @@ struct ReasoningWriteCompletionV1 {
 
 struct StdioResponseV1 {
     bytes: Vec<u8>,
-    reasoning_completion: Option<ReasoningWriteCompletionV1>,
 }
 
 fn hex_v1(digest: &[u8; 32]) -> String {
@@ -2511,7 +2523,7 @@ pub struct McpGateway {
     delivery_ledger: Mutex<DeliveryLedgerV1>,
     delivery_sink: Arc<dyn DeliveryConfirmationSink>,
     reasoning_delivery_ledger: Mutex<ReasoningDeliveryLedgerV1>,
-    pending_reasoning_writes: Mutex<BTreeMap<(u64, JsonRpcId), ReasoningWriteCompletionV1>>,
+    pending_reasoning_writes: Mutex<BTreeMap<String, ReasoningWriteCompletionV1>>,
     #[cfg(test)]
     reasoning_confirmation_count: Arc<AtomicU64>,
 }
@@ -2668,14 +2680,13 @@ impl McpGateway {
         exact: &mut Value,
         candidate: Box<dyn ReasoningContextCandidateV1>,
         connection: &StdioConnectionV1,
-        request_id: &JsonRpcId,
-    ) {
+    ) -> Option<String> {
         let Ok(recipient) = connection.current_reasoning_recipient() else {
-            return;
+            return None;
         };
         let scope = candidate.scope();
         if scope.authorization_scope_digest != connection.authorization_scope_digest {
-            return;
+            return None;
         }
         let key = ReasoningDeliveryKeyV1::from_scope(connection.session_id, &scope, &recipient);
         let acknowledgment = self
@@ -2686,28 +2697,22 @@ impl McpGateway {
             .get(&key)
             .cloned();
         let Ok(mut prepared) = candidate.compile(&recipient, acknowledgment.as_deref()) else {
-            return;
+            return None;
         };
         if prepared.presentation == ReasoningTransportPresentationV1::Full
             && prepared.completion.is_none()
         {
-            return;
+            return None;
         }
-        let Some(object) = exact.as_object_mut() else {
-            return;
-        };
+        let object = exact.as_object_mut()?;
         let metadata = object
             .entry("_meta")
             .or_insert_with(|| Value::Object(Map::new()));
-        let Some(metadata) = metadata.as_object_mut() else {
-            return;
-        };
+        let metadata = metadata.as_object_mut()?;
         let again = metadata
             .entry("again")
             .or_insert_with(|| Value::Object(Map::new()));
-        let Some(again) = again.as_object_mut() else {
-            return;
-        };
+        let again = again.as_object_mut()?;
         let presentation = match prepared.presentation {
             ReasoningTransportPresentationV1::Full => "full",
             ReasoningTransportPresentationV1::CompactReference => "compact_reference",
@@ -2722,22 +2727,26 @@ impl McpGateway {
             }),
         );
         if let Some(completion) = prepared.completion.take() {
+            let reasoning_delivery_id = format!("rd_{}", uuid::Uuid::new_v4().simple());
             self.pending_reasoning_writes
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .insert(
-                    (connection.session_id, request_id.clone()),
+                    reasoning_delivery_id.clone(),
                     ReasoningWriteCompletionV1 {
+                        stdio_session_id: connection.session_id,
                         key,
                         recipient,
                         completion,
                         lifecycle_generation: Arc::clone(&connection.lifecycle_generation),
                     },
                 );
+            return Some(reasoning_delivery_id);
         }
+        None
     }
 
-    fn confirm_reasoning_write_v1(&self, completion: ReasoningWriteCompletionV1) {
+    fn confirm_reasoning_acknowledgment_v2(&self, completion: ReasoningWriteCompletionV1) {
         if completion.lifecycle_generation.load(Ordering::Acquire)
             != completion.recipient.lifecycle_generation
         {
@@ -2777,7 +2786,7 @@ impl McpGateway {
         self.pending_reasoning_writes
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .retain(|(session_id, _), _| *session_id != connection.session_id);
+            .retain(|_, completion| completion.stdio_session_id != connection.session_id);
     }
 
     /// Parse one JSON-RPC frame, rejecting duplicate keys before constructing a
@@ -2812,8 +2821,10 @@ impl McpGateway {
         };
         response.map(|mut value| {
             let pending = take_internal_delivery_v2(&mut value);
+            let reasoning_delivery_id = take_internal_reasoning_delivery_v2(&mut value);
             let mut encoded = serde_json::to_vec(&value)
                 .expect("JSON-RPC response values are always serializable");
+            let mut reasoning_bound_to_challenge = false;
             if let (Some(connection), Some((call_digest, captured))) = (connection, pending)
                 && connection.delivery_protocol_enabled.load(Ordering::Acquire)
                 && let Some(request_id) = value
@@ -2832,8 +2843,10 @@ impl McpGateway {
                         call_digest,
                         captured,
                         envelope_digest,
+                        reasoning_delivery_id.clone(),
                     )
                 {
+                    reasoning_bound_to_challenge = reasoning_delivery_id.is_some();
                     let notification = json!({
                         "jsonrpc": "2.0",
                         "method": "notifications/again/delivery-challenge",
@@ -2845,6 +2858,14 @@ impl McpGateway {
                             .expect("delivery challenge notifications are serializable"),
                     );
                 }
+            }
+            if !reasoning_bound_to_challenge
+                && let Some(reasoning_delivery_id) = reasoning_delivery_id
+            {
+                self.pending_reasoning_writes
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&reasoning_delivery_id);
             }
             encoded
         })
@@ -2901,7 +2922,6 @@ impl McpGateway {
         struct StdioJobV1 {
             bytes: Vec<u8>,
             context: GatewayRequestContext,
-            request_id: JsonRpcId,
             response_id: Value,
             activation: Arc<StdioActivationV1>,
         }
@@ -2949,9 +2969,6 @@ impl McpGateway {
                         writer.write_all(&response.bytes)?;
                         writer.write_all(b"\n")?;
                         writer.flush()?;
-                        if let Some(completion) = response.reasoning_completion {
-                            self.confirm_reasoning_write_v1(completion);
-                        }
                     }
                     Ok(())
                 })();
@@ -3001,18 +3018,7 @@ impl McpGateway {
                             });
                         job.activation.signal();
                         if let Some(response) = response {
-                            let reasoning_completion = self
-                                .pending_reasoning_writes
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .remove(&(connection.session_id, job.request_id));
-                            if responses
-                                .send(StdioResponseV1 {
-                                    bytes: response,
-                                    reasoning_completion,
-                                })
-                                .is_err()
-                            {
+                            if responses.send(StdioResponseV1 { bytes: response }).is_err() {
                                 inflight.fetch_sub(1, Ordering::AcqRel);
                                 break;
                             }
@@ -3039,7 +3045,7 @@ impl McpGateway {
                     );
                     match frame {
                         Ok(bytes) => {
-                            if let Some((request_id, response_id)) =
+                            if let Some((_request_id, response_id)) =
                                 self.stdio_tool_call_response_id(&bytes)
                             {
                                 let admitted = inflight
@@ -3070,7 +3076,6 @@ impl McpGateway {
                                 let job = StdioJobV1 {
                                     bytes,
                                     context,
-                                    request_id,
                                     response_id,
                                     activation,
                                 };
@@ -3471,17 +3476,23 @@ impl McpGateway {
         self.record_call_audit(context, &route, physical_attempt_id, outcome);
         Some(match result {
             CallResult::Success(mut exact, delivery, reasoning) => {
-                if let (Some(reasoning), Some(connection)) = (reasoning, connection) {
-                    self.attach_reasoning_context_v1(
-                        &mut exact,
-                        reasoning,
-                        connection,
-                        &request_id,
-                    );
-                }
+                let reasoning_delivery_id =
+                    if let (Some(reasoning), Some(connection)) = (reasoning, connection) {
+                        self.attach_reasoning_context_v1(&mut exact, reasoning, connection)
+                    } else {
+                        None
+                    };
                 let mut response = success_response(response_id, exact);
                 if let Some(delivery) = delivery {
                     attach_internal_delivery_v2(&mut response, delivery_call_digest, delivery);
+                }
+                if let Some(reasoning_delivery_id) = reasoning_delivery_id
+                    && let Some(object) = response.as_object_mut()
+                {
+                    object.insert(
+                        INTERNAL_REASONING_DELIVERY_FIELD_V2.to_owned(),
+                        Value::String(reasoning_delivery_id),
+                    );
                 }
                 response
             }
@@ -3526,6 +3537,7 @@ impl McpGateway {
             .acknowledge(connection, acknowledgement);
         match confirmation {
             Ok(confirmation) => {
+                let reasoning_delivery_id = confirmation.reasoning_delivery_id().map(str::to_owned);
                 let sink_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.delivery_sink
                         .confirm_delivery_and_issue_retrieval(&confirmation)
@@ -3533,9 +3545,21 @@ impl McpGateway {
                 let grant = match sink_result {
                     Ok(Ok(grant)) => grant,
                     Ok(Err(refusal)) => {
+                        if let Some(reasoning_delivery_id) = reasoning_delivery_id.as_ref() {
+                            self.pending_reasoning_writes
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(reasoning_delivery_id);
+                        }
                         return delivery_refusal_response_v1(response_id, refusal);
                     }
                     Err(_) => {
+                        if let Some(reasoning_delivery_id) = reasoning_delivery_id.as_ref() {
+                            self.pending_reasoning_writes
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(reasoning_delivery_id);
+                        }
                         return error_response(
                             response_id,
                             McpError::typed(
@@ -3545,6 +3569,15 @@ impl McpGateway {
                         );
                     }
                 };
+                if let Some(reasoning_delivery_id) = reasoning_delivery_id
+                    && let Some(reasoning) = self
+                        .pending_reasoning_writes
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&reasoning_delivery_id)
+                {
+                    self.confirm_reasoning_acknowledgment_v2(reasoning);
+                }
                 success_response(
                     response_id,
                     json!({
@@ -3983,6 +4016,14 @@ fn take_internal_delivery_v2(value: &mut Value) -> Option<([u8; 32], CapturedDel
     ))
 }
 
+fn take_internal_reasoning_delivery_v2(value: &mut Value) -> Option<String> {
+    value
+        .as_object_mut()?
+        .remove(INTERNAL_REASONING_DELIVERY_FIELD_V2)?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn error_response(id: Value, error: McpError) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": error })
 }
@@ -3996,10 +4037,7 @@ fn enqueue_stdio_response(
     response: Vec<u8>,
 ) -> io::Result<()> {
     sender
-        .send(StdioResponseV1 {
-            bytes: response,
-            reasoning_completion: None,
-        })
+        .send(StdioResponseV1 { bytes: response })
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdio response writer stopped"))
 }
 
@@ -4890,6 +4928,7 @@ mod delivery_receipt_tests {
                 [4; 32],
                 captured_delivery(),
                 "f".repeat(64),
+                None,
             )
             .unwrap();
         let mut value = serde_json::to_value(challenge).unwrap();
@@ -4915,6 +4954,7 @@ mod delivery_receipt_tests {
                 [9; 32],
                 captured_delivery(),
                 "f".repeat(64),
+                None,
             )
             .unwrap();
         assert_eq!(
@@ -4942,6 +4982,7 @@ mod delivery_receipt_tests {
                 [8; 32],
                 captured_delivery(),
                 "f".repeat(64),
+                None,
             )
             .unwrap();
         ledger.retire_request(1, &JsonRpcId::String("cancelled".into()));
@@ -4959,6 +5000,7 @@ mod delivery_receipt_tests {
                 [7; 32],
                 captured_delivery(),
                 "f".repeat(64),
+                None,
             )
             .unwrap();
         ledger.retire_session(1);
@@ -4967,6 +5009,48 @@ mod delivery_receipt_tests {
                 .acknowledge(&first, acknowledgement(&disconnected))
                 .unwrap_err(),
             DeliveryAuthorityRefusalV1::Retired
+        );
+    }
+
+    #[test]
+    fn reused_json_rpc_ids_cannot_redirect_reasoning_delivery_authority() {
+        let connection = authenticated_connection(31, "scope", "agent", "session", "turn", 0);
+        let mut ledger = DeliveryLedgerV1::default();
+        let request_id = JsonRpcId::String("reused".into());
+        let first = ledger
+            .issue(
+                &connection,
+                &request_id,
+                [1; 32],
+                captured_delivery(),
+                "e".repeat(64),
+                Some("reasoning-first".into()),
+            )
+            .unwrap();
+        let second = ledger
+            .issue(
+                &connection,
+                &request_id,
+                [2; 32],
+                captured_delivery(),
+                "f".repeat(64),
+                Some("reasoning-second".into()),
+            )
+            .unwrap();
+
+        let confirmed_first = ledger
+            .acknowledge(&connection, acknowledgement(&first))
+            .unwrap();
+        assert_eq!(
+            confirmed_first.reasoning_delivery_id(),
+            Some("reasoning-first")
+        );
+        let confirmed_second = ledger
+            .acknowledge(&connection, acknowledgement(&second))
+            .unwrap();
+        assert_eq!(
+            confirmed_second.reasoning_delivery_id(),
+            Some("reasoning-second")
         );
     }
 
@@ -4992,6 +5076,7 @@ mod delivery_receipt_tests {
                     [1; 32],
                     captured_delivery(),
                     "f".repeat(64),
+                    None,
                 )
                 .unwrap_err(),
             DeliveryAuthorityRefusalV1::UnsupportedRecipientAuthority
@@ -5005,6 +5090,7 @@ mod delivery_receipt_tests {
                 [2; 32],
                 captured_delivery(),
                 "f".repeat(64),
+                None,
             )
             .unwrap();
         connection.compaction_generation.store(5, Ordering::Release);
@@ -5153,6 +5239,7 @@ mod delivery_receipt_tests {
                     [index as u8; 32],
                     captured_delivery(),
                     "f".repeat(64),
+                    None,
                 )
                 .unwrap();
         }
@@ -5165,6 +5252,7 @@ mod delivery_receipt_tests {
                     [0xff; 32],
                     captured_delivery(),
                     "f".repeat(64),
+                    None,
                 )
                 .unwrap_err(),
             DeliveryAuthorityRefusalV1::ChallengeCapacity

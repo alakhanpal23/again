@@ -1,7 +1,9 @@
 use std::any::Any;
 use std::collections::BTreeSet;
-use std::io::{self, BufRead, Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,14 +33,14 @@ use context::{
     ReasoningSourceReferenceV1,
 };
 use mcp_gateway::{
-    AuthenticatedStdioRecipientV1, AuthorizationScopeId, CapturedToolResult, EffectClass,
-    EphemeralSecrets, Freshness, FreshnessMetadata, GatewayLimits, McpGateway,
-    OpaqueReasoningAcknowledgmentV1, PreparedReasoningContextV1, ProviderCall,
-    ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration, ProviderTool,
-    ReasoningContextCandidateV1, ReasoningDeliveryCompletionV1, ReasoningTransportPresentationV1,
-    ReasoningTransportRecipientV1, ReasoningTransportScopeV1, SideEffectClassification,
-    StructuredResultCapture, ToolCancellation, ToolDiscovery, ToolExecution, UpstreamProvider,
-    authorization_scope_digest_v1,
+    AuthenticatedStdioRecipientV1, AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1,
+    DeliveryConfirmationSink, EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata,
+    GatewayLimits, McpGateway, OpaqueReasoningAcknowledgmentV1, PreparedReasoningContextV1,
+    ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration,
+    ProviderTool, ReasoningContextCandidateV1, ReasoningDeliveryCompletionV1,
+    ReasoningTransportPresentationV1, ReasoningTransportRecipientV1, ReasoningTransportScopeV1,
+    RetrievalGrantV2, SideEffectClassification, StructuredResultCapture, ToolCancellation,
+    ToolDiscovery, ToolExecution, UpstreamProvider, authorization_scope_digest_v1,
 };
 use serde_json::{Value, json};
 
@@ -287,7 +289,6 @@ impl ResponseGate {
 enum ReaderGate {
     None,
     Response(i64),
-    Confirmation(u64),
     Flag(Arc<AtomicBool>),
 }
 
@@ -297,7 +298,6 @@ struct GatedReader {
     offset: usize,
     eof_gate: ReaderGate,
     responses: Arc<ResponseGate>,
-    confirmations: Arc<AtomicU64>,
 }
 
 impl GatedReader {
@@ -305,7 +305,6 @@ impl GatedReader {
         frames: Vec<(ReaderGate, Value)>,
         eof_gate: ReaderGate,
         responses: Arc<ResponseGate>,
-        confirmations: Arc<AtomicU64>,
     ) -> Self {
         Self {
             frames: frames
@@ -320,7 +319,6 @@ impl GatedReader {
             offset: 0,
             eof_gate,
             responses,
-            confirmations,
         }
     }
 
@@ -328,16 +326,6 @@ impl GatedReader {
         match gate {
             ReaderGate::None => {}
             ReaderGate::Response(id) => self.responses.wait(*id),
-            ReaderGate::Confirmation(expected) => {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while self.confirmations.load(Ordering::Acquire) < *expected {
-                    assert!(
-                        Instant::now() < deadline,
-                        "timed out waiting for reasoning confirmation {expected}"
-                    );
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-            }
             ReaderGate::Flag(flag) => {
                 let deadline = Instant::now() + Duration::from_secs(5);
                 while !flag.load(Ordering::Acquire) {
@@ -535,8 +523,24 @@ fn gateway(scope: &AuthorizationScopeId) -> McpGateway {
     .unwrap()
 }
 
+struct ExplicitReceiptSink;
+
+impl DeliveryConfirmationSink for ExplicitReceiptSink {
+    fn confirm_delivery_and_issue_retrieval(
+        &self,
+        delivery: &ConfirmedDeliveryV1,
+    ) -> Result<RetrievalGrantV2, protocol::DeliveryAuthorityRefusalV1> {
+        Ok(RetrievalGrantV2::from_store(
+            "reasoning-test-grant".to_owned(),
+            "reasoning-test-token".to_owned(),
+            delivery.gateway_result_id().to_owned(),
+            9_999_999_999_999,
+        ))
+    }
+}
+
 #[test]
-fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generation() {
+fn write_and_flush_without_client_acknowledgment_never_compacts_reasoning() {
     let scope = AuthorizationScopeId::new("reasoning-scope").unwrap();
     let gateway = gateway(&scope);
     let confirmations = gateway.reasoning_confirmation_counter_for_test_v1();
@@ -545,7 +549,7 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
     let frames = vec![
         (ReaderGate::None, initialize(0)),
         (ReaderGate::Response(0), call(1)),
-        (ReaderGate::Confirmation(1), call(2)),
+        (ReaderGate::Response(1), call(2)),
         (
             ReaderGate::Response(2),
             json!({
@@ -565,12 +569,7 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
         ),
         (ReaderGate::None, call(4)),
     ];
-    let mut reader = GatedReader::new(
-        frames,
-        ReaderGate::Response(4),
-        Arc::clone(&gate),
-        Arc::clone(&confirmations),
-    );
+    let mut reader = GatedReader::new(frames, ReaderGate::Response(4), Arc::clone(&gate));
     let mut writer = RecordingWriter::new(Arc::clone(&bytes), gate);
     let recipient =
         AuthenticatedStdioRecipientV1::issue_for_test("agent", "session", "turn", 0).unwrap();
@@ -586,19 +585,16 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
 
     let output = responses(&bytes);
     assert_eq!(presentation(response(&output, 1)), "full");
-    assert_eq!(presentation(response(&output, 2)), "compact_reference");
+    assert_eq!(presentation(response(&output, 2)), "full");
     assert_eq!(presentation(response(&output, 3)), "full");
     assert_eq!(presentation(response(&output, 4)), "full");
     assert_eq!(
         response(&output, 1)["result"]["_meta"]["again"]["reasoningContext"]["metrics"]["confirmed_tokens_avoided"],
         0
     );
-    assert!(
-        response(&output, 2)["result"]["_meta"]["again"]["reasoningContext"]["metrics"]
-            ["confirmed_tokens_avoided"]
-            .as_u64()
-            .unwrap()
-            > 0
+    assert_eq!(
+        response(&output, 2)["result"]["_meta"]["again"]["reasoningContext"]["metrics"]["confirmed_tokens_avoided"],
+        0
     );
     assert_eq!(
         response(&output, 2)["result"]["_meta"]["again"]["reasoningContext"]["brief"]["full_result_retrieval"]
@@ -610,6 +606,7 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
         "full exact result"
     );
     assert_eq!(gateway.reasoning_acknowledgment_count_for_test_v1(), 0);
+    assert_eq!(confirmations.load(Ordering::Acquire), 0);
 
     for (id, session, turn) in [(5, "session", "turn"), (6, "session-2", "turn-2")] {
         let gate = Arc::new(ResponseGate::default());
@@ -618,7 +615,6 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
             vec![(ReaderGate::None, call(id))],
             ReaderGate::Response(id),
             Arc::clone(&gate),
-            Arc::clone(&confirmations),
         );
         let mut writer = RecordingWriter::new(Arc::clone(&bytes), gate);
         let recipient =
@@ -636,6 +632,94 @@ fn authenticated_stdio_delivers_full_then_compact_and_invalidates_every_generati
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_response_bound_acknowledgment_enables_exact_recipient_compaction() {
+    fn send(stream: &mut UnixStream, value: &Value) {
+        serde_json::to_writer(&mut *stream, value).unwrap();
+        stream.write_all(b"\n").unwrap();
+        stream.flush().unwrap();
+    }
+
+    fn read(reader: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        assert!(reader.read_line(&mut line).unwrap() > 0);
+        serde_json::from_str(&line).unwrap()
+    }
+
+    let scope = AuthorizationScopeId::new("reasoning-explicit-ack-scope").unwrap();
+    let gateway =
+        Arc::new(gateway(&scope).with_delivery_confirmation_sink(Arc::new(ExplicitReceiptSink)));
+    let confirmations = gateway.reasoning_confirmation_counter_for_test_v1();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let mut client_reader = BufReader::new(client.try_clone().unwrap());
+    let serving = Arc::clone(&gateway);
+    let serving_scope = scope.clone();
+    let server_thread = std::thread::spawn(move || {
+        let mut writer = server;
+        let mut reader = BufReader::new(writer.try_clone().unwrap());
+        let recipient =
+            AuthenticatedStdioRecipientV1::issue_for_test("agent", "session", "turn", 0).unwrap();
+        serving
+            .serve_stdio_for_authenticated_recipient_v1(
+                &mut reader,
+                &mut writer,
+                &serving_scope,
+                EphemeralSecrets::default(),
+                recipient,
+            )
+            .unwrap();
+    });
+
+    send(
+        &mut client,
+        &json!({
+            "jsonrpc":"2.0","id":"init","method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "capabilities":{"experimental":{"again":{"deliveryReceipts":{"schemaVersion":2}}}},
+                "clientInfo":{"name":"reasoning-explicit-ack","version":"1"}
+            }
+        }),
+    );
+    assert_eq!(read(&mut client_reader)["id"], "init");
+    send(&mut client, &call(1));
+    let first = read(&mut client_reader);
+    assert_eq!(presentation(&first), "full");
+    let challenge = read(&mut client_reader);
+    assert_eq!(
+        challenge["method"],
+        "notifications/again/delivery-challenge"
+    );
+    send(
+        &mut client,
+        &json!({
+            "jsonrpc":"2.0","id":"ack","method":"again/delivery/ack",
+            "params":challenge["params"]["challenge"].clone()
+        }),
+    );
+    assert_eq!(read(&mut client_reader)["result"]["status"], "confirmed");
+    assert_eq!(confirmations.load(Ordering::Acquire), 1);
+
+    send(&mut client, &call(2));
+    let compact = read(&mut client_reader);
+    assert_eq!(presentation(&compact), "compact_reference");
+    assert!(
+        compact["result"]["_meta"]["again"]["reasoningContext"]["metrics"]
+            ["confirmed_tokens_avoided"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    assert_eq!(
+        read(&mut client_reader)["method"],
+        "notifications/again/delivery-challenge"
+    );
+    drop(client_reader);
+    drop(client);
+    server_thread.join().unwrap();
+}
+
 #[test]
 fn partial_response_write_issues_no_reasoning_acknowledgment_or_savings() {
     let scope = AuthorizationScopeId::new("partial-scope").unwrap();
@@ -651,7 +735,6 @@ fn partial_response_write_issues_no_reasoning_acknowledgment_or_savings() {
         ],
         ReaderGate::Flag(Arc::clone(&failed)),
         Arc::clone(&gate),
-        Arc::clone(&confirmations),
     );
     let mut writer = PartialWriter {
         bytes,
