@@ -763,6 +763,7 @@ impl Store {
         };
         store.migrate()?;
         store.verify_gateway_schema_current()?;
+        verify_reasoning_metrics_accounting_v1(&store.conn)?;
         store.maybe_cleanup()?;
         set_private_file(&database)?;
         set_private_file(&store.root.join("again.sqlite-wal"))?;
@@ -2888,6 +2889,7 @@ impl Store {
     }
 
     pub fn gateway_stats(&self) -> Result<GatewayStats> {
+        verify_reasoning_metrics_accounting_v1(&self.conn)?;
         let mut stats = GatewayStats::default();
         let mut statement = self.conn.prepare(
             "SELECT event_type, COUNT(*), COALESCE(SUM(estimated_tokens_avoided), 0) FROM gateway_events GROUP BY event_type",
@@ -2922,25 +2924,42 @@ impl Store {
             }
         }
         let legacy_context_bytes: u64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0) FROM gateway_delivery_receipts",
+            "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0)
+             FROM gateway_delivery_receipts",
             [],
             |row| row.get(0),
         )?;
         let (v2_context_bytes, compact_deliveries): (u64, u64) = self.conn.query_row(
-            "SELECT
-                COALESCE(SUM(CASE WHEN presentation = 'full' THEN stdout_bytes + stderr_bytes ELSE 0 END), 0),
-                COALESCE(SUM(CASE WHEN presentation = 'compact' THEN 1 ELSE 0 END), 0)
-             FROM gateway_delivery_receipts_v2",
+            "WITH unique_deliveries AS (
+                 SELECT response_envelope_digest, presentation,
+                        MAX(stdout_bytes + stderr_bytes) AS delivered_bytes
+                 FROM gateway_delivery_receipts_v2
+                 GROUP BY response_envelope_digest, presentation
+             )
+             SELECT
+                 COALESCE(SUM(CASE WHEN presentation = 'full' THEN delivered_bytes ELSE 0 END), 0),
+                 COALESCE(SUM(CASE WHEN presentation = 'compact' THEN 1 ELSE 0 END), 0)
+             FROM unique_deliveries",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let (confirmed_bytes_omitted, confirmed_tokens_avoided): (u64, u64) = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(SUM(bytes_omitted), 0), COALESCE(SUM(estimated_tokens_avoided), 0) FROM gateway_delivery_savings_v2",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
+        let (confirmed_bytes_omitted, confirmed_tokens_avoided): (u64, u64) = self.conn.query_row(
+            "WITH unique_savings AS (
+                     SELECT receipts.response_envelope_digest,
+                            MAX(savings.bytes_omitted) AS bytes_omitted,
+                            MAX(savings.estimated_tokens_avoided) AS estimated_tokens_avoided
+                     FROM gateway_delivery_savings_v2 AS savings
+                     JOIN gateway_delivery_receipts_v2 AS receipts
+                       ON receipts.receipt_id = savings.receipt_id
+                     WHERE receipts.presentation = 'compact'
+                     GROUP BY receipts.response_envelope_digest
+                 )
+                 SELECT COALESCE(SUM(bytes_omitted), 0),
+                        COALESCE(SUM(estimated_tokens_avoided), 0)
+                 FROM unique_savings",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
         let estimated_execution_time_saved_ms: u64 = self.conn.query_row(
             "SELECT COALESCE(SUM(gateway_results.duration_ms), 0)
              FROM gateway_events
@@ -4672,6 +4691,180 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         .optional()?;
     if let Some(table) = foreign_key_failure {
         bail!("Again gateway schema foreign-key violation in {table}");
+    }
+    Ok(())
+}
+
+fn verify_reasoning_metrics_accounting_v1(connection: &Connection) -> Result<()> {
+    // Receipts are evidence, not authority by identifier. Every counted row
+    // must still bind to the exact ready, unquarantined result bytes.
+    let invalid_exact_receipt: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM gateway_delivery_receipts AS receipt
+             LEFT JOIN gateway_results AS gateway_result
+               ON gateway_result.gateway_result_id = receipt.gateway_result_id
+             LEFT JOIN results AS stored_result
+               ON stored_result.id = gateway_result.result_id
+             WHERE gateway_result.gateway_result_id IS NULL
+                OR stored_result.id IS NULL
+                OR gateway_result.status != 'ready'
+                OR gateway_result.quarantine_reason IS NOT NULL
+                OR stored_result.quarantined != 0
+                OR receipt.result_digest != receipt.gateway_result_id
+                OR receipt.exact_status != gateway_result.exit_code
+                OR receipt.stdout_digest != gateway_result.stdout_digest
+                OR receipt.stdout_bytes != gateway_result.stdout_bytes
+                OR receipt.stderr_digest != gateway_result.stderr_digest
+                OR receipt.stderr_bytes != gateway_result.stderr_bytes
+                OR receipt.exact_status != stored_result.exit_code
+                OR receipt.stdout_digest != stored_result.stdout_digest
+                OR receipt.stdout_bytes != stored_result.stdout_bytes
+                OR receipt.stderr_digest != stored_result.stderr_digest
+                OR receipt.stderr_bytes != stored_result.stderr_bytes
+             UNION ALL
+             SELECT 1
+             FROM gateway_delivery_receipts_v2 AS receipt
+             LEFT JOIN gateway_results AS gateway_result
+               ON gateway_result.gateway_result_id = receipt.gateway_result_id
+             LEFT JOIN results AS stored_result
+               ON stored_result.id = gateway_result.result_id
+             WHERE gateway_result.gateway_result_id IS NULL
+                OR stored_result.id IS NULL
+                OR gateway_result.status != 'ready'
+                OR gateway_result.quarantine_reason IS NOT NULL
+                OR stored_result.quarantined != 0
+                OR receipt.result_digest != receipt.gateway_result_id
+                OR receipt.exact_status != gateway_result.exit_code
+                OR receipt.stdout_digest != gateway_result.stdout_digest
+                OR receipt.stdout_bytes != gateway_result.stdout_bytes
+                OR receipt.stderr_digest != gateway_result.stderr_digest
+                OR receipt.stderr_bytes != gateway_result.stderr_bytes
+                OR receipt.exact_status != stored_result.exit_code
+                OR receipt.stdout_digest != stored_result.stdout_digest
+                OR receipt.stdout_bytes != stored_result.stdout_bytes
+                OR receipt.stderr_digest != stored_result.stderr_digest
+                OR receipt.stderr_bytes != stored_result.stderr_bytes
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_exact_receipt {
+        bail!("Again reasoning delivery accounting has an invalid exact-result receipt");
+    }
+
+    // A compact receipt may cite only a prior full receipt for the exact same
+    // authenticated recipient generation and exact result. Restart, turn,
+    // compaction, or generation changes therefore cannot inherit savings.
+    let invalid_compact_source: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM gateway_delivery_receipts_v2 AS compact
+             LEFT JOIN gateway_delivery_receipts_v2 AS source
+               ON source.receipt_id = compact.source_receipt_id
+             WHERE compact.presentation = 'compact'
+               AND (
+                    source.receipt_id IS NULL
+                    OR source.presentation != 'full'
+                    OR source.authorization_scope_digest != compact.authorization_scope_digest
+                    OR source.connection_digest != compact.connection_digest
+                    OR source.connection_generation != compact.connection_generation
+                    OR source.session_id != compact.session_id
+                    OR source.turn_id != compact.turn_id
+                    OR source.agent_id != compact.agent_id
+                    OR source.compaction_generation != compact.compaction_generation
+                    OR source.gateway_result_id != compact.gateway_result_id
+                    OR source.result_digest != compact.result_digest
+                    OR source.exact_status != compact.exact_status
+                    OR source.stdout_digest != compact.stdout_digest
+                    OR source.stdout_bytes != compact.stdout_bytes
+                    OR source.stderr_digest != compact.stderr_digest
+                    OR source.stderr_bytes != compact.stderr_bytes
+                    OR source.acknowledged_ms > compact.acknowledged_ms
+               )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_compact_source {
+        bail!("Again reasoning delivery accounting has an invalid compact source");
+    }
+
+    let invalid_savings: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM gateway_delivery_savings_v2 AS savings
+             LEFT JOIN gateway_delivery_receipts_v2 AS receipt
+               ON receipt.receipt_id = savings.receipt_id
+             WHERE receipt.receipt_id IS NULL
+                OR receipt.presentation != 'compact'
+                OR receipt.response_envelope_digest != savings.response_envelope_digest
+                OR savings.estimated_tokens_avoided != savings.bytes_omitted / 4
+                OR savings.recorded_ms < receipt.acknowledged_ms
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_savings {
+        bail!("Again reasoning delivery accounting has invalid confirmed savings");
+    }
+
+    // Duplicate database receipts can arise from a retried durable write. They
+    // are harmless only when the immutable response envelope and every binding
+    // dimension agree. Aggregation below then counts that envelope once.
+    let inconsistent_duplicate: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM (
+                 SELECT receipt.response_envelope_digest
+                 FROM gateway_delivery_receipts_v2 AS receipt
+                 LEFT JOIN gateway_delivery_receipts_v2 AS source
+                   ON source.receipt_id = receipt.source_receipt_id
+                 GROUP BY receipt.response_envelope_digest
+                 HAVING COUNT(*) > 1
+                    AND (
+                         MIN(receipt.presentation) != MAX(receipt.presentation)
+                         OR MIN(receipt.authorization_scope_digest) != MAX(receipt.authorization_scope_digest)
+                         OR MIN(receipt.connection_digest) != MAX(receipt.connection_digest)
+                         OR MIN(receipt.connection_generation) != MAX(receipt.connection_generation)
+                         OR MIN(receipt.session_id) != MAX(receipt.session_id)
+                         OR MIN(receipt.turn_id) != MAX(receipt.turn_id)
+                         OR MIN(receipt.agent_id) != MAX(receipt.agent_id)
+                         OR MIN(receipt.compaction_generation) != MAX(receipt.compaction_generation)
+                         OR MIN(receipt.response_request_id_digest) != MAX(receipt.response_request_id_digest)
+                         OR MIN(receipt.call_digest) != MAX(receipt.call_digest)
+                         OR MIN(receipt.gateway_result_id) != MAX(receipt.gateway_result_id)
+                         OR MIN(receipt.result_digest) != MAX(receipt.result_digest)
+                         OR MIN(receipt.exact_status) != MAX(receipt.exact_status)
+                         OR MIN(receipt.stdout_digest) != MAX(receipt.stdout_digest)
+                         OR MIN(receipt.stdout_bytes) != MAX(receipt.stdout_bytes)
+                         OR MIN(receipt.stderr_digest) != MAX(receipt.stderr_digest)
+                         OR MIN(receipt.stderr_bytes) != MAX(receipt.stderr_bytes)
+                         OR MIN(COALESCE(source.response_envelope_digest, ''))
+                            != MAX(COALESCE(source.response_envelope_digest, ''))
+                    )
+             )
+             UNION ALL
+             SELECT 1
+             FROM (
+                 SELECT receipt.response_envelope_digest
+                 FROM gateway_delivery_receipts_v2 AS receipt
+                 JOIN gateway_delivery_savings_v2 AS savings
+                   ON savings.receipt_id = receipt.receipt_id
+                 GROUP BY receipt.response_envelope_digest
+                 HAVING COUNT(*) > 1
+                    AND (
+                         MIN(savings.bytes_omitted) != MAX(savings.bytes_omitted)
+                         OR MIN(savings.estimated_tokens_avoided)
+                            != MAX(savings.estimated_tokens_avoided)
+                    )
+             )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if inconsistent_duplicate {
+        bail!("Again reasoning delivery accounting has inconsistent duplicate receipts");
     }
     Ok(())
 }
