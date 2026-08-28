@@ -1077,7 +1077,11 @@ impl Store {
                     source_receipt_id TEXT,
                     acknowledged_ms INTEGER NOT NULL,
                     FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE,
-                    FOREIGN KEY (source_receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE RESTRICT
+                    FOREIGN KEY (source_receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE RESTRICT,
+                    CHECK(
+                        (presentation = 'full' AND source_receipt_id IS NULL) OR
+                        (presentation = 'compact' AND source_receipt_id IS NOT NULL)
+                    )
                 ) WITHOUT ROWID;
                 CREATE INDEX gateway_delivery_receipts_v2_context_idx
                     ON gateway_delivery_receipts_v2(
@@ -1106,7 +1110,9 @@ impl Store {
                     FOREIGN KEY (source_receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE CASCADE,
                     FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE,
                     CHECK(consumed_ms IS NULL OR consumed_ms >= issued_ms),
-                    CHECK(retired_ms IS NULL OR retired_ms >= issued_ms)
+                    CHECK(retired_ms IS NULL OR retired_ms >= issued_ms),
+                    CHECK(consumed_ms IS NULL OR retired_ms IS NULL),
+                    CHECK((retired_ms IS NULL) = (retire_reason IS NULL))
                 ) WITHOUT ROWID;
                 CREATE INDEX gateway_retrieval_grants_v2_context_idx
                     ON gateway_retrieval_grants_v2(
@@ -3939,12 +3945,28 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "CHECK(presentation IN ('full', 'compact'))",
         ),
         (
+            "gateway_delivery_receipts_v2",
+            "(presentation = 'full' AND source_receipt_id IS NULL)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "(presentation = 'compact' AND source_receipt_id IS NOT NULL)",
+        ),
+        (
             "gateway_retrieval_grants_v2",
             "CHECK(length(token_digest) = 64)",
         ),
         (
             "gateway_retrieval_grants_v2",
             "CHECK(expires_ms > issued_ms)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(consumed_ms IS NULL OR retired_ms IS NULL)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK((retired_ms IS NULL) = (retire_reason IS NULL))",
         ),
         ("gateway_delivery_savings_v2", "CHECK(bytes_omitted > 0)"),
         (
@@ -5139,7 +5161,17 @@ mod tests {
         set_private_dir(temp.path()).unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
-            store.conn.pragma_update(None, "user_version", 9).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "PRAGMA foreign_keys = OFF;
+                     DROP TABLE gateway_delivery_savings_v2;
+                     DROP TABLE gateway_retrieval_grants_v2;
+                     DROP TABLE gateway_delivery_receipts_v2;
+                     PRAGMA user_version = 9;
+                     PRAGMA foreign_keys = ON;",
+                )
+                .unwrap();
         }
 
         let reopened = Store::open(temp.path()).unwrap();
