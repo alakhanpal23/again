@@ -1227,6 +1227,7 @@ def require_exact_search_result(
     result: Mapping[str, Any], *, expected_matches: Sequence[Mapping[str, Any]], expected_text: str
 ) -> str:
     expected_structured = {
+        "schemaVersion": 1,
         "pattern": "ONBOARDING_SEARCH_V1",
         "path": "scope",
         "matches": [dict(item) for item in expected_matches],
