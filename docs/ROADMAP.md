@@ -38,6 +38,15 @@ exact dependency-bound reuse, SQLite/CAS coordination, in-flight joining,
 cancellation, and explicit workspace-bound Codex/Claude setup. It remains
 pre-alpha until these gates close:
 
+The internal delivery composition now proves that one authenticated recipient
+receives the canonical full reasoning brief before a compact reference can be
+issued, and that write failure, reconnect, cancellation, compaction, or
+lifecycle change clears that authority. Durable accounting revalidates the
+exact result and response envelope and deduplicates retried receipts. This is
+not yet a user-visible capability: the public stdio transport has no trusted
+recipient issuer, so it continues to send full results and records zero
+delivery-confirmed savings.
+
 1. Replace every caller-constructible routing observation with a store-issued,
    one-use proof whose lifecycle generation, dependency binding, and freshness
    are checked at consumption.
