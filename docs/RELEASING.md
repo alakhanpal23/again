@@ -13,9 +13,12 @@ as stable releases.
 Only a named human release authority may create or push a release tag. Before
 tagging, that person must verify that the applicable exact-SHA CI jobs actually
 ran and passed; a skipped, canceled, zero-step, or billing-blocked run is not a
-release gate. The workflow currently publishes unsigned artifacts, so it is not
-eligible for the outside-alpha gate until the reviewed signing/attestation and
-independent verification work below is complete. See
+release gate. The workflow contains a reviewed keyless GitHub-attestation and
+independent-verification design, but the current private user-owned repository
+cannot run that design on GitHub Free. No release is eligible for the
+outside-alpha gate until the repository is public or hosted by an organization
+with GitHub Enterprise Cloud, the exact release run succeeds, and publisher
+identity is independently verified. See
 [DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md#evidence-and-release-authority)
 and [Roadmap Gate 1](ROADMAP.md#gate-1--distributable-local-alpha).
 
@@ -24,9 +27,10 @@ tests, builds, and SBOM generation. `rust-toolchain.toml` pins the same version,
 and release builds use `Cargo.lock` through `--locked`. All referenced GitHub
 Actions are pinned to full commit SHAs and use Node 24 action runtimes.
 Checkout credentials are not persisted, and the verify, build, and SBOM jobs
-receive only read access. The source is not
-checked out in the publishing job; that job alone receives `contents: write`
-and exposes its token only to tag revalidation and release publication.
+receive only read access. The publishing job checks out the exact tagged
+release definitions without persisted credentials; that job alone receives
+`contents: write` and exposes its token only to tag revalidation and release
+publication.
 
 Before any build, the verify job runs formatting, clippy with warnings denied,
 all feature-enabled tests, the deterministic 100,000-case differential corpus,
@@ -74,32 +78,36 @@ source SBOM, then creates and verifies a combined `SHA256SUMS` before publishing
 them. These checksums bind the downloaded files to that manifest, but they do
 not identify or authenticate the publisher.
 
-## Signing status
+## Signing and verification status
 
-Release artifacts are currently unsigned. Full-SHA action pins, source gates,
-checksums, and restricted workflow credentials reduce release risk, but none is
-an artifact signature. The workflow deliberately does not publish a fabricated
-provenance statement.
+The release workflow requests GitHub artifact attestations for each native
+archive at its build origin, the source SBOM, the checksum manifest, and the
+generated Homebrew formula. The post-publication verifier binds each downloaded
+asset to the exact repository, release workflow, signer/source commit, tag ref,
+GitHub OIDC issuer, SLSA provenance predicate, and GitHub-hosted runner policy.
+It also checks the exact immutable release inventory and tag commit.
 
-Keyless signing and attestations remain pending a reviewed GitHub OIDC design
-with:
+The retained `again.release-verification-summary.v1` JSON is deliberately
+non-authoritative when detached. It records hashes and the policy passed to the
+successful verifier, but omits the raw cryptographic bundles and explicitly
+requires the enclosing GitHub Actions run. A consumer must still run
+`gh attestation verify` or authenticate that enclosing run; the summary itself
+is not a bearer proof of publisher identity.
 
-- an explicit trusted workflow/repository identity and tag policy;
-- a public transparency-log entry or equivalent verifier;
-- verification instructions tested independently of the publishing job; and
-- a recovery and revocation procedure for compromised workflows.
-
-Until that work lands, consumers must verify `SHA256SUMS` obtained through a
-trusted channel. A checksum manifest downloaded from the same compromised
-release as an archive would not provide an independent trust anchor. GitHub
-release immutability is also a repository setting outside this workflow and
-must not be assumed unless it has been enabled and verified for the release.
+No release has run. GitHub-native artifact attestations for private or internal
+repositories require GitHub Enterprise Cloud, while this repository is private
+and user-owned on GitHub Free. The first release therefore remains blocked
+until the repository is public or moved to an eligible Enterprise Cloud
+organization. GitHub release immutability is a repository setting outside this
+workflow and must also be enabled and verified before tagging. Checksums alone
+do not authenticate the publisher.
 
 ## Maintainer checklist
 
 1. Confirm the named human release authority, intended release class, exact
-   candidate SHA, and successful nonempty applicable CI jobs. Do not use the
-   current unsigned path for an outside-alpha release.
+   candidate SHA, successful nonempty applicable CI jobs, an attestation-eligible
+   repository plan/visibility, and enabled immutable releases. Do not tag while
+   any prerequisite is unverified.
 2. Confirm that `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and the
    intended release notes are correct on `main`.
 3. Run the same source and packaging gates locally:
@@ -236,9 +244,10 @@ what uninstall will restore.
 - Archive metadata is normalized, but compiled binaries are not yet proven
   bit-for-bit reproducible across independent builders.
 - The CycloneDX file is a source dependency SBOM, not a target-specific binary
-  SBOM or a signed provenance attestation.
+  SBOM. Its workflow attestation does not turn it into a binary SBOM.
 - SHA-256 manifests provide integrity relative to the manifest, not publisher
-  authentication. Artifact signing and attestations remain pending.
+  authentication. The attestation workflow is implemented but unavailable on
+  the repository's current private GitHub Free configuration.
 - Catchable-failure rollback does not cover power loss, `SIGKILL`, hardware or
   filesystem failure, or a hostile process that ignores the adjacent lock. An
   uncatchable failure can leave a stale lock requiring deliberate inspection and
