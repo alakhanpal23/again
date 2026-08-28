@@ -490,6 +490,73 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             )
         self.assertEqual(refused.exception.code, "reuse_identity")
 
+    def test_catalog_cold_warm_hashes_output_and_classifies_safe_git_miss(self) -> None:
+        payload = {
+            "content": [{"type": "text", "text": "PRIVATE-CATALOG-CONTENT"}],
+            "structuredContent": {"schemaVersion": 1, "entries": []},
+        }
+        repository_pair = corpus.run_catalog_cold_warm(
+            FakeSession([mcp_result(payload)]),
+            FakeSession([mcp_result(payload)]),
+            FakeAudit(
+                [
+                    {"event_counts": {"requested": 1, "executed": 1}},
+                    {"event_counts": {"requested": 1, "exact_hit": 1}},
+                ]
+            ),
+            "catalog",
+            "repo.tree",
+            {"path": "."},
+            require_exact_reuse=True,
+        )
+        self.assertEqual(repository_pair["cold_route"], "executed")
+        self.assertEqual(repository_pair["warm_route"], "exact_hit")
+        self.assertNotIn(
+            b"PRIVATE-CATALOG-CONTENT", corpus.canonical_json_bytes(repository_pair)
+        )
+
+        git_pair = corpus.run_catalog_cold_warm(
+            FakeSession([mcp_result(payload, "a" * 64)]),
+            FakeSession([mcp_result(payload, "b" * 64)]),
+            FakeAudit(
+                [
+                    {"event_counts": {"requested": 1, "executed": 1}},
+                    {"event_counts": {"requested": 1, "executed": 1}},
+                ]
+            ),
+            "git-catalog",
+            "git.status",
+            {"path": "."},
+            require_exact_reuse=False,
+        )
+        self.assertEqual(git_pair["warm_route"], "executed")
+        self.assertTrue(git_pair["exact_output_equality"])
+
+        no_authority = mcp_result(payload)
+        del no_authority["result"]["_meta"]
+        accepted = corpus.opaque_invocation_record(
+            label="dirty-git",
+            tool="git.status",
+            arguments={"path": "."},
+            response=no_authority,
+            elapsed_ms=1.0,
+            audit={"event_counts": {"executed": 1}},
+            require_result_authority=False,
+        )
+        self.assertFalse(accepted["comparison"]["reusable_authority"])
+
+    def test_corpus_session_allows_only_the_explicit_full_catalog(self) -> None:
+        session = object.__new__(corpus.CorpusMcpSession)
+        session.advertised_tools = set(corpus.EXERCISED_TOOLS)
+        session.request = mock.Mock(return_value={"jsonrpc": "2.0", "id": "probe"})
+        corpus.CorpusMcpSession.tool_call(
+            session, "probe", "git.log", {"maxResults": 1}
+        )
+        request = session.request.call_args.args[0]
+        self.assertEqual(request["params"]["name"], "git.log")
+        with self.assertRaises(corpus.HarnessRefusal):
+            corpus.CorpusMcpSession.tool_call(session, "bad", "shell.exec", {})
+
     def test_gateway_audit_is_schema_pinned_ordered_and_counted(self) -> None:
         database = self.root / "again.sqlite"
         connection = sqlite3.connect(database)
@@ -503,6 +570,11 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 gateway_result_id TEXT,
                 reason TEXT,
                 created_ms INTEGER NOT NULL
+            );
+            CREATE TABLE gateway_requests (
+                call_id TEXT PRIMARY KEY,
+                role TEXT,
+                status TEXT
             );
             PRAGMA user_version=10;
             """
@@ -525,6 +597,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         connection.close()
         window = audit.end(cursor)
         self.assertEqual(window["event_counts"], {"exact_hit": 1})
+        self.assertEqual(window["request_roles"], {})
         connection = sqlite3.connect(database)
         connection.execute("PRAGMA user_version=99")
         connection.commit()
@@ -545,6 +618,17 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             }
         )
         self.assertEqual(counters["provider_executions"], 21)
+        self.assertEqual(counters["non_reusable_successes"], 0)
+        non_reusable = corpus.reconcile_gateway_counters(
+            {
+                "requested": 2,
+                "executed": 2,
+                "completed": 1,
+                "failed": 0,
+            },
+            non_reusable_successes=1,
+        )
+        self.assertEqual(non_reusable["non_reusable_successes"], 1)
         with self.assertRaises(corpus.HarnessRefusal) as refused:
             corpus.reconcile_gateway_counters(
                 {
@@ -557,6 +641,21 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 }
             )
         self.assertEqual(refused.exception.code, "gateway_counter_mismatch")
+
+    def test_non_reusable_success_count_is_derived_from_hash_only_records(self) -> None:
+        records = {
+            "one": {
+                "label": "one",
+                "command": {"tool": "git.status"},
+                "comparison": {"status": "ok", "reusable_authority": False},
+            },
+            "two": {
+                "label": "two",
+                "command": {"tool": "git.log"},
+                "comparison": {"status": "ok", "reusable_authority": True},
+            },
+        }
+        self.assertEqual(corpus.count_non_reusable_successes(records), 1)
 
     def test_latency_analysis_is_bounded_and_flags_only_real_outliers(self) -> None:
         scenarios = {
@@ -634,6 +733,22 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             corpus.workspace_manifest_sha256(workspace)
         self.assertEqual(refused.exception.code, "workspace_special_file")
 
+    def test_bounded_git_object_manifest_is_hash_only_and_rejects_symlinks(self) -> None:
+        objects = self.root / "objects"
+        (objects / "aa").mkdir(parents=True)
+        (objects / "aa" / "object").write_bytes(b"private-object-bytes")
+        first = corpus.bounded_tree_manifest_sha256(objects)
+        self.assertEqual(first["entries"], 2)
+        self.assertEqual(first["logical_bytes"], len(b"private-object-bytes"))
+        (objects / "aa" / "object").write_bytes(b"changed-object-bytes")
+        self.assertNotEqual(
+            first["sha256"], corpus.bounded_tree_manifest_sha256(objects)["sha256"]
+        )
+        os.symlink("aa/object", objects / "link")
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.bounded_tree_manifest_sha256(objects)
+        self.assertEqual(refused.exception.code, "git_object_tree")
+
     def test_exclusive_bounded_evidence_never_overwrites(self) -> None:
         output = self.root / "evidence.json"
         corpus.write_json_exclusive(output, {"a": "\u96ea", "z": [2, 1]})
@@ -677,7 +792,14 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         self.assertFalse(boundary["harness_clone_download_or_network_client_path"])
         self.assertFalse(boundary["network_namespace_sandbox"])
         self.assertFalse(boundary["fresh_socket_creation_blocked"])
-        self.assertEqual(boundary["trusted_product_operations"], ["repo.read", "repo.search"])
+        self.assertEqual(
+            boundary["trusted_product_operations"], list(corpus.EXERCISED_TOOLS)
+        )
+
+    def test_resource_snapshot_has_portable_cpu_and_rss_measurements(self) -> None:
+        observed = corpus.resource_snapshot()
+        self.assertGreaterEqual(observed["self_cpu_seconds"], 0)
+        self.assertGreater(observed["self_max_rss_bytes"], 0)
 
     def test_repository_count_language_and_root_bounds_precede_execution(self) -> None:
         roots = []

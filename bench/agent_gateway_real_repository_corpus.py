@@ -36,12 +36,32 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - non-POSIX environmental classification.
+    resource = None  # type: ignore[assignment]
 
-SCHEMA = "again.agent-gateway-real-repository-corpus.v1"
-HARNESS_VERSION = "1.1.0"
+
+SCHEMA = "again.agent-gateway-real-repository-corpus.v2"
+HARNESS_VERSION = "1.2.0"
 MCP_PROTOCOL_VERSION = "2025-06-18"
 EXPECTED_DATABASE_SCHEMA = 10
 LANGUAGES = ("rust", "python", "go", "typescript")
+EXERCISED_TOOLS = (
+    "git.blame",
+    "git.diff",
+    "git.log",
+    "git.show",
+    "git.status",
+    "repo.glob",
+    "repo.list",
+    "repo.manifest",
+    "repo.read",
+    "repo.references",
+    "repo.search",
+    "repo.stat",
+    "repo.tree",
+)
 LANGUAGE_SUFFIXES = {
     "rust": (".rs",),
     "python": (".py",),
@@ -53,12 +73,14 @@ MAX_REPOSITORY_SCAN_BYTES = 16 * 1024 * 1024
 LARGE_FIXTURE_BYTES = 768 * 1024
 BULK_FILE_BYTES = 512 * 1024
 BULK_FILE_COUNT = 12
+BULK_PARTITIONS = 3
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 RELEVANT_MARKER_V1 = "AGAIN_REAL_CORPUS_RELEVANT_V1"
 RELEVANT_MARKER_V2 = "AGAIN_REAL_CORPUS_RELEVANT_V2"
 IRRELEVANT_MARKER = "AGAIN_REAL_CORPUS_IRRELEVANT_V1"
 CONCURRENT_MARKER = "AGAIN_REAL_CORPUS_CONCURRENT_V1"
 ORDER_MARKER = "AGAIN_REAL_CORPUS_ORDER_V1"
+REPOSITORY_REPLACEMENT_MARKER = "AGAIN_REAL_CORPUS_REPLACEMENT_V1"
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_REPOSITORIES = len(LANGUAGES)
 PROCESS_STOP_SECONDS = 2.0
@@ -69,6 +91,10 @@ MAX_SEARCH_DIRECTORIES = 8_192
 MAX_SEARCH_ENTRIES = 65_536
 MAX_SEARCH_ERRORS = 128
 MAX_GIT_PROBE_BYTES = 16 * 1024 * 1024
+MAX_GIT_OBJECT_ENTRIES = 10_000
+MAX_GIT_OBJECT_BYTES = 64 * 1024 * 1024
+MAX_CPU_SECONDS = 1_800.0
+MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024
 
 
 def _load_sibling(name: str) -> Any:
@@ -163,6 +189,25 @@ def sha256_file(path: pathlib.Path, maximum: int | None = None) -> str:
                 raise HarnessRefusal("file_oversized", f"file exceeds bound: {path}")
             digest.update(block)
     return digest.hexdigest()
+
+
+def resource_snapshot() -> dict[str, float | int]:
+    if resource is None:
+        raise HarnessRefusal(
+            "unsupported_resource_metrics", "portable CPU and RSS accounting is unavailable"
+        )
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+    def rss_bytes(value: float) -> int:
+        return int(value) if sys.platform == "darwin" else int(value * 1024)
+
+    return {
+        "self_cpu_seconds": own.ru_utime + own.ru_stime,
+        "child_cpu_seconds": children.ru_utime + children.ru_stime,
+        "self_max_rss_bytes": rss_bytes(own.ru_maxrss),
+        "child_max_rss_bytes": rss_bytes(children.ru_maxrss),
+    }
 
 
 def pinned_executable_identity(path: pathlib.Path) -> PinnedExecutableIdentity:
@@ -770,11 +815,18 @@ def prepare_workspace(snapshot: Any, workspace: pathlib.Path) -> dict[str, Any]:
     }
     for relative, value in edge_files.items():
         _write_new(workspace / relative, value)
+    files_per_partition = BULK_FILE_COUNT // BULK_PARTITIONS
+    if files_per_partition * BULK_PARTITIONS != BULK_FILE_COUNT:
+        raise HarnessRefusal("fixture_partition", "bulk files do not partition exactly")
     for index in range(BULK_FILE_COUNT):
         suffix = f"\n{CONCURRENT_MARKER}\n".encode() if index == BULK_FILE_COUNT - 1 else b"\n"
         prefix = f"bulk-{index:02d}\n".encode()
         filler = b"offline-corpus-filler\n" * ((BULK_FILE_BYTES // 22) + 1)
-        _write_new(workspace / "bulk" / f"{index:02d}.txt", (prefix + filler)[: BULK_FILE_BYTES] + suffix)
+        partition = index // files_per_partition
+        _write_new(
+            workspace / "bulk" / f"partition-{partition:02d}" / f"{index:02d}.txt",
+            (prefix + filler)[: BULK_FILE_BYTES] + suffix,
+        )
     _run_git_mutating_copy(workspace, "init", "-q")
     _run_git_mutating_copy(workspace, "config", "user.name", "Again Corpus")
     _run_git_mutating_copy(workspace, "config", "user.email", "again-corpus@example.invalid")
@@ -816,6 +868,44 @@ def workspace_manifest_sha256(workspace: pathlib.Path) -> str:
             digest.update(b"\0")
             digest.update(bytes.fromhex(sha256_file(path)))
     return digest.hexdigest()
+
+
+def bounded_tree_manifest_sha256(
+    root: pathlib.Path,
+    *,
+    maximum_entries: int = MAX_GIT_OBJECT_ENTRIES,
+    maximum_bytes: int = MAX_GIT_OBJECT_BYTES,
+) -> dict[str, Any]:
+    metadata = root.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise HarnessRefusal("git_object_tree", "Git object root is not a real directory")
+    digest = hashlib.sha256()
+    entries = 0
+    logical_bytes = 0
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        observed = path.lstat()
+        entries += 1
+        if entries > maximum_entries:
+            raise HarnessRefusal("git_object_tree_bound", "Git object entry bound exceeded")
+        if stat.S_ISLNK(observed.st_mode) or not (
+            stat.S_ISDIR(observed.st_mode) or stat.S_ISREG(observed.st_mode)
+        ):
+            raise HarnessRefusal("git_object_tree", "Git object tree contains an unsafe node")
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        if stat.S_ISREG(observed.st_mode):
+            logical_bytes += observed.st_size
+            if logical_bytes > maximum_bytes:
+                raise HarnessRefusal("git_object_tree_bound", "Git object byte bound exceeded")
+            digest.update(str(observed.st_size).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(bytes.fromhex(sha256_file(path, maximum_bytes)))
+    return {
+        "sha256": digest.hexdigest(),
+        "entries": entries,
+        "logical_bytes": logical_bytes,
+    }
 
 
 def _safe_relative(workspace: pathlib.Path, relative: str) -> pathlib.Path:
@@ -1029,20 +1119,38 @@ class GatewayAudit:
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT id,event_type,call_id,lease_id,gateway_result_id,reason,created_ms
-                FROM gateway_events
-                WHERE id > ?1 AND created_ms BETWEEN ?2 AND ?3
-                ORDER BY id
+                SELECT e.id,e.event_type,e.call_id,e.lease_id,e.gateway_result_id,
+                       e.reason,e.created_ms,r.role,r.status
+                FROM gateway_events AS e
+                LEFT JOIN gateway_requests AS r ON r.call_id = e.call_id
+                WHERE e.id > ?1 AND e.created_ms BETWEEN ?2 AND ?3
+                ORDER BY e.id
                 """,
                 (cursor.event_id, cursor.started_ms, ended_ms),
             ).fetchall()
         counts = collections.Counter(str(row["event_type"]) for row in rows)
+        roles = collections.Counter(
+            str(row["role"])
+            for row in rows
+            if row["event_type"] == "requested" and row["role"] is not None
+        )
         return {
             "event_counts": dict(sorted(counts.items())),
+            "request_roles": dict(sorted(roles.items())),
             "event_rows": len(rows),
             "event_id_first": int(rows[0]["id"]) if rows else None,
             "event_id_last": int(rows[-1]["id"]) if rows else cursor.event_id,
         }
+
+    def wait_for_event(
+        self, cursor: EventCursor, event_type: str, timeout_seconds: float
+    ) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            if int(self.end(cursor)["event_counts"].get(event_type, 0)) >= 1:
+                return
+            time.sleep(0.002)
+        raise HarnessRefusal("event_timeout", f"timed out waiting for {event_type}")
 
     def totals(self) -> dict[str, int]:
         with self._connection() as connection:
@@ -1084,7 +1192,7 @@ def network_boundary_record() -> dict[str, Any]:
         "proxy_environment_redirected_to_loopback_refusal": True,
         "network_namespace_sandbox": False,
         "fresh_socket_creation_blocked": False,
-        "trusted_product_operations": ["repo.read", "repo.search"],
+        "trusted_product_operations": list(EXERCISED_TOOLS),
     }
 
 
@@ -1222,6 +1330,25 @@ class CorpusMcpSession(gateway_support.McpSession):
                 cleanup_codes=tuple(dict.fromkeys(cleanup_codes)),
             ) from primary
         self._closed_record: dict[str, Any] | None = None
+
+    def tool_call(
+        self,
+        request_id: str,
+        tool: str,
+        arguments: Mapping[str, Any],
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        if tool not in self.advertised_tools or tool not in EXERCISED_TOOLS:
+            raise HarnessRefusal("tool_not_advertised", f"refusing unadvertised tool: {tool}")
+        return self.request(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": tool, "arguments": dict(arguments)},
+            },
+            timeout,
+        )
 
     def close_and_evidence(self) -> tuple[dict[str, Any], tuple[str, ...]]:
         if self._closed_record is not None:
@@ -1428,12 +1555,19 @@ def latency_analysis(value: Any, timeout_seconds: float) -> dict[str, Any]:
     }
 
 
-def reconcile_gateway_counters(totals: Mapping[str, int]) -> dict[str, int]:
+def reconcile_gateway_counters(
+    totals: Mapping[str, int], *, non_reusable_successes: int = 0
+) -> dict[str, int]:
+    if non_reusable_successes < 0:
+        raise HarnessRefusal(
+            "gateway_counter_mismatch", "non-reusable success count cannot be negative"
+        )
     counters = {
         "requested": int(totals.get("requested", 0)),
         "provider_executions": int(totals.get("executed", 0)),
         "inflight_joins": int(totals.get("inflight_join", 0)),
         "exact_hits": int(totals.get("exact_hit", 0)),
+        "non_reusable_successes": non_reusable_successes,
     }
     routes = (
         counters["provider_executions"]
@@ -1445,13 +1579,37 @@ def reconcile_gateway_counters(totals: Mapping[str, int]) -> dict[str, int]:
             "gateway_counter_mismatch",
             f"requested={counters['requested']} but terminal routes={routes}",
         )
-    if int(totals.get("completed", 0)) + int(totals.get("failed", 0)) != counters[
-        "provider_executions"
-    ]:
+    if (
+        int(totals.get("completed", 0))
+        + int(totals.get("failed", 0))
+        + non_reusable_successes
+        != counters["provider_executions"]
+    ):
         raise HarnessRefusal(
             "gateway_counter_mismatch", "provider executions do not reconcile to completion/failure"
         )
     return counters
+
+
+def count_non_reusable_successes(value: Any) -> int:
+    count = 0
+    stack = [value]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            comparison = current.get("comparison")
+            if (
+                isinstance(current.get("label"), str)
+                and isinstance(current.get("command"), dict)
+                and isinstance(comparison, dict)
+                and comparison.get("status") == "ok"
+                and comparison.get("reusable_authority") is False
+            ):
+                count += 1
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return count
 
 
 def process_evidence(
@@ -1538,6 +1696,115 @@ def run_cold_warm(
     return {"cold": cold, "warm": warm}
 
 
+def opaque_invocation_record(
+    *,
+    label: str,
+    tool: str,
+    arguments: Mapping[str, Any],
+    response: Mapping[str, Any],
+    elapsed_ms: float,
+    audit: Mapping[str, Any],
+    require_result_authority: bool = True,
+) -> dict[str, Any]:
+    result = response.get("result")
+    if not isinstance(result, dict) or "error" in response:
+        raise HarnessRefusal("catalog_status", f"{tool} did not return a successful result")
+    identifier = result_id(result)
+    if require_result_authority and identifier is None:
+        raise HarnessRefusal("catalog_result_id", f"{tool} omitted reusable result authority")
+    observation = result_without_reference(result)
+    return {
+        "label": label,
+        "command": {"tool": tool, "arguments": dict(arguments)},
+        "elapsed_ms": elapsed_ms,
+        "response_sha256": sha256_bytes(canonical_json_bytes(response)),
+        "comparison": {
+            "status": "ok",
+            "result_id": identifier,
+            "reusable_authority": identifier is not None,
+            "payload_sha256": sha256_bytes(canonical_json_bytes(observation)),
+        },
+        "audit": dict(audit),
+    }
+
+
+def run_opaque_call(
+    session: Any,
+    audit: GatewayAudit,
+    label: str,
+    tool: str,
+    arguments: Mapping[str, Any],
+    *,
+    require_result_authority: bool = True,
+) -> dict[str, Any]:
+    cursor = audit.begin()
+    response, elapsed = _timed_tool_call(session, label, tool, arguments)
+    return opaque_invocation_record(
+        label=label,
+        tool=tool,
+        arguments=arguments,
+        response=response,
+        elapsed_ms=elapsed,
+        audit=audit.end(cursor),
+        require_result_authority=require_result_authority,
+    )
+
+
+def invocation_route(record: Mapping[str, Any]) -> str:
+    counts = record.get("audit", {}).get("event_counts", {})
+    if not isinstance(counts, dict):
+        raise HarnessRefusal("catalog_event", "catalog event counts are unavailable")
+    routes = [
+        name
+        for name in ("executed", "exact_hit", "inflight_join")
+        if int(counts.get(name, 0)) == 1
+    ]
+    if len(routes) != 1:
+        raise HarnessRefusal("catalog_event", "catalog call has no exact terminal route")
+    return routes[0]
+
+
+def run_catalog_cold_warm(
+    first: Any,
+    second: Any,
+    audit: GatewayAudit,
+    label: str,
+    tool: str,
+    arguments: Mapping[str, Any],
+    *,
+    require_exact_reuse: bool,
+) -> dict[str, Any]:
+    cold = run_opaque_call(first, audit, f"{label}:cold", tool, arguments)
+    warm = run_opaque_call(second, audit, f"{label}:warm", tool, arguments)
+    cold_route = invocation_route(cold)
+    warm_route = invocation_route(warm)
+    if cold_route != "executed":
+        raise HarnessRefusal("catalog_cold_route", f"{tool} cold call was not executed")
+    if (
+        cold["comparison"]["status"] != warm["comparison"]["status"]
+        or cold["comparison"]["payload_sha256"]
+        != warm["comparison"]["payload_sha256"]
+    ):
+        raise HarnessRefusal("catalog_output_mismatch", f"{tool} cold/warm output changed")
+    if require_exact_reuse:
+        if (
+            warm_route != "exact_hit"
+            or cold["comparison"]["result_id"]
+            != warm["comparison"]["result_id"]
+        ):
+            raise HarnessRefusal("catalog_reuse", f"{tool} did not reuse exact authority")
+    elif warm_route not in {"executed", "exact_hit"}:
+        raise HarnessRefusal("catalog_warm_route", f"{tool} used an unsafe warm route")
+    return {
+        "cold": cold,
+        "warm": warm,
+        "cold_route": cold_route,
+        "warm_route": warm_route,
+        "exact_output_equality": True,
+        "exact_status_equality": True,
+    }
+
+
 def _replace_file(path: pathlib.Path, value: bytes) -> dict[str, Any]:
     before = sha256_file(path)
     replacement = path.with_name(path.name + ".replacement")
@@ -1590,6 +1857,84 @@ def run_repository(
 
         first_path = prepared["first_path"]
         second_path = prepared["second_path"]
+        first_parent = pathlib.PurePosixPath(first_path).parent.as_posix()
+        first_suffix = pathlib.PurePosixPath(first_path).suffix
+        catalog_probes: tuple[tuple[str, Mapping[str, Any]], ...] = (
+            ("git.blame", {"path": first_path, "startLine": 1, "endLine": 1}),
+            ("git.diff", {"path": "."}),
+            ("git.log", {"maxResults": 10}),
+            ("git.show", {"path": first_path}),
+            ("git.status", {"path": "."}),
+            ("repo.glob", {"pattern": f"**/*{first_suffix}", "path": "."}),
+            ("repo.list", {"path": first_parent}),
+            ("repo.manifest", {}),
+            ("repo.references", {"symbol": RELEVANT_MARKER_V1, "path": first_path}),
+            ("repo.stat", {"path": first_path}),
+            ("repo.tree", {"path": "."}),
+        )
+        catalog: dict[str, Any] = {}
+        for tool, arguments in catalog_probes:
+            catalog[tool] = run_catalog_cold_warm(
+                first,
+                second,
+                audit,
+                f"catalog-{tool}",
+                tool,
+                arguments,
+                require_exact_reuse=tool.startswith("repo."),
+            )
+        scenarios["full_tool_catalog"] = {
+            "advertised_and_exercised_tools": list(EXERCISED_TOOLS),
+            "probes": catalog,
+        }
+
+        config_before = catalog["git.status"]["cold"]
+        _run_git_mutating_copy(workspace, "config", "diff.algorithm", "histogram")
+        config_after = run_opaque_call(
+            first, audit, "git-config-after", "git.status", {"path": "."}
+        )
+        require_event(config_after, "executed")
+        if (
+            config_after["comparison"]["payload_sha256"]
+            != config_before["comparison"]["payload_sha256"]
+        ):
+            raise HarnessRefusal(
+                "git_config_output", "Git configuration changed status output"
+            )
+        object_root = workspace / ".git" / "objects"
+        objects_before = bounded_tree_manifest_sha256(object_root)
+        _run_git_mutating_copy(workspace, "repack", "-ad")
+        objects_after = bounded_tree_manifest_sha256(object_root)
+        if objects_before["sha256"] == objects_after["sha256"]:
+            raise HarnessRefusal(
+                "git_object_replacement", "Git object representation did not change"
+            )
+        log_after_objects = run_opaque_call(
+            second, audit, "git-objects-after", "git.log", {"maxResults": 10}
+        )
+        require_event(log_after_objects, "executed")
+        if (
+            log_after_objects["comparison"]["payload_sha256"]
+            != catalog["git.log"]["cold"]["comparison"]["payload_sha256"]
+        ):
+            raise HarnessRefusal(
+                "git_object_output", "equivalent Git objects changed log output"
+            )
+        scenarios["git_control_and_object_replacement"] = {
+            "configuration": {
+                "mutation": "diff.algorithm=histogram",
+                "after": config_after,
+                "exact_output_equality": True,
+            },
+            "objects": {
+                "strategy": "bounded-local-git-repack",
+                "before": objects_before,
+                "after": objects_after,
+                "observation": log_after_objects,
+                "exact_output_equality": True,
+            },
+        }
+
         scenarios["real_tracked_read"] = run_cold_warm(
             first,
             second,
@@ -1603,12 +1948,10 @@ def run_repository(
         concurrent_arguments = {"pattern": CONCURRENT_MARKER, "path": "bulk", "maxResults": 50}
         concurrent_native = native_search(workspace, CONCURRENT_MARKER, "bulk", 50)
         cursor = audit.begin()
-        barrier = threading.Barrier(3)
         outcomes: list[dict[str, Any]] = [{}, {}]
 
         def worker(index: int, session: Any) -> None:
             try:
-                barrier.wait(timeout=5)
                 response, elapsed = _timed_tool_call(
                     session,
                     f"concurrent-{index}",
@@ -1619,13 +1962,12 @@ def run_repository(
             except BaseException as error:  # re-raised by the controller
                 outcomes[index] = {"error": error}
 
-        workers = [
-            threading.Thread(target=worker, args=(0, first)),
-            threading.Thread(target=worker, args=(1, second)),
-        ]
-        for thread in workers:
-            thread.start()
-        barrier.wait(timeout=5)
+        workers = [threading.Thread(target=worker, args=(0, first))]
+        workers[0].start()
+        audit.wait_for_event(cursor, "executed", min(5.0, timeout_seconds))
+        workers.append(threading.Thread(target=worker, args=(1, second)))
+        workers[1].start()
+        audit.wait_for_event(cursor, "inflight_candidate", min(5.0, timeout_seconds))
         for thread in workers:
             thread.join(timeout_seconds)
         if any(thread.is_alive() for thread in workers):
@@ -1651,12 +1993,57 @@ def run_repository(
         ]
         ids = [record["comparison"]["result_id"] for record in concurrent_records]
         counts = concurrent_audit["event_counts"]
-        if ids[0] is None or ids[0] != ids[1] or counts.get("executed") != 1 or counts.get("inflight_join") != 1:
+        if (
+            ids[0] is None
+            or ids[0] != ids[1]
+            or counts.get("executed") != 1
+            or counts.get("inflight_join") != 1
+            or concurrent_audit["request_roles"] != {"follower": 1, "leader": 1}
+        ):
             raise HarnessRefusal("concurrent_join_unproven", "two MCP processes did not execute/join exactly once")
         scenarios["concurrent_process_join"] = {
             "calls": concurrent_records,
             "exactly_one_provider_execution": True,
             "joined_current_inflight": True,
+            "leader_latency_ms": concurrent_records[0]["elapsed_ms"],
+            "follower_latency_ms": concurrent_records[1]["elapsed_ms"],
+            "request_roles": concurrent_audit["request_roles"],
+        }
+
+        partitioned: list[dict[str, Any]] = []
+        for partition in range(BULK_PARTITIONS):
+            partition_path = f"bulk/partition-{partition:02d}"
+            partition_arguments = {
+                "pattern": CONCURRENT_MARKER,
+                "path": partition_path,
+                "maxResults": 50,
+            }
+            partitioned.append(
+                {
+                    "path": partition_path,
+                    "logical_bytes": (BULK_FILE_COUNT // BULK_PARTITIONS)
+                    * BULK_FILE_BYTES,
+                    "authority_scan_limit_bytes": MAX_REPOSITORY_SCAN_BYTES,
+                    "calls": run_cold_warm(
+                        first,
+                        second,
+                        audit,
+                        f"partitioned-search-{partition:02d}",
+                        "repo.search",
+                        partition_arguments,
+                        native_search(
+                            workspace,
+                            CONCURRENT_MARKER,
+                            partition_path,
+                            50,
+                        ),
+                    ),
+                }
+            )
+        scenarios["partitioned_large_repository_search"] = {
+            "partitions": partitioned,
+            "partition_count": BULK_PARTITIONS,
+            "aggregate_logical_bytes": BULK_FILE_COUNT * BULK_FILE_BYTES,
         }
 
         later = run_verified_call(
@@ -1785,6 +2172,77 @@ def run_repository(
             "mutation": relevant_mutation,
             "after": relevant_after,
             "invalidated": True,
+        }
+
+        head_before = _git_probe(workspace, ("rev-parse", "HEAD"))
+        if head_before.returncode != 0:
+            raise HarnessRefusal("git_head", "private workspace HEAD is unavailable")
+        before_index = _git_probe(workspace, ("diff", "--cached", "--quiet", "--"))
+        if before_index.returncode != 0:
+            raise HarnessRefusal("git_index", "private workspace index was unexpectedly dirty")
+        _run_git_mutating_copy(workspace, "add", "--", first_path)
+        after_index = _git_probe(workspace, ("diff", "--cached", "--quiet", "--"))
+        if after_index.returncode != 1:
+            raise HarnessRefusal("git_index", "index mutation was not observed")
+        index_status = run_opaque_call(
+            first,
+            audit,
+            "git-index-status",
+            "git.status",
+            {"path": first_path},
+            require_result_authority=False,
+        )
+        index_diff = run_opaque_call(
+            restarted,
+            audit,
+            "git-index-diff",
+            "git.diff",
+            {"path": first_path, "staged": True, "revision": "HEAD"},
+            require_result_authority=False,
+        )
+        require_event(index_status, "executed")
+        require_event(index_diff, "executed")
+        _run_git_mutating_copy(workspace, "commit", "-q", "-m", "relevant mutation")
+        head_after = _git_probe(workspace, ("rev-parse", "HEAD"))
+        if (
+            head_after.returncode != 0
+            or head_after.stdout == head_before.stdout
+            or len(head_after.stdout.strip()) not in {40, 64}
+        ):
+            raise HarnessRefusal("git_head", "HEAD mutation was not observed")
+        head_log = run_opaque_call(
+            first,
+            audit,
+            "git-head-log",
+            "git.log",
+            {"maxResults": 10},
+            require_result_authority=False,
+        )
+        head_show = run_opaque_call(
+            restarted,
+            audit,
+            "git-head-show",
+            "git.show",
+            {"path": first_path},
+            require_result_authority=False,
+        )
+        head_blame = run_opaque_call(
+            first,
+            audit,
+            "git-head-blame",
+            "git.blame",
+            {"path": first_path, "startLine": 1, "endLine": 1},
+            require_result_authority=False,
+        )
+        for observation in (head_log, head_show, head_blame):
+            require_event(observation, "executed")
+        scenarios["git_index_and_head_mutation"] = {
+            "head_before": head_before.stdout.decode("ascii").strip(),
+            "head_after": head_after.stdout.decode("ascii").strip(),
+            "index_changed": True,
+            "status": index_status,
+            "staged_diff": index_diff,
+            "head_observations": [head_log, head_show, head_blame],
         }
 
         for label, relative in (
@@ -1930,13 +2388,57 @@ def run_repository(
             "after": replace_after,
         }
 
+        replacement_workspace = temporary_root / f"replacement-{snapshot.language}"
+        replacement_prepared = prepare_workspace(snapshot, replacement_workspace)
+        replacement_path = replacement_workspace / replacement_prepared["first_path"]
+        _replace_file(
+            replacement_path,
+            replacement_path.read_bytes()
+            + f"\n{REPOSITORY_REPLACEMENT_MARKER}\n".encode("utf-8"),
+        )
+        retired_workspace = temporary_root / f"retired-{snapshot.language}"
+        os.replace(workspace, retired_workspace)
+        os.replace(replacement_workspace, workspace)
+        repository_replacement = run_verified_call(
+            restarted,
+            audit,
+            "repository-replacement",
+            "repo.read",
+            {"path": replacement_prepared["first_path"]},
+            native_read(workspace, replacement_prepared["first_path"]),
+        )
+        require_event(repository_replacement, "executed")
+        prior_read_id = scenarios["real_tracked_read"]["cold"]["comparison"]["result_id"]
+        if repository_replacement["comparison"]["result_id"] in {None, prior_read_id}:
+            raise HarnessRefusal(
+                "repository_replacement_false_hit",
+                "repository replacement reused superseded authority",
+            )
+        scenarios["repository_replacement"] = {
+            "strategy": "same-path-directory-identity-replacement",
+            "workspace_manifest_sha256": workspace_manifest_sha256(workspace),
+            "observation": repository_replacement,
+            "old_authority_reused": False,
+        }
+
         totals = audit.totals()
-        counters = {**reconcile_gateway_counters(totals), "false_hits": false_hits}
+        non_reusable_successes = count_non_reusable_successes(scenarios)
+        counters = {
+            **reconcile_gateway_counters(
+                totals, non_reusable_successes=non_reusable_successes
+            ),
+            "false_hits": false_hits,
+        }
         if counters["false_hits"] != 0:
             raise HarnessRefusal("false_hits", "one or more reuse results were incorrect")
         report = {
             "outcome": "pass",
             "language": snapshot.language,
+            "tool_coverage": {
+                "advertised": list(EXERCISED_TOOLS),
+                "exercised": list(EXERCISED_TOOLS),
+                "exact_status_and_output_equality": True,
+            },
             "repository": {
                 "root": str(snapshot.root),
                 "git_sha": snapshot.git_sha,
@@ -2076,6 +2578,8 @@ def evaluate(
     if timeout_seconds < 10 or timeout_seconds > 300:
         raise HarnessRefusal("timeout_bound", "timeout must be within 10..=300 seconds")
     validate_repository_inputs(repositories)
+    baseline_resources = resource_snapshot()
+    started_ns = time.perf_counter_ns()
     go_search = (
         discover_go_repository(
             go_search_roots,
@@ -2124,7 +2628,6 @@ def evaluate(
             snapshots.append((repository, snapshot))
         except HarnessRefusal as error:
             reports.append(refusal_record(repository, error))
-    started_ns = time.perf_counter_ns()
     with tempfile.TemporaryDirectory(prefix="again-real-repo-gateway-corpus-") as temporary:
         root = pathlib.Path(temporary).resolve()
         root.chmod(0o700)
@@ -2190,6 +2693,22 @@ def evaluate(
             )
     passed = sum(item.get("outcome") == "pass" for item in reports)
     non_pass = sum(item.get("outcome") != "pass" for item in reports)
+    final_resources = resource_snapshot()
+    self_cpu = float(final_resources["self_cpu_seconds"]) - float(
+        baseline_resources["self_cpu_seconds"]
+    )
+    child_cpu = float(final_resources["child_cpu_seconds"]) - float(
+        baseline_resources["child_cpu_seconds"]
+    )
+    total_cpu = self_cpu + child_cpu
+    observed_rss = max(
+        int(final_resources["self_max_rss_bytes"]),
+        int(final_resources["child_max_rss_bytes"]),
+    )
+    if total_cpu > MAX_CPU_SECONDS:
+        raise HarnessRefusal("cpu_bound", "repository corpus exceeded its CPU bound")
+    if observed_rss > MAX_RSS_BYTES:
+        raise HarnessRefusal("rss_bound", "repository corpus exceeded its RSS bound")
     return {
         "schema": SCHEMA,
         "harness_version": HARNESS_VERSION,
@@ -2201,6 +2720,10 @@ def evaluate(
         "harness_sha256": sibling_hashes[harness.name],
         "support_sha256": {
             key: value for key, value in sibling_hashes.items() if key != harness.name
+        },
+        "tool_coverage": {
+            "advertised": list(EXERCISED_TOOLS),
+            "exercised_on_each_passing_repository": list(EXERCISED_TOOLS),
         },
         "host": {
             "system": platform.system(),
@@ -2217,6 +2740,24 @@ def evaluate(
         },
         "go_repository_search": go_search,
         "repositories": reports,
+        "resource_observation": {
+            "cpu": {
+                "self_seconds": round(self_cpu, 6),
+                "child_seconds": round(child_cpu, 6),
+                "total_seconds": round(total_cpu, 6),
+                "limit_seconds": MAX_CPU_SECONDS,
+            },
+            "rss": {
+                "self_max_bytes": int(final_resources["self_max_rss_bytes"]),
+                "child_max_bytes": int(final_resources["child_max_rss_bytes"]),
+                "observed_max_bytes": observed_rss,
+                "limit_bytes": MAX_RSS_BYTES,
+            },
+        },
+        "delivery_receipts": {
+            "authenticated_receipts": 0,
+            "token_savings_claimed": False,
+        },
         "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
     }
 
