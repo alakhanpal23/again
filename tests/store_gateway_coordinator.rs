@@ -6,12 +6,13 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use again::agent_gateway::context::{ReasoningRecipientV1, ReasoningScopeV1};
 use again::store::{
     GatewayAgentContext, GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion,
     GatewayCoordinatorInputV1, GatewayDependencyV1, GatewayExecutionStart, GatewayFailure,
     GatewayFailureReason, GatewayFollowerCancellation, GatewayFreshnessEvidenceV1,
-    GatewayOperationDispositionV1, GatewayRefusalReason, GatewayServedRouteV1, Store, StoredResult,
-    ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayOperationDispositionV1, GatewayReasoningContextQueryV1, GatewayRefusalReason,
+    GatewayServedRouteV1, Store, StoredResult, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use rusqlite::{Connection, params};
 use tempfile::TempDir;
@@ -105,6 +106,62 @@ fn complete(store: &Store, lease: &str, owner: &str, result: &StoredResult) -> S
     }
 }
 
+fn reasoning_query(
+    proof: &ValidatedGatewayReadV1,
+    authorization_scope_digest: &str,
+    task: &str,
+    agent: &str,
+) -> GatewayReasoningContextQueryV1 {
+    let scope = ReasoningScopeV1::new(
+        task,
+        "repository-01",
+        "workspace-01",
+        proof.state_digest(),
+        &proof.dependency_digest(),
+        authorization_scope_digest,
+    )
+    .unwrap();
+    let recipient = ReasoningRecipientV1::new(
+        agent,
+        "session-01",
+        "turn-01",
+        &digest("connection-generation"),
+        0,
+        1,
+    )
+    .unwrap();
+    GatewayReasoningContextQueryV1::new(scope, recipient, proof.clone()).unwrap()
+}
+
+fn insert_reasoning_delivery(
+    root: &Path,
+    gateway_result_id: &str,
+    result: &StoredResult,
+    authorization_scope_digest: &str,
+    agent: &str,
+) {
+    Connection::open(root.join("again.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO gateway_delivery_receipts (challenge_id, authorization_scope_digest, connection_digest, session_id, turn_id, agent_id, compaction_generation, call_digest, gateway_result_id, result_digest, exact_status, stdout_digest, stdout_bytes, stderr_digest, stderr_bytes, acknowledged_ms) VALUES (?1, ?2, ?3, 'source-session', 'source-turn', ?4, 0, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                format!("reasoning-receipt-{agent}"),
+                authorization_scope_digest,
+                digest("source-connection"),
+                agent,
+                digest("source-call"),
+                gateway_result_id,
+                result.exit_code,
+                result.stdout_digest,
+                result.stdout_bytes,
+                result.stderr_digest,
+                result.stderr_bytes,
+                now_ms(),
+            ],
+        )
+        .unwrap();
+}
+
 #[test]
 fn twenty_callers_elect_one_leader_for_exact_read_binding() {
     const CALLERS: usize = 20;
@@ -191,6 +248,88 @@ fn follower_observes_and_retrieves_content_addressed_full_result() {
 }
 
 #[test]
+fn authenticated_observation_is_shared_across_agents_but_not_authorization_scopes() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("state");
+    let proof = binding("reasoning-shared-request", "reasoning-shared-state");
+    let store = Store::open(&root).unwrap();
+    let (_, lease) = leader(store.acquire_gateway_call(&proof, "source-agent").unwrap());
+    let result = stored_result(&root, &proof, b"verified source bytes");
+    let gateway_result_id = complete(&store, &lease, "source-agent", &result);
+    let authorization_scope = digest("shared-authorization");
+    insert_reasoning_delivery(
+        &root,
+        &gateway_result_id,
+        &result,
+        &authorization_scope,
+        "source-agent",
+    );
+
+    let shared = store
+        .reasoning_context_v1(&reasoning_query(
+            &proof,
+            &authorization_scope,
+            "task-a",
+            "recipient-agent",
+        ))
+        .unwrap();
+    assert_eq!(shared.known_facts.len(), 1);
+    assert_eq!(shared.completed_observations.len(), 1);
+    assert_eq!(
+        shared.known_facts[0].sources()[0].result_id(),
+        gateway_result_id
+    );
+    assert_eq!(shared.evidence_metrics.investigations_avoided, 1);
+    assert_eq!(shared.evidence_metrics.provider_calls_avoided, 1);
+    assert_eq!(shared.evidence_metrics.estimated_execution_time_saved_ms, 7);
+
+    let isolated = store
+        .reasoning_context_v1(&reasoning_query(
+            &proof,
+            &digest("different-authorization"),
+            "task-a",
+            "isolated-agent",
+        ))
+        .unwrap();
+    assert!(isolated.known_facts.is_empty());
+    assert!(isolated.completed_observations.is_empty());
+    assert_eq!(isolated.explicit_unknowns.len(), 1);
+    assert_eq!(isolated.evidence_metrics.provider_calls_avoided, 0);
+}
+
+#[test]
+fn reasoning_read_model_reports_other_agent_work_and_verified_failure() {
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("state");
+    let proof = binding("reasoning-inflight-request", "reasoning-inflight-state");
+    let store = Store::open(&root).unwrap();
+    let (_, lease) = leader(store.acquire_gateway_call(&proof, "leader-agent").unwrap());
+    let query = reasoning_query(
+        &proof,
+        &digest("inflight-authorization"),
+        "task-inflight",
+        "follower-agent",
+    );
+
+    let inflight = store.reasoning_context_v1(&query).unwrap();
+    assert_eq!(inflight.inflight_work.len(), 1);
+    assert_eq!(inflight.evidence_metrics.inflight_joins, 1);
+    assert_eq!(inflight.evidence_metrics.provider_calls_avoided, 1);
+
+    assert!(matches!(
+        store
+            .fail_gateway_call(&lease, GatewayFailureReason::Transport)
+            .unwrap(),
+        GatewayFailure::Failed { .. }
+    ));
+    let failed = store.reasoning_context_v1(&query).unwrap();
+    assert_eq!(failed.failed_approaches.len(), 1);
+    assert_eq!(failed.explicit_unknowns.len(), 1);
+    assert!(failed.known_facts.is_empty());
+    assert_eq!(failed.evidence_metrics.provider_calls_avoided, 0);
+}
+
+#[test]
 fn route_stats_require_final_served_promotion_and_are_idempotent() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("state");
@@ -254,6 +393,11 @@ fn route_stats_require_final_served_promotion_and_are_idempotent() {
     let after = store.gateway_stats().unwrap();
     assert_eq!(after.exact_hits, 1);
     assert_eq!(after.inflight_joins, 1);
+    assert_eq!(after.facts_reused, 1);
+    assert_eq!(after.investigations_avoided, 2);
+    assert_eq!(after.provider_calls_avoided, 2);
+    assert_eq!(after.estimated_execution_time_saved_ms, 14);
+    assert_eq!(after.confirmed_tokens_avoided, 0);
 }
 
 #[test]

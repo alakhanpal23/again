@@ -10,6 +10,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::agent_gateway::context::{
+    CompletedReasoningObservationV1, FailedReasoningApproachV1, InflightReasoningWorkV1,
+    InvalidatedReasoningFactV1, ReasoningBriefInputV1, ReasoningContextRefusalV1,
+    ReasoningFactScopeV1, ReasoningFactV1, ReasoningInvalidationV1, ReasoningRecipientV1,
+    ReasoningRetrievalIdentityV1, ReasoningRouteDecisionV1, ReasoningScopeV1,
+    ReasoningSourceReferenceV1, ReasoningUnknownV1, SuggestedReasoningToolCallV1,
+};
 use crate::agent_gateway::protocol::{
     DeliveryAuthorityRefusalV1, EffectClass, FreshnessRequirementV1, GatewayToolCallV1,
     RequestDigestV1,
@@ -110,6 +117,15 @@ pub struct StoreStats {
     pub compact_deliveries: u64,
     pub estimated_tokens_avoided: u64,
     pub stale_or_divergent_quarantines: u64,
+    pub facts_reused: u64,
+    pub investigations_avoided: u64,
+    pub provider_calls_avoided: u64,
+    pub invalidated_facts: u64,
+    pub context_bytes_delivered: u64,
+    pub delivery_confirmed_bytes_omitted: u64,
+    pub confirmed_tokens_avoided: u64,
+    pub false_hit_quarantines: u64,
+    pub estimated_execution_time_saved_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,6 +275,61 @@ impl ValidatedGatewayReadV1 {
 
     pub fn binding_digest(&self) -> &str {
         &self.binding_digest
+    }
+
+    pub fn dependencies(&self) -> &[GatewayDependencyV1] {
+        &self.input.dependencies
+    }
+
+    pub fn dependency_digest(&self) -> String {
+        gateway_dependency_digest_v1(&self.input.dependencies)
+    }
+}
+
+/// Read-only request for a payload-safe reasoning brief derived from the
+/// coordinator's verified rows. The validated gateway binding remains the
+/// authority boundary; labels and result identifiers never grant reuse.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GatewayReasoningContextQueryV1 {
+    scope: ReasoningScopeV1,
+    recipient: ReasoningRecipientV1,
+    binding: ValidatedGatewayReadV1,
+}
+
+impl std::fmt::Debug for GatewayReasoningContextQueryV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GatewayReasoningContextQueryV1(<redacted>)")
+    }
+}
+
+impl GatewayReasoningContextQueryV1 {
+    pub fn new(
+        scope: ReasoningScopeV1,
+        recipient: ReasoningRecipientV1,
+        binding: ValidatedGatewayReadV1,
+    ) -> Result<Self> {
+        if scope.state_digest() != binding.state_digest()
+            || scope.dependency_digest() != binding.dependency_digest()
+        {
+            bail!(GatewayRefusalReason::BindingMismatch.as_str());
+        }
+        Ok(Self {
+            scope,
+            recipient,
+            binding,
+        })
+    }
+
+    pub const fn scope(&self) -> &ReasoningScopeV1 {
+        &self.scope
+    }
+
+    pub const fn recipient(&self) -> &ReasoningRecipientV1 {
+        &self.recipient
+    }
+
+    pub const fn binding(&self) -> &ValidatedGatewayReadV1 {
+        &self.binding
     }
 }
 
@@ -433,6 +504,15 @@ pub struct GatewayStats {
     pub compact_deliveries: u64,
     pub estimated_tokens_avoided: u64,
     pub stale_or_divergent_quarantines: u64,
+    pub facts_reused: u64,
+    pub investigations_avoided: u64,
+    pub provider_calls_avoided: u64,
+    pub invalidated_facts: u64,
+    pub context_bytes_delivered: u64,
+    pub delivery_confirmed_bytes_omitted: u64,
+    pub confirmed_tokens_avoided: u64,
+    pub false_hit_quarantines: u64,
+    pub estimated_execution_time_saved_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1871,6 +1951,199 @@ impl Store {
         )
     }
 
+    /// Compile the coordinator's durable state into a bounded, payload-safe
+    /// reasoning read model. This method never returns provider output and
+    /// never issues a routing proof: callers must still use the exact store
+    /// proof and full-result APIs before reuse or retrieval.
+    pub fn reasoning_context_v1(
+        &self,
+        query: &GatewayReasoningContextQueryV1,
+    ) -> Result<ReasoningBriefInputV1> {
+        let mut brief = ReasoningBriefInputV1::empty(query.scope.clone(), query.recipient.clone());
+        match self.observe_gateway_call(&query.binding)? {
+            GatewayCallObservation::Ready { gateway_result_id } => {
+                let Some(result) = self.get_gateway_result(&query.binding, &gateway_result_id)?
+                else {
+                    add_reasoning_unknown_v1(
+                        &mut brief,
+                        ReasoningRouteDecisionV1::ExecuteForUnknown,
+                    )?;
+                    return Ok(brief);
+                };
+                if !has_matching_reasoning_delivery_v1(
+                    &self.conn,
+                    query.scope.authorization_scope_digest(),
+                    &result,
+                )? {
+                    brief.explicit_unknowns.push(reasoning_item_v1(
+                        ReasoningUnknownV1::new(
+                            "authorization-scope-evidence",
+                            "the current authorization scope has no authenticated full-delivery evidence for this observation",
+                        ),
+                    )?);
+                    brief.suggested_next_tool_calls.push(reasoning_item_v1(
+                        SuggestedReasoningToolCallV1::new(
+                            "gateway",
+                            "execute-observation",
+                            "obtain a verified observation under the current authorization scope",
+                            ReasoningRouteDecisionV1::ExecuteForAuthorization,
+                        ),
+                    )?);
+                    brief
+                        .route_decisions
+                        .push(ReasoningRouteDecisionV1::ExecuteForAuthorization);
+                    return Ok(brief);
+                }
+
+                let source = reasoning_gateway_source_v1(
+                    query.scope(),
+                    &gateway_result_id,
+                    &gateway_result_id,
+                    &format!("gateway-result:{gateway_result_id}"),
+                )?;
+                brief.known_facts.push(reasoning_item_v1(ReasoningFactV1::new(
+                    &format!("gateway-result-{}", &gateway_result_id[..16]),
+                    "gateway-exact-observation",
+                    "a verified result is available for the exact request, state, policy, dependencies, and authorization scope",
+                    &gateway_result_id,
+                    ReasoningFactScopeV1::RepositoryWide,
+                    None,
+                    vec![source.clone()],
+                ))?);
+                let total_bytes = result
+                    .result
+                    .stdout_bytes
+                    .checked_add(result.result.stderr_bytes)
+                    .ok_or_else(|| anyhow!("gateway result byte count overflow"))?;
+                let retrieval = reasoning_item_v1(ReasoningRetrievalIdentityV1::new(
+                    &gateway_result_id,
+                    &gateway_result_id,
+                    total_bytes,
+                ))?;
+                brief.completed_observations.push(reasoning_item_v1(
+                    CompletedReasoningObservationV1::new(
+                        &gateway_result_id,
+                        "provider execution completed and the exact result remains available through binding-checked retrieval",
+                        result.result.duration_ms,
+                        retrieval,
+                        vec![source],
+                    ),
+                )?);
+                brief
+                    .route_decisions
+                    .push(ReasoningRouteDecisionV1::SharedVerifiedFact);
+                brief.evidence_metrics.investigations_avoided = 1;
+                brief.evidence_metrics.provider_calls_avoided = 1;
+                brief.evidence_metrics.estimated_execution_time_saved_ms =
+                    result.result.duration_ms;
+            }
+            GatewayCallObservation::Inflight {
+                leader_call_id,
+                leader,
+                ..
+            } => {
+                let generation = self
+                    .conn
+                    .query_row(
+                        "SELECT lifecycle_generation FROM inflight_leases WHERE call_id = ?1 AND binding_digest = ?2 AND status = 'active'",
+                        params![leader_call_id, query.binding.binding_digest()],
+                        |row| row.get::<_, u64>(0),
+                    )
+                    .optional()?;
+                if leader != query.recipient.agent_id() {
+                    let generation = generation
+                        .ok_or_else(|| anyhow!(GatewayRefusalReason::LeaseNotCurrent.as_str()))?;
+                    brief
+                        .inflight_work
+                        .push(reasoning_item_v1(InflightReasoningWorkV1::new(
+                            &leader_call_id,
+                            &leader,
+                            generation,
+                            "another agent is executing the exact current binding",
+                        ))?);
+                    brief
+                        .route_decisions
+                        .push(ReasoningRouteDecisionV1::InflightJoin);
+                    brief.evidence_metrics.inflight_joins = 1;
+                    brief.evidence_metrics.provider_calls_avoided = 1;
+                }
+            }
+            GatewayCallObservation::Failed { reason } => {
+                let call_id = self
+                    .conn
+                    .query_row(
+                        "SELECT call_id FROM gateway_requests WHERE binding_digest = ?1 AND status = 'failed' ORDER BY updated_ms DESC, call_id DESC LIMIT 1",
+                        [query.binding.binding_digest()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| query.binding.binding_digest().to_owned());
+                let row_digest = reasoning_store_row_digest_v1(
+                    "failed-request",
+                    query.binding.binding_digest(),
+                    &call_id,
+                    reason.as_str(),
+                );
+                let source = reasoning_gateway_source_v1(
+                    query.scope(),
+                    &call_id,
+                    &row_digest,
+                    &format!("gateway-request:{call_id}"),
+                )?;
+                brief
+                    .failed_approaches
+                    .push(reasoning_item_v1(FailedReasoningApproachV1::new(
+                        &format!("failed-{}", &row_digest[..16]),
+                        "execute the exact gateway observation",
+                        gateway_failure_explanation_v1(reason),
+                        vec![source],
+                    ))?);
+                add_reasoning_unknown_v1(&mut brief, ReasoningRouteDecisionV1::ExecuteForUnknown)?;
+            }
+            GatewayCallObservation::Quarantined { .. } => {
+                let gateway_result_id = self
+                    .conn
+                    .query_row(
+                        "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'quarantined' ORDER BY updated_ms DESC, gateway_result_id DESC LIMIT 1",
+                        [query.binding.binding_digest()],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| query.binding.binding_digest().to_owned());
+                let source = reasoning_gateway_source_v1(
+                    query.scope(),
+                    &gateway_result_id,
+                    &gateway_result_id,
+                    &format!("gateway-result:{gateway_result_id}"),
+                )?;
+                let fact = reasoning_item_v1(ReasoningFactV1::new(
+                    &format!("quarantined-{}", &gateway_result_id[..16]),
+                    "gateway-exact-observation",
+                    "a prior observation for this exact binding is quarantined and cannot be current context",
+                    &gateway_result_id,
+                    ReasoningFactScopeV1::RepositoryWide,
+                    None,
+                    vec![source],
+                ))?;
+                brief
+                    .invalidated_facts
+                    .push(reasoning_item_v1(InvalidatedReasoningFactV1::new(
+                        fact,
+                        ReasoningInvalidationV1::Quarantined,
+                        Vec::new(),
+                    ))?);
+                brief
+                    .route_decisions
+                    .push(ReasoningRouteDecisionV1::QuarantineContradiction);
+                brief.evidence_metrics.false_hit_quarantines = 1;
+            }
+            GatewayCallObservation::Missing => {
+                add_reasoning_unknown_v1(&mut brief, ReasoningRouteDecisionV1::ExecuteForUnknown)?;
+            }
+        }
+        Ok(brief)
+    }
+
     /// Observe one validated binding and issue at most one transaction-time
     /// router proof from the exact committed store rows. This does not load or
     /// present result bytes and grants no authority by itself.
@@ -2648,6 +2921,47 @@ impl Store {
                 _ => {}
             }
         }
+        let legacy_context_bytes: u64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0) FROM gateway_delivery_receipts",
+            [],
+            |row| row.get(0),
+        )?;
+        let (v2_context_bytes, compact_deliveries): (u64, u64) = self.conn.query_row(
+            "SELECT
+                COALESCE(SUM(CASE WHEN presentation = 'full' THEN stdout_bytes + stderr_bytes ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN presentation = 'compact' THEN 1 ELSE 0 END), 0)
+             FROM gateway_delivery_receipts_v2",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (confirmed_bytes_omitted, confirmed_tokens_avoided): (u64, u64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(bytes_omitted), 0), COALESCE(SUM(estimated_tokens_avoided), 0) FROM gateway_delivery_savings_v2",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+        let estimated_execution_time_saved_ms: u64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(gateway_results.duration_ms), 0)
+             FROM gateway_events
+             JOIN gateway_results
+               ON gateway_results.gateway_result_id = gateway_events.gateway_result_id
+             WHERE gateway_events.event_type IN ('exact_hit', 'coverage_hit', 'inflight_join')
+               AND gateway_results.status = 'ready'",
+            [],
+            |row| row.get(0),
+        )?;
+        stats.facts_reused = stats.exact_hits.saturating_add(stats.coverage_hits);
+        stats.investigations_avoided = stats.facts_reused.saturating_add(stats.inflight_joins);
+        stats.provider_calls_avoided = stats.investigations_avoided;
+        stats.invalidated_facts = stats.stale_or_divergent_quarantines;
+        stats.context_bytes_delivered = legacy_context_bytes.saturating_add(v2_context_bytes);
+        stats.compact_deliveries = compact_deliveries;
+        stats.delivery_confirmed_bytes_omitted = confirmed_bytes_omitted;
+        stats.confirmed_tokens_avoided = confirmed_tokens_avoided;
+        stats.estimated_tokens_avoided = confirmed_tokens_avoided;
+        stats.false_hit_quarantines = stats.stale_or_divergent_quarantines;
+        stats.estimated_execution_time_saved_ms = estimated_execution_time_saved_ms;
         Ok(stats)
     }
 
@@ -2859,6 +3173,15 @@ impl Store {
         stats.compact_deliveries = gateway.compact_deliveries;
         stats.estimated_tokens_avoided = gateway.estimated_tokens_avoided;
         stats.stale_or_divergent_quarantines = gateway.stale_or_divergent_quarantines;
+        stats.facts_reused = gateway.facts_reused;
+        stats.investigations_avoided = gateway.investigations_avoided;
+        stats.provider_calls_avoided = gateway.provider_calls_avoided;
+        stats.invalidated_facts = gateway.invalidated_facts;
+        stats.context_bytes_delivered = gateway.context_bytes_delivered;
+        stats.delivery_confirmed_bytes_omitted = gateway.delivery_confirmed_bytes_omitted;
+        stats.confirmed_tokens_avoided = gateway.confirmed_tokens_avoided;
+        stats.false_hit_quarantines = gateway.false_hit_quarantines;
+        stats.estimated_execution_time_saved_ms = gateway.estimated_execution_time_saved_ms;
         Ok(stats)
     }
 }
@@ -2976,6 +3299,142 @@ fn gateway_dependency_digest_v1(dependencies: &[GatewayDependencyV1]) -> String 
         hash_field(&mut hasher, dependency.value_digest.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn reasoning_item_v1<T>(item: std::result::Result<T, ReasoningContextRefusalV1>) -> Result<T> {
+    item.map_err(|reason| anyhow!(reason.code()))
+}
+
+fn reasoning_gateway_source_v1(
+    scope: &ReasoningScopeV1,
+    observation_id: &str,
+    observation_digest: &str,
+    locator: &str,
+) -> Result<ReasoningSourceReferenceV1> {
+    reasoning_item_v1(ReasoningSourceReferenceV1::new(
+        observation_id,
+        observation_digest,
+        scope.repository_id(),
+        scope.workspace_id(),
+        scope.state_digest(),
+        scope.dependency_digest(),
+        scope.authorization_scope_digest(),
+        locator,
+    ))
+}
+
+fn add_reasoning_unknown_v1(
+    brief: &mut ReasoningBriefInputV1,
+    route: ReasoningRouteDecisionV1,
+) -> Result<()> {
+    brief
+        .explicit_unknowns
+        .push(reasoning_item_v1(ReasoningUnknownV1::new(
+            "gateway-exact-observation",
+            "no verified current result or matching active work is available",
+        ))?);
+    brief
+        .suggested_next_tool_calls
+        .push(reasoning_item_v1(SuggestedReasoningToolCallV1::new(
+            "gateway",
+            "execute-observation",
+            "obtain the missing exact observation",
+            route,
+        ))?);
+    brief.route_decisions.push(route);
+    Ok(())
+}
+
+fn gateway_failure_explanation_v1(reason: GatewayFailureReason) -> &'static str {
+    match reason {
+        GatewayFailureReason::ProviderUnavailable => {
+            "the provider was unavailable for the verified failed execution"
+        }
+        GatewayFailureReason::Transport => {
+            "the verified execution failed at the provider transport boundary"
+        }
+        GatewayFailureReason::Deadline => {
+            "the verified execution or freshness interval reached its deadline"
+        }
+        GatewayFailureReason::Cancelled => {
+            "the verified execution was cancelled before a result committed"
+        }
+        GatewayFailureReason::Protocol => {
+            "the provider response failed verified protocol validation"
+        }
+        GatewayFailureReason::Internal => {
+            "the coordinator recorded a verified internal execution failure"
+        }
+    }
+}
+
+fn reasoning_store_row_digest_v1(
+    kind: &str,
+    binding_digest: &str,
+    row_id: &str,
+    reason: &str,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.reasoning-store-row.v1\0");
+    for value in [kind, binding_digest, row_id, reason] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn has_matching_reasoning_delivery_v1(
+    connection: &Connection,
+    authorization_scope_digest: &str,
+    result: &GatewayFullResultV1,
+) -> Result<bool> {
+    let legacy: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM gateway_delivery_receipts
+            WHERE authorization_scope_digest = ?1
+              AND gateway_result_id = ?2
+              AND result_digest = ?2
+              AND exact_status = ?3
+              AND stdout_digest = ?4 AND stdout_bytes = ?5
+              AND stderr_digest = ?6 AND stderr_bytes = ?7
+        )",
+        params![
+            authorization_scope_digest,
+            result.gateway_result_id,
+            result.result.exit_code,
+            result.result.stdout_digest,
+            result.result.stdout_bytes,
+            result.result.stderr_digest,
+            result.result.stderr_bytes,
+        ],
+        |row| row.get(0),
+    )?;
+    if legacy {
+        return Ok(true);
+    }
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM gateway_delivery_receipts_v2
+                WHERE authorization_scope_digest = ?1
+                  AND gateway_result_id = ?2
+                  AND result_digest = ?2
+                  AND exact_status = ?3
+                  AND stdout_digest = ?4 AND stdout_bytes = ?5
+                  AND stderr_digest = ?6 AND stderr_bytes = ?7
+                  AND presentation = 'full'
+            )",
+            params![
+                authorization_scope_digest,
+                result.gateway_result_id,
+                result.result.exit_code,
+                result.result.stdout_digest,
+                result.result.stdout_bytes,
+                result.result.stderr_digest,
+                result.result.stderr_bytes,
+            ],
+            |row| row.get(0),
+        )
+        .context("read authenticated reasoning delivery")
 }
 
 fn exact_store_record_digest_v1(
