@@ -910,11 +910,11 @@ class ConfiguredMcpSession:
         listing = self.request(f"{self.label}:tools", "tools/list", {})
         tools = listing.get("result", {}).get("tools")
         names = [item.get("name") for item in tools] if isinstance(tools, list) else []
-        if names != ["repo.read", "repo.search"]:
+        if names != list(product.EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("mcp_tools", f"unexpected installed tools: {names!r}")
 
     def tool_call(self, request_id: str, name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
-        if name not in {"repo.read", "repo.search"}:
+        if name not in product.E2E_EXERCISED_TOOLS:
             raise HarnessRefusal("mcp_tool", "smoke harness permits only built-in read tools")
         return self.request(
             request_id,
@@ -1522,7 +1522,7 @@ def run_onboarding_smoke(
             "refusals": {"unowned": unowned, "symlink": symlink},
             "mcp": {
                 "installed_clients": ["codex", "claude"],
-                "tools": ["repo.read", "repo.search"],
+                "tools": list(product.EXPECTED_ADVERTISED_TOOLS),
                 "sessions": session_evidence,
                 "mutation": mutation,
             },
