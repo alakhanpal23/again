@@ -22,7 +22,9 @@ use crate::agent_gateway::protocol::{
     RequestDigestV1,
 };
 use crate::fingerprint::{FileDigestCache, FileIdentity};
-use crate::mcp_gateway::ConfirmedDeliveryV1;
+use crate::mcp_gateway::{
+    ConfirmedDeliveryV1, RecipientConnectionRetirementV2, RecipientRetrievalAuthorityV2,
+};
 
 const SCHEMA_VERSION: i64 = 10;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
@@ -38,6 +40,7 @@ const GATEWAY_LEASE_TTL_MS: i64 = 30_000;
 const GATEWAY_FRESHNESS_MAX_MS: i64 = 5 * 60_000;
 const GATEWAY_MAX_DEPENDENCIES: usize = 64;
 const GATEWAY_MAX_OWNER_BYTES: usize = 128;
+const RETRIEVAL_GRANT_TTL_MS_V2: i64 = 30_000;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -544,6 +547,27 @@ pub struct GatewayFullResultV1 {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub dependencies: Vec<GatewayDependencyV1>,
+}
+
+/// Store-created wire material for one same-connection retrieval. The token
+/// is persisted only as a digest and the value is consumed when transferred
+/// into the MCP response.
+pub struct StoreRetrievalGrantV2 {
+    grant_id: String,
+    token: String,
+    gateway_result_id: String,
+    expires_at_ms: i64,
+}
+
+impl StoreRetrievalGrantV2 {
+    pub(crate) fn into_wire_parts(self) -> (String, String, String, i64) {
+        (
+            self.grant_id,
+            self.token,
+            self.gateway_result_id,
+            self.expires_at_ms,
+        )
+    }
 }
 
 /// Store-transaction-issued, one-shot exact result authority. The private
@@ -2761,6 +2785,7 @@ impl Store {
     /// Persist complete recipient delivery only from an opaque confirmation
     /// issued by the live MCP connection ledger. Callers cannot construct this
     /// authority from a result ID or content digest.
+    #[cfg(test)]
     pub(crate) fn confirm_gateway_delivery_v1(
         &self,
         delivery: &ConfirmedDeliveryV1,
@@ -2866,6 +2891,254 @@ impl Store {
         }
         transaction.commit()?;
         Ok(inserted)
+    }
+
+    /// Atomically persist an exact response-bound receipt and create the only
+    /// retrieval grant derived from it. A crash can therefore leave neither
+    /// object or both objects, never an acknowledged receipt with a lost
+    /// follow-up authority.
+    pub(crate) fn confirm_gateway_delivery_and_issue_retrieval_v2(
+        &self,
+        delivery: &ConfirmedDeliveryV1,
+    ) -> Result<StoreRetrievalGrantV2> {
+        let binding = delivery.binding();
+        for digest in [
+            delivery.gateway_result_id(),
+            binding.authorization_scope_digest(),
+            binding.connection_digest(),
+            binding.connection_generation(),
+            binding.call_digest(),
+            binding.response_request_id_digest(),
+            binding.result_digest(),
+            binding.streams().stdout_digest(),
+            binding.streams().stderr_digest(),
+            binding.response_envelope_digest(),
+        ] {
+            validate_digest(digest, "delivery authority digest")?;
+        }
+        if delivery.gateway_result_id() != binding.result_digest()
+            || binding.compaction_generation() > i64::MAX as u64
+            || binding.streams().stdout_bytes() > i64::MAX as u64
+            || binding.streams().stderr_bytes() > i64::MAX as u64
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+
+        let now = now_ms();
+        let expires_at_ms = now
+            .checked_add(RETRIEVAL_GRANT_TTL_MS_V2)
+            .ok_or_else(|| anyhow!(DeliveryAuthorityRefusalV1::InvalidBinding.code()))?;
+        let receipt_id = format!("dr2_{}", Uuid::new_v4().simple());
+        let grant_id = format!("gr2_{}", Uuid::new_v4().simple());
+        let token = format!("rt2_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+        let token_digest = delivery_token_digest_v2(&token);
+
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result =
+            load_gateway_result_unbound_snapshot_v2(&transaction, delivery.gateway_result_id())?;
+        let streams = binding.streams();
+        if result.exit_code != streams.exact_status()
+            || result.stdout_digest != streams.stdout_digest()
+            || result.stdout_bytes != streams.stdout_bytes()
+            || result.stderr_digest != streams.stderr_digest()
+            || result.stderr_bytes != streams.stderr_bytes()
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        let stdout = self.get_blob(&result.stdout_digest)?;
+        let stderr = self.get_blob(&result.stderr_digest)?;
+        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO gateway_delivery_receipts_v2 (receipt_id, challenge_id, authorization_scope_digest, connection_digest, connection_generation, session_id, turn_id, agent_id, compaction_generation, response_request_id_digest, call_digest, gateway_result_id, result_digest, exact_status, stdout_digest, stdout_bytes, stderr_digest, stderr_bytes, response_envelope_digest, presentation, source_receipt_id, acknowledged_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, 'full', NULL, ?20)",
+            params![
+                receipt_id,
+                delivery.challenge_id(),
+                binding.authorization_scope_digest(),
+                binding.connection_digest(),
+                binding.connection_generation(),
+                binding.session_id(),
+                binding.turn_id(),
+                binding.agent_id(),
+                binding.compaction_generation(),
+                binding.response_request_id_digest(),
+                binding.call_digest(),
+                delivery.gateway_result_id(),
+                binding.result_digest(),
+                streams.exact_status(),
+                streams.stdout_digest(),
+                streams.stdout_bytes(),
+                streams.stderr_digest(),
+                streams.stderr_bytes(),
+                binding.response_envelope_digest(),
+                now,
+            ],
+        )?;
+        if inserted != 1 {
+            bail!(DeliveryAuthorityRefusalV1::AcknowledgementReplayed.code());
+        }
+        transaction.execute(
+            "INSERT INTO gateway_retrieval_grants_v2 (grant_id, token_digest, source_receipt_id, authorization_scope_digest, connection_digest, connection_generation, session_id, turn_id, agent_id, compaction_generation, gateway_result_id, issued_ms, expires_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                grant_id,
+                token_digest,
+                receipt_id,
+                binding.authorization_scope_digest(),
+                binding.connection_digest(),
+                binding.connection_generation(),
+                binding.session_id(),
+                binding.turn_id(),
+                binding.agent_id(),
+                binding.compaction_generation(),
+                delivery.gateway_result_id(),
+                now,
+                expires_at_ms,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(StoreRetrievalGrantV2 {
+            grant_id,
+            token,
+            gateway_result_id: delivery.gateway_result_id().to_owned(),
+            expires_at_ms,
+        })
+    }
+
+    /// Consume a connection- and generation-bound observation grant in one
+    /// transaction. This operation returns bytes only; it grants neither reuse
+    /// nor execution authority.
+    pub(crate) fn consume_gateway_retrieval_grant_v2(
+        &self,
+        authority: &RecipientRetrievalAuthorityV2,
+    ) -> Result<GatewayFullResultV1> {
+        if authority.grant_id().is_empty()
+            || authority.grant_id().len() > 128
+            || authority.token().is_empty()
+            || authority.token().len() > 128
+            || authority.expires_at_ms() <= 0
+            || authority.compaction_generation() > i64::MAX as u64
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        validate_digest(authority.gateway_result_id(), "gateway result digest")?;
+        for digest in [
+            authority.authorization_scope_digest(),
+            authority.connection_digest(),
+            authority.connection_generation(),
+        ] {
+            validate_digest(digest, "retrieval authority digest")?;
+        }
+
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let grant = transaction
+            .query_row(
+                "SELECT token_digest, authorization_scope_digest, connection_digest, connection_generation, session_id, turn_id, agent_id, compaction_generation, gateway_result_id, expires_ms, consumed_ms, retired_ms, source_receipt_id FROM gateway_retrieval_grants_v2 WHERE grant_id = ?1",
+                [authority.grant_id()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(5)?, row.get::<_, String>(6)?, row.get::<_, u64>(7)?, row.get::<_, String>(8)?, row.get::<_, i64>(9)?, row.get::<_, Option<i64>>(10)?, row.get::<_, Option<i64>>(11)?, row.get::<_, String>(12)?)),
+            )
+            .optional()?;
+        let Some((
+            token_digest,
+            scope,
+            connection,
+            connection_generation,
+            session,
+            turn,
+            agent,
+            generation,
+            result_id,
+            expires_ms,
+            consumed_ms,
+            retired_ms,
+            source_receipt_id,
+        )) = grant
+        else {
+            bail!(DeliveryAuthorityRefusalV1::Retired.code());
+        };
+        if consumed_ms.is_some() {
+            bail!(DeliveryAuthorityRefusalV1::AcknowledgementReplayed.code());
+        }
+        if retired_ms.is_some() || expires_ms <= now {
+            bail!(DeliveryAuthorityRefusalV1::Retired.code());
+        }
+        if !constant_time_digest_eq_v2(
+            token_digest.as_bytes(),
+            delivery_token_digest_v2(authority.token()).as_bytes(),
+        ) || scope != authority.authorization_scope_digest()
+            || connection != authority.connection_digest()
+            || connection_generation != authority.connection_generation()
+            || session != authority.session_id()
+            || turn != authority.turn_id()
+            || agent != authority.agent_id()
+            || generation != authority.compaction_generation()
+            || result_id != authority.gateway_result_id()
+            || expires_ms != authority.expires_at_ms()
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        let receipt_matches: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_delivery_receipts_v2 WHERE receipt_id = ?1 AND authorization_scope_digest = ?2 AND connection_digest = ?3 AND connection_generation = ?4 AND session_id = ?5 AND turn_id = ?6 AND agent_id = ?7 AND compaction_generation = ?8 AND gateway_result_id = ?9 AND result_digest = ?9 AND presentation = 'full' AND source_receipt_id IS NULL)",
+            params![source_receipt_id, scope, connection, connection_generation, session, turn, agent, generation, result_id],
+            |row| row.get(0),
+        )?;
+        if !receipt_matches {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+
+        let result = load_gateway_result_unbound_snapshot_v2(&transaction, &result_id)?;
+        let dependencies = load_result_dependencies_v1(&transaction, &result_id)?;
+        let stdout = self.get_blob(&result.stdout_digest)?;
+        let stderr = self.get_blob(&result.stderr_digest)?;
+        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        let changed = transaction.execute(
+            "UPDATE gateway_retrieval_grants_v2 SET consumed_ms = ?2 WHERE grant_id = ?1 AND consumed_ms IS NULL AND retired_ms IS NULL AND expires_ms > ?2",
+            params![authority.grant_id(), now],
+        )?;
+        if changed != 1 {
+            bail!(DeliveryAuthorityRefusalV1::Retired.code());
+        }
+        transaction.commit()?;
+        Ok(GatewayFullResultV1 {
+            gateway_result_id: result_id,
+            result,
+            stdout,
+            stderr,
+            dependencies,
+        })
+    }
+
+    pub(crate) fn retire_gateway_retrieval_grants_v2(
+        &self,
+        retirement: &RecipientConnectionRetirementV2,
+        reason: &'static str,
+    ) -> Result<u64> {
+        if !matches!(
+            reason,
+            "connection_closed" | "context_compacted" | "request_cancelled"
+        ) || retirement.compaction_generation() > i64::MAX as u64
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        for digest in [
+            retirement.authorization_scope_digest(),
+            retirement.connection_digest(),
+            retirement.connection_generation(),
+        ] {
+            validate_digest(digest, "retrieval retirement digest")?;
+        }
+        let now = now_ms();
+        let changed = self.conn.execute(
+            "UPDATE gateway_retrieval_grants_v2 SET retired_ms = ?1, retire_reason = ?2 WHERE authorization_scope_digest = ?3 AND connection_digest = ?4 AND connection_generation = ?5 AND compaction_generation = ?6 AND consumed_ms IS NULL AND retired_ms IS NULL",
+            params![now, reason, retirement.authorization_scope_digest(), retirement.connection_digest(), retirement.connection_generation(), retirement.compaction_generation()],
+        )?;
+        Ok(changed as u64)
     }
 
     pub fn clear_gateway_deliveries(&self, agent_context: &GatewayAgentContext) -> Result<u64> {
@@ -3689,6 +3962,99 @@ fn gateway_result_content_digest(
         hash_field(&mut hasher, dependency.value_digest.as_bytes());
     }
     hasher.finalize().to_hex().to_string()
+}
+
+fn delivery_token_digest_v2(token: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.retrieval-token.v2\0");
+    hasher.update(&(token.len() as u64).to_be_bytes());
+    hasher.update(token.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn constant_time_digest_eq_v2(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
+}
+
+/// Reconstruct a ready result from its complete publication chain without
+/// treating its content address as authorization. Callers must already hold a
+/// separate live recipient authority before reaching this helper.
+fn load_gateway_result_unbound_snapshot_v2(
+    transaction: &Transaction<'_>,
+    gateway_result_id: &str,
+) -> Result<StoredResult> {
+    let snapshot = transaction
+        .query_row(
+            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest, lease_id FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready' AND quarantine_reason IS NULL",
+            [gateway_result_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, i32>(5)?, row.get::<_, u64>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?, row.get::<_, String>(13)?)),
+        )
+        .optional()?;
+    let Some((
+        result_id,
+        stdout_digest,
+        stderr_digest,
+        stdout_bytes,
+        stderr_bytes,
+        exit_code,
+        duration_ms,
+        policy_version,
+        proof_digest,
+        request_digest,
+        state_digest,
+        policy_digest,
+        binding_digest,
+        lease_id,
+    )) = snapshot
+    else {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    };
+    let Some(result) = load_visible_result_tx(transaction, &result_id)? else {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    };
+    if result.request_key != request_digest
+        || result.stdout_digest != stdout_digest
+        || result.stderr_digest != stderr_digest
+        || result.stdout_bytes != stdout_bytes
+        || result.stderr_bytes != stderr_bytes
+        || result.exit_code != exit_code
+        || result.duration_ms != duration_ms
+        || result.policy_version != policy_version
+        || blake3::hash(result.proof_json.as_bytes()).to_hex().as_str() != proof_digest
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    let Some(lease) = gateway_lease_row_v1(transaction, &lease_id)? else {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    };
+    let current_generation: Option<u64> = transaction.query_row(
+        "SELECT MAX(lifecycle_generation) FROM inflight_leases WHERE binding_digest = ?1",
+        [&binding_digest],
+        |row| row.get(0),
+    )?;
+    if lease.status != "completed"
+        || lease.gateway_result_id.as_deref() != Some(gateway_result_id)
+        || lease.request_digest != request_digest
+        || lease.state_digest != state_digest
+        || lease.policy_digest != policy_digest
+        || lease.binding_digest != binding_digest
+        || current_generation != Some(lease.lifecycle_generation)
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
+    if gateway_result_content_digest(&lease, &result, &dependencies) != gateway_result_id {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    Ok(result)
 }
 
 fn load_gateway_result_snapshot_v1(
@@ -6284,6 +6650,60 @@ mod tests {
             "legacy context must not delete receipt authority"
         );
         assert_eq!(legacy, 0);
+
+        let grant = store
+            .confirm_gateway_delivery_and_issue_retrieval_v2(&confirmation)
+            .unwrap();
+        assert!(
+            store
+                .confirm_gateway_delivery_and_issue_retrieval_v2(&confirmation)
+                .is_err(),
+            "the same response-bound receipt is one use"
+        );
+        let (grant_id, token, granted_result_id, grant_expires_at_ms) = grant.into_wire_parts();
+        let wrong_connection = crate::mcp_gateway::recipient_retrieval_authority_for_test_v2(
+            grant_id.clone(),
+            token.clone(),
+            granted_result_id.clone(),
+            grant_expires_at_ms,
+            "1".repeat(64),
+            "f".repeat(64),
+            "3".repeat(64),
+            "test-agent".to_owned(),
+            "test-session".to_owned(),
+            "test-turn".to_owned(),
+            0,
+        );
+        assert!(
+            store
+                .consume_gateway_retrieval_grant_v2(&wrong_connection)
+                .is_err(),
+            "a grant token cannot cross the live connection boundary"
+        );
+        let authority = crate::mcp_gateway::recipient_retrieval_authority_for_test_v2(
+            grant_id,
+            token,
+            granted_result_id,
+            grant_expires_at_ms,
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64),
+            "test-agent".to_owned(),
+            "test-session".to_owned(),
+            "test-turn".to_owned(),
+            0,
+        );
+        let retrieved = store
+            .consume_gateway_retrieval_grant_v2(&authority)
+            .unwrap();
+        assert_eq!(retrieved.stdout, b"delivered bytes");
+        assert_eq!(retrieved.stderr, b"delivery diagnostic");
+        assert!(
+            store
+                .consume_gateway_retrieval_grant_v2(&authority)
+                .is_err(),
+            "retrieval grants are one use"
+        );
     }
 
     #[test]

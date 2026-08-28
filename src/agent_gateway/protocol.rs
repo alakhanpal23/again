@@ -26,8 +26,8 @@ pub const MAX_GATEWAY_TOOL_CALL_BYTES: usize = 80 * 1024;
 pub const MAX_GATEWAY_TOOL_CALL_DEPTH: usize = MAX_CANONICAL_JSON_DEPTH + 8;
 /// The envelope permits the bounded arguments nodes plus its fixed fields.
 pub const MAX_GATEWAY_TOOL_CALL_NODES: usize = MAX_CANONICAL_JSON_NODES + 128;
-pub const DELIVERY_CHALLENGE_SCHEMA_VERSION: u16 = 1;
-pub const DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 1;
+pub const DELIVERY_CHALLENGE_SCHEMA_VERSION: u16 = 2;
+pub const DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 2;
 pub const MAX_DELIVERY_IDENTIFIER_BYTES_V1: usize = 128;
 pub const TOOL_POLICY_SCHEMA_VERSION_V1: u16 = 1;
 pub const MAX_TOOL_POLICY_IDENTIFIER_BYTES_V1: usize = 128;
@@ -997,6 +997,8 @@ pub enum DeliveryAuthorityRefusalV1 {
     MalformedAcknowledgement,
     #[error("wrong_connection")]
     WrongConnection,
+    #[error("wrong_connection_generation")]
+    WrongConnectionGeneration,
     #[error("wrong_authorization_scope")]
     WrongAuthorizationScope,
     #[error("wrong_recipient")]
@@ -1005,10 +1007,14 @@ pub enum DeliveryAuthorityRefusalV1 {
     WrongTurn,
     #[error("wrong_call")]
     WrongCall,
+    #[error("wrong_response_request")]
+    WrongResponseRequest,
     #[error("wrong_result")]
     WrongResult,
     #[error("wrong_streams")]
     WrongStreams,
+    #[error("wrong_response_envelope")]
+    WrongResponseEnvelope,
     #[error("stale_compaction_generation")]
     StaleCompactionGeneration,
     #[error("acknowledgement_replayed")]
@@ -1026,12 +1032,15 @@ impl DeliveryAuthorityRefusalV1 {
             Self::InvalidBinding => "invalid_delivery_binding",
             Self::MalformedAcknowledgement => "malformed_acknowledgement",
             Self::WrongConnection => "wrong_connection",
+            Self::WrongConnectionGeneration => "wrong_connection_generation",
             Self::WrongAuthorizationScope => "wrong_authorization_scope",
             Self::WrongRecipient => "wrong_recipient",
             Self::WrongTurn => "wrong_turn",
             Self::WrongCall => "wrong_call",
+            Self::WrongResponseRequest => "wrong_response_request",
             Self::WrongResult => "wrong_result",
             Self::WrongStreams => "wrong_streams",
+            Self::WrongResponseEnvelope => "wrong_response_envelope",
             Self::StaleCompactionGeneration => "stale_compaction_generation",
             Self::AcknowledgementReplayed => "acknowledgement_replayed",
             Self::Retired => "delivery_authority_retired",
@@ -1105,33 +1114,108 @@ impl DeliveryStreamsV1 {
 pub struct DeliveryBindingV1 {
     authorization_scope_digest: String,
     connection_digest: String,
+    connection_generation: String,
     agent_id: String,
     session_id: String,
     turn_id: String,
     call_digest: String,
+    response_request_id_digest: String,
     result_digest: String,
     streams: DeliveryStreamsV1,
+    response_envelope_digest: String,
     compaction_generation: u64,
 }
 
 impl DeliveryBindingV1 {
+    #[cfg(not(test))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn issue(
+        _live_connection: &crate::mcp_gateway::LiveConnectionAuthorityV2,
         authorization_scope_digest: String,
         connection_digest: String,
+        connection_generation: String,
         agent_id: String,
         session_id: String,
         turn_id: String,
         call_digest: String,
+        response_request_id_digest: String,
         result_digest: String,
         streams: DeliveryStreamsV1,
+        response_envelope_digest: String,
+        compaction_generation: u64,
+    ) -> Result<Self, DeliveryAuthorityRefusalV1> {
+        Self::issue_fields(
+            authorization_scope_digest,
+            connection_digest,
+            connection_generation,
+            agent_id,
+            session_id,
+            turn_id,
+            call_digest,
+            response_request_id_digest,
+            result_digest,
+            streams,
+            response_envelope_digest,
+            compaction_generation,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn issue<T>(
+        _test_only_live_connection: &T,
+        authorization_scope_digest: String,
+        connection_digest: String,
+        connection_generation: String,
+        agent_id: String,
+        session_id: String,
+        turn_id: String,
+        call_digest: String,
+        response_request_id_digest: String,
+        result_digest: String,
+        streams: DeliveryStreamsV1,
+        response_envelope_digest: String,
+        compaction_generation: u64,
+    ) -> Result<Self, DeliveryAuthorityRefusalV1> {
+        Self::issue_fields(
+            authorization_scope_digest,
+            connection_digest,
+            connection_generation,
+            agent_id,
+            session_id,
+            turn_id,
+            call_digest,
+            response_request_id_digest,
+            result_digest,
+            streams,
+            response_envelope_digest,
+            compaction_generation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_fields(
+        authorization_scope_digest: String,
+        connection_digest: String,
+        connection_generation: String,
+        agent_id: String,
+        session_id: String,
+        turn_id: String,
+        call_digest: String,
+        response_request_id_digest: String,
+        result_digest: String,
+        streams: DeliveryStreamsV1,
+        response_envelope_digest: String,
         compaction_generation: u64,
     ) -> Result<Self, DeliveryAuthorityRefusalV1> {
         for digest in [
             &authorization_scope_digest,
             &connection_digest,
+            &connection_generation,
             &call_digest,
+            &response_request_id_digest,
             &result_digest,
+            &response_envelope_digest,
         ] {
             validate_delivery_digest_v1(digest)?;
         }
@@ -1142,12 +1226,15 @@ impl DeliveryBindingV1 {
         Ok(Self {
             authorization_scope_digest,
             connection_digest,
+            connection_generation,
             agent_id,
             session_id,
             turn_id,
             call_digest,
+            response_request_id_digest,
             result_digest,
             streams,
+            response_envelope_digest,
             compaction_generation,
         })
     }
@@ -1158,6 +1245,10 @@ impl DeliveryBindingV1 {
 
     pub fn connection_digest(&self) -> &str {
         &self.connection_digest
+    }
+
+    pub fn connection_generation(&self) -> &str {
+        &self.connection_generation
     }
 
     pub fn agent_id(&self) -> &str {
@@ -1176,12 +1267,20 @@ impl DeliveryBindingV1 {
         &self.call_digest
     }
 
+    pub fn response_request_id_digest(&self) -> &str {
+        &self.response_request_id_digest
+    }
+
     pub fn result_digest(&self) -> &str {
         &self.result_digest
     }
 
     pub const fn streams(&self) -> &DeliveryStreamsV1 {
         &self.streams
+    }
+
+    pub fn response_envelope_digest(&self) -> &str {
+        &self.response_envelope_digest
     }
 
     pub const fn compaction_generation(&self) -> u64 {

@@ -14,12 +14,13 @@ use std::thread;
 use std::time::Duration;
 
 use mcp_gateway::{
-    AuthorizationScopeId, CapturedToolResult, EffectClass, EphemeralSecret, EphemeralSecrets,
-    Freshness, FreshnessMetadata, GatewayAuditEvent, GatewayAuditSink, GatewayInputError,
-    GatewayLimits, GatewayRequestContext, LogicalCallId, McpError, McpErrorCode, McpGateway,
-    ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration,
-    ProviderTool, ReuseDispositionV1, SideEffectClassification, StructuredResultCapture,
-    ToolCancellation, ToolDiscovery, ToolExecution,
+    AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
+    EffectClass, EphemeralSecret, EphemeralSecrets, Freshness, FreshnessMetadata,
+    GatewayAuditEvent, GatewayAuditSink, GatewayInputError, GatewayLimits, GatewayRequestContext,
+    LogicalCallId, McpError, McpErrorCode, McpGateway, ProviderCall, ProviderCancellation,
+    ProviderDescriptor, ProviderError, ProviderRegistration, ProviderTool,
+    RecipientRetrievalAuthorityV2, RetrievalGrantV2, ReuseDispositionV1, SideEffectClassification,
+    StructuredResultCapture, ToolCancellation, ToolDiscovery, ToolExecution,
 };
 use serde_json::{Value, json};
 
@@ -42,6 +43,7 @@ struct FakeProvider {
     freshness_panics: bool,
     capture_panics: bool,
     cancellation_panics: bool,
+    delivery: bool,
     observed_secret: Mutex<Option<Vec<u8>>>,
     freshness: Freshness,
 }
@@ -65,6 +67,7 @@ impl FakeProvider {
             freshness_panics: false,
             capture_panics: false,
             cancellation_panics: false,
+            delivery: false,
             observed_secret: Mutex::new(None),
             freshness: Freshness {
                 revision: "fake-revision-7".into(),
@@ -80,6 +83,11 @@ impl FakeProvider {
 
     fn with_result(self, result: Result<Value, ProviderError>) -> Self {
         *self.result.lock().unwrap() = result;
+        self
+    }
+
+    fn with_delivery(mut self) -> Self {
+        self.delivery = true;
         self
     }
 
@@ -179,7 +187,25 @@ impl SideEffectClassification for FakeProvider {
 impl StructuredResultCapture for FakeProvider {
     fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
         assert!(!self.capture_panics, "injected capture panic");
-        Ok(CapturedToolResult::exact(result))
+        if self.delivery {
+            let streams = agent_gateway_protocol::DeliveryStreamsV1::new(
+                0,
+                &"b".repeat(64),
+                17,
+                &"c".repeat(64),
+                0,
+            )
+            .unwrap();
+            Ok(CapturedToolResult::exact_with_delivery_and_reasoning(
+                result,
+                "a".repeat(64),
+                "a".repeat(64),
+                streams,
+                None,
+            ))
+        } else {
+            Ok(CapturedToolResult::exact(result))
+        }
     }
 }
 
@@ -361,6 +387,50 @@ impl Write for LineWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct ProtocolDeliverySink {
+    consumed: AtomicBool,
+}
+
+impl DeliveryConfirmationSink for ProtocolDeliverySink {
+    fn confirm_delivery_and_issue_retrieval(
+        &self,
+        delivery: &ConfirmedDeliveryV1,
+    ) -> Result<RetrievalGrantV2, agent_gateway_protocol::DeliveryAuthorityRefusalV1> {
+        if delivery.gateway_result_id() != "a".repeat(64) {
+            return Err(agent_gateway_protocol::DeliveryAuthorityRefusalV1::InvalidBinding);
+        }
+        Ok(RetrievalGrantV2::from_store(
+            "gr2_protocol_test".to_owned(),
+            "rt2_protocol_test".to_owned(),
+            delivery.gateway_result_id().to_owned(),
+            i64::MAX,
+        ))
+    }
+
+    fn retrieve_result(
+        &self,
+        authority: &RecipientRetrievalAuthorityV2,
+    ) -> Result<Value, agent_gateway_protocol::DeliveryAuthorityRefusalV1> {
+        if authority.grant_id() != "gr2_protocol_test"
+            || authority.token() != "rt2_protocol_test"
+            || authority.gateway_result_id() != "a".repeat(64)
+        {
+            return Err(agent_gateway_protocol::DeliveryAuthorityRefusalV1::InvalidBinding);
+        }
+        if self
+            .consumed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(
+                agent_gateway_protocol::DeliveryAuthorityRefusalV1::AcknowledgementReplayed,
+            );
+        }
+        Ok(json!({"content":[{"type":"text","text":"retrieved"}]}))
     }
 }
 
@@ -1226,6 +1296,165 @@ fn stdio_is_newline_delimited_and_recovers_after_an_oversized_frame() {
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["error"]["code"], -32_021);
     assert_eq!(responses[1]["result"], json!({}));
+}
+
+#[test]
+fn negotiated_delivery_grant_is_same_connection_and_one_use() {
+    let provider = Arc::new(
+        FakeProvider::new("fake", vec![tool("read")])
+            .with_result(Ok(json!({"content":[{"type":"text","text":"full"}]})))
+            .with_delivery(),
+    );
+    let sink = Arc::new(ProtocolDeliverySink::default());
+    let gateway = Arc::new(
+        McpGateway::new(
+            vec![ProviderRegistration::trusted_annotations(provider)],
+            GatewayLimits::default(),
+        )
+        .unwrap()
+        .with_delivery_confirmation_sink(sink),
+    );
+    let (input_sender, input_receiver) = mpsc::channel();
+    let (line_sender, line_receiver) = mpsc::channel();
+    let serving_gateway = Arc::clone(&gateway);
+    let server = thread::spawn(move || {
+        let mut reader = BufReader::new(ChannelReader::new(input_receiver));
+        let mut writer = LineWriter {
+            pending: Vec::new(),
+            lines: line_sender,
+        };
+        serving_gateway.serve_stdio(
+            &mut reader,
+            &mut writer,
+            &AuthorizationScopeId::new("scope:delivery-v2").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+    });
+
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"initialize", "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "capabilities":{"experimental":{"again":{"deliveryReceipts":{"schemaVersion":2}}}},
+                "clientInfo":{"name":"delivery-test","version":"1"}
+            }
+        })))
+        .unwrap();
+    let initialized: Value =
+        serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+            .unwrap();
+    assert_eq!(
+        initialized["result"]["capabilities"]["experimental"]["again"]["deliveryReceipts"]["schemaVersion"],
+        2
+    );
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "method":"notifications/initialized"
+        })))
+        .unwrap();
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"call", "method":"tools/call",
+            "params":{"name":"fake.read","arguments":{}}
+        })))
+        .unwrap();
+    let full: Value =
+        serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+            .unwrap();
+    assert_eq!(full["id"], "call");
+    assert_eq!(full["result"]["content"][0]["text"], "full");
+    assert!(full.get("__again_internal_delivery_v2").is_none());
+    let challenge_notification: Value =
+        serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+            .unwrap();
+    assert_eq!(
+        challenge_notification["method"],
+        "notifications/again/delivery-challenge"
+    );
+    let challenge = challenge_notification["params"]["challenge"].clone();
+
+    input_sender
+        .send(encoded_line(json!({
+            "jsonrpc":"2.0", "id":"ack", "method":"again/delivery/ack",
+            "params":challenge
+        })))
+        .unwrap();
+    let acknowledged: Value =
+        serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+            .unwrap();
+    assert_eq!(acknowledged["result"]["status"], "confirmed");
+    let grant = acknowledged["result"]["retrievalGrant"].clone();
+    assert_eq!(grant["schemaVersion"], 2, "{grant}");
+    assert!(grant["grantId"].is_string(), "{grant}");
+    assert!(grant["token"].is_string(), "{grant}");
+    assert!(grant["gatewayResultId"].is_string(), "{grant}");
+
+    for (id, expected_success) in [("retrieve", true), ("replay", false)] {
+        input_sender
+            .send(encoded_line(json!({
+                "jsonrpc":"2.0", "id":id, "method":"again/result/retrieve",
+                "params":grant
+            })))
+            .unwrap();
+        let response: Value =
+            serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
+                .unwrap();
+        if expected_success {
+            assert!(response.get("result").is_some(), "{response}");
+            assert_eq!(response["result"]["schemaVersion"], 2);
+            assert_eq!(response["result"]["presentation"], "fullToolResult");
+            assert_eq!(
+                response["result"]["toolResult"]["content"][0]["text"],
+                "retrieved"
+            );
+        } else {
+            assert_eq!(
+                response["error"]["data"]["reason"],
+                "acknowledgement_replayed"
+            );
+        }
+    }
+
+    drop(input_sender);
+    server.join().unwrap().unwrap();
+}
+
+#[test]
+fn unnegotiated_stdio_never_emits_delivery_authority() {
+    let provider = Arc::new(
+        FakeProvider::new("fake", vec![tool("read")])
+            .with_result(Ok(json!({"content":[]})))
+            .with_delivery(),
+    );
+    let gateway = McpGateway::new(
+        vec![ProviderRegistration::trusted_annotations(provider)],
+        GatewayLimits::default(),
+    )
+    .unwrap();
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"plain\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"fake.read\",\"arguments\":{}}}\n"
+    );
+    let mut reader = BufReader::new(Cursor::new(input.as_bytes()));
+    let mut output = Vec::new();
+    gateway
+        .serve_stdio(
+            &mut reader,
+            &mut output,
+            &AuthorizationScopeId::new("scope:plain").unwrap(),
+            EphemeralSecrets::empty(),
+        )
+        .unwrap();
+    let lines = String::from_utf8(output).unwrap();
+    let responses = lines
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[1]["id"], 2);
+    assert!(responses[1].get("__again_internal_delivery_v2").is_none());
 }
 
 #[test]

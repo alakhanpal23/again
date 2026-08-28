@@ -47,6 +47,7 @@ use crate::mcp_gateway::{
     ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration,
     ProviderTool, ReasoningContextCandidateV1, ReasoningDeliveryCompletionV1,
     ReasoningTransportPresentationV1, ReasoningTransportRecipientV1, ReasoningTransportScopeV1,
+    RecipientConnectionRetirementV2, RecipientRetrievalAuthorityV2, RetrievalGrantV2,
     SideEffectClassification, StructuredResultCapture, ToolCancellation, ToolDiscovery,
     ToolExecution, UpstreamProvider, authorization_scope_digest_v1,
 };
@@ -1039,22 +1040,61 @@ struct StoreDeliveryConfirmationSinkV1 {
     store: Arc<Mutex<Store>>,
 }
 
+fn delivery_store_refusal_v2(error: anyhow::Error) -> DeliveryAuthorityRefusalV1 {
+    match error.to_string().as_str() {
+        "acknowledgement_replayed" => DeliveryAuthorityRefusalV1::AcknowledgementReplayed,
+        "delivery_authority_retired" => DeliveryAuthorityRefusalV1::Retired,
+        _ => DeliveryAuthorityRefusalV1::InvalidBinding,
+    }
+}
+
 impl DeliveryConfirmationSink for StoreDeliveryConfirmationSinkV1 {
-    fn confirm_delivery(
+    fn confirm_delivery_and_issue_retrieval(
         &self,
         delivery: &ConfirmedDeliveryV1,
-    ) -> Result<(), DeliveryAuthorityRefusalV1> {
-        let stored = self
+    ) -> Result<RetrievalGrantV2, DeliveryAuthorityRefusalV1> {
+        let grant = self
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
-            .confirm_gateway_delivery_v1(delivery)
-            .map_err(|_| DeliveryAuthorityRefusalV1::InvalidBinding)?;
-        if stored {
-            Ok(())
-        } else {
-            Err(DeliveryAuthorityRefusalV1::AcknowledgementReplayed)
+            .confirm_gateway_delivery_and_issue_retrieval_v2(delivery)
+            .map_err(delivery_store_refusal_v2)?;
+        let (grant_id, token, result_id, expires_at_ms) = grant.into_wire_parts();
+        Ok(RetrievalGrantV2::from_store(
+            grant_id,
+            token,
+            result_id,
+            expires_at_ms,
+        ))
+    }
+
+    fn retrieve_result(
+        &self,
+        authority: &RecipientRetrievalAuthorityV2,
+    ) -> Result<Value, DeliveryAuthorityRefusalV1> {
+        let full = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .consume_gateway_retrieval_grant_v2(authority)
+            .map_err(delivery_store_refusal_v2)?;
+        if !full.stderr.is_empty() || full.result.exit_code != 0 {
+            return Err(DeliveryAuthorityRefusalV1::InvalidBinding);
         }
+        serde_json::from_slice(&full.stdout).map_err(|_| DeliveryAuthorityRefusalV1::InvalidBinding)
+    }
+
+    fn retire_retrievals(
+        &self,
+        retirement: &RecipientConnectionRetirementV2,
+        reason: &'static str,
+    ) -> Result<(), DeliveryAuthorityRefusalV1> {
+        self.store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retire_gateway_retrieval_grants_v2(retirement, reason)
+            .map(|_| ())
+            .map_err(delivery_store_refusal_v2)
     }
 }
 
