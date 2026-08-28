@@ -162,6 +162,55 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         self.assertEqual([item.path for item in snapshot.selected], ["src/a.rs", "src/m.rs"])
         self.assertFalse(snapshot.dirty)
 
+    def test_explicit_go_search_is_read_only_and_requires_two_clean_regular_files(self) -> None:
+        search_root = self.root / "development-root"
+        search_root.mkdir()
+        fixture_root = search_root / "go-project"
+        fixture_root.mkdir()
+        fixture = RepositoryFixture(fixture_root)
+        fixture.write("cmd/main.go", b"package main\nfunc main() {}\n")
+        fixture.write("internal/value.go", b"package internal\n\nconst Value = 1\n")
+        commit = fixture.commit()
+        before_status = fixture.git("status", "--porcelain=v1", "--untracked-files=all")
+
+        found = corpus.discover_go_repository((search_root,))
+        self.assertTrue(found["go_repository_eligible"])
+        self.assertEqual(found["selected_repository"], str(fixture_root))
+        self.assertEqual(found["candidate_count"], 1)
+        candidate = found["eligibility_checks"][0]
+        self.assertEqual(candidate["tracked_go_file_count"], 2)
+        self.assertTrue(candidate["checks"]["at_least_two_tracked_go_files"])
+        self.assertTrue(candidate["checks"]["tracked_files_regular_non_symlink"])
+        self.assertTrue(candidate["checks"]["clean_worktree"])
+        self.assertEqual(fixture.git("rev-parse", "HEAD"), commit)
+        self.assertEqual(
+            fixture.git("status", "--porcelain=v1", "--untracked-files=all"), before_status
+        )
+
+    def test_go_search_preserves_typed_non_pass_for_dirty_or_insufficient_candidates(self) -> None:
+        search_root = self.root / "development-root"
+        search_root.mkdir()
+        dirty_root = search_root / "dirty-go"
+        dirty_root.mkdir()
+        dirty = RepositoryFixture(dirty_root)
+        dirty.write("a.go", b"package a\n")
+        dirty.write("b.go", b"package b\n")
+        dirty.commit()
+        dirty.write("untracked.go", b"package dirty\n")
+
+        insufficient_root = search_root / "one-go"
+        insufficient_root.mkdir()
+        insufficient = RepositoryFixture(insufficient_root)
+        insufficient.write("only.go", b"package only\n")
+        insufficient.commit()
+
+        found = corpus.discover_go_repository((search_root,))
+        self.assertFalse(found["go_repository_eligible"])
+        self.assertIsNone(found["selected_repository"])
+        by_root = {item["repository_root"]: item for item in found["eligibility_checks"]}
+        self.assertEqual(by_root[str(dirty_root)]["refusal_code"], "unsupported_git_dirty")
+        self.assertFalse(by_root[str(insufficient_root)]["checks"]["at_least_two_tracked_go_files"])
+
     def test_dirty_detached_shallow_sparse_and_operation_states_are_non_pass(self) -> None:
         dirty, requested = self.repository("dirty")
         self.two_files(dirty)

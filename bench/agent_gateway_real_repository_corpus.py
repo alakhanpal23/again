@@ -62,6 +62,9 @@ ORDER_MARKER = "AGAIN_REAL_CORPUS_ORDER_V1"
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
 MAX_REPOSITORIES = len(LANGUAGES)
 PROCESS_STOP_SECONDS = 2.0
+MAX_SEARCH_ROOTS = 8
+MAX_SEARCH_DEPTH = 4
+MAX_SEARCH_CANDIDATES = 128
 
 
 def _load_sibling(name: str) -> Any:
@@ -521,6 +524,110 @@ def inspect_input_repository(
                 "selected_input_binary", f"selected language input is not UTF-8: {selected.path}"
             ) from error
     return snapshot
+
+
+def discover_go_repository(search_roots: Sequence[pathlib.Path]) -> dict[str, Any]:
+    """Search explicit local roots for one eligible clean Go repository, read-only."""
+
+    if not 1 <= len(search_roots) <= MAX_SEARCH_ROOTS:
+        raise HarnessRefusal("search_root_bound", "Go search roots exceed their bound")
+    roots: list[pathlib.Path] = []
+    for root in search_roots:
+        if not root.is_absolute():
+            raise HarnessRefusal("path_not_absolute", "Go search roots must be absolute")
+        try:
+            canonical = root.resolve(strict=True)
+            metadata = canonical.lstat()
+        except OSError as error:
+            raise HarnessRefusal("search_root_unavailable", "Go search root is unavailable") from error
+        if canonical != root or not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise HarnessRefusal("search_root_not_canonical", "Go search root is not canonical")
+        if canonical not in roots:
+            roots.append(canonical)
+    candidates: set[pathlib.Path] = set()
+    search_errors: list[dict[str, str]] = []
+    for root in roots:
+        queue: list[tuple[pathlib.Path, int]] = [(root, 0)]
+        while queue and len(candidates) < MAX_SEARCH_CANDIDATES:
+            current, depth = queue.pop(0)
+            try:
+                git_marker = current / ".git"
+                if git_marker.exists() or git_marker.is_symlink():
+                    metadata = git_marker.lstat()
+                    if not stat.S_ISLNK(metadata.st_mode) and (
+                        stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+                    ):
+                        candidates.add(current)
+                if depth >= MAX_SEARCH_DEPTH:
+                    continue
+                entries = sorted(os.scandir(current), key=lambda entry: entry.name)
+                for entry in entries:
+                    if entry.name == ".git" or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                        continue
+                    queue.append((pathlib.Path(entry.path), depth + 1))
+            except OSError as error:
+                search_errors.append({"root": str(current), "code": "search_unreadable"})
+    records: list[dict[str, Any]] = []
+    selected: str | None = None
+    for candidate in sorted(candidates):
+        tracked = _git_probe(candidate, ("ls-files", "-z", "--", "*.go"))
+        paths = [item for item in tracked.stdout.split(b"\0") if item]
+        regular = True
+        bounded = True
+        for relative in paths:
+            try:
+                relative_text = relative.decode("utf-8")
+                relative_path = pathlib.PurePosixPath(relative_text)
+                if relative_path.is_absolute() or ".." in relative_path.parts:
+                    regular = False
+                    continue
+                metadata = (candidate / relative_path).lstat()
+                regular = regular and stat.S_ISREG(metadata.st_mode) and not stat.S_ISLNK(metadata.st_mode)
+                bounded = bounded and metadata.st_size <= MAX_REPOSITORY_FILE_BYTES
+            except (OSError, UnicodeDecodeError, ValueError):
+                regular = False
+        status = _git_probe(candidate, ("status", "--porcelain=v1", "-z", "--untracked-files=all"))
+        clean = status.returncode == 0 and status.stdout == b""
+        try:
+            inspect_input_repository(RepositoryInput("go", candidate))
+            inspection_code = None
+        except HarnessRefusal as error:
+            inspection_code = error.code
+        eligible = (
+            tracked.returncode == 0
+            and len(paths) >= 2
+            and regular
+            and bounded
+            and clean
+            and inspection_code is None
+        )
+        records.append(
+            {
+                "repository_root": str(candidate),
+                "tracked_go_file_count": len(paths) if tracked.returncode == 0 else None,
+                "checks": {
+                    "git_probe_succeeded": tracked.returncode == 0,
+                    "at_least_two_tracked_go_files": len(paths) >= 2,
+                    "tracked_files_regular_non_symlink": regular,
+                    "tracked_files_bounded": bounded,
+                    "clean_worktree": clean,
+                    "full_repository_inspection_passed": inspection_code is None,
+                },
+                "eligible": eligible,
+                "refusal_code": None if eligible else inspection_code or "go_eligibility_failed",
+            }
+        )
+        if eligible and selected is None:
+            selected = str(candidate)
+    return {
+        "search_roots": [str(root) for root in roots],
+        "max_depth": MAX_SEARCH_DEPTH,
+        "candidate_count": len(records),
+        "search_errors": search_errors,
+        "selected_repository": selected,
+        "go_repository_eligible": selected is not None,
+        "eligibility_checks": records,
+    }
 
 
 def snapshot_identity(snapshot: Any) -> tuple[Any, ...]:
@@ -1890,6 +1997,7 @@ def evaluate(
     source_git_sha: str,
     repositories: Sequence[RepositoryInput],
     timeout_seconds: float,
+    go_search_roots: Sequence[pathlib.Path] = (),
 ) -> dict[str, Any]:
     if not again_binary.is_absolute() or not source_root.is_absolute():
         raise HarnessRefusal("path_not_absolute", "binary and source root must be absolute")
@@ -1900,6 +2008,20 @@ def evaluate(
     if timeout_seconds < 10 or timeout_seconds > 300:
         raise HarnessRefusal("timeout_bound", "timeout must be within 10..=300 seconds")
     validate_repository_inputs(repositories)
+    go_search = (
+        discover_go_repository(go_search_roots)
+        if go_search_roots
+        else {
+            "search_roots": [],
+            "max_depth": MAX_SEARCH_DEPTH,
+            "candidate_count": 0,
+            "search_errors": [],
+            "selected_repository": None,
+            "go_repository_eligible": False,
+            "eligibility_checks": [],
+            "refusal_code": "search_not_requested",
+        }
+    )
     harness = pathlib.Path(__file__).resolve()
     sibling_hashes = {
         path.name: sha256_file(path)
@@ -2014,7 +2136,9 @@ def evaluate(
             "repositories_passed": passed,
             "typed_non_pass": non_pass,
             "languages_requested": dict(sorted(present.items())),
+            "go_repository_eligible": go_search["go_repository_eligible"],
         },
+        "go_repository_search": go_search,
         "repositories": reports,
         "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
     }
@@ -2026,6 +2150,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-root", required=True, type=pathlib.Path)
     parser.add_argument("--source-git-sha", required=True)
     parser.add_argument("--repository", action="append", default=[])
+    parser.add_argument("--go-search-root", action="append", default=[])
     parser.add_argument("--json-out", required=True, type=pathlib.Path)
     parser.add_argument("--timeout-seconds", type=float, default=90.0)
     return parser.parse_args(argv)
@@ -2045,6 +2170,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             source_git_sha=arguments.source_git_sha,
             repositories=repositories,
             timeout_seconds=arguments.timeout_seconds,
+            go_search_roots=[pathlib.Path(item) for item in arguments.go_search_root],
         )
         write_json_exclusive(output, report)
         print(
