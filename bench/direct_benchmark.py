@@ -30,7 +30,7 @@ from typing import Any, Callable
 
 
 SCHEMA = "again.direct-benchmark.v1"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.0.1"
 DEFAULT_SIZE_MIB = 2048
 DEFAULT_FIXTURE_FILES = 4
 DEFAULT_STREAM_LIMIT_KIB = 16 * 1024
@@ -198,6 +198,14 @@ def write_sparse_fixture(path: pathlib.Path, size_bytes: int) -> None:
         os.fsync(fixture.fileno())
 
 
+def create_private_state_directory(path: pathlib.Path) -> None:
+    path.mkdir(mode=0o700)
+    # The configured state root has an exact 0700 contract. Apply it explicitly
+    # so a caller's unusually restrictive or permissive umask cannot make the
+    # benchmark fail before it reaches the product path under measurement.
+    path.chmod(0o700)
+
+
 def child_peak_rss_bytes() -> tuple[int, str]:
     raw = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     if platform.system() == "Darwin":
@@ -360,6 +368,7 @@ def main() -> int:
         workspace = root / "workspace"
         state = root / "state"
         workspace.mkdir()
+        create_private_state_directory(state)
         (workspace / ".git").mkdir()
         if size_bytes < arguments.fixture_files * len(b"needle\n"):
             raise SystemExit("aggregate fixture is too small for --fixture-files")
