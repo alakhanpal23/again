@@ -19,6 +19,8 @@ trap 'cleanup 143' TERM
 version=v0.1.0-alpha.1
 source_commit=0123456789abcdef0123456789abcdef01234567
 verified_at=2026-08-27T20:30:00Z
+workflow_run_id=123456789
+workflow_run_attempt=2
 assets=$fixture/assets
 summaries=$fixture/summaries
 fake_bin=$fixture/bin
@@ -80,13 +82,16 @@ index=0
 while IFS= read -r name; do
     digest=$(file_hash "$assets/$name")
     cat > "$fixture/attestation.json" <<EOF
-[{"attestation":{"bundle":"intentionally-discarded"},"verificationResult":{"signature":{"certificate":{"issuer":"fixture"}},"verifiedTimestamps":[{"type":"transparency-log"}],"statement":{"subject":[{"name":"$name","digest":{"sha256":"$digest"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"untrusted":"not-retained"}}}}]
+[{"attestation":{"bundle":"intentionally-discarded"},"verificationResult":{"signature":{"certificate":{"buildInvocationID":"https://github.com/alakhanpal23/again/actions/runs/${workflow_run_id}/attempts/${workflow_run_attempt}","githubWorkflowRef":"refs/tags/${version}","githubWorkflowRepository":"alakhanpal23/again","githubWorkflowSHA":"${source_commit}","githubWorkflowTrigger":"push","issuer":"https://token.actions.githubusercontent.com","runnerEnvironment":"github-hosted","sourceRepositoryDigest":"${source_commit}","sourceRepositoryIdentifier":"763287532","sourceRepositoryOwnerIdentifier":"44036562","sourceRepositoryOwnerURI":"https://github.com/alakhanpal23","sourceRepositoryRef":"refs/tags/${version}","sourceRepositoryURI":"https://github.com/alakhanpal23/again","sourceRepositoryVisibilityAtSigning":"private","subjectAlternativeName":"https://github.com/alakhanpal23/again/.github/workflows/release.yml@refs/tags/${version}"}},"verifiedTimestamps":[{"type":"transparency-log"}],"statement":{"subject":[{"name":"$name","digest":{"sha256":"$digest"}}],"predicateType":"https://slsa.dev/provenance/v1","predicate":{"untrusted":"not-retained"}}}}]
 EOF
     summary=$(printf '%s/%03d.json' "$summaries" "$index")
     python3 "$exporter" attestation \
         --input "$fixture/attestation.json" \
         --subject-name "$name" \
         --subject-digest "$digest" \
+        --repository alakhanpal23/again \
+        --tag "$version" \
+        --source-commit "$source_commit" \
         --output "$summary"
     index=$((index + 1))
 done < "$fixture/names"
@@ -108,6 +113,7 @@ run_export() {
         --source-commit "$commit" \
         --verified-at "$verified_at" \
         --github-cli-version 'gh version 2.92.0 (2026-06-18)' \
+        --harness-root "$repository_root" \
         --output "$output"
 }
 
@@ -141,7 +147,20 @@ assert document["release"]["draft"] is False
 assert document["release"]["source_commit"] == "0123456789abcdef0123456789abcdef01234567"
 assert len(document["artifacts"]) == 7
 assert all(item["attestation"]["status"] == "verified" for item in document["artifacts"])
+archives = [item for item in document["artifacts"] if item["name"].endswith(".tar.gz")]
+assert len(archives) == 4
+assert all(item["binary_sha256"] == item["members"][0]["sha256"] for item in archives)
+assert all(item["members"][0]["name"] == "again" for item in archives)
+assert document["publisher"]["status"] == "authenticated"
+assert document["publisher"]["workflow_run"] == {
+    "attempt": 2,
+    "id": 123456789,
+    "url": "https://github.com/alakhanpal23/again/actions/runs/123456789/attempts/2",
+}
 assert document["verification"]["github_cli"].startswith("gh version 2.92.0")
+assert len(document["verification"]["harness"]["components"]) == 5
+assert len(document["verification"]["harness"]["sha256"]) == 64
+assert document["verification"]["platform"]["operating_system"]
 PY
 if grep -F 'private-source-sentinel' "$evidence" >/dev/null || \
     grep -F 'intentionally-discarded' "$evidence" >/dev/null || \
@@ -212,8 +231,9 @@ case "$first:$second" in
         else
             digest=$(shasum -a 256 "$subject" | awk '{ print $1 }')
         fi
-        printf '[{"attestation":{"fixture":true},"verificationResult":{"signature":{"certificate":{"issuer":"fixture"}},"verifiedTimestamps":[{"type":"transparency-log"}],"statement":{"subject":[{"name":"%s","digest":{"sha256":"%s"}}],"predicateType":"https://slsa.dev/provenance/v1"}}}]\n' \
-            "$name" "$digest"
+        printf '[{"attestation":{"fixture":true},"verificationResult":{"signature":{"certificate":{"buildInvocationID":"https://github.com/alakhanpal23/again/actions/runs/%s/attempts/%s","githubWorkflowRef":"refs/tags/%s","githubWorkflowRepository":"alakhanpal23/again","githubWorkflowSHA":"%s","githubWorkflowTrigger":"push","issuer":"https://token.actions.githubusercontent.com","runnerEnvironment":"github-hosted","sourceRepositoryDigest":"%s","sourceRepositoryIdentifier":"763287532","sourceRepositoryOwnerIdentifier":"44036562","sourceRepositoryOwnerURI":"https://github.com/alakhanpal23","sourceRepositoryRef":"refs/tags/%s","sourceRepositoryURI":"https://github.com/alakhanpal23/again","sourceRepositoryVisibilityAtSigning":"private","subjectAlternativeName":"https://github.com/alakhanpal23/again/.github/workflows/release.yml@refs/tags/%s"}},"verifiedTimestamps":[{"type":"transparency-log"}],"statement":{"subject":[{"name":"%s","digest":{"sha256":"%s"}}],"predicateType":"https://slsa.dev/provenance/v1"}}}]\n' \
+            "$WORKFLOW_RUN_ID" "$WORKFLOW_RUN_ATTEMPT" "$VERSION" "$SOURCE_COMMIT" \
+            "$SOURCE_COMMIT" "$VERSION" "$VERSION" "$name" "$digest"
         ;;
     --version:)
         printf '%s\n' 'gh version 2.92.0 (2026-06-18)'
@@ -230,6 +250,8 @@ integrated_evidence=$fixture/integrated-evidence.json
 GH_CALL_LOG=$call_log PUBLISHED_VIEW=$published_view \
     PUBLISHED_JSON=$metadata PUBLISHED_INVENTORY=$fixture/names \
     SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \
+    WORKFLOW_RUN_ID=$workflow_run_id WORKFLOW_RUN_ATTEMPT=$workflow_run_attempt \
+    VERSION=$version \
     PATH="$fake_bin:$PATH" \
     sh "$repository_root/scripts/verify_published_release.sh" \
     --version "$version" \
@@ -265,7 +287,9 @@ failed_evidence=$fixture/failed-evidence.json
 if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-gh-calls \
     PUBLISHED_VIEW=$published_view PUBLISHED_JSON=$metadata \
     PUBLISHED_INVENTORY=$fixture/names SOURCE_COMMIT=$source_commit \
-    REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    REMOTE_ASSETS=$assets WORKFLOW_RUN_ID=$workflow_run_id \
+    WORKFLOW_RUN_ATTEMPT=$workflow_run_attempt VERSION=$version \
+    PATH="$fake_bin:$PATH" \
     sh "$repository_root/scripts/verify_published_release.sh" \
     --version "$version" \
     --source-commit "$source_commit" \
@@ -341,6 +365,8 @@ if python3 "$exporter" attestation \
     --input "$fixture/duplicate-attestation.json" \
     --subject-name SHA256SUMS \
     --subject-digest "$(file_hash "$assets/SHA256SUMS")" \
+    --repository alakhanpal23/again --tag "$version" \
+    --source-commit "$source_commit" \
     --output "$fixture/duplicate-attestation-summary.json" > /dev/null 2>&1; then
     echo "error: attestation summarizer accepted duplicate JSON keys" >&2
     exit 1
@@ -351,6 +377,8 @@ if python3 "$exporter" attestation \
     --input "$fixture/oversized-attestation.json" \
     --subject-name SHA256SUMS \
     --subject-digest "$(file_hash "$assets/SHA256SUMS")" \
+    --repository alakhanpal23/again --tag "$version" \
+    --source-commit "$source_commit" \
     --output "$fixture/oversized-attestation-summary.json" > /dev/null 2>&1; then
     echo "error: attestation summarizer accepted oversized input" >&2
     exit 1
@@ -362,11 +390,47 @@ sed 's#https://slsa.dev/provenance/v1#https://example.invalid/wrong#' \
     "$fixture/attestation.json" > "$fixture/wrong-predicate.json"
 if python3 "$exporter" attestation \
     --input "$fixture/wrong-predicate.json" --subject-name "$last_name" \
-    --subject-digest "$digest" --output "$fixture/wrong-predicate-summary.json" \
+    --subject-digest "$digest" --repository alakhanpal23/again \
+    --tag "$version" --source-commit "$source_commit" \
+    --output "$fixture/wrong-predicate-summary.json" \
     > /dev/null 2>&1; then
     echo "error: attestation summarizer accepted a mismatched predicate" >&2
     exit 1
 fi
+
+sed 's#https://github.com/alakhanpal23/again/actions/runs/#https://github.com/other/again/actions/runs/#' \
+    "$fixture/attestation.json" > "$fixture/wrong-publisher.json"
+if python3 "$exporter" attestation \
+    --input "$fixture/wrong-publisher.json" --subject-name "$last_name" \
+    --subject-digest "$digest" --repository alakhanpal23/again \
+    --tag "$version" --source-commit "$source_commit" \
+    --output "$fixture/wrong-publisher-summary.json" > /dev/null 2>&1; then
+    echo "error: attestation summarizer accepted a foreign workflow run" >&2
+    exit 1
+fi
+
+python3 - "$fixture/attestation.json" "$fixture/deep-attestation.json" <<'PY'
+import json
+import pathlib
+import sys
+
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+value = {}
+for _ in range(40):
+    value = {"nested": value}
+document[0]["attestation"] = value
+pathlib.Path(sys.argv[2]).write_text(json.dumps(document), encoding="utf-8")
+PY
+if python3 "$exporter" attestation \
+    --input "$fixture/deep-attestation.json" --subject-name "$last_name" \
+    --subject-digest "$digest" --repository alakhanpal23/again \
+    --tag "$version" --source-commit "$source_commit" \
+    --output "$fixture/deep-attestation-summary.json" \
+    > "$fixture/deep.out" 2>&1; then
+    echo "error: attestation summarizer accepted deeply nested JSON" >&2
+    exit 1
+fi
+grep -F 'JSON depth limit' "$fixture/deep.out" >/dev/null
 
 trap - EXIT HUP INT TERM
 rm -rf "$fixture"

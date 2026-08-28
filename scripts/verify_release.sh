@@ -149,6 +149,9 @@ verify_attestation() {
         --input "$raw_result" \
         --subject-name "$subject_name" \
         --subject-digest "$subject_digest" \
+        --repository "$repository" \
+        --tag "$version" \
+        --source-commit "$source_commit" \
         --output "$attestation_summary_dir/$summary_name"
     rm -f "$raw_result"
     attestation_index=$((attestation_index + 1))

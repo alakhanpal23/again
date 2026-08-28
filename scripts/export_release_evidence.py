@@ -10,13 +10,17 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import secrets
 import stat
+import tarfile
 from typing import Any
+import zlib
 
 
 SCHEMA = "again.release-verification-summary.v1"
@@ -26,7 +30,18 @@ OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_SUMMARY_BYTES = 64 * 1024
 MAX_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_TAR_BYTES = MAX_ARTIFACT_BYTES + 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
+MAX_JSON_DEPTH = 32
+MAX_JSON_NODES = 100_000
+WORKFLOW_PATH = ".github/workflows/release.yml"
+HARNESS_PATHS = (
+    "packaging/homebrew/generate_formula.py",
+    "scripts/export_release_evidence.py",
+    "scripts/package_release.py",
+    "scripts/verify_published_release.sh",
+    "scripts/verify_release.sh",
+)
 SEMVER_TAG = re.compile(
     r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
     r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
@@ -42,6 +57,9 @@ def parser() -> argparse.ArgumentParser:
     attestation.add_argument("--input", required=True, type=Path)
     attestation.add_argument("--subject-name", required=True)
     attestation.add_argument("--subject-digest", required=True)
+    attestation.add_argument("--repository", required=True)
+    attestation.add_argument("--tag", required=True)
+    attestation.add_argument("--source-commit", required=True)
     attestation.add_argument("--output", required=True, type=Path)
 
     evidence = commands.add_parser("evidence")
@@ -53,6 +71,7 @@ def parser() -> argparse.ArgumentParser:
     evidence.add_argument("--source-commit", required=True)
     evidence.add_argument("--verified-at", required=True)
     evidence.add_argument("--github-cli-version", required=True)
+    evidence.add_argument("--harness-root", required=True, type=Path)
     evidence.add_argument("--output", required=True, type=Path)
     return root
 
@@ -123,9 +142,27 @@ def read_regular(path: Path, maximum: int, description: str) -> bytes:
 def strict_json(path: Path, maximum: int, description: str) -> Any:
     try:
         content = read_regular(path, maximum, description).decode("utf-8")
-        return json.loads(content, object_pairs_hook=duplicate_rejecting_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        document = json.loads(content, object_pairs_hook=duplicate_rejecting_object)
+        validate_json_shape(document, description)
+        return document
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as error:
         raise SystemExit(f"{description} is not strict UTF-8 JSON: {error}") from error
+
+
+def validate_json_shape(document: Any, description: str) -> None:
+    nodes = 0
+    stack = [(document, 1)]
+    while stack:
+        value, depth = stack.pop()
+        nodes += 1
+        if nodes > MAX_JSON_NODES:
+            raise ValueError(f"{description} exceeds the JSON node limit")
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError(f"{description} exceeds the JSON depth limit")
+        if isinstance(value, dict):
+            stack.extend((item, depth + 1) for item in value.values())
+        elif isinstance(value, list):
+            stack.extend((item, depth + 1) for item in value)
 
 
 def validate_name(name: str) -> None:
@@ -143,6 +180,17 @@ def validate_name(name: str) -> None:
 def validate_digest(digest: str, description: str) -> None:
     if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
         raise SystemExit(f"{description} must be 64 lowercase hexadecimal characters")
+
+
+def bounded_string(value: Any, description: str, maximum: int = 512) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > maximum
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise SystemExit(f"{description} is invalid")
+    return value
 
 
 def attestation_name_matches(statement_name: Any, release_name: str) -> bool:
@@ -227,10 +275,162 @@ def directory_entries(path: Path, description: str) -> list[Path]:
         raise SystemExit(f"{description} cannot be read: {error}") from error
 
 
-def artifact_hash(path: Path) -> str:
-    return hashlib.sha256(
-        read_regular(path, MAX_ARTIFACT_BYTES, f"release artifact {path.name}")
-    ).hexdigest()
+def archive_member_evidence(compressed: bytes) -> dict[str, Any]:
+    try:
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        payload = decompressor.decompress(compressed, MAX_TAR_BYTES + 1)
+    except (EOFError, zlib.error) as error:
+        raise SystemExit("release archive is not a complete gzip stream") from error
+    if (
+        len(payload) > MAX_TAR_BYTES
+        or decompressor.unconsumed_tail
+        or not decompressor.eof
+    ):
+        raise SystemExit("release archive expands beyond its fixed limit")
+    if decompressor.unused_data:
+        raise SystemExit("release archive contains trailing or concatenated gzip data")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
+            members = archive.getmembers()
+            if len(members) != 1:
+                raise SystemExit("release archive must contain exactly one member")
+            member = members[0]
+            if (
+                member.name != "again"
+                or not member.isreg()
+                or member.linkname
+                or member.size <= 0
+                or member.size > MAX_ARTIFACT_BYTES
+                or member.mode != 0o755
+                or member.uid != 0
+                or member.gid != 0
+                or member.uname != "root"
+                or member.gname != "root"
+                or member.pax_headers
+            ):
+                raise SystemExit("release archive member metadata is not normalized")
+            source = archive.extractfile(member)
+            if source is None:
+                raise SystemExit("release archive member is unreadable")
+            digest = hashlib.sha256()
+            total = 0
+            while block := source.read(1024 * 1024):
+                total += len(block)
+                if total > MAX_ARTIFACT_BYTES:
+                    raise SystemExit("release archive member exceeds its fixed limit")
+                digest.update(block)
+            if total != member.size:
+                raise SystemExit("release archive member is truncated")
+            padded_size = ((member.size + 511) // 512) * 512
+            minimum_end = member.offset_data + padded_size + 1024
+    except (tarfile.TarError, OSError) as error:
+        raise SystemExit("release archive is not a valid tar stream") from error
+    if len(payload) % tarfile.RECORDSIZE != 0 or len(payload) < minimum_end:
+        raise SystemExit("release tar stream has invalid record padding")
+    if any(payload[minimum_end:]):
+        raise SystemExit("release tar stream has trailing non-padding bytes")
+    return {
+        "mode": "0755",
+        "name": "again",
+        "sha256": digest.hexdigest(),
+        "size_bytes": total,
+    }
+
+
+def certificate_identity(
+    certificate: Any, repository: str, tag: str, source_commit: str
+) -> dict[str, str]:
+    if not isinstance(certificate, dict) or not certificate:
+        raise SystemExit("attestation verification result lacks a certificate")
+    owner = repository.split("/", 1)[0]
+    source_ref = f"refs/tags/{tag}"
+    expected = {
+        "githubWorkflowRef": source_ref,
+        "githubWorkflowRepository": repository,
+        "githubWorkflowSHA": source_commit,
+        "githubWorkflowTrigger": "push",
+        "issuer": OIDC_ISSUER,
+        "runnerEnvironment": "github-hosted",
+        "sourceRepositoryDigest": source_commit,
+        "sourceRepositoryOwnerURI": f"https://github.com/{owner}",
+        "sourceRepositoryRef": source_ref,
+        "sourceRepositoryURI": f"https://github.com/{repository}",
+        "subjectAlternativeName": (
+            f"https://github.com/{repository}/{WORKFLOW_PATH}@{source_ref}"
+        ),
+    }
+    for key, expected_value in expected.items():
+        if bounded_string(certificate.get(key), f"certificate {key}") != expected_value:
+            raise SystemExit(f"certificate {key} is inconsistent")
+    invocation = bounded_string(
+        certificate.get("buildInvocationID"), "certificate buildInvocationID"
+    )
+    invocation_pattern = re.compile(
+        rf"^https://github\.com/{re.escape(repository)}/actions/runs/"
+        r"([1-9][0-9]*)/attempts/([1-9][0-9]*)$"
+    )
+    if invocation_pattern.fullmatch(invocation) is None:
+        raise SystemExit("certificate build invocation identity is inconsistent")
+    repository_identifier = bounded_string(
+        certificate.get("sourceRepositoryIdentifier"),
+        "certificate sourceRepositoryIdentifier",
+        32,
+    )
+    owner_identifier = bounded_string(
+        certificate.get("sourceRepositoryOwnerIdentifier"),
+        "certificate sourceRepositoryOwnerIdentifier",
+        32,
+    )
+    visibility = bounded_string(
+        certificate.get("sourceRepositoryVisibilityAtSigning"),
+        "certificate sourceRepositoryVisibilityAtSigning",
+        16,
+    )
+    if (
+        re.fullmatch(r"[1-9][0-9]*", repository_identifier) is None
+        or re.fullmatch(r"[1-9][0-9]*", owner_identifier) is None
+        or visibility not in {"internal", "private", "public"}
+    ):
+        raise SystemExit("certificate immutable repository identity is invalid")
+    return {
+        "build_invocation_id": invocation,
+        "github_workflow_ref": expected["githubWorkflowRef"],
+        "github_workflow_repository": expected["githubWorkflowRepository"],
+        "github_workflow_sha": expected["githubWorkflowSHA"],
+        "github_workflow_trigger": expected["githubWorkflowTrigger"],
+        "issuer": expected["issuer"],
+        "runner_environment": expected["runnerEnvironment"],
+        "source_repository_digest": expected["sourceRepositoryDigest"],
+        "source_repository_identifier": repository_identifier,
+        "source_repository_owner_identifier": owner_identifier,
+        "source_repository_owner_uri": expected["sourceRepositoryOwnerURI"],
+        "source_repository_ref": expected["sourceRepositoryRef"],
+        "source_repository_uri": expected["sourceRepositoryURI"],
+        "source_repository_visibility_at_signing": visibility,
+        "subject_alternative_name": expected["subjectAlternativeName"],
+    }
+
+
+def harness_evidence(root: Path) -> dict[str, Any]:
+    if (
+        not root.is_absolute()
+        or ".." in root.parts
+        or not root.is_dir()
+        or root.is_symlink()
+    ):
+        raise SystemExit("harness root must be an absolute non-symlink directory")
+    components = []
+    aggregate = hashlib.sha256()
+    for relative in HARNESS_PATHS:
+        path = root / relative
+        content = read_regular(path, MAX_ARTIFACT_BYTES, f"release harness {relative}")
+        digest = hashlib.sha256(content).hexdigest()
+        components.append({"path": relative, "sha256": digest})
+        aggregate.update(relative.encode("utf-8"))
+        aggregate.update(b"\0")
+        aggregate.update(digest.encode("ascii"))
+        aggregate.update(b"\0")
+    return {"components": components, "sha256": aggregate.hexdigest()}
 
 
 def expected_names(tag: str) -> list[str]:
@@ -250,10 +450,12 @@ def expected_names(tag: str) -> list[str]:
 def summarize_attestation(args: argparse.Namespace) -> None:
     validate_name(args.subject_name)
     validate_digest(args.subject_digest, "subject digest")
+    validate_release_identity(args.repository, args.tag, args.source_commit)
     document = strict_json(args.input, MAX_JSON_BYTES, "attestation verification output")
     if not isinstance(document, list) or not document or len(document) > 30:
         raise SystemExit("attestation verification output must be a bounded non-empty array")
     timestamp_count = 0
+    publisher: dict[str, str] | None = None
     for entry in document:
         result = entry.get("verificationResult") if isinstance(entry, dict) else None
         signature = result.get("signature") if isinstance(result, dict) else None
@@ -262,9 +464,7 @@ def summarize_attestation(args: argparse.Namespace) -> None:
         statement = result.get("statement") if isinstance(result, dict) else None
         subjects = statement.get("subject") if isinstance(statement, dict) else None
         if (
-            not isinstance(certificate, dict)
-            or not certificate
-            or not isinstance(timestamps, list)
+            not isinstance(timestamps, list)
             or not timestamps
             or not all(isinstance(timestamp, dict) and timestamp for timestamp in timestamps)
             or not isinstance(subjects, list)
@@ -282,11 +482,20 @@ def summarize_attestation(args: argparse.Namespace) -> None:
                 matching = True
         if not matching:
             raise SystemExit("attestation subject identity or digest is inconsistent")
+        observed_publisher = certificate_identity(
+            certificate, args.repository, args.tag, args.source_commit
+        )
+        if publisher is not None and observed_publisher != publisher:
+            raise SystemExit("verified attestations disagree on publisher identity")
+        publisher = observed_publisher
         timestamp_count += len(timestamps)
+    if publisher is None:
+        raise SystemExit("attestation verification did not authenticate a publisher")
     summary = {
         "certificate_present": True,
         "name": args.subject_name,
         "predicate_type": PREDICATE_TYPE,
+        "publisher": publisher,
         "schema": ATTESTATION_SCHEMA,
         "sha256": args.subject_digest,
         "status": "verified",
@@ -329,13 +538,17 @@ def release_asset_names(document: Any, tag: str) -> list[str]:
     return sorted(names)
 
 
-def validate_identity(args: argparse.Namespace) -> None:
-    if SEMVER_TAG.fullmatch(args.tag) is None or len(args.tag) > 128:
+def validate_release_identity(repository: str, tag: str, source_commit: str) -> None:
+    if SEMVER_TAG.fullmatch(tag) is None or len(tag) > 128:
         raise SystemExit("release tag is invalid")
-    if re.fullmatch(r"[0-9a-f]{40}", args.source_commit) is None:
+    if re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
         raise SystemExit("source commit must be 40 lowercase hexadecimal characters")
-    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository) is None:
+    if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository) is None:
         raise SystemExit("GitHub repository is invalid")
+
+
+def validate_identity(args: argparse.Namespace) -> None:
+    validate_release_identity(args.repository, args.tag, args.source_commit)
     try:
         timestamp = datetime.strptime(args.verified_at, "%Y-%m-%dT%H:%M:%SZ").replace(
             tzinfo=timezone.utc
@@ -367,7 +580,24 @@ def export_evidence(args: argparse.Namespace) -> None:
     )
     if observed != names:
         raise SystemExit("artifact directory does not contain the exact release inventory")
-    digests = {name: artifact_hash(args.artifact_dir / name) for name in names}
+    artifacts_by_name: dict[str, dict[str, Any]] = {}
+    for name in names:
+        path = args.artifact_dir / name
+        content = read_regular(path, MAX_ARTIFACT_BYTES, f"release artifact {name}")
+        detail: dict[str, Any] = {
+            "name": name,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": len(content),
+        }
+        if name.endswith(".tar.gz"):
+            prefix = f"again-{args.tag}-"
+            target = name[len(prefix) : -len(".tar.gz")]
+            member = archive_member_evidence(content)
+            detail["binary_sha256"] = member["sha256"]
+            detail["members"] = [member]
+            detail["target"] = target
+        artifacts_by_name[name] = detail
+    digests = {name: detail["sha256"] for name, detail in artifacts_by_name.items()}
 
     if not args.attestation_dir.is_dir() or args.attestation_dir.is_symlink():
         raise SystemExit("attestation summary directory must be a regular directory")
@@ -383,6 +613,7 @@ def export_evidence(args: argparse.Namespace) -> None:
             "certificate_present",
             "name",
             "predicate_type",
+            "publisher",
             "schema",
             "sha256",
             "status",
@@ -402,6 +633,7 @@ def export_evidence(args: argparse.Namespace) -> None:
             or summary["predicate_type"] != PREDICATE_TYPE
             or summary["status"] != "verified"
             or summary["certificate_present"] is not True
+            or not isinstance(summary["publisher"], dict)
             or not isinstance(summary["verified_attestations"], int)
             or isinstance(summary["verified_attestations"], bool)
             or summary["verified_attestations"] <= 0
@@ -414,21 +646,61 @@ def export_evidence(args: argparse.Namespace) -> None:
     if sorted(summaries) != names:
         raise SystemExit("attestation summaries do not match the release inventory")
 
+    publishers = {
+        json.dumps(summary["publisher"], sort_keys=True)
+        for summary in summaries.values()
+    }
+    if len(publishers) != 1:
+        raise SystemExit("attestation summaries disagree on publisher identity")
+    publisher = next(iter(summaries.values()))["publisher"]
+    authenticated_publisher = certificate_identity(
+        {
+            "buildInvocationID": publisher.get("build_invocation_id"),
+            "githubWorkflowRef": publisher.get("github_workflow_ref"),
+            "githubWorkflowRepository": publisher.get("github_workflow_repository"),
+            "githubWorkflowSHA": publisher.get("github_workflow_sha"),
+            "githubWorkflowTrigger": publisher.get("github_workflow_trigger"),
+            "issuer": publisher.get("issuer"),
+            "runnerEnvironment": publisher.get("runner_environment"),
+            "sourceRepositoryDigest": publisher.get("source_repository_digest"),
+            "sourceRepositoryIdentifier": publisher.get(
+                "source_repository_identifier"
+            ),
+            "sourceRepositoryOwnerIdentifier": publisher.get(
+                "source_repository_owner_identifier"
+            ),
+            "sourceRepositoryOwnerURI": publisher.get("source_repository_owner_uri"),
+            "sourceRepositoryRef": publisher.get("source_repository_ref"),
+            "sourceRepositoryURI": publisher.get("source_repository_uri"),
+            "sourceRepositoryVisibilityAtSigning": publisher.get(
+                "source_repository_visibility_at_signing"
+            ),
+            "subjectAlternativeName": publisher.get("subject_alternative_name"),
+        },
+        args.repository,
+        args.tag,
+        args.source_commit,
+    )
+    invocation_match = re.fullmatch(
+        rf"https://github\.com/{re.escape(args.repository)}/actions/runs/"
+        r"([1-9][0-9]*)/attempts/([1-9][0-9]*)",
+        authenticated_publisher["build_invocation_id"],
+    )
+    if invocation_match is None:
+        raise SystemExit("publisher workflow run identity is invalid")
+
     artifacts = []
     for name in names:
         summary = summaries[name]
-        artifacts.append(
-            {
-                "attestation": {
-                    "certificate_present": True,
-                    "status": "verified",
-                    "verified_attestations": summary["verified_attestations"],
-                    "verified_timestamps": summary["verified_timestamps"],
-                },
-                "name": name,
-                "sha256": digests[name],
-            }
-        )
+        detail = dict(artifacts_by_name[name])
+        detail["attestation"] = {
+            "certificate_present": True,
+            "status": "verified",
+            "verified_attestations": summary["verified_attestations"],
+            "verified_timestamps": summary["verified_timestamps"],
+        }
+        artifacts.append(detail)
+    harness = harness_evidence(args.harness_root)
     evidence = {
         "authority": {
             "independent_release_verification": False,
@@ -445,6 +717,15 @@ def export_evidence(args: argparse.Namespace) -> None:
             "source_digest": args.source_commit,
             "source_ref": f"refs/tags/{args.tag}",
         },
+        "publisher": {
+            "identity": authenticated_publisher,
+            "status": "authenticated",
+            "workflow_run": {
+                "attempt": int(invocation_match.group(2)),
+                "id": int(invocation_match.group(1)),
+                "url": authenticated_publisher["build_invocation_id"],
+            },
+        },
         "release": {
             "draft": False,
             "immutable": True,
@@ -457,6 +738,14 @@ def export_evidence(args: argparse.Namespace) -> None:
         "verification": {
             "evidence_exporter": SCHEMA,
             "github_cli": args.github_cli_version,
+            "harness": harness,
+            "platform": {
+                "architecture": platform.machine(),
+                "kernel_release": platform.release(),
+                "operating_system": platform.system(),
+                "python_implementation": platform.python_implementation(),
+                "python_version": platform.python_version(),
+            },
             "release_verifier": "again.release-verifier.v1",
             "verification_completed_at": args.verified_at,
         },

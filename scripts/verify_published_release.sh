@@ -81,6 +81,7 @@ command -v gh >/dev/null 2>&1 || {
 }
 
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
+repository_root=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/again-published-release.XXXXXXXX")
 cleanup() {
     status=$1
@@ -177,6 +178,7 @@ if [ -n "$evidence_output" ]; then
         --source-commit "$source_commit" \
         --verified-at "$verified_at" \
         --github-cli-version "$github_cli_version" \
+        --harness-root "$repository_root" \
         --output "$evidence_output"
 else
     sh "$script_dir/verify_release.sh" \

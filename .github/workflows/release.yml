@@ -79,7 +79,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
-      artifact-metadata: write
       attestations: write
       contents: read
       id-token: write
@@ -134,7 +133,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      artifact-metadata: write
       attestations: write
       contents: read
       id-token: write
@@ -181,7 +179,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      artifact-metadata: write
       attestations: write
       contents: write
       id-token: write
