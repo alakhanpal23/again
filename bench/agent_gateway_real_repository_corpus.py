@@ -65,6 +65,10 @@ PROCESS_STOP_SECONDS = 2.0
 MAX_SEARCH_ROOTS = 8
 MAX_SEARCH_DEPTH = 4
 MAX_SEARCH_CANDIDATES = 128
+MAX_SEARCH_DIRECTORIES = 8_192
+MAX_SEARCH_ENTRIES = 65_536
+MAX_SEARCH_ERRORS = 128
+MAX_GIT_PROBE_BYTES = 16 * 1024 * 1024
 
 
 def _load_sibling(name: str) -> Any:
@@ -451,16 +455,29 @@ def _git_environment(home: pathlib.Path | None = None) -> dict[str, str]:
 
 def _git_probe(root: pathlib.Path, arguments: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
     try:
-        return subprocess.run(
-            ("git", "-c", "protocol.allow=never", *arguments),
-            cwd=root,
-            env=_git_environment(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=10,
-        )
+        with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+            completed = subprocess.run(
+                ("git", "-c", "protocol.allow=never", *arguments),
+                cwd=root,
+                env=_git_environment(),
+                stdin=subprocess.DEVNULL,
+                stdout=stdout,
+                stderr=stderr,
+                check=False,
+                timeout=10,
+            )
+            stdout_size = stdout.tell()
+            stderr_size = stderr.tell()
+            if stdout_size > MAX_GIT_PROBE_BYTES or stderr_size > MAX_GIT_PROBE_BYTES:
+                raise HarnessRefusal("git_output_bound", "local Git probe exceeded its byte bound")
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(
+                completed.args,
+                completed.returncode,
+                stdout.read(MAX_GIT_PROBE_BYTES + 1),
+                stderr.read(MAX_GIT_PROBE_BYTES + 1),
+            )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise HarnessRefusal("git_inspection_failed", "bounded local Git probe failed") from error
 
@@ -531,6 +548,8 @@ def discover_go_repository(
     *,
     max_depth: int = MAX_SEARCH_DEPTH,
     max_candidates: int = MAX_SEARCH_CANDIDATES,
+    max_directories: int = MAX_SEARCH_DIRECTORIES,
+    max_entries: int = MAX_SEARCH_ENTRIES,
 ) -> dict[str, Any]:
     """Search explicit local roots for one eligible clean Go repository, read-only."""
 
@@ -540,6 +559,10 @@ def discover_go_repository(
         raise HarnessRefusal("search_depth_bound", "Go search depth exceeds its bound")
     if not 1 <= max_candidates <= MAX_SEARCH_CANDIDATES:
         raise HarnessRefusal("search_candidate_bound", "Go candidate limit exceeds its bound")
+    if not 1 <= max_directories <= MAX_SEARCH_DIRECTORIES:
+        raise HarnessRefusal("search_directory_bound", "Go directory limit exceeds its bound")
+    if not 1 <= max_entries <= MAX_SEARCH_ENTRIES:
+        raise HarnessRefusal("search_entry_bound", "Go entry limit exceeds its bound")
     roots: list[pathlib.Path] = []
     for root in search_roots:
         if not root.is_absolute():
@@ -557,27 +580,53 @@ def discover_go_repository(
             raise HarnessRefusal("duplicate_search_root", "Go search roots must be distinct")
     candidates: set[pathlib.Path] = set()
     search_errors: list[dict[str, str]] = []
-    for root in roots:
-        queue: list[tuple[pathlib.Path, int]] = [(root, 0)]
-        while queue and len(candidates) < max_candidates:
-            current, depth = queue.pop(0)
-            try:
-                git_marker = current / ".git"
-                if git_marker.exists() or git_marker.is_symlink():
-                    metadata = git_marker.lstat()
-                    if not stat.S_ISLNK(metadata.st_mode) and (
-                        stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
-                    ):
-                        candidates.add(current)
-                if depth >= max_depth:
+    queue = collections.deque((root, 0) for root in roots)
+    directories_enqueued = len(queue)
+    entries_observed = 0
+    if directories_enqueued > max_directories:
+        raise HarnessRefusal("search_directory_bound", "Go directory limit is below root count")
+    while queue and len(candidates) < max_candidates:
+        current, depth = queue.popleft()
+        try:
+            git_marker = current / ".git"
+            if git_marker.exists() or git_marker.is_symlink():
+                metadata = git_marker.lstat()
+                if not stat.S_ISLNK(metadata.st_mode) and (
+                    stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
+                ):
+                    candidates.add(current)
+            if depth >= max_depth:
+                continue
+            entries = []
+            with os.scandir(current) as iterator:
+                for entry in iterator:
+                    entries_observed += 1
+                    if entries_observed > max_entries:
+                        raise HarnessRefusal(
+                            "search_entry_bound", "Go search exceeded its entry bound"
+                        )
+                    entries.append(entry)
+            for entry in sorted(entries, key=lambda observed: observed.name):
+                if (
+                    entry.name == ".git"
+                    or entry.is_symlink()
+                    or not entry.is_dir(follow_symlinks=False)
+                ):
                     continue
-                entries = sorted(os.scandir(current), key=lambda entry: entry.name)
-                for entry in entries:
-                    if entry.name == ".git" or entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
-                        continue
-                    queue.append((pathlib.Path(entry.path), depth + 1))
-            except OSError as error:
-                search_errors.append({"root": str(current), "code": "search_unreadable"})
+                directories_enqueued += 1
+                if directories_enqueued > max_directories:
+                    raise HarnessRefusal(
+                        "search_directory_bound", "Go search exceeded its directory bound"
+                    )
+                queue.append((pathlib.Path(entry.path), depth + 1))
+        except HarnessRefusal:
+            raise
+        except OSError:
+            if len(search_errors) >= MAX_SEARCH_ERRORS:
+                raise HarnessRefusal("search_error_bound", "Go search error bound exceeded")
+            search_errors.append({"root": str(current), "code": "search_unreadable"})
+    if queue and len(candidates) >= max_candidates:
+        raise HarnessRefusal("search_candidate_bound", "Go search candidate bound was reached")
     records: list[dict[str, Any]] = []
     selected: str | None = None
     for candidate in sorted(candidates):
@@ -634,6 +683,10 @@ def discover_go_repository(
         "search_roots": [str(root) for root in roots],
         "max_depth": max_depth,
         "max_candidates": max_candidates,
+        "max_directories": max_directories,
+        "max_entries": max_entries,
+        "directories_enqueued": directories_enqueued,
+        "entries_observed": entries_observed,
         "candidate_count": len(records),
         "search_errors": search_errors,
         "selected_repository": selected,
@@ -2033,6 +2086,10 @@ def evaluate(
             "search_roots": [],
             "max_depth": MAX_SEARCH_DEPTH,
             "max_candidates": MAX_SEARCH_CANDIDATES,
+            "max_directories": MAX_SEARCH_DIRECTORIES,
+            "max_entries": MAX_SEARCH_ENTRIES,
+            "directories_enqueued": 0,
+            "entries_observed": 0,
             "candidate_count": 0,
             "search_errors": [],
             "selected_repository": None,

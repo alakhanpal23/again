@@ -1802,9 +1802,18 @@ def validate_evaluation_matrix(
                 tokens = run.get("client_reported_tokens")
                 if not isinstance(tokens, Mapping) or tokens.get("source") != "direct_client_output":
                     raise HarnessRefusal("token_accounting", "estimated output tokens cannot be actual tokens")
+                counts = tokens.get("counts")
+                if not isinstance(counts, Mapping) or len(counts) > 64:
+                    raise HarnessRefusal("token_accounting", "client token counts are not bounded")
                 if any(
-                    not isinstance(value, int) or isinstance(value, bool) or value < 0
-                    for value in dict(tokens.get("counts", {})).values()
+                    not isinstance(name, str)
+                    or not name
+                    or len(name.encode("utf-8")) > 256
+                    or "token" not in name.casefold()
+                    or not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for name, value in counts.items()
                 ):
                     raise HarnessRefusal("token_accounting", "client token fields are invalid")
     if seen != set(expected_pairs):

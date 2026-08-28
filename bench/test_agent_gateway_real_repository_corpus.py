@@ -226,6 +226,17 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             corpus.discover_go_repository((search_root,), max_candidates=0)
         self.assertEqual(candidates.exception.code, "search_candidate_bound")
 
+        child = search_root / "child"
+        child.mkdir()
+        with self.assertRaises(corpus.HarnessRefusal) as directories:
+            corpus.discover_go_repository((search_root,), max_directories=1)
+        self.assertEqual(directories.exception.code, "search_directory_bound")
+
+        (search_root / "second-child").mkdir()
+        with self.assertRaises(corpus.HarnessRefusal) as entries:
+            corpus.discover_go_repository((search_root,), max_entries=1)
+        self.assertEqual(entries.exception.code, "search_entry_bound")
+
         with self.assertRaises(corpus.HarnessRefusal) as traversal:
             corpus.discover_go_repository((self.root / "bounded-root" / "..",))
         self.assertEqual(traversal.exception.code, "search_root_not_canonical")

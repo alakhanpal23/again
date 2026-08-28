@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -460,6 +461,14 @@ os._exit(0)
                 impossible, expected_models=models, expected_settings_ids=settings
             )
         self.assertEqual(counters.exception.code, "counter_impossible")
+
+        malformed_tokens = copy.deepcopy(pairs)
+        malformed_tokens[0]["baseline"]["runs"][0]["client_reported_tokens"]["counts"] = "tokens"
+        with self.assertRaises(real_eval.HarnessRefusal) as tokens:
+            real_eval.validate_evaluation_matrix(
+                malformed_tokens, expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(tokens.exception.code, "token_accounting")
 
     def test_matrix_is_exactly_16_runs_with_balanced_alternation(self) -> None:
         self.assertEqual(real_eval.planned_agent_runs(2), 16)
