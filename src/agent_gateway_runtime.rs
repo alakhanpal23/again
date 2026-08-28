@@ -46,9 +46,10 @@ use crate::store::{
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
-    ExternalFreshnessV1, McpIdentityV1, RepositoryGitStateV1, RepositoryObservationKindV1,
-    StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1,
-    WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1, observe_environment_v1,
+    ExecutableObservationRequestV1, ExternalFreshnessV1, McpIdentityV1, RepositoryGitStateV1,
+    RepositoryObservationKindV1, StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1,
+    WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1,
+    observe_environment_v1,
 };
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
@@ -1003,23 +1004,25 @@ fn resolve_repository_request_v1(
         bail!("Git tools require the exact workspace to be a Git worktree root");
     }
 
-    let exclusions = vec![
+    let mut exclusions = vec![
         (
             StateDimensionV1::Kernel,
             b"closed repository tools make no kernel-version-dependent query".to_vec(),
-        ),
-        (
-            StateDimensionV1::Executables,
-            b"closed repository tools execute no child binary".to_vec(),
         ),
         (
             StateDimensionV1::EnvironmentValues,
             b"closed repository tools read no ambient environment value".to_vec(),
         ),
     ];
+    if !operation.is_git() {
+        exclusions.push((
+            StateDimensionV1::Executables,
+            b"closed in-process repository tools execute no child binary".to_vec(),
+        ));
+    }
     let relevance = EnvironmentRelevanceProofV1::from_exclusions(exclusions, &limits)
         .map_err(|_| anyhow!("environment relevance is incomplete"))?;
-    let environment_plan = EnvironmentObservationPlanV1::new()
+    let mut environment_plan = EnvironmentObservationPlanV1::new()
         .with_operating_system()
         .with_architecture()
         .with_cwd(workspace)
@@ -1035,6 +1038,16 @@ fn resolve_repository_request_v1(
         )
         .map_err(|_| anyhow!("authorization scope is incomplete"))?
         .with_relevance_proof(relevance);
+    if operation.is_git() {
+        let executable = ExecutableObservationRequestV1::new(
+            "git",
+            "/usr/bin/git",
+            b"again.read-only-git-provider.v1",
+            &limits,
+        )
+        .map_err(|_| anyhow!("Git executable identity is incomplete"))?;
+        environment_plan = environment_plan.with_executable(executable);
+    }
     let environment = observe_environment_v1(&environment_plan, &limits)
         .map_err(|_| anyhow!("environment state is incomplete"))?;
 
