@@ -1104,10 +1104,16 @@ def run_product_e2e(
             concurrent_results = [
                 require_success(response, "concurrent search") for response in concurrent_responses
             ]
-            if concurrent_results[0] != concurrent_results[1]:
-                raise HarnessRefusal("joined_response_mismatch", "leader and follower responses differ")
-            concurrent_id = result_id(concurrent_results[0])
-            if concurrent_id is None:
+            concurrent_ids = [result_id(result) for result in concurrent_results]
+            if result_without_reference(concurrent_results[0]) != result_without_reference(
+                concurrent_results[1]
+            ):
+                raise HarnessRefusal(
+                    "joined_observation_mismatch",
+                    "leader and follower observations differ",
+                )
+            concurrent_id = concurrent_ids[0]
+            if concurrent_id is None or concurrent_ids[1] != concurrent_id:
                 raise HarnessRefusal("result_reference_missing", "joined result has no exact ID")
             window = reader.end(start)
             concurrent_binding, events, counts = _binding_and_events(
@@ -1127,7 +1133,9 @@ def run_product_e2e(
             provider_execution_count += 1
             scenarios["concurrent_join"] = {
                 "classification": {"leader": 1, "joined_follower": 1},
-                "identical_responses": True,
+                "identical_responses": False,
+                "identical_observations": True,
+                "recipient_bound_presentations": True,
                 "result_id": concurrent_id,
                 "response_sha256": [
                     sha256_bytes(canonical_json_bytes(response)) for response in concurrent_responses
@@ -1148,11 +1156,17 @@ def run_product_e2e(
                 window,
                 {"requested": 1, "exact_candidate": 1, "exact_hit": 1},
             )
-            if exact_binding != concurrent_binding or exact_result != concurrent_results[0]:
+            if (
+                exact_binding != concurrent_binding
+                or result_id(exact_result) != concurrent_id
+                or result_without_reference(exact_result)
+                != result_without_reference(concurrent_results[0])
+            ):
                 raise HarnessRefusal("exact_reuse_unproven", "exact repeat did not preserve binding/output")
             scenarios["exact_repeat"] = {
                 "classification": "exact_reuse",
-                "identical_response": True,
+                "identical_response": False,
+                "identical_observation": True,
                 "result_id": result_id(exact_result),
                 "timing_ms": exact_ms,
                 **_window_record(window, exact_binding, counts),
@@ -1202,7 +1216,13 @@ def run_product_e2e(
             if relevant_binding == baseline_binding or relevant_before == relevant_after:
                 raise HarnessRefusal("relevant_mutation_ignored", "relevant mutation did not partition state")
             matches = relevant_result.get("structuredContent", {}).get("matches")
-            if matches != [] or relevant_result == relevant_baseline:
+            if (
+                matches != []
+                or result_id(relevant_result) is None
+                or result_id(relevant_result) == result_id(relevant_baseline)
+                or result_without_reference(relevant_result)
+                == result_without_reference(relevant_baseline)
+            ):
                 raise HarnessRefusal("stale_search_output", "removed marker remained in search output")
             scenarios["relevant_mutation"] = {
                 "classification": "executed_new_state",
@@ -1236,7 +1256,12 @@ def run_product_e2e(
                 window,
                 {"requested": 1, "exact_candidate": 1, "exact_hit": 1},
             )
-            if irrelevant_binding != relevant_binding or irrelevant_result != relevant_result:
+            if (
+                irrelevant_binding != relevant_binding
+                or result_id(irrelevant_result) != result_id(relevant_result)
+                or result_without_reference(irrelevant_result)
+                != result_without_reference(relevant_result)
+            ):
                 raise HarnessRefusal(
                     "dependency_proof_failed", "out-of-scope mutation did not produce proven exact reuse"
                 )

@@ -1415,8 +1415,15 @@ def run_onboarding_smoke(
             claude_read = product.require_success(
                 claude_read_response, "installed Claude repo.read"
             )
-            if claude_read != read_result:
-                raise HarnessRefusal("client_output_mismatch", "Codex and Claude config paths differ")
+            if (
+                product.result_without_reference(claude_read)
+                != product.result_without_reference(read_result)
+                or product.result_id(claude_read) != product.result_id(read_result)
+            ):
+                raise HarnessRefusal(
+                    "client_observation_mismatch",
+                    "Codex and Claude observations differ",
+                )
 
             mutation_path = workspace / "scope/search.txt"
             before = mutation_path.read_bytes()
@@ -1435,7 +1442,11 @@ def run_onboarding_smoke(
             changed_result_id = require_exact_search_result(
                 changed_result, expected_matches=[], expected_text=""
             )
-            if changed_result_id == baseline_result_id or changed_result == baseline_result:
+            if (
+                changed_result_id == baseline_result_id
+                or product.result_without_reference(changed_result)
+                == product.result_without_reference(baseline_result)
+            ):
                 raise HarnessRefusal("mutation_replayed", "relevant mutation returned stale search")
             mutation = {
                 "classification": "relevant_mutation_invalidated",

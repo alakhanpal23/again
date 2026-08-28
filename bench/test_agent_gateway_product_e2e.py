@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pathlib
@@ -325,6 +326,24 @@ class GatewayProductE2ETest(unittest.TestCase):
         self.assertEqual(harness.result_id(valid), "a" * 64)
         self.assertIsNone(harness.result_id({"_meta": {"again": {"resultId": "A" * 64}}}))
         self.assertEqual(harness.result_without_reference(valid), {})
+
+    def test_observation_projection_ignores_recipient_bound_metadata_only(self) -> None:
+        first = {
+            "content": [{"type": "text", "text": "same"}],
+            "structuredContent": {"schemaVersion": 1, "matches": []},
+            "_meta": {"again": {"resultId": "a" * 64, "recipient": "agent-a"}},
+        }
+        second = copy.deepcopy(first)
+        second["_meta"]["again"]["recipient"] = "agent-b"
+        self.assertEqual(
+            harness.result_without_reference(first),
+            harness.result_without_reference(second),
+        )
+        second["content"][0]["text"] = "different"
+        self.assertNotEqual(
+            harness.result_without_reference(first),
+            harness.result_without_reference(second),
+        )
 
 
 if __name__ == "__main__":

@@ -537,7 +537,8 @@ def derive_false_hits(report: Mapping[str, Any]) -> tuple[int, list[dict[str, An
             "name": "concurrent_join",
             "false_hit": not (
                 _valid_result_id(concurrent.get("result_id"))
-                and concurrent.get("identical_responses") is True
+                and concurrent.get("identical_observations") is True
+                and concurrent.get("recipient_bound_presentations") is True
                 and _event_counts(concurrent)
                 == {
                     "completed": 1,
@@ -552,7 +553,7 @@ def derive_false_hits(report: Mapping[str, Any]) -> tuple[int, list[dict[str, An
             "name": "exact_hit",
             "false_hit": not (
                 exact.get("result_id") == concurrent.get("result_id")
-                and exact.get("identical_response") is True
+                and exact.get("identical_observation") is True
                 and _event_counts(exact)
                 == {"exact_candidate": 1, "exact_hit": 1, "requested": 1}
             ),

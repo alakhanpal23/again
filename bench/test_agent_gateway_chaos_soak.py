@@ -22,7 +22,9 @@ def scenario_report() -> dict[str, object]:
         "scenarios": {
             "concurrent_join": {
                 "result_id": rid_a,
-                "identical_responses": True,
+                "identical_responses": False,
+                "identical_observations": True,
+                "recipient_bound_presentations": True,
                 "event_counts": {
                     "completed": 1,
                     "executed": 1,
@@ -33,7 +35,8 @@ def scenario_report() -> dict[str, object]:
             },
             "exact_repeat": {
                 "result_id": rid_a,
-                "identical_response": True,
+                "identical_response": False,
+                "identical_observation": True,
                 "event_counts": {"exact_candidate": 1, "exact_hit": 1, "requested": 1},
             },
             "relevant_mutation": {
