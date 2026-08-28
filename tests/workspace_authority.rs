@@ -90,6 +90,11 @@ fn content_plan(path: &str) -> RepositoryObservationPlanV1 {
     )
 }
 
+fn source_plan(path: &str) -> RepositoryObservationPlanV1 {
+    RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        .with_source_trees(vec![PathBuf::from(path)])
+}
+
 fn digest(value: &[u8]) -> StateDigestV1 {
     StateDigestV1::from_domain_and_bytes(b"again.authority-test.v1", value)
 }
@@ -179,6 +184,26 @@ fn untracked_addition_under_recursive_scope_changes_epoch() {
         observe_repository_v1(fixture.root(), &plan, &limits()).expect("expanded tree epoch");
     assert_ne!(before.digest(), after.digest());
     assert_eq!(after.observations()[0].entries(), 3);
+}
+
+#[test]
+fn source_tree_binds_untracked_source_but_not_git_control_files() {
+    let fixture = RepositoryFixture::git();
+    fixture.write("src/lib.rs", b"pub fn stable() {}\n");
+    fixture.commit_all("initial");
+    let plan = source_plan(".");
+    let before = observe_repository_v1(fixture.root(), &plan, &limits()).expect("source epoch");
+
+    fixture.write("src/untracked.rs", b"pub fn added() {}\n");
+    let with_source =
+        observe_repository_v1(fixture.root(), &plan, &limits()).expect("source addition epoch");
+    assert_ne!(before.digest(), with_source.digest());
+
+    let control = fixture.root().join(".git/again-test-control");
+    fs::write(&control, b"not a source input").expect("Git control file");
+    let after_control =
+        observe_repository_v1(fixture.root(), &plan, &limits()).expect("control-file epoch");
+    assert_eq!(with_source.digest(), after_control.digest());
 }
 
 #[test]

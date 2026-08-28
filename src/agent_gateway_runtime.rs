@@ -7,11 +7,13 @@
 
 #[path = "agent_gateway_runtime/context_compiler.rs"]
 pub mod context_compiler;
+#[path = "agent_gateway_runtime/repository_tools.rs"]
+mod repository_tools;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufReader};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -44,10 +46,9 @@ use crate::store::{
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
-    ExternalFreshnessV1, McpIdentityV1, RepositoryNodeKindV1, RepositoryObservationKindV1,
-    RepositoryObservationPlanV1, StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1,
-    WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1,
-    observe_environment_v1,
+    ExternalFreshnessV1, McpIdentityV1, RepositoryObservationKindV1, StateDigestV1,
+    StateDimensionV1, TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1,
+    WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1, observe_environment_v1,
 };
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
@@ -56,9 +57,6 @@ const REPOSITORY_PROVIDER_IMPLEMENTATION_V1: &str = "again.repository-provider-v
 const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
-const MAX_SEARCH_RESULTS_V1: usize = 500;
-const MAX_SEARCH_LINE_BYTES_V1: usize = 4 * 1024;
-const MAX_SEARCH_OUTPUT_BYTES_V1: usize = 512 * 1024;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
 const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_millis(250);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
@@ -79,6 +77,12 @@ fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
 enum RepositoryOperationV1 {
     Read,
     Search,
+    List,
+    Tree,
+    Stat,
+    Glob,
+    References,
+    Manifest,
 }
 
 impl RepositoryOperationV1 {
@@ -92,6 +96,12 @@ impl RepositoryOperationV1 {
         match call.upstream_tool_name.as_str() {
             "read" => Some(Self::Read),
             "search" => Some(Self::Search),
+            "list" => Some(Self::List),
+            "tree" => Some(Self::Tree),
+            "stat" => Some(Self::Stat),
+            "glob" => Some(Self::Glob),
+            "references" => Some(Self::References),
+            "manifest" => Some(Self::Manifest),
             _ => None,
         }
     }
@@ -699,14 +709,11 @@ impl RepositoryProviderV1 {
         call: ProviderCall,
         _secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        match call.upstream_tool_name.as_str() {
-            "read" => repository_read_v1(epoch, &call.arguments),
-            "search" => repository_search_v1(epoch, &call.arguments),
-            _ => Err(ProviderError(McpError::typed(
-                McpErrorCode::MethodNotFound,
-                "unknown repository tool",
-            ))),
-        }
+        repository_tools::execute_repository_tool_v1(
+            epoch,
+            &call.upstream_tool_name,
+            &call.arguments,
+        )
     }
 }
 
@@ -732,30 +739,7 @@ impl ToolDiscovery for RepositoryProviderV1 {
     }
 
     fn discover_tools(&self) -> Result<Vec<ProviderTool>, ProviderError> {
-        Ok(vec![
-            ProviderTool::new(
-                "read",
-                json!({
-                    "type": "object",
-                    "properties": { "path": { "type": "string" } },
-                    "required": ["path"],
-                    "additionalProperties": false
-                }),
-            ),
-            ProviderTool::new(
-                "search",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "pattern": { "type": "string" },
-                        "path": { "type": "string", "default": "." },
-                        "maxResults": { "type": "integer", "minimum": 1, "maximum": 500 }
-                    },
-                    "required": ["pattern"],
-                    "additionalProperties": false
-                }),
-            ),
-        ])
+        Ok(repository_tools::repository_tool_definitions_v1())
     }
 }
 
@@ -771,7 +755,9 @@ impl FreshnessMetadata for RepositoryProviderV1 {
 impl SideEffectClassification for RepositoryProviderV1 {
     fn classify_effect(&self, upstream_tool_name: &str) -> EffectClass {
         match upstream_tool_name {
-            "read" | "search" => EffectClass::ReadOnly,
+            "read" | "search" | "list" | "tree" | "stat" | "glob" | "references" | "manifest" => {
+                EffectClass::ReadOnly
+            }
             _ => EffectClass::Unknown,
         }
     }
@@ -884,24 +870,8 @@ fn resolve_repository_request_v1(
 ) -> Result<ResolvedRequestV1> {
     let limits = gateway_workspace_limits_v1();
     let workspace = execution_epoch.canonical_workspace();
-    let relative = argument_path_v1(&call.arguments, operation == RepositoryOperationV1::Search)?;
-    let observation_plan = match execution_epoch
-        .classify_relative(&relative)
-        .map_err(|_| anyhow!("repository path classification is incomplete"))?
-    {
-        RepositoryNodeKindV1::Regular => {
-            RepositoryObservationPlanV1::new(vec![relative.clone()], vec![], vec![], vec![])
-        }
-        RepositoryNodeKindV1::Directory if operation == RepositoryOperationV1::Search => {
-            RepositoryObservationPlanV1::new(vec![], vec![relative.clone()], vec![], vec![])
-        }
-        RepositoryNodeKindV1::Missing => {
-            RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![relative.clone()])
-        }
-        RepositoryNodeKindV1::Directory => {
-            bail!("repository path is not an admitted regular file")
-        }
-    };
+    let observation_plan =
+        repository_tools::observation_plan_v1(execution_epoch, &call.arguments, operation)?;
     let repository = execution_epoch
         .observe_repository(&observation_plan, &limits)
         .map_err(|_| anyhow!("repository state is incomplete"))?;
@@ -1033,6 +1003,7 @@ fn resolve_repository_request_v1(
             let kind = match observation.kind() {
                 RepositoryObservationKindV1::ContentPath => b"content".as_slice(),
                 RepositoryObservationKindV1::RecursiveTree => b"tree".as_slice(),
+                RepositoryObservationKindV1::SourceTree => b"source-tree".as_slice(),
                 RepositoryObservationKindV1::DirectoryListing => b"listing".as_slice(),
                 RepositoryObservationKindV1::NegativeDependency => b"negative".as_slice(),
             };
@@ -1061,174 +1032,6 @@ fn resolve_repository_request_v1(
         dependencies,
     })?;
     Ok(ResolvedRequestV1 { core_call, binding })
-}
-
-fn repository_read_v1(
-    execution_epoch: &WorkspaceExecutionEpochV1,
-    arguments: &Value,
-) -> Result<Value, ProviderError> {
-    let relative = argument_path_v1(arguments, false).map_err(invalid_arguments_v1)?;
-    if execution_epoch
-        .classify_relative(&relative)
-        .map_err(|_| provider_io_v1(anyhow!("descriptor-bound repository classification failed")))?
-        != RepositoryNodeKindV1::Regular
-    {
-        return Err(invalid_arguments_v1(anyhow!(
-            "path is not an admitted bounded regular file"
-        )));
-    }
-    let bytes = execution_epoch
-        .read_repository_file(&relative, MAX_REPOSITORY_FILE_BYTES_V1)
-        .map_err(|_| provider_io_v1(anyhow!("descriptor-bound repository read failed")))?;
-    let text = String::from_utf8(bytes)
-        .map_err(|_| invalid_arguments_v1(anyhow!("repository file is not UTF-8")))?;
-    Ok(json!({
-        "content": [{ "type": "text", "text": text }],
-        "structuredContent": { "path": path_text_v1(&relative), "bytes": text.len() }
-    }))
-}
-
-fn repository_search_v1(
-    execution_epoch: &WorkspaceExecutionEpochV1,
-    arguments: &Value,
-) -> Result<Value, ProviderError> {
-    let object = arguments
-        .as_object()
-        .ok_or_else(|| invalid_arguments_v1(anyhow!("arguments must be an object")))?;
-    let pattern = object
-        .get("pattern")
-        .and_then(Value::as_str)
-        .filter(|pattern| !pattern.is_empty() && pattern.len() <= 4096)
-        .ok_or_else(|| {
-            invalid_arguments_v1(anyhow!("pattern must be a non-empty bounded string"))
-        })?;
-    let relative = argument_path_v1(arguments, true).map_err(invalid_arguments_v1)?;
-    let maximum = object
-        .get("maxResults")
-        .and_then(Value::as_u64)
-        .unwrap_or(200);
-    let maximum = usize::try_from(maximum)
-        .ok()
-        .filter(|maximum| (1..=MAX_SEARCH_RESULTS_V1).contains(maximum))
-        .ok_or_else(|| invalid_arguments_v1(anyhow!("maxResults is outside 1..=500")))?;
-    let limits = gateway_workspace_limits_v1();
-    let mut files = execution_epoch
-        .list_regular_files(&relative, &limits)
-        .map_err(|_| provider_io_v1(anyhow!("descriptor-bound search traversal failed")))?;
-    files.sort_by(|left, right| left.relative_path().cmp(right.relative_path()));
-    let mut scanned = 0_u64;
-    let mut matches = Vec::new();
-    let mut rendered_bytes = 0_usize;
-    let mut truncated = false;
-    'files: for file in files {
-        scanned = scanned.checked_add(file.bytes()).ok_or_else(|| {
-            ProviderError(McpError::typed(
-                McpErrorCode::LimitExceeded,
-                "repository search bound exceeded",
-            ))
-        })?;
-        if file.bytes() > MAX_REPOSITORY_FILE_BYTES_V1 || scanned > MAX_REPOSITORY_SCAN_BYTES_V1 {
-            return Err(ProviderError(McpError::typed(
-                McpErrorCode::LimitExceeded,
-                "repository search bound exceeded",
-            )));
-        }
-        let relative_file = file.relative_path();
-        let bytes = execution_epoch
-            .read_repository_file(relative_file, MAX_REPOSITORY_FILE_BYTES_V1)
-            .map_err(|_| provider_io_v1(anyhow!("descriptor-bound search read failed")))?;
-        if bytes.len() as u64 != file.bytes() {
-            return Err(provider_io_v1(anyhow!(
-                "repository file changed after traversal"
-            )));
-        }
-        let Ok(text) = std::str::from_utf8(&bytes) else {
-            continue;
-        };
-        for (index, line) in text.lines().enumerate() {
-            if line.contains(pattern) {
-                let snippet = bounded_utf8_prefix_v1(line, MAX_SEARCH_LINE_BYTES_V1);
-                let path_text = path_text_v1(relative_file);
-                let estimated = path_text
-                    .len()
-                    .saturating_add(snippet.len())
-                    .saturating_add(32);
-                if rendered_bytes.saturating_add(estimated) > MAX_SEARCH_OUTPUT_BYTES_V1 {
-                    truncated = true;
-                    break 'files;
-                }
-                rendered_bytes = rendered_bytes.saturating_add(estimated);
-                matches.push(json!({
-                    "path": path_text,
-                    "line": index + 1,
-                    "text": snippet,
-                    "lineTruncated": snippet.len() != line.len()
-                }));
-                if matches.len() >= maximum {
-                    truncated = true;
-                    break 'files;
-                }
-            }
-        }
-    }
-    let rendered = matches
-        .iter()
-        .map(|entry| {
-            format!(
-                "{}:{}:{}",
-                entry["path"].as_str().unwrap_or_default(),
-                entry["line"].as_u64().unwrap_or_default(),
-                entry["text"].as_str().unwrap_or_default()
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(json!({
-        "content": [{ "type": "text", "text": rendered }],
-        "structuredContent": {
-            "pattern": pattern,
-            "path": path_text_v1(&relative),
-            "matches": matches,
-            "truncated": truncated
-        }
-    }))
-}
-
-fn bounded_utf8_prefix_v1(value: &str, maximum_bytes: usize) -> &str {
-    if value.len() <= maximum_bytes {
-        return value;
-    }
-    let mut end = maximum_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn argument_path_v1(arguments: &Value, default_dot: bool) -> Result<PathBuf> {
-    let object = arguments
-        .as_object()
-        .ok_or_else(|| anyhow!("arguments must be an object"))?;
-    let path = object
-        .get("path")
-        .and_then(Value::as_str)
-        .or(default_dot.then_some("."))
-        .ok_or_else(|| anyhow!("path is required"))?;
-    if path.is_empty() || path.len() > 4096 || path.as_bytes().contains(&0) {
-        bail!("path is invalid");
-    }
-    let path = PathBuf::from(path);
-    if path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("path must be relative and traversal-free");
-    }
-    Ok(path)
 }
 
 fn attach_result_reference_v1(

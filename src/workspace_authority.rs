@@ -250,6 +250,9 @@ pub struct RepositoryObservationPlanV1 {
     /// Exact recursive trees. Every entry is included regardless of Git
     /// tracking or ignore status, so relevant untracked inputs are bound.
     recursive_trees: Vec<PathBuf>,
+    /// Recursive source trees that exclude only the root `.git` control
+    /// directory. Git identity is observed independently by every epoch.
+    source_trees: Vec<PathBuf>,
     /// One-level directory name, type, and metadata observations.
     directory_listings: Vec<PathBuf>,
     /// Existence observations, including an explicit absent state.
@@ -260,6 +263,7 @@ impl std::fmt::Debug for RepositoryObservationPlanV1 {
         f.debug_struct("RepositoryObservationPlanV1")
             .field("content_paths", &self.content_paths.len())
             .field("recursive_trees", &self.recursive_trees.len())
+            .field("source_trees", &self.source_trees.len())
             .field("directory_listings", &self.directory_listings.len())
             .field("negative_dependencies", &self.negative_dependencies.len())
             .finish()
@@ -276,6 +280,7 @@ impl RepositoryObservationPlanV1 {
         Self {
             content_paths,
             recursive_trees,
+            source_trees: Vec::new(),
             directory_listings,
             negative_dependencies,
         }
@@ -287,6 +292,15 @@ impl RepositoryObservationPlanV1 {
 
     pub fn recursive_trees(&self) -> &[PathBuf] {
         &self.recursive_trees
+    }
+
+    pub fn with_source_trees(mut self, source_trees: Vec<PathBuf>) -> Self {
+        self.source_trees = source_trees;
+        self
+    }
+
+    pub fn source_trees(&self) -> &[PathBuf] {
+        &self.source_trees
     }
 
     pub fn directory_listings(&self) -> &[PathBuf] {
@@ -302,6 +316,7 @@ impl RepositoryObservationPlanV1 {
 pub enum RepositoryObservationKindV1 {
     ContentPath,
     RecursiveTree,
+    SourceTree,
     DirectoryListing,
     NegativeDependency,
 }
@@ -472,6 +487,27 @@ pub(crate) enum RepositoryNodeKindV1 {
 pub(crate) struct RepositoryRegularFileV1 {
     relative_path: PathBuf,
     bytes: u64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct RepositoryDirectoryEntryV1 {
+    relative_path: PathBuf,
+    kind: RepositoryNodeKindV1,
+    bytes: u64,
+}
+
+impl RepositoryDirectoryEntryV1 {
+    pub(crate) fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    pub(crate) const fn kind(&self) -> RepositoryNodeKindV1 {
+        self.kind
+    }
+
+    pub(crate) const fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 impl RepositoryRegularFileV1 {
@@ -917,16 +953,108 @@ impl WorkspaceExecutionEpochV1 {
         Ok(bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn list_regular_files(
         &self,
         start: &Path,
         limits: &WorkspaceAuthorityLimitsV1,
     ) -> AuthorityResult<Vec<RepositoryRegularFileV1>> {
+        self.list_regular_files_inner(start, limits, false)
+    }
+
+    pub(crate) fn list_source_directory(
+        &self,
+        relative: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Vec<RepositoryDirectoryEntryV1>> {
+        validate_limits(limits)?;
+        let relative = normalize_provider_relative_path(relative, limits)?;
+        let display = self.canonical_workspace.join(&relative);
+        let (_identity, names) =
+            stable_directory_listing_relative(&self.root_handle, &relative, &display, limits)?;
+        let mut entries = Vec::new();
+        for name in names {
+            if relative.as_os_str().is_empty() && name.as_bytes() == b".git" {
+                continue;
+            }
+            let child = relative.join(name);
+            let child_display = self.canonical_workspace.join(&child);
+            let kind = secure_node_kind_relative(
+                &self.root_handle,
+                &child,
+                StateDimensionV1::RepositoryContent,
+                &child_display,
+                "inspect provider directory entry",
+            )?
+            .ok_or_else(|| {
+                concurrent(
+                    StateDimensionV1::RepositoryContent,
+                    &child_display,
+                    "inspect provider directory entry",
+                )
+            })?;
+            let expected = if kind == SecureNodeKindV1::Directory {
+                ExpectedNodeV1::Directory
+            } else {
+                ExpectedNodeV1::Regular
+            };
+            let handle = secure_open_relative(
+                &self.root_handle,
+                &child,
+                expected,
+                StateDimensionV1::RepositoryContent,
+                &child_display,
+                "open provider directory entry",
+            )?;
+            let metadata = handle.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::RepositoryContent,
+                    &child_display,
+                    "inspect provider directory entry",
+                    error,
+                )
+            })?;
+            entries.push(RepositoryDirectoryEntryV1 {
+                relative_path: child,
+                kind: if kind == SecureNodeKindV1::Directory {
+                    RepositoryNodeKindV1::Directory
+                } else {
+                    RepositoryNodeKindV1::Regular
+                },
+                bytes: metadata.len(),
+            });
+        }
+        self.verify_current_path()?;
+        Ok(entries)
+    }
+
+    pub(crate) fn list_source_files(
+        &self,
+        start: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Vec<RepositoryRegularFileV1>> {
+        self.list_regular_files_inner(start, limits, true)
+    }
+
+    fn list_regular_files_inner(
+        &self,
+        start: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+        exclude_git_control_directory: bool,
+    ) -> AuthorityResult<Vec<RepositoryRegularFileV1>> {
         validate_limits(limits)?;
         let normalized = normalize_provider_relative_path(start, limits)?;
         let mut files = Vec::new();
         let mut ledger = ProviderTraversalLedgerV1::default();
-        collect_provider_regular_files_v1(self, &normalized, 0, limits, &mut ledger, &mut files)?;
+        collect_provider_regular_files_v1(
+            self,
+            &normalized,
+            0,
+            limits,
+            &mut ledger,
+            &mut files,
+            exclude_git_control_directory && normalized.as_os_str().is_empty(),
+        )?;
         self.verify_current_path()?;
         Ok(files)
     }
@@ -1389,6 +1517,7 @@ fn collect_provider_regular_files_v1(
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ProviderTraversalLedgerV1,
     files: &mut Vec<RepositoryRegularFileV1>,
+    exclude_git_control_directory: bool,
 ) -> AuthorityResult<()> {
     if depth > limits.max_tree_depth {
         return Err(incomplete_limit(
@@ -1471,6 +1600,9 @@ fn collect_provider_regular_files_v1(
             let (_identity, names) =
                 stable_directory_listing_relative(&epoch.root_handle, relative, &display, limits)?;
             for name in names {
+                if exclude_git_control_directory && depth == 0 && name.as_bytes() == b".git" {
+                    continue;
+                }
                 let child_bytes = relative
                     .as_os_str()
                     .as_bytes()
@@ -1492,7 +1624,15 @@ fn collect_provider_regular_files_v1(
                     ));
                 }
                 let child = relative.join(name);
-                collect_provider_regular_files_v1(epoch, &child, depth + 1, limits, ledger, files)?;
+                collect_provider_regular_files_v1(
+                    epoch,
+                    &child,
+                    depth + 1,
+                    limits,
+                    ledger,
+                    files,
+                    exclude_git_control_directory,
+                )?;
             }
             Ok(())
         }
@@ -1741,6 +1881,7 @@ fn normalize_plan(
         .content_paths
         .len()
         .checked_add(plan.recursive_trees.len())
+        .and_then(|value| value.checked_add(plan.source_trees.len()))
         .and_then(|value| value.checked_add(plan.directory_listings.len()))
         .and_then(|value| value.checked_add(plan.negative_dependencies.len()))
         .ok_or_else(|| {
@@ -1761,6 +1902,7 @@ fn normalize_plan(
     Ok(RepositoryObservationPlanV1 {
         content_paths: normalize_path_set(&plan.content_paths, false, limits)?,
         recursive_trees: normalize_path_set(&plan.recursive_trees, true, limits)?,
+        source_trees: normalize_path_set(&plan.source_trees, true, limits)?,
         directory_listings: normalize_path_set(&plan.directory_listings, true, limits)?,
         negative_dependencies: normalize_path_set(&plan.negative_dependencies, false, limits)?,
     })
@@ -1849,6 +1991,17 @@ fn observe_plan_once(
             relative,
             limits,
             &mut ledger,
+            false,
+        )?);
+    }
+    for relative in &plan.source_trees {
+        observations.push(observe_recursive_tree(
+            root,
+            root_handle,
+            relative,
+            limits,
+            &mut ledger,
+            true,
         )?);
     }
     for relative in &plan.directory_listings {
@@ -1920,6 +2073,7 @@ fn observe_recursive_tree(
     relative: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ObservationLedger,
+    source_tree: bool,
 ) -> AuthorityResult<RepositoryObservationV1> {
     let tree_root = root.join(relative);
     if secure_node_kind_relative(
@@ -1942,10 +2096,15 @@ fn observe_recursive_tree(
         root_handle,
         tree_base: relative,
         limits,
+        exclude_git_control_directory: source_tree && relative.as_os_str().is_empty(),
     };
     encode_tree(&context, Path::new(""), 0, ledger, &mut encoder)?;
     Ok(RepositoryObservationV1 {
-        kind: RepositoryObservationKindV1::RecursiveTree,
+        kind: if source_tree {
+            RepositoryObservationKindV1::SourceTree
+        } else {
+            RepositoryObservationKindV1::RecursiveTree
+        },
         path: relative.to_path_buf(),
         digest: encoder.finish(),
         entries: ledger.entries - entries_before,
@@ -1959,6 +2118,7 @@ struct TreeObservationContextV1<'a> {
     root_handle: &'a File,
     tree_base: &'a Path,
     limits: &'a WorkspaceAuthorityLimitsV1,
+    exclude_git_control_directory: bool,
 }
 
 fn encode_tree(
@@ -1989,6 +2149,12 @@ fn encode_tree(
     identity.encode_full(encoder);
     encoder.u64(names.len() as u64);
     for name in names {
+        if context.exclude_git_control_directory
+            && tree_relative.as_os_str().is_empty()
+            && name.as_bytes() == b".git"
+        {
+            continue;
+        }
         let child_relative = tree_relative.join(&name);
         let child_repository_relative = context.tree_base.join(&child_relative);
         let child = context.repository_root.join(&child_repository_relative);
@@ -4537,6 +4703,7 @@ fn encode_repository_plan(plan: &RepositoryObservationPlanV1, encoder: &mut Cano
     for paths in [
         &plan.content_paths,
         &plan.recursive_trees,
+        &plan.source_trees,
         &plan.directory_listings,
         &plan.negative_dependencies,
     ] {
@@ -4621,8 +4788,9 @@ fn observation_kind_tag(kind: RepositoryObservationKindV1) -> u8 {
     match kind {
         RepositoryObservationKindV1::ContentPath => 1,
         RepositoryObservationKindV1::RecursiveTree => 2,
-        RepositoryObservationKindV1::DirectoryListing => 3,
-        RepositoryObservationKindV1::NegativeDependency => 4,
+        RepositoryObservationKindV1::SourceTree => 3,
+        RepositoryObservationKindV1::DirectoryListing => 4,
+        RepositoryObservationKindV1::NegativeDependency => 5,
     }
 }
 
