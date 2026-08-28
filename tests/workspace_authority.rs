@@ -282,6 +282,37 @@ fn git_control_configuration_changes_are_bound() {
 }
 
 #[test]
+fn external_git_configuration_dependencies_fail_closed() {
+    for key in [
+        "include.path",
+        "core.excludesFile",
+        "core.attributesFile",
+        "core.worktree",
+        "diff.orderFile",
+        "blame.ignoreRevsFile",
+    ] {
+        let fixture = RepositoryFixture::git();
+        fixture.write("tracked", b"tracked\n");
+        fixture.commit_all("initial");
+        let external = fixture.temporary.path().join("external-git-input");
+        fs::write(&external, b"# external Git input\n").unwrap();
+        fixture.run_git(&["config", key, external.to_str().unwrap()]);
+
+        let refusal = observe_repository_v1(
+            fixture.root(),
+            &RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            &limits(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal.primary_code(),
+            IncompleteReasonCodeV1::UnknownRelevantState,
+            "{key} must not create unobserved reuse authority"
+        );
+    }
+}
+
+#[test]
 fn nested_workspace_discovers_its_enclosing_git_identity() {
     let fixture = RepositoryFixture::git();
     fixture.write("nested/workspace/input", b"input\n");

@@ -36,6 +36,24 @@ fn call(gateway: &McpGateway, sequence: u64, name: &str, arguments: Value) -> Va
     )
 }
 
+fn initialize(gateway: &McpGateway) {
+    let response = process(
+        gateway,
+        "initialize",
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "repository-tools-test", "version": "1" }
+            }
+        }),
+    );
+    assert_eq!(response["result"]["protocolVersion"], "2025-06-18");
+}
+
 fn write(root: &Path, relative: &str, content: &str) {
     let path = root.join(relative);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -91,21 +109,7 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     git(workspace.path(), &["commit", "-q", "-m", "initial"]);
 
     let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
-    let initialize = process(
-        server.gateway(),
-        "initialize",
-        json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": "2025-06-18",
-                "capabilities": {},
-                "clientInfo": { "name": "repository-tools-test", "version": "1" }
-            }
-        }),
-    );
-    assert_eq!(initialize["result"]["protocolVersion"], "2025-06-18");
+    initialize(server.gateway());
 
     let listed = process(
         server.gateway(),
@@ -412,4 +416,166 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     // that is a safe miss, and its exact response equality is asserted above.
     assert!((2..=3).contains(&stats.exact_hits), "{stats:?}");
     assert_eq!(stats.executed + stats.exact_hits, 25, "{stats:?}");
+}
+
+#[test]
+fn external_git_inputs_execute_without_reuse() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "tracked", "tracked\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(
+        workspace.path(),
+        &["config", "user.name", "Repository Tool Tests"],
+    );
+    git(
+        workspace.path(),
+        &["config", "user.email", "repository-tools@example.invalid"],
+    );
+    git(workspace.path(), &["add", "tracked"]);
+    git(workspace.path(), &["commit", "-q", "-m", "initial"]);
+    write(workspace.path(), "ignored.txt", "untracked\n");
+    let external_root = TempDir::new().unwrap();
+    let external = external_root.path().join("external-ignore");
+    fs::write(&external, b"ignored.txt\n").unwrap();
+    git(
+        workspace.path(),
+        &["config", "core.excludesFile", external.to_str().unwrap()],
+    );
+
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+    let ignored = call(server.gateway(), 10, "git.status", json!({ "path": "." }));
+    assert_eq!(
+        ignored["result"]["structuredContent"]["entries"],
+        json!([]),
+        "{ignored}"
+    );
+
+    fs::write(&external, b"").unwrap();
+    let visible = call(server.gateway(), 11, "git.status", json!({ "path": "." }));
+    assert_eq!(
+        visible["result"]["structuredContent"]["entries"][0]["path"], "ignored.txt",
+        "{visible}"
+    );
+    let stats = server.stats().unwrap();
+    assert_eq!(stats.exact_hits, 0, "external Git inputs must never hit");
+}
+
+#[test]
+fn nested_git_state_executes_without_reuse() {
+    let workspace = TempDir::new().unwrap();
+    git(workspace.path(), &["init", "-q"]);
+    git(
+        workspace.path(),
+        &["config", "user.name", "Repository Tool Tests"],
+    );
+    git(
+        workspace.path(),
+        &["config", "user.email", "repository-tools@example.invalid"],
+    );
+
+    let nested = workspace.path().join("dep");
+    fs::create_dir(&nested).unwrap();
+    git(&nested, &["init", "-q"]);
+    git(&nested, &["config", "user.name", "Nested Tool Tests"]);
+    git(
+        &nested,
+        &["config", "user.email", "nested-tools@example.invalid"],
+    );
+    write(&nested, "file", "unchanged\n");
+    git(&nested, &["add", "file"]);
+    git(&nested, &["commit", "-q", "-m", "nested-one"]);
+
+    let modules = workspace.path().join(".git/modules");
+    fs::create_dir_all(&modules).unwrap();
+    fs::rename(nested.join(".git"), modules.join("dep")).unwrap();
+    write(&nested, ".git", "gitdir: ../.git/modules/dep\n");
+    git(workspace.path(), &["add", "dep"]);
+    git(workspace.path(), &["commit", "-q", "-m", "parent"]);
+
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+    let clean = call(server.gateway(), 20, "git.status", json!({ "path": "." }));
+    assert_eq!(
+        clean["result"]["structuredContent"]["entries"],
+        json!([]),
+        "{clean}"
+    );
+
+    git(
+        &nested,
+        &["commit", "-q", "--allow-empty", "-m", "nested-two"],
+    );
+    let changed = call(server.gateway(), 21, "git.status", json!({ "path": "." }));
+    assert_eq!(
+        changed["result"]["structuredContent"]["entries"][0]["path"], "dep",
+        "{changed}"
+    );
+    let stats = server.stats().unwrap();
+    assert_eq!(stats.exact_hits, 0, "nested Git state must never hit");
+}
+
+#[test]
+fn repository_configured_filters_never_execute() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "input.txt", "one\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(
+        workspace.path(),
+        &["config", "user.name", "Repository Tool Tests"],
+    );
+    git(
+        workspace.path(),
+        &["config", "user.email", "repository-tools@example.invalid"],
+    );
+    git(workspace.path(), &["add", "input.txt"]);
+    git(workspace.path(), &["commit", "-q", "-m", "initial"]);
+
+    let marker_root = TempDir::new().unwrap();
+    let marker = marker_root.path().join("filter-ran");
+    let command = format!("touch '{}'", marker.display());
+    git(workspace.path(), &["config", "filter.evil.clean", &command]);
+    write(workspace.path(), ".gitattributes", "*.txt filter=evil\n");
+    write(workspace.path(), "input.txt", "two\n");
+
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+    let response = call(server.gateway(), 30, "git.diff", json!({ "path": "." }));
+    assert!(response.get("error").is_some(), "{response}");
+    assert!(
+        !marker.exists(),
+        "the sanitized read-only Git provider executed a configured filter"
+    );
+}
+
+#[test]
+fn externally_configured_git_worktree_is_refused() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "tracked", "tracked\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(
+        workspace.path(),
+        &["config", "user.name", "Repository Tool Tests"],
+    );
+    git(
+        workspace.path(),
+        &["config", "user.email", "repository-tools@example.invalid"],
+    );
+    git(workspace.path(), &["add", "tracked"]);
+    git(workspace.path(), &["commit", "-q", "-m", "initial"]);
+
+    let external = TempDir::new().unwrap();
+    write(external.path(), "outside", "must not be observed\n");
+    git(
+        workspace.path(),
+        &["config", "core.worktree", external.path().to_str().unwrap()],
+    );
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+    let response = call(server.gateway(), 40, "git.status", json!({ "path": "." }));
+    assert!(response.get("error").is_some(), "{response}");
+    assert!(
+        !response.to_string().contains("outside"),
+        "external worktree content leaked into the response: {response}"
+    );
 }

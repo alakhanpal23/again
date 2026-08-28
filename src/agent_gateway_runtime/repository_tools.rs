@@ -231,6 +231,7 @@ pub(super) fn observation_plan_v1(
     if operation == RepositoryOperationV1::GitStatus {
         let relative = argument_path_v1(arguments, true)?;
         require_directory_v1(epoch, &relative)?;
+        refuse_nested_git_control_v1(epoch, &relative)?;
         return Ok(
             RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![])
                 .with_source_trees(vec![relative]),
@@ -256,6 +257,7 @@ pub(super) fn observation_plan_v1(
                 RepositoryObservationPlanV1::new(vec![relative], vec![], vec![], vec![])
             }
             RepositoryNodeKindV1::Directory => {
+                refuse_nested_git_control_v1(epoch, &relative)?;
                 RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![])
                     .with_source_trees(vec![relative])
             }
@@ -1109,6 +1111,9 @@ fn run_git_v1(
     maximum_stdout_bytes: usize,
 ) -> Result<Vec<u8>, ProviderError> {
     epoch
+        .validate_git_execution_safety(&gateway_workspace_limits_v1())
+        .map_err(|_| provider_io_v1("Git configuration is not safe for read-only execution"))?;
+    epoch
         .validate_current()
         .map_err(|_| provider_io_v1("workspace changed before Git execution"))?;
     let mut command = Command::new("/usr/bin/git");
@@ -1130,6 +1135,10 @@ fn run_git_v1(
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "status.showStash=false",
+            "-c",
+            "log.showSignature=false",
         ])
         .args(arguments)
         .stdin(Stdio::null())
@@ -1314,6 +1323,19 @@ fn source_files_v1(
         }
     }
     Ok(files)
+}
+
+fn refuse_nested_git_control_v1(epoch: &WorkspaceExecutionEpochV1, relative: &Path) -> Result<()> {
+    let files = source_files_v1(epoch, relative)
+        .map_err(|_| anyhow!("nested Git control inspection is incomplete"))?;
+    if files.iter().any(|file| {
+        file.relative_path()
+            .components()
+            .any(|component| matches!(component, Component::Normal(name) if name == ".git"))
+    }) {
+        bail!("nested Git worktrees or submodules are not admitted for reusable Git queries");
+    }
+    Ok(())
 }
 
 fn read_file_v1(

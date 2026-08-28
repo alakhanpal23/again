@@ -1110,6 +1110,15 @@ impl WorkspaceExecutionEpochV1 {
     pub(crate) fn validate_current(&self) -> AuthorityResult<()> {
         self.verify_current_path()
     }
+
+    pub(crate) fn validate_git_execution_safety(
+        &self,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<()> {
+        validate_limits(limits)?;
+        let _ = observe_git_state_inner(&self.canonical_workspace, limits, false)?;
+        self.verify_current_path()
+    }
 }
 
 fn openat_no_follow(
@@ -2789,6 +2798,14 @@ fn observe_git_state(
     workspace: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
 ) -> AuthorityResult<RepositoryGitStateV1> {
+    observe_git_state_inner(workspace, limits, true)
+}
+
+fn observe_git_state_inner(
+    workspace: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    reject_external_dependencies: bool,
+) -> AuthorityResult<RepositoryGitStateV1> {
     let Some((worktree_root, dot_git, dot_git_kind)) = find_git_marker(workspace)? else {
         return Ok(RepositoryGitStateV1::NotGitRepository);
     };
@@ -2881,7 +2898,12 @@ fn observe_git_state(
         }
         None => None,
     };
-    let control_digest = observe_git_control_digest(&git_directory, &common_directory, limits)?;
+    let control_digest = observe_git_control_digest(
+        &git_directory,
+        &common_directory,
+        limits,
+        reject_external_dependencies,
+    )?;
 
     Ok(RepositoryGitStateV1::Git {
         worktree_root,
@@ -2898,6 +2920,7 @@ fn observe_git_control_digest(
     git_directory: &Path,
     common_directory: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
+    reject_external_dependencies: bool,
 ) -> AuthorityResult<StateDigestV1> {
     for path in [
         common_directory.join("objects/info/alternates"),
@@ -2949,6 +2972,24 @@ fn observe_git_control_digest(
                 encoder.u8(1);
                 let bytes =
                     read_bounded_stable_file(&path, maximum, StateDimensionV1::RepositoryGit)?;
+                if matches!(label, "worktree-config" | "common-config") {
+                    if git_config_may_execute_command_v1(&bytes) {
+                        return Err(IncompleteToolStateV1::single(
+                            IncompleteReasonCodeV1::UnknownRelevantState,
+                            StateDimensionV1::RepositoryGit,
+                            Some(path),
+                            "reject executable Git configuration",
+                        ));
+                    }
+                    if reject_external_dependencies && git_config_uses_external_file_v1(&bytes) {
+                        return Err(IncompleteToolStateV1::single(
+                            IncompleteReasonCodeV1::UnknownRelevantState,
+                            StateDimensionV1::RepositoryGit,
+                            Some(path),
+                            "reject external Git configuration dependency",
+                        ));
+                    }
+                }
                 encoder.bytes(&bytes);
             }
             Some(SecureNodeKindV1::Directory) => {
@@ -3119,6 +3160,84 @@ fn git_config_enables_sparse(bytes: &[u8]) -> bool {
         let value = value.trim().to_ascii_lowercase();
         if matches!(key.as_str(), "sparsecheckout" | "sparseindex")
             && matches!(value.as_str(), "true" | "yes" | "on" | "1")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true when repository-local configuration can make a read-only Git
+/// query consume an unobserved file. The gateway deliberately has no external
+/// filesystem authority, so includes and global ignore/attribute files must be
+/// refused rather than treated as reusable repository state.
+fn git_config_uses_external_file_v1(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut section = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']').map(|(header, _)| header))
+        {
+            section = header
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "include" | "includeif") {
+                return true;
+            }
+            continue;
+        }
+        let key = line
+            .split_once('=')
+            .map_or(line, |(key, _)| key)
+            .trim()
+            .to_ascii_lowercase();
+        if (section == "core"
+            && matches!(key.as_str(), "excludesfile" | "attributesfile" | "worktree"))
+            || (section == "diff" && key == "orderfile")
+            || (section == "blame" && key == "ignorerevsfile")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn git_config_may_execute_command_v1(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut section = String::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(header) = line
+            .strip_prefix('[')
+            .and_then(|value| value.split_once(']').map(|(header, _)| header))
+        {
+            section = header
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if matches!(section.as_str(), "include" | "includeif" | "filter") {
+                return true;
+            }
+            continue;
+        }
+        let key = line
+            .split_once('=')
+            .map_or(line, |(key, _)| key)
+            .trim()
+            .to_ascii_lowercase();
+        if (section == "diff" && matches!(key.as_str(), "command" | "external" | "textconv"))
+            || (section == "core" && matches!(key.as_str(), "alternaterefscommand" | "worktree"))
         {
             return true;
         }
