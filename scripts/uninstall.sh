@@ -59,29 +59,62 @@ backup_restored=0
 committed=0
 had_backup=0
 
+retry_remove_file() {
+    retry_path=$1
+    retry_description=$2
+    if ! rm -f "$retry_path" && ! rm -f "$retry_path"; then
+        echo "warning: could not $retry_description: $retry_path" >&2
+        return 1
+    fi
+}
+
+retry_move() {
+    retry_source=$1
+    retry_destination=$2
+    retry_description=$3
+    if ! mv "$retry_source" "$retry_destination" && \
+        ! mv "$retry_source" "$retry_destination"; then
+        echo "warning: could not $retry_description" >&2
+        return 1
+    fi
+}
+
+release_owned_lock() {
+    if [ ! -d "$lock" ]; then
+        lock_held=0
+        return 0
+    fi
+    if rmdir "$lock" 2>/dev/null || rmdir "$lock" 2>/dev/null; then
+        lock_held=0
+        return 0
+    fi
+    echo "warning: could not remove install lock; inspect and remove it manually: $lock" >&2
+    return 1
+}
+
 rollback() {
     status=$1
     trap '' HUP INT TERM
     trap - EXIT
     if [ "$status" -ne 0 ] && [ "$committed" -eq 0 ]; then
         if [ ! -e "$metadata" ] && [ -n "$marker_tmp" ] && [ -e "$marker_tmp" ]; then
-            mv "$marker_tmp" "$metadata"
+            retry_move "$marker_tmp" "$metadata" \
+                "restore the install marker" || :
         fi
         if [ "$had_backup" -eq 1 ] && [ -n "$removed_tmp" ] && [ -e "$removed_tmp" ] \
             && { [ -e "$destination" ] || [ -L "$destination" ]; } \
             && { [ ! -e "$backup" ] && [ ! -L "$backup" ]; }; then
-            mv "$destination" "$backup"
+            retry_move "$destination" "$backup" \
+                "restore the managed backup" || :
         fi
         if [ -n "$removed_tmp" ] && [ -e "$removed_tmp" ] \
             && { [ ! -e "$destination" ] && [ ! -L "$destination" ]; }; then
-            mv "$removed_tmp" "$destination"
+            retry_move "$removed_tmp" "$destination" \
+                "restore the managed binary" || :
         fi
     fi
     if [ "$lock_held" -eq 1 ]; then
-        if [ -d "$lock" ] && ! rmdir "$lock" 2>/dev/null; then
-            echo "warning: could not remove install lock; inspect and remove it manually: $lock" >&2
-        fi
-        lock_held=0
+        release_owned_lock || :
     fi
     exit "$status"
 }
@@ -181,11 +214,15 @@ if [ -e "$backup" ] || [ -L "$backup" ]; then
     backup_restored=1
 fi
 mv "$metadata" "$marker_tmp"
+# The staged paths still permit rollback until all three renames complete.
+# Publish the commit decision with catchable signals ignored so no signal can
+# report failure after the old state has become intentionally unreachable.
+trap '' HUP INT TERM
 committed=1
 
-rm -f "$removed_tmp" "$marker_tmp"
-rmdir "$lock"
-lock_held=0
+retry_remove_file "$removed_tmp" "remove the staged managed binary" || :
+retry_remove_file "$marker_tmp" "remove the staged install marker" || :
+release_owned_lock || :
 trap - EXIT HUP INT TERM
 if [ "$backup_restored" -eq 1 ]; then
     echo "Restored the previous file at $destination"

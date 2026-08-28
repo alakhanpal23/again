@@ -151,6 +151,58 @@ prepared_binary=0
 prepared_metadata=0
 committed=0
 
+retry_remove_file() {
+    retry_path=$1
+    retry_description=$2
+    if ! rm -f "$retry_path" && ! rm -f "$retry_path"; then
+        echo "warning: could not $retry_description: $retry_path" >&2
+        return 1
+    fi
+}
+
+retry_remove_tree() {
+    retry_path=$1
+    if ! rm -rf "$retry_path" && ! rm -rf "$retry_path"; then
+        echo "warning: could not remove installer temporary directory: $retry_path" >&2
+        return 1
+    fi
+}
+
+retry_copy() {
+    retry_source=$1
+    retry_destination=$2
+    retry_description=$3
+    if ! cp -p "$retry_source" "$retry_destination" && \
+        ! cp -p "$retry_source" "$retry_destination"; then
+        echo "warning: could not $retry_description" >&2
+        return 1
+    fi
+}
+
+retry_move() {
+    retry_source=$1
+    retry_destination=$2
+    retry_description=$3
+    if ! mv "$retry_source" "$retry_destination" && \
+        ! mv "$retry_source" "$retry_destination"; then
+        echo "warning: could not $retry_description" >&2
+        return 1
+    fi
+}
+
+release_owned_lock() {
+    if [ ! -d "$lock" ]; then
+        lock_held=0
+        return 0
+    fi
+    if rmdir "$lock" 2>/dev/null || rmdir "$lock" 2>/dev/null; then
+        lock_held=0
+        return 0
+    fi
+    echo "warning: could not remove install lock; inspect and remove it manually: $lock" >&2
+    return 1
+}
+
 cleanup() {
     status=$1
     trap '' HUP INT TERM
@@ -165,30 +217,33 @@ cleanup() {
             metadata_was_replaced=1
         fi
         if [ "$binary_was_replaced" -eq 1 ]; then
-            rm -f "$destination"
+            retry_remove_file "$destination" "remove the uncommitted binary" || :
             if [ "$managed_upgrade" -eq 1 ] && [ -f "$tmp/managed-binary" ]; then
-                cp -p "$tmp/managed-binary" "$destination"
+                retry_copy "$tmp/managed-binary" "$destination" \
+                    "restore the previous managed binary" || :
             elif [ "$moved_backup" -eq 1 ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
-                mv "$backup" "$destination"
+                retry_move "$backup" "$destination" \
+                    "restore the original destination" || :
             fi
         elif [ "$moved_backup" -eq 1 ] && { [ -e "$backup" ] || [ -L "$backup" ]; }; then
-            mv "$backup" "$destination"
+            retry_move "$backup" "$destination" \
+                "restore the original destination" || :
         fi
         if [ "$metadata_was_replaced" -eq 1 ]; then
-            rm -f "$metadata"
+            retry_remove_file "$metadata" "remove the uncommitted install marker" || :
             if [ "$managed_upgrade" -eq 1 ] && [ -f "$tmp/managed-metadata" ]; then
-                cp -p "$tmp/managed-metadata" "$metadata"
+                retry_copy "$tmp/managed-metadata" "$metadata" \
+                    "restore the previous install marker" || :
             fi
         fi
     fi
-    [ -z "$installed_tmp" ] || rm -f "$installed_tmp"
-    [ -z "$metadata_tmp" ] || rm -f "$metadata_tmp"
-    rm -rf "$tmp"
+    [ -z "$installed_tmp" ] || \
+        retry_remove_file "$installed_tmp" "remove the prepared binary" || :
+    [ -z "$metadata_tmp" ] || \
+        retry_remove_file "$metadata_tmp" "remove the prepared marker" || :
+    retry_remove_tree "$tmp" || :
     if [ "$lock_held" -eq 1 ]; then
-        if [ -d "$lock" ] && ! rmdir "$lock" 2>/dev/null; then
-            echo "warning: could not remove install lock; inspect and remove it manually: $lock" >&2
-        fi
-        lock_held=0
+        release_owned_lock || :
     fi
     exit "$status"
 }
@@ -479,10 +534,13 @@ fi
 
 mv "$installed_tmp" "$destination"
 mv "$metadata_tmp" "$metadata"
+# Both destination records are now consistent. Ignore catchable termination
+# during the few shell-builtins that publish the commit decision; a signal
+# delivered by either rename is still handled by rollback before this point.
+trap '' HUP INT TERM
 committed=1
 
-rm -rf "$tmp"
-rmdir "$lock"
-lock_held=0
+retry_remove_tree "$tmp" || :
+release_owned_lock || :
 trap - EXIT HUP INT TERM
 echo "Installed Again $version ($target) at $destination"
