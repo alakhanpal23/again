@@ -1103,6 +1103,10 @@ impl WorkspaceExecutionEpochV1 {
         }
         Ok(())
     }
+
+    pub(crate) fn validate_current(&self) -> AuthorityResult<()> {
+        self.verify_current_path()
+    }
 }
 
 fn openat_no_follow(

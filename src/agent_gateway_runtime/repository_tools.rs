@@ -1,7 +1,10 @@
 //! Closed, bounded implementations for the built-in read-only repository tools.
 
 use std::collections::BTreeSet;
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, bail};
@@ -23,6 +26,7 @@ const MAX_PATTERN_BYTES_V1: usize = 4 * 1024;
 const MAX_GLOB_BYTES_V1: usize = 512;
 const MAX_TREE_DEPTH_V1: usize = 128;
 const MAX_EXECUTION_TIME_V1: Duration = Duration::from_secs(5);
+const MAX_GIT_STDERR_BYTES_V1: usize = 64 * 1024;
 const MANIFEST_NAMES_V1: [&str; 6] = [
     "Cargo.toml",
     "go.mod",
@@ -122,6 +126,69 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
     ]
 }
 
+pub(super) fn git_tool_definitions_v1() -> Vec<ProviderTool> {
+    vec![
+        tool(
+            "status",
+            json!({
+                "type": "object",
+                "properties": { "path": bounded_path_schema(), "maxResults": result_limit_schema() },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "diff",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": bounded_path_schema(),
+                    "staged": { "type": "boolean", "default": false },
+                    "revision": { "type": "string", "enum": ["HEAD"] },
+                    "contextLines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 3 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "log",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": bounded_path_schema(),
+                    "revision": { "type": "string", "enum": ["HEAD"], "default": "HEAD" },
+                    "maxResults": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "show",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": bounded_path_schema(),
+                    "revision": { "type": "string", "enum": ["HEAD"], "default": "HEAD" }
+                },
+                "additionalProperties": false
+            }),
+        ),
+        tool(
+            "blame",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": bounded_path_schema(),
+                    "revision": { "type": "string", "enum": ["HEAD", "WORKTREE"], "default": "WORKTREE" },
+                    "startLine": { "type": "integer", "minimum": 1, "maximum": 10000000 },
+                    "endLine": { "type": "integer", "minimum": 1, "maximum": 10000000 }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        ),
+    ]
+}
+
 fn tool(name: &str, schema: Value) -> ProviderTool {
     let mut tool = ProviderTool::new(name, schema);
     tool.description = Some(format!(
@@ -143,6 +210,61 @@ pub(super) fn observation_plan_v1(
     arguments: &Value,
     operation: RepositoryOperationV1,
 ) -> Result<RepositoryObservationPlanV1> {
+    if matches!(
+        operation,
+        RepositoryOperationV1::GitLog | RepositoryOperationV1::GitShow
+    ) {
+        if let Some(path) = arguments
+            .as_object()
+            .and_then(|object| object.get("path"))
+            .and_then(Value::as_str)
+        {
+            let _ = argument_path_v1(&json!({ "path": path }), false)?;
+        }
+        return Ok(RepositoryObservationPlanV1::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+    }
+    if operation == RepositoryOperationV1::GitStatus {
+        let relative = argument_path_v1(arguments, true)?;
+        require_directory_v1(epoch, &relative)?;
+        return Ok(
+            RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![])
+                .with_source_trees(vec![relative]),
+        );
+    }
+    if operation == RepositoryOperationV1::GitBlame {
+        let relative = argument_path_v1(arguments, false)?;
+        require_regular_v1(epoch, &relative)?;
+        return Ok(RepositoryObservationPlanV1::new(
+            vec![relative],
+            vec![],
+            vec![],
+            vec![],
+        ));
+    }
+    if operation == RepositoryOperationV1::GitDiff {
+        let relative = argument_path_v1(arguments, true)?;
+        let plan = match epoch
+            .classify_relative(&relative)
+            .map_err(|_| anyhow!("Git diff path classification is incomplete"))?
+        {
+            RepositoryNodeKindV1::Regular => {
+                RepositoryObservationPlanV1::new(vec![relative], vec![], vec![], vec![])
+            }
+            RepositoryNodeKindV1::Directory => {
+                RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![])
+                    .with_source_trees(vec![relative])
+            }
+            RepositoryNodeKindV1::Missing => {
+                RepositoryObservationPlanV1::new(vec![], vec![], vec![], vec![relative])
+            }
+        };
+        return Ok(plan);
+    }
     if operation == RepositoryOperationV1::Manifest {
         let base = argument_path_v1(arguments, true)?;
         require_directory_v1(epoch, &base)?;
@@ -634,6 +756,515 @@ fn repository_manifest_v1(
         rendered,
         json!({ "schemaVersion": 1, "path": path_text_v1(&base), "manifests": manifests }),
     ))
+}
+
+pub(super) fn execute_git_tool_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    tool_name: &str,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    match tool_name {
+        "status" => git_status_v1(epoch, arguments),
+        "diff" => git_diff_v1(epoch, arguments),
+        "log" => git_log_v1(epoch, arguments),
+        "show" => git_show_v1(epoch, arguments),
+        "blame" => git_blame_v1(epoch, arguments),
+        _ => Err(ProviderError(McpError::typed(
+            McpErrorCode::MethodNotFound,
+            "unknown Git tool",
+        ))),
+    }
+}
+
+fn git_status_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    let object = object_v1(arguments)?;
+    let maximum = max_results_v1(object)?;
+    let path = argument_path_v1(arguments, true).map_err(invalid_arguments_v1)?;
+    let path_text = path_text_v1(&path);
+    let args = vec![
+        "status".to_owned(),
+        "--porcelain=v2".to_owned(),
+        "-z".to_owned(),
+        "--untracked-files=all".to_owned(),
+        "--".to_owned(),
+        path_text.clone(),
+    ];
+    let bytes = run_git_v1(epoch, &args, MAX_OUTPUT_BYTES_V1)?;
+    let fields = split_nul_v1(&bytes)?;
+    let mut entries = Vec::new();
+    let mut index = 0;
+    while index < fields.len() {
+        let record = fields[index];
+        if record.is_empty() {
+            index += 1;
+            continue;
+        }
+        let text = std::str::from_utf8(record)
+            .map_err(|_| provider_io_v1("Git status emitted a non-UTF-8 path"))?;
+        let mut entry = if let Some(path) = text.strip_prefix("? ") {
+            json!({ "kind": "untracked", "status": "??", "path": path })
+        } else if let Some(path) = text.strip_prefix("! ") {
+            json!({ "kind": "ignored", "status": "!!", "path": path })
+        } else {
+            let kind = text.split(' ').next().unwrap_or_default();
+            let maximum_fields = match kind {
+                "1" => 9,
+                "2" => 10,
+                "u" => 11,
+                _ => 0,
+            };
+            let fields = text.splitn(maximum_fields, ' ').collect::<Vec<_>>();
+            let status = fields.get(1).copied().unwrap_or_default();
+            let path = fields.last().copied().unwrap_or_default();
+            if path.is_empty() || !matches!(kind, "1" | "2" | "u") {
+                return Err(provider_io_v1("Git status record is malformed"));
+            }
+            json!({ "kind": kind, "status": status, "path": path })
+        };
+        if text.starts_with("2 ") {
+            index += 1;
+            let original = fields
+                .get(index)
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .ok_or_else(|| provider_io_v1("Git rename status record is malformed"))?;
+            entry["originalPath"] = Value::String(original.to_owned());
+        }
+        entries.push(entry);
+        if entries.len() > maximum {
+            return Err(limit_error_v1("Git status result bound exceeded"));
+        }
+        index += 1;
+    }
+    entries.sort_by(|left, right| {
+        left["path"]
+            .as_str()
+            .cmp(&right["path"].as_str())
+            .then_with(|| left["status"].as_str().cmp(&right["status"].as_str()))
+    });
+    let rendered = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}\t{}",
+                entry["status"].as_str().unwrap_or_default(),
+                entry["path"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(tool_result_v1(
+        rendered,
+        json!({ "schemaVersion": 1, "path": path_text, "entries": entries }),
+    ))
+}
+
+fn git_diff_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    let object = object_v1(arguments)?;
+    let path = argument_path_v1(arguments, true).map_err(invalid_arguments_v1)?;
+    let staged = object
+        .get("staged")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let revision = optional_head_revision_v1(object)?;
+    let context = object
+        .get("contextLines")
+        .and_then(Value::as_u64)
+        .unwrap_or(3);
+    if context > 20 {
+        return Err(invalid_arguments_v1(
+            "contextLines is outside the admitted range",
+        ));
+    }
+    let mut args = vec![
+        "diff".to_owned(),
+        "--no-ext-diff".to_owned(),
+        "--no-textconv".to_owned(),
+        "--no-color".to_owned(),
+        format!("--unified={context}"),
+    ];
+    if staged {
+        args.push("--cached".to_owned());
+    }
+    if let Some(revision) = revision {
+        args.push(revision.to_owned());
+    }
+    args.push("--".to_owned());
+    args.push(path_text_v1(&path));
+    let bytes = run_git_v1(epoch, &args, MAX_OUTPUT_BYTES_V1)?;
+    let patch = String::from_utf8(bytes)
+        .map_err(|_| provider_io_v1("Git diff emitted non-UTF-8 output"))?;
+    Ok(tool_result_v1(
+        patch.clone(),
+        json!({
+            "schemaVersion": 1,
+            "path": path_text_v1(&path),
+            "staged": staged,
+            "revision": revision,
+            "bytes": patch.len(),
+            "patch": patch
+        }),
+    ))
+}
+
+fn git_log_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    let object = object_v1(arguments)?;
+    let revision = head_revision_v1(object)?;
+    let maximum = object
+        .get("maxResults")
+        .and_then(Value::as_u64)
+        .unwrap_or(50);
+    let maximum = usize::try_from(maximum)
+        .ok()
+        .filter(|value| (1..=200).contains(value))
+        .ok_or_else(|| invalid_arguments_v1("maxResults is outside the Git log bound"))?;
+    let mut args = vec![
+        "log".to_owned(),
+        revision.to_owned(),
+        format!("--max-count={maximum}"),
+        "-z".to_owned(),
+        "--date=iso-strict".to_owned(),
+        "--format=%H%x00%P%x00%an%x00%ae%x00%aI%x00%s".to_owned(),
+    ];
+    let path = optional_path_v1(arguments)?;
+    if let Some(path) = &path {
+        args.push("--".to_owned());
+        args.push(path_text_v1(path));
+    }
+    let bytes = run_git_v1(epoch, &args, MAX_OUTPUT_BYTES_V1)?;
+    let fields = split_nul_v1(&bytes)?;
+    let mut commits = Vec::new();
+    for chunk in fields.chunks(6) {
+        if chunk.iter().all(|field| field.is_empty()) {
+            continue;
+        }
+        if chunk.len() != 6 {
+            return Err(provider_io_v1("Git log record is malformed"));
+        }
+        let text = chunk
+            .iter()
+            .map(|field| std::str::from_utf8(field))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| provider_io_v1("Git log emitted non-UTF-8 metadata"))?;
+        commits.push(json!({
+            "commit": text[0],
+            "parents": text[1].split_ascii_whitespace().collect::<Vec<_>>(),
+            "authorName": text[2],
+            "authorEmail": text[3],
+            "authorDate": text[4],
+            "subject": text[5]
+        }));
+    }
+    let rendered = commits
+        .iter()
+        .map(|commit| {
+            format!(
+                "{}\t{}",
+                commit["commit"].as_str().unwrap_or_default(),
+                commit["subject"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(tool_result_v1(
+        rendered,
+        json!({ "schemaVersion": 1, "revision": revision, "path": path.as_deref().map(path_text_v1), "commits": commits }),
+    ))
+}
+
+fn git_show_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    let object = object_v1(arguments)?;
+    let revision = head_revision_v1(object)?;
+    let path = optional_path_v1(arguments)?;
+    let mut args = vec!["show".to_owned()];
+    if let Some(path) = &path {
+        args.push(format!("{revision}:{}", path_text_v1(path)));
+    } else {
+        args.extend([
+            "--no-ext-diff".to_owned(),
+            "--no-textconv".to_owned(),
+            "--no-color".to_owned(),
+            "--format=fuller".to_owned(),
+            revision.to_owned(),
+        ]);
+    }
+    let bytes = run_git_v1(epoch, &args, MAX_OUTPUT_BYTES_V1)?;
+    let output = String::from_utf8(bytes)
+        .map_err(|_| provider_io_v1("Git show emitted non-UTF-8 output"))?;
+    Ok(tool_result_v1(
+        output.clone(),
+        json!({
+            "schemaVersion": 1,
+            "revision": revision,
+            "path": path.as_deref().map(path_text_v1),
+            "bytes": output.len(),
+            "output": output
+        }),
+    ))
+}
+
+fn git_blame_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &Value,
+) -> Result<Value, ProviderError> {
+    let object = object_v1(arguments)?;
+    let path = argument_path_v1(arguments, false).map_err(invalid_arguments_v1)?;
+    require_regular_v1(epoch, &path).map_err(invalid_arguments_v1)?;
+    let revision = object
+        .get("revision")
+        .and_then(Value::as_str)
+        .unwrap_or("WORKTREE");
+    if !matches!(revision, "HEAD" | "WORKTREE") {
+        return Err(invalid_arguments_v1("revision must be HEAD or WORKTREE"));
+    }
+    let start = optional_line_v1(object, "startLine")?;
+    let end = optional_line_v1(object, "endLine")?;
+    if let (Some(start), Some(end)) = (start, end)
+        && start > end
+    {
+        return Err(invalid_arguments_v1("startLine must not exceed endLine"));
+    }
+    let mut args = vec!["blame".to_owned(), "--line-porcelain".to_owned()];
+    if start.is_some() || end.is_some() {
+        args.push(format!(
+            "-L{},{}",
+            start.unwrap_or(1),
+            end.map_or_else(String::new, |value| value.to_string())
+        ));
+    }
+    if revision == "HEAD" {
+        args.push("HEAD".to_owned());
+    }
+    args.push("--".to_owned());
+    args.push(path_text_v1(&path));
+    let bytes = run_git_v1(epoch, &args, MAX_OUTPUT_BYTES_V1)?;
+    let output = String::from_utf8(bytes)
+        .map_err(|_| provider_io_v1("Git blame emitted non-UTF-8 output"))?;
+    let mut lines = Vec::new();
+    let mut pending: Option<(String, u64, u64)> = None;
+    for line in output.lines() {
+        if let Some(text) = line.strip_prefix('\t') {
+            let (commit, original_line, final_line) = pending
+                .take()
+                .ok_or_else(|| provider_io_v1("Git blame source line lacks a header"))?;
+            lines.push(json!({
+                "path": path_text_v1(&path),
+                "line": final_line,
+                "originalLine": original_line,
+                "commit": commit,
+                "text": text
+            }));
+            continue;
+        }
+        let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 3
+            && matches!(fields[0].len(), 40 | 64)
+            && fields[0].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            let original_line = fields[1]
+                .parse::<u64>()
+                .map_err(|_| provider_io_v1("Git blame original line is malformed"))?;
+            let final_line = fields[2]
+                .parse::<u64>()
+                .map_err(|_| provider_io_v1("Git blame final line is malformed"))?;
+            pending = Some((fields[0].to_owned(), original_line, final_line));
+        }
+    }
+    let rendered = lines
+        .iter()
+        .map(|line| {
+            format!(
+                "{}:{}:{}:{}",
+                line["path"].as_str().unwrap_or_default(),
+                line["line"],
+                line["commit"].as_str().unwrap_or_default(),
+                line["text"].as_str().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(tool_result_v1(
+        rendered,
+        json!({ "schemaVersion": 1, "revision": revision, "path": path_text_v1(&path), "lines": lines }),
+    ))
+}
+
+fn run_git_v1(
+    epoch: &WorkspaceExecutionEpochV1,
+    arguments: &[String],
+    maximum_stdout_bytes: usize,
+) -> Result<Vec<u8>, ProviderError> {
+    epoch
+        .validate_current()
+        .map_err(|_| provider_io_v1("workspace changed before Git execution"))?;
+    let mut command = Command::new("/usr/bin/git");
+    command
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .current_dir(epoch.canonical_workspace())
+        .args([
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|_| provider_io_v1("start sanitized Git process failed"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| provider_io_v1("capture Git stdout failed"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| provider_io_v1("capture Git stderr failed"))?;
+    let stdout_reader = thread::spawn(move || read_bounded_pipe_v1(stdout, maximum_stdout_bytes));
+    let stderr_reader =
+        thread::spawn(move || read_bounded_pipe_v1(stderr, MAX_GIT_STDERR_BYTES_V1));
+    let deadline = Instant::now() + MAX_EXECUTION_TIME_V1;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(2)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(limit_error_v1("Git execution deadline exceeded"));
+            }
+            Err(_) => return Err(provider_io_v1("wait for Git process failed")),
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| provider_io_v1("Git stdout reader failed"))?
+        .map_err(|_| provider_io_v1("read Git stdout failed"))?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| provider_io_v1("Git stderr reader failed"))?
+        .map_err(|_| provider_io_v1("read Git stderr failed"))?;
+    if stdout.overflow || stderr.overflow {
+        return Err(limit_error_v1("Git output bound exceeded"));
+    }
+    if !status.success() {
+        let _ = stderr.bytes;
+        return Err(provider_io_v1("read-only Git command failed"));
+    }
+    epoch
+        .validate_current()
+        .map_err(|_| provider_io_v1("workspace changed during Git execution"))?;
+    Ok(stdout.bytes)
+}
+
+struct BoundedPipeV1 {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+fn read_bounded_pipe_v1(
+    mut reader: impl Read,
+    maximum_bytes: usize,
+) -> std::io::Result<BoundedPipeV1> {
+    let mut bytes = Vec::new();
+    let mut overflow = false;
+    let mut chunk = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        let remaining = maximum_bytes.saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..read.min(remaining)]);
+        overflow |= read > remaining;
+    }
+    Ok(BoundedPipeV1 { bytes, overflow })
+}
+
+fn split_nul_v1(bytes: &[u8]) -> Result<Vec<&[u8]>, ProviderError> {
+    if bytes.contains(&b'\n') && !bytes.contains(&0) {
+        return Err(provider_io_v1("Git record framing is malformed"));
+    }
+    let mut fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    while fields.last().is_some_and(|field| field.is_empty()) {
+        fields.pop();
+    }
+    Ok(fields)
+}
+
+fn optional_path_v1(arguments: &Value) -> Result<Option<PathBuf>, ProviderError> {
+    let object = object_v1(arguments)?;
+    if object.get("path").is_none() {
+        Ok(None)
+    } else {
+        argument_path_v1(arguments, false)
+            .map(Some)
+            .map_err(invalid_arguments_v1)
+    }
+}
+
+fn head_revision_v1(object: &serde_json::Map<String, Value>) -> Result<&str, ProviderError> {
+    let revision = object
+        .get("revision")
+        .and_then(Value::as_str)
+        .unwrap_or("HEAD");
+    if revision == "HEAD" {
+        Ok(revision)
+    } else {
+        Err(invalid_arguments_v1(
+            "only the authority-bound HEAD revision is admitted",
+        ))
+    }
+}
+
+fn optional_head_revision_v1(
+    object: &serde_json::Map<String, Value>,
+) -> Result<Option<&str>, ProviderError> {
+    object.get("revision").map_or(Ok(None), |revision| {
+        revision
+            .as_str()
+            .filter(|revision| *revision == "HEAD")
+            .map(Some)
+            .ok_or_else(|| invalid_arguments_v1("only the HEAD revision is admitted"))
+    })
+}
+
+fn optional_line_v1(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<Option<u64>, ProviderError> {
+    object.get(field).map_or(Ok(None), |value| {
+        value
+            .as_u64()
+            .filter(|value| (1..=10_000_000).contains(value))
+            .map(Some)
+            .ok_or_else(|| invalid_arguments_v1("line bound is invalid"))
+    })
 }
 
 fn source_files_v1(

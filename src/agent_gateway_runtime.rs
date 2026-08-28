@@ -46,14 +46,16 @@ use crate::store::{
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
-    ExternalFreshnessV1, McpIdentityV1, RepositoryObservationKindV1, StateDigestV1,
-    StateDimensionV1, TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1,
+    ExternalFreshnessV1, McpIdentityV1, RepositoryGitStateV1, RepositoryObservationKindV1,
+    StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1,
     WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1, observe_environment_v1,
 };
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
 const REPOSITORY_PROVIDER_ID_V1: &str = "repo";
 const REPOSITORY_PROVIDER_IMPLEMENTATION_V1: &str = "again.repository-provider-v1";
+const GIT_PROVIDER_ID_V1: &str = "git";
+const GIT_PROVIDER_IMPLEMENTATION_V1: &str = "again.git-provider-v1";
 const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
@@ -83,6 +85,11 @@ enum RepositoryOperationV1 {
     Glob,
     References,
     Manifest,
+    GitStatus,
+    GitDiff,
+    GitLog,
+    GitShow,
+    GitBlame,
 }
 
 impl RepositoryOperationV1 {
@@ -93,17 +100,38 @@ impl RepositoryOperationV1 {
         {
             return None;
         }
-        match call.upstream_tool_name.as_str() {
-            "read" => Some(Self::Read),
-            "search" => Some(Self::Search),
-            "list" => Some(Self::List),
-            "tree" => Some(Self::Tree),
-            "stat" => Some(Self::Stat),
-            "glob" => Some(Self::Glob),
-            "references" => Some(Self::References),
-            "manifest" => Some(Self::Manifest),
+        match call.translation.namespaced_tool_name() {
+            "repo.read" => Some(Self::Read),
+            "repo.search" => Some(Self::Search),
+            "repo.list" => Some(Self::List),
+            "repo.tree" => Some(Self::Tree),
+            "repo.stat" => Some(Self::Stat),
+            "repo.glob" => Some(Self::Glob),
+            "repo.references" => Some(Self::References),
+            "repo.manifest" => Some(Self::Manifest),
+            "git.status" => Some(Self::GitStatus),
+            "git.diff" => Some(Self::GitDiff),
+            "git.log" => Some(Self::GitLog),
+            "git.show" => Some(Self::GitShow),
+            "git.blame" => Some(Self::GitBlame),
             _ => None,
         }
+    }
+
+    fn provider_boundary(self) -> (&'static str, &'static str) {
+        match self {
+            Self::GitStatus | Self::GitDiff | Self::GitLog | Self::GitShow | Self::GitBlame => {
+                (GIT_PROVIDER_ID_V1, GIT_PROVIDER_IMPLEMENTATION_V1)
+            }
+            _ => (
+                REPOSITORY_PROVIDER_ID_V1,
+                REPOSITORY_PROVIDER_IMPLEMENTATION_V1,
+            ),
+        }
+    }
+
+    fn is_git(self) -> bool {
+        self.provider_boundary().0 == GIT_PROVIDER_ID_V1
     }
 }
 
@@ -196,9 +224,8 @@ impl GatewayControlledProviderV1 {
     ) -> Option<ResolvedRequestV1> {
         let operation = RepositoryOperationV1::from_call(call)?;
         let descriptor = self.inner.descriptor();
-        if descriptor.id != REPOSITORY_PROVIDER_ID_V1
-            || descriptor.implementation != REPOSITORY_PROVIDER_IMPLEMENTATION_V1
-        {
+        let (provider_id, implementation) = operation.provider_boundary();
+        if descriptor.id != provider_id || descriptor.implementation != implementation {
             return None;
         }
         resolve_repository_request_v1(epoch, call, operation).ok()
@@ -789,6 +816,90 @@ impl ToolExecution for RepositoryProviderV1 {
     }
 }
 
+struct GitProviderV1 {
+    workspace: PathBuf,
+}
+
+impl GitProviderV1 {
+    fn new(workspace: &Path) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve Git MCP workspace")?;
+        if !workspace.is_dir() {
+            bail!("Git MCP workspace is not a directory");
+        }
+        Ok(Self { workspace })
+    }
+}
+
+impl RepositoryEpochProviderV1 for GitProviderV1 {
+    fn execute_with_epoch(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        _secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        repository_tools::execute_git_tool_v1(epoch, &call.upstream_tool_name, &call.arguments)
+    }
+}
+
+impl ToolDiscovery for GitProviderV1 {
+    fn descriptor(&self) -> ProviderDescriptor {
+        ProviderDescriptor {
+            id: GIT_PROVIDER_ID_V1.to_owned(),
+            implementation: GIT_PROVIDER_IMPLEMENTATION_V1.to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            endpoint_identity: "local-git-descriptor-bound".to_owned(),
+        }
+    }
+
+    fn discover_tools(&self) -> Result<Vec<ProviderTool>, ProviderError> {
+        Ok(repository_tools::git_tool_definitions_v1())
+    }
+}
+
+impl FreshnessMetadata for GitProviderV1 {
+    fn freshness(&self) -> Freshness {
+        Freshness {
+            revision: "descriptor-git-state-v1".to_owned(),
+            observed_at_unix_ms: None,
+        }
+    }
+}
+
+impl SideEffectClassification for GitProviderV1 {
+    fn classify_effect(&self, upstream_tool_name: &str) -> EffectClass {
+        match upstream_tool_name {
+            "status" | "diff" | "log" | "show" | "blame" => EffectClass::ReadOnly,
+            _ => EffectClass::Unknown,
+        }
+    }
+}
+
+impl StructuredResultCapture for GitProviderV1 {
+    fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
+        Ok(CapturedToolResult::exact(result))
+    }
+}
+
+impl ToolCancellation for GitProviderV1 {
+    fn cancel(&self, _cancellation: ProviderCancellation) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+impl ToolExecution for GitProviderV1 {
+    fn execute(
+        &self,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        let limits = gateway_workspace_limits_v1();
+        let epoch = WorkspaceExecutionEpochV1::begin(&self.workspace, &limits).map_err(|_| {
+            provider_io_v1(anyhow!("descriptor-retained Git workspace issuance failed"))
+        })?;
+        self.execute_with_epoch(&epoch, call, secrets)
+    }
+}
+
 /// Fully composed experimental MCP server. The returned gateway owns an exact
 /// repository provider and a coordinator-backed execution memory.
 pub struct ExperimentalMcpGatewayV1 {
@@ -823,14 +934,21 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
-        let provider = Arc::new(RepositoryProviderV1::new(&workspace)?);
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            provider,
+        let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
+        let repository_controlled: Arc<dyn UpstreamProvider> = Arc::new(
+            GatewayControlledProviderV1::new(repository, workspace.clone(), Arc::clone(&store)),
+        );
+        let git = Arc::new(GitProviderV1::new(&workspace)?);
+        let git_controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
+            git,
             workspace,
             Arc::clone(&store),
         ));
         let gateway = McpGateway::new(
-            vec![ProviderRegistration::trusted_annotations(controlled)],
+            vec![
+                ProviderRegistration::trusted_annotations(repository_controlled),
+                ProviderRegistration::trusted_annotations(git_controlled),
+            ],
             GatewayLimits::default(),
         )?
         .with_delivery_confirmation_sink(Arc::new(StoreDeliveryConfirmationSinkV1 {
@@ -875,6 +993,15 @@ fn resolve_repository_request_v1(
     let repository = execution_epoch
         .observe_repository(&observation_plan, &limits)
         .map_err(|_| anyhow!("repository state is incomplete"))?;
+    if operation.is_git()
+        && !matches!(
+            repository.git_state(),
+            RepositoryGitStateV1::Git { worktree_root, .. }
+                if worktree_root == repository.canonical_workspace()
+        )
+    {
+        bail!("Git tools require the exact workspace to be a Git worktree root");
+    }
 
     let exclusions = vec![
         (
@@ -1108,7 +1235,11 @@ fn canonical_json_bytes_v1(value: &Value) -> Vec<u8> {
 }
 
 fn path_text_v1(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    if path.as_os_str().is_empty() {
+        ".".to_owned()
+    } else {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
 fn now_millis_i64_v1() -> i64 {

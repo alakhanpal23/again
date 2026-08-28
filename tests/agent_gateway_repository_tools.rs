@@ -1,5 +1,6 @@
 use std::fs;
 use std::path::Path;
+use std::process::Command;
 
 use again::agent_gateway_runtime::ExperimentalMcpGatewayV1;
 use again::mcp_gateway::{
@@ -41,6 +42,27 @@ fn write(root: &Path, relative: &str, content: &str) {
     fs::write(path, content).unwrap();
 }
 
+fn git(root: &Path, arguments: &[&str]) -> String {
+    let output = Command::new("/usr/bin/git")
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args(["-c", "commit.gpgsign=false"])
+        .args(arguments)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {arguments:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
+}
+
 #[test]
 fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable() {
     let workspace = TempDir::new().unwrap();
@@ -56,6 +78,17 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
         "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
     );
     write(workspace.path(), "docs/notes.txt", "irrelevant\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(
+        workspace.path(),
+        &["config", "user.name", "Repository Tool Tests"],
+    );
+    git(
+        workspace.path(),
+        &["config", "user.email", "repository-tools@example.invalid"],
+    );
+    git(workspace.path(), &["add", "--all"]);
+    git(workspace.path(), &["commit", "-q", "-m", "initial"]);
 
     let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
     let initialize = process(
@@ -88,6 +121,11 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     assert_eq!(
         names,
         vec![
+            "git.blame",
+            "git.diff",
+            "git.log",
+            "git.show",
+            "git.status",
             "repo.glob",
             "repo.list",
             "repo.manifest",
@@ -186,6 +224,18 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
         "Cargo.toml"
     );
 
+    let clean_status = call(server.gateway(), 18, "git.status", json!({ "path": "." }));
+    assert_eq!(
+        clean_status["result"]["structuredContent"]["entries"],
+        json!([]),
+        "{clean_status}"
+    );
+    let log = call(server.gateway(), 19, "git.log", json!({ "maxResults": 10 }));
+    assert_eq!(
+        log["result"]["structuredContent"]["commits"][0]["subject"],
+        "initial"
+    );
+
     let negative = call(
         server.gateway(),
         20,
@@ -231,7 +281,113 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
         "src/new.rs"
     );
 
+    write(
+        workspace.path(),
+        "src/lib.rs",
+        "pub fn target() -> usize { 8 }\npub fn caller() { let _ = target(); }\n",
+    );
+    let dirty_status = call(server.gateway(), 24, "git.status", json!({ "path": "src" }));
+    let dirty_paths = dirty_status["result"]["structuredContent"]["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(dirty_paths, vec!["src/lib.rs", "src/new.rs"]);
+
+    let diff = call(
+        server.gateway(),
+        25,
+        "git.diff",
+        json!({ "path": "src/lib.rs" }),
+    );
+    assert!(
+        diff["result"]["structuredContent"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("usize { 8 }")
+    );
+    let warm_diff = call(
+        server.gateway(),
+        26,
+        "git.diff",
+        json!({ "path": "src/lib.rs" }),
+    );
+    assert_eq!(diff["result"], warm_diff["result"]);
+
+    let shown = call(
+        server.gateway(),
+        27,
+        "git.show",
+        json!({ "path": "src/lib.rs" }),
+    );
+    assert!(
+        shown["result"]["structuredContent"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("usize { 7 }")
+    );
+    let blame = call(
+        server.gateway(),
+        28,
+        "git.blame",
+        json!({ "path": "src/lib.rs", "startLine": 1, "endLine": 1 }),
+    );
+    assert_eq!(
+        blame["result"]["structuredContent"]["lines"][0]["path"],
+        "src/lib.rs"
+    );
+    assert_eq!(blame["result"]["structuredContent"]["lines"][0]["line"], 1);
+
+    let unstaged_index = call(
+        server.gateway(),
+        29,
+        "git.diff",
+        json!({ "path": "src/lib.rs", "staged": true, "revision": "HEAD" }),
+    );
+    assert_eq!(unstaged_index["result"]["structuredContent"]["patch"], "");
+    git(workspace.path(), &["add", "src/lib.rs"]);
+    let staged = call(
+        server.gateway(),
+        30,
+        "git.diff",
+        json!({ "path": "src/lib.rs", "staged": true, "revision": "HEAD" }),
+    );
+    assert!(
+        staged["result"]["structuredContent"]["patch"]
+            .as_str()
+            .unwrap()
+            .contains("usize { 8 }")
+    );
+
+    let staged_status = call(server.gateway(), 31, "git.status", json!({ "path": "src" }));
+    assert!(
+        staged_status["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/lib.rs")
+    );
+    git(workspace.path(), &["mv", "src/lib.rs", "src/moved.rs"]);
+    let renamed = call(server.gateway(), 32, "git.status", json!({ "path": "src" }));
+    assert!(
+        renamed["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/moved.rs")
+    );
+    fs::remove_file(workspace.path().join("src/empty.py")).unwrap();
+    let deleted = call(server.gateway(), 33, "git.status", json!({ "path": "src" }));
+    assert!(
+        deleted["result"]["structuredContent"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["path"] == "src/empty.py")
+    );
+
     let stats = server.stats().unwrap();
-    assert_eq!(stats.executed, 10);
-    assert_eq!(stats.exact_hits, 2);
+    assert_eq!(stats.executed, 21);
+    assert_eq!(stats.exact_hits, 3);
 }
