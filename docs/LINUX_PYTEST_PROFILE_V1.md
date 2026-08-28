@@ -518,12 +518,14 @@ twice-captured canonical absolute paths beneath a private branded
 `/.oldroot` descriptor with `openat2`
 `RESOLVE_BENEATH|RESOLVE_NO_MAGICLINKS|RESOLVE_NO_SYMLINKS`. It reauthenticates
 the named and selected roots, permits only the namespace-local mount-ID bytes
-of their commitments to change, closes the inherited descriptors, clones and
-attaches both roots, and authenticates both targets. It then closes the only
-old-root descriptor, detaches and removes `/.oldroot`, and revalidates the
-complete private layout and attached mounts before emitting the
-filesystem-ready frame. No path, descriptor, or release operation escapes
-that child-only continuation.
+of their commitments to change, and closes the inherited descriptors. Each
+published root is then revalidated at the last fallible source boundary before
+its own `open_tree`, recursively sealed, attached, and authenticated. A final
+pass authenticates both targets after both attachments exist. It then closes
+the only old-root descriptor, detaches and removes `/.oldroot`, and revalidates
+the complete private layout and attached mounts before emitting the
+filesystem-ready frame. No path, descriptor, or release operation escapes that
+child-only continuation.
 
 The parent may consume that exact filesystem-ready owner through one
 command-free supervisor handoff. It seizes the still-single-task child with the
@@ -534,6 +536,13 @@ supervisor-held owner. The owner can only cancel and terminally reap; it exposes
 no tracee identity, descriptor, resume, filter, release, command, or execution
 operation. Workload-filter installation and readback on this same held child
 are a later protocol phase.
+
+The separate fixed two-task supervisor diagnostic has an additional linear
+seize-to-release witness: its trace-all child remains blocked until checked
+`PTRACE_SEIZE` succeeds, and only that witness can release the child to install
+`SECCOMP_RET_TRACE`. Production issuer and cleanup permits have no test
+constructor. Portable planner tests use a private model helper and are not live
+Linux evidence.
 
 Inside the new root, child-local umask is set to `0` while it creates the fixed
 directories `/workspace` `0755`, `/tmp` `01777`, `/run` `0755`, `/home`

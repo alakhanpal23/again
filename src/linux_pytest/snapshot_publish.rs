@@ -132,6 +132,7 @@ pub(super) enum SnapshotChildRootRoleV1 {
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum SnapshotChildAttachOperationV1 {
+    RebindSource,
     ValidateSource,
     OpenTree,
     SetRecursiveAttributes,
@@ -141,7 +142,14 @@ pub(super) enum SnapshotChildAttachOperationV1 {
     VerifyTarget,
     FinalTargetRevalidation,
     FinalSourceRevalidation,
-    CloseKnownDescriptors,
+    CloseInheritedRoot,
+    CloseInheritedPublication,
+    CloseDetachedTree,
+    CloseTargetBefore,
+    CloseTargetAfter,
+    CloseFinalTarget,
+    CloseSelectedRoot,
+    ClosePublicationDirectory,
 }
 
 /// Typed refusal from the fork-child attachment leaf. It is intentionally
@@ -2304,19 +2312,19 @@ mod platform {
         fn close(
             &mut self,
             role: SnapshotChildRootRoleV1,
+            operation: SnapshotChildAttachOperationV1,
+            plan: ChildAttachOperationPlanV1,
         ) -> Result<(), SnapshotChildAttachFailureV1> {
             if self.descriptor < 0 {
                 return Ok(());
             }
+            plan.check(role, operation)?;
             let descriptor = self.descriptor;
             self.descriptor = -1;
             if unsafe { libc::syscall(libc::SYS_close, descriptor) } == 0 {
                 Ok(())
             } else {
-                Err(child_attach_os_failure_v1(
-                    role,
-                    SnapshotChildAttachOperationV1::CloseKnownDescriptors,
-                ))
+                Err(child_attach_os_failure_v1(role, operation))
             }
         }
     }
@@ -2382,11 +2390,15 @@ mod platform {
         plan: ChildAttachOperationPlanV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
         child_validate_fork_child_root_pair_v1(workspace, runtime)?;
-        child_rebind_source_in_current_mount_namespace_v1(workspace, child_brand)?;
-        child_rebind_source_in_current_mount_namespace_v1(runtime, child_brand)?;
+        child_rebind_source_in_current_mount_namespace_v1(workspace, child_brand, plan)?;
+        child_rebind_source_in_current_mount_namespace_v1(runtime, child_brand, plan)?;
+
+        // Revalidate each published root at the last fallible boundary before
+        // its own detached-tree attachment. In particular, runtime validation
+        // no longer separates workspace validation from workspace open_tree.
         child_attach_validate_source_v1(workspace, plan)?;
-        child_attach_validate_source_v1(runtime, plan)?;
         let workspace_target = child_attach_one_root_v1(workspace, WORKSPACE_TARGET_V1, plan)?;
+        child_attach_validate_source_v1(runtime, plan)?;
         let runtime_target = child_attach_one_root_v1(runtime, RUNTIME_TARGET_V1, plan)?;
         child_verify_final_attached_target_v1(
             SnapshotChildRootRoleV1::Workspace,
@@ -2437,9 +2449,11 @@ mod platform {
     fn child_rebind_source_in_current_mount_namespace_v1(
         root: &mut ForkChildPublishedRootV1,
         child_brand: &IsolationChildOnlyBrandV1,
+        plan: ChildAttachOperationPlanV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
-        let operation = SnapshotChildAttachOperationV1::ValidateSource;
+        let operation = SnapshotChildAttachOperationV1::RebindSource;
         let role = root.role;
+        plan.check(role, operation)?;
         let published_end = usize::from(root.published_namespace_path_len)
             .checked_add(1)
             .filter(|end| *end <= root.published_namespace_path.len())
@@ -2479,12 +2493,18 @@ mod platform {
             return Err(SnapshotChildAttachFailureV1::Invariant { role, operation });
         }
         root.expected_child_statx_commitment.0[1..9].copy_from_slice(&rebound_named[1..9]);
-        for descriptor in [&mut root.root_descriptor, &mut root.published_descriptor] {
-            if *descriptor < 0 || unsafe { libc::syscall(libc::SYS_close, *descriptor) } != 0 {
-                return Err(child_attach_os_failure_v1(role, operation));
-            }
-            *descriptor = -1;
-        }
+        child_attach_close_raw_slot_v1(
+            &mut root.root_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::CloseInheritedRoot,
+            plan,
+        )?;
+        child_attach_close_raw_slot_v1(
+            &mut root.published_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::CloseInheritedPublication,
+            plan,
+        )?;
         root.published_descriptor = published.descriptor;
         published.descriptor = -1;
         root.root_descriptor = rebound_root.descriptor;
@@ -2675,9 +2695,17 @@ mod platform {
                 operation: SnapshotChildAttachOperationV1::VerifyTarget,
             });
         }
-        target_after.close(role)?;
-        target_before.close(role)?;
-        detached.close(role)?;
+        target_after.close(role, SnapshotChildAttachOperationV1::CloseTargetAfter, plan)?;
+        target_before.close(
+            role,
+            SnapshotChildAttachOperationV1::CloseTargetBefore,
+            plan,
+        )?;
+        detached.close(
+            role,
+            SnapshotChildAttachOperationV1::CloseDetachedTree,
+            plan,
+        )?;
         Ok(detached_identity)
     }
 
@@ -2739,7 +2767,7 @@ mod platform {
                 operation: SnapshotChildAttachOperationV1::FinalTargetRevalidation,
             });
         }
-        target.close(role)
+        target.close(role, SnapshotChildAttachOperationV1::CloseFinalTarget, plan)
     }
 
     fn child_attach_final_source_revalidation_v1(
@@ -2782,18 +2810,38 @@ mod platform {
         plan: ChildAttachOperationPlanV1,
     ) -> Result<(), SnapshotChildAttachFailureV1> {
         let role = root.role;
-        plan.check(role, SnapshotChildAttachOperationV1::CloseKnownDescriptors)?;
-        for descriptor in [&mut root.root_descriptor, &mut root.published_descriptor] {
-            let raw = *descriptor;
-            *descriptor = -1;
-            if raw >= 0 && unsafe { libc::syscall(libc::SYS_close, raw) } != 0 {
-                return Err(child_attach_os_failure_v1(
-                    role,
-                    SnapshotChildAttachOperationV1::CloseKnownDescriptors,
-                ));
-            }
-        }
+        child_attach_close_raw_slot_v1(
+            &mut root.root_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::CloseSelectedRoot,
+            plan,
+        )?;
+        child_attach_close_raw_slot_v1(
+            &mut root.published_descriptor,
+            role,
+            SnapshotChildAttachOperationV1::ClosePublicationDirectory,
+            plan,
+        )?;
         Ok(())
+    }
+
+    fn child_attach_close_raw_slot_v1(
+        descriptor: &mut RawFd,
+        role: SnapshotChildRootRoleV1,
+        operation: SnapshotChildAttachOperationV1,
+        plan: ChildAttachOperationPlanV1,
+    ) -> Result<(), SnapshotChildAttachFailureV1> {
+        if *descriptor < 0 {
+            return Err(SnapshotChildAttachFailureV1::Invariant { role, operation });
+        }
+        plan.check(role, operation)?;
+        let raw = *descriptor;
+        *descriptor = -1;
+        if unsafe { libc::syscall(libc::SYS_close, raw) } == 0 {
+            Ok(())
+        } else {
+            Err(child_attach_os_failure_v1(role, operation))
+        }
     }
 
     fn child_root_name_v1(root: &ForkChildPublishedRootV1) -> Option<&CStr> {
@@ -6626,7 +6674,8 @@ mod platform {
 
         #[test]
         fn fixed_capacity_fault_plan_addresses_every_mount_leaf_for_both_roles() {
-            const OPERATIONS: [SnapshotChildAttachOperationV1; 10] = [
+            const OPERATIONS: [SnapshotChildAttachOperationV1; 18] = [
+                SnapshotChildAttachOperationV1::RebindSource,
                 SnapshotChildAttachOperationV1::ValidateSource,
                 SnapshotChildAttachOperationV1::OpenTree,
                 SnapshotChildAttachOperationV1::SetRecursiveAttributes,
@@ -6636,7 +6685,14 @@ mod platform {
                 SnapshotChildAttachOperationV1::VerifyTarget,
                 SnapshotChildAttachOperationV1::FinalTargetRevalidation,
                 SnapshotChildAttachOperationV1::FinalSourceRevalidation,
-                SnapshotChildAttachOperationV1::CloseKnownDescriptors,
+                SnapshotChildAttachOperationV1::CloseInheritedRoot,
+                SnapshotChildAttachOperationV1::CloseInheritedPublication,
+                SnapshotChildAttachOperationV1::CloseDetachedTree,
+                SnapshotChildAttachOperationV1::CloseTargetBefore,
+                SnapshotChildAttachOperationV1::CloseTargetAfter,
+                SnapshotChildAttachOperationV1::CloseFinalTarget,
+                SnapshotChildAttachOperationV1::CloseSelectedRoot,
+                SnapshotChildAttachOperationV1::ClosePublicationDirectory,
             ];
             for role in [
                 SnapshotChildRootRoleV1::Workspace,
@@ -6666,13 +6722,54 @@ mod platform {
             let first = descriptors[0];
             let second = descriptors[1];
             let mut tracked = ChildTrackedAttachFdV1 { descriptor: first };
-            tracked.close(SnapshotChildRootRoleV1::Workspace).unwrap();
+            tracked
+                .close(
+                    SnapshotChildRootRoleV1::Workspace,
+                    SnapshotChildAttachOperationV1::CloseSelectedRoot,
+                    ChildAttachOperationPlanV1::default(),
+                )
+                .unwrap();
             drop(tracked);
             assert_eq!(unsafe { libc::fcntl(first, libc::F_GETFD) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
             drop(ChildTrackedAttachFdV1 { descriptor: second });
             assert_eq!(unsafe { libc::fcntl(second, libc::F_GETFD) }, -1);
             assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+
+        #[test]
+        fn injected_explicit_close_retains_drop_cleanup_ownership() {
+            let mut descriptors = [-1_i32; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let selected = descriptors[0];
+            let mut tracked = ChildTrackedAttachFdV1 {
+                descriptor: selected,
+            };
+            assert_eq!(
+                tracked.close(
+                    SnapshotChildRootRoleV1::Workspace,
+                    SnapshotChildAttachOperationV1::CloseSelectedRoot,
+                    ChildAttachOperationPlanV1::fail(
+                        SnapshotChildRootRoleV1::Workspace,
+                        SnapshotChildAttachOperationV1::CloseSelectedRoot,
+                    ),
+                ),
+                Err(SnapshotChildAttachFailureV1::Injected {
+                    role: SnapshotChildRootRoleV1::Workspace,
+                    operation: SnapshotChildAttachOperationV1::CloseSelectedRoot,
+                    errno: libc::EIO,
+                })
+            );
+            assert_ne!(unsafe { libc::fcntl(selected, libc::F_GETFD) }, -1);
+            drop(tracked);
+            assert_eq!(unsafe { libc::fcntl(selected, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            drop(ChildTrackedAttachFdV1 {
+                descriptor: descriptors[1],
+            });
         }
 
         fn read_bound_for_test(

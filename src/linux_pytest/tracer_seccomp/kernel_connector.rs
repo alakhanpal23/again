@@ -11,23 +11,9 @@ use super::super::RefusalCode;
 /// connector. The field is private to this module.
 pub(in crate::linux_pytest) struct TracerSupervisorIssuerPermitV1(());
 
-impl TracerSupervisorIssuerPermitV1 {
-    #[cfg(test)]
-    pub(in crate::linux_pytest) const fn issue_for_test() -> Self {
-        Self(())
-    }
-}
-
 /// Single-use evidence that final `ECHILD`, signal-state preservation and
 /// drain, and connector resource cleanup all completed.
 pub(in crate::linux_pytest) struct TracerSupervisorCleanupCompletionPermitV1(());
-
-impl TracerSupervisorCleanupCompletionPermitV1 {
-    #[cfg(test)]
-    pub(in crate::linux_pytest) const fn issue_for_test() -> Self {
-        Self(())
-    }
-}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(in crate::linux_pytest) enum FixedTwoTaskForkDeliveryOrderV1 {
@@ -412,6 +398,8 @@ mod platform {
         WaitRun,
         WaitCleanup,
         PtraceSeize,
+        OwnershipTransfer,
+        SeccompInstall,
         PtraceFilterCount,
         PtraceFilterRead,
         PtraceEventMessage,
@@ -713,6 +701,21 @@ mod platform {
         nested_reaped: bool,
         final_echild: bool,
         disarmed: bool,
+    }
+
+    /// Linear proof that the connector successfully seized the fixed root
+    /// while the child was still blocked on its private release channel.
+    /// There is no constructor other than the checked `PTRACE_SEIZE` leaf and
+    /// no raw-identity accessor.
+    struct SupervisorOwnedRootV1 {
+        raw_tid: i32,
+    }
+
+    /// The same ownership after the private one-byte release was consumed.
+    /// Only this state may enter the wait/filter-readback driver, so the child
+    /// cannot install `SECCOMP_RET_TRACE` before supervisor ownership.
+    struct SupervisorReleasedRootV1 {
+        raw_tid: i32,
     }
 
     impl TaskTreeGuardV1 {
@@ -1061,16 +1064,20 @@ mod platform {
         let mut release_write = Some(release.write);
 
         let outcome = (|| {
-            seize_root_v1(faults, tree.root_tid)?;
-            release_root_v1(release_write.take().ok_or_else(|| {
-                failure_v1(
-                    FixedTwoTaskSupervisorStageV1::ReleaseRoot,
-                    FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
-                    None,
-                )
-            })?)?;
+            let owned_root = seize_root_v1(faults, tree.root_tid)?;
+            let released_root = release_root_v1(
+                faults,
+                owned_root,
+                release_write.take().ok_or_else(|| {
+                    failure_v1(
+                        FixedTwoTaskSupervisorStageV1::ReleaseRoot,
+                        FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
+                        None,
+                    )
+                })?,
+            )?;
             let deadline = MonotonicDeadlineV1::after(RUN_SECONDS_V1)?;
-            drive_supervisor_v1(faults, &mut tree, deadline)
+            drive_supervisor_v1(faults, released_root, &mut tree, deadline)
         })();
         drop(release_write);
 
@@ -1134,9 +1141,17 @@ mod platform {
 
     fn drive_supervisor_v1(
         faults: &mut impl ConnectorFaultInjectorV1,
+        released_root: SupervisorReleasedRootV1,
         tree: &mut TaskTreeGuardV1,
         deadline: MonotonicDeadlineV1,
     ) -> Result<TracerSupervisorStateV1, FixedTwoTaskSupervisorFailureV1> {
+        if released_root.raw_tid != tree.root_tid {
+            return Err(failure_v1(
+                FixedTwoTaskSupervisorStageV1::PtraceSeize,
+                FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
+                None,
+            ));
+        }
         let (initial_tid, initial_status) = wait_any_v1(faults, deadline)?.ok_or_else(|| {
             failure_v1(
                 FixedTwoTaskSupervisorStageV1::WaitEvent,
@@ -1151,11 +1166,11 @@ mod platform {
                 None,
             ));
         }
-        prove_installed_filter_v1(faults, tree.root_tid)?;
+        prove_installed_filter_v1(faults, released_root.raw_tid)?;
         let mut sink = FixedEventSinkV1::new();
         let mut supervisor = TracerSupervisorStateV1::begin(
             TracerSupervisorIssuerPermitV1(()),
-            tree.root_tid,
+            released_root.raw_tid,
             &mut sink,
         )
         .map_err(planner_failure_v1)?;
@@ -1298,6 +1313,11 @@ mod platform {
         release_read: RawFd,
         release_write: RawFd,
     ) -> Result<TaskTreeGuardV1, FixedTwoTaskSupervisorFailureV1> {
+        let child_faults = FixedRootFaultPlanV1 {
+            seccomp_install: faults
+                .take(ConnectorKernelOperationV1::SeccompInstall)
+                .is_some(),
+        };
         let mut pidfd = -1_i32;
         let mut arguments = CloneArgsV1 {
             flags: CLONE_PIDFD_V1,
@@ -1313,7 +1333,7 @@ mod platform {
             )
         };
         if result == 0 {
-            unsafe { fixed_root_entry_v1(release_read, release_write) };
+            unsafe { fixed_root_entry_v1(release_read, release_write, child_faults) };
         }
         if result < 0 {
             let errno = last_errno_v1();
@@ -1434,7 +1454,16 @@ mod platform {
         (false, Some(libc::ETIMEDOUT))
     }
 
-    unsafe fn fixed_root_entry_v1(release_read: RawFd, release_write: RawFd) -> ! {
+    #[derive(Clone, Copy, Default)]
+    struct FixedRootFaultPlanV1 {
+        seccomp_install: bool,
+    }
+
+    unsafe fn fixed_root_entry_v1(
+        release_read: RawFd,
+        release_write: RawFd,
+        faults: FixedRootFaultPlanV1,
+    ) -> ! {
         unsafe {
             if raw_syscall6_v1(libc::SYS_close, i64::from(release_write), 0, 0, 0, 0, 0) != 0 {
                 child_exit_v1(CHILD_FAILURE_EXIT_V1);
@@ -1519,7 +1548,10 @@ mod platform {
                 length: filter.len() as u16,
                 filter: filter.as_ptr(),
             };
-            if raw_syscall6_v1(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS_V1, 1, 0, 0, 0, 0) != 0
+            if raw_syscall6_v1(libc::SYS_prctl, PR_SET_NO_NEW_PRIVS_V1, 1, 0, 0, 0, 0) != 0 {
+                child_exit_v1(CHILD_FAILURE_EXIT_V1);
+            }
+            if faults.seccomp_install
                 || raw_syscall6_v1(
                     libc::SYS_seccomp,
                     i64::from(SECCOMP_SET_MODE_FILTER_V1),
@@ -1587,7 +1619,7 @@ mod platform {
     fn seize_root_v1(
         faults: &mut impl ConnectorFaultInjectorV1,
         root_tid: i32,
-    ) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+    ) -> Result<SupervisorOwnedRootV1, FixedTwoTaskSupervisorFailureV1> {
         match ptrace_call_v1(
             faults,
             ConnectorKernelOperationV1::PtraceSeize,
@@ -1596,7 +1628,7 @@ mod platform {
             0,
             PTRACE_OPTIONS_V1,
         ) {
-            Ok(0) => Ok(()),
+            Ok(0) => Ok(SupervisorOwnedRootV1 { raw_tid: root_tid }),
             Ok(_) => Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::PtraceSeize,
                 FixedTwoTaskSupervisorReasonV1::MalformedKernelResponse,
@@ -1609,27 +1641,37 @@ mod platform {
         }
     }
 
-    fn release_root_v1(descriptor: OwnedFd) -> Result<(), FixedTwoTaskSupervisorFailureV1> {
+    fn release_root_v1(
+        faults: &mut impl ConnectorFaultInjectorV1,
+        owned_root: SupervisorOwnedRootV1,
+        descriptor: OwnedFd,
+    ) -> Result<SupervisorReleasedRootV1, FixedTwoTaskSupervisorFailureV1> {
         let byte = RELEASE_BYTE_V1;
-        let result = unsafe {
-            libc::send(
-                descriptor.as_raw_fd(),
-                (&byte as *const u8).cast(),
-                1,
-                libc::MSG_NOSIGNAL,
-            )
-        };
-        if result == 1 {
-            Ok(())
+        let result = connector_kernel_call_v1(
+            faults,
+            ConnectorKernelOperationV1::OwnershipTransfer,
+            || unsafe {
+                libc::send(
+                    descriptor.as_raw_fd(),
+                    (&byte as *const u8).cast(),
+                    1,
+                    libc::MSG_NOSIGNAL,
+                ) as i64
+            },
+        );
+        if result == Ok(1) {
+            Ok(SupervisorReleasedRootV1 {
+                raw_tid: owned_root.raw_tid,
+            })
         } else {
             Err(failure_v1(
                 FixedTwoTaskSupervisorStageV1::ReleaseRoot,
-                if result == 0 {
+                if result == Ok(0) {
                     FixedTwoTaskSupervisorReasonV1::ShortIo
                 } else {
                     FixedTwoTaskSupervisorReasonV1::Io
                 },
-                (result < 0).then(last_errno_v1),
+                result.err(),
             ))
         }
     }
@@ -2739,7 +2781,9 @@ mod platform {
                 ConnectorKernelOperationV1::PtraceSeize,
                 InjectedKernelResultV1::Errno(libc::EIO),
             );
-            let failure = seize_root_v1(&mut seize, 1).unwrap_err();
+            let failure = seize_root_v1(&mut seize, 1)
+                .err()
+                .expect("injected seize failure");
             assert_eq!((failure.stage(), failure.reason()), ("ptrace_seize", "io"));
             seize.assert_consumed();
             assert_forward_failure_cleans_tree_v1(failure);
@@ -2774,6 +2818,28 @@ mod platform {
                 ("filter_witness", "io")
             );
             filter_read.assert_consumed();
+            assert_forward_failure_cleans_tree_v1(failure);
+
+            let mut filter_mismatch = ScriptedFaultsV1::new(vec![
+                (
+                    ConnectorKernelOperationV1::PtraceFilterCount,
+                    InjectedKernelResultV1::Return(
+                        super::super::super::TRACE_ALL_NATIVE_SECCOMP_INSTRUCTION_COUNT_V1 as i64,
+                    ),
+                ),
+                (
+                    ConnectorKernelOperationV1::PtraceFilterRead,
+                    InjectedKernelResultV1::Return(
+                        super::super::super::TRACE_ALL_NATIVE_SECCOMP_INSTRUCTION_COUNT_V1 as i64,
+                    ),
+                ),
+            ]);
+            let failure = prove_installed_filter_v1(&mut filter_mismatch, 1).unwrap_err();
+            assert_eq!(
+                (failure.stage(), failure.reason()),
+                ("filter_witness", "filter_mismatch")
+            );
+            filter_mismatch.assert_consumed();
             assert_forward_failure_cleans_tree_v1(failure);
 
             let mut event = ScriptedFaultsV1::one(
@@ -3094,6 +3160,60 @@ mod platform {
                 assert_eq!((failure.stage(), failure.reason()), ("signal_state", "io"));
                 assert_eq!(failure.errno(), Some(libc::EIO));
                 faults.assert_consumed();
+            }
+        }
+
+        #[test]
+        fn authority_witnesses_and_child_fault_plan_are_linear_non_evidence() {
+            trait AmbiguousIfClone<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+            impl<T: Clone> AmbiguousIfClone<u8> for T {}
+            trait AmbiguousIfCopy<A> {
+                fn probe() {}
+            }
+            impl<T: ?Sized> AmbiguousIfCopy<()> for T {}
+            impl<T: Copy> AmbiguousIfCopy<u8> for T {}
+
+            <SupervisorOwnedRootV1 as AmbiguousIfClone<_>>::probe();
+            <SupervisorOwnedRootV1 as AmbiguousIfCopy<_>>::probe();
+            <SupervisorReleasedRootV1 as AmbiguousIfClone<_>>::probe();
+            <SupervisorReleasedRootV1 as AmbiguousIfCopy<_>>::probe();
+            assert!(!FixedRootFaultPlanV1::default().seccomp_install);
+            assert!(
+                FixedRootFaultPlanV1 {
+                    seccomp_install: true,
+                }
+                .seccomp_install
+            );
+        }
+
+        #[test]
+        #[ignore = "requires the provisioned supervisor kernel contract and isolated single-thread execution"]
+        fn provisioned_live_post_seize_faults_cleanup_the_complete_tree() {
+            for operation in [
+                ConnectorKernelOperationV1::OwnershipTransfer,
+                ConnectorKernelOperationV1::SeccompInstall,
+            ] {
+                let helper = unsafe { libc::fork() };
+                assert!(helper >= 0, "fork failed for {operation:?}");
+                if helper == 0 {
+                    let mut faults =
+                        ScriptedFaultsV1::one(operation, InjectedKernelResultV1::Errno(libc::EIO));
+                    let accepted = qualify_fixed_two_task_supervisor_with_faults_v1(&mut faults)
+                        .is_err_and(|failure| failure.cleanup_complete());
+                    let consumed = faults.cursor == faults.script.len();
+                    unsafe { libc::_exit(i32::from(!(accepted && consumed))) };
+                }
+                let mut status = 0_i32;
+                assert_eq!(unsafe { libc::waitpid(helper, &mut status, 0) }, helper);
+                assert!(libc::WIFEXITED(status), "helper was not reaped normally");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "fault did not clean: {operation:?}"
+                );
             }
         }
     }

@@ -285,13 +285,6 @@ pub(super) static TRACE_ALL_NATIVE_SECCOMP_POLICY_SUMMARY_V1: TraceAllNativeSecc
 #[allow(dead_code)]
 pub(super) struct FutureTracerSeccompConnectorPermitV1(());
 
-#[cfg(test)]
-impl FutureTracerSeccompConnectorPermitV1 {
-    pub(super) const fn issue_for_test() -> Self {
-        Self(())
-    }
-}
-
 /// Borrowed static program view for the fixed diagnostic connector.
 #[allow(dead_code)]
 pub(super) struct TraceAllNativeSeccompProgramV1 {

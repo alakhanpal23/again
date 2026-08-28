@@ -715,6 +715,18 @@ impl TracerSupervisorStateV1 {
         initial_raw_tid: i32,
         sink: &mut S,
     ) -> Result<Self, TracerSupervisorExecuteOnlyReasonV1> {
+        Self::begin_modeled_state_v1(initial_raw_tid, sink)
+    }
+
+    /// Construct only the portable correlation model.
+    ///
+    /// This private helper deliberately consumes no kernel issuer. Unit tests
+    /// exercise it as a model and cannot present its state as live Linux
+    /// evidence; the production entry point above remains permit-gated.
+    fn begin_modeled_state_v1<S: NormalizedTracerTaskEventSinkV1>(
+        initial_raw_tid: i32,
+        sink: &mut S,
+    ) -> Result<Self, TracerSupervisorExecuteOnlyReasonV1> {
         if initial_raw_tid <= 0 {
             return Err(TracerSupervisorExecuteOnlyReasonV1::InvalidRawTid);
         }
@@ -1618,8 +1630,17 @@ impl TracerSupervisorStateV1 {
     /// Consume a fully drained planner after the connector has independently
     /// proven final `ECHILD` and completed signal/descriptor cleanup.
     pub(super) fn complete(
-        mut self,
+        self,
         _cleanup: TracerSupervisorCleanupCompletionPermitV1,
+    ) -> Result<CompletedTracerSupervisorStateV1, TracerSupervisorExecuteOnlyReasonV1> {
+        self.complete_modeled_state_v1()
+    }
+
+    /// Complete only the portable model after its caller has separately
+    /// supplied the production cleanup permit, or from this module's unit
+    /// tests. The helper itself is not Linux cleanup evidence.
+    fn complete_modeled_state_v1(
+        mut self,
     ) -> Result<CompletedTracerSupervisorStateV1, TracerSupervisorExecuteOnlyReasonV1> {
         self.require_healthy()?;
         if self.exchange != PendingExchangeV1::None
@@ -1795,12 +1816,7 @@ mod tests {
     }
 
     fn begin<const N: usize>(sink: &mut FixedSinkV1<N>) -> TracerSupervisorStateV1 {
-        TracerSupervisorStateV1::begin(
-            TracerSupervisorIssuerPermitV1::issue_for_test(),
-            ROOT_TID,
-            sink,
-        )
-        .expect("initial birth")
+        TracerSupervisorStateV1::begin_modeled_state_v1(ROOT_TID, sink).expect("initial birth")
     }
 
     fn reach_seccomp_syscall_read<const N: usize>(
@@ -2128,7 +2144,7 @@ mod tests {
         assert_eq!(child_index, CHILD_STEPS.len());
 
         supervisor
-            .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+            .complete_modeled_state_v1()
             .expect("complete topological merge")
             .summary()
     }
@@ -3064,7 +3080,7 @@ mod tests {
             finish_zero_exit(&mut supervisor, ROOT_TID, &mut sink);
 
             let completed = supervisor
-                .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
+                .complete_modeled_state_v1()
                 .expect("complete fixed transcript");
             let summary = completed.summary();
             assert_eq!(summary.task_count, 2);
@@ -3157,8 +3173,7 @@ mod tests {
         let mut live_sink = FixedSinkV1::<4>::new();
         let live = begin(&mut live_sink);
         assert_eq!(
-            live.complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
-                .err(),
+            live.complete_modeled_state_v1().err(),
             Some(TracerSupervisorExecuteOnlyReasonV1::TaskState(
                 TracerTaskExecuteOnlyReasonV1::IncompleteShutdown,
             ))
@@ -3174,9 +3189,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            pending
-                .complete(TracerSupervisorCleanupCompletionPermitV1::issue_for_test())
-                .err(),
+            pending.complete_modeled_state_v1().err(),
             Some(TracerSupervisorExecuteOnlyReasonV1::IncompleteShutdown)
         );
     }

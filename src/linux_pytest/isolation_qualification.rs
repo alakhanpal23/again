@@ -869,6 +869,7 @@ pub(super) enum SupervisorHandoffStageV1 {
     PtraceInterrupt,
     WaitForStop,
     VerifyStoppedIdentity,
+    OwnershipTransfer,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1589,6 +1590,14 @@ mod platform {
     /// boundaries and force their wrappers to fail before issuing a syscall.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum IsolationOperationV1 {
+        PinParentNamespaces,
+        CloneNamespaces,
+        OpenChildProc,
+        WriteUidMap,
+        WriteSetgroups,
+        WriteGidMap,
+        PinChildNamespaces,
+        VerifyNamespaceSet,
         AuthenticatedRelease,
         ClearSupplementaryGroups,
         AuthenticateSupplementaryGroups,
@@ -1629,6 +1638,7 @@ mod platform {
         PtraceInterrupt,
         PtraceWaitStop,
         PtraceVerifyStop,
+        PtraceOwnershipTransfer,
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -2737,6 +2747,17 @@ mod platform {
                 Some(libc::EIO),
             ));
         }
+        if guard
+            .operations
+            .check(IsolationOperationV1::PtraceOwnershipTransfer)
+            .is_err()
+        {
+            return Err((
+                SupervisorHandoffStageV1::OwnershipTransfer,
+                SupervisorHandoffReasonV1::KernelOperation,
+                Some(libc::EIO),
+            ));
+        }
         Ok(())
     }
 
@@ -2924,6 +2945,16 @@ mod platform {
                 None,
             ));
         }
+        operations
+            .check(IsolationOperationV1::PinParentNamespaces)
+            .map_err(|errno| {
+                failure(
+                    RefusalCode::RequiredNamespaceFailed,
+                    IsolationQualificationStageV1::ParentNamespaces,
+                    IsolationQualificationReasonV1::Io,
+                    Some(errno),
+                )
+            })?;
         let parent_namespaces = NamespaceFdSetV1::open_at(
             self_proc.as_raw_fd(),
             IsolationQualificationStageV1::ParentNamespaces,
@@ -2945,6 +2976,16 @@ mod platform {
             proc_root.as_raw_fd(),
             IsolationQualificationStageV1::HostSwapPreflight,
         )?;
+        operations
+            .check(IsolationOperationV1::CloneNamespaces)
+            .map_err(|errno| {
+                failure(
+                    RefusalCode::RequiredNamespaceFailed,
+                    IsolationQualificationStageV1::CloneNamespaces,
+                    IsolationQualificationReasonV1::Io,
+                    Some(errno),
+                )
+            })?;
 
         let mut continuation = Some(continuation);
         let mut pidfd_raw = -1_i32;
@@ -3076,6 +3117,19 @@ mod platform {
         // SIGCHLD is DFL without SA_NOCLDWAIT and this exact direct child is
         // deliberately unreaped through validation, so its PID cannot be
         // recycled while this descriptor-relative proc view is opened.
+        if guard
+            .operations
+            .check(IsolationOperationV1::OpenChildProc)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::OpenChildProc,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         let proc_directory = guarded!(open_pid_directory_at(
             proc_root.as_raw_fd(),
             child_pid,
@@ -3102,6 +3156,19 @@ mod platform {
             deadline
         ));
 
+        if guard
+            .operations
+            .check(IsolationOperationV1::WriteUidMap)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::WriteUidMap,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         guarded!(write_and_verify_id_map(
             proc_fd,
             c"uid_map",
@@ -3110,7 +3177,33 @@ mod platform {
             IsolationQualificationStageV1::VerifyUidMap,
             deadline,
         ));
+        if guard
+            .operations
+            .check(IsolationOperationV1::WriteSetgroups)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::WriteSetgroups,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         guarded!(write_and_verify_setgroups(proc_fd, deadline));
+        if guard
+            .operations
+            .check(IsolationOperationV1::WriteGidMap)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::WriteGidMap,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         guarded!(write_and_verify_id_map(
             proc_fd,
             c"gid_map",
@@ -3125,10 +3218,36 @@ mod platform {
             deadline,
         ));
 
+        if guard
+            .operations
+            .check(IsolationOperationV1::PinChildNamespaces)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::PinChildNamespaces,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         let child_namespaces = guarded!(NamespaceFdSetV1::open_at(
             proc_fd,
             IsolationQualificationStageV1::PinChildNamespaces,
         ));
+        if guard
+            .operations
+            .check(IsolationOperationV1::VerifyNamespaceSet)
+            .is_err()
+        {
+            let failure = failure(
+                RefusalCode::RequiredNamespaceFailed,
+                IsolationQualificationStageV1::VerifyNamespaceFreshness,
+                IsolationQualificationReasonV1::Io,
+                Some(libc::EIO),
+            );
+            return Err(guard.refuse(failure));
+        }
         guarded!(verify_namespace_set(
             &parent_namespaces,
             &child_namespaces,
@@ -12388,6 +12507,14 @@ mod platform {
         #[ignore = "requires the provisioned rootless namespace tuple and a single-threaded test process"]
         fn provisioned_live_fault_matrix_enters_real_partial_isolation_states_and_reaps() {
             let operations = [
+                IsolationOperationV1::PinParentNamespaces,
+                IsolationOperationV1::CloneNamespaces,
+                IsolationOperationV1::OpenChildProc,
+                IsolationOperationV1::WriteUidMap,
+                IsolationOperationV1::WriteSetgroups,
+                IsolationOperationV1::WriteGidMap,
+                IsolationOperationV1::PinChildNamespaces,
+                IsolationOperationV1::VerifyNamespaceSet,
                 IsolationOperationV1::ClearSupplementaryGroups,
                 IsolationOperationV1::AuthenticateSupplementaryGroups,
                 IsolationOperationV1::AuthenticatedRelease,
@@ -12431,6 +12558,42 @@ mod platform {
                 };
                 assert_eq!(observed.errno(), Some(libc::EIO), "{operation:?}");
                 assert!(observed.cleanup_complete(), "{operation:?}");
+            }
+        }
+
+        #[test]
+        #[ignore = "requires the provisioned rootless namespace tuple and isolated single-thread execution"]
+        fn provisioned_live_supervisor_handoff_faults_reap_before_refusal() {
+            for operation in [
+                IsolationOperationV1::PtraceSeize,
+                IsolationOperationV1::PtraceInterrupt,
+                IsolationOperationV1::PtraceWaitStop,
+                IsolationOperationV1::PtraceVerifyStop,
+                IsolationOperationV1::PtraceOwnershipTransfer,
+            ] {
+                let helper = unsafe { libc::fork() };
+                assert!(helper >= 0, "fork failed for {operation:?}");
+                if helper == 0 {
+                    let accepted = begin_blocked_rootless_namespace_bootstrap_with_plan_v1(
+                        EmptyGroupsTestContinuationV1,
+                        IsolationOperationPlanV1::fail(operation),
+                    )
+                    .and_then(BlockedRootlessNamespaceBootstrapV1::continue_to_isolation_ready_v1)
+                    .ok()
+                    .and_then(|ready| ready.handoff_to_supervisor_v1().err())
+                    .is_some_and(|failure| {
+                        failure.terminal_reap_complete() && failure.cleanup_complete()
+                    });
+                    unsafe { libc::_exit(i32::from(!accepted)) };
+                }
+                let mut status = 0_i32;
+                assert_eq!(unsafe { libc::waitpid(helper, &mut status, 0) }, helper);
+                assert!(libc::WIFEXITED(status), "helper was not reaped normally");
+                assert_eq!(
+                    libc::WEXITSTATUS(status),
+                    0,
+                    "handoff fault did not clean: {operation:?}"
+                );
             }
         }
 

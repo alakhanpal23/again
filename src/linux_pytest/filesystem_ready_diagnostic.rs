@@ -543,6 +543,7 @@ mod supported {
                 SupervisorHandoffStageV1::PtraceInterrupt => "ptrace_interrupt",
                 SupervisorHandoffStageV1::WaitForStop => "ptrace_wait_stop",
                 SupervisorHandoffStageV1::VerifyStoppedIdentity => "ptrace_verify_stop",
+                SupervisorHandoffStageV1::OwnershipTransfer => "ownership_transfer",
             };
             let reason = match failure.reason() {
                 SupervisorHandoffReasonV1::UnsupportedPlatform => "unsupported_platform",
