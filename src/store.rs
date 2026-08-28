@@ -5062,7 +5062,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE gateway_deliveries;
+                    "DROP TABLE gateway_delivery_savings_v2;
+                     DROP TABLE gateway_retrieval_grants_v2;
+                     DROP TABLE gateway_delivery_receipts_v2;
+                     DROP TABLE gateway_deliveries;
                      DROP TABLE gateway_delivery_receipts;
                      DROP TABLE result_dependencies;
                      DROP TABLE gateway_results;
@@ -5132,7 +5135,15 @@ mod tests {
                     [],
                 )
                 .unwrap();
-            store.conn.pragma_update(None, "user_version", 8).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE gateway_delivery_savings_v2;
+                     DROP TABLE gateway_retrieval_grants_v2;
+                     DROP TABLE gateway_delivery_receipts_v2;
+                     PRAGMA user_version = 8;",
+                )
+                .unwrap();
         }
 
         let reopened = Store::open(temp.path()).unwrap();
