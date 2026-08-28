@@ -25,11 +25,15 @@ import shutil
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, BinaryIO
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from bench import agent_gateway_product_e2e as product
 
