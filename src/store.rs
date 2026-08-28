@@ -4664,10 +4664,10 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             ],
         ),
     ];
+    let mut table_info_statement = connection
+        .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info(?1) ORDER BY cid")?;
     for (table, expected) in tables {
-        let mut statement = connection
-            .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info(?1) ORDER BY cid")?;
-        let actual: Vec<(String, String, bool)> = statement
+        let actual: Vec<(String, String, bool)> = table_info_statement
             .query_map([table], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
             .collect::<rusqlite::Result<_>>()?;
         let expected = expected
@@ -4801,20 +4801,21 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             false,
         ),
     ];
+    let mut index_signature_statement = connection.prepare(
+        "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2 AND origin = 'c'",
+    )?;
+    let mut index_columns_statement =
+        connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
     for (table, index, expected_columns, expected_unique, expected_partial) in required_indexes {
-        let signature = connection
-            .query_row(
-                "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2 AND origin = 'c'",
-                params![table, index],
-                |row| Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?)),
-            )
+        let signature = index_signature_statement
+            .query_row(params![table, index], |row| {
+                Ok((row.get::<_, bool>(0)?, row.get::<_, bool>(1)?))
+            })
             .optional()?;
         if signature != Some((*expected_unique, *expected_partial)) {
             bail!("Again gateway schema is missing required index {index}");
         }
-        let mut statement =
-            connection.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
-        let actual_columns: Vec<String> = statement
+        let actual_columns: Vec<String> = index_columns_statement
             .query_map([index], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         if actual_columns
@@ -5073,13 +5074,16 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "CHECK(length(event_type) BETWEEN 1 AND 64)",
         ),
     ];
+    let mut table_sql_statement =
+        connection.prepare("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1")?;
+    let mut current_table = None;
+    let mut current_sql = String::new();
     for (table, fragment) in required_checks {
-        let sql: String = connection.query_row(
-            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
-            [table],
-            |row| row.get(0),
-        )?;
-        if !sql.contains(fragment) {
+        if current_table != Some(table) {
+            current_sql = table_sql_statement.query_row([table], |row| row.get(0))?;
+            current_table = Some(table);
+        }
+        if !current_sql.contains(fragment) {
             bail!("Again gateway schema table {table} is missing a required constraint");
         }
     }
@@ -5167,11 +5171,11 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             )],
         ),
     ];
+    let mut foreign_key_statement = connection.prepare(
+        "SELECT \"table\", \"from\", \"to\", on_delete FROM pragma_foreign_key_list(?1) ORDER BY id",
+    )?;
     for (table, expected) in expected_foreign_keys {
-        let mut statement = connection.prepare(
-            "SELECT \"table\", \"from\", \"to\", on_delete FROM pragma_foreign_key_list(?1) ORDER BY id",
-        )?;
-        let actual: Vec<(String, String, String, String)> = statement
+        let actual: Vec<(String, String, String, String)> = foreign_key_statement
             .query_map([table], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
@@ -6452,6 +6456,41 @@ mod tests {
             .execute_batch("PRAGMA writable_schema=OFF;")
             .unwrap();
         assert!(verify_gateway_schema_current(&store.conn).is_err());
+    }
+
+    #[test]
+    fn current_schema_verifier_rechecks_catalog_after_reopen() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let original: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_delivery_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let weakened = original.replace("CHECK(stderr_bytes >= 0)", "");
+        assert_ne!(weakened, original);
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=ON;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'gateway_delivery_receipts'",
+                [&weakened],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=OFF;")
+            .unwrap();
+        drop(store);
+
+        assert!(Store::open(temp.path()).is_err());
     }
 
     #[test]
