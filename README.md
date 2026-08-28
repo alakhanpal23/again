@@ -1,6 +1,6 @@
 # Again
 
-Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The stable local engine currently applies that rule to a deliberately narrow set of explicit read-only commands; an experimental MCP gateway applies it to bounded built-in repository reads and searches.
+Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The stable local engine currently applies that rule to a deliberately narrow set of explicit read-only commands; an experimental MCP gateway applies it to bounded repository and Git intelligence.
 
 ```bash
 # Redirect all three standard streams so this terminal demonstration is non-TTY.
@@ -16,7 +16,7 @@ The second eligible invocation can be a cache hit and still returns the same com
 
 ## Experimental agent gateway
 
-`again mcp serve` exposes `repo.read` and `repo.search` over bounded MCP stdio. Exact repository, task, provider, schema, environment, and authorization-scope bindings control reuse. Concurrent identical calls can join one in-flight execution; later exact calls can reuse its verified result. Relevant repository changes invalidate it. Unknown state and every non-read-only or unknown tool execute normally rather than manufacturing a hit.
+`again mcp serve` exposes 13 bounded read-only tools over MCP stdio: `repo.read`, `repo.search`, `repo.list`, `repo.tree`, `repo.stat`, `repo.glob`, `repo.references`, `repo.manifest`, plus `git.status`, `git.diff`, `git.log`, `git.show`, and `git.blame`. Exact repository, task, provider, schema, environment, authorization-scope, dependency, and executable bindings control reuse. Concurrent identical calls can join one in-flight execution; later exact calls can reuse its verified result. Relevant repository changes invalidate it. Unknown state and every mutation, credential operation, communication, deployment, payment, or unknown tool bypasses storage and replay.
 
 ```bash
 repo_root="$(pwd -P)"
@@ -24,7 +24,7 @@ again mcp setup --client codex --workspace "$repo_root"
 # Review the printed command, then add it using the agent's own configuration flow.
 ```
 
-Setup is a dry run by default and emits a command containing the exact canonical workspace. `--install-owned-config ABSOLUTE_PATH` may create a wholly Again-owned, previously absent configuration and ownership record; it never merges into or overwrites an existing user-managed file. The gateway is experimental: it is not a general MCP proxy, semantic similarity creates no reuse authority, compact cross-agent delivery is disabled, and no Linux command-execution backend is exposed.
+Setup is a dry run by default and emits a command containing the exact canonical workspace. `--install-owned-config ABSOLUTE_PATH` may create a wholly Again-owned, previously absent configuration and ownership record; it never merges into or overwrites an existing user-managed file. A bounded real-upstream stdio transport and conservative universal tool policy now exist behind crate APIs, including process-tree cancellation and ephemeral credential borrowing, but arbitrary upstream registration is not exposed by the CLI. Semantic similarity creates no reuse authority, compact cross-agent delivery is disabled, and no Linux command-execution backend is exposed.
 
 The schema-v10 release-binary checkpoint at source `850e7c4398adc25ef1210ee4260e27b29aaeb753` passed all eight bounded product scenarios through four real MCP stdio processes: concurrent execution/join, later exact reuse, relevant and proven-irrelevant mutations, follower and leader cancellation, real 30-second lease recovery after process death, and copied-CAS corruption refusal. It observed 12 provider executions and zero false hits. The scenario windows show three avoided provider executions: two exact reuses and one joined follower. Acquisition candidates are not counted as hits; promotion occurs only after proof consumption, result loading, and repository revalidation. See the [release E2E report](bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json), bound to release binary SHA-256 `e52e7540c3754038db3fbc87bc0039df1b6e983b124497d4f3559708c5a536f0` and file SHA-256 `9b818771f830395d2b123e83437b290ea470b284bcef0f52ce1576edbd82ce08`.
 

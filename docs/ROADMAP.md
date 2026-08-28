@@ -33,7 +33,7 @@ client/service foundation, not a deployed product.
 ## Agent gateway fast track
 
 The experimental local vertical slice now includes a real bounded MCP stdio
-server, `repo.read` and `repo.search`, descriptor-retained repository authority,
+server, 13 built-in repository/Git intelligence tools, descriptor-retained repository authority,
 exact dependency-bound reuse, SQLite/CAS coordination, in-flight joining,
 cancellation, and explicit workspace-bound Codex/Claude setup. It remains
 pre-alpha until these gates close:
@@ -52,9 +52,11 @@ pre-alpha until these gates close:
    network-controlled repository fixtures. Measure provider calls avoided,
    latency, bytes and estimated tokens omitted, false-hit count, task outcome,
    cancellation, restart recovery, and store corruption.
-6. Only after those gates, broaden from built-in repository tools to an
-   allowlisted upstream MCP proxy. Side effects, credentials, deployments,
-   payments, and unknown tools continue to bypass reuse.
+6. Expose reviewed configuration for the implemented bounded upstream MCP
+   transport only after provider identity, executable drift, cancellation,
+   credentials, and local policy are bound end to end. Side effects,
+   credentials, communication, deployments, payments, and unknown tools must
+   continue to bypass storage and reuse.
 
 Current checkpoint: item 1 is closed for the built-in tools, and acquisition
 events are only candidates; exact-hit and in-flight-join statistics are
