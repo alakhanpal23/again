@@ -211,6 +211,29 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         self.assertEqual(by_root[str(dirty_root)]["refusal_code"], "unsupported_git_dirty")
         self.assertFalse(by_root[str(insufficient_root)]["checks"]["at_least_two_tracked_go_files"])
 
+    def test_go_search_bounds_duplicate_roots_and_traversal_are_fail_closed(self) -> None:
+        search_root = self.root / "bounded-root"
+        search_root.mkdir()
+        with self.assertRaises(corpus.HarnessRefusal) as duplicate:
+            corpus.discover_go_repository((search_root, search_root))
+        self.assertEqual(duplicate.exception.code, "duplicate_search_root")
+
+        with self.assertRaises(corpus.HarnessRefusal) as depth:
+            corpus.discover_go_repository((search_root,), max_depth=corpus.MAX_SEARCH_DEPTH + 1)
+        self.assertEqual(depth.exception.code, "search_depth_bound")
+
+        with self.assertRaises(corpus.HarnessRefusal) as candidates:
+            corpus.discover_go_repository((search_root,), max_candidates=0)
+        self.assertEqual(candidates.exception.code, "search_candidate_bound")
+
+        with self.assertRaises(corpus.HarnessRefusal) as traversal:
+            corpus.discover_go_repository((self.root / "bounded-root" / "..",))
+        self.assertEqual(traversal.exception.code, "search_root_not_canonical")
+
+        with self.assertRaises(corpus.HarnessRefusal) as unavailable:
+            corpus.discover_go_repository((self.root / "missing-root",))
+        self.assertEqual(unavailable.exception.code, "search_root_unavailable")
+
     def test_dirty_detached_shallow_sparse_and_operation_states_are_non_pass(self) -> None:
         dirty, requested = self.repository("dirty")
         self.two_files(dirty)

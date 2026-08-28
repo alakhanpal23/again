@@ -371,9 +371,34 @@ os._exit(0)
 
         with self.assertRaises(real_eval.HarnessRefusal) as duplicate:
             real_eval.validate_evaluation_matrix(
-                [*pairs, pairs[0]], expected_models=models, expected_settings_ids=settings
+                [*pairs[:5], pairs[0]], expected_models=models, expected_settings_ids=settings
             )
-        self.assertEqual(duplicate.exception.code, "comparison_matrix")
+        self.assertEqual(duplicate.exception.code, "duplicate_run")
+
+        with self.assertRaises(real_eval.HarnessRefusal) as missing:
+            real_eval.validate_evaluation_matrix(
+                pairs[:5], expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(missing.exception.code, "missing_baseline_pair")
+
+        duplicate_replica = dict(pairs[0])
+        duplicate_replica["baseline"] = {
+            **duplicate_replica["baseline"],
+            "runs": [
+                duplicate_replica["baseline"]["runs"][0],
+                {**duplicate_replica["baseline"]["runs"][0], "replica": 0},
+            ],
+        }
+        duplicate_replica["concurrency"] = 2
+        with self.assertRaises(real_eval.HarnessRefusal) as replica:
+            real_eval.validate_comparison_pair(duplicate_replica)
+        self.assertEqual(replica.exception.code, "comparison_run")
+
+        missing_condition = dict(pairs[0])
+        missing_condition.pop("again_enabled")
+        with self.assertRaises(real_eval.HarnessRefusal) as condition:
+            real_eval.validate_comparison_pair(missing_condition)
+        self.assertEqual(condition.exception.code, "comparison_pair")
 
         changed_binding = [dict(pair) for pair in pairs]
         changed_binding[0] = {**changed_binding[0], "binding": {**changed_binding[0]["binding"], "requested_model": "other-model"}}
@@ -382,6 +407,37 @@ os._exit(0)
                 changed_binding, expected_models=models, expected_settings_ids=settings
             )
         self.assertEqual(binding.exception.code, "binding_mismatch")
+
+        changed_fixture = [dict(pair) for pair in pairs]
+        changed_fixture[0] = {**changed_fixture[0], "fixture_digest_sha256": "other-fixture"}
+        with self.assertRaises(real_eval.HarnessRefusal) as fixture:
+            real_eval.validate_evaluation_matrix(
+                changed_fixture,
+                expected_models=models,
+                expected_settings_ids=settings,
+                expected_fixture_digest_sha256="fixture-digest",
+            )
+        self.assertEqual(fixture.exception.code, "binding_mismatch")
+
+        changed_reported_model = [dict(pair) for pair in pairs]
+        changed_reported_model[0] = {
+            **changed_reported_model[0],
+            "baseline": {
+                **changed_reported_model[0]["baseline"],
+                "runs": [
+                    {
+                        **changed_reported_model[0]["baseline"]["runs"][0],
+                        "client_reported_model": "other-model",
+                    },
+                    *changed_reported_model[0]["baseline"]["runs"][1:],
+                ],
+            },
+        }
+        with self.assertRaises(real_eval.HarnessRefusal) as reported_model:
+            real_eval.validate_evaluation_matrix(
+                changed_reported_model, expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(reported_model.exception.code, "binding_mismatch")
 
         reused_workspace = [dict(pair) for pair in pairs]
         reused_workspace[1] = {**reused_workspace[1], "workspace_identity": pairs[0]["workspace_identity"]}

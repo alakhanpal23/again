@@ -526,11 +526,20 @@ def inspect_input_repository(
     return snapshot
 
 
-def discover_go_repository(search_roots: Sequence[pathlib.Path]) -> dict[str, Any]:
+def discover_go_repository(
+    search_roots: Sequence[pathlib.Path],
+    *,
+    max_depth: int = MAX_SEARCH_DEPTH,
+    max_candidates: int = MAX_SEARCH_CANDIDATES,
+) -> dict[str, Any]:
     """Search explicit local roots for one eligible clean Go repository, read-only."""
 
     if not 1 <= len(search_roots) <= MAX_SEARCH_ROOTS:
         raise HarnessRefusal("search_root_bound", "Go search roots exceed their bound")
+    if not 0 <= max_depth <= MAX_SEARCH_DEPTH:
+        raise HarnessRefusal("search_depth_bound", "Go search depth exceeds its bound")
+    if not 1 <= max_candidates <= MAX_SEARCH_CANDIDATES:
+        raise HarnessRefusal("search_candidate_bound", "Go candidate limit exceeds its bound")
     roots: list[pathlib.Path] = []
     for root in search_roots:
         if not root.is_absolute():
@@ -544,11 +553,13 @@ def discover_go_repository(search_roots: Sequence[pathlib.Path]) -> dict[str, An
             raise HarnessRefusal("search_root_not_canonical", "Go search root is not canonical")
         if canonical not in roots:
             roots.append(canonical)
+        else:
+            raise HarnessRefusal("duplicate_search_root", "Go search roots must be distinct")
     candidates: set[pathlib.Path] = set()
     search_errors: list[dict[str, str]] = []
     for root in roots:
         queue: list[tuple[pathlib.Path, int]] = [(root, 0)]
-        while queue and len(candidates) < MAX_SEARCH_CANDIDATES:
+        while queue and len(candidates) < max_candidates:
             current, depth = queue.pop(0)
             try:
                 git_marker = current / ".git"
@@ -558,7 +569,7 @@ def discover_go_repository(search_roots: Sequence[pathlib.Path]) -> dict[str, An
                         stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)
                     ):
                         candidates.add(current)
-                if depth >= MAX_SEARCH_DEPTH:
+                if depth >= max_depth:
                     continue
                 entries = sorted(os.scandir(current), key=lambda entry: entry.name)
                 for entry in entries:
@@ -621,7 +632,8 @@ def discover_go_repository(search_roots: Sequence[pathlib.Path]) -> dict[str, An
             selected = str(candidate)
     return {
         "search_roots": [str(root) for root in roots],
-        "max_depth": MAX_SEARCH_DEPTH,
+        "max_depth": max_depth,
+        "max_candidates": max_candidates,
         "candidate_count": len(records),
         "search_errors": search_errors,
         "selected_repository": selected,
@@ -1998,6 +2010,8 @@ def evaluate(
     repositories: Sequence[RepositoryInput],
     timeout_seconds: float,
     go_search_roots: Sequence[pathlib.Path] = (),
+    go_search_depth: int = MAX_SEARCH_DEPTH,
+    go_search_max_candidates: int = MAX_SEARCH_CANDIDATES,
 ) -> dict[str, Any]:
     if not again_binary.is_absolute() or not source_root.is_absolute():
         raise HarnessRefusal("path_not_absolute", "binary and source root must be absolute")
@@ -2009,11 +2023,16 @@ def evaluate(
         raise HarnessRefusal("timeout_bound", "timeout must be within 10..=300 seconds")
     validate_repository_inputs(repositories)
     go_search = (
-        discover_go_repository(go_search_roots)
+        discover_go_repository(
+            go_search_roots,
+            max_depth=go_search_depth,
+            max_candidates=go_search_max_candidates,
+        )
         if go_search_roots
         else {
             "search_roots": [],
             "max_depth": MAX_SEARCH_DEPTH,
+            "max_candidates": MAX_SEARCH_CANDIDATES,
             "candidate_count": 0,
             "search_errors": [],
             "selected_repository": None,
@@ -2151,6 +2170,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-git-sha", required=True)
     parser.add_argument("--repository", action="append", default=[])
     parser.add_argument("--go-search-root", action="append", default=[])
+    parser.add_argument("--go-search-depth", type=int, default=MAX_SEARCH_DEPTH)
+    parser.add_argument("--go-search-max-candidates", type=int, default=MAX_SEARCH_CANDIDATES)
     parser.add_argument("--json-out", required=True, type=pathlib.Path)
     parser.add_argument("--timeout-seconds", type=float, default=90.0)
     return parser.parse_args(argv)
@@ -2171,6 +2192,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             repositories=repositories,
             timeout_seconds=arguments.timeout_seconds,
             go_search_roots=[pathlib.Path(item) for item in arguments.go_search_root],
+            go_search_depth=arguments.go_search_depth,
+            go_search_max_candidates=arguments.go_search_max_candidates,
         )
         write_json_exclusive(output, report)
         print(

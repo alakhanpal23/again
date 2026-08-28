@@ -1718,10 +1718,10 @@ def validate_evaluation_matrix(
         for client in ("claude", "codex")
         for task in TASKS
     }
+    observed_ids = {f"{pair.get('client')}--{pair.get('task_id')}" for pair in pairs}
+    if len(observed_ids) != len(pairs):
+        raise HarnessRefusal("duplicate_run", "matrix contains a duplicate pair")
     if len(pairs) != len(expected_pairs):
-        observed_ids = {
-            f"{pair.get('client')}--{pair.get('task_id')}" for pair in pairs
-        }
         if set(expected_pairs) - observed_ids:
             raise HarnessRefusal("missing_baseline_pair", "matrix is missing a required pair")
         raise HarnessRefusal("comparison_matrix", "matrix does not contain exactly one pair per task/client")
