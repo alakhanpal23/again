@@ -671,12 +671,15 @@ fn repository_references_v1(
                 }
                 let snippet = bounded_utf8_prefix_v1(line, MAX_LINE_BYTES_V1);
                 let path = path_text_v1(file.relative_path());
+                let character_column = line[..column].chars().count() + 1;
                 charge_output_v1(&mut rendered_bytes, path.len() + snippet.len() + 64)?;
                 references.push(json!({
                     "path": path,
                     "line": line_index + 1,
-                    "column": column + 1,
-                    "endColumn": column + symbol.len() + 1,
+                    "column": character_column,
+                    "endColumn": character_column + symbol.chars().count(),
+                    "byteColumn": column + 1,
+                    "endByteColumn": column + symbol.len() + 1,
                     "text": snippet,
                     "lineTruncated": snippet.len() != line.len()
                 }));
@@ -1158,7 +1161,13 @@ fn run_git_v1(
                 let _ = stderr_reader.join();
                 return Err(limit_error_v1("Git execution deadline exceeded"));
             }
-            Err(_) => return Err(provider_io_v1("wait for Git process failed")),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(provider_io_v1("wait for Git process failed"));
+            }
         }
     };
     let stdout = stdout_reader
