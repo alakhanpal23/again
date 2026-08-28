@@ -15,6 +15,13 @@ path = "src/lib.rs"
 name = "again"
 path = "src/main.rs"
 
+[features]
+default = []
+hook = []
+daemon = []
+linux-pytest = []
+team-alpha = []
+
 [dependencies]
 anyhow = "1"
 blake3 = { version = "1", features = ["zeroize"] }

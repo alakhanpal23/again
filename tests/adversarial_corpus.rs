@@ -1,3 +1,5 @@
+#![cfg(feature = "hook")]
+
 //! Deterministic, process-level checks for Again's fail-closed hook boundary.
 //!
 //! These cases intentionally test the public JSON adapter rather than the

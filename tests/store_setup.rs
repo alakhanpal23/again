@@ -1,16 +1,21 @@
 use std::fs;
 
+#[cfg(feature = "hook")]
 use again::setup::{SetupScope, hook_path, install_codex_hook, remove_codex_hook};
 use again::store::{EventDisposition, Store};
+#[cfg(feature = "hook")]
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[cfg(feature = "hook")]
 const AGAIN_SENTINEL: &str = "AGAIN_CODEX_HOOK_V1=1";
 
+#[cfg(feature = "hook")]
 fn hook_file(temp: &TempDir) -> std::path::PathBuf {
     temp.path().join(".codex").join("hooks.json")
 }
 
+#[cfg(feature = "hook")]
 fn executable_with_shell_sensitive_path(temp: &TempDir) -> std::path::PathBuf {
     let dir = temp.path().join("bin with spaces");
     fs::create_dir_all(&dir).unwrap();
@@ -191,6 +196,7 @@ fn stats_aggregate_execution_replay_bypass_and_quarantine_events() {
     assert_eq!(stats.estimated_execution_ms_saved, 50);
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn project_hook_path_is_isolated_from_real_home() {
     let temp = TempDir::new().unwrap();
@@ -201,6 +207,7 @@ fn project_hook_path_is_isolated_from_real_home() {
     assert!(hook_path(SetupScope::Project, None).is_err());
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn install_is_idempotent_and_preserves_unrelated_hooks() {
     let temp = TempDir::new().unwrap();
@@ -238,6 +245,7 @@ fn install_is_idempotent_and_preserves_unrelated_hooks() {
     assert!(document["hooks"]["PostCompact"].is_array());
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn install_quotes_executable_paths_with_spaces_and_single_quotes() {
     let temp = TempDir::new().unwrap();
@@ -260,6 +268,7 @@ fn install_quotes_executable_paths_with_spaces_and_single_quotes() {
     assert!(command.contains("'\\''"));
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn dry_run_does_not_create_or_modify_hook_file() {
     let temp = TempDir::new().unwrap();
@@ -273,6 +282,7 @@ fn dry_run_does_not_create_or_modify_hook_file() {
     assert!(change.rendered.contains(AGAIN_SENTINEL));
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn removal_removes_again_only_and_is_idempotent() {
     let temp = TempDir::new().unwrap();
@@ -303,6 +313,7 @@ fn removal_removes_again_only_and_is_idempotent() {
     assert!(again.backup.is_none());
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn malformed_hook_shapes_fail_closed_without_writing() {
     let temp = TempDir::new().unwrap();

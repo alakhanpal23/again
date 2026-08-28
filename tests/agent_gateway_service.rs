@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(feature = "daemon", unix))]
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};

@@ -6,7 +6,9 @@
 //! Callers must provide the complete environment visible to the child process; the
 //! returned value contains only digests of environment names and values.
 
-use std::collections::{HashMap, HashSet};
+#[cfg(feature = "team-alpha")]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read};
@@ -133,11 +135,13 @@ pub trait FileDigestCache {
 /// before calling `lookup`; this layer only avoids repeating SQLite lookups and
 /// content hashing for the same fully validated identity during pull/capture
 /// boundary rechecks.
+#[cfg(feature = "team-alpha")]
 pub(crate) struct SessionFileDigestCache<'a> {
     persistent: &'a mut dyn FileDigestCache,
     memory: HashMap<FileIdentity, [u8; 32]>,
 }
 
+#[cfg(feature = "team-alpha")]
 impl<'a> SessionFileDigestCache<'a> {
     pub(crate) fn new(persistent: &'a mut dyn FileDigestCache) -> Self {
         Self {
@@ -147,6 +151,7 @@ impl<'a> SessionFileDigestCache<'a> {
     }
 }
 
+#[cfg(feature = "team-alpha")]
 impl FileDigestCache for SessionFileDigestCache<'_> {
     fn lookup(&mut self, identity: &FileIdentity) -> Option<[u8; 32]> {
         if let Some(digest) = self.memory.get(identity) {
@@ -1647,6 +1652,7 @@ mod tests {
         assert_eq!(cache.hits, 2);
     }
 
+    #[cfg(feature = "team-alpha")]
     #[test]
     fn session_digest_cache_avoids_repeated_persistent_lookups() {
         let fixture = Fixture::new();

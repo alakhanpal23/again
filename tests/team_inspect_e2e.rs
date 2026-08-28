@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(all(feature = "team-alpha", target_os = "macos"))]
 
 use std::fs;
 use std::net::TcpListener;
