@@ -49,13 +49,15 @@ jobs:
           sh -n scripts/install.sh scripts/uninstall.sh scripts/verify_release.sh \
             scripts/verify_published_release.sh \
             scripts/test_packaging.sh scripts/test_release_verification.sh \
-            scripts/test_homebrew_formula.sh scripts/test_release_evidence.sh
+            scripts/test_homebrew_formula.sh scripts/test_release_evidence.sh \
+            scripts/test_installer_crash_matrix.sh
           python3 -m py_compile scripts/package_release.py \
             packaging/homebrew/generate_formula.py scripts/export_release_evidence.py
           sh scripts/test_packaging.sh
           sh scripts/test_release_verification.sh
           sh scripts/test_homebrew_formula.sh
           sh scripts/test_release_evidence.sh
+          sh scripts/test_installer_crash_matrix.sh
 
   build:
     name: build ${{ matrix.target }}

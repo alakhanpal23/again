@@ -1,10 +1,12 @@
 #!/bin/sh
+# Catchable-signal and one-shot command-fault coverage only. This harness does
+# not claim SIGKILL, power-loss, storage-durability, or persistent-fault safety.
 set -eu
 
 repository=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd -P)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/again-installer-crash-matrix.XXXXXXXX")
 fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
-socket_fixture=$(mktemp -d /private/tmp/ai.XXXXXXXX)
+socket_fixture=
 cleanup() {
     status=$1
     trap - EXIT HUP INT TERM
@@ -15,13 +17,14 @@ cleanup() {
         fi
     fi
     rm -rf "$fixture"
-    rm -rf "$socket_fixture"
+    [ -z "$socket_fixture" ] || rm -rf "$socket_fixture"
     exit "$status"
 }
 trap 'cleanup "$?"' EXIT
 trap 'cleanup 129' HUP
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
+socket_fixture=$(mktemp -d /tmp/ai.XXXXXXXX)
 
 case "$(uname -s):$(uname -m)" in
     Darwin:arm64|Darwin:aarch64) target=aarch64-apple-darwin ;;
@@ -138,7 +141,10 @@ case "$tool" in
         real=$REAL_INSTALL
         ;;
     chmod)
-        case "$last" in */.again-marker.*) point=prepared-marker-chmod ;; esac
+        case "$last" in
+            *.again-lock/owner) point=lock-owner-chmod ;;
+            */.again-marker.*) point=prepared-marker-chmod ;;
+        esac
         real=$REAL_CHMOD
         ;;
     rm)
@@ -193,20 +199,25 @@ if [ "$point" = lock-mkdir ] && [ -n "${HOLD_LOCK_GATE:-}" ]; then
         sleep 0.01
     done
 fi
-if [ "$point" = lock-mkdir ] && [ "${REPLACE_LOCK:-0}" -eq 1 ] && \
+if [ "$point" = lock-owner-chmod ] && [ "${REPLACE_LOCK:-0}" -eq 1 ] && \
     [ ! -e "$FAULT_STATE_DIR/replaced-lock" ]; then
     : > "$FAULT_STATE_DIR/replaced-lock"
-    "$REAL_RMDIR" "$last"
-    "$REAL_MKDIR" "$last"
-    : > "$last/foreign-owner"
-    kill -TERM "$PPID"
-    sleep 0.1
+    lock_path=${last%/owner}
+    "$REAL_RM" -f "$last"
+    "$REAL_RMDIR" "$lock_path"
+    "$REAL_MKDIR" "$lock_path"
+    : > "$SIGNAL_READY"
+    while [ ! -e "$SIGNAL_GATE" ]; do
+        sleep 0.01
+    done
 fi
 if [ -n "${SIGNAL_POINT:-}" ] && [ "$point" = "$SIGNAL_POINT" ] && \
     [ ! -e "$FAULT_STATE_DIR/signal-$point" ]; then
     : > "$FAULT_STATE_DIR/signal-$point"
-    kill -TERM "$PPID"
-    sleep 0.1
+    : > "$SIGNAL_READY"
+    while [ ! -e "$SIGNAL_GATE" ]; do
+        sleep 0.01
+    done
 fi
 exit 0
 EOF
@@ -228,16 +239,51 @@ run_faulted() {
     shift 5
     CURRENT_CASE=$case_dir
     mkdir -p "$case_dir/fault-state" "$case_dir/tmp" "$case_dir/home"
+    signal_ready=$case_dir/signal-ready
+    signal_gate=$case_dir/signal-gate
     status=0
-    env \
-        REAL_CP="$real_cp" REAL_MV="$real_mv" REAL_MKDIR="$real_mkdir" \
-        REAL_RMDIR="$real_rmdir" REAL_INSTALL="$real_install" \
-        REAL_CHMOD="$real_chmod" REAL_RM="$real_rm" REAL_MKTEMP="$real_mktemp" \
-        FAULT_POINT="$fault_point" SIGNAL_POINT="$signal_point" \
-        FAULT_STATE_DIR="$case_dir/fault-state" FAULT_LOG="$coverage_log" \
-        TEST_DEST="$destination" TMPDIR="$case_dir/tmp" HOME="$case_dir/home" \
-        PATH="$fake_bin:$PATH" \
-        sh "$script" "$@" > "$case_dir/stdout" 2> "$case_dir/stderr" || status=$?
+    if [ -n "$signal_point" ]; then
+        env \
+            REAL_CP="$real_cp" REAL_MV="$real_mv" REAL_MKDIR="$real_mkdir" \
+            REAL_RMDIR="$real_rmdir" REAL_INSTALL="$real_install" \
+            REAL_CHMOD="$real_chmod" REAL_RM="$real_rm" REAL_MKTEMP="$real_mktemp" \
+            FAULT_POINT="$fault_point" SIGNAL_POINT="$signal_point" \
+            SIGNAL_READY="$signal_ready" SIGNAL_GATE="$signal_gate" \
+            FAULT_STATE_DIR="$case_dir/fault-state" FAULT_LOG="$coverage_log" \
+            TEST_DEST="$destination" TMPDIR="$case_dir/tmp" HOME="$case_dir/home" \
+            PATH="$fake_bin:$PATH" \
+            sh "$script" "$@" > "$case_dir/stdout" 2> "$case_dir/stderr" &
+        command_pid=$!
+        attempt=0
+        while [ ! -e "$signal_ready" ] && [ "$attempt" -lt 1000 ]; do
+            if ! kill -0 "$command_pid" 2>/dev/null; then
+                break
+            fi
+            sleep 0.01
+            attempt=$((attempt + 1))
+        done
+        if [ ! -e "$signal_ready" ]; then
+            : > "$signal_gate"
+            wait "$command_pid" || status=$?
+            echo "error: signal point $signal_point was not reached" >&2
+            RUN_STATUS=$status
+            return 1
+        fi
+        kill -TERM "$command_pid"
+        : > "$signal_gate"
+        wait "$command_pid" || status=$?
+    else
+        env \
+            REAL_CP="$real_cp" REAL_MV="$real_mv" REAL_MKDIR="$real_mkdir" \
+            REAL_RMDIR="$real_rmdir" REAL_INSTALL="$real_install" \
+            REAL_CHMOD="$real_chmod" REAL_RM="$real_rm" REAL_MKTEMP="$real_mktemp" \
+            FAULT_POINT="$fault_point" SIGNAL_POINT= \
+            SIGNAL_READY="$signal_ready" SIGNAL_GATE="$signal_gate" \
+            FAULT_STATE_DIR="$case_dir/fault-state" FAULT_LOG="$coverage_log" \
+            TEST_DEST="$destination" TMPDIR="$case_dir/tmp" HOME="$case_dir/home" \
+            PATH="$fake_bin:$PATH" \
+            sh "$script" "$@" > "$case_dir/stdout" 2> "$case_dir/stderr" || status=$?
+    fi
     RUN_STATUS=$status
 }
 
@@ -495,30 +541,42 @@ for mode in failure signal; do
     done
 done
 
-# Replacing the acquired empty directory with a nonempty foreign lock before
-# termination must never let cleanup remove the replacement.
+# Replacing the fully recorded owned lock with an empty foreign directory
+# before termination must never let cleanup remove the replacement.
 case_dir=$fixture/cases/replaced-lock
 CURRENT_CASE=$case_dir
 prepare_initial_case "$case_dir"
 mkdir -p "$case_dir/fault-state" "$case_dir/tmp" "$case_dir/home"
-status=0
+signal_ready=$case_dir/signal-ready
+signal_gate=$case_dir/signal-gate
 env REAL_CP="$real_cp" REAL_MV="$real_mv" REAL_MKDIR="$real_mkdir" \
     REAL_RMDIR="$real_rmdir" REAL_INSTALL="$real_install" \
     REAL_CHMOD="$real_chmod" REAL_RM="$real_rm" REAL_MKTEMP="$real_mktemp" \
     FAULT_POINT= SIGNAL_POINT= REPLACE_LOCK=1 \
+    SIGNAL_READY="$signal_ready" SIGNAL_GATE="$signal_gate" \
     FAULT_STATE_DIR="$case_dir/fault-state" FAULT_LOG="$coverage_log" \
     TEST_DEST="$INITIAL_DESTINATION" TMPDIR="$case_dir/tmp" HOME="$case_dir/home" \
     PATH="$fake_bin:$PATH" sh "$repository/scripts/install.sh" \
     --version v0.1.0 --artifact-dir "$fixture/releases/v0.1.0" \
-    --dest "$INITIAL_DESTINATION" > "$case_dir/stdout" 2> "$case_dir/stderr" || status=$?
+    --dest "$INITIAL_DESTINATION" > "$case_dir/stdout" 2> "$case_dir/stderr" &
+command_pid=$!
+attempt=0
+while [ ! -e "$signal_ready" ] && [ "$attempt" -lt 1000 ]; do
+    kill -0 "$command_pid" 2>/dev/null || break
+    sleep 0.01
+    attempt=$((attempt + 1))
+done
+test -e "$signal_ready"
+kill -TERM "$command_pid"
+: > "$signal_gate"
+status=0
+wait "$command_pid" || status=$?
 [ "$status" -ne 0 ]
 [ "$(file_hash "$INITIAL_DESTINATION")" = "$INITIAL_HASH" ]
 [ "$($INITIAL_DESTINATION)" = original-user-file ]
 [ ! -e "${INITIAL_DESTINATION}.again-install" ]
 [ ! -e "${INITIAL_DESTINATION}.previous" ]
-test -f "${INITIAL_DESTINATION}.again-lock/foreign-owner"
-rmdir "${INITIAL_DESTINATION}.again-lock" 2>/dev/null && exit 1 || :
-rm "${INITIAL_DESTINATION}.again-lock/foreign-owner"
+test -d "${INITIAL_DESTINATION}.again-lock"
 rmdir "${INITIAL_DESTINATION}.again-lock"
 case_count=$((case_count + 1))
 
@@ -759,7 +817,7 @@ case_count=$((case_count + 1))
 
 for required_point in \
     input-archive-copy input-manifest-copy binary-temp-create marker-temp-create \
-    prepared-binary-install prepared-marker-chmod lock-mkdir \
+    prepared-binary-install prepared-marker-chmod lock-mkdir lock-owner-chmod \
     destination-to-backup-rename backup-to-destination-rename \
     snapshot-binary-copy snapshot-marker-copy binary-commit-rename \
     marker-commit-rename rollback-new-binary-remove rollback-binary-copy \
@@ -775,7 +833,7 @@ do
     }
 done
 
-printf 'installer crash matrix: %s deterministic cases passed\n' "$case_count"
+printf 'installer catchable-signal/command-fault matrix: %s cases passed\n' "$case_count"
 trap - EXIT HUP INT TERM
 rm -rf "$fixture"
 rm -rf "$socket_fixture"

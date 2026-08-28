@@ -51,6 +51,8 @@ destination="$destination_dir/$destination_name"
 metadata=${destination}.again-install
 backup=${destination}.previous
 lock=${destination}.again-lock
+lock_owner=${lock}/owner
+lock_token=uninstall-$$
 
 removed_tmp=
 marker_tmp=
@@ -80,10 +82,16 @@ retry_move() {
 }
 
 release_owned_lock() {
-    if [ ! -d "$lock" ]; then
-        lock_held=0
-        return 0
+    observed_token=
+    if [ -d "$lock" ] && [ ! -L "$lock" ] && \
+        [ -f "$lock_owner" ] && [ ! -L "$lock_owner" ]; then
+        IFS= read -r observed_token < "$lock_owner" || observed_token=
     fi
+    if [ "$observed_token" != "$lock_token" ]; then
+        echo "warning: install lock ownership changed; preserving it for inspection: $lock" >&2
+        return 1
+    fi
+    retry_remove_file "$lock_owner" "remove the install lock owner record" || return 1
     if rmdir "$lock" 2>/dev/null || rmdir "$lock" 2>/dev/null; then
         lock_held=0
         return 0
@@ -136,7 +144,10 @@ acquire_lock() {
     trap 'pending_signal=143' TERM
     if mkdir "$lock" 2>/dev/null; then
         lock_held=1
-        lock_acquired=1
+        if (umask 077; printf '%s\n' "$lock_token" > "$lock_owner") && \
+            chmod 0600 "$lock_owner"; then
+            lock_acquired=1
+        fi
     fi
     arm_signal_traps
     if [ "$pending_signal" -ne 0 ]; then

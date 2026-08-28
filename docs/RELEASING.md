@@ -110,9 +110,11 @@ must not be assumed unless it has been enabled and verified for the release.
    cargo +1.88.0 test --locked --all-features
    cargo +1.88.0 test --locked --test generated_differential \
      generated_differential_100k -- --ignored --exact --nocapture
-   sh -n scripts/install.sh scripts/uninstall.sh scripts/test_packaging.sh
+   sh -n scripts/install.sh scripts/uninstall.sh scripts/test_packaging.sh \
+     scripts/test_installer_crash_matrix.sh
    python3 -m py_compile scripts/package_release.py
    sh scripts/test_packaging.sh
+   sh scripts/test_installer_crash_matrix.sh
    ```
 
 4. Create and push an annotated tag whose version exactly matches
@@ -181,10 +183,12 @@ writes a mode-`0600` `<destination>.again-install` marker containing the
 installed binary hash.
 
 Install, managed upgrade, and uninstall serialize mutations with an atomically
-created adjacent `<destination>.again-lock` directory. If that path already
-exists, the command fails closed without changing managed state or removing the
-other operation's lock. A lock created by the current command is removed on
-normal completion, ordinary command errors, and handled `HUP`, `INT`, or `TERM`.
+created adjacent `<destination>.again-lock` directory containing a private
+owner record. If that path already exists, the command fails closed without
+changing managed state or removing the other operation's lock. Cleanup removes
+a lock only while its owner record still matches this process. A matching lock
+is removed on normal completion, ordinary command errors, and handled `HUP`,
+`INT`, or `TERM`.
 
 For a managed upgrade, the installer first verifies that the current binary
 still matches its marker and snapshots the managed binary and marker. It stages
@@ -206,8 +210,8 @@ hostile process that ignores the lock. Recovery after those events may require
 inspecting the adjacent marker, backup, lock, and staging state manually. In
 particular, `SIGKILL` or a machine failure can leave a stale
 `<destination>.again-lock`; after confirming that no install or uninstall is
-active and inspecting the adjacent state, remove that exact empty lock directory
-manually before retrying.
+active and inspecting the adjacent state, remove the owner record and that exact
+lock directory manually before retrying.
 
 Uninstall verifies the marker and current binary hash, stages the managed
 binary and marker, restores the original backup when present, and removes the
