@@ -31,6 +31,7 @@ const GATEWAY_LEASE_TTL_MS: i64 = 30_000;
 const GATEWAY_FRESHNESS_MAX_MS: i64 = 5 * 60_000;
 const GATEWAY_MAX_DEPENDENCIES: usize = 64;
 const GATEWAY_MAX_OWNER_BYTES: usize = 128;
+const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CleanupReport {
@@ -669,7 +670,7 @@ impl Store {
         ensure_private_database_file(&database)?;
         let conn = Connection::open(&database)
             .with_context(|| format!("open Again database {}", database.display()))?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.busy_timeout(SQLITE_BUSY_TIMEOUT)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -4497,6 +4498,21 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn store_configures_exact_sqlite_busy_timeout() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let configured_ms: u64 = store
+            .conn
+            .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            configured_ms,
+            u64::try_from(SQLITE_BUSY_TIMEOUT.as_millis()).unwrap()
+        );
+    }
 
     #[test]
     fn state_root_and_fixed_children_reject_symlinks() {

@@ -6482,18 +6482,25 @@ mod platform {
             let published = fixture.publish_root();
             let expected = published_child_commitment(&published, ROOT);
             let published_raw = published.directory().as_raw_fd();
+            let published_stat = fstat_raw(published.directory().as_fd()).unwrap();
+            let published_identity = (published_stat.st_dev, published_stat.st_ino);
             let resources = charged_resources_with_entries(1_000_000, 1024 * 1024, 4);
             let before = resources.forward_attempts_remaining_for_test();
             let reservation = resources
                 .reserve_published_child_bind_attempts(NonZeroU64::new(2).unwrap())
                 .unwrap();
             let root_raw = Cell::new(-1);
+            let root_identity = Cell::new(None);
             let error = bind_published_snapshot_child_at_with_projection_hook(
                 published,
                 ROOT,
                 expected,
                 reservation,
-                |root| root_raw.set(root.as_raw_fd()),
+                |root| {
+                    root_raw.set(root.as_raw_fd());
+                    let stat = fstat_raw(root).unwrap();
+                    root_identity.set(Some((stat.st_dev, stat.st_ino)));
+                },
             )
             .unwrap_err();
             assert!(matches!(
@@ -6504,10 +6511,30 @@ mod platform {
             ));
             assert_eq!(resources.forward_attempts_remaining_for_test(), before - 2);
             assert_ne!(root_raw.get(), -1);
-            assert_eq!(unsafe { libc::fcntl(published_raw, libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-            assert_eq!(unsafe { libc::fcntl(root_raw.get(), libc::F_GETFD) }, -1);
-            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+            assert_original_descriptor_released_or_reused(published_raw, published_identity);
+            assert_original_descriptor_released_or_reused(
+                root_raw.get(),
+                root_identity.get().unwrap(),
+            );
+        }
+
+        fn assert_original_descriptor_released_or_reused(
+            raw: RawFd,
+            expected_identity: (libc::dev_t, libc::ino_t),
+        ) {
+            let mut observed = MaybeUninit::<libc::stat>::zeroed();
+            let result = unsafe { libc::fstat(raw, observed.as_mut_ptr()) };
+            if result == -1 {
+                assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                return;
+            }
+            assert_eq!(result, 0);
+            let observed = unsafe { observed.assume_init() };
+            assert_ne!(
+                (observed.st_dev, observed.st_ino),
+                expected_identity,
+                "the original owned descriptor remained reachable after refusal"
+            );
         }
 
         fn fake_fork_child_root(
