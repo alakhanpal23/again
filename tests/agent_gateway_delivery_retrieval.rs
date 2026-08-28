@@ -5,6 +5,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use again::store::Store;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -145,31 +146,17 @@ fn initialize(session: &mut Session) {
     }));
 }
 
-fn call_and_acknowledge(session: &mut Session, suffix: &str) -> (Value, Value) {
-    let response = session.request(
+fn call_full_result(session: &mut Session, suffix: &str) -> Value {
+    session.request(
         &format!("call-{suffix}"),
         "tools/call",
         json!({"name": "repo.read", "arguments": {"path": "README.md"}}),
-    );
-    let challenge = session.read();
-    assert_eq!(
-        challenge["method"],
-        "notifications/again/delivery-challenge"
-    );
-    let acknowledgement = session.request(
-        &format!("ack-{suffix}"),
-        "again/delivery/ack",
-        challenge["params"]["challenge"].clone(),
-    );
-    assert_eq!(acknowledgement["result"]["status"], "confirmed");
-    (
-        response["result"].clone(),
-        acknowledgement["result"]["retrievalGrant"].clone(),
-    )
+    )["result"]
+        .clone()
 }
 
 #[test]
-fn production_binary_retrieval_is_response_bound_one_use_and_compaction_safe() {
+fn production_binary_unknown_recipient_has_no_delivery_or_retrieval_authority() {
     let fixture = TempDir::new().unwrap();
     let workspace = fixture.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
@@ -188,42 +175,34 @@ fn production_binary_retrieval_is_response_bound_one_use_and_compaction_safe() {
     let mut session = Session::start(&workspace, fixture.path());
     initialize(&mut session);
 
-    let (full, grant) = call_and_acknowledge(&mut session, "one-use");
-    let retrieved = session.request("retrieve", "again/result/retrieve", grant.clone());
-    assert_eq!(retrieved["result"]["schemaVersion"], 2);
-    assert_eq!(retrieved["result"]["presentation"], "fullToolResult");
-    assert_eq!(
-        retrieved["result"]["gatewayResultId"],
-        full["_meta"]["again"]["resultId"]
-    );
-    assert_eq!(
-        retrieved["result"]["toolResult"]["content"],
-        full["content"]
-    );
-    assert_eq!(
-        retrieved["result"]["toolResult"]["structuredContent"],
-        full["structuredContent"]
-    );
-    let replay = session.request("replay", "again/result/retrieve", grant);
-    assert_eq!(
-        replay["error"]["data"]["reason"],
-        "acknowledgement_replayed"
-    );
+    let full = call_full_result(&mut session, "full");
+    assert_eq!(full["content"][0]["text"], "delivery fixture\n");
 
-    let (_, compacted_grant) = call_and_acknowledge(&mut session, "compaction");
+    let acknowledgement = session.request("ack", "again/delivery/ack", json!({}));
+    assert_eq!(
+        acknowledgement["error"]["data"]["reason"],
+        "unsupported_recipient_authority"
+    );
+    let retrieval = session.request("retrieve", "again/result/retrieve", json!({}));
+    assert_eq!(
+        retrieval["error"]["data"]["reason"],
+        "unsupported_recipient_authority"
+    );
     session.send(json!({
         "jsonrpc": "2.0",
         "method": "notifications/again/context-compacted",
         "params": {"compactionGeneration": 1}
     }));
-    let compacted = session.request("compacted", "again/result/retrieve", compacted_grant);
-    assert!(
-        matches!(
-            compacted["error"]["data"]["reason"].as_str(),
-            Some("delivery_authority_retired" | "invalid_delivery_binding")
-        ),
-        "{compacted}"
-    );
+    let after_compaction = call_full_result(&mut session, "after-compaction");
+    assert_eq!(after_compaction["content"], full["content"]);
 
     session.close();
+    let stats = Store::open(fixture.path().join("state"))
+        .unwrap()
+        .gateway_stats()
+        .unwrap();
+    assert_eq!(stats.compact_deliveries, 0);
+    assert_eq!(stats.delivery_confirmed_bytes_omitted, 0);
+    assert_eq!(stats.estimated_tokens_avoided, 0);
+    assert_eq!(stats.confirmed_tokens_avoided, 0);
 }

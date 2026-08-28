@@ -14,11 +14,11 @@ use std::thread;
 use std::time::Duration;
 
 use mcp_gateway::{
-    AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
-    EffectClass, EphemeralSecret, EphemeralSecrets, Freshness, FreshnessMetadata,
-    GatewayAuditEvent, GatewayAuditSink, GatewayInputError, GatewayLimits, GatewayRequestContext,
-    LogicalCallId, McpError, McpErrorCode, McpGateway, ProviderCall, ProviderCancellation,
-    ProviderDescriptor, ProviderError, ProviderRegistration, ProviderTool,
+    AuthenticatedStdioRecipientV1, AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1,
+    DeliveryConfirmationSink, EffectClass, EphemeralSecret, EphemeralSecrets, Freshness,
+    FreshnessMetadata, GatewayAuditEvent, GatewayAuditSink, GatewayInputError, GatewayLimits,
+    GatewayRequestContext, LogicalCallId, McpError, McpErrorCode, McpGateway, ProviderCall,
+    ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration, ProviderTool,
     RecipientRetrievalAuthorityV2, RetrievalGrantV2, ReuseDispositionV1, SideEffectClassification,
     StructuredResultCapture, ToolCancellation, ToolDiscovery, ToolExecution,
 };
@@ -1323,11 +1323,12 @@ fn negotiated_delivery_grant_is_same_connection_and_one_use() {
             pending: Vec::new(),
             lines: line_sender,
         };
-        serving_gateway.serve_stdio(
+        serving_gateway.serve_stdio_for_authenticated_recipient_v1(
             &mut reader,
             &mut writer,
             &AuthorizationScopeId::new("scope:delivery-v2").unwrap(),
             EphemeralSecrets::empty(),
+            AuthenticatedStdioRecipientV1::issue_for_test("agent", "session", "turn", 0).unwrap(),
         )
     });
 
@@ -1421,7 +1422,7 @@ fn negotiated_delivery_grant_is_same_connection_and_one_use() {
 }
 
 #[test]
-fn unnegotiated_stdio_never_emits_delivery_authority() {
+fn public_stdio_never_emits_delivery_authority_even_when_negotiated() {
     let provider = Arc::new(
         FakeProvider::new("fake", vec![tool("read")])
             .with_result(Ok(json!({"content":[]})))
@@ -1433,9 +1434,10 @@ fn unnegotiated_stdio_never_emits_delivery_authority() {
     )
     .unwrap();
     let input = concat!(
-        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{},\"clientInfo\":{\"name\":\"plain\",\"version\":\"1\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\",\"capabilities\":{\"experimental\":{\"again\":{\"deliveryReceipts\":{\"schemaVersion\":2}}}},\"clientInfo\":{\"name\":\"plain\",\"version\":\"1\"}}}\n",
         "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
-        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"fake.read\",\"arguments\":{}}}\n"
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"fake.read\",\"arguments\":{}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"again/delivery/ack\",\"params\":{}}\n"
     );
     let mut reader = BufReader::new(Cursor::new(input.as_bytes()));
     let mut output = Vec::new();
@@ -1452,9 +1454,13 @@ fn unnegotiated_stdio_never_emits_delivery_authority() {
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 2);
+    assert_eq!(responses.len(), 3);
     assert_eq!(responses[1]["id"], 2);
     assert!(responses[1].get("__again_internal_delivery_v2").is_none());
+    assert_eq!(
+        responses[2]["error"]["data"]["reason"],
+        "unsupported_recipient_authority"
+    );
 }
 
 #[test]
