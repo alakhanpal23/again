@@ -1140,9 +1140,21 @@ impl ExperimentalMcpGatewayV1 {
         let stdin = io::stdin();
         let mut reader = BufReader::new(stdin.lock());
         let mut writer = io::stdout();
+        self.serve_io(&mut reader, &mut writer, authorization_scope)
+    }
+
+    /// Serve one already-authenticated byte transport. This is crate-private
+    /// because transport peer authentication and workspace binding must happen
+    /// before MCP can observe or mutate gateway-owned connection state.
+    pub(crate) fn serve_io<R: std::io::BufRead, W: std::io::Write + Send>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        authorization_scope: &AuthorizationScopeId,
+    ) -> io::Result<()> {
         self.gateway.serve_stdio(
-            &mut reader,
-            &mut writer,
+            reader,
+            writer,
             authorization_scope,
             EphemeralSecrets::default(),
         )

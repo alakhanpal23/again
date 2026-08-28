@@ -96,6 +96,10 @@ enum McpCommand {
     Serve(McpServeArgs),
     /// Print an opt-in Codex or Claude MCP setup plan.
     Setup(McpSetupArgs),
+    /// Run or inspect the opt-in, same-user local gateway daemon.
+    Daemon(McpDaemonArgs),
+    /// Proxy stdio to an authenticated local gateway daemon.
+    Connect(McpConnectArgs),
 }
 
 #[derive(Debug, Args)]
@@ -106,6 +110,46 @@ struct McpServeArgs {
     /// Stable, non-secret local authorization-scope identifier.
     #[arg(long)]
     authorization_scope: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct McpDaemonArgs {
+    #[command(subcommand)]
+    command: McpDaemonCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum McpDaemonCommand {
+    /// Serve workspace-bound MCP connections until an authenticated stop.
+    Serve(McpDaemonServeArgs),
+    /// Query a live daemon without opening an MCP session.
+    Status(McpDaemonWorkspaceArgs),
+    /// Stop a live daemon and close its active MCP sessions.
+    Stop(McpDaemonWorkspaceArgs),
+}
+
+#[derive(Debug, Args)]
+struct McpDaemonServeArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Stable, non-secret local authorization-scope identifier.
+    #[arg(long)]
+    authorization_scope: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct McpDaemonWorkspaceArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct McpConnectArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -490,6 +534,8 @@ pub fn run_cli() -> Result<i32> {
         CommandName::Mcp(args) => match args.command {
             McpCommand::Serve(args) => mcp_serve(args),
             McpCommand::Setup(args) => mcp_setup(args),
+            McpCommand::Daemon(args) => mcp_daemon(args),
+            McpCommand::Connect(args) => mcp_connect(args),
         },
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         CommandName::Exec(args) => execute_pending_call(&args.call),
@@ -806,31 +852,89 @@ fn normalized_args() -> Vec<OsString> {
 }
 
 fn mcp_serve(args: McpServeArgs) -> Result<i32> {
-    let cwd = std::env::current_dir()?;
-    let workspace = match args.workspace {
-        Some(workspace) => fs::canonicalize(&workspace)
-            .with_context(|| format!("resolve MCP workspace {}", workspace.display()))?,
-        None => discover_workspace(&cwd)?,
-    };
-    let authorization_scope = match args.authorization_scope {
-        Some(scope) => crate::mcp_gateway::AuthorizationScopeId::new(scope)?,
-        None => {
-            let mut hasher = Hasher::new();
-            hasher.update(b"again.local-mcp-authorization-scope.v1\0");
-            hasher.update(workspace.as_os_str().as_encoded_bytes());
-            let digest = hasher.finalize().to_hex();
-            crate::mcp_gateway::AuthorizationScopeId::new(format!(
-                "local-workspace:{}",
-                &digest[..24]
-            ))?
-        }
-    };
+    let workspace = resolve_mcp_workspace(args.workspace)?;
+    let authorization_scope =
+        local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
     eprintln!(
         "Again MCP gateway is experimental; only bounded built-in repository reads are reuse-eligible."
     );
     let gateway = ExperimentalMcpGatewayV1::build(&workspace)?;
     gateway.serve_stdio(&authorization_scope)?;
     Ok(0)
+}
+
+fn resolve_mcp_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    match workspace {
+        Some(workspace) => fs::canonicalize(&workspace)
+            .with_context(|| format!("resolve MCP workspace {}", workspace.display())),
+        None => discover_workspace(&cwd),
+    }
+}
+
+fn local_mcp_authorization_scope_v1(
+    workspace: &Path,
+    explicit: Option<String>,
+) -> Result<crate::mcp_gateway::AuthorizationScopeId> {
+    if let Some(scope) = explicit {
+        return Ok(crate::mcp_gateway::AuthorizationScopeId::new(scope)?);
+    }
+    let mut hasher = Hasher::new();
+    hasher.update(b"again.local-mcp-authorization-scope.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize().to_hex();
+    Ok(crate::mcp_gateway::AuthorizationScopeId::new(format!(
+        "local-workspace:{}",
+        &digest[..24]
+    ))?)
+}
+
+#[cfg(unix)]
+fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
+    use crate::agent_gateway_service::{GatewayDaemonV1, daemon_status_v1, stop_daemon_v1};
+
+    match args.command {
+        McpDaemonCommand::Serve(args) => {
+            let workspace = resolve_mcp_workspace(args.workspace)?;
+            let authorization_scope =
+                local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
+            let daemon = GatewayDaemonV1::bind(&workspace, authorization_scope)?;
+            eprintln!(
+                "Again MCP daemon is experimental; socket peers are restricted to the current uid."
+            );
+            daemon.serve()?;
+            Ok(0)
+        }
+        McpDaemonCommand::Status(args) => {
+            let workspace = resolve_mcp_workspace(args.workspace)?;
+            println!("{}", serde_json::to_string(&daemon_status_v1(&workspace)?)?);
+            Ok(0)
+        }
+        McpDaemonCommand::Stop(args) => {
+            let workspace = resolve_mcp_workspace(args.workspace)?;
+            stop_daemon_v1(&workspace)?;
+            println!("{{\"schemaVersion\":1,\"status\":\"stopping\"}}");
+            Ok(0)
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
+    bail!("the local MCP daemon requires Unix peer credentials")
+}
+
+#[cfg(unix)]
+fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
+    let workspace = resolve_mcp_workspace(args.workspace)?;
+    let stream = crate::agent_gateway_service::connect_mcp_v1(&workspace)?;
+    crate::agent_gateway_service::proxy_current_stdio_v1(stream)?;
+    Ok(0)
+}
+
+#[cfg(not(unix))]
+fn mcp_connect(_args: McpConnectArgs) -> Result<i32> {
+    bail!("the local MCP daemon requires Unix peer credentials")
 }
 
 fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
