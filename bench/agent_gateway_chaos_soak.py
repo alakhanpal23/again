@@ -19,6 +19,7 @@ import json
 import math
 import os
 import pathlib
+import platform
 import random
 import selectors
 import shutil
@@ -32,13 +33,18 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, BinaryIO
 
+try:
+    import resource
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts.
+    resource = None  # type: ignore[assignment]
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from bench import agent_gateway_product_e2e as product
 
 
-SCHEMA = "again.agent-gateway-chaos-soak.v2"
+SCHEMA = "again.agent-gateway-chaos-soak.v3"
 MAX_PROCESSES = 32
 MAX_OPERATIONS = 2_000
 MAX_EVIDENCE_BYTES = 1_000_000
@@ -50,6 +56,11 @@ MAX_JSON_NODES = 250_000
 PROCESS_STOP_SECONDS = 2.0
 LEASE_SECONDS = int(product.LEASE_TTL_SECONDS)
 RESULT_ID_LENGTH = 64
+TRANSPORT_FIXTURE_BYTES = 12 * 1024 * 1024
+STDIO_MAX_INFLIGHT = 16
+MAX_CPU_SECONDS = 1_800.0
+MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024
+RUNTIME_SLACK_SECONDS = 45.0
 
 
 class HarnessRefusal(RuntimeError):
@@ -58,6 +69,10 @@ class HarnessRefusal(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+class HarnessUnsupported(HarnessRefusal):
+    """A constrained-host condition, separate from a product or harness failure."""
 
 
 def canonical_json(value: Any) -> bytes:
@@ -435,6 +450,45 @@ class Session:
             raise HarnessRefusal("response_id", "MCP response ID changed")
         return response
 
+    def write_raw(self, raw: bytes) -> None:
+        if not raw or len(raw) > MAX_FRAME_BYTES * 32:
+            raise HarnessRefusal("raw_request_bound", "raw request batch exceeded its bound")
+        with self.lock:
+            try:
+                view = memoryview(raw)
+                while view:
+                    written = os.write(self.stdin.fileno(), view)
+                    if written <= 0:
+                        raise OSError("raw request write made no progress")
+                    view = view[written:]
+            except (BrokenPipeError, OSError) as error:
+                raise HarnessRefusal("server_pipe", "MCP raw request pipe closed") from error
+
+    def read_response(self, timeout: float | None = None) -> dict[str, Any]:
+        with self.lock:
+            return parse_json_rpc_line(
+                self._read_line(self.timeout if timeout is None else timeout)
+            )
+
+    def require_no_response(self, timeout: float) -> None:
+        selector: selectors.BaseSelector | None = None
+        try:
+            selector = selectors.DefaultSelector()
+            selector.register(self.stdout, selectors.EVENT_READ)
+            if selector.select(timeout):
+                raise HarnessRefusal(
+                    "partial_frame_executed",
+                    "MCP server responded before a partial frame was terminated",
+                )
+        except OSError as error:
+            raise HarnessUnsupported(
+                "host_resource_exhausted",
+                "host resources prevented partial-frame polling",
+            ) from error
+        finally:
+            if selector is not None:
+                selector.close()
+
     def notify(self, method: str) -> None:
         with self.lock:
             try:
@@ -499,6 +553,7 @@ class Session:
             raise HarnessRefusal("session_cleanup", type(first_error).__name__) from first_error
         return {
             "argv": list(self.argv),
+            "pid": self.process.pid,
             "return_code": self.process.returncode,
             "process_group": group,
             "stderr_bytes": len(self.stderr_capture),
@@ -516,6 +571,13 @@ def _valid_result_id(value: Any) -> bool:
 
 def _clean_exit_code(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
+def _cleanup_absent(value: Mapping[str, Any]) -> bool:
+    process_group = value.get("process_group")
+    return isinstance(process_group, dict) and process_group.get(
+        "absent_after_cleanup"
+    ) is True
 
 
 def _event_counts(scenario: Mapping[str, Any]) -> Mapping[str, Any]:
@@ -651,15 +713,109 @@ def derive_false_hits(report: Mapping[str, Any]) -> tuple[int, list[dict[str, An
     return sum(bool(case["false_hit"]) for case in cases), cases
 
 
-def _open_fd_snapshot(maximum: int = 4096) -> dict[int, tuple[int, int, int]]:
+def _open_fd_snapshot() -> dict[int, tuple[int, int, int]]:
     result: dict[int, tuple[int, int, int]] = {}
-    for descriptor in range(maximum):
+    descriptor_root = next(
+        (candidate for candidate in (pathlib.Path("/proc/self/fd"), pathlib.Path("/dev/fd"))
+         if candidate.is_dir()),
+        None,
+    )
+    if descriptor_root is None:
+        raise HarnessUnsupported(
+            "fd_accounting_unsupported",
+            "host exposes neither /proc/self/fd nor /dev/fd",
+        )
+    try:
+        descriptors = sorted(
+            int(item.name) for item in descriptor_root.iterdir() if item.name.isdigit()
+        )
+    except OSError as error:
+        raise HarnessUnsupported(
+            "fd_accounting_unsupported", "host file descriptors cannot be enumerated"
+        ) from error
+    for descriptor in descriptors:
         try:
             metadata = os.fstat(descriptor)
         except OSError:
             continue
         result[descriptor] = (metadata.st_dev, metadata.st_ino, metadata.st_mode)
     return result
+
+
+def _descendant_snapshot() -> dict[int, tuple[int, int]]:
+    if os.name != "posix":
+        raise HarnessUnsupported(
+            "process_accounting_unsupported", "exact descendant accounting requires POSIX"
+        )
+    ps = next(
+        (candidate for candidate in ("/bin/ps", "/usr/bin/ps") if pathlib.Path(candidate).is_file()),
+        None,
+    )
+    if ps is None:
+        raise HarnessUnsupported(
+            "process_accounting_unsupported", "a fixed local ps executable is unavailable"
+        )
+    try:
+        completed = subprocess.run(
+            [ps, "-axo", "pid=,ppid=,pgid=,comm="],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise HarnessUnsupported(
+            "process_accounting_unsupported", "host process inventory is unavailable"
+        ) from error
+    if completed.returncode != 0 or len(completed.stdout) > 8 * 1024 * 1024:
+        raise HarnessUnsupported(
+            "process_accounting_unsupported", "host process inventory is invalid"
+        )
+    rows: dict[int, tuple[int, int, str]] = {}
+    try:
+        for raw in completed.stdout.decode("utf-8", errors="strict").splitlines():
+            fields = raw.strip().split(None, 3)
+            if len(fields) != 4:
+                continue
+            pid, parent, group = (int(fields[index]) for index in range(3))
+            rows[pid] = (parent, group, fields[3])
+    except (UnicodeDecodeError, ValueError) as error:
+        raise HarnessUnsupported(
+            "process_accounting_unsupported", "host process inventory cannot be parsed"
+        ) from error
+    descendants: dict[int, tuple[int, int]] = {}
+    frontier = {os.getpid()}
+    while frontier:
+        children = {
+            pid
+            for pid, (parent, _, command) in rows.items()
+            if parent in frontier and not command.endswith("/ps") and command != "ps"
+        }
+        for pid in children:
+            parent, group, _ = rows[pid]
+            descendants[pid] = (parent, group)
+        frontier = children
+    return descendants
+
+
+def _resource_snapshot() -> dict[str, float | int]:
+    if resource is None:
+        raise HarnessUnsupported(
+            "resource_metrics_unsupported", "CPU and RSS accounting is unavailable"
+        )
+    own = resource.getrusage(resource.RUSAGE_SELF)
+    children = resource.getrusage(resource.RUSAGE_CHILDREN)
+
+    def rss_bytes(value: float) -> int:
+        return int(value) if sys.platform == "darwin" else int(value * 1024)
+
+    return {
+        "self_cpu_seconds": own.ru_utime + own.ru_stime,
+        "child_cpu_seconds": children.ru_utime + children.ru_stime,
+        "self_max_rss_bytes": rss_bytes(own.ru_maxrss),
+        "child_max_rss_bytes": rss_bytes(children.ru_maxrss),
+    }
 
 
 def _source_identity(root: pathlib.Path) -> str:
@@ -787,6 +943,20 @@ def _fixture(root: pathlib.Path) -> pathlib.Path:
     repo = root / "exact-probe-repository"
     repo.mkdir(mode=0o700)
     (repo / "README.md").write_text("chaos fixture\n", encoding="utf-8")
+    scope = repo / "scope"
+    scope.mkdir(mode=0o700)
+    tail = b"\nTOKEN_DUPLICATE_ID\nTOKEN_QUEUE_SATURATION\nTOKEN_DISCONNECT\n"
+    fill = b"abcdefghijklmnopqrstuvwxyz0123456789\n"
+    file_bytes = TRANSPORT_FIXTURE_BYTES // 4
+    for index in range(4):
+        suffix = tail if index == 3 else b"\n"
+        with (scope / f"transport-{index}.txt").open("xb") as output:
+            remaining = file_bytes - len(suffix)
+            while remaining:
+                block = fill[: min(remaining, len(fill))]
+                output.write(block)
+                remaining -= len(block)
+            output.write(suffix)
     environment = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(root / "git-home"),
@@ -833,6 +1003,7 @@ def _exact_probe(
     root: pathlib.Path,
     concurrency: int,
     operations: int,
+    rng: random.Random,
 ) -> dict[str, Any]:
     repo = _fixture(root)
     state = root / "exact-probe-state"
@@ -846,8 +1017,12 @@ def _exact_probe(
             sessions.append(session)
             session.handshake()
 
-        def call(index: int) -> str:
-            session = sessions[index % len(sessions)]
+        schedule = [index % concurrency for index in range(operations)]
+        rng.shuffle(schedule)
+
+        def call(item: tuple[int, int]) -> str:
+            index, session_index = item
+            session = sessions[session_index]
             response = session.request(
                 f"probe-{index}",
                 "tools/call",
@@ -868,7 +1043,7 @@ def _exact_probe(
             return str(identifier)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            result_ids = list(executor.map(call, range(operations)))
+            result_ids = list(executor.map(call, enumerate(schedule)))
     except BaseException as error:
         active_error = error
         raise
@@ -896,14 +1071,373 @@ def _exact_probe(
         raise HarnessRefusal("probe_argv", "exact probe launched an unexpected argv")
     if any(not _clean_exit_code(item.get("return_code")) for item in cleanup):
         raise HarnessRefusal("probe_shutdown", "exact probe server did not exit cleanly")
+    if any(not _cleanup_absent(item) for item in cleanup):
+        raise HarnessRefusal("probe_cleanup", "exact probe left an owned process group")
     return {
         "operations": operations,
         "sessions": concurrency,
         "unique_result_ids": len(set(result_ids)),
         "result_id": result_ids[0],
         "result_sha256": sha256_bytes(canonical_json({"text": "chaos fixture\n"})),
+        "schedule_sha256": sha256_bytes(canonical_json(schedule)),
         "cleanup": cleanup,
     }
+
+
+def _tool_frame(request_id: str, pattern: str) -> bytes:
+    return canonical_json(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "repo.search",
+                "arguments": {"pattern": pattern, "path": "scope", "maxResults": 50},
+            },
+        }
+    )
+
+
+def _require_error(
+    response: Mapping[str, Any], expected_id: Any, code: int, message: str
+) -> None:
+    if response != {
+        "jsonrpc": "2.0",
+        "id": expected_id,
+        "error": {"code": code, "message": message},
+    }:
+        raise HarnessRefusal(
+            "transport_error_mismatch", "MCP transport refusal bytes changed"
+        )
+
+
+def _bounded_file_hash(path: pathlib.Path, maximum: int = 256 * 1024 * 1024) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise HarnessRefusal("store_file_open", "store file could not be opened safely") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum:
+            raise HarnessRefusal("store_file_invalid", "store file is not a bounded regular file")
+        digest = hashlib.sha256()
+        total = 0
+        while block := os.read(descriptor, 1024 * 1024):
+            total += len(block)
+            if total > maximum:
+                raise HarnessRefusal("store_file_oversized", "store file exceeded its bound")
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    if total != before.st_size or _stat_identity(before) != _stat_identity(after):
+        raise HarnessRefusal("store_file_changed", "store file changed while it was hashed")
+    return digest.hexdigest()
+
+
+def _corrupt_store_header(path: pathlib.Path) -> dict[str, str]:
+    before = _bounded_file_hash(path)
+    flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise HarnessRefusal("store_file_open", "store file could not be opened for corruption") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size < 16:
+            raise HarnessRefusal("store_file_invalid", "store header is unavailable")
+        original = os.pread(descriptor, 16, 0)
+        if len(original) != 16:
+            raise HarnessRefusal("store_file_invalid", "store header is truncated")
+        corrupted = bytes([original[0] ^ 0xFF]) + original[1:]
+        if os.pwrite(descriptor, corrupted, 0) != len(corrupted):
+            raise HarnessRefusal("store_corruption_failed", "store corruption write was short")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    after = _bounded_file_hash(path)
+    if after == before:
+        raise HarnessRefusal("store_corruption_failed", "store corruption changed no bytes")
+    return {"before_sha256": before, "corrupted_sha256": after}
+
+
+def _transport_chaos_probe(
+    binary: pathlib.Path,
+    root: pathlib.Path,
+    repo: pathlib.Path,
+    rng: random.Random,
+) -> dict[str, Any]:
+    state = root / "transport-chaos-state"
+    sessions: list[Session] = []
+    closed: set[int] = set()
+    cleanup: list[dict[str, Any]] = []
+
+    def start(label: str) -> Session:
+        session = Session(binary, repo, state, label, timeout=10.0)
+        sessions.append(session)
+        return session
+
+    def finish(session: Session, require_zero: bool = True) -> dict[str, Any]:
+        evidence = session.close()
+        closed.add(id(session))
+        cleanup.append(evidence)
+        if require_zero and not _clean_exit_code(evidence.get("return_code")):
+            raise HarnessRefusal("transport_shutdown", "MCP transport probe did not exit cleanly")
+        return evidence
+
+    active_error: BaseException | None = None
+    try:
+        primary = start("transport-primary")
+        primary.handshake()
+
+        partial = canonical_json(
+            {"jsonrpc": "2.0", "id": "partial-frame", "method": "ping"}
+        )
+        cut = rng.randrange(1, len(partial) - 1)
+        primary.write_raw(partial[:cut])
+        primary.require_no_response(0.05)
+        primary.write_raw(partial[cut:])
+        partial_response = primary.read_response()
+        if partial_response != {
+            "jsonrpc": "2.0",
+            "id": "partial-frame",
+            "result": {},
+        }:
+            raise HarnessRefusal("partial_frame_result", "split frame response changed")
+
+        deep = b"[" * 49 + b"0" + b"]" * 49 + b"\n"
+        malformed_cases = [
+            (
+                "malformed",
+                b'{"jsonrpc":"2.0",]\n',
+                -32700,
+                "invalid JSON",
+            ),
+            (
+                "duplicate_key",
+                b'{"jsonrpc":"2.0","id":"first","id":"second","method":"ping"}\n',
+                -32700,
+                "invalid JSON",
+            ),
+            ("deep_json", deep, -32021, "JSON input limit exceeded"),
+            (
+                "oversized_frame",
+                b"x" * (1_048_576 + 1) + b"\n",
+                -32021,
+                "JSON input limit exceeded",
+            ),
+        ]
+        rng.shuffle(malformed_cases)
+        malformed_results: dict[str, str] = {}
+        for name, frame, code, message in malformed_cases:
+            primary.write_raw(frame)
+            response = primary.read_response()
+            _require_error(response, None, code, message)
+            malformed_results[name] = sha256_bytes(canonical_json(response))
+
+        duplicate_frame = _tool_frame("duplicate-inflight", "TOKEN_DUPLICATE_ID")
+        primary.write_raw(duplicate_frame + duplicate_frame)
+        duplicate_responses = [primary.read_response(), primary.read_response()]
+        duplicate_errors = [
+            response
+            for response in duplicate_responses
+            if response.get("error", {}).get("code") == -32600
+        ]
+        duplicate_successes = [
+            response for response in duplicate_responses if isinstance(response.get("result"), dict)
+        ]
+        if len(duplicate_errors) != 1 or len(duplicate_successes) != 1:
+            raise HarnessRefusal(
+                "duplicate_id_not_refused", "in-flight duplicate ID was not refused exactly once"
+            )
+        _require_error(
+            duplicate_errors[0],
+            "duplicate-inflight",
+            -32600,
+            "request id is already in flight",
+        )
+        duplicate_observation = product.result_without_reference(
+            duplicate_successes[0]["result"]
+        )
+
+        saturation_ids = [f"saturation-{index:02d}" for index in range(STDIO_MAX_INFLIGHT + 1)]
+        primary.write_raw(
+            b"".join(
+                _tool_frame(request_id, "TOKEN_QUEUE_SATURATION")
+                for request_id in saturation_ids
+            )
+        )
+        saturation_responses = [
+            primary.read_response(timeout=20.0) for _ in saturation_ids
+        ]
+        if {response.get("id") for response in saturation_responses} != set(saturation_ids):
+            raise HarnessRefusal("saturation_ids", "queue saturation response IDs diverged")
+        saturation_errors = [
+            response
+            for response in saturation_responses
+            if response.get("error", {}).get("code") == -32021
+        ]
+        saturation_successes = [
+            response
+            for response in saturation_responses
+            if isinstance(response.get("result"), dict)
+        ]
+        if (
+            len(saturation_errors) != 1
+            or len(saturation_successes) != STDIO_MAX_INFLIGHT
+            or any(
+                response.get("error") is not None
+                and response.get("error", {}).get("code") != -32021
+                for response in saturation_responses
+            )
+        ):
+            raise HarnessRefusal(
+                "queue_saturation_mismatch", "real stdio queue did not refuse exactly one call"
+            )
+        _require_error(
+            saturation_errors[0],
+            saturation_errors[0]["id"],
+            -32021,
+            "stdio in-flight limit reached",
+        )
+        observations = {
+            canonical_json(product.result_without_reference(response["result"]))
+            for response in saturation_successes
+        }
+        if len(observations) != 1:
+            raise HarnessRefusal(
+                "saturation_output_divergence", "successful saturated calls changed output"
+            )
+        saturation_observation = next(iter(observations))
+        primary_health = primary.request(
+            "transport-health", "tools/call", {"name": "repo.read", "arguments": {"path": "README.md"}}
+        )
+        if not isinstance(primary_health.get("result"), dict):
+            raise HarnessRefusal("transport_health", "transport session did not recover")
+        finish(primary)
+
+        disconnect = start("transport-disconnect")
+        disconnect.handshake()
+        disconnect.write_raw(_tool_frame("disconnect-active", "TOKEN_DISCONNECT"))
+        disconnect.stdin.close()
+        disconnect_evidence = finish(disconnect)
+
+        restarted = start("transport-restarted")
+        restarted.handshake()
+        restart_result = restarted.request(
+            "restart-health",
+            "tools/call",
+            {"name": "repo.read", "arguments": {"path": "README.md"}},
+        )
+        if not isinstance(restart_result.get("result"), dict):
+            raise HarnessRefusal("disconnect_restart", "restart after disconnect was unhealthy")
+        restart_observation = product.result_without_reference(restart_result["result"])
+        finish(restarted)
+
+        database = state / "again.sqlite"
+        backup = root / "transport-store-backup"
+        shutil.copytree(state, backup, copy_function=shutil.copy2)
+        corruption = _corrupt_store_header(database)
+        corrupted = start("transport-store-corrupted")
+        corruption_refusal: HarnessRefusal | None = None
+        try:
+            corrupted.handshake()
+        except HarnessRefusal as error:
+            corruption_refusal = error
+        if corruption_refusal is None:
+            raise HarnessRefusal(
+                "store_corruption_accepted", "MCP server accepted a corrupted SQLite store"
+            )
+        try:
+            corrupted.process.wait(timeout=PROCESS_STOP_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise HarnessRefusal(
+                "store_corruption_hung", "corrupted store did not fail within the bound"
+            ) from error
+        corrupted_evidence = finish(corrupted, require_zero=False)
+        if not isinstance(corrupted_evidence.get("return_code"), int) or corrupted_evidence[
+            "return_code"
+        ] == 0:
+            raise HarnessRefusal(
+                "store_corruption_status", "corrupted store did not return a failure status"
+            )
+
+        shutil.rmtree(state)
+        shutil.copytree(backup, state, copy_function=shutil.copy2)
+        restored_database_sha = _bounded_file_hash(state / "again.sqlite")
+        if restored_database_sha != corruption["before_sha256"]:
+            raise HarnessRefusal("store_restore_hash", "restored store hash changed")
+        recovered = start("transport-store-recovered")
+        recovered.handshake()
+        recovered_result = recovered.request(
+            "store-recovery-health",
+            "tools/call",
+            {"name": "repo.read", "arguments": {"path": "README.md"}},
+        )
+        if not isinstance(recovered_result.get("result"), dict):
+            raise HarnessRefusal("store_recovery", "restored store was unhealthy")
+        recovered_observation = product.result_without_reference(recovered_result["result"])
+        if recovered_observation != restart_observation:
+            raise HarnessRefusal("store_recovery_output", "restored store output changed")
+        finish(recovered)
+
+        schedule = {
+            "malformed_order": [item[0] for item in malformed_cases],
+            "partial_split": cut,
+            "saturation_ids": saturation_ids,
+        }
+        return {
+            "partial_frame": {
+                "split_offset": cut,
+                "response_sha256": sha256_bytes(canonical_json(partial_response)),
+            },
+            "malformed_frames": malformed_results,
+            "duplicate_id": {
+                "refusals": 1,
+                "successes": 1,
+                "observation_sha256": sha256_bytes(canonical_json(duplicate_observation)),
+            },
+            "queue_saturation": {
+                "admitted": len(saturation_successes),
+                "refused": len(saturation_errors),
+                "limit": STDIO_MAX_INFLIGHT,
+                "observation_sha256": sha256_bytes(saturation_observation),
+                "exact_status_equality": True,
+                "exact_output_equality": True,
+            },
+            "disconnect_restart": {
+                "disconnect_return_code": disconnect_evidence["return_code"],
+                "restart_observation_sha256": sha256_bytes(
+                    canonical_json(restart_observation)
+                ),
+            },
+            "store_corruption_recovery": {
+                **corruption,
+                "corruption_refusal_code": corruption_refusal.code,
+                "corruption_return_code": corrupted_evidence["return_code"],
+                "restored_sha256": restored_database_sha,
+                "strategy": "verified_backup_restore",
+                "exact_output_equality": True,
+            },
+            "schedule_sha256": sha256_bytes(canonical_json(schedule)),
+            "cleanup": cleanup,
+            "sessions": len(cleanup),
+        }
+    except BaseException as error:
+        active_error = error
+        raise
+    finally:
+        cleanup_error: BaseException | None = None
+        for session in reversed(sessions):
+            if id(session) in closed:
+                continue
+            try:
+                cleanup.append(session.close())
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
+        if cleanup_error is not None and active_error is None:
+            raise cleanup_error
 
 
 def write_exclusive(path: pathlib.Path, payload: bytes) -> None:
@@ -988,6 +1522,8 @@ def run(
         concurrency = 2 if mode == "quick" else 4
     if concurrency not in {1, 2, 4, 8, 16, 32} or concurrency > MAX_PROCESSES:
         raise HarnessRefusal("concurrency", "concurrency must be one of 1,2,4,8,16,32")
+    if isinstance(seed, bool) or not 0 <= seed < 2**64:
+        raise HarnessRefusal("seed", "seed must be an unsigned 64-bit integer")
     if not product.LEASE_TTL_SECONDS + product.RECOVERY_GRACE_SECONDS < duration <= 3600:
         raise HarnessRefusal("duration", "duration must exceed lease recovery and be at most one hour")
     operations = min(
@@ -996,12 +1532,16 @@ def run(
     )
     source_root = pathlib.Path(__file__).resolve().parents[1]
     source_sha = _source_identity(source_root)
+    rng = random.Random(seed)
     baseline_fds = _open_fd_snapshot()
+    baseline_descendants = _descendant_snapshot()
+    baseline_resources = _resource_snapshot()
     started = time.monotonic_ns()
     root = pathlib.Path(tempfile.mkdtemp(prefix="again-chaos-soak-v2-")).resolve()
     root.chmod(0o700)
     process_cleanup: list[dict[str, Any]] = []
     product_temp_paths: set[pathlib.Path] = set()
+    product_process_ids: list[int] = []
     try:
         outer_pin = pin_binary_exact(binary.resolve(strict=True), root / "pinned" / "again")
         with _harden_product_harness() as hardening:
@@ -1016,6 +1556,7 @@ def run(
                 raise HarnessRefusal(error.code, str(error)) from error
             for process_group in sorted(hardening["process_groups"]):
                 process_cleanup.append(terminate_owned_process_group(process_group))
+            product_process_ids = sorted(int(value) for value in hardening["process_groups"])
             revalidations = int(hardening["revalidations"]())
         post_product_pin = revalidate_pinned_binary(outer_pin)
         for argv in product_report.get("commands", []):
@@ -1040,7 +1581,15 @@ def run(
             raise HarnessRefusal("false_hit_reconciliation", "independent false-hit count diverged")
         if false_hits:
             raise HarnessRefusal("false_hit", f"observed {false_hits} false-hit scenarios")
-        exact_probe = _exact_probe(outer_pin.executable_path, root, concurrency, operations)
+        exact_probe = _exact_probe(
+            outer_pin.executable_path, root, concurrency, operations, rng
+        )
+        transport_probe = _transport_chaos_probe(
+            outer_pin.executable_path,
+            root,
+            root / "exact-probe-repository",
+            rng,
+        )
         post_probe_pin = revalidate_pinned_binary(outer_pin)
         binary_evidence = {
             "requested_path": str(outer_pin.requested_path),
@@ -1057,6 +1606,8 @@ def run(
     root_absent = not root.exists()
     product_temp_absent = all(not path.exists() for path in product_temp_paths)
     final_fds = _open_fd_snapshot()
+    final_descendants = _descendant_snapshot()
+    final_resources = _resource_snapshot()
     leaked_fds = sorted(
         descriptor
         for descriptor, identity in final_fds.items()
@@ -1067,17 +1618,69 @@ def run(
         resource_leaks.append({"kind": "file_descriptors", "count": len(leaked_fds)})
     if any(not item["absent_after_cleanup"] for item in process_cleanup):
         resource_leaks.append({"kind": "process_groups"})
+    unexpected_descendants = sorted(set(final_descendants) - set(baseline_descendants))
+    if unexpected_descendants or final_descendants != baseline_descendants:
+        resource_leaks.append(
+            {"kind": "descendant_processes", "count": len(unexpected_descendants)}
+        )
     if not root_absent or not product_temp_absent:
         resource_leaks.append({"kind": "temporary_state"})
     if resource_leaks:
         raise HarnessRefusal("resource_leak", json.dumps(resource_leaks, sort_keys=True))
     elapsed = (time.monotonic_ns() - started) / 1_000_000_000
+    if elapsed > duration + RUNTIME_SLACK_SECONDS:
+        raise HarnessRefusal("runtime_bound", "chaos run exceeded its wall-clock bound")
+    self_cpu = float(final_resources["self_cpu_seconds"]) - float(
+        baseline_resources["self_cpu_seconds"]
+    )
+    child_cpu = float(final_resources["child_cpu_seconds"]) - float(
+        baseline_resources["child_cpu_seconds"]
+    )
+    total_cpu = self_cpu + child_cpu
+    max_rss = max(
+        int(final_resources["self_max_rss_bytes"]),
+        int(final_resources["child_max_rss_bytes"]),
+    )
+    if total_cpu > MAX_CPU_SECONDS:
+        raise HarnessRefusal("cpu_bound", "chaos run exceeded its CPU bound")
+    if max_rss > MAX_RSS_BYTES:
+        raise HarnessRefusal("rss_bound", "chaos run exceeded its RSS bound")
+    exact_process_ids = [int(item["pid"]) for item in exact_probe["cleanup"]]
+    transport_process_ids = [int(item["pid"]) for item in transport_probe["cleanup"]]
+    if any(not _cleanup_absent(item) for item in transport_probe["cleanup"]):
+        raise HarnessRefusal(
+            "transport_cleanup", "transport probe left an owned process group"
+        )
+    owned_process_ids = product_process_ids + exact_process_ids + transport_process_ids
+    if len(set(owned_process_ids)) != len(owned_process_ids):
+        raise HarnessRefusal("process_identity_reused", "owned process IDs were not unique")
+    product_timings = product_report.get("timings")
+    if not isinstance(product_timings, dict):
+        raise HarnessRefusal("product_measurements", "product timings are missing")
+    scenario_latencies: dict[str, dict[str, float]] = {}
+    for scenario_name, scenario in product_report["scenarios"].items():
+        if not isinstance(scenario, dict):
+            raise HarnessRefusal("product_measurements", "product scenario is invalid")
+        measurements = {
+            key: round(float(value), 6)
+            for key, value in scenario.items()
+            if key.endswith("_ms")
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        }
+        if measurements:
+            scenario_latencies[scenario_name] = measurements
     evidence: dict[str, Any] = {
         "schema": SCHEMA,
         "classification": {"type": "pass", "code": "all_exact_scenarios_reconciled"},
         "mode": mode,
         "source_git_sha": source_sha,
         "harness_sha256": sha256_bytes(pathlib.Path(__file__).read_bytes()),
+        "platform": {
+            "machine": platform.machine(),
+            "release": platform.release(),
+            "system": platform.system(),
+        },
         "binary": binary_evidence,
         "seed": seed,
         "concurrency": concurrency,
@@ -1089,12 +1692,36 @@ def run(
         "scenario_reconciliation": false_hit_cases,
         "false_hit_count": false_hits,
         "exact_probe": exact_probe,
+        "transport_chaos": transport_probe,
+        "product_measurements": {
+            "provider_executions": int(product_report["provider_execution_count"]),
+            "processes": len(product_process_ids),
+            "scenario_latencies_ms": scenario_latencies,
+            "timings": product_timings,
+        },
         "resource_observation": {
             "baseline_open_fds": len(baseline_fds),
             "final_open_fds": len(final_fds),
             "new_or_changed_open_fds": len(leaked_fds),
-            "owned_process_groups": len(process_cleanup) + int(exact_probe["sessions"]),
+            "owned_processes": len(owned_process_ids),
+            "owned_process_ids": owned_process_ids,
+            "owned_process_groups": len(owned_process_ids),
             "all_owned_process_groups_absent": True,
+            "baseline_descendants": len(baseline_descendants),
+            "final_descendants": len(final_descendants),
+            "unexpected_descendants": len(unexpected_descendants),
+            "cpu": {
+                "self_seconds": round(self_cpu, 6),
+                "child_seconds": round(child_cpu, 6),
+                "total_seconds": round(total_cpu, 6),
+                "limit_seconds": MAX_CPU_SECONDS,
+            },
+            "rss": {
+                "self_max_bytes": int(final_resources["self_max_rss_bytes"]),
+                "child_max_bytes": int(final_resources["child_max_rss_bytes"]),
+                "observed_max_bytes": max_rss,
+                "limit_bytes": MAX_RSS_BYTES,
+            },
             "temporary_state_absent": root_absent and product_temp_absent,
             "resource_leaks": resource_leaks,
         },
@@ -1109,7 +1736,9 @@ def run(
             "Proxy variables are not a kernel-enforced network sandbox.",
             "The hash authenticates observed executable bytes, not publisher identity or build provenance.",
             "Resource observations cover this harness process, its owned process groups, and its temporary roots.",
+            "SQLite recovery is proven only for an exact verified backup restore, not automatic repair.",
         ],
+        "unsupported_environmental_conditions": [],
     }
     evidence["report_sha256"] = sha256_bytes(canonical_json(evidence))
     if output is not None:
@@ -1126,6 +1755,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--json-out", type=pathlib.Path)
     arguments = parser.parse_args(argv)
+    output = (
+        arguments.json_out.resolve(strict=False)
+        if arguments.json_out is not None
+        else None
+    )
+    if output is not None and (output.exists() or output.is_symlink()):
+        parser.error(f"refusing to replace existing evidence: {output}")
     try:
         evidence = run(
             arguments.again_binary,
@@ -1133,12 +1769,59 @@ def main(argv: Sequence[str] | None = None) -> int:
             concurrency=arguments.concurrency,
             duration=arguments.duration,
             seed=arguments.seed,
-            output=arguments.json_out,
+            output=output,
         )
+        exit_code = 0
+    except HarnessUnsupported as error:
+        evidence = {
+            "schema": SCHEMA,
+            "classification": {"type": "unsupported_environment", "code": error.code},
+            "message": str(error),
+            "requested": {
+                "again_binary": str(arguments.again_binary),
+                "concurrency": arguments.concurrency,
+                "duration": arguments.duration,
+                "mode": arguments.mode,
+                "seed": arguments.seed,
+            },
+            "harness_sha256": sha256_bytes(pathlib.Path(__file__).read_bytes()),
+            "platform": {
+                "machine": platform.machine(),
+                "release": platform.release(),
+                "system": platform.system(),
+            },
+            "unsupported_environmental_conditions": [error.code],
+        }
+        evidence["report_sha256"] = sha256_bytes(canonical_json(evidence))
+        if output is not None:
+            write_exclusive(output, canonical_json(evidence))
+        exit_code = 2
     except HarnessRefusal as error:
-        parser.error(f"{error.code}: {error}")
+        evidence = {
+            "schema": SCHEMA,
+            "classification": {"type": "failure", "code": error.code},
+            "message": str(error),
+            "requested": {
+                "again_binary": str(arguments.again_binary),
+                "concurrency": arguments.concurrency,
+                "duration": arguments.duration,
+                "mode": arguments.mode,
+                "seed": arguments.seed,
+            },
+            "harness_sha256": sha256_bytes(pathlib.Path(__file__).read_bytes()),
+            "platform": {
+                "machine": platform.machine(),
+                "release": platform.release(),
+                "system": platform.system(),
+            },
+            "unsupported_environmental_conditions": [],
+        }
+        evidence["report_sha256"] = sha256_bytes(canonical_json(evidence))
+        if output is not None:
+            write_exclusive(output, canonical_json(evidence))
+        exit_code = 3
     print(json.dumps(evidence, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

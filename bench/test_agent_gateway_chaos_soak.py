@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import pathlib
@@ -241,17 +243,82 @@ class ChaosSoakHarnessTests(unittest.TestCase):
         self.assertTrue(evidence["absent_after_cleanup"])
 
     def test_bounds_and_network_nonclaim_are_explicit(self) -> None:
+        self.assertEqual(harness.SCHEMA, "again.agent-gateway-chaos-soak.v3")
         self.assertEqual(harness.MAX_PROCESSES, 32)
         self.assertEqual(harness.LEASE_SECONDS, 30)
+        self.assertEqual(harness.STDIO_MAX_INFLIGHT, 16)
+        self.assertGreater(harness.TRANSPORT_FIXTURE_BYTES, 8 * 1024 * 1024)
+        self.assertGreater(harness.MAX_CPU_SECONDS, 0)
+        self.assertGreater(harness.MAX_RSS_BYTES, 0)
         self.assertEqual(
             json.loads(harness.canonical_json({"mode": "quick"})), {"mode": "quick"}
         )
+
+    def test_transport_frames_and_exact_refusals_are_stable(self) -> None:
+        frame = harness._tool_frame("request-7", "TOKEN")
+        value = json.loads(frame)
+        self.assertTrue(frame.endswith(b"\n"))
+        self.assertEqual(value["id"], "request-7")
+        self.assertEqual(value["params"]["arguments"]["pattern"], "TOKEN")
+        response = {
+            "jsonrpc": "2.0",
+            "id": "request-7",
+            "error": {"code": -32021, "message": "bounded refusal"},
+        }
+        harness._require_error(response, "request-7", -32021, "bounded refusal")
+        with self.assertRaises(harness.HarnessRefusal) as refused:
+            harness._require_error(response, "request-7", -32021, "changed")
+        self.assertEqual(refused.exception.code, "transport_error_mismatch")
+
+    def test_invalid_seed_is_refused_before_environmental_work(self) -> None:
+        for seed in (-1, 2**64, True):
+            with self.subTest(seed=seed), self.assertRaises(
+                harness.HarnessRefusal
+            ) as refused:
+                harness.run(pathlib.Path("/does/not/exist"), seed=seed)
+            self.assertEqual(refused.exception.code, "seed")
+
+    def test_main_separates_unsupported_environment_from_failure(self) -> None:
+        cases = (
+            (
+                harness.HarnessUnsupported("missing_procfs", "unsupported host"),
+                2,
+                "unsupported_environment",
+            ),
+            (harness.HarnessRefusal("false_hit", "product mismatch"), 3, "failure"),
+        )
+        for error, expected_status, classification in cases:
+            with self.subTest(classification=classification), mock.patch.object(
+                harness, "run", side_effect=error
+            ):
+                stream = io.StringIO()
+                with contextlib.redirect_stdout(stream):
+                    status = harness.main(["--again-binary", "/missing/again"])
+                evidence = json.loads(stream.getvalue())
+            self.assertEqual(status, expected_status)
+            self.assertEqual(evidence["classification"]["type"], classification)
+            self.assertEqual(
+                evidence["unsupported_environmental_conditions"],
+                ["missing_procfs"] if classification == "unsupported_environment" else [],
+            )
 
     def test_probe_cleanup_requires_exact_zero_exit(self) -> None:
         self.assertTrue(harness._clean_exit_code(0))
         for value in (1, -9, True, None, "0"):
             with self.subTest(value=value):
                 self.assertFalse(harness._clean_exit_code(value))
+        self.assertTrue(
+            harness._cleanup_absent(
+                {"process_group": {"absent_after_cleanup": True}}
+            )
+        )
+        for value in (
+            {},
+            {"absent_after_cleanup": True},
+            {"process_group": {"absent_after_cleanup": False}},
+        ):
+            with self.subTest(cleanup=value):
+                self.assertFalse(harness._cleanup_absent(value))
 
 
 if __name__ == "__main__":
