@@ -325,6 +325,15 @@ class AgentGatewayAlphaTrialTest(unittest.TestCase):
             harness.validate_trial(trial, inspect_local=True)
         self.assertEqual(refused.exception.code, "repository_not_canonical")
 
+    def test_symlinked_binary_is_refused_before_hashing(self) -> None:
+        linked_binary = self.root / "again-link"
+        linked_binary.symlink_to(self.again_binary)
+        trial = self.trial()
+        trial["release"]["binary_path"] = str(linked_binary)
+        with self.assertRaises(harness.TrialRefusal) as refused:
+            harness.validate_trial(trial, inspect_local=True)
+        self.assertEqual(refused.exception.code, "again_binary_not_canonical")
+
     def test_strict_json_rejects_duplicate_keys_nonfinite_and_deep_input(self) -> None:
         duplicate = self.root / "duplicate.json"
         duplicate.write_text('{"schema":"x","schema":"y"}', encoding="utf-8")

@@ -117,6 +117,20 @@ def sha256_file(path: pathlib.Path, maximum: int) -> str:
     return digest.hexdigest()
 
 
+def _sha256_descriptor(descriptor: int, maximum: int) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        block = os.read(descriptor, min(1024 * 1024, maximum + 1 - total))
+        if not block:
+            break
+        total += len(block)
+        if total > maximum:
+            raise TrialRefusal("file_oversized", "descriptor exceeds its byte bound")
+        digest.update(block)
+    return digest.hexdigest(), total
+
+
 def harness_sha256() -> str:
     return sha256_file(pathlib.Path(__file__).resolve(), MAX_INPUT_BYTES)
 
@@ -373,15 +387,27 @@ def observe_repository(root_text: str, expected_git_sha: str) -> dict[str, Any]:
 
 def _observe_executable(path_text: str, expected_sha256: str, name: str) -> dict[str, Any]:
     path = _canonical_existing_path(pathlib.Path(path_text), name)
-    metadata = path.stat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-        raise TrialRefusal(f"{name}_not_regular", f"{name} must be a single-link regular file")
-    if metadata.st_size <= 0 or metadata.st_size > MAX_EXECUTABLE_BYTES:
-        raise TrialRefusal(f"{name}_size", f"{name} is outside its byte bound")
-    actual = sha256_file(path, MAX_EXECUTABLE_BYTES)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise TrialRefusal(f"{name}_open_failed", f"{name} could not be opened safely") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise TrialRefusal(f"{name}_not_regular", f"{name} must be a single-link regular file")
+        if before.st_size <= 0 or before.st_size > MAX_EXECUTABLE_BYTES:
+            raise TrialRefusal(f"{name}_size", f"{name} is outside its byte bound")
+        actual, total = _sha256_descriptor(descriptor, MAX_EXECUTABLE_BYTES)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    stable_fields = ("st_dev", "st_ino", "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in stable_fields) or total != before.st_size:
+        raise TrialRefusal(f"{name}_changed", f"{name} changed while being hashed")
     if actual != expected_sha256:
         raise TrialRefusal(f"{name}_sha256_mismatch", f"{name} SHA-256 changed")
-    return {"canonical_path": str(path), "sha256": actual, "size": metadata.st_size}
+    return {"canonical_path": str(path), "sha256": actual, "size": before.st_size}
 
 
 def trial_specification() -> dict[str, Any]:
@@ -793,6 +819,10 @@ def validate_trial(value: Any, *, inspect_local: bool) -> tuple[dict[str, Any], 
         "delivery_confirmed_tokens_saved": 0,
         "delivery_savings_reason": "no_authenticated_production_receipt_verifier",
     }
+    if inspect_local:
+        final_repository = observe_repository(repository_path, repository_git_sha)
+        if final_repository["identity_sha256"] != repository_identity:
+            raise TrialRefusal("repository_identity_mismatch", "repository changed during validation")
     return normalized_trial, summary, classification
 
 
