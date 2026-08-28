@@ -4696,6 +4696,36 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
 }
 
 fn verify_reasoning_metrics_accounting_v1(connection: &Connection) -> Result<()> {
+    let mut result_columns = connection.prepare("SELECT name FROM pragma_table_info('results')")?;
+    let result_columns = result_columns
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let has_complete_result_shape = [
+        "id",
+        "exit_code",
+        "stdout_digest",
+        "stdout_bytes",
+        "stderr_digest",
+        "stderr_bytes",
+        "quarantined",
+    ]
+    .iter()
+    .all(|required| result_columns.iter().any(|actual| actual == required));
+    if !has_complete_result_shape {
+        // Early legacy test/fixture databases may have the historical minimal
+        // results table. Migration creates the gateway tables empty, so there
+        // is no reasoning accounting to authenticate. Never waive the shape
+        // requirement once any gateway result exists.
+        let has_gateway_result: bool =
+            connection.query_row("SELECT EXISTS(SELECT 1 FROM gateway_results)", [], |row| {
+                row.get(0)
+            })?;
+        if has_gateway_result {
+            bail!("Again reasoning delivery accounting requires the complete result schema");
+        }
+        return Ok(());
+    }
+
     // Receipts are evidence, not authority by identifier. Every counted row
     // must still bind to the exact ready, unquarantined result bytes.
     let invalid_exact_receipt: bool = connection.query_row(
@@ -5801,6 +5831,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(exists, 1);
+        assert_eq!(store.gateway_stats().unwrap(), GatewayStats::default());
     }
 
     #[test]
