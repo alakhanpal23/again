@@ -77,6 +77,20 @@ fn context(call: &str) -> GatewayRequestContext {
     )
 }
 
+fn wait_for_descendant_pid(path: &Path) -> i32 {
+    for _ in 0..200 {
+        if let Ok(text) = fs::read_to_string(path) {
+            if let Ok(pid) = text.trim().parse::<i32>() {
+                if pid > 0 {
+                    return pid;
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("upstream attempt did not publish a valid descendant identity");
+}
+
 fn invoke(gateway: &McpGateway, request: Value, secrets: EphemeralSecrets<'_>) -> Value {
     serde_json::from_slice(
         &gateway
@@ -310,13 +324,10 @@ fn gateway_cancellation_reaches_the_exact_attempt_and_reaps_descendants() {
     initialize(&gateway);
     let worker_gateway = Arc::clone(&gateway);
     let worker = thread::spawn(move || call(&worker_gateway, EphemeralSecrets::empty()));
-    for _ in 0..200 {
-        if pid_file.exists() {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert!(pid_file.exists(), "upstream attempt did not start");
+    // File creation precedes the fixture's PID write. Waiting for existence
+    // alone races an empty regular file on Linux and does not prove that the
+    // descendant identity is ready for the subsequent cleanup assertion.
+    let descendant = wait_for_descendant_pid(&pid_file);
     let cancellation = gateway.process_bytes(
         &serde_json::to_vec(&json!({
             "jsonrpc": "2.0",
@@ -330,11 +341,6 @@ fn gateway_cancellation_reaches_the_exact_attempt_and_reaps_descendants() {
     assert!(cancellation.is_none());
     let response = worker.join().unwrap();
     assert_eq!(response["error"]["code"], -32800);
-    let descendant = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
     for _ in 0..100 {
         if unsafe { libc::kill(descendant, 0) } != 0 {
             return;
