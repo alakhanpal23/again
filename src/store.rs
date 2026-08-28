@@ -2493,17 +2493,11 @@ impl Store {
         if !agent_context.is_valid() || agent_context.compaction_epoch > i64::MAX as u64 {
             bail!(GatewayRefusalReason::InvalidAgentContext.as_str());
         }
-        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "DELETE FROM gateway_delivery_receipts WHERE session_id = ?1 AND turn_id = ?2 AND agent_id = ?3 AND compaction_generation = ?4",
-            params![
-                agent_context.session_id,
-                agent_context.turn_id,
-                agent_context.agent_id,
-                agent_context.compaction_epoch
-            ],
-        )?;
-        let cleared = transaction.execute(
+        // This legacy, caller-constructed context may clear only the old
+        // presentation cache. Recipient acknowledgements are immutable here:
+        // deleting them will require a future consuming compaction authority
+        // bound to the authenticated transport scope and generation change.
+        let cleared = self.conn.execute(
             "DELETE FROM gateway_deliveries WHERE session_id = ?1 AND turn_id = ?2 AND agent_id = ?3 AND compaction_epoch = ?4",
             params![
                 agent_context.session_id,
@@ -2511,9 +2505,8 @@ impl Store {
                 agent_context.agent_id,
                 agent_context.compaction_epoch
             ],
-        )? as u64;
-        transaction.commit()?;
-        Ok(cleared)
+        )?;
+        Ok(cleared as u64)
     }
 
     pub fn gateway_stats(&self) -> Result<GatewayStats> {
@@ -3684,8 +3677,46 @@ fn verify_gateway_schema_v8(connection: &Connection) -> Result<()> {
         ),
         (
             "gateway_delivery_receipts",
+            "CHECK(length(challenge_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(session_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(turn_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(agent_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts",
             "CHECK(compaction_generation >= 0)",
         ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(call_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(gateway_result_id) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(result_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(stdout_digest) = 64)",
+        ),
+        ("gateway_delivery_receipts", "CHECK(stdout_bytes >= 0)"),
+        (
+            "gateway_delivery_receipts",
+            "CHECK(length(stderr_digest) = 64)",
+        ),
+        ("gateway_delivery_receipts", "CHECK(stderr_bytes >= 0)"),
         (
             "gateway_delivery_receipts",
             "FOREIGN KEY (gateway_result_id) REFERENCES gateway_results",
@@ -4745,6 +4776,39 @@ mod tests {
     }
 
     #[test]
+    fn version_eight_verifier_requires_every_delivery_receipt_constraint() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let original: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_delivery_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let weakened = original.replace("CHECK(length(call_digest) = 64)", "");
+        assert_ne!(weakened, original);
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=ON;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'gateway_delivery_receipts'",
+                [&weakened],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=OFF;")
+            .unwrap();
+        assert!(verify_gateway_schema_v8(&store.conn).is_err());
+    }
+
+    #[test]
     fn repository_scoped_store_is_self_ignored_without_overwriting_user_file() {
         let temp = TempDir::new().unwrap();
         let root = temp.path().join(".again");
@@ -4908,6 +4972,90 @@ mod tests {
         assert!(!store.was_delivered("s", "root-turn", &result.id).unwrap());
         store.mark_delivered("s", "root-turn", &result.id).unwrap();
         assert!(store.was_delivered("s", "root-turn", &result.id).unwrap());
+    }
+
+    #[test]
+    fn acknowledged_delivery_persists_once_and_legacy_clear_cannot_erase_receipt() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let mut store = Store::open(temp.path()).unwrap();
+        let state_digest = "a".repeat(64);
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: "b".repeat(64),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest("delivery-test-v1"),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now_ms(),
+                valid_until_ms: now_ms() + 60_000,
+            },
+            dependencies: Vec::new(),
+        })
+        .unwrap();
+        let acquisition = store.acquire_gateway_call(&binding, "test-owner").unwrap();
+        let lease_id = match acquisition {
+            GatewayCallAcquisition::Leader { lease_id, .. } => lease_id,
+            other => panic!("expected delivery test leader, got {other:?}"),
+        };
+        assert_eq!(
+            store
+                .start_gateway_execution(&lease_id, "test-owner")
+                .unwrap(),
+            GatewayExecutionStart::Started
+        );
+        let result = store
+            .insert_result(
+                binding.request_digest(),
+                b"delivered bytes",
+                b"delivery diagnostic",
+                0,
+                1,
+                "delivery-test-v1",
+                "{}",
+            )
+            .unwrap();
+        let gateway_result_id = match store.complete_gateway_call(&lease_id, &result.id).unwrap() {
+            GatewayCompletion::Completed {
+                gateway_result_id, ..
+            } => gateway_result_id,
+            other => panic!("expected delivery test completion, got {other:?}"),
+        };
+        let confirmation = crate::mcp_gateway::confirmed_delivery_for_test_v1(
+            "delivery_test_challenge",
+            &gateway_result_id,
+            result.exit_code,
+            &result.stdout_digest,
+            result.stdout_bytes,
+            &result.stderr_digest,
+            result.stderr_bytes,
+        );
+        assert!(store.confirm_gateway_delivery_v1(&confirmation).unwrap());
+        assert!(!store.confirm_gateway_delivery_v1(&confirmation).unwrap());
+
+        let context = GatewayAgentContext::new("test-session", "test-turn", "test-agent", 0);
+        assert_eq!(store.clear_gateway_deliveries(&context).unwrap(), 1);
+        let receipts: u64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM gateway_delivery_receipts WHERE challenge_id = 'delivery_test_challenge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy: u64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM gateway_deliveries WHERE session_id = 'test-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            receipts, 1,
+            "legacy context must not delete receipt authority"
+        );
+        assert_eq!(legacy, 0);
     }
 
     #[test]

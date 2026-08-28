@@ -524,7 +524,34 @@ fn delivery_and_cleanup_accounting_are_isolated() {
             )
             .unwrap();
     }
+    connection
+        .execute(
+            "INSERT INTO gateway_delivery_receipts (challenge_id, authorization_scope_digest, connection_digest, session_id, turn_id, agent_id, compaction_generation, call_digest, gateway_result_id, result_digest, exact_status, stdout_digest, stdout_bytes, stderr_digest, stderr_bytes, acknowledged_ms) VALUES ('immutable-receipt', ?1, ?2, ?3, ?4, ?5, 0, ?6, ?7, ?7, 0, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                digest("scope"),
+                digest("connection"),
+                first.session_id,
+                first.turn_id,
+                first.agent_id,
+                digest("call"),
+                gateway_result_id,
+                result.stdout_digest,
+                result.stdout_bytes,
+                result.stderr_digest,
+                result.stderr_bytes,
+                now_ms(),
+            ],
+        )
+        .unwrap();
     assert_eq!(store.clear_gateway_deliveries(&first).unwrap(), 1);
+    let receipt_count: u64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM gateway_delivery_receipts WHERE challenge_id = 'immutable-receipt'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(receipt_count, 1);
     connection
         .execute(
             "INSERT INTO gateway_events (event_type, estimated_tokens_avoided, created_ms) VALUES ('old_test_event', 0, 0)",

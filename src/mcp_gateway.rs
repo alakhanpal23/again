@@ -41,7 +41,7 @@ struct StdioActivationV1 {
 }
 
 #[derive(Clone)]
-pub(crate) struct AuthenticatedStdioRecipientV1 {
+struct AuthenticatedStdioRecipientV1 {
     agent_id: String,
     session_id: String,
     turn_id: String,
@@ -49,11 +49,10 @@ pub(crate) struct AuthenticatedStdioRecipientV1 {
 }
 
 impl AuthenticatedStdioRecipientV1 {
-    #[allow(
-        dead_code,
-        reason = "reserved for a composition layer that authenticates MCP recipient identity"
-    )]
-    pub(crate) fn new(
+    /// Test-only issuance. Production has no recipient-authentication
+    /// composition yet, so no production caller can construct this value.
+    #[cfg(test)]
+    fn issue_for_test(
         agent_id: &str,
         session_id: &str,
         turn_id: &str,
@@ -549,6 +548,47 @@ impl ConfirmedDeliveryV1 {
 
     pub(crate) const fn binding(&self) -> &DeliveryBindingV1 {
         &self.binding
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    dead_code,
+    reason = "used by the crate unit suite; path-included integration copies do not compose Store"
+)]
+pub(crate) fn confirmed_delivery_for_test_v1(
+    challenge_id: &str,
+    gateway_result_id: &str,
+    exact_status: i32,
+    stdout_digest: &str,
+    stdout_bytes: u64,
+    stderr_digest: &str,
+    stderr_bytes: u64,
+) -> ConfirmedDeliveryV1 {
+    let streams = DeliveryStreamsV1::new(
+        exact_status,
+        stdout_digest,
+        stdout_bytes,
+        stderr_digest,
+        stderr_bytes,
+    )
+    .expect("test delivery stream identity is valid");
+    let binding = DeliveryBindingV1::issue(
+        "1".repeat(64),
+        "2".repeat(64),
+        "test-agent".to_owned(),
+        "test-session".to_owned(),
+        "test-turn".to_owned(),
+        "3".repeat(64),
+        gateway_result_id.to_owned(),
+        streams,
+        0,
+    )
+    .expect("test delivery binding is valid");
+    ConfirmedDeliveryV1 {
+        challenge_id: challenge_id.to_owned(),
+        gateway_result_id: gateway_result_id.to_owned(),
+        binding,
     }
 }
 
@@ -1299,11 +1339,8 @@ impl McpGateway {
         )
     }
 
-    #[allow(
-        dead_code,
-        reason = "reserved for a composition layer that authenticates MCP recipient identity"
-    )]
-    pub(crate) fn serve_stdio_for_authenticated_recipient_v1<R: BufRead, W: Write + Send>(
+    #[cfg(test)]
+    fn serve_stdio_for_authenticated_recipient_v1<R: BufRead, W: Write + Send>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -3075,7 +3112,8 @@ mod delivery_receipt_tests {
         generation: u64,
     ) -> StdioConnectionV1 {
         let recipient =
-            AuthenticatedStdioRecipientV1::new(agent, session, turn, generation).unwrap();
+            AuthenticatedStdioRecipientV1::issue_for_test(agent, session, turn, generation)
+                .unwrap();
         StdioConnectionV1 {
             session_id: physical_session,
             connection_digest: delivery_digest_v1(
@@ -3101,6 +3139,31 @@ mod delivery_receipt_tests {
 
     fn acknowledgement(challenge: &DeliveryChallengeV1) -> DeliveryAcknowledgementV1 {
         serde_json::from_value(serde_json::to_value(challenge).unwrap()).unwrap()
+    }
+
+    fn assert_mutated_acknowledgement_refuses(
+        mutate: impl FnOnce(&mut Value),
+        expected: DeliveryAuthorityRefusalV1,
+    ) {
+        let connection = authenticated_connection(17, "scope", "agent", "session", "turn", 4);
+        let mut ledger = DeliveryLedgerV1::default();
+        let challenge = ledger
+            .issue(
+                &connection,
+                &JsonRpcId::String("mutated".into()),
+                [4; 32],
+                captured_delivery(),
+            )
+            .unwrap();
+        let mut value = serde_json::to_value(challenge).unwrap();
+        mutate(&mut value);
+        let acknowledgement = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            ledger
+                .acknowledge(&connection, acknowledgement)
+                .unwrap_err(),
+            expected
+        );
     }
 
     #[test]
@@ -3229,7 +3292,8 @@ mod delivery_receipt_tests {
         let gateway = McpGateway::new(Vec::new(), GatewayLimits::default())
             .unwrap()
             .with_delivery_confirmation_sink(Arc::new(NoopDeliveryConfirmationSink));
-        let recipient = AuthenticatedStdioRecipientV1::new("agent", "session", "turn", 0).unwrap();
+        let recipient =
+            AuthenticatedStdioRecipientV1::issue_for_test("agent", "session", "turn", 0).unwrap();
         let mut input = Cursor::new(Vec::<u8>::new());
         let mut output = Vec::new();
         gateway
@@ -3242,5 +3306,83 @@ mod delivery_receipt_tests {
             )
             .unwrap();
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn every_acknowledgement_binding_dimension_is_checked() {
+        type BindingMutationCaseV1 = (fn(&mut Value), DeliveryAuthorityRefusalV1);
+        let cases: Vec<BindingMutationCaseV1> = vec![
+            (
+                |value| value["acknowledgement_token"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::MalformedAcknowledgement,
+            ),
+            (
+                |value| value["binding"]["authorization_scope_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongAuthorizationScope,
+            ),
+            (
+                |value| value["binding"]["agent_id"] = json!("other-agent"),
+                DeliveryAuthorityRefusalV1::WrongRecipient,
+            ),
+            (
+                |value| value["binding"]["session_id"] = json!("other-session"),
+                DeliveryAuthorityRefusalV1::WrongRecipient,
+            ),
+            (
+                |value| value["binding"]["turn_id"] = json!("other-turn"),
+                DeliveryAuthorityRefusalV1::WrongTurn,
+            ),
+            (
+                |value| value["binding"]["call_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongCall,
+            ),
+            (
+                |value| value["binding"]["result_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongResult,
+            ),
+            (
+                |value| value["binding"]["streams"]["stdout_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongStreams,
+            ),
+            (
+                |value| value["binding"]["compaction_generation"] = json!(5),
+                DeliveryAuthorityRefusalV1::StaleCompactionGeneration,
+            ),
+            (
+                |value| value["binding"]["connection_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongConnection,
+            ),
+        ];
+        for (mutate, expected) in cases {
+            assert_mutated_acknowledgement_refuses(mutate, expected);
+        }
+    }
+
+    #[test]
+    fn pending_delivery_capacity_is_exact_and_bounded() {
+        let connection = authenticated_connection(23, "scope", "agent", "session", "turn", 0);
+        let mut ledger = DeliveryLedgerV1::default();
+        for index in 0..MAX_OUTSTANDING_DELIVERY_CHALLENGES_V1 {
+            ledger
+                .issue(
+                    &connection,
+                    &JsonRpcId::Number(index as i64),
+                    [index as u8; 32],
+                    captured_delivery(),
+                )
+                .unwrap();
+        }
+        assert_eq!(ledger.pending.len(), MAX_OUTSTANDING_DELIVERY_CHALLENGES_V1);
+        assert_eq!(
+            ledger
+                .issue(
+                    &connection,
+                    &JsonRpcId::String("over-capacity".into()),
+                    [0xff; 32],
+                    captured_delivery(),
+                )
+                .unwrap_err(),
+            DeliveryAuthorityRefusalV1::ChallengeCapacity
+        );
     }
 }
