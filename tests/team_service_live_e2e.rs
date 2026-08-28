@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(all(feature = "team-alpha", target_os = "macos"))]
 
 //! Manual live-system proof for the encrypted team-cache path.
 //!
