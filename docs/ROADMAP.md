@@ -57,16 +57,25 @@ pre-alpha until these gates close:
    payments, and unknown tools continue to bypass reuse.
 
 Current checkpoint: item 1 is closed for the built-in tools, and acquisition
-events are now only candidates; exact-hit and in-flight-join statistics are
+events are only candidates; exact-hit and in-flight-join statistics are
 promoted after one-use proof consumption, result loading, and repository
-revalidation. The retained production-binary harness closes the deterministic
-portion of item 5 with 11/11 scenarios, four real MCP processes, 12 provider
-executions, and zero false hits at source
-`bb896396dc768cf6704bbb3380de6be012588556`. The separate real-agent harness
-passed its offline dry run against Codex 0.150.1 and Claude 2.1.220, but all 16
-networked/paid paired runs remain manual and unexecuted. Item 2 remains open for
-bytes, tokens, and time: full-result delivery has no authenticated recipient
-receipt, so those savings must not be claimed from route counters.
+revalidation. Receipt protocol/storage scaffolding exists, but item 2 remains
+open because production stdio has no transport-authenticated recipient issuer.
+No compact delivery, bytes, tokens, or time savings are claimed. A phase-two
+retrieval/compact candidate was rejected because it exposed caller-asserted
+recipient identity, allowed legacy context clearing to erase receipts, collided
+with schema version 9, and bound compact accounting to the full-result streams
+rather than the exact compact presentation.
+
+The retained release-binary harness closes the deterministic portion of item 5
+with 8/8 scenarios, four real MCP processes, 12 provider executions, three
+avoided executions (two exact hits and one delivered join), and zero false hits
+at source `f1a646b60867de1cb688869df71c0425e5f92307`. The same binary passed the
+isolated onboarding and quick chaos harnesses. Three explicit clean real
+repositories passed, while the overall corpus correctly remains `non_pass`
+until a local Go repository is supplied. The real-agent harness passed only its
+offline dry run against Codex 0.150.1 and Claude 2.1.220; all 16 networked/paid
+paired runs remain manual and unexecuted.
 
 ## Critical path
 

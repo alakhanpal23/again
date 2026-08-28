@@ -32,7 +32,7 @@ apply across the local, Linux trace-backed, and team paths:
 
 | Plane | Current implementation | Missing authority/product step |
 |---|---|---|
-| Agent tool-call gateway | Experimental bounded MCP stdio server with canonical tool translation, descriptor-retained repository authority, built-in `repo.read`/`repo.search`, SQLite/CAS coordination, post-proof exact reuse/in-flight joining, bounded queues, session cancellation, crash recovery, corruption quarantine, workspace-bound setup, a retained production-binary E2E, and an offline real-agent harness | general provider proxying, authenticated full-result retrieval, delivery receipts and safe compact references, semantic-candidate validation, live Codex/Claude task-quality evaluation, release-binary evidence, and production qualification |
+| Agent tool-call gateway | Experimental bounded MCP stdio server with canonical tool translation, descriptor-retained repository authority, built-in `repo.read`/`repo.search`, SQLite/CAS coordination, post-proof exact reuse/in-flight joining, bounded queues, session cancellation, crash recovery, corruption quarantine, workspace-bound setup, recipient-bound receipt protocol/storage scaffolding, retained release-binary product/onboarding/chaos evidence, a partial real-repository corpus, and an offline real-agent plan | transport-authenticated recipient issuance, recipient-bound full retrieval and exact compact-presentation receipts, general provider proxying, semantic-candidate validation, a complete four-language corpus, live Codex/Claude task-quality evaluation, and production qualification |
 | Explicit local reads | Working macOS MVP with strict policy, exact executable/profile checks, SQLite/CAS, double-run admission, complete-stream replay, explicit references, and reversible Codex skill | audited multi-host profile registry, signed distribution, and outside-alpha evidence |
 | Linux snapshots | Descriptor-stable enumeration, charged materialization, canonical workspace/runtime-tree publication, reopened-child binding, a descriptor-bound `.venv/bin/python` checkpoint, and a bounded two-publication structural runtime inventory exist internally | model complete loader search/cache/preload/hwcaps semantics, content-addressed snapshot identity, live connector composition, and `SnapshotProvider` |
 | Linux isolation | Private-root, bounded scratch/procfs, descriptor scrub, credential normalization, capability elimination, authenticated child-only continuation, Landlock, terminal seccomp, and fixed ptrace diagnostics exist as hidden leaves; a command-free connector now consumes the real runtime checkpoint, concrete isolation-ready child, and split stdio ownership with terminate/reap-before-drain cancellation | compose descriptor-selected workspace/runtime and `/dev`, Landlock, workload seccomp, supervisor, command release, foreground presentation, and one cleanup owner in a real provisioned launch |
@@ -63,6 +63,16 @@ bound into the request, and the current server does not expose retrieval by
 result ID. AI or embedding systems may suggest work for deterministic checking
 in a future layer, but cannot issue an exact-hit, join, replay, or delivery
 permit.
+
+The receipt protocol and durable exact-receipt table are structural groundwork,
+not a current production delivery channel. Normal stdio sessions have unknown
+recipient identity, and the authenticated recipient issuer and route remain
+test-only. Receipts therefore cannot yet authorize retrieval or compact output,
+and compact bytes/tokens/time remain zero and unclaimed. The rejected phase-two
+candidate attempted to expose caller-asserted recipient identity, erase receipts
+through a legacy context, reuse schema version 9 for incompatible shapes, and
+account against underlying full-result streams rather than the compact bytes
+actually presented. None of those changes is on main.
 
 ## Target Linux authority chain
 
