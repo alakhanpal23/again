@@ -2960,7 +2960,9 @@ impl Store {
         stats.delivery_confirmed_bytes_omitted = confirmed_bytes_omitted;
         stats.confirmed_tokens_avoided = confirmed_tokens_avoided;
         stats.estimated_tokens_avoided = confirmed_tokens_avoided;
-        stats.false_hit_quarantines = stats.stale_or_divergent_quarantines;
+        // Quarantine is a prevented serve, not evidence that a false result
+        // reached a caller. No durable false-hit event exists in schema v10.
+        stats.false_hit_quarantines = 0;
         stats.estimated_execution_time_saved_ms = estimated_execution_time_saved_ms;
         Ok(stats)
     }

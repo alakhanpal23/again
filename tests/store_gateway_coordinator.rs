@@ -273,15 +273,18 @@ fn authenticated_observation_is_shared_across_agents_but_not_authorization_scope
             "recipient-agent",
         ))
         .unwrap();
-    assert_eq!(shared.known_facts.len(), 1);
-    assert_eq!(shared.completed_observations.len(), 1);
+    assert_eq!(shared.known_facts().len(), 1);
+    assert_eq!(shared.completed_observations().len(), 1);
     assert_eq!(
-        shared.known_facts[0].sources()[0].result_id(),
+        shared.known_facts()[0].sources()[0].result_id(),
         gateway_result_id
     );
-    assert_eq!(shared.evidence_metrics.investigations_avoided, 1);
-    assert_eq!(shared.evidence_metrics.provider_calls_avoided, 1);
-    assert_eq!(shared.evidence_metrics.estimated_execution_time_saved_ms, 7);
+    assert_eq!(shared.evidence_metrics().investigations_avoided, 1);
+    assert_eq!(shared.evidence_metrics().provider_calls_avoided, 1);
+    assert_eq!(
+        shared.evidence_metrics().estimated_execution_time_saved_ms,
+        7
+    );
 
     let isolated = store
         .reasoning_context_v1(&reasoning_query(
@@ -291,10 +294,10 @@ fn authenticated_observation_is_shared_across_agents_but_not_authorization_scope
             "isolated-agent",
         ))
         .unwrap();
-    assert!(isolated.known_facts.is_empty());
-    assert!(isolated.completed_observations.is_empty());
-    assert_eq!(isolated.explicit_unknowns.len(), 1);
-    assert_eq!(isolated.evidence_metrics.provider_calls_avoided, 0);
+    assert!(isolated.known_facts().is_empty());
+    assert!(isolated.completed_observations().is_empty());
+    assert_eq!(isolated.explicit_unknowns().len(), 1);
+    assert_eq!(isolated.evidence_metrics().provider_calls_avoided, 0);
 }
 
 #[test]
@@ -312,9 +315,9 @@ fn reasoning_read_model_reports_other_agent_work_and_verified_failure() {
     );
 
     let inflight = store.reasoning_context_v1(&query).unwrap();
-    assert_eq!(inflight.inflight_work.len(), 1);
-    assert_eq!(inflight.evidence_metrics.inflight_joins, 1);
-    assert_eq!(inflight.evidence_metrics.provider_calls_avoided, 1);
+    assert_eq!(inflight.inflight_work().len(), 1);
+    assert_eq!(inflight.evidence_metrics().inflight_joins, 1);
+    assert_eq!(inflight.evidence_metrics().provider_calls_avoided, 1);
 
     assert!(matches!(
         store
@@ -323,10 +326,10 @@ fn reasoning_read_model_reports_other_agent_work_and_verified_failure() {
         GatewayFailure::Failed { .. }
     ));
     let failed = store.reasoning_context_v1(&query).unwrap();
-    assert_eq!(failed.failed_approaches.len(), 1);
-    assert_eq!(failed.explicit_unknowns.len(), 1);
-    assert!(failed.known_facts.is_empty());
-    assert_eq!(failed.evidence_metrics.provider_calls_avoided, 0);
+    assert_eq!(failed.failed_approaches().len(), 1);
+    assert_eq!(failed.explicit_unknowns().len(), 1);
+    assert!(failed.known_facts().is_empty());
+    assert_eq!(failed.evidence_metrics().provider_calls_avoided, 0);
 }
 
 #[test]

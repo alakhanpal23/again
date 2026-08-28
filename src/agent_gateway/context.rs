@@ -1118,17 +1118,17 @@ pub struct ReasoningEvidenceMetricsV1 {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningBriefInputV1 {
-    pub scope: ReasoningScopeV1,
-    pub recipient: ReasoningRecipientV1,
-    pub known_facts: Vec<ReasoningFactV1>,
-    pub invalidated_facts: Vec<InvalidatedReasoningFactV1>,
-    pub explicit_unknowns: Vec<ReasoningUnknownV1>,
-    pub completed_observations: Vec<CompletedReasoningObservationV1>,
-    pub inflight_work: Vec<InflightReasoningWorkV1>,
-    pub failed_approaches: Vec<FailedReasoningApproachV1>,
-    pub suggested_next_tool_calls: Vec<SuggestedReasoningToolCallV1>,
-    pub route_decisions: Vec<ReasoningRouteDecisionV1>,
-    pub evidence_metrics: ReasoningEvidenceMetricsV1,
+    pub(crate) scope: ReasoningScopeV1,
+    pub(crate) recipient: ReasoningRecipientV1,
+    pub(crate) known_facts: Vec<ReasoningFactV1>,
+    pub(crate) invalidated_facts: Vec<InvalidatedReasoningFactV1>,
+    pub(crate) explicit_unknowns: Vec<ReasoningUnknownV1>,
+    pub(crate) completed_observations: Vec<CompletedReasoningObservationV1>,
+    pub(crate) inflight_work: Vec<InflightReasoningWorkV1>,
+    pub(crate) failed_approaches: Vec<FailedReasoningApproachV1>,
+    pub(crate) suggested_next_tool_calls: Vec<SuggestedReasoningToolCallV1>,
+    pub(crate) route_decisions: Vec<ReasoningRouteDecisionV1>,
+    pub(crate) evidence_metrics: ReasoningEvidenceMetricsV1,
 }
 
 impl fmt::Debug for ReasoningBriefInputV1 {
@@ -1138,7 +1138,7 @@ impl fmt::Debug for ReasoningBriefInputV1 {
 }
 
 impl ReasoningBriefInputV1 {
-    pub fn empty(scope: ReasoningScopeV1, recipient: ReasoningRecipientV1) -> Self {
+    pub(crate) fn empty(scope: ReasoningScopeV1, recipient: ReasoningRecipientV1) -> Self {
         Self {
             scope,
             recipient,
@@ -1152,6 +1152,42 @@ impl ReasoningBriefInputV1 {
             route_decisions: Vec::new(),
             evidence_metrics: ReasoningEvidenceMetricsV1::default(),
         }
+    }
+
+    pub fn known_facts(&self) -> &[ReasoningFactV1] {
+        &self.known_facts
+    }
+
+    pub fn invalidated_facts(&self) -> &[InvalidatedReasoningFactV1] {
+        &self.invalidated_facts
+    }
+
+    pub fn explicit_unknowns(&self) -> &[ReasoningUnknownV1] {
+        &self.explicit_unknowns
+    }
+
+    pub fn completed_observations(&self) -> &[CompletedReasoningObservationV1] {
+        &self.completed_observations
+    }
+
+    pub fn inflight_work(&self) -> &[InflightReasoningWorkV1] {
+        &self.inflight_work
+    }
+
+    pub fn failed_approaches(&self) -> &[FailedReasoningApproachV1] {
+        &self.failed_approaches
+    }
+
+    pub fn suggested_next_tool_calls(&self) -> &[SuggestedReasoningToolCallV1] {
+        &self.suggested_next_tool_calls
+    }
+
+    pub fn route_decisions(&self) -> &[ReasoningRouteDecisionV1] {
+        &self.route_decisions
+    }
+
+    pub const fn evidence_metrics(&self) -> &ReasoningEvidenceMetricsV1 {
+        &self.evidence_metrics
     }
 }
 
