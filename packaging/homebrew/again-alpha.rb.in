@@ -1,0 +1,46 @@
+# frozen_string_literal: true
+
+class AgainAlpha < Formula
+  desc "Repository-aware execution memory and tool-call control plane"
+  homepage "https://github.com/alakhanpal23/again"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  SOURCE_COMMIT = "@SOURCE_COMMIT@"
+  CORE_VERSION = "@CORE_VERSION@"
+
+  on_macos do
+    on_arm do
+      url "@AARCH64_APPLE_URL@"
+      sha256 "@AARCH64_APPLE_SHA256@"
+    end
+    on_intel do
+      url "@X86_64_APPLE_URL@"
+      sha256 "@X86_64_APPLE_SHA256@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "@AARCH64_LINUX_URL@"
+      sha256 "@AARCH64_LINUX_SHA256@"
+    end
+    on_intel do
+      url "@X86_64_LINUX_URL@"
+      sha256 "@X86_64_LINUX_SHA256@"
+    end
+  end
+
+  def install
+    bin.install "again"
+  end
+
+  test do
+    assert_match(/\A[0-9a-f]{40}\z/, SOURCE_COMMIT)
+    assert_equal "again #{CORE_VERSION}", shell_output("#{bin}/again --version").strip
+    doctor = shell_output("#{bin}/again doctor --json")
+    assert_match '"profile": "scoped_audited_read_only_v0"', doctor
+    assert_match '"trace_backed_replay": false', doctor
+    assert_match '"seatbelt_used_for_profile": false', doctor
+  end
+end

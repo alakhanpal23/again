@@ -9,8 +9,8 @@ Usage: verify_published_release.sh --version TAG --source-commit SHA
        [--repository OWNER/REPO]
 
 The GitHub CLI must be able to read the release and its public attestations.
-The release must contain exactly the four native archives, source SBOM, and
-SHA256SUMS expected for TAG.
+The release must contain exactly the four native archives, source SBOM,
+SHA256SUMS, and deterministic alpha formula expected for TAG.
 EOF
     exit 2
 }
@@ -85,6 +85,7 @@ downloaded=$temporary/downloaded
 downloaded_sorted=$temporary/downloaded-sorted
 cat > "$expected" <<EOF
 SHA256SUMS
+again-alpha.rb
 again-${version}-aarch64-apple-darwin.tar.gz
 again-${version}-aarch64-unknown-linux-gnu.tar.gz
 again-${version}-source.cdx.json

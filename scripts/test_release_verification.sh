@@ -61,12 +61,17 @@ done
 
 checksum_manifest() {
     if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$assets" && sha256sum again-* > SHA256SUMS)
+        (cd "$assets" && sha256sum "again-${version}-"* > SHA256SUMS)
     else
-        (cd "$assets" && shasum -a 256 again-* > SHA256SUMS)
+        (cd "$assets" && shasum -a 256 "again-${version}-"* > SHA256SUMS)
     fi
 }
 checksum_manifest
+python3 "$repository/packaging/homebrew/generate_formula.py" \
+    --version "$version" \
+    --source-commit "$source_commit" \
+    --checksums "$assets/SHA256SUMS" \
+    --output "$assets/again-alpha.rb"
 
 cat > "$fake_bin/gh" <<'EOF'
 #!/bin/sh
@@ -134,7 +139,7 @@ GH_CALL_LOG=$call_log PATH="$fake_bin:$PATH" \
     > "$fixture/success.out"
 grep -Fx "Verified authenticated Again release $version from alakhanpal23/again" \
     "$fixture/success.out" >/dev/null
-test "$(wc -l < "$call_log" | tr -d ' ')" -eq 6
+test "$(wc -l < "$call_log" | tr -d ' ')" -eq 7
 while IFS= read -r call; do
     for required in \
         "--repo alakhanpal23/again" \
@@ -158,6 +163,7 @@ done < "$call_log"
 published_inventory=$fixture/published-inventory
 cat > "$published_inventory" <<EOF
 SHA256SUMS
+again-alpha.rb
 again-${version}-aarch64-apple-darwin.tar.gz
 again-${version}-aarch64-unknown-linux-gnu.tar.gz
 again-${version}-source.cdx.json
@@ -179,8 +185,8 @@ GH_CALL_LOG=$published_call_log PUBLISHED_VIEW=$published_view \
     > "$fixture/published.out"
 grep -Fx "Verified exact published Again release $version from alakhanpal23/again" \
     "$fixture/published.out" >/dev/null
-test "$(wc -l < "$published_call_log" | tr -d ' ')" -eq 9
-test "$(grep -c '^attestation verify ' "$published_call_log")" -eq 6
+test "$(wc -l < "$published_call_log" | tr -d ' ')" -eq 10
+test "$(grep -c '^attestation verify ' "$published_call_log")" -eq 7
 grep -F "release view $version --repo alakhanpal23/again --json assets,isDraft,isImmutable,isPrerelease,tagName" \
     "$published_call_log" >/dev/null
 grep -F "api repos/alakhanpal23/again/commits/$version --jq .sha" \
@@ -277,6 +283,18 @@ if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-install-calls \
     exit 1
 fi
 test ! -e "$failed_install_destination"
+
+cp "$assets/again-alpha.rb" "$fixture/formula-original.rb"
+printf '\n# untrusted mutation\n' >> "$assets/again-alpha.rb"
+if GH_CALL_LOG=$fixture/mutated-formula-calls PATH="$fake_bin:$PATH" \
+    sh "$repository/scripts/verify_release.sh" \
+    --version "$version" --source-commit "$source_commit" \
+    --artifact-dir "$assets" --repository alakhanpal23/again \
+    > /dev/null 2>&1; then
+    echo "error: verifier accepted mutated Homebrew formula bytes" >&2
+    exit 1
+fi
+cp "$fixture/formula-original.rb" "$assets/again-alpha.rb"
 
 if GH_CALL_LOG=$fixture/missing-source-install-calls \
     PUBLISHED_VIEW=$published_view SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \

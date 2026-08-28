@@ -5,13 +5,15 @@ set -eu
 
 MAX_ASSET_BYTES=67108864
 MAX_CHECKSUM_BYTES=1048576
+MAX_FORMULA_BYTES=131072
 
 usage() {
     cat >&2 <<'EOF'
 Usage: verify_release.sh --version TAG --source-commit SHA --artifact-dir DIR
        [--repository OWNER/REPO]
 
-DIR must contain SHA256SUMS, all four native archives, and the source SBOM.
+DIR must contain SHA256SUMS, all four native archives, the source SBOM, and the
+deterministically generated again-alpha.rb formula.
 The GitHub CLI must be authenticated or otherwise able to read public
 attestations. Verification pins the Again release workflow, tag ref, repository,
 and GitHub-hosted runner provenance.
@@ -148,6 +150,7 @@ again-${version}-x86_64-unknown-linux-gnu.tar.gz
 EOF
 {
     printf '%s\n' SHA256SUMS
+    printf '%s\n' again-alpha.rb
     cat "$expected"
 } > "$expected_inventory"
 
@@ -180,6 +183,15 @@ cmp "$expected" "$actual" >/dev/null || {
     echo "error: checksum manifest does not name the exact release asset set" >&2
     exit 1
 }
+
+formula=$artifact_dir/again-alpha.rb
+bounded_regular_file "$formula" "$MAX_FORMULA_BYTES" "Homebrew alpha formula"
+python3 "$script_dir/../packaging/homebrew/generate_formula.py" \
+    --version "$version" \
+    --source-commit "$source_commit" \
+    --checksums "$manifest" \
+    --verify "$formula"
+verify_attestation "$formula"
 
 while IFS= read -r asset; do
     path=$artifact_dir/$asset

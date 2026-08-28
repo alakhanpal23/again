@@ -273,6 +273,7 @@ else
         printf '%s\n' "$version" false true "$expected_prerelease"
         printf '%s\n' \
             SHA256SUMS \
+            again-alpha.rb \
             "again-${version}-aarch64-apple-darwin.tar.gz" \
             "again-${version}-aarch64-unknown-linux-gnu.tar.gz" \
             "again-${version}-source.cdx.json" \
@@ -337,7 +338,7 @@ awk '
 }
 awk '{ print $2 }' "$parsed_manifest" | LC_ALL=C sort > "$manifest_names"
 if [ -z "$artifact_dir" ]; then
-    sed '1,5d' "$expected_release" > "$tmp/expected-checksum-names"
+    sed '1,6d' "$expected_release" > "$tmp/expected-checksum-names"
     cmp "$tmp/expected-checksum-names" "$manifest_names" >/dev/null 2>&1 || {
         echo "error: checksum manifest does not contain the exact release assets" >&2
         exit 1
