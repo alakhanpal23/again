@@ -5,7 +5,8 @@ set -eu
 
 usage() {
     cat >&2 <<'EOF'
-Usage: verify_published_release.sh --version TAG [--repository OWNER/REPO]
+Usage: verify_published_release.sh --version TAG --source-commit SHA
+       [--repository OWNER/REPO]
 
 The GitHub CLI must be able to read the release and its public attestations.
 The release must contain exactly the four native archives, source SBOM, and
@@ -15,6 +16,7 @@ EOF
 }
 
 version=
+source_commit=
 repository=alakhanpal23/again
 
 while [ "$#" -gt 0 ]; do
@@ -29,6 +31,11 @@ while [ "$#" -gt 0 ]; do
             repository=$2
             shift 2
             ;;
+        --source-commit)
+            [ "$#" -ge 2 ] || usage
+            source_commit=$2
+            shift 2
+            ;;
         -h|--help)
             usage
             ;;
@@ -38,7 +45,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$version" ] || usage
+[ -n "$version" ] && [ -n "$source_commit" ] || usage
 semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
 printf '%s\n' "$version" | grep -Eq "$semver_re" || {
     echo "error: invalid release tag" >&2
@@ -46,6 +53,10 @@ printf '%s\n' "$version" | grep -Eq "$semver_re" || {
 }
 printf '%s\n' "$repository" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || {
     echo "error: invalid GitHub repository" >&2
+    exit 2
+}
+printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
+    echo "error: source commit must be 40 lowercase hexadecimal characters" >&2
     exit 2
 }
 command -v gh >/dev/null 2>&1 || {
@@ -68,7 +79,7 @@ trap 'cleanup 143' TERM
 
 expected=$temporary/expected
 observed=$temporary/observed
-sorted=$temporary/sorted
+published=$temporary/published
 assets=$temporary/assets
 downloaded=$temporary/downloaded
 downloaded_sorted=$temporary/downloaded-sorted
@@ -81,13 +92,26 @@ again-${version}-x86_64-apple-darwin.tar.gz
 again-${version}-x86_64-unknown-linux-gnu.tar.gz
 EOF
 
+case "$version" in
+    *-*) expected_prerelease=true ;;
+    *) expected_prerelease=false ;;
+esac
+{
+    printf '%s\n' "$version" false true "$expected_prerelease"
+    cat "$expected"
+} > "$published"
 gh release view "$version" \
     --repo "$repository" \
-    --json assets \
-    --jq '.assets[].name' > "$observed"
-LC_ALL=C sort "$observed" > "$sorted"
-cmp "$expected" "$sorted" >/dev/null || {
-    echo "error: published release does not contain the exact expected asset inventory" >&2
+    --json assets,isDraft,isImmutable,isPrerelease,tagName \
+    --jq '[.tagName,(.isDraft|tostring),(.isImmutable|tostring),(.isPrerelease|tostring)] + ([.assets[].name] | sort) | .[]' \
+    > "$observed"
+cmp "$published" "$observed" >/dev/null || {
+    echo "error: published release identity, immutability, kind, or inventory is invalid" >&2
+    exit 1
+}
+current_sha=$(gh api "repos/${repository}/commits/${version}" --jq .sha)
+[ "$current_sha" = "$source_commit" ] || {
+    echo "error: published release tag does not resolve to the expected source commit" >&2
     exit 1
 }
 
@@ -110,6 +134,7 @@ cmp "$expected" "$downloaded_sorted" >/dev/null || {
 }
 sh "$script_dir/verify_release.sh" \
     --version "$version" \
+    --source-commit "$source_commit" \
     --artifact-dir "$assets" \
     --repository "$repository"
 

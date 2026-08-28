@@ -8,7 +8,8 @@ MAX_CHECKSUM_BYTES=1048576
 
 usage() {
     cat >&2 <<'EOF'
-Usage: verify_release.sh --version TAG --artifact-dir DIR [--repository OWNER/REPO]
+Usage: verify_release.sh --version TAG --source-commit SHA --artifact-dir DIR
+       [--repository OWNER/REPO]
 
 DIR must contain SHA256SUMS, all four native archives, and the source SBOM.
 The GitHub CLI must be authenticated or otherwise able to read public
@@ -19,6 +20,7 @@ EOF
 }
 
 version=
+source_commit=
 artifact_dir=
 repository=alakhanpal23/again
 
@@ -32,6 +34,11 @@ while [ "$#" -gt 0 ]; do
         --artifact-dir)
             [ "$#" -ge 2 ] || usage
             artifact_dir=$2
+            shift 2
+            ;;
+        --source-commit)
+            [ "$#" -ge 2 ] || usage
+            source_commit=$2
             shift 2
             ;;
         --repository)
@@ -48,7 +55,7 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-[ -n "$version" ] && [ -n "$artifact_dir" ] || usage
+[ -n "$version" ] && [ -n "$source_commit" ] && [ -n "$artifact_dir" ] || usage
 semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
 printf '%s\n' "$version" | grep -Eq "$semver_re" || {
     echo "error: invalid release tag" >&2
@@ -56,6 +63,10 @@ printf '%s\n' "$version" | grep -Eq "$semver_re" || {
 }
 printf '%s\n' "$repository" | grep -Eq '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$' || {
     echo "error: invalid GitHub repository" >&2
+    exit 2
+}
+printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
+    echo "error: source commit must be 40 lowercase hexadecimal characters" >&2
     exit 2
 }
 [ -d "$artifact_dir" ] && [ ! -L "$artifact_dir" ] || {
@@ -70,6 +81,7 @@ command -v gh >/dev/null 2>&1 || {
     echo "error: GitHub CLI with attestation support is required" >&2
     exit 1
 }
+script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
 
 bounded_regular_file() {
     path=$1
@@ -98,7 +110,11 @@ verify_attestation() {
     gh attestation verify "$1" \
         --repo "$repository" \
         --signer-workflow "$repository/.github/workflows/release.yml" \
+        --signer-digest "$source_commit" \
         --source-ref "refs/tags/$version" \
+        --source-digest "$source_commit" \
+        --cert-oidc-issuer https://token.actions.githubusercontent.com \
+        --predicate-type https://slsa.dev/provenance/v1 \
         --deny-self-hosted-runners >/dev/null
 }
 
@@ -119,8 +135,10 @@ bounded_regular_file "$manifest" "$MAX_CHECKSUM_BYTES" "checksum manifest"
 verify_attestation "$manifest"
 
 expected=$temporary/expected
+expected_inventory=$temporary/expected-inventory
 parsed=$temporary/parsed
 actual=$temporary/actual
+observed_inventory=$temporary/observed-inventory
 cat > "$expected" <<EOF
 again-${version}-aarch64-apple-darwin.tar.gz
 again-${version}-aarch64-unknown-linux-gnu.tar.gz
@@ -128,6 +146,22 @@ again-${version}-source.cdx.json
 again-${version}-x86_64-apple-darwin.tar.gz
 again-${version}-x86_64-unknown-linux-gnu.tar.gz
 EOF
+{
+    printf '%s\n' SHA256SUMS
+    cat "$expected"
+} > "$expected_inventory"
+
+find "$artifact_dir" -mindepth 1 -maxdepth 1 -print | while IFS= read -r path; do
+    [ -f "$path" ] && [ ! -L "$path" ] || {
+        echo "error: artifact directory contains a non-regular member" >&2
+        exit 1
+    }
+    basename "$path"
+done | LC_ALL=C sort > "$observed_inventory" || exit 1
+cmp "$expected_inventory" "$observed_inventory" >/dev/null || {
+    echo "error: artifact directory does not contain the exact release asset set" >&2
+    exit 1
+}
 
 awk '
     NF != 2 || length($1) != 64 || tolower($1) ~ /[^0-9a-f]/ { exit 1 }
@@ -162,6 +196,19 @@ while IFS= read -r asset; do
         echo "error: checksum mismatch for $asset" >&2
         exit 1
     }
+    case "$asset" in
+        *.tar.gz)
+            python3 "$script_dir/package_release.py" --verify-archive "$path"
+            ;;
+        *.cdx.json)
+            python3 "$script_dir/package_release.py" \
+                --verify-sbom "$path" --version "$version"
+            ;;
+        *)
+            echo "error: unsupported release asset type: $asset" >&2
+            exit 1
+            ;;
+    esac
     verify_attestation "$path"
 done < "$expected"
 
