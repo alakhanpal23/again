@@ -497,6 +497,10 @@ def _valid_result_id(value: Any) -> bool:
     )
 
 
+def _clean_exit_code(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value == 0
+
+
 def _event_counts(scenario: Mapping[str, Any]) -> Mapping[str, Any]:
     value = scenario.get("event_counts")
     return value if isinstance(value, dict) else {}
@@ -872,6 +876,8 @@ def _exact_probe(
     ]
     if any(item["argv"] != expected_argv for item in cleanup):
         raise HarnessRefusal("probe_argv", "exact probe launched an unexpected argv")
+    if any(not _clean_exit_code(item.get("return_code")) for item in cleanup):
+        raise HarnessRefusal("probe_shutdown", "exact probe server did not exit cleanly")
     return {
         "operations": operations,
         "sessions": concurrency,

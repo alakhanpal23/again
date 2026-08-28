@@ -231,6 +231,12 @@ class ChaosSoakHarnessTests(unittest.TestCase):
             json.loads(harness.canonical_json({"mode": "quick"})), {"mode": "quick"}
         )
 
+    def test_probe_cleanup_requires_exact_zero_exit(self) -> None:
+        self.assertTrue(harness._clean_exit_code(0))
+        for value in (1, -9, True, None, "0"):
+            with self.subTest(value=value):
+                self.assertFalse(harness._clean_exit_code(value))
+
 
 if __name__ == "__main__":
     unittest.main()
