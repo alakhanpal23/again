@@ -49,12 +49,13 @@ jobs:
           sh -n scripts/install.sh scripts/uninstall.sh scripts/verify_release.sh \
             scripts/verify_published_release.sh \
             scripts/test_packaging.sh scripts/test_release_verification.sh \
-            scripts/test_homebrew_formula.sh
+            scripts/test_homebrew_formula.sh scripts/test_release_evidence.sh
           python3 -m py_compile scripts/package_release.py \
-            packaging/homebrew/generate_formula.py
+            packaging/homebrew/generate_formula.py scripts/export_release_evidence.py
           sh scripts/test_packaging.sh
           sh scripts/test_release_verification.sh
           sh scripts/test_homebrew_formula.sh
+          sh scripts/test_release_evidence.sh
 
   build:
     name: build ${{ matrix.target }}
@@ -274,7 +275,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Download and authenticate the exact public release inventory
+      - name: Download and authenticate the exact published release inventory
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -284,8 +285,16 @@ jobs:
           sh scripts/verify_published_release.sh \
             --version "$TAG" \
             --source-commit "$GITHUB_SHA" \
-            --repository "$GITHUB_REPOSITORY"
-      - name: Exercise the authenticated public installer and uninstaller
+            --repository "$GITHUB_REPOSITORY" \
+            --evidence-output "$GITHUB_WORKSPACE/release-evidence.json"
+      - name: Retain the bounded non-authoritative verification summary
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-evidence-${{ github.ref_name }}
+          path: release-evidence.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Exercise the authenticated published installer and uninstaller
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}

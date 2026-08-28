@@ -10,7 +10,7 @@ MAX_FORMULA_BYTES=131072
 usage() {
     cat >&2 <<'EOF'
 Usage: verify_release.sh --version TAG --source-commit SHA --artifact-dir DIR
-       [--repository OWNER/REPO]
+       [--repository OWNER/REPO] [--attestation-summary-dir DIR]
 
 DIR must contain SHA256SUMS, all four native archives, the source SBOM, and the
 deterministically generated again-alpha.rb formula.
@@ -25,6 +25,7 @@ version=
 source_commit=
 artifact_dir=
 repository=alakhanpal23/again
+attestation_summary_dir=
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -46,6 +47,11 @@ while [ "$#" -gt 0 ]; do
         --repository)
             [ "$#" -ge 2 ] || usage
             repository=$2
+            shift 2
+            ;;
+        --attestation-summary-dir)
+            [ "$#" -ge 2 ] || usage
+            attestation_summary_dir=$2
             shift 2
             ;;
         -h|--help)
@@ -84,6 +90,7 @@ command -v gh >/dev/null 2>&1 || {
     exit 1
 }
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
+evidence_tool=$script_dir/export_release_evidence.py
 
 bounded_regular_file() {
     path=$1
@@ -109,7 +116,26 @@ file_hash() {
 }
 
 verify_attestation() {
-    gh attestation verify "$1" \
+    subject=$1
+    subject_name=$2
+    subject_digest=$3
+    if [ "$collect_attestation_summaries" -eq 0 ]; then
+        gh attestation verify "$subject" \
+            --repo "$repository" \
+            --signer-workflow "$repository/.github/workflows/release.yml" \
+            --signer-digest "$source_commit" \
+            --source-ref "refs/tags/$version" \
+            --source-digest "$source_commit" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
+            --deny-self-hosted-runners \
+            >/dev/null
+        attestation_index=$((attestation_index + 1))
+        return
+    fi
+    summary_name=$(printf '%03d.json' "$attestation_index")
+    raw_result=$temporary/attestation-result.json
+    (ulimit -f 8192; gh attestation verify "$subject" \
         --repo "$repository" \
         --signer-workflow "$repository/.github/workflows/release.yml" \
         --signer-digest "$source_commit" \
@@ -117,13 +143,25 @@ verify_attestation() {
         --source-digest "$source_commit" \
         --cert-oidc-issuer https://token.actions.githubusercontent.com \
         --predicate-type https://slsa.dev/provenance/v1 \
-        --deny-self-hosted-runners >/dev/null
+        --deny-self-hosted-runners \
+        --format json > "$raw_result")
+    python3 "$evidence_tool" attestation \
+        --input "$raw_result" \
+        --subject-name "$subject_name" \
+        --subject-digest "$subject_digest" \
+        --output "$attestation_summary_dir/$summary_name"
+    rm -f "$raw_result"
+    attestation_index=$((attestation_index + 1))
 }
 
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/again-release-verify.XXXXXXXX")
+attestation_summary_external=0
 cleanup() {
     status=$1
     trap - EXIT HUP INT TERM
+    if [ "$status" -ne 0 ] && [ "$attestation_summary_external" -eq 1 ]; then
+        rm -rf "$attestation_summary_dir"
+    fi
     rm -rf "$temporary"
     exit "$status"
 }
@@ -132,9 +170,30 @@ trap 'cleanup 129' HUP
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
 
+if [ -n "$attestation_summary_dir" ]; then
+    case "$attestation_summary_dir" in
+        /*) ;;
+        *)
+            echo "error: attestation summary directory must be absolute" >&2
+            exit 2
+            ;;
+    esac
+    if [ -e "$attestation_summary_dir" ] || [ -L "$attestation_summary_dir" ]; then
+        echo "error: attestation summary directory already exists" >&2
+        exit 1
+    fi
+    mkdir "$attestation_summary_dir"
+    attestation_summary_external=1
+    collect_attestation_summaries=1
+else
+    collect_attestation_summaries=0
+fi
+attestation_index=0
+
 manifest=$artifact_dir/SHA256SUMS
 bounded_regular_file "$manifest" "$MAX_CHECKSUM_BYTES" "checksum manifest"
-verify_attestation "$manifest"
+manifest_digest=$(file_hash "$manifest")
+verify_attestation "$manifest" SHA256SUMS "$manifest_digest"
 
 expected=$temporary/expected
 expected_inventory=$temporary/expected-inventory
@@ -205,7 +264,8 @@ python3 "$script_dir/../packaging/homebrew/generate_formula.py" \
     --source-commit "$source_commit" \
     --checksums "$manifest" \
     --verify "$formula"
-verify_attestation "$formula"
+formula_digest=$(file_hash "$formula")
+verify_attestation "$formula" again-alpha.rb "$formula_digest"
 
 while IFS= read -r asset; do
     path=$artifact_dir/$asset
@@ -235,8 +295,12 @@ while IFS= read -r asset; do
             exit 1
             ;;
     esac
-    verify_attestation "$path"
+    verify_attestation "$path" "$asset" "$actual_hash"
 done < "$expected"
+[ "$attestation_index" -eq 7 ] || {
+    echo "error: attestation verification count is inconsistent" >&2
+    exit 1
+}
 
 trap - EXIT HUP INT TERM
 rm -rf "$temporary"
