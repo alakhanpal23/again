@@ -106,6 +106,7 @@ mod supported {
     use super::super::execute_only_runtime::{
         FirstExecuteOnlyRuntimeFilesystemReadyChildV1,
         FirstExecuteOnlyRuntimeFilesystemSplitRefusalV1, FirstExecuteOnlyRuntimeRetainedRootPairV1,
+        FirstExecuteOnlyRuntimeSupervisorHeldChildV1,
         split_first_execute_only_runtime_filesystem_roots_v1,
     };
     use super::super::execute_only_stdio::{
@@ -113,7 +114,8 @@ mod supported {
         ProfileStdioFailureV1, open_profile_owned_stdio_v1,
     };
     use super::super::isolation_qualification::{
-        IsolationCancellationCodeV1, IsolationCancellationOperationV1,
+        IsolationCancellationCodeV1, IsolationCancellationOperationV1, SupervisorHandoffFailureV1,
+        SupervisorHandoffReasonV1, SupervisorHandoffStageV1,
     };
     use super::{
         CommandFreeCancellationDriverV1, CommandFreeCancellationFlowFailureV1,
@@ -232,6 +234,112 @@ mod supported {
     pub(in crate::linux_pytest) struct FirstExecuteOnlyFilesystemReadyCheckpointV1<'resources> {
         runtime_child: Option<FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources>>,
         stdio: Option<ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>>,
+    }
+
+    /// The same filesystem-ready child after a live, exact `PTRACE_SEIZE` and
+    /// authenticated interrupt stop. Cleanup and publication anchors have
+    /// moved into this owner; no command, resume, PID, or descriptor escapes.
+    pub(in crate::linux_pytest) struct SupervisorOwnedFilesystemReadyChildV1<'resources> {
+        runtime_child: Option<FirstExecuteOnlyRuntimeSupervisorHeldChildV1<'resources>>,
+        stdio: Option<ParentStdioDrainV1<LinuxProfileStdioSyscallsV1>>,
+    }
+
+    impl fmt::Debug for SupervisorOwnedFilesystemReadyChildV1<'_> {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SupervisorOwnedFilesystemReadyChildV1")
+                .field("child", &"<ptrace-held-cleanup-owned>")
+                .field("runtime_anchor", &"<full-inventory-publications-retained>")
+                .field("stdio", &"<profile-owned-redacted>")
+                .field("command", &"<none>")
+                .field("execution_authority", &false)
+                .finish()
+        }
+    }
+
+    impl Drop for SupervisorOwnedFilesystemReadyChildV1<'_> {
+        fn drop(&mut self) {
+            drop_cleanup_flow_v1(self);
+        }
+    }
+
+    impl CommandFreeCancellationDriverV1 for SupervisorOwnedFilesystemReadyChildV1<'_> {
+        type IsolationFailure = ExecuteOnlyIsolationCancellationFailureV1;
+        type StdioFailure = ProfileStdioFailureV1;
+        type Report = ProfileStdioDrainReportV1;
+
+        fn terminate_and_reap_v1(
+            &mut self,
+        ) -> Result<(), IsolationCancellationStepFailureV1<Self::IsolationFailure>> {
+            let Some(runtime_child) = self.runtime_child.take() else {
+                return Ok(());
+            };
+            runtime_child.cancel_and_reap_v1().map_err(|primary| {
+                IsolationCancellationStepFailureV1 {
+                    terminal_reap_complete: primary.terminal_reap_complete(),
+                    cleanup_complete: primary.cleanup_complete(),
+                    primary,
+                }
+            })
+        }
+
+        fn drain_stdio_v1(
+            &mut self,
+        ) -> Result<Self::Report, StdioCancellationStepFailureV1<Self::StdioFailure>> {
+            self.stdio
+                .take()
+                .expect("supervisor owner retains one stdio drain")
+                .drain_capture_v1()
+                .map_err(|primary| StdioCancellationStepFailureV1 {
+                    cleanup_complete: primary.cleanup_complete(),
+                    primary,
+                })
+        }
+
+        fn close_stdio_without_capture_v1(&mut self) -> bool {
+            self.stdio
+                .take()
+                .is_none_or(ParentStdioDrainV1::close_without_capture_v1)
+        }
+    }
+
+    /// Refusal from the live same-child supervisor transfer. The ptrace cause
+    /// and cleanup facts remain separate; the wrapper carries no tracee data.
+    pub(in crate::linux_pytest) struct SupervisorHandoffSetupFailureV1 {
+        primary: SupervisorHandoffFailureV1,
+        stdio_cleanup_complete: bool,
+    }
+
+    impl SupervisorHandoffSetupFailureV1 {
+        pub(in crate::linux_pytest) const fn stage(&self) -> SupervisorHandoffStageV1 {
+            self.primary.stage()
+        }
+
+        pub(in crate::linux_pytest) const fn reason(&self) -> SupervisorHandoffReasonV1 {
+            self.primary.reason()
+        }
+
+        pub(in crate::linux_pytest) const fn errno(&self) -> Option<i32> {
+            self.primary.errno()
+        }
+
+        pub(in crate::linux_pytest) const fn terminal_reap_complete(&self) -> bool {
+            self.primary.terminal_reap_complete()
+        }
+
+        pub(in crate::linux_pytest) const fn cleanup_complete(&self) -> bool {
+            self.primary.cleanup_complete() && self.stdio_cleanup_complete
+        }
+    }
+
+    impl fmt::Debug for SupervisorHandoffSetupFailureV1 {
+        fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter
+                .debug_struct("SupervisorHandoffSetupFailureV1")
+                .field("primary", &self.primary)
+                .field("stdio_cleanup_complete", &self.stdio_cleanup_complete)
+                .finish()
+        }
     }
 
     impl fmt::Debug for FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
@@ -462,10 +570,74 @@ mod supported {
         }
     }
 
-    impl FirstExecuteOnlyFilesystemReadyCheckpointV1<'_> {
+    impl<'resources> FirstExecuteOnlyFilesystemReadyCheckpointV1<'resources> {
+        /// Move cleanup ownership only after the exact live child has been
+        /// seized and stopped by ptrace. A refusal has already terminally
+        /// cleaned the child as far as its independent cleanup facts claim.
+        pub(in crate::linux_pytest) fn handoff_to_supervisor_v1(
+            mut self,
+        ) -> Result<
+            SupervisorOwnedFilesystemReadyChildV1<'resources>,
+            SupervisorHandoffSetupFailureV1,
+        > {
+            let runtime_child = self
+                .runtime_child
+                .take()
+                .expect("filesystem-ready owner retains one runtime child");
+            let runtime_child = match runtime_child.handoff_to_supervisor_v1() {
+                Ok(runtime_child) => runtime_child,
+                Err(primary) => {
+                    let stdio_cleanup_complete = self.close_stdio_without_capture_v1();
+                    return Err(SupervisorHandoffSetupFailureV1 {
+                        primary,
+                        stdio_cleanup_complete,
+                    });
+                }
+            };
+            let stdio = self
+                .stdio
+                .take()
+                .expect("filesystem-ready owner retains one stdio drain");
+            Ok(SupervisorOwnedFilesystemReadyChildV1 {
+                runtime_child: Some(runtime_child),
+                stdio: Some(stdio),
+            })
+        }
+
         /// Cancel and reap the child first, then require exact stdout/stderr
         /// EOF. If terminal cleanup is uncertain, close the streams immediately
         /// rather than waiting on a potentially live writer.
+        pub(in crate::linux_pytest) fn cancel_and_finish_v1(
+            mut self,
+        ) -> Result<CommandFreeCancellationReportV1, CommandFreeCancellationFailureV1> {
+            match explicit_cancellation_flow_v1(&mut self) {
+                Ok(stdio) => Ok(CommandFreeCancellationReportV1 { stdio }),
+                Err(CommandFreeCancellationFlowFailureV1::Isolation {
+                    primary,
+                    terminal_reap_complete,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }) => Err(CommandFreeCancellationFailureV1 {
+                    primary: CommandFreeCancellationPrimaryV1::Isolation(primary),
+                    terminal_reap_complete,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }),
+                Err(CommandFreeCancellationFlowFailureV1::Stdio {
+                    primary,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }) => Err(CommandFreeCancellationFailureV1 {
+                    primary: CommandFreeCancellationPrimaryV1::Stdio(primary),
+                    terminal_reap_complete: true,
+                    isolation_cleanup_complete,
+                    stdio_cleanup_complete,
+                }),
+            }
+        }
+    }
+
+    impl SupervisorOwnedFilesystemReadyChildV1<'_> {
         pub(in crate::linux_pytest) fn cancel_and_finish_v1(
             mut self,
         ) -> Result<CommandFreeCancellationReportV1, CommandFreeCancellationFailureV1> {
@@ -520,12 +692,20 @@ mod supported {
             <FirstExecuteOnlyFilesystemReadyCheckpointV1<'static> as AmbiguousIfCopy<_>>::probe();
             <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfClone<_>>::probe();
             <FirstExecuteOnlyRuntimeRetainedRootPairV1<'static> as AmbiguousIfCopy<_>>::probe();
+            <SupervisorOwnedFilesystemReadyChildV1<'static> as AmbiguousIfClone<_>>::probe();
+            <SupervisorOwnedFilesystemReadyChildV1<'static> as AmbiguousIfCopy<_>>::probe();
             let _constructor: fn(
                 FirstExecuteOnlyRuntimeRetainedRootPairV1<'static>,
             ) -> Result<
                 FirstExecuteOnlyFilesystemReadyCheckpointV1<'static>,
                 CommandFreeSetupFailureV1,
             > = prepare_first_execute_only_filesystem_ready_checkpoint_v1;
+            let _handoff: fn(
+                FirstExecuteOnlyFilesystemReadyCheckpointV1<'static>,
+            ) -> Result<
+                SupervisorOwnedFilesystemReadyChildV1<'static>,
+                SupervisorHandoffSetupFailureV1,
+            > = FirstExecuteOnlyFilesystemReadyCheckpointV1::handoff_to_supervisor_v1;
         }
     }
 }

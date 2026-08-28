@@ -35,6 +35,7 @@ fn release_or_quarantine_parent_anchor_v1<T>(anchor: T, terminal_reap_proven: bo
 use super::execute_only_isolation::{
     BlockedExecuteOnlyIsolationFailureV1, BlockedExecuteOnlyIsolationV1,
     ExecuteOnlyIsolationCancellationFailureV1, FirstExecuteOnlyIsolationReadyPermitV1,
+    FirstExecuteOnlySupervisorHeldPermitV1,
     begin_blocked_execute_only_isolation_with_filesystem_stdio_fixed_runtime_refusal_v1,
     begin_blocked_execute_only_isolation_with_filesystem_stdio_v1,
 };
@@ -45,6 +46,13 @@ use super::execute_only_isolation::{
     target_pointer_width = "64"
 ))]
 use super::execute_only_stdio::ProfileStdioIsolationChildV1;
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+use super::isolation_qualification::SupervisorHandoffFailureV1;
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 use super::snapshot_manifest::{
     FirstExecuteOnlyForkChildRootPairRefusalV1, FirstExecuteOnlyForkChildRootPairV1,
@@ -1857,6 +1865,19 @@ pub(super) struct FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources> {
     parent_anchor: Option<FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>>,
 }
 
+/// Runtime publication anchor paired with the exact same live child after
+/// ptrace supervision has been established. No command/resume surface exists.
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+pub(super) struct FirstExecuteOnlyRuntimeSupervisorHeldChildV1<'resources> {
+    isolation: Option<FirstExecuteOnlySupervisorHeldPermitV1>,
+    parent_anchor: Option<FirstExecuteOnlyRuntimeRetainedRootPairV1<'resources>>,
+}
+
 #[cfg(all(
     target_os = "linux",
     target_arch = "x86_64",
@@ -2002,7 +2023,34 @@ impl<'resources> FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'resources> {
     target_env = "gnu",
     target_pointer_width = "64"
 ))]
-impl FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'_> {
+impl<'resources> FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'resources> {
+    pub(super) fn handoff_to_supervisor_v1(
+        mut self,
+    ) -> Result<FirstExecuteOnlyRuntimeSupervisorHeldChildV1<'resources>, SupervisorHandoffFailureV1>
+    {
+        let isolation = self
+            .isolation
+            .take()
+            .expect("runtime ready owner retains one isolation guard");
+        let parent_anchor = self
+            .parent_anchor
+            .take()
+            .expect("runtime ready owner retains one publication anchor");
+        match isolation.handoff_to_supervisor_v1() {
+            Ok(isolation) => Ok(FirstExecuteOnlyRuntimeSupervisorHeldChildV1 {
+                isolation: Some(isolation),
+                parent_anchor: Some(parent_anchor),
+            }),
+            Err(failure) => {
+                release_or_quarantine_parent_anchor_v1(
+                    parent_anchor,
+                    failure.terminal_reap_complete(),
+                );
+                Err(failure)
+            }
+        }
+    }
+
     pub(super) fn cancel_and_reap_v1(
         mut self,
     ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
@@ -2014,6 +2062,34 @@ impl FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'_> {
             .parent_anchor
             .take()
             .expect("runtime ready owner retains one publication anchor");
+        let result = isolation.cancel_and_reap_v1();
+        let terminal_reap_proven = match result.as_ref() {
+            Ok(()) => true,
+            Err(failure) => failure.terminal_reap_complete(),
+        };
+        release_or_quarantine_parent_anchor_v1(parent_anchor, terminal_reap_proven);
+        result
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl FirstExecuteOnlyRuntimeSupervisorHeldChildV1<'_> {
+    pub(super) fn cancel_and_reap_v1(
+        mut self,
+    ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
+        let isolation = self
+            .isolation
+            .take()
+            .expect("runtime supervisor owner retains one isolation guard");
+        let parent_anchor = self
+            .parent_anchor
+            .take()
+            .expect("runtime supervisor owner retains one publication anchor");
         let result = isolation.cancel_and_reap_v1();
         let terminal_reap_proven = match result.as_ref() {
             Ok(()) => true,
@@ -2048,6 +2124,35 @@ impl Drop for FirstExecuteOnlyRuntimeBlockedFilesystemChildV1<'_> {
     target_pointer_width = "64"
 ))]
 impl Drop for FirstExecuteOnlyRuntimeFilesystemReadyChildV1<'_> {
+    fn drop(&mut self) {
+        let isolation = self.isolation.take();
+        let parent_anchor = self.parent_anchor.take();
+        match (isolation, parent_anchor) {
+            (Some(isolation), Some(parent_anchor)) => {
+                let terminal_reap_proven = match isolation.cancel_and_reap_v1() {
+                    Ok(()) => true,
+                    Err(failure) => failure.terminal_reap_complete(),
+                };
+                release_or_quarantine_parent_anchor_v1(parent_anchor, terminal_reap_proven);
+            }
+            (None, Some(parent_anchor)) => {
+                release_or_quarantine_parent_anchor_v1(parent_anchor, false);
+            }
+            (Some(isolation), None) => {
+                let _ = isolation.cancel_and_reap_v1();
+            }
+            (None, None) => {}
+        }
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu",
+    target_pointer_width = "64"
+))]
+impl Drop for FirstExecuteOnlyRuntimeSupervisorHeldChildV1<'_> {
     fn drop(&mut self) {
         let isolation = self.isolation.take();
         let parent_anchor = self.parent_anchor.take();

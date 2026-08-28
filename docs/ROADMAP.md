@@ -344,13 +344,18 @@ structural result does not qualify the loader or authorize execution.
 The runtime, stdio, and isolation owners now meet at one command-free connector
 checkpoint. It requires and retains the two-publication structural inventory
 before creating the concrete isolation-ready child, authenticates and splits
-all pipe ownership, and retains bounded parent capture. Cancellation terminates
-and reaps before EOF draining;
-uncertain reap closes without capture, and split/setup failures retain their
-first error separately from cleanup completeness. The connector exposes no
-release frame, command, PID, descriptor, execution, candidate, replay, or reuse
-authority. There is still no orchestrator that launches this continuation
-through the qualified namespace path.
+all pipe ownership, and retains bounded parent capture. After both roots are
+attached and reauthenticated in the child's private mount namespace, a linear
+handoff performs `PTRACE_SEIZE`, interrupts that exact single-task child,
+requires the exact ptrace-event stop, and rechecks its task count, tracer,
+`NoNewPrivs`, and pre-filter seccomp state before transferring the existing
+cleanup guard to an opaque supervisor owner. Cancellation terminates and reaps
+before EOF draining; uncertain reap closes without capture, and setup failures
+retain their first error separately from cleanup completeness. A provisioned
+x86_64 Linux run completed 100/100 attach, handoff, cancel, and terminal-reap
+samples. This is a command-free ownership checkpoint, not execution evidence:
+the connector exposes no resume, filter-install, release frame, command, PID,
+descriptor, execution, candidate, replay, or reuse authority.
 
 A separate live workload-seccomp diagnostic is also integrated. It installs and
 reads back the exact 223-instruction cBPF program in one disposable single-task
@@ -358,10 +363,12 @@ child, retires the child identity on every terminal/ownership-loss path, and
 returns only after kill, reap, final `ECHILD`, pending-signal continuity, and
 signal restoration. Its result is intentionally a completed-probe record, not
 a live installed-filter witness: the diagnostic child is already gone and can
-never accept a command. Supervisor cookie handling, filter installation in the
-real isolation child, and qualification against pinned Python remain future
-composition work. No component grants execution, profile, candidate, replay,
-hit, or reuse authority.
+never accept a command. The real isolation child can now enter a distinct
+supervisor-held state, but supervisor cookie handling, same-child filter
+installation/readback, fixed command release, complete post-release task-tree
+supervision, and qualification against pinned Python remain future composition
+work. No component grants execution, profile, candidate, replay, hit, or reuse
+authority.
 
 A separate bounded reference snapshot oracle records the fixed workspace
 fixture and exact argv while marking source, binary, and qualified-tuple

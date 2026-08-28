@@ -37,7 +37,8 @@ use super::execute_only_stdio::ProfileStdioIsolationChildV1;
 use super::isolation_qualification::{
     self, BlockedRootlessNamespaceBootstrapV1, IsolationCancellationCodeV1,
     IsolationCancellationFailureV1, IsolationCancellationOperationV1,
-    IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1,
+    IsolationQualificationFailureV1, IsolationReadyRootlessNamespaceV1, SupervisorHandoffFailureV1,
+    SupervisorHeldRootlessNamespaceV1,
 };
 #[cfg(all(
     target_os = "linux",
@@ -55,6 +56,7 @@ enum BlockedIsolationPhaseV1 {
     ContinuationIssued,
     IsolationConfiguring,
     IsolationReady,
+    SupervisorHeld,
     Poisoned,
 }
 
@@ -231,6 +233,13 @@ pub(super) struct FirstExecuteOnlyIsolationReadyPermitV1 {
     state: BlockedIsolationStateV1,
 }
 
+/// Same linear child after the live ptrace seizure and exact stop have been
+/// authenticated. It remains command-free and cancellation-only.
+pub(super) struct FirstExecuteOnlySupervisorHeldPermitV1 {
+    _live: SupervisorHeldRootlessNamespaceV1,
+    state: BlockedIsolationStateV1,
+}
+
 /// Typed uncertainty from explicit cancellation of an isolation-ready child.
 /// The live guard has been consumed and still performs its bounded Drop
 /// fallback, but that retry is not observable and cannot prove cleanup.
@@ -287,7 +296,52 @@ impl fmt::Debug for FirstExecuteOnlyIsolationReadyPermitV1 {
     }
 }
 
+impl fmt::Debug for FirstExecuteOnlySupervisorHeldPermitV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FirstExecuteOnlySupervisorHeldPermitV1")
+            .field("state", &"ptrace-held-command-free")
+            .field("live", &"<opaque-cleanup-owned>")
+            .field("execution_authority", &false)
+            .finish()
+    }
+}
+
 impl FirstExecuteOnlyIsolationReadyPermitV1 {
+    pub(super) fn cancel_and_reap_v1(
+        self,
+    ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
+        self._live
+            .cancel_and_reap_v1()
+            .map_err(|failure: IsolationCancellationFailureV1| {
+                ExecuteOnlyIsolationCancellationFailureV1 {
+                    operation: failure.operation(),
+                    code: failure.code(),
+                    errno: failure.errno(),
+                    terminal_reap_complete: failure.terminal_reap_complete(),
+                    cleanup_complete: failure.cleanup_complete(),
+                }
+            })
+    }
+
+    pub(super) fn handoff_to_supervisor_v1(
+        mut self,
+    ) -> Result<FirstExecuteOnlySupervisorHeldPermitV1, SupervisorHandoffFailureV1> {
+        let live = self._live.handoff_to_supervisor_v1()?;
+        self.state
+            .advance(
+                BlockedIsolationPhaseV1::IsolationReady,
+                BlockedIsolationPhaseV1::SupervisorHeld,
+            )
+            .expect("only the linear isolation-ready owner can enter supervisor hold");
+        Ok(FirstExecuteOnlySupervisorHeldPermitV1 {
+            _live: live,
+            state: self.state,
+        })
+    }
+}
+
+impl FirstExecuteOnlySupervisorHeldPermitV1 {
     pub(super) fn cancel_and_reap_v1(
         self,
     ) -> Result<(), ExecuteOnlyIsolationCancellationFailureV1> {
@@ -533,6 +587,8 @@ mod tests {
         <BlockedExecuteOnlyIsolationContinuationPermitV1 as AmbiguousIfCopy<_>>::probe();
         <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfClone<_>>::probe();
         <FirstExecuteOnlyIsolationReadyPermitV1 as AmbiguousIfCopy<_>>::probe();
+        <FirstExecuteOnlySupervisorHeldPermitV1 as AmbiguousIfClone<_>>::probe();
+        <FirstExecuteOnlySupervisorHeldPermitV1 as AmbiguousIfCopy<_>>::probe();
     }
 
     #[cfg(all(

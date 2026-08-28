@@ -855,6 +855,77 @@ pub(super) struct IsolationReadyRootlessNamespaceV1 {
     _inner: platform::IsolationReadyRootlessNamespaceV1,
 }
 
+/// Same live command-free child after this process has atomically assumed
+/// ptrace supervision and authenticated the resulting stop. The value remains
+/// cancellation-only: it exposes no PID, descriptor, command, resume, filter,
+/// or execution operation.
+pub(super) struct SupervisorHeldRootlessNamespaceV1 {
+    _inner: platform::SupervisorHeldRootlessNamespaceV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SupervisorHandoffStageV1 {
+    PtraceSeize,
+    PtraceInterrupt,
+    WaitForStop,
+    VerifyStoppedIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum SupervisorHandoffReasonV1 {
+    UnsupportedPlatform,
+    AdministrativePolicy,
+    KernelOperation,
+    UnexpectedObservation,
+}
+
+/// Payload-free refusal from the one-shot same-child supervisor transfer.
+/// Cleanup facts describe the child tree independently from the first ptrace
+/// failure; no raw identity or kernel status escapes this boundary.
+pub(super) struct SupervisorHandoffFailureV1 {
+    stage: SupervisorHandoffStageV1,
+    reason: SupervisorHandoffReasonV1,
+    errno: Option<i32>,
+    terminal_reap_complete: bool,
+    cleanup_complete: bool,
+}
+
+impl SupervisorHandoffFailureV1 {
+    pub(super) const fn stage(&self) -> SupervisorHandoffStageV1 {
+        self.stage
+    }
+
+    pub(super) const fn reason(&self) -> SupervisorHandoffReasonV1 {
+        self.reason
+    }
+
+    pub(super) const fn errno(&self) -> Option<i32> {
+        self.errno
+    }
+
+    pub(super) const fn terminal_reap_complete(&self) -> bool {
+        self.terminal_reap_complete
+    }
+
+    pub(super) const fn cleanup_complete(&self) -> bool {
+        self.cleanup_complete
+    }
+}
+
+impl fmt::Debug for SupervisorHandoffFailureV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupervisorHandoffFailureV1")
+            .field("stage", &self.stage)
+            .field("reason", &self.reason)
+            .field("errno", &self.errno)
+            .field("terminal_reap_complete", &self.terminal_reap_complete)
+            .field("cleanup_complete", &self.cleanup_complete)
+            .field("tracee_identity", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Failure to prove terminal cleanup of an isolation-ready command-free child.
 /// The consumed platform guard still performs its bounded Drop fallback, but
 /// that unobservable retry cannot upgrade this refusal to complete cleanup.
@@ -940,7 +1011,32 @@ impl fmt::Debug for IsolationReadyRootlessNamespaceV1 {
     }
 }
 
+impl fmt::Debug for SupervisorHeldRootlessNamespaceV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SupervisorHeldRootlessNamespaceV1")
+            .field("state", &"ptrace-held-command-free")
+            .field("resources", &"<opaque-cleanup-owned>")
+            .field("execution_authority", &false)
+            .finish()
+    }
+}
+
 impl IsolationReadyRootlessNamespaceV1 {
+    pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+        self._inner.cancel_and_reap_v1()
+    }
+
+    pub(super) fn handoff_to_supervisor_v1(
+        self,
+    ) -> Result<SupervisorHeldRootlessNamespaceV1, SupervisorHandoffFailureV1> {
+        self._inner
+            .handoff_to_supervisor_v1()
+            .map(|inner| SupervisorHeldRootlessNamespaceV1 { _inner: inner })
+    }
+}
+
+impl SupervisorHeldRootlessNamespaceV1 {
     pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
         self._inner.cancel_and_reap_v1()
     }
@@ -1088,9 +1184,35 @@ mod platform {
         _private: (),
     }
 
+    pub(super) struct SupervisorHeldRootlessNamespaceV1 {
+        _private: (),
+    }
+
     impl IsolationReadyRootlessNamespaceV1 {
         pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
             Err(IsolationCancellationFailureV1::unsupported())
+        }
+
+        pub(super) fn handoff_to_supervisor_v1(
+            self,
+        ) -> Result<SupervisorHeldRootlessNamespaceV1, SupervisorHandoffFailureV1> {
+            Err(unsupported_supervisor_handoff_v1())
+        }
+    }
+
+    impl SupervisorHeldRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
+        }
+    }
+
+    fn unsupported_supervisor_handoff_v1() -> SupervisorHandoffFailureV1 {
+        SupervisorHandoffFailureV1 {
+            stage: SupervisorHandoffStageV1::PtraceSeize,
+            reason: SupervisorHandoffReasonV1::UnsupportedPlatform,
+            errno: Some(libc::ENOSYS),
+            terminal_reap_complete: false,
+            cleanup_complete: false,
         }
     }
 
@@ -1272,6 +1394,7 @@ mod contract_tests {
 ))]
 mod platform {
     use std::ffi::CStr;
+    use std::fs;
     use std::io;
     use std::mem::MaybeUninit;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -1283,6 +1406,24 @@ mod platform {
     const MAX_PROC_SWAPS_BYTES_V1: usize = 64 * 1024;
     const MAX_PROC_SYSCTL_BYTES_V1: usize = 32;
     const MAX_PROC_STATUS_BYTES_V1: usize = 64 * 1024;
+    const PTRACE_SEIZE_V1: libc::c_uint = 0x4206;
+    const PTRACE_INTERRUPT_V1: libc::c_uint = 0x4207;
+    const PTRACE_EVENT_STOP_V1: i32 = 128;
+    const WAIT_ALL_TASKS_V1: i32 = 0x4000_0000;
+    const PTRACE_O_TRACESYSGOOD_V1: usize = 0x0000_0001;
+    const PTRACE_O_TRACEFORK_V1: usize = 0x0000_0002;
+    const PTRACE_O_TRACEVFORK_V1: usize = 0x0000_0004;
+    const PTRACE_O_TRACECLONE_V1: usize = 0x0000_0008;
+    const PTRACE_O_TRACEEXEC_V1: usize = 0x0000_0010;
+    const PTRACE_O_TRACESECCOMP_V1: usize = 0x0000_0080;
+    const PTRACE_O_EXITKILL_V1: usize = 0x0010_0000;
+    const PTRACE_OPTIONS_V1: usize = PTRACE_O_TRACESYSGOOD_V1
+        | PTRACE_O_TRACEFORK_V1
+        | PTRACE_O_TRACEVFORK_V1
+        | PTRACE_O_TRACECLONE_V1
+        | PTRACE_O_TRACEEXEC_V1
+        | PTRACE_O_TRACESECCOMP_V1
+        | PTRACE_O_EXITKILL_V1;
     const PROBE_PROTOCOL_SECONDS_V1: i64 = 8;
     const PROBE_HARD_SECONDS_V1: i64 = 10;
     const FRAME_BYTES_V1: usize = 64;
@@ -1484,6 +1625,10 @@ mod platform {
         FinalEchildAudit,
         CloseControl,
         CloseReport,
+        PtraceSeize,
+        PtraceInterrupt,
+        PtraceWaitStop,
+        PtraceVerifyStop,
     }
 
     #[derive(Clone, Copy, Debug, Default)]
@@ -2442,10 +2587,301 @@ mod platform {
         _nonce: [u8; NONCE_BYTES_V1],
     }
 
+    pub(super) struct SupervisorHeldRootlessNamespaceV1 {
+        _guard: ProbeChildGuardV1,
+        _nonce: [u8; NONCE_BYTES_V1],
+    }
+
     impl IsolationReadyRootlessNamespaceV1 {
         pub(super) fn cancel_and_reap_v1(mut self) -> Result<(), IsolationCancellationFailureV1> {
             self._guard.kill_and_reap()
         }
+
+        pub(super) fn handoff_to_supervisor_v1(
+            mut self,
+        ) -> Result<SupervisorHeldRootlessNamespaceV1, SupervisorHandoffFailureV1> {
+            let result = establish_supervisor_stop_v1(&mut self._guard);
+            match result {
+                Ok(()) => Ok(SupervisorHeldRootlessNamespaceV1 {
+                    _guard: self._guard,
+                    _nonce: self._nonce,
+                }),
+                Err((stage, reason, errno)) => {
+                    let cleanup = self._guard.kill_and_reap();
+                    let (terminal_reap_complete, cleanup_complete) = match cleanup {
+                        Ok(()) => (true, true),
+                        Err(failure) => {
+                            (failure.terminal_reap_complete(), failure.cleanup_complete())
+                        }
+                    };
+                    Err(SupervisorHandoffFailureV1 {
+                        stage,
+                        reason,
+                        errno,
+                        terminal_reap_complete,
+                        cleanup_complete,
+                    })
+                }
+            }
+        }
+    }
+
+    impl SupervisorHeldRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(mut self) -> Result<(), IsolationCancellationFailureV1> {
+            self._guard.kill_and_reap()
+        }
+    }
+
+    type SupervisorHandoffOperationResultV1 = Result<
+        (),
+        (
+            SupervisorHandoffStageV1,
+            SupervisorHandoffReasonV1,
+            Option<i32>,
+        ),
+    >;
+
+    fn establish_supervisor_stop_v1(
+        guard: &mut ProbeChildGuardV1,
+    ) -> SupervisorHandoffOperationResultV1 {
+        let pid = positive_direct_pid(guard.pid).ok_or((
+            SupervisorHandoffStageV1::PtraceSeize,
+            SupervisorHandoffReasonV1::UnexpectedObservation,
+            Some(libc::EINVAL),
+        ))?;
+        if guard
+            .operations
+            .check(IsolationOperationV1::PtraceSeize)
+            .is_err()
+        {
+            return Err((
+                SupervisorHandoffStageV1::PtraceSeize,
+                SupervisorHandoffReasonV1::KernelOperation,
+                Some(libc::EIO),
+            ));
+        }
+        let seize = unsafe {
+            libc::ptrace(
+                PTRACE_SEIZE_V1,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                PTRACE_OPTIONS_V1 as *mut libc::c_void,
+            )
+        };
+        if seize != 0 {
+            let errno = last_errno();
+            return Err((
+                SupervisorHandoffStageV1::PtraceSeize,
+                if matches!(errno, Some(libc::EPERM) | Some(libc::EACCES)) {
+                    SupervisorHandoffReasonV1::AdministrativePolicy
+                } else {
+                    SupervisorHandoffReasonV1::KernelOperation
+                },
+                errno,
+            ));
+        }
+        if guard
+            .operations
+            .check(IsolationOperationV1::PtraceInterrupt)
+            .is_err()
+        {
+            return Err((
+                SupervisorHandoffStageV1::PtraceInterrupt,
+                SupervisorHandoffReasonV1::KernelOperation,
+                Some(libc::EIO),
+            ));
+        }
+        if unsafe {
+            libc::ptrace(
+                PTRACE_INTERRUPT_V1,
+                pid,
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
+            )
+        } != 0
+        {
+            return Err((
+                SupervisorHandoffStageV1::PtraceInterrupt,
+                SupervisorHandoffReasonV1::KernelOperation,
+                last_errno(),
+            ));
+        }
+        let deadline = probe_deadlines().map(|(_, hard)| hard).map_err(|error| {
+            (
+                SupervisorHandoffStageV1::WaitForStop,
+                SupervisorHandoffReasonV1::KernelOperation,
+                error.errno(),
+            )
+        })?;
+        wait_for_exact_ptrace_stop_v1(guard, pid, deadline)?;
+        if guard
+            .operations
+            .check(IsolationOperationV1::PtraceWaitStop)
+            .is_err()
+        {
+            return Err((
+                SupervisorHandoffStageV1::WaitForStop,
+                SupervisorHandoffReasonV1::KernelOperation,
+                Some(libc::EIO),
+            ));
+        }
+        verify_supervisor_stopped_identity_v1(guard, pid)?;
+        if guard
+            .operations
+            .check(IsolationOperationV1::PtraceVerifyStop)
+            .is_err()
+        {
+            return Err((
+                SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                SupervisorHandoffReasonV1::KernelOperation,
+                Some(libc::EIO),
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_exact_ptrace_stop_v1(
+        guard: &mut ProbeChildGuardV1,
+        pid: libc::pid_t,
+        deadline: MonotonicDeadlineV1,
+    ) -> SupervisorHandoffOperationResultV1 {
+        loop {
+            let mut status = 0_i32;
+            let waited =
+                unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG | WAIT_ALL_TASKS_V1) };
+            if waited == pid {
+                if libc::WIFSTOPPED(status)
+                    && libc::WSTOPSIG(status) == libc::SIGTRAP
+                    && status >> 16 == PTRACE_EVENT_STOP_V1
+                {
+                    return Ok(());
+                }
+                if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                    guard.reaped = true;
+                }
+                return Err((
+                    SupervisorHandoffStageV1::WaitForStop,
+                    SupervisorHandoffReasonV1::UnexpectedObservation,
+                    None,
+                ));
+            }
+            if waited < 0 {
+                let errno = last_errno();
+                if errno == Some(libc::EINTR) {
+                    continue;
+                }
+                return Err((
+                    SupervisorHandoffStageV1::WaitForStop,
+                    SupervisorHandoffReasonV1::KernelOperation,
+                    errno,
+                ));
+            }
+            let remaining = deadline.remaining_milliseconds().map_err(|_| {
+                (
+                    SupervisorHandoffStageV1::WaitForStop,
+                    SupervisorHandoffReasonV1::KernelOperation,
+                    Some(libc::ETIMEDOUT),
+                )
+            })?;
+            let pause = remaining.min(10);
+            if unsafe { libc::poll(std::ptr::null_mut(), 0, pause) } < 0
+                && last_errno() != Some(libc::EINTR)
+            {
+                return Err((
+                    SupervisorHandoffStageV1::WaitForStop,
+                    SupervisorHandoffReasonV1::KernelOperation,
+                    last_errno(),
+                ));
+            }
+        }
+    }
+
+    fn verify_supervisor_stopped_identity_v1(
+        guard: &ProbeChildGuardV1,
+        pid: libc::pid_t,
+    ) -> SupervisorHandoffOperationResultV1 {
+        let proc_directory = guard
+            .proc_directory
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .ok_or((
+                SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                SupervisorHandoffReasonV1::UnexpectedObservation,
+                None,
+            ))?;
+        let expected_task = pid.to_string();
+        let task_path = format!("/proc/{pid}/task");
+        let mut task_count = 0_usize;
+        for entry in fs::read_dir(task_path).map_err(|error| {
+            (
+                SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                SupervisorHandoffReasonV1::KernelOperation,
+                error.raw_os_error(),
+            )
+        })? {
+            let entry = entry.map_err(|error| {
+                (
+                    SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                    SupervisorHandoffReasonV1::KernelOperation,
+                    error.raw_os_error(),
+                )
+            })?;
+            if entry.file_name() != std::ffi::OsStr::new(&expected_task) {
+                return Err((
+                    SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                    SupervisorHandoffReasonV1::UnexpectedObservation,
+                    None,
+                ));
+            }
+            task_count += 1;
+        }
+        let status = read_bounded_file_at(proc_directory, c"status", MAX_PROC_STATUS_BYTES_V1)
+            .map_err(|error| {
+                (
+                    SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                    SupervisorHandoffReasonV1::KernelOperation,
+                    error.raw_os_error(),
+                )
+            })?;
+        let tracer_pid = supervisor_status_u32_v1(&status, b"TracerPid:");
+        let no_new_privileges = supervisor_status_u32_v1(&status, b"NoNewPrivs:");
+        let seccomp_mode = supervisor_status_u32_v1(&status, b"Seccomp:");
+        let state = supervisor_status_row_v1(&status, b"State:");
+        if task_count != 1
+            || tracer_pid != u32::try_from(unsafe { libc::getpid() }).ok()
+            || no_new_privileges != Some(1)
+            || seccomp_mode != Some(0)
+            || !state.is_some_and(|row| row.starts_with(b"\tt "))
+        {
+            return Err((
+                SupervisorHandoffStageV1::VerifyStoppedIdentity,
+                SupervisorHandoffReasonV1::UnexpectedObservation,
+                None,
+            ));
+        }
+        Ok(())
+    }
+
+    fn supervisor_status_u32_v1(status: &[u8], label: &[u8]) -> Option<u32> {
+        let row = supervisor_status_row_v1(status, label)?;
+        let mut parser = AsciiFieldsV1::new(row);
+        let value = parser.next_u32()?;
+        (!parser.has_more_fields()).then_some(value)
+    }
+
+    fn supervisor_status_row_v1<'a>(status: &'a [u8], label: &[u8]) -> Option<&'a [u8]> {
+        let mut found = None;
+        for row in status.split(|byte| *byte == b'\n') {
+            if row.contains(&b'\r') {
+                return None;
+            }
+            if let Some(value) = row.strip_prefix(label)
+                && found.replace(value).is_some()
+            {
+                return None;
+            }
+        }
+        found
     }
 
     pub(super) fn begin_blocked_rootless_namespace_bootstrap_v1<C: IsolationChildContinuationV1>(
@@ -12024,9 +12460,35 @@ mod platform {
         _private: (),
     }
 
+    pub(super) struct SupervisorHeldRootlessNamespaceV1 {
+        _private: (),
+    }
+
     impl IsolationReadyRootlessNamespaceV1 {
         pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
             Err(IsolationCancellationFailureV1::unsupported())
+        }
+
+        pub(super) fn handoff_to_supervisor_v1(
+            self,
+        ) -> Result<SupervisorHeldRootlessNamespaceV1, SupervisorHandoffFailureV1> {
+            Err(unsupported_supervisor_handoff_v1())
+        }
+    }
+
+    impl SupervisorHeldRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
+        }
+    }
+
+    fn unsupported_supervisor_handoff_v1() -> SupervisorHandoffFailureV1 {
+        SupervisorHandoffFailureV1 {
+            stage: SupervisorHandoffStageV1::PtraceSeize,
+            reason: SupervisorHandoffReasonV1::UnsupportedPlatform,
+            errno: Some(libc::ENOSYS),
+            terminal_reap_complete: false,
+            cleanup_complete: false,
         }
     }
 
@@ -12081,9 +12543,35 @@ mod platform {
         _private: (),
     }
 
+    pub(super) struct SupervisorHeldRootlessNamespaceV1 {
+        _private: (),
+    }
+
     impl IsolationReadyRootlessNamespaceV1 {
         pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
             Err(IsolationCancellationFailureV1::unsupported())
+        }
+
+        pub(super) fn handoff_to_supervisor_v1(
+            self,
+        ) -> Result<SupervisorHeldRootlessNamespaceV1, SupervisorHandoffFailureV1> {
+            Err(unsupported_supervisor_handoff_v1())
+        }
+    }
+
+    impl SupervisorHeldRootlessNamespaceV1 {
+        pub(super) fn cancel_and_reap_v1(self) -> Result<(), IsolationCancellationFailureV1> {
+            Err(IsolationCancellationFailureV1::unsupported())
+        }
+    }
+
+    fn unsupported_supervisor_handoff_v1() -> SupervisorHandoffFailureV1 {
+        SupervisorHandoffFailureV1 {
+            stage: SupervisorHandoffStageV1::PtraceSeize,
+            reason: SupervisorHandoffReasonV1::UnsupportedPlatform,
+            errno: Some(libc::ENOSYS),
+            terminal_reap_complete: false,
+            cleanup_complete: false,
         }
     }
 

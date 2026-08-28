@@ -525,6 +525,16 @@ complete private layout and attached mounts before emitting the
 filesystem-ready frame. No path, descriptor, or release operation escapes
 that child-only continuation.
 
+The parent may consume that exact filesystem-ready owner through one
+command-free supervisor handoff. It seizes the still-single-task child with the
+fixed ptrace options, interrupts it, requires `PTRACE_EVENT_STOP`, and rechecks
+the pinned process status while also requiring one exact task. Only then do the
+live cleanup guard and retained publication anchors move to an opaque
+supervisor-held owner. The owner can only cancel and terminally reap; it exposes
+no tracee identity, descriptor, resume, filter, release, command, or execution
+operation. Workload-filter installation and readback on this same held child
+are a later protocol phase.
+
 Inside the new root, child-local umask is set to `0` while it creates the fixed
 directories `/workspace` `0755`, `/tmp` `01777`, `/run` `0755`, `/home`
 `0755`, `/home/again` `0700`, `/proc` `0555`, and `/dev` `0755`; it then

@@ -57,6 +57,9 @@ mod supported {
         split_first_execute_only_runtime_filesystem_roots_v1,
     };
     use crate::linux_pytest::execute_only_stdio::open_profile_owned_stdio_v1;
+    use crate::linux_pytest::isolation_qualification::{
+        SupervisorHandoffReasonV1, SupervisorHandoffStageV1,
+    };
     use crate::linux_pytest::snapshot_connector::connect_snapshot_pipeline;
     use crate::linux_pytest::snapshot_policy::{
         SnapshotPipelineResourcesV1, SnapshotResourcePolicyV1,
@@ -534,7 +537,29 @@ mod supported {
                 }
             },
         )?;
-        let report = ready.cancel_and_finish_v1().map_err(|failure| {
+        let supervisor = ready.handoff_to_supervisor_v1().map_err(|failure| {
+            let stage = match failure.stage() {
+                SupervisorHandoffStageV1::PtraceSeize => "ptrace_seize",
+                SupervisorHandoffStageV1::PtraceInterrupt => "ptrace_interrupt",
+                SupervisorHandoffStageV1::WaitForStop => "ptrace_wait_stop",
+                SupervisorHandoffStageV1::VerifyStoppedIdentity => "ptrace_verify_stop",
+            };
+            let reason = match failure.reason() {
+                SupervisorHandoffReasonV1::UnsupportedPlatform => "unsupported_platform",
+                SupervisorHandoffReasonV1::AdministrativePolicy => "administrative_policy",
+                SupervisorHandoffReasonV1::KernelOperation => "kernel_operation",
+                SupervisorHandoffReasonV1::UnexpectedObservation => "unexpected_observation",
+            };
+            FixedDiagnosticFailureV1::new(
+                RefusalCode::IsolationPreflightFailed,
+                stage,
+                reason,
+                failure.errno(),
+                failure.cleanup_complete(),
+                false,
+            )
+        })?;
+        let report = supervisor.cancel_and_finish_v1().map_err(|failure| {
             let reason = match failure.primary() {
                 CommandFreeCancellationPrimaryV1::Isolation(_) => "isolation_cancellation",
                 CommandFreeCancellationPrimaryV1::Stdio(_) => "stdio_drain",
