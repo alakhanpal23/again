@@ -3930,6 +3930,22 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ("gateway_delivery_receipts", "CHECK(stderr_bytes >= 0)"),
         (
             "gateway_delivery_receipts_v2",
+            "CHECK(length(receipt_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "UNIQUE CHECK(length(challenge_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(authorization_scope_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(connection_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
             "CHECK(length(response_request_id_digest) = 64)",
         ),
         (
@@ -3940,6 +3956,44 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "gateway_delivery_receipts_v2",
             "CHECK(length(connection_generation) = 64)",
         ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(session_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(turn_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(agent_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(compaction_generation >= 0)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(call_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(gateway_result_id) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(result_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(stdout_digest) = 64)",
+        ),
+        ("gateway_delivery_receipts_v2", "CHECK(stdout_bytes >= 0)"),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(stderr_digest) = 64)",
+        ),
+        ("gateway_delivery_receipts_v2", "CHECK(stderr_bytes >= 0)"),
         (
             "gateway_delivery_receipts_v2",
             "CHECK(presentation IN ('full', 'compact'))",
@@ -3954,11 +4008,55 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ),
         (
             "gateway_retrieval_grants_v2",
-            "CHECK(length(token_digest) = 64)",
+            "CHECK(length(grant_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "UNIQUE CHECK(length(token_digest) = 64)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(authorization_scope_digest) = 64)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(connection_digest) = 64)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(connection_generation) = 64)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(session_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(turn_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(agent_id) BETWEEN 1 AND 128)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(compaction_generation >= 0)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(gateway_result_id) = 64)",
         ),
         (
             "gateway_retrieval_grants_v2",
             "CHECK(expires_ms > issued_ms)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(consumed_ms IS NULL OR consumed_ms >= issued_ms)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(retired_ms IS NULL OR retired_ms >= issued_ms)",
         ),
         (
             "gateway_retrieval_grants_v2",
@@ -3968,7 +4066,15 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "gateway_retrieval_grants_v2",
             "CHECK((retired_ms IS NULL) = (retire_reason IS NULL))",
         ),
+        (
+            "gateway_delivery_savings_v2",
+            "CHECK(length(response_envelope_digest) = 64)",
+        ),
         ("gateway_delivery_savings_v2", "CHECK(bytes_omitted > 0)"),
+        (
+            "gateway_delivery_savings_v2",
+            "CHECK(estimated_tokens_avoided >= 0)",
+        ),
         (
             "gateway_delivery_receipts",
             "FOREIGN KEY (gateway_result_id) REFERENCES gateway_results",
@@ -5112,6 +5218,42 @@ mod tests {
             .conn
             .execute(
                 "UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'gateway_delivery_receipts'",
+                [&weakened],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=OFF;")
+            .unwrap();
+        assert!(verify_gateway_schema_current(&store.conn).is_err());
+    }
+
+    #[test]
+    fn current_schema_verifier_requires_v10_retrieval_token_uniqueness() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let original: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'gateway_retrieval_grants_v2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let weakened = original.replace(
+            "token_digest TEXT NOT NULL UNIQUE CHECK(length(token_digest) = 64)",
+            "token_digest TEXT NOT NULL CHECK(length(token_digest) = 64)",
+        );
+        assert_ne!(weakened, original);
+        store
+            .conn
+            .execute_batch("PRAGMA writable_schema=ON;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = 'gateway_retrieval_grants_v2'",
                 [&weakened],
             )
             .unwrap();
