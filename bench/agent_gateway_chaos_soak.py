@@ -442,7 +442,7 @@ class Session:
         listing = self.request("tools", "tools/list", {})
         tools = listing.get("result", {}).get("tools")
         names = [item.get("name") for item in tools] if isinstance(tools, list) else []
-        if names != ["repo.read", "repo.search"]:
+        if names != list(product.EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("tools", "MCP tool list changed")
 
     def close(self) -> dict[str, Any]:
