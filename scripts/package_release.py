@@ -18,6 +18,7 @@ import stat
 import tarfile
 import tempfile
 from typing import Any
+import zlib
 
 
 MAX_BINARY_BYTES = 64 * 1024 * 1024
@@ -51,12 +52,19 @@ def regular_file(path: Path, maximum: int, description: str) -> os.stat_result:
 def verify_archive(path: Path) -> None:
     regular_file(path, MAX_BINARY_BYTES, "release archive")
     try:
-        with gzip.open(path, "rb") as compressed:
-            payload = compressed.read(MAX_TAR_BYTES + 1)
-    except (OSError, EOFError) as error:
+        compressed_bytes = path.read_bytes()
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        payload = decompressor.decompress(compressed_bytes, MAX_TAR_BYTES + 1)
+    except (OSError, EOFError, zlib.error) as error:
         raise SystemExit("release archive is not a complete gzip stream") from error
-    if len(payload) > MAX_TAR_BYTES:
+    if (
+        len(payload) > MAX_TAR_BYTES
+        or decompressor.unconsumed_tail
+        or not decompressor.eof
+    ):
         raise SystemExit("release archive expands beyond its fixed limit")
+    if decompressor.unused_data:
+        raise SystemExit("release archive contains trailing or concatenated gzip data")
     try:
         with tarfile.open(fileobj=io.BytesIO(payload), mode="r:") as archive:
             members = archive.getmembers()

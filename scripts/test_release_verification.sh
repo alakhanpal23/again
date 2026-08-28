@@ -409,6 +409,33 @@ if python3 "$repository/scripts/package_release.py" \
     exit 1
 fi
 
+cp "$assets/again-${version}-${target}.tar.gz" "$fixture/concatenated.tar.gz"
+python3 - "$fixture/second-gzip-member" <<'PY'
+import gzip
+import pathlib
+import sys
+
+with gzip.GzipFile(filename=pathlib.Path(sys.argv[1]), mode="wb", mtime=0) as output:
+    output.write(b"\0" * 1024)
+PY
+cat "$fixture/second-gzip-member" >> "$fixture/concatenated.tar.gz"
+if python3 "$repository/scripts/package_release.py" \
+    --verify-archive "$fixture/concatenated.tar.gz" > /dev/null 2>&1; then
+    echo "error: archive verifier accepted a concatenated gzip member" >&2
+    exit 1
+fi
+
+mkdir "$assets/unexpected-directory"
+if GH_CALL_LOG=$fixture/unexpected-directory-calls PATH="$fake_bin:$PATH" \
+    sh "$repository/scripts/verify_release.sh" \
+    --version "$version" --source-commit "$source_commit" \
+    --artifact-dir "$assets" --repository alakhanpal23/again \
+    > /dev/null 2>&1; then
+    echo "error: verifier accepted an unexpected directory member" >&2
+    exit 1
+fi
+rmdir "$assets/unexpected-directory"
+
 mkdir "$fixture/symlink-archive"
 ln -s outside "$fixture/symlink-archive/again"
 tar -czf "$fixture/symlink.tar.gz" -C "$fixture/symlink-archive" again

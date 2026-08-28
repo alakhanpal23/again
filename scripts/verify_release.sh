@@ -140,6 +140,7 @@ expected=$temporary/expected
 expected_inventory=$temporary/expected-inventory
 parsed=$temporary/parsed
 actual=$temporary/actual
+observed_inventory_unsorted=$temporary/observed-inventory-unsorted
 observed_inventory=$temporary/observed-inventory
 cat > "$expected" <<EOF
 again-${version}-aarch64-apple-darwin.tar.gz
@@ -154,13 +155,26 @@ EOF
     cat "$expected"
 } > "$expected_inventory"
 
-find "$artifact_dir" -mindepth 1 -maxdepth 1 -print | while IFS= read -r path; do
+: > "$observed_inventory_unsorted"
+for path in "$artifact_dir"/* "$artifact_dir"/.[!.]* "$artifact_dir"/..?*; do
+    if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+        continue
+    fi
     [ -f "$path" ] && [ ! -L "$path" ] || {
         echo "error: artifact directory contains a non-regular member" >&2
         exit 1
     }
-    basename "$path"
-done | LC_ALL=C sort > "$observed_inventory" || exit 1
+    name=$(basename "$path")
+    case "$name" in
+        SHA256SUMS|again-alpha.rb|again-"${version}"-aarch64-apple-darwin.tar.gz|again-"${version}"-aarch64-unknown-linux-gnu.tar.gz|again-"${version}"-source.cdx.json|again-"${version}"-x86_64-apple-darwin.tar.gz|again-"${version}"-x86_64-unknown-linux-gnu.tar.gz) ;;
+        *)
+            echo "error: artifact directory contains an unexpected member" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$name" >> "$observed_inventory_unsorted"
+done
+LC_ALL=C sort "$observed_inventory_unsorted" > "$observed_inventory"
 cmp "$expected_inventory" "$observed_inventory" >/dev/null || {
     echo "error: artifact directory does not contain the exact release asset set" >&2
     exit 1
