@@ -2934,7 +2934,7 @@ impl Store {
         let token_digest = delivery_token_digest_v2(&token);
 
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        let result =
+        let (result, _) =
             load_gateway_result_unbound_snapshot_v2(&transaction, delivery.gateway_result_id())?;
         let streams = binding.streams();
         if result.exit_code != streams.exact_status()
@@ -3062,8 +3062,16 @@ impl Store {
         if consumed_ms.is_some() {
             bail!(DeliveryAuthorityRefusalV1::AcknowledgementReplayed.code());
         }
-        if retired_ms.is_some() || expires_ms <= now {
+        if retired_ms.is_some() {
             bail!(DeliveryAuthorityRefusalV1::Retired.code());
+        }
+        if expires_ms <= now {
+            transaction.execute(
+                "UPDATE gateway_retrieval_grants_v2 SET retired_ms = ?2, retire_reason = 'expired' WHERE grant_id = ?1 AND consumed_ms IS NULL AND retired_ms IS NULL",
+                params![authority.grant_id(), now],
+            )?;
+            transaction.commit()?;
+            return Err(anyhow!(DeliveryAuthorityRefusalV1::Retired.code()));
         }
         if !constant_time_digest_eq_v2(
             token_digest.as_bytes(),
@@ -3089,14 +3097,29 @@ impl Store {
             bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
 
-        let result = load_gateway_result_unbound_snapshot_v2(&transaction, &result_id)?;
-        let dependencies = load_result_dependencies_v1(&transaction, &result_id)?;
-        let stdout = self.get_blob(&result.stdout_digest)?;
-        let stderr = self.get_blob(&result.stderr_digest)?;
-        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
-        {
-            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
-        }
+        let integrity = (|| -> Result<_> {
+            let (result, dependencies) =
+                load_gateway_result_unbound_snapshot_v2(&transaction, &result_id)?;
+            let stdout = self.get_blob(&result.stdout_digest)?;
+            let stderr = self.get_blob(&result.stderr_digest)?;
+            if stdout.len() as u64 != result.stdout_bytes
+                || stderr.len() as u64 != result.stderr_bytes
+            {
+                bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+            }
+            Ok((result, dependencies, stdout, stderr))
+        })();
+        let (result, dependencies, stdout, stderr) = match integrity {
+            Ok(integrity) => integrity,
+            Err(_) => {
+                transaction.execute(
+                    "UPDATE gateway_retrieval_grants_v2 SET retired_ms = ?2, retire_reason = 'integrity_refused' WHERE gateway_result_id = ?1 AND consumed_ms IS NULL AND retired_ms IS NULL",
+                    params![result_id, now],
+                )?;
+                transaction.commit()?;
+                return Err(anyhow!(DeliveryAuthorityRefusalV1::InvalidBinding.code()));
+            }
+        };
         let changed = transaction.execute(
             "UPDATE gateway_retrieval_grants_v2 SET consumed_ms = ?2 WHERE grant_id = ?1 AND consumed_ms IS NULL AND retired_ms IS NULL AND expires_ms > ?2",
             params![authority.grant_id(), now],
@@ -3527,14 +3550,28 @@ fn hash_field(hasher: &mut blake3::Hasher, value: &[u8]) {
 }
 
 fn gateway_binding_digest(input: &GatewayCoordinatorInputV1) -> String {
+    gateway_binding_content_digest(
+        &input.request_digest,
+        &input.state_digest,
+        &input.policy_digest,
+        &input.dependencies,
+    )
+}
+
+fn gateway_binding_content_digest(
+    request_digest: &str,
+    state_digest: &str,
+    policy_digest: &str,
+    dependencies: &[GatewayDependencyV1],
+) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"again.gateway.binding.v1\0");
-    hash_field(&mut hasher, input.request_digest.as_bytes());
-    hash_field(&mut hasher, input.state_digest.as_bytes());
-    hash_field(&mut hasher, input.policy_digest.as_bytes());
+    hash_field(&mut hasher, request_digest.as_bytes());
+    hash_field(&mut hasher, state_digest.as_bytes());
+    hash_field(&mut hasher, policy_digest.as_bytes());
     hash_field(&mut hasher, b"replay_eligible_read");
-    hasher.update(&(input.dependencies.len() as u64).to_le_bytes());
-    for dependency in &input.dependencies {
+    hasher.update(&(dependencies.len() as u64).to_le_bytes());
+    for dependency in dependencies {
         hash_field(&mut hasher, dependency.key_digest.as_bytes());
         hash_field(&mut hasher, dependency.value_digest.as_bytes());
     }
@@ -3990,12 +4027,12 @@ fn constant_time_digest_eq_v2(left: &[u8], right: &[u8]) -> bool {
 fn load_gateway_result_unbound_snapshot_v2(
     transaction: &Transaction<'_>,
     gateway_result_id: &str,
-) -> Result<StoredResult> {
+) -> Result<(StoredResult, Vec<GatewayDependencyV1>)> {
     let snapshot = transaction
         .query_row(
-            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest, lease_id FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready' AND quarantine_reason IS NULL",
+            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest, lease_id, status, quarantine_reason FROM gateway_results WHERE gateway_result_id = ?1",
             [gateway_result_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, i32>(5)?, row.get::<_, u64>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?, row.get::<_, String>(13)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, i32>(5)?, row.get::<_, u64>(6)?, row.get::<_, String>(7)?, row.get::<_, String>(8)?, row.get::<_, String>(9)?, row.get::<_, String>(10)?, row.get::<_, String>(11)?, row.get::<_, String>(12)?, row.get::<_, String>(13)?, row.get::<_, String>(14)?, row.get::<_, Option<String>>(15)?)),
         )
         .optional()?;
     let Some((
@@ -4013,23 +4050,33 @@ fn load_gateway_result_unbound_snapshot_v2(
         policy_digest,
         binding_digest,
         lease_id,
+        status,
+        quarantine_reason,
     )) = snapshot
     else {
         bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
     };
-    let Some(result) = load_visible_result_tx(transaction, &result_id)? else {
+    if status != "ready" || quarantine_reason.is_some() {
         bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
-    };
-    if result.request_key != request_digest
-        || result.stdout_digest != stdout_digest
-        || result.stderr_digest != stderr_digest
-        || result.stdout_bytes != stdout_bytes
-        || result.stderr_bytes != stderr_bytes
-        || result.exit_code != exit_code
-        || result.duration_ms != duration_ms
-        || result.policy_version != policy_version
-        || blake3::hash(result.proof_json.as_bytes()).to_hex().as_str() != proof_digest
-    {
+    }
+    for digest in [
+        gateway_result_id,
+        &stdout_digest,
+        &stderr_digest,
+        &proof_digest,
+        &request_digest,
+        &state_digest,
+        &policy_digest,
+        &binding_digest,
+    ] {
+        validate_digest(digest, "gateway retrieval snapshot digest")?;
+    }
+    let divergent_rows: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM gateway_results WHERE binding_digest = ?1 AND gateway_result_id != ?2",
+        params![binding_digest, gateway_result_id],
+        |row| row.get(0),
+    )?;
+    if divergent_rows != 0 {
         bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
     }
     let Some(lease) = gateway_lease_row_v1(transaction, &lease_id)? else {
@@ -4050,11 +4097,103 @@ fn load_gateway_result_unbound_snapshot_v2(
     {
         bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
     }
+    let leader_request = transaction
+        .query_row(
+            "SELECT request_digest, state_digest, policy_digest, binding_digest, role, status, joined_lease_id, gateway_result_id FROM gateway_requests WHERE call_id = ?1",
+            [&lease.call_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(leader_request) = leader_request else {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    };
+    if leader_request.0 != request_digest
+        || leader_request.1 != state_digest
+        || leader_request.2 != policy_digest
+        || leader_request.3 != binding_digest
+        || leader_request.4 != "leader"
+        || leader_request.5 != "ready"
+        || leader_request.6.as_deref() != Some(lease_id.as_str())
+        || leader_request.7.as_deref() != Some(gateway_result_id)
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
     let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
+    validate_gateway_dependency_manifest_v1(&dependencies)?;
+    let request_dependencies = load_request_dependencies_v1(transaction, &lease.call_id)?;
+    validate_gateway_dependency_manifest_v1(&request_dependencies)?;
+    if dependencies != request_dependencies
+        || gateway_binding_content_digest(
+            &request_digest,
+            &state_digest,
+            &policy_digest,
+            &dependencies,
+        ) != binding_digest
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    let source = transaction
+        .query_row(
+            "SELECT id, request_key, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, policy_version, proof_json, quarantined FROM results WHERE id = ?1",
+            [&result_id],
+            |row| Ok((row_to_result(row)?, row.get::<_, bool>(10)?)),
+        )
+        .optional()?;
+    let Some((result, source_quarantined)) = source else {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    };
+    if source_quarantined
+        || result.request_key != request_digest
+        || result.stdout_digest != stdout_digest
+        || result.stderr_digest != stderr_digest
+        || result.stdout_bytes != stdout_bytes
+        || result.stderr_bytes != stderr_bytes
+        || result.exit_code != exit_code
+        || result.duration_ms != duration_ms
+        || result.policy_version != policy_version
+        || blake3::hash(result.proof_json.as_bytes()).to_hex().as_str() != proof_digest
+        || gateway_policy_digest(&result.policy_version) != policy_digest
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
     if gateway_result_content_digest(&lease, &result, &dependencies) != gateway_result_id {
         bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
     }
-    Ok(result)
+    Ok((result, dependencies))
+}
+
+fn validate_gateway_dependency_manifest_v1(dependencies: &[GatewayDependencyV1]) -> Result<()> {
+    if dependencies.len() > GATEWAY_MAX_DEPENDENCIES {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    for dependency in dependencies {
+        validate_digest(
+            &dependency.key_digest,
+            "gateway result dependency key digest",
+        )?;
+        validate_digest(
+            &dependency.value_digest,
+            "gateway result dependency value digest",
+        )?;
+    }
+    if dependencies
+        .windows(2)
+        .any(|pair| pair[0].key_digest >= pair[1].key_digest)
+    {
+        bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+    }
+    Ok(())
 }
 
 fn load_gateway_result_snapshot_v1(
@@ -6568,6 +6707,157 @@ mod tests {
         assert!(store.was_delivered("s", "root-turn", &result.id).unwrap());
     }
 
+    struct RetrievalAuthorityFixtureV2 {
+        _temp: TempDir,
+        root: PathBuf,
+        store: Store,
+        result: StoredResult,
+        gateway_result_id: String,
+    }
+
+    impl RetrievalAuthorityFixtureV2 {
+        fn new(label: &str) -> Self {
+            let temp = TempDir::new().unwrap();
+            let root = temp.path().join("state");
+            let mut store = Store::open(&root).unwrap();
+            let state_digest = blake3::hash(format!("state-{label}").as_bytes())
+                .to_hex()
+                .to_string();
+            let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+                request_digest: blake3::hash(format!("request-{label}").as_bytes())
+                    .to_hex()
+                    .to_string(),
+                state_digest: state_digest.clone(),
+                policy_digest: gateway_policy_digest("retrieval-authority-v2"),
+                operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+                freshness: GatewayFreshnessEvidenceV1 {
+                    snapshot_digest: state_digest,
+                    observed_at_ms: now_ms(),
+                    valid_until_ms: now_ms() + 60_000,
+                },
+                dependencies: vec![GatewayDependencyV1 {
+                    key_digest: blake3::hash(b"retrieval-dependency-key")
+                        .to_hex()
+                        .to_string(),
+                    value_digest: blake3::hash(format!("dependency-{label}").as_bytes())
+                        .to_hex()
+                        .to_string(),
+                }],
+            })
+            .unwrap();
+            let lease_id = match store
+                .acquire_gateway_call(&binding, "retrieval-authority-owner")
+                .unwrap()
+            {
+                GatewayCallAcquisition::Leader { lease_id, .. } => lease_id,
+                other => panic!("expected retrieval authority leader, got {other:?}"),
+            };
+            assert_eq!(
+                store
+                    .start_gateway_execution(&lease_id, "retrieval-authority-owner")
+                    .unwrap(),
+                GatewayExecutionStart::Started
+            );
+            let result = store
+                .insert_result(
+                    binding.request_digest(),
+                    br#"{"retrieved":true}"#,
+                    b"",
+                    0,
+                    7,
+                    "retrieval-authority-v2",
+                    r#"{"proof":"retrieval-authority-v2"}"#,
+                )
+                .unwrap();
+            let gateway_result_id =
+                match store.complete_gateway_call(&lease_id, &result.id).unwrap() {
+                    GatewayCompletion::Completed {
+                        gateway_result_id, ..
+                    } => gateway_result_id,
+                    other => panic!("expected retrieval authority completion, got {other:?}"),
+                };
+            Self {
+                _temp: temp,
+                root,
+                store,
+                result,
+                gateway_result_id,
+            }
+        }
+
+        fn issue(&self, suffix: &str) -> (String, String, String, i64) {
+            let confirmation = crate::mcp_gateway::confirmed_delivery_for_test_v1(
+                &format!("retrieval_authority_{suffix}"),
+                &self.gateway_result_id,
+                self.result.exit_code,
+                &self.result.stdout_digest,
+                self.result.stdout_bytes,
+                &self.result.stderr_digest,
+                self.result.stderr_bytes,
+            );
+            self.store
+                .confirm_gateway_delivery_and_issue_retrieval_v2(&confirmation)
+                .unwrap()
+                .into_wire_parts()
+        }
+
+        fn assert_zero_confirmed_savings(&self) {
+            let (compact_receipts, savings): (u64, u64) = self
+                .store
+                .conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM gateway_delivery_receipts_v2 WHERE presentation = 'compact'), (SELECT COUNT(*) FROM gateway_delivery_savings_v2)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((compact_receipts, savings), (0, 0));
+        }
+    }
+
+    struct RetrievalRecipientBindingV2 {
+        scope: String,
+        connection: String,
+        connection_generation: String,
+        agent: String,
+        session: String,
+        turn: String,
+        compaction_generation: u64,
+    }
+
+    impl RetrievalRecipientBindingV2 {
+        fn authentic() -> Self {
+            Self {
+                scope: "1".repeat(64),
+                connection: "2".repeat(64),
+                connection_generation: "3".repeat(64),
+                agent: "test-agent".to_owned(),
+                session: "test-session".to_owned(),
+                turn: "test-turn".to_owned(),
+                compaction_generation: 0,
+            }
+        }
+    }
+
+    fn retrieval_authority_v2(
+        wire: &(String, String, String, i64),
+        binding: &RetrievalRecipientBindingV2,
+    ) -> crate::mcp_gateway::RecipientRetrievalAuthorityV2 {
+        crate::mcp_gateway::recipient_retrieval_authority_for_test_v2(
+            wire.0.clone(),
+            wire.1.clone(),
+            wire.2.clone(),
+            wire.3,
+            binding.scope.clone(),
+            binding.connection.clone(),
+            binding.connection_generation.clone(),
+            binding.agent.clone(),
+            binding.session.clone(),
+            binding.turn.clone(),
+            binding.compaction_generation,
+        )
+    }
+
     #[test]
     fn acknowledged_delivery_persists_once_and_legacy_clear_cannot_erase_receipt() {
         let temp = TempDir::new().unwrap();
@@ -6704,6 +6994,340 @@ mod tests {
                 .is_err(),
             "retrieval grants are one use"
         );
+    }
+
+    #[test]
+    fn retrieval_authority_v2_refuses_forged_bindings_without_consuming_the_grant() {
+        let fixture = RetrievalAuthorityFixtureV2::new("forged-bindings");
+        let authentic_binding = RetrievalRecipientBindingV2::authentic();
+        let cases = vec![
+            (
+                "f".repeat(64),
+                authentic_binding.connection.clone(),
+                authentic_binding.connection_generation.clone(),
+                "test-agent".to_owned(),
+                "test-session".to_owned(),
+                "test-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                "f".repeat(64),
+                authentic_binding.connection_generation.clone(),
+                "test-agent".to_owned(),
+                "test-session".to_owned(),
+                "test-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                authentic_binding.connection.clone(),
+                "f".repeat(64),
+                "test-agent".to_owned(),
+                "test-session".to_owned(),
+                "test-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                authentic_binding.connection.clone(),
+                authentic_binding.connection_generation.clone(),
+                "forged-agent".to_owned(),
+                "test-session".to_owned(),
+                "test-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                authentic_binding.connection.clone(),
+                authentic_binding.connection_generation.clone(),
+                "test-agent".to_owned(),
+                "forged-session".to_owned(),
+                "test-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                authentic_binding.connection.clone(),
+                authentic_binding.connection_generation.clone(),
+                "test-agent".to_owned(),
+                "test-session".to_owned(),
+                "forged-turn".to_owned(),
+                0,
+            ),
+            (
+                authentic_binding.scope.clone(),
+                authentic_binding.connection.clone(),
+                authentic_binding.connection_generation.clone(),
+                "test-agent".to_owned(),
+                "test-session".to_owned(),
+                "test-turn".to_owned(),
+                1,
+            ),
+        ];
+        for (
+            index,
+            (
+                wrong_scope,
+                wrong_connection,
+                wrong_generation,
+                wrong_agent,
+                wrong_session,
+                wrong_turn,
+                wrong_compaction,
+            ),
+        ) in cases.into_iter().enumerate()
+        {
+            let wire = fixture.issue(&format!("forged_binding_{index}"));
+            let forged_binding = RetrievalRecipientBindingV2 {
+                scope: wrong_scope,
+                connection: wrong_connection,
+                connection_generation: wrong_generation,
+                agent: wrong_agent,
+                session: wrong_session,
+                turn: wrong_turn,
+                compaction_generation: wrong_compaction,
+            };
+            let forged = retrieval_authority_v2(&wire, &forged_binding);
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&forged)
+                    .is_err()
+            );
+            let authentic = retrieval_authority_v2(&wire, &authentic_binding);
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&authentic)
+                    .is_ok(),
+                "forged case {index} consumed authentic one-use authority"
+            );
+            fixture.assert_zero_confirmed_savings();
+        }
+
+        for (suffix, mutate) in [
+            ("stolen_token", 0_u8),
+            ("stolen_result_id", 1_u8),
+            ("forged_expiry", 2_u8),
+        ] {
+            let wire = fixture.issue(suffix);
+            let mut forged_wire = wire.clone();
+            match mutate {
+                0 => forged_wire.1 = "stolen-token".to_owned(),
+                1 => forged_wire.2 = "f".repeat(64),
+                2 => forged_wire.3 = forged_wire.3.saturating_add(1),
+                _ => unreachable!(),
+            }
+            let forged = retrieval_authority_v2(&forged_wire, &authentic_binding);
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&forged)
+                    .is_err()
+            );
+            let authentic = retrieval_authority_v2(&wire, &authentic_binding);
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&authentic)
+                    .is_ok()
+            );
+            fixture.assert_zero_confirmed_savings();
+        }
+    }
+
+    #[test]
+    fn retrieval_authority_v2_revalidates_every_store_binding_and_retires_on_refusal() {
+        type MutationV2 = Box<dyn FnOnce(&RetrievalAuthorityFixtureV2)>;
+        let mutations: Vec<(&str, MutationV2)> = vec![
+            (
+                "leader-request",
+                Box::new(|fixture| {
+                    fixture.store.conn.execute(
+                    "UPDATE gateway_requests SET state_digest = ?2 WHERE gateway_result_id = ?1 AND role = 'leader'",
+                    params![fixture.gateway_result_id, "f".repeat(64)],
+                ).unwrap();
+                }),
+            ),
+            (
+                "request-dependency",
+                Box::new(|fixture| {
+                    fixture
+                        .store
+                        .conn
+                        .execute(
+                            "UPDATE gateway_request_dependencies SET dependency_value_digest = ?1",
+                            ["f".repeat(64)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "result-dependency",
+                Box::new(|fixture| {
+                    fixture
+                        .store
+                        .conn
+                        .execute(
+                            "UPDATE result_dependencies SET dependency_value_digest = ?1",
+                            ["f".repeat(64)],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "repository-state",
+                Box::new(|fixture| {
+                    fixture.store.conn.execute(
+                    "UPDATE inflight_leases SET state_digest = ?2 WHERE gateway_result_id = ?1",
+                    params![fixture.gateway_result_id, "f".repeat(64)],
+                ).unwrap();
+                }),
+            ),
+            (
+                "policy",
+                Box::new(|fixture| {
+                    fixture
+                        .store
+                        .conn
+                        .execute(
+                            "UPDATE results SET policy_version = 'forged-policy' WHERE id = ?1",
+                            [&fixture.result.id],
+                        )
+                        .unwrap();
+                }),
+            ),
+            (
+                "quarantined-result",
+                Box::new(|fixture| {
+                    fixture.store.conn.execute(
+                    "UPDATE gateway_results SET status = 'quarantined', quarantine_reason = 'test' WHERE gateway_result_id = ?1",
+                    [&fixture.gateway_result_id],
+                ).unwrap();
+                }),
+            ),
+            (
+                "incomplete-source",
+                Box::new(|fixture| {
+                    fixture.store.conn.execute(
+                    "UPDATE results SET quarantined = 1, quarantine_reason = 'test' WHERE id = ?1",
+                    [&fixture.result.id],
+                ).unwrap();
+                }),
+            ),
+        ];
+
+        for (label, mutation) in mutations {
+            let fixture = RetrievalAuthorityFixtureV2::new(label);
+            let wire = fixture.issue(label);
+            mutation(&fixture);
+            let authority =
+                retrieval_authority_v2(&wire, &RetrievalRecipientBindingV2::authentic());
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&authority)
+                    .is_err(),
+                "mutation {label} unexpectedly retained retrieval authority"
+            );
+            let outstanding: u64 = fixture.store.conn.query_row(
+                "SELECT COUNT(*) FROM gateway_retrieval_grants_v2 WHERE consumed_ms IS NULL AND retired_ms IS NULL",
+                [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(outstanding, 0, "mutation {label} left authority live");
+            fixture.assert_zero_confirmed_savings();
+        }
+    }
+
+    #[test]
+    fn retrieval_authority_v2_refuses_deleted_replaced_and_same_length_corrupt_cas() {
+        for mode in ["deleted", "replaced", "same-length-corrupt"] {
+            let fixture = RetrievalAuthorityFixtureV2::new(mode);
+            let wire = fixture.issue(mode);
+            let path = fixture
+                .store
+                .blob_path(&fixture.result.stdout_digest)
+                .unwrap();
+            match mode {
+                "deleted" => fs::remove_file(path).unwrap(),
+                "replaced" => fs::write(path, b"replacement").unwrap(),
+                "same-length-corrupt" => {
+                    fs::write(path, vec![b'x'; fixture.result.stdout_bytes as usize]).unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let authority =
+                retrieval_authority_v2(&wire, &RetrievalRecipientBindingV2::authentic());
+            assert!(
+                fixture
+                    .store
+                    .consume_gateway_retrieval_grant_v2(&authority)
+                    .is_err(),
+                "CAS mode {mode} unexpectedly retained retrieval authority"
+            );
+            let outstanding: u64 = fixture.store.conn.query_row(
+                "SELECT COUNT(*) FROM gateway_retrieval_grants_v2 WHERE consumed_ms IS NULL AND retired_ms IS NULL",
+                [],
+                |row| row.get(0),
+            ).unwrap();
+            assert_eq!(outstanding, 0);
+            fixture.assert_zero_confirmed_savings();
+        }
+    }
+
+    #[test]
+    fn retrieval_authority_v2_is_expiring_and_concurrently_one_use() {
+        let expired = RetrievalAuthorityFixtureV2::new("expired");
+        let expired_wire = expired.issue("expired");
+        expired
+            .store
+            .conn
+            .execute(
+                "UPDATE gateway_retrieval_grants_v2 SET issued_ms = 0, expires_ms = 1 WHERE grant_id = ?1",
+                [&expired_wire.0],
+            )
+            .unwrap();
+        let expired_authority =
+            retrieval_authority_v2(&expired_wire, &RetrievalRecipientBindingV2::authentic());
+        assert!(
+            expired
+                .store
+                .consume_gateway_retrieval_grant_v2(&expired_authority)
+                .is_err()
+        );
+        let retired: bool = expired.store.conn.query_row(
+            "SELECT retired_ms IS NOT NULL FROM gateway_retrieval_grants_v2 WHERE grant_id = ?1",
+            [&expired_wire.0],
+            |row| row.get(0),
+        ).unwrap();
+        assert!(retired);
+        expired.assert_zero_confirmed_savings();
+
+        let concurrent = RetrievalAuthorityFixtureV2::new("concurrent");
+        let wire = concurrent.issue("concurrent");
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let root = concurrent.root.clone();
+                let wire = wire.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = Store::open(root).unwrap();
+                    let authority =
+                        retrieval_authority_v2(&wire, &RetrievalRecipientBindingV2::authentic());
+                    barrier.wait();
+                    store.consume_gateway_retrieval_grant_v2(&authority)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(workers.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(workers.iter().filter(|result| result.is_err()).count(), 1);
+        concurrent.assert_zero_confirmed_savings();
     }
 
     #[test]
