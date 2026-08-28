@@ -1,0 +1,236 @@
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from unittest import mock
+
+from bench import agent_gateway_chaos_soak as harness
+
+
+def scenario_report() -> dict[str, object]:
+    rid_a = "a" * 64
+    rid_b = "b" * 64
+    return {
+        "false_hit_count": 0,
+        "scenarios": {
+            "concurrent_join": {
+                "result_id": rid_a,
+                "identical_responses": True,
+                "event_counts": {
+                    "completed": 1,
+                    "executed": 1,
+                    "inflight_candidate": 1,
+                    "inflight_join": 1,
+                    "requested": 2,
+                },
+            },
+            "exact_repeat": {
+                "result_id": rid_a,
+                "identical_response": True,
+                "event_counts": {"exact_candidate": 1, "exact_hit": 1, "requested": 1},
+            },
+            "relevant_mutation": {
+                "baseline_result_id": rid_a,
+                "new_result_id": rid_b,
+                "old_result_served": False,
+                "request_binding": "new",
+                "baseline_window": {"request_binding": "old"},
+                "event_counts": {"completed": 1, "executed": 1, "requested": 1},
+            },
+            "irrelevant_mutation": {
+                "request_binding": "new",
+                "event_counts": {"exact_candidate": 1, "exact_hit": 1, "requested": 1},
+            },
+            "follower_cancellation": {
+                "follower_error_code": -32800,
+                "leader_result_id": rid_a,
+                "event_counts": {
+                    "completed": 1,
+                    "executed": 1,
+                    "follower_cancelled": 1,
+                    "inflight_candidate": 1,
+                    "requested": 2,
+                },
+            },
+            "leader_cancellation": {
+                "cancel_error_code": -32800,
+                "ready_results_before_retry": 0,
+                "retry_result_id": rid_b,
+                "event_counts": {"executed": 1, "failed": 1, "requested": 1},
+            },
+            "lease_owner_crash": {
+                "classification": "bounded_recovery_without_stale_completion",
+                "old_lease": {"lifecycle_generation": 3},
+                "new_lease": {"lifecycle_generation": 4, "status": "completed"},
+                "event_counts": {
+                    "completed": 1,
+                    "executed": 1,
+                    "lease_expired": 1,
+                    "requested": 1,
+                },
+            },
+            "corrupted_evidence": {
+                "served_result_id": None,
+                "recomputed_output_matches": True,
+                "quarantine_window": {
+                    "reason": "result_corrupt",
+                    "request_authority_issued": False,
+                    "event_counts": {"binding_quarantined": 1},
+                },
+            },
+        },
+    }
+
+
+class ChaosSoakHarnessTests(unittest.TestCase):
+    def test_canonical_json_and_digest_are_stable(self) -> None:
+        self.assertEqual(
+            harness.canonical_json({"z": 1, "a": "x"}), b'{"a":"x","z":1}\n'
+        )
+        self.assertEqual(harness.sha256_bytes(b"x"), harness.sha256_bytes(b"x"))
+
+    def test_strict_json_rejects_duplicate_depth_oversize_and_framing(self) -> None:
+        valid = b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
+        self.assertEqual(harness.parse_json_rpc_line(valid)["id"], 1)
+        for raw, code in (
+            (b'{"jsonrpc":"2.0","id":1,"id":2,"result":{}}\n', "duplicate_json_key"),
+            (b'{"jsonrpc":"2.0","id":1,"result":{}}\r\n', "invalid_json_framing"),
+            (b"x" * (harness.MAX_FRAME_BYTES + 1), "response_oversized"),
+        ):
+            with self.subTest(code=code), self.assertRaises(harness.HarnessRefusal) as refused:
+                harness.parse_json_rpc_line(raw)
+            self.assertEqual(refused.exception.code, code)
+        deep: object = None
+        for _ in range(harness.MAX_JSON_DEPTH + 1):
+            deep = [deep]
+        raw = harness.canonical_json({"jsonrpc": "2.0", "id": 1, "result": deep})
+        with self.assertRaises(harness.HarnessRefusal) as refused:
+            harness.parse_json_rpc_line(raw)
+        self.assertEqual(refused.exception.code, "json_depth_limit")
+
+    def test_selector_framing_times_out_and_accepts_split_line(self) -> None:
+        read_fd, write_fd = os.pipe()
+        read = os.fdopen(read_fd, "rb", buffering=0)
+        fake = object.__new__(harness.Session)
+        fake.stdout = read
+        fake.buffer = bytearray()
+        try:
+            with self.assertRaises(harness.HarnessRefusal) as refused:
+                fake._read_line(0.02)
+            self.assertEqual(refused.exception.code, "response_timeout")
+
+            def writer() -> None:
+                os.write(write_fd, b'{"jsonrpc":"2.0",')
+                time.sleep(0.01)
+                os.write(write_fd, b'"id":1,"result":{}}\n')
+
+            thread = threading.Thread(target=writer)
+            thread.start()
+            frame = fake._read_line(1.0)
+            thread.join(1.0)
+            self.assertEqual(harness.parse_json_rpc_line(frame)["id"], 1)
+        finally:
+            os.close(write_fd)
+            read.close()
+
+    def test_false_hits_are_derived_from_result_ids_outputs_and_events(self) -> None:
+        report = scenario_report()
+        count, cases = harness.derive_false_hits(report)
+        self.assertEqual(count, 0)
+        self.assertFalse(any(case["false_hit"] for case in cases))
+        scenarios = report["scenarios"]
+        assert isinstance(scenarios, dict)
+        mutation = scenarios["relevant_mutation"]
+        assert isinstance(mutation, dict)
+        mutation["new_result_id"] = "a" * 64
+        count, cases = harness.derive_false_hits(report)
+        self.assertEqual(count, 1)
+        self.assertTrue(
+            next(case for case in cases if case["name"] == "mutation_invalidation")["false_hit"]
+        )
+        report = scenario_report()
+        scenarios = report["scenarios"]
+        assert isinstance(scenarios, dict)
+        corruption = scenarios["corrupted_evidence"]
+        assert isinstance(corruption, dict)
+        corruption["served_result_id"] = "c" * 64
+        self.assertEqual(harness.derive_false_hits(report)[0], 1)
+
+    def test_atomic_evidence_refuses_overwrite_and_cleans_pending_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            path = root / "evidence.json"
+            harness.write_exclusive(path, b"{}\n")
+            self.assertEqual(path.read_bytes(), b"{}\n")
+            with self.assertRaises(harness.HarnessRefusal) as refused:
+                harness.write_exclusive(path, b'{"changed":true}\n')
+            self.assertEqual(refused.exception.code, "evidence_exists")
+            self.assertEqual(path.read_bytes(), b"{}\n")
+            self.assertEqual(
+                [item for item in root.iterdir() if item.name.endswith(".pending")], []
+            )
+            with self.assertRaises(harness.HarnessRefusal):
+                harness.write_exclusive(
+                    root / "large", b"x" * (harness.MAX_EVIDENCE_BYTES + 1)
+                )
+
+    def test_atomic_evidence_write_failure_never_publishes_final_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            path = root / "evidence.json"
+            with mock.patch.object(harness.os, "write", side_effect=OSError("injected")):
+                with self.assertRaises(OSError):
+                    harness.write_exclusive(path, b"{}\n")
+            self.assertFalse(path.exists())
+            self.assertEqual(list(root.iterdir()), [])
+
+    def test_pin_uses_stable_descriptor_and_revalidates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory).resolve()
+            source = root / "source"
+            source.write_bytes(b"#!/bin/sh\nexit 0\n")
+            source.chmod(0o700)
+            pinned = harness.pin_binary_exact(source, root / "pin" / "again")
+            self.assertTrue(harness.revalidate_pinned_binary(pinned)["stable"])
+            pinned.executable_path.chmod(0o700)
+            pinned.executable_path.write_bytes(b"changed")
+            with self.assertRaises(harness.HarnessRefusal) as refused:
+                harness.revalidate_pinned_binary(pinned)
+            self.assertEqual(refused.exception.code, "binary_revalidation")
+
+    def test_complete_process_group_cleanup_after_leader_exit(self) -> None:
+        if os.name != "posix":
+            self.skipTest("process groups require POSIX")
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        process.wait(timeout=5)
+        self.assertTrue(harness._process_group_exists(process.pid))
+        evidence = harness.terminate_owned_process_group(process.pid)
+        self.assertTrue(evidence["absent_after_cleanup"])
+
+    def test_bounds_and_network_nonclaim_are_explicit(self) -> None:
+        self.assertEqual(harness.MAX_PROCESSES, 32)
+        self.assertEqual(harness.LEASE_SECONDS, 30)
+        self.assertEqual(
+            json.loads(harness.canonical_json({"mode": "quick"})), {"mode": "quick"}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
