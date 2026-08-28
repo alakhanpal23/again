@@ -1,7 +1,4 @@
-#[path = "../src/execution_backend.rs"]
-mod execution_backend;
-
-use execution_backend::{
+use again::execution_backend::{
     AuditedLocalRead, AuditedReadRequest, AuditedReadResult, BackendError, BackendKind,
     ExactReadAdapter, Firecracker, GVisor, Qualification, RemoteMcp, RootlessLinux,
     UnsupportedReason,
@@ -34,6 +31,7 @@ fn authority_matrix_is_minimal_and_explicit() {
     assert_eq!(firecracker.qualification(), Qualification::DescriptorOnly);
     assert_eq!(gvisor.authority(), rootless.authority());
     assert_eq!(firecracker.authority(), rootless.authority());
+    assert!(!gvisor.authority().permits_local_command_execution());
 
     let remote = RemoteMcp {
         provider_identity: "provider-identity".into(),
