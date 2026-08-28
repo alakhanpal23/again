@@ -3,9 +3,10 @@
 //! The daemon is an optimization boundary, not a new reuse authority. Every
 //! MCP connection still constructs the normal repository-aware gateway and
 //! earns reuse through the existing store proofs. The transport accepts only
-//! the current effective uid, binds a canonical-workspace digest in a fixed
-//! handshake, and places its predictable socket below an owner-private
-//! directory. No caller-provided bearer token is accepted.
+//! the current effective uid, binds a canonical-workspace digest and random
+//! bounded-lifetime session nonce in a fixed handshake, and publishes a random
+//! socket name through an owner-private locator. No caller-provided bearer
+//! token is accepted and possession of stale session material is insufficient.
 
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, File, FileType, Metadata, OpenOptions, Permissions};
@@ -17,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -28,10 +29,18 @@ use crate::store::Store;
 
 const HANDSHAKE_MAGIC_V1: &[u8; 8] = b"AGNGW001";
 const RESPONSE_MAGIC_V1: &[u8; 8] = b"AGNR0001";
-const HANDSHAKE_BYTES_V1: usize = 41;
+const ENDPOINT_MAGIC_V1: &[u8; 8] = b"AGNEP001";
+const SESSION_NONCE_BYTES_V1: usize = 16;
+const SOCKET_NAME_BYTES_V1: usize = 32;
+const ENDPOINT_BYTES_V1: usize = 8 + SESSION_NONCE_BYTES_V1 + SOCKET_NAME_BYTES_V1;
+const HANDSHAKE_BYTES_V1: usize = 8 + 1 + 32 + SESSION_NONCE_BYTES_V1;
 const MAX_CONTROL_PAYLOAD_BYTES_V1: usize = 4 * 1024;
 const MAX_ACTIVE_CONNECTIONS_V1: usize = 32;
 const HANDSHAKE_TIMEOUT_V1: Duration = Duration::from_secs(5);
+const MCP_IDLE_READ_TIMEOUT_V1: Duration = Duration::from_secs(60);
+const MCP_WRITE_TIMEOUT_V1: Duration = Duration::from_secs(10);
+const MAX_SESSION_LIFETIME_V1: Duration = Duration::from_secs(8 * 60 * 60);
+const SHUTDOWN_TIMEOUT_V1: Duration = Duration::from_secs(10);
 const ACCEPT_POLL_V1: Duration = Duration::from_millis(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,6 +91,10 @@ pub enum GatewayServiceError {
     InvalidHandshake,
     #[error("gateway daemon is at its bounded connection capacity")]
     Busy,
+    #[error("gateway daemon peer authentication is unsupported on this platform")]
+    UnsupportedPlatform,
+    #[error("gateway daemon workers did not stop before the shutdown deadline")]
+    ShutdownDeadline,
     #[error("gateway daemon I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("gateway daemon initialization failed")]
@@ -112,24 +125,38 @@ impl GatewayDaemonStatusV1 {
     }
 }
 
-struct SocketCleanupV1 {
-    path: PathBuf,
-    device: u64,
-    inode: u64,
+struct RuntimeCleanupV1 {
+    endpoint: PathBuf,
+    endpoint_device: u64,
+    endpoint_inode: u64,
+    socket: PathBuf,
+    socket_identity: Option<(u64, u64)>,
 }
 
-impl Drop for SocketCleanupV1 {
+impl Drop for RuntimeCleanupV1 {
     fn drop(&mut self) {
-        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
-            return;
-        };
-        if metadata.file_type().is_socket()
-            && metadata.dev() == self.device
-            && metadata.ino() == self.inode
+        if let Some((device, inode)) = self.socket_identity
+            && let Ok(metadata) = fs::symlink_metadata(&self.socket)
+            && metadata.file_type().is_socket()
+            && metadata.dev() == device
+            && metadata.ino() == inode
         {
-            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(&self.socket);
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&self.endpoint)
+            && metadata.file_type().is_file()
+            && metadata.dev() == self.endpoint_device
+            && metadata.ino() == self.endpoint_inode
+        {
+            let _ = fs::remove_file(&self.endpoint);
         }
     }
+}
+
+struct RuntimePathsV1 {
+    root: PathBuf,
+    lock: PathBuf,
+    endpoint: PathBuf,
 }
 
 struct ActiveConnectionGuardV1 {
@@ -157,7 +184,9 @@ pub struct GatewayDaemonV1 {
     workspace_digest: [u8; 32],
     authorization_scope: AuthorizationScopeId,
     listener: UnixListener,
-    socket_cleanup: SocketCleanupV1,
+    runtime_cleanup: RuntimeCleanupV1,
+    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
+    started: Instant,
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     peers: Arc<Mutex<BTreeMap<u64, UnixStream>>>,
@@ -179,6 +208,7 @@ impl GatewayDaemonV1 {
         workspace: &Path,
         authorization_scope: AuthorizationScopeId,
     ) -> Result<Self, GatewayServiceError> {
+        ensure_supported_platform_v1()?;
         let workspace =
             fs::canonicalize(workspace).map_err(|_| GatewayServiceError::InvalidWorkspace)?;
         if !workspace.is_dir() {
@@ -188,19 +218,22 @@ impl GatewayDaemonV1 {
         // Prepare and validate the normal state root first. The daemon does not
         // create a second authority store and never places state in the repo.
         Store::open_for_workspace(&workspace).map_err(|_| GatewayServiceError::Initialization)?;
-        let socket = gateway_socket_path_v1(&workspace, true)?;
-        let instance_lock = acquire_instance_lock_v1(&socket)?;
-        match fs::symlink_metadata(&socket) {
-            Ok(_) => {
-                validate_socket_file_v1(&socket)?;
-                fs::remove_file(&socket)?;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
+        let paths = gateway_runtime_paths_v1(&workspace, true)?;
+        let instance_lock = acquire_instance_lock_v1(&paths.lock)?;
+        cleanup_stale_endpoint_v1(&paths)?;
+        let (socket, session_nonce, endpoint_metadata) = publish_endpoint_v1(&paths)?;
+        let mut runtime_cleanup = RuntimeCleanupV1 {
+            endpoint: paths.endpoint,
+            endpoint_device: endpoint_metadata.dev(),
+            endpoint_inode: endpoint_metadata.ino(),
+            socket: socket.clone(),
+            socket_identity: None,
+        };
         let listener = UnixListener::bind(&socket)?;
+        let bound_metadata = observe_bound_socket_v1(&socket)?;
+        runtime_cleanup.socket_identity = Some((bound_metadata.dev(), bound_metadata.ino()));
         fs::set_permissions(&socket, Permissions::from_mode(0o600))?;
-        let metadata = validate_socket_file_v1(&socket)?;
+        validate_socket_file_v1(&socket)?;
         listener.set_nonblocking(true)?;
 
         Ok(Self {
@@ -208,11 +241,9 @@ impl GatewayDaemonV1 {
             workspace,
             authorization_scope,
             listener,
-            socket_cleanup: SocketCleanupV1 {
-                path: socket,
-                device: metadata.dev(),
-                inode: metadata.ino(),
-            },
+            runtime_cleanup,
+            session_nonce,
+            started: Instant::now(),
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -223,7 +254,7 @@ impl GatewayDaemonV1 {
 
     #[must_use]
     pub fn socket_path(&self) -> &Path {
-        &self.socket_cleanup.path
+        &self.runtime_cleanup.socket
     }
 
     /// Run until an authenticated same-uid stop request arrives. Active MCP
@@ -233,6 +264,10 @@ impl GatewayDaemonV1 {
         let mut workers = Vec::new();
         let mut worker_panicked = false;
         while !self.stop.load(Ordering::Acquire) {
+            if self.started.elapsed() >= MAX_SESSION_LIFETIME_V1 {
+                self.stop.store(true, Ordering::Release);
+                break;
+            }
             reap_finished_workers_v1(&mut workers, &mut worker_panicked);
             if worker_panicked {
                 self.stop.store(true, Ordering::Release);
@@ -264,6 +299,7 @@ impl GatewayDaemonV1 {
                     self.active.fetch_add(1, Ordering::AcqRel);
                     let workspace = self.workspace.clone();
                     let workspace_digest = self.workspace_digest;
+                    let session_nonce = self.session_nonce;
                     let authorization_scope = self.authorization_scope.clone();
                     let stop = Arc::clone(&self.stop);
                     let active = Arc::clone(&self.active);
@@ -275,6 +311,7 @@ impl GatewayDaemonV1 {
                             stream,
                             &workspace,
                             workspace_digest,
+                            session_nonce,
                             &authorization_scope,
                             &stop,
                             &active_for_handler,
@@ -296,9 +333,11 @@ impl GatewayDaemonV1 {
             let _ = peer.shutdown(std::net::Shutdown::Both);
         }
         drop(peers);
-        for worker in workers {
-            worker_panicked |= worker.join().is_err();
-        }
+        join_workers_until_v1(
+            &mut workers,
+            Instant::now() + SHUTDOWN_TIMEOUT_V1,
+            &mut worker_panicked,
+        )?;
         if worker_panicked {
             return Err(GatewayServiceError::Initialization);
         }
@@ -310,11 +349,12 @@ fn handle_connection_v1(
     mut stream: UnixStream,
     workspace: &Path,
     workspace_digest: [u8; 32],
+    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
     authorization_scope: &AuthorizationScopeId,
     stop: &AtomicBool,
     active: &AtomicUsize,
 ) -> Result<(), GatewayServiceError> {
-    let mode = read_handshake_v1(&mut stream, &workspace_digest)?;
+    let mode = read_handshake_v1(&mut stream, &workspace_digest, &session_nonce)?;
     match mode {
         ConnectionModeV1::Status => {
             let status = GatewayDaemonStatusV1 {
@@ -342,8 +382,8 @@ fn handle_connection_v1(
                 ResponseCodeV1::Ready,
                 &serde_json::json!({"schemaVersion":1,"status":"ready"}),
             )?;
-            stream.set_read_timeout(None)?;
-            stream.set_write_timeout(None)?;
+            stream.set_read_timeout(Some(MCP_IDLE_READ_TIMEOUT_V1))?;
+            stream.set_write_timeout(Some(MCP_WRITE_TIMEOUT_V1))?;
             let reader_stream = stream.try_clone()?;
             let mut reader = BufReader::new(reader_stream);
             let gateway = ExperimentalMcpGatewayV1::build(workspace)
@@ -375,9 +415,11 @@ fn connect_mode_v1(
     workspace: &Path,
     mode: ConnectionModeV1,
 ) -> Result<(UnixStream, Vec<u8>), GatewayServiceError> {
+    ensure_supported_platform_v1()?;
     let workspace =
         fs::canonicalize(workspace).map_err(|_| GatewayServiceError::InvalidWorkspace)?;
-    let socket = gateway_socket_path_v1(&workspace, false)?;
+    let paths = gateway_runtime_paths_v1(&workspace, false)?;
+    let (socket, session_nonce) = read_endpoint_v1(&paths)?;
     validate_socket_file_v1(&socket)?;
     let mut stream = UnixStream::connect(&socket)?;
     authenticate_peer_v1(&stream)?;
@@ -387,7 +429,8 @@ fn connect_mode_v1(
     let mut request = [0_u8; HANDSHAKE_BYTES_V1];
     request[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
     request[8] = mode as u8;
-    request[9..].copy_from_slice(&digest);
+    request[9..41].copy_from_slice(&digest);
+    request[41..].copy_from_slice(&session_nonce);
     stream.write_all(&request)?;
     stream.flush()?;
     let (code, payload) = read_response_v1(&mut stream)?;
@@ -401,8 +444,8 @@ fn connect_mode_v1(
         });
     }
     if mode == ConnectionModeV1::Mcp {
-        stream.set_read_timeout(None)?;
-        stream.set_write_timeout(None)?;
+        stream.set_read_timeout(Some(MCP_IDLE_READ_TIMEOUT_V1))?;
+        stream.set_write_timeout(Some(MCP_WRITE_TIMEOUT_V1))?;
     }
     Ok((stream, payload))
 }
@@ -410,10 +453,14 @@ fn connect_mode_v1(
 fn read_handshake_v1(
     stream: &mut UnixStream,
     expected_workspace: &[u8; 32],
+    expected_session_nonce: &[u8; SESSION_NONCE_BYTES_V1],
 ) -> Result<ConnectionModeV1, GatewayServiceError> {
     let mut request = [0_u8; HANDSHAKE_BYTES_V1];
     stream.read_exact(&mut request)?;
-    if &request[..8] != HANDSHAKE_MAGIC_V1 || &request[9..] != expected_workspace {
+    if &request[..8] != HANDSHAKE_MAGIC_V1
+        || &request[9..41] != expected_workspace
+        || &request[41..] != expected_session_nonce
+    {
         let _ = write_response_v1(
             stream,
             ResponseCodeV1::Invalid,
@@ -465,47 +512,164 @@ fn read_response_v1(
     Ok((code, payload))
 }
 
-fn gateway_socket_path_v1(
+fn gateway_runtime_paths_v1(
     workspace: &Path,
     create_parent: bool,
-) -> Result<PathBuf, GatewayServiceError> {
+) -> Result<RuntimePathsV1, GatewayServiceError> {
     let temporary = fs::canonicalize(std::env::temp_dir())?;
-    let parent = temporary.join(format!("again-{}", effective_uid_v1()));
-    if create_parent && !parent.exists() {
-        match DirBuilder::new().mode(0o700).create(&parent) {
+    let root = temporary.join(format!("again-{}", effective_uid_v1()));
+    if create_parent && !root.exists() {
+        match DirBuilder::new().mode(0o700).create(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error.into()),
         }
     }
-    validate_private_directory_v1(&parent)?;
+    validate_private_directory_v1(&root)?;
     let digest = canonical_workspace_digest_v1(workspace);
-    let socket = parent
-        .join("gw")
-        .with_extension(format!("{}.sock", &hex_digest_v1(&digest)[..24]));
+    let workspace_name = &hex_digest_v1(&digest)[..32];
+    Ok(RuntimePathsV1 {
+        lock: root.join(format!("gateway-{workspace_name}.lock")),
+        endpoint: root.join(format!("gateway-{workspace_name}.endpoint")),
+        root,
+    })
+}
+
+fn cleanup_stale_endpoint_v1(paths: &RuntimePathsV1) -> Result<(), GatewayServiceError> {
+    let endpoint = match open_validated_regular_v1(&paths.endpoint) {
+        Ok(file) => file,
+        Err(GatewayServiceError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let endpoint_metadata = endpoint.metadata()?;
+    if let Ok((socket, _)) = decode_endpoint_v1(endpoint, &paths.root) {
+        match fs::symlink_metadata(&socket) {
+            Ok(_) => {
+                validate_socket_file_v1(&socket)?;
+                fs::remove_file(socket)?;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let current = fs::symlink_metadata(&paths.endpoint)?;
+    if !current.file_type().is_file()
+        || current.dev() != endpoint_metadata.dev()
+        || current.ino() != endpoint_metadata.ino()
+    {
+        return Err(GatewayServiceError::UnsafeSocketParent);
+    }
+    fs::remove_file(&paths.endpoint)?;
+    Ok(())
+}
+
+fn publish_endpoint_v1(
+    paths: &RuntimePathsV1,
+) -> Result<(PathBuf, [u8; SESSION_NONCE_BYTES_V1], Metadata), GatewayServiceError> {
+    let socket_name = uuid::Uuid::new_v4().simple().to_string();
+    debug_assert_eq!(socket_name.len(), SOCKET_NAME_BYTES_V1);
+    let socket = paths.root.join(&socket_name);
     // macOS has a 104-byte sockaddr_un.sun_path including NUL; Linux has 108.
     if socket.as_os_str().as_encoded_bytes().len() >= 104 {
         return Err(GatewayServiceError::SocketPathTooLong);
     }
-    Ok(socket)
+    let session_nonce = *uuid::Uuid::new_v4().as_bytes();
+    let temporary = paths
+        .root
+        .join(format!(".endpoint-{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(&temporary)?;
+        validate_regular_metadata_v1(&file.metadata()?)?;
+        let mut encoded = [0_u8; ENDPOINT_BYTES_V1];
+        encoded[..8].copy_from_slice(ENDPOINT_MAGIC_V1);
+        encoded[8..24].copy_from_slice(&session_nonce);
+        encoded[24..].copy_from_slice(socket_name.as_bytes());
+        file.write_all(&encoded)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &paths.endpoint)?;
+        let metadata = fs::symlink_metadata(&paths.endpoint)?;
+        validate_regular_metadata_v1(&metadata)?;
+        Ok((socket, session_nonce, metadata))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
+}
+
+fn read_endpoint_v1(
+    paths: &RuntimePathsV1,
+) -> Result<(PathBuf, [u8; SESSION_NONCE_BYTES_V1]), GatewayServiceError> {
+    let endpoint = open_validated_regular_v1(&paths.endpoint)?;
+    decode_endpoint_v1(endpoint, &paths.root)
+}
+
+fn decode_endpoint_v1(
+    mut endpoint: File,
+    root: &Path,
+) -> Result<(PathBuf, [u8; SESSION_NONCE_BYTES_V1]), GatewayServiceError> {
+    let mut encoded = [0_u8; ENDPOINT_BYTES_V1];
+    endpoint.read_exact(&mut encoded)?;
+    let mut trailing = [0_u8; 1];
+    if endpoint.read(&mut trailing)? != 0 || &encoded[..8] != ENDPOINT_MAGIC_V1 {
+        return Err(GatewayServiceError::InvalidHandshake);
+    }
+    let socket_name =
+        std::str::from_utf8(&encoded[24..]).map_err(|_| GatewayServiceError::InvalidHandshake)?;
+    if !valid_socket_name_v1(socket_name) {
+        return Err(GatewayServiceError::InvalidHandshake);
+    }
+    let mut session_nonce = [0_u8; SESSION_NONCE_BYTES_V1];
+    session_nonce.copy_from_slice(&encoded[8..24]);
+    Ok((root.join(socket_name), session_nonce))
+}
+
+fn valid_socket_name_v1(name: &str) -> bool {
+    name.len() == SOCKET_NAME_BYTES_V1 && name.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn validate_private_directory_v1(path: &Path) -> Result<(), GatewayServiceError> {
     let metadata = fs::symlink_metadata(path).map_err(GatewayServiceError::Io)?;
     if !metadata.file_type().is_dir()
         || metadata.uid() != effective_uid_v1()
-        || metadata.mode() & 0o077 != 0
+        || metadata.mode() & 0o7777 != 0o700
     {
         return Err(GatewayServiceError::UnsafeSocketParent);
     }
     Ok(())
 }
 
-fn validate_socket_file_v1(path: &Path) -> Result<Metadata, GatewayServiceError> {
-    let metadata = fs::symlink_metadata(path).map_err(GatewayServiceError::Io)?;
+fn validate_regular_metadata_v1(metadata: &Metadata) -> Result<(), GatewayServiceError> {
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid_v1()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(GatewayServiceError::UnsafeSocketParent);
+    }
+    Ok(())
+}
+
+fn open_validated_regular_v1(path: &Path) -> Result<File, GatewayServiceError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    validate_regular_metadata_v1(&file.metadata()?)?;
+    Ok(file)
+}
+
+fn observe_bound_socket_v1(path: &Path) -> Result<Metadata, GatewayServiceError> {
+    let metadata = fs::symlink_metadata(path)?;
     if !is_socket_v1(metadata.file_type())
         || metadata.uid() != effective_uid_v1()
-        || metadata.mode() & 0o777 != 0o600
         || metadata.nlink() != 1
     {
         return Err(GatewayServiceError::WrongPeer);
@@ -513,23 +677,28 @@ fn validate_socket_file_v1(path: &Path) -> Result<Metadata, GatewayServiceError>
     Ok(metadata)
 }
 
-fn acquire_instance_lock_v1(socket: &Path) -> Result<File, GatewayServiceError> {
-    let lock = socket.with_extension("lock");
+fn validate_socket_file_v1(path: &Path) -> Result<Metadata, GatewayServiceError> {
+    let metadata = fs::symlink_metadata(path).map_err(GatewayServiceError::Io)?;
+    if !is_socket_v1(metadata.file_type())
+        || metadata.uid() != effective_uid_v1()
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        return Err(GatewayServiceError::WrongPeer);
+    }
+    Ok(metadata)
+}
+
+fn acquire_instance_lock_v1(lock: &Path) -> Result<File, GatewayServiceError> {
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(0o600)
         .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(&lock)?;
+        .open(lock)?;
     let metadata = file.metadata()?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != effective_uid_v1()
-        || metadata.mode() & 0o777 != 0o600
-        || metadata.nlink() != 1
-    {
-        return Err(GatewayServiceError::UnsafeSocketParent);
-    }
+    validate_regular_metadata_v1(&metadata)?;
     // SAFETY: flock operates on the live lock-file descriptor and retains no
     // pointer. The descriptor remains owned by GatewayDaemonV1 for its life.
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -564,14 +733,7 @@ fn effective_uid_v1() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-#[cfg(any(
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-))]
+#[cfg(target_os = "macos")]
 fn peer_uid_v1(stream: &UnixStream) -> io::Result<u32> {
     let mut uid = 0;
     let mut gid = 0;
@@ -581,6 +743,22 @@ fn peer_uid_v1(stream: &UnixStream) -> io::Result<u32> {
         Ok(uid)
     } else {
         Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn peer_uid_v1(_stream: &UnixStream) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no reviewed peer-credential implementation for this platform",
+    ))
+}
+
+fn ensure_supported_platform_v1() -> Result<(), GatewayServiceError> {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        Ok(())
+    } else {
+        Err(GatewayServiceError::UnsupportedPlatform)
     }
 }
 
@@ -610,18 +788,26 @@ fn peer_uid_v1(stream: &UnixStream) -> io::Result<u32> {
 }
 
 fn authenticate_peer_v1(stream: &UnixStream) -> Result<(), GatewayServiceError> {
-    if peer_uid_v1(stream)? == effective_uid_v1() {
-        Ok(())
-    } else {
-        Err(GatewayServiceError::WrongPeer)
+    ensure_supported_platform_v1()?;
+    let observed = peer_uid_v1(stream).map_err(|_| GatewayServiceError::WrongPeer)?;
+    authenticate_observed_peer_v1(Some(observed))
+}
+
+fn authenticate_observed_peer_v1(observed_uid: Option<u32>) -> Result<(), GatewayServiceError> {
+    match observed_uid {
+        Some(uid) if uid == effective_uid_v1() => Ok(()),
+        Some(_) => Err(GatewayServiceError::WrongPeer),
+        None => Err(GatewayServiceError::UnsupportedPlatform),
     }
 }
 
 fn peer_authentication_name_v1() -> &'static str {
     #[cfg(target_os = "linux")]
     return "so_peercred_euid";
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     return "getpeereid_euid";
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    return "unsupported";
 }
 
 fn reap_finished_workers_v1(workers: &mut Vec<thread::JoinHandle<()>>, worker_panicked: &mut bool) {
@@ -634,6 +820,24 @@ fn reap_finished_workers_v1(workers: &mut Vec<thread::JoinHandle<()>>, worker_pa
             index += 1;
         }
     }
+}
+
+fn join_workers_until_v1(
+    workers: &mut Vec<thread::JoinHandle<()>>,
+    deadline: Instant,
+    worker_panicked: &mut bool,
+) -> Result<(), GatewayServiceError> {
+    while !workers.is_empty() {
+        reap_finished_workers_v1(workers, worker_panicked);
+        if workers.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(GatewayServiceError::ShutdownDeadline);
+        }
+        thread::sleep(ACCEPT_POLL_V1);
+    }
+    Ok(())
 }
 
 /// Bidirectionally proxy the current standard streams to an authenticated MCP
@@ -690,5 +894,93 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
         if descriptors[1].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
             return Err(io::Error::other("gateway daemon stream failed").into());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn unsafe_runtime_permissions_and_symlinked_locator_fail_closed_without_chmod() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            validate_private_directory_v1(directory.path()),
+            Err(GatewayServiceError::UnsafeSocketParent)
+        ));
+        assert_eq!(
+            fs::symlink_metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o755
+        );
+
+        fs::set_permissions(directory.path(), Permissions::from_mode(0o700)).unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, [0_u8; ENDPOINT_BYTES_V1]).unwrap();
+        fs::set_permissions(&target, Permissions::from_mode(0o600)).unwrap();
+        let locator = directory.path().join("locator");
+        symlink(&target, &locator).unwrap();
+        assert!(open_validated_regular_v1(&locator).is_err());
+        assert!(
+            fs::symlink_metadata(&locator)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn unverifiable_or_different_uid_peer_never_authenticates() {
+        assert_eq!(
+            authenticate_observed_peer_v1(None).unwrap_err().to_string(),
+            GatewayServiceError::UnsupportedPlatform.to_string()
+        );
+        assert_eq!(
+            authenticate_observed_peer_v1(Some(effective_uid_v1().wrapping_add(1)))
+                .unwrap_err()
+                .to_string(),
+            GatewayServiceError::WrongPeer.to_string()
+        );
+        assert!(authenticate_observed_peer_v1(Some(effective_uid_v1())).is_ok());
+    }
+
+    #[test]
+    fn replayed_session_material_and_partial_handshakes_are_rejected() {
+        let workspace = [7_u8; 32];
+        let old_nonce = [3_u8; SESSION_NONCE_BYTES_V1];
+        let current_nonce = [4_u8; SESSION_NONCE_BYTES_V1];
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut replay = [0_u8; HANDSHAKE_BYTES_V1];
+        replay[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
+        replay[8] = ConnectionModeV1::Status as u8;
+        replay[9..41].copy_from_slice(&workspace);
+        replay[41..].copy_from_slice(&old_nonce);
+        client.write_all(&replay).unwrap();
+        assert!(matches!(
+            read_handshake_v1(&mut server, &workspace, &current_nonce),
+            Err(GatewayServiceError::InvalidHandshake)
+        ));
+
+        let (mut slow_client, mut slow_server) = UnixStream::pair().unwrap();
+        slow_server
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+        slow_client.write_all(HANDSHAKE_MAGIC_V1).unwrap();
+        assert!(matches!(
+            read_handshake_v1(&mut slow_server, &workspace, &current_nonce),
+            Err(GatewayServiceError::Io(_))
+        ));
+    }
+
+    #[test]
+    fn locator_encoding_accepts_only_fixed_random_socket_names() {
+        assert!(valid_socket_name_v1("0123456789abcdef0123456789abcdef"));
+        assert!(!valid_socket_name_v1("../shared.sock"));
+        assert!(!valid_socket_name_v1("0123456789abcdef0123456789abcdeg"));
     }
 }

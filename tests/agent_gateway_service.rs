@@ -91,8 +91,8 @@ fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
 #[test]
 fn socket_is_private_singleton_and_drop_never_unlinks_a_replacement() {
     let workspace = workspace();
-    let daemon = daemon(workspace.path());
-    let socket = daemon.socket_path().to_owned();
+    let first_daemon = daemon(workspace.path());
+    let socket = first_daemon.socket_path().to_owned();
     let parent = fs::symlink_metadata(socket.parent().unwrap()).unwrap();
     let socket_metadata = fs::symlink_metadata(&socket).unwrap();
     assert_eq!(parent.permissions().mode() & 0o777, 0o700);
@@ -110,10 +110,19 @@ fn socket_is_private_singleton_and_drop_never_unlinks_a_replacement() {
     let original = socket.with_extension("original-test-socket");
     fs::rename(&socket, &original).unwrap();
     fs::write(&socket, b"replacement owned by test").unwrap();
-    drop(daemon);
+    drop(first_daemon);
     assert_eq!(fs::read(&socket).unwrap(), b"replacement owned by test");
-    fs::remove_file(socket).unwrap();
+    fs::remove_file(&socket).unwrap();
     fs::remove_file(original).unwrap();
+
+    // Even an attacker who learned the prior socket cannot pre-create the
+    // next random name. The known hostile path is neither used nor removed.
+    fs::write(&socket, b"hostile old socket path").unwrap();
+    let replacement = daemon(workspace.path());
+    assert_ne!(replacement.socket_path(), socket);
+    assert_eq!(fs::read(&socket).unwrap(), b"hostile old socket path");
+    drop(replacement);
+    fs::remove_file(&socket).unwrap();
 }
 
 #[test]
@@ -121,7 +130,7 @@ fn same_uid_status_and_stop_are_workspace_bound_and_clean() {
     let workspace = workspace();
     let (socket, server) = start_daemon(workspace.path());
     let mut malformed = UnixStream::connect(&socket).unwrap();
-    malformed.write_all(&[0_u8; 41]).unwrap();
+    malformed.write_all(&[0_u8; 57]).unwrap();
     malformed
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();

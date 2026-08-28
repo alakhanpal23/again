@@ -921,7 +921,7 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
 
 #[cfg(not(unix))]
 fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
-    bail!("the local MCP daemon requires Unix peer credentials")
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
 }
 
 #[cfg(unix)]
@@ -934,7 +934,7 @@ fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
 
 #[cfg(not(unix))]
 fn mcp_connect(_args: McpConnectArgs) -> Result<i32> {
-    bail!("the local MCP daemon requires Unix peer credentials")
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
 }
 
 fn mcp_setup(args: McpSetupArgs) -> Result<i32> {

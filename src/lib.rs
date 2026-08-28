@@ -2,6 +2,9 @@ pub mod agent_gateway;
 pub mod agent_gateway_runtime;
 #[cfg(unix)]
 pub mod agent_gateway_service;
+#[cfg(not(unix))]
+#[path = "agent_gateway_service_unsupported.rs"]
+pub mod agent_gateway_service;
 pub mod agent_gateway_setup;
 pub mod effect;
 pub mod engine;
