@@ -497,6 +497,14 @@ def expect_success(response: Response, scenario: str) -> None:
         raise HarnessError(f"{scenario} did not return successful product output")
 
 
+def result_observation(result: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Project away recipient-bound presentation metadata, never observation bytes."""
+
+    if result is None:
+        return None
+    return {key: value for key, value in result.items() if key != "_meta"}
+
+
 def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[str, Any]:
     temporary = Path(tempfile.mkdtemp(prefix="again-repository-tools-e2e-"))
     false_hits = 0
@@ -555,7 +563,10 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
             )
             expect_success(first, "concurrent leader")
             expect_success(second, "concurrent follower")
-            if first.result != second.result or first.result_id != second.result_id:
+            if (
+                result_observation(first.result) != result_observation(second.result)
+                or first.result_id != second.result_id
+            ):
                 raise HarnessError("concurrent responses diverged")
             concurrent_events = event_counts(
                 database, start_ms, end_ms, first.result_id
@@ -579,7 +590,10 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
             warm = left.call(102, "repo.search", arguments)
             end_ms = int(time.time() * 1000) + 2
             expect_success(warm, "exact warm reuse")
-            if warm.result != first.result or warm.result_id != first.result_id:
+            if (
+                result_observation(warm.result) != result_observation(first.result)
+                or warm.result_id != first.result_id
+            ):
                 false_hits += 1
                 raise HarnessError("exact warm response diverged")
             warm_events = event_counts(database, start_ms, end_ms, warm.result_id)
@@ -600,7 +614,10 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
             )
             changed = left.call(103, "repo.search", arguments)
             expect_success(changed, "relevant mutation")
-            if changed.result_id == first.result_id or changed.result == first.result:
+            if (
+                changed.result_id == first.result_id
+                or result_observation(changed.result) == result_observation(first.result)
+            ):
                 false_hits += 1
                 raise HarnessError("relevant mutation produced a false hit")
             scenarios.append(
@@ -620,7 +637,11 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
             )
             scoped_warm = right.call(105, "repo.search", scoped)
             expect_success(scoped_warm, "irrelevant mutation")
-            if scoped_warm.result_id != scoped_cold.result_id:
+            if (
+                scoped_warm.result_id != scoped_cold.result_id
+                or result_observation(scoped_warm.result)
+                != result_observation(scoped_cold.result)
+            ):
                 raise HarnessError("proven irrelevant mutation did not preserve exact reuse")
             scenarios.append(
                 {
@@ -681,7 +702,11 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
             negative_args = {"pattern": "negative_needle", "path": "web"}
             negative = left.call(113, "repo.search", negative_args)
             negative_warm = right.call(114, "repo.search", negative_args)
-            if negative.result_id != negative_warm.result_id:
+            if (
+                negative.result_id != negative_warm.result_id
+                or result_observation(negative.result)
+                != result_observation(negative_warm.result)
+            ):
                 raise HarnessError("negative search was not exactly reusable")
             (workspace / "web" / "new.ts").write_text(
                 "export const negative_needle = true;\n", encoding="utf-8"
@@ -696,7 +721,9 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
 
             ordered_first = left.call(116, "repo.tree", {"path": "web"})
             ordered_second = right.call(117, "repo.tree", {"path": "web"})
-            if ordered_first.result != ordered_second.result:
+            if result_observation(ordered_first.result) != result_observation(
+                ordered_second.result
+            ):
                 raise HarnessError("stable ordering changed across repeated runs")
             scenarios.append(
                 {"name": "stable_ordering", "classification": "pass"}

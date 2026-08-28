@@ -136,6 +136,22 @@ class RepositoryToolsHarnessTests(unittest.TestCase):
             HARNESS.digest_bytes(HARNESS.canonical_json_bytes(second)),
         )
 
+    def test_result_observation_ignores_only_recipient_bound_metadata(self):
+        first = {
+            "content": [{"type": "text", "text": "same"}],
+            "structuredContent": {"schemaVersion": 1, "matches": []},
+            "_meta": {"again": {"recipient": "agent-a"}},
+        }
+        second = json.loads(json.dumps(first))
+        second["_meta"]["again"]["recipient"] = "agent-b"
+        self.assertEqual(
+            HARNESS.result_observation(first), HARNESS.result_observation(second)
+        )
+        second["structuredContent"]["matches"] = [{"path": "changed"}]
+        self.assertNotEqual(
+            HARNESS.result_observation(first), HARNESS.result_observation(second)
+        )
+
     def test_mcp_close_terminates_a_live_process(self):
         process = subprocess_for_cleanup_test()
         client = HARNESS.McpProcess.__new__(HARNESS.McpProcess)
