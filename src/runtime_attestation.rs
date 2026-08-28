@@ -128,6 +128,10 @@ const CACHE_SUB_VM_OFFSET: u64 = 0x0000_0000_a560_c000;
 const CACHE_MAGIC: &[u8; 16] = b"dyld_v1  arm64e\0";
 const AUDITED_SHARED_CACHE_RANGE_SIZE: u64 = 5_040_898_048;
 
+pub(crate) fn host_supports_team_runtime_v1() -> bool {
+    host_audited_apple_profile() == Ok(AUDITED_SYSTEM_PROFILE)
+}
+
 const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STATIC_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_HEADER_BYTES: usize = 1024 * 1024;
@@ -2649,7 +2653,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn current_reviewed_host_mints_a_real_capability() {
-        if host_audited_apple_profile().is_err() {
+        if !host_supports_team_runtime_v1() {
             return;
         }
         let attestation = attest_team_runtime_v1("cat", Path::new("/bin/cat")).unwrap();
@@ -2685,7 +2689,7 @@ mod tests {
     #[test]
     #[ignore = "explicit slow-audit integration test"]
     fn explicit_full_audit_writes_a_fast_path_checkpoint() {
-        if host_audited_apple_profile().is_err() {
+        if !host_supports_team_runtime_v1() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();
@@ -2706,7 +2710,7 @@ mod tests {
     #[test]
     #[ignore = "diagnostic cold/warm runtime-attestation benchmark"]
     fn benchmark_cold_and_warm_runtime_attestation() {
-        if host_audited_apple_profile().is_err() {
+        if !host_supports_team_runtime_v1() {
             return;
         }
         let started = Instant::now();
@@ -2746,7 +2750,7 @@ mod tests {
     #[test]
     #[ignore = "diagnostic fresh-process runtime-checkpoint benchmark"]
     fn benchmark_fresh_process_checkpoint_attestation() {
-        if host_audited_apple_profile().is_err() {
+        if !host_supports_team_runtime_v1() {
             return;
         }
         let directory = tempfile::tempdir().unwrap();

@@ -46,7 +46,7 @@ fn run_inspect(workspace: &Path, profile: &Path, state: &Path, home: &Path) -> O
 
 #[test]
 fn inspect_is_deterministic_secret_free_and_never_uses_transport_or_target_command() {
-    if again::executable::host_audited_apple_profile().is_err() {
+    if again::executable::host_audited_apple_profile() != Ok("macos-15.6.1-24G90-read-v0") {
         return;
     }
 

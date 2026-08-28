@@ -13,30 +13,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 const MACOS_SYSTEM_PROFILE_PATH: &str = "/System/Library/CoreServices/SystemVersion.plist";
 #[cfg(target_os = "macos")]
-const MACOS_SYSTEM_PROFILE_BLAKE3: &str =
-    "5adbd08043e220188b91445787a518ddaa060a56057191707da49b3e91aba10a";
-#[cfg(target_os = "macos")]
-const MACOS_SYSTEM_PROFILE_ID: &str = "macos-15.6.1-24G90-read-v0";
-#[cfg(target_os = "macos")]
-const CODEX_RG_BLAKE3: &str = "0dc9090877943cb7bcc35fab4dd2bf501f53c4555a919bf2476fef702f1e5af2";
-#[cfg(target_os = "macos")]
-const CODEX_RG_PROFILE_ID: &str = "codex-rg-15.2.0-e89fff89ac-arm64-read-v0";
-#[cfg(target_os = "macos")]
 const MAX_AUDITED_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
-
-#[cfg(target_os = "macos")]
-fn audited_apple_tool_digest(tool: ToolKind) -> Option<&'static str> {
-    match tool {
-        ToolKind::Cat => Some("30fdc8a74ef975c1d61a6110083490ac43fe0c0c28228a5abd2cd5f88187cf1c"),
-        ToolKind::Head => Some("5ce13107571eecfaf6fb128e0f9697f98bade39df715adfd83afd66bbff77f66"),
-        ToolKind::Tail => Some("fd4c9cffd139ee86e199c464f71554157ae11eae2809f513aaacade1ab5f2caa"),
-        ToolKind::Wc => Some("f34527e367649c6ca0434e0f4a3a083f69cb06325526edd00e418fbdbb73e12b"),
-        ToolKind::Grep => Some("46dee6a2c4f69fcaf38aecbc32003bc93ff57903c682b3271e53920e2658a62f"),
-        ToolKind::Ls => Some("73d13c2d68c0b93c8cbd18502900d8bd3d8d3472d683c84a06780d0a2b240c77"),
-        ToolKind::Pwd => Some("354299ce70bdeafe5a1a74b8063fcad17d785f42db8c0c3d8ebdb157eca572fd"),
-        ToolKind::Rg => None,
-    }
-}
 
 /// A command whose executable has a v0 audit profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -51,6 +28,101 @@ pub enum ToolKind {
     Pwd,
     Rg,
 }
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct AuditedAppleToolDigests {
+    cat: &'static str,
+    head: &'static str,
+    tail: &'static str,
+    wc: &'static str,
+    grep: &'static str,
+    ls: &'static str,
+    pwd: &'static str,
+}
+
+#[cfg(target_os = "macos")]
+impl AuditedAppleToolDigests {
+    fn get(self, tool: ToolKind) -> Option<&'static str> {
+        match tool {
+            ToolKind::Cat => Some(self.cat),
+            ToolKind::Head => Some(self.head),
+            ToolKind::Tail => Some(self.tail),
+            ToolKind::Wc => Some(self.wc),
+            ToolKind::Grep => Some(self.grep),
+            ToolKind::Ls => Some(self.ls),
+            ToolKind::Pwd => Some(self.pwd),
+            ToolKind::Rg => None,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct AuditedMacosProfile {
+    id: &'static str,
+    system_profile_blake3: &'static str,
+    tools: AuditedAppleToolDigests,
+}
+
+#[cfg(target_os = "macos")]
+const AUDITED_MACOS_PROFILES: &[AuditedMacosProfile] = &[
+    AuditedMacosProfile {
+        id: "macos-15.6.1-24G90-read-v0",
+        system_profile_blake3: "5adbd08043e220188b91445787a518ddaa060a56057191707da49b3e91aba10a",
+        tools: AuditedAppleToolDigests {
+            cat: "30fdc8a74ef975c1d61a6110083490ac43fe0c0c28228a5abd2cd5f88187cf1c",
+            head: "5ce13107571eecfaf6fb128e0f9697f98bade39df715adfd83afd66bbff77f66",
+            tail: "fd4c9cffd139ee86e199c464f71554157ae11eae2809f513aaacade1ab5f2caa",
+            wc: "f34527e367649c6ca0434e0f4a3a083f69cb06325526edd00e418fbdbb73e12b",
+            grep: "46dee6a2c4f69fcaf38aecbc32003bc93ff57903c682b3271e53920e2658a62f",
+            ls: "73d13c2d68c0b93c8cbd18502900d8bd3d8d3472d683c84a06780d0a2b240c77",
+            pwd: "354299ce70bdeafe5a1a74b8063fcad17d785f42db8c0c3d8ebdb157eca572fd",
+        },
+    },
+    AuditedMacosProfile {
+        id: "macos-26.5-25F71-read-v0",
+        system_profile_blake3: "db65ceb0a5ebb79346a3e89947b837fc9ae7cef7eb1cd86f7d8e51cf9214ca78",
+        tools: AuditedAppleToolDigests {
+            cat: "dfb0a5df1c60bee6c73ecf192e96c113c7654e270e7bf1c402f83942a46c6a1e",
+            head: "c42a5382e07b7f2e13f291f12458b4c125a4f076d0e272a92448ea583e513d1c",
+            tail: "7aeec25463930b3a9da14439c14ab2eb474c3ac03c577e1e9bc6ea355e381e62",
+            wc: "035964649a71c25d572598512a0a8b821b5631f8787c60d10c0dd6b7008edd73",
+            grep: "34d36be119715737d34da134ab3d52dd4102f23dfa0831defb8df97366ca7162",
+            ls: "b9c141f5475a9ed95726f497192d9c63d47dad0909513928f9465e1e2ece69b7",
+            pwd: "9e4979d9166a14fc52b703fe54b7ff4f2c797c0b5fd40c2f5372306d11c803b5",
+        },
+    },
+];
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexRgLayout {
+    NpmBundle,
+    StandaloneRelease(&'static str),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct AuditedCodexRgProfile {
+    id: &'static str,
+    blake3: &'static str,
+    layout: CodexRgLayout,
+}
+
+#[cfg(target_os = "macos")]
+const AUDITED_CODEX_RG_PROFILES: &[AuditedCodexRgProfile] = &[
+    AuditedCodexRgProfile {
+        id: "codex-rg-15.2.0-e89fff89ac-arm64-read-v0",
+        blake3: "0dc9090877943cb7bcc35fab4dd2bf501f53c4555a919bf2476fef702f1e5af2",
+        layout: CodexRgLayout::NpmBundle,
+    },
+    AuditedCodexRgProfile {
+        id: "codex-rg-15.2.0-e89fff89ac-arm64-standalone-0.150.1-read-v0",
+        blake3: "7657ba5af2af062affb5b0b4527305317476823c4647fb865cea005a1a5df3dd",
+        layout: CodexRgLayout::StandaloneRelease("0.150.1-aarch64-apple-darwin"),
+    },
+];
 
 impl ToolKind {
     #[cfg(target_os = "macos")]
@@ -214,13 +286,15 @@ pub fn host_audited_apple_profile() -> Result<&'static str, VerifyError> {
                 .apple_system_path()
                 .ok_or(VerifyError::SystemPathMismatch)?;
             inspect_regular_non_privileged_binary(path)?;
-            let expected =
-                audited_apple_tool_digest(tool).ok_or(VerifyError::ContentDigestMismatch)?;
+            let expected = profile
+                .tools
+                .get(tool)
+                .ok_or(VerifyError::ContentDigestMismatch)?;
             if hash_file_bounded(path)? != expected {
                 return Err(VerifyError::ContentDigestMismatch);
             }
         }
-        Ok(profile)
+        Ok(profile.id)
     }
 }
 
@@ -261,9 +335,11 @@ fn verify_macos(
         if canonical_path != system_path {
             return Err(VerifyError::SystemPathMismatch);
         }
-        let semantic_profile = verify_macos_system_profile()?;
-        let expected_digest =
-            audited_apple_tool_digest(tool).ok_or(VerifyError::ContentDigestMismatch)?;
+        let profile = verify_macos_system_profile()?;
+        let expected_digest = profile
+            .tools
+            .get(tool)
+            .ok_or(VerifyError::ContentDigestMismatch)?;
         if hash_file_bounded(canonical_path)? != expected_digest {
             return Err(VerifyError::ContentDigestMismatch);
         }
@@ -271,37 +347,42 @@ fn verify_macos(
             tool,
             canonical_path: canonical_path.to_path_buf(),
             provenance: ExecutableProvenance::AppleSystem,
-            semantic_profile: semantic_profile.to_owned(),
+            semantic_profile: profile.id.to_owned(),
         });
     }
 
-    if !is_codex_bundled_rg(canonical_path) {
+    if !is_recognized_codex_rg_path(canonical_path) {
         return Err(VerifyError::CodexBundlePathMismatch);
     }
     let system_profile = verify_macos_system_profile()?;
     verify_codex_rg_signature_identity(canonical_path)?;
     let digest = hash_file_bounded(canonical_path)?;
-    if digest != CODEX_RG_BLAKE3 {
-        return Err(VerifyError::ContentDigestMismatch);
-    }
+    let rg_profile = audited_codex_rg_profile(canonical_path, &digest)
+        .ok_or(VerifyError::ContentDigestMismatch)?;
     Ok(ExecutableIdentity {
         tool,
         canonical_path: canonical_path.to_path_buf(),
         provenance: ExecutableProvenance::OpenAiCodexBundle,
-        semantic_profile: format!("{system_profile}+{CODEX_RG_PROFILE_ID}"),
+        semantic_profile: format!("{}+{}", system_profile.id, rg_profile.id),
     })
 }
 
 #[cfg(target_os = "macos")]
-fn verify_macos_system_profile() -> Result<&'static str, VerifyError> {
+fn verify_macos_system_profile() -> Result<&'static AuditedMacosProfile, VerifyError> {
     let bytes =
         std::fs::read(MACOS_SYSTEM_PROFILE_PATH).map_err(|_| VerifyError::InspectionFailed)?;
-    if bytes.len() > 1024 * 1024
-        || blake3::hash(&bytes).to_hex().as_str() != MACOS_SYSTEM_PROFILE_BLAKE3
-    {
+    if bytes.len() > 1024 * 1024 {
         return Err(VerifyError::SystemProfileMismatch);
     }
-    Ok(MACOS_SYSTEM_PROFILE_ID)
+    let digest = blake3::hash(&bytes).to_hex();
+    audited_macos_profile_for_digest(digest.as_str()).ok_or(VerifyError::SystemProfileMismatch)
+}
+
+#[cfg(target_os = "macos")]
+fn audited_macos_profile_for_digest(digest: &str) -> Option<&'static AuditedMacosProfile> {
+    AUDITED_MACOS_PROFILES
+        .iter()
+        .find(|profile| profile.system_profile_blake3 == digest)
 }
 
 #[cfg(target_os = "macos")]
@@ -364,18 +445,44 @@ fn inspect_regular_non_privileged_binary(path: &Path) -> Result<(), VerifyError>
 }
 
 #[cfg(target_os = "macos")]
-fn is_codex_bundled_rg(path: &Path) -> bool {
+fn is_recognized_codex_rg_path(path: &Path) -> bool {
+    AUDITED_CODEX_RG_PROFILES
+        .iter()
+        .any(|profile| codex_rg_path_matches_layout(path, profile.layout))
+}
+
+#[cfg(target_os = "macos")]
+fn audited_codex_rg_profile(path: &Path, digest: &str) -> Option<&'static AuditedCodexRgProfile> {
+    AUDITED_CODEX_RG_PROFILES.iter().find(|profile| {
+        profile.blake3 == digest && codex_rg_path_matches_layout(path, profile.layout)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn codex_rg_path_matches_layout(path: &Path, layout: CodexRgLayout) -> bool {
     let components: Vec<_> = path
         .components()
         .filter_map(|component| component.as_os_str().to_str())
         .collect();
-    let has_openai_codex_package = components
-        .windows(2)
-        .any(|pair| pair[0] == "@openai" && pair[1].starts_with("codex"));
-    has_openai_codex_package
-        && components.windows(2).any(|pair| pair[0] == "vendor")
-        && components.contains(&"codex-path")
-        && components.last() == Some(&"rg")
+    match layout {
+        CodexRgLayout::NpmBundle => {
+            components
+                .windows(2)
+                .any(|pair| pair[0] == "@openai" && pair[1].starts_with("codex"))
+                && components.windows(2).any(|pair| pair[0] == "vendor")
+                && components.contains(&"codex-path")
+                && components.last() == Some(&"rg")
+        }
+        CodexRgLayout::StandaloneRelease(release) => components.ends_with(&[
+            ".codex",
+            "packages",
+            "standalone",
+            "releases",
+            release,
+            "codex-path",
+            "rg",
+        ]),
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -434,13 +541,14 @@ mod tests {
         ];
         for (requested, path, tool) in cases {
             let path = std::fs::canonicalize(path).expect("system tool exists");
+            let profile = verify_macos_system_profile().unwrap();
             assert_eq!(
                 verify_executable(requested, &path),
                 Ok(ExecutableIdentity {
                     tool,
                     canonical_path: path,
                     provenance: ExecutableProvenance::AppleSystem,
-                    semantic_profile: MACOS_SYSTEM_PROFILE_ID.to_owned(),
+                    semantic_profile: profile.id.to_owned(),
                 })
             );
         }
@@ -480,7 +588,7 @@ mod tests {
             .into_iter()
             .flat_map(|value| std::env::split_paths(&value).collect::<Vec<_>>())
             .map(|directory| directory.join("rg"))
-            .find(|path| path.is_file() && is_codex_bundled_rg(path))
+            .find(|path| path.is_file() && is_recognized_codex_rg_path(path))
         else {
             return;
         };
@@ -496,28 +604,60 @@ mod tests {
             .read_to_end(&mut audited_candidate)
             .unwrap();
         assert!(audited_candidate.len() as u64 <= MAX_AUDITED_EXECUTABLE_BYTES);
-        let has_exact_audited_bytes =
-            blake3::hash(&audited_candidate).to_hex().as_str() == CODEX_RG_BLAKE3;
-        match (has_exact_audited_bytes, verify_executable("rg", &path)) {
-            (true, Ok(identity)) => {
+        let digest = blake3::hash(&audited_candidate).to_hex();
+        let audited_profile = audited_codex_rg_profile(&path, digest.as_str());
+        match (audited_profile, verify_executable("rg", &path)) {
+            (Some(rg_profile), Ok(identity)) => {
                 assert_eq!(identity.tool, ToolKind::Rg);
                 assert_eq!(identity.provenance, ExecutableProvenance::OpenAiCodexBundle);
                 assert_eq!(
                     identity.semantic_profile,
-                    format!("{MACOS_SYSTEM_PROFILE_ID}+{CODEX_RG_PROFILE_ID}")
+                    format!(
+                        "{}+{}",
+                        verify_macos_system_profile().unwrap().id,
+                        rg_profile.id
+                    )
                 );
             }
             // Codex may update or re-sign its bundled binary independently of
             // Again. An otherwise recognized bundle with unreviewed bytes must
             // remain an explicit fail-closed negative lane, not make the suite
             // assume that any Codex-bundled `rg` is the audited executable.
-            (false, Err(VerifyError::ContentDigestMismatch)) => {}
-            (true, Err(error)) => {
+            (None, Err(VerifyError::ContentDigestMismatch)) => {}
+            (Some(_), Err(error)) => {
                 panic!("exact audited Codex rg bytes must verify successfully: {error}")
             }
-            (false, Ok(_)) => panic!("unreviewed Codex rg bytes must fail closed"),
-            (false, Err(error)) => panic!("unexpected Codex rg verification result: {error}"),
+            (None, Ok(_)) => panic!("unreviewed Codex rg bytes must fail closed"),
+            (None, Err(error)) => panic!("unexpected Codex rg verification result: {error}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_profiles_and_codex_rg_layouts_are_exactly_versioned() {
+        for profile in AUDITED_MACOS_PROFILES {
+            assert_eq!(
+                audited_macos_profile_for_digest(profile.system_profile_blake3)
+                    .map(|selected| selected.id),
+                Some(profile.id)
+            );
+        }
+        assert!(audited_macos_profile_for_digest(&"0".repeat(64)).is_none());
+
+        let npm =
+            Path::new("/opt/node_modules/@openai/codex/vendor/aarch64-apple-darwin/codex-path/rg");
+        let standalone = Path::new(
+            "/Users/test/.codex/packages/standalone/releases/0.150.1-aarch64-apple-darwin/codex-path/rg",
+        );
+        let wrong_release = Path::new(
+            "/Users/test/.codex/packages/standalone/releases/0.150.2-aarch64-apple-darwin/codex-path/rg",
+        );
+        assert!(codex_rg_path_matches_layout(npm, CodexRgLayout::NpmBundle));
+        assert!(codex_rg_path_matches_layout(
+            standalone,
+            CodexRgLayout::StandaloneRelease("0.150.1-aarch64-apple-darwin")
+        ));
+        assert!(!is_recognized_codex_rg_path(wrong_release));
     }
 
     #[cfg(target_os = "macos")]
