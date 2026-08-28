@@ -18,6 +18,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     let codex_path = temp.path().join("codex-config.toml");
     let claude_path = temp.path().join("claude-config.json");
     let workspace = canonical_workspace(&temp);
+    let executable = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
 
     let codex = AgentGatewaySetupPlanV1::codex(&codex_path, &workspace).unwrap();
     let same_codex = AgentGatewaySetupPlanV1::codex(&codex_path, &workspace).unwrap();
@@ -25,11 +26,12 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         codex.local_cli_command,
         format!(
-            "codex mcp add again -- again mcp serve --workspace {}",
+            "codex mcp add again -- {} mcp serve --workspace {}",
+            executable.display(),
             workspace.display()
         )
     );
-    assert_eq!(codex.stdio.command, "again");
+    assert_eq!(codex.stdio.command, executable);
     assert_eq!(
         codex.stdio.args,
         ["mcp", "serve", "--workspace", workspace.to_str().unwrap()]
@@ -50,7 +52,8 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         codex.to_string(),
         format!(
-            "Dry run only. Install with:\ncodex mcp add again -- again mcp serve --workspace {}",
+            "Dry run only. Install with:\ncodex mcp add again -- {} mcp serve --workspace {}",
+            executable.display(),
             workspace.display()
         )
     );
@@ -60,7 +63,8 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         claude.local_cli_command,
         format!(
-            "claude mcp add -s user again -- again mcp serve --workspace {}",
+            "claude mcp add -s user again -- {} mcp serve --workspace {}",
+            executable.display(),
             workspace.display()
         )
     );
@@ -198,6 +202,49 @@ fn paths_are_bounded_and_existing_symlinks_are_refused() {
         ));
         assert_eq!(fs::read_to_string(&target).unwrap(), "user data");
     }
+}
+
+#[test]
+fn explicit_executable_is_canonical_executable_and_path_independent() {
+    let temp = TempDir::new().unwrap();
+    let workspace = canonical_workspace(&temp);
+    let config = temp.path().join("config.toml");
+    let executable_directory = temp.path().join("binary with ' quote");
+    fs::create_dir(&executable_directory).unwrap();
+    let executable = executable_directory.join("again");
+    fs::write(&executable, b"fixture executable").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let executable = fs::canonicalize(executable).unwrap();
+
+    let plan = AgentGatewaySetupPlanV1::dry_run_with_executable(
+        AgentGatewayClientV1::Codex,
+        &config,
+        &workspace,
+        &executable,
+    )
+    .unwrap();
+    assert_eq!(plan.stdio.command, executable);
+    assert!(plan.local_cli_command.contains("'\\''"));
+    assert!(
+        plan.managed_config_document()
+            .contains(executable.to_str().unwrap())
+    );
+
+    let non_executable = temp.path().join("not-executable");
+    fs::write(&non_executable, b"data").unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o600)).unwrap();
+    #[cfg(unix)]
+    assert!(matches!(
+        AgentGatewaySetupPlanV1::dry_run_with_executable(
+            AgentGatewayClientV1::Codex,
+            &config,
+            &workspace,
+            &non_executable,
+        ),
+        Err(AgentGatewaySetupError::InvalidExecutablePath)
+    ));
 }
 
 #[test]

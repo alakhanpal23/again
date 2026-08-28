@@ -1055,8 +1055,20 @@ fn setup(args: SetupArgs) -> Result<i32> {
     };
 
     if args.dry_run {
-        println!("# dry run: {}", change.path.display());
-        print!("{}", change.rendered);
+        if args.remove {
+            println!(
+                "# dry run: {} {}",
+                if change.changed {
+                    "would remove"
+                } else {
+                    "nothing to remove at"
+                },
+                change.path.display()
+            );
+        } else {
+            println!("# dry run: would install {}", change.path.display());
+            print!("{}", change.rendered);
+        }
     } else if args.remove {
         if change.changed {
             println!(

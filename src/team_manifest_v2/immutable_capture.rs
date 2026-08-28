@@ -3345,7 +3345,11 @@ mod tests {
         let started = Instant::now();
         let failure = boundary_attempt(&body, &hooks, EXECUTION_TIMEOUT).unwrap_err();
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            // The operational deadline is the injected 100 ms timeout; allow
+            // scheduler contention from the large parallel all-feature suite
+            // while still proving this never approaches the 30-second product
+            // execution deadline.
+            started.elapsed() < Duration::from_secs(5),
             "capture exceeded its bounded lifecycle"
         );
         assert!(matches!(

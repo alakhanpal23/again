@@ -2687,6 +2687,22 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn local_only_audited_profile_cannot_mint_team_authority() {
+        let Ok(profile) = host_audited_apple_profile() else {
+            return;
+        };
+        if profile == AUDITED_SYSTEM_PROFILE {
+            return;
+        }
+        assert!(!host_supports_team_runtime_v1());
+        assert_eq!(
+            attest_team_runtime_v1("cat", Path::new("/bin/cat")).unwrap_err(),
+            RuntimeAttestationError::ExecutableIdentityMismatch
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     #[ignore = "explicit slow-audit integration test"]
     fn explicit_full_audit_writes_a_fast_path_checkpoint() {
         if !host_supports_team_runtime_v1() {

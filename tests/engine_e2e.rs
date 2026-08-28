@@ -1377,6 +1377,16 @@ fn personal_codex_skill_setup_is_idempotent_and_reversible() {
     fs::create_dir(&project).unwrap();
     let skill = project.join("home/.agents/skills/again/SKILL.md");
 
+    let absent_remove = run_again(
+        &project,
+        &["setup", "--codex", "--remove", "--dry-run"],
+        None,
+    );
+    assert!(absent_remove.status.success());
+    let absent_stdout = String::from_utf8_lossy(&absent_remove.stdout);
+    assert!(absent_stdout.contains("# dry run: nothing to remove at"));
+    assert!(!absent_stdout.contains("name: again"));
+
     let first = run_again(&project, &["setup", "--codex"], None);
     assert!(first.status.success(), "setup failed: {:?}", first.stderr);
     assert!(String::from_utf8_lossy(&first.stdout).contains("Installed Again's Codex skill"));
@@ -1386,6 +1396,17 @@ fn personal_codex_skill_setup_is_idempotent_and_reversible() {
     let second = run_again(&project, &["setup", "--codex"], None);
     assert!(second.status.success());
     assert!(String::from_utf8_lossy(&second.stdout).contains("already current"));
+
+    let planned_remove = run_again(
+        &project,
+        &["setup", "--codex", "--remove", "--dry-run"],
+        None,
+    );
+    assert!(planned_remove.status.success());
+    let planned_stdout = String::from_utf8_lossy(&planned_remove.stdout);
+    assert!(planned_stdout.contains("# dry run: would remove"));
+    assert!(!planned_stdout.contains("name: again"));
+    assert!(skill.is_file());
 
     let removed = run_again(&project, &["setup", "--codex", "--remove"], None);
     assert!(

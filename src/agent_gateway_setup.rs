@@ -20,7 +20,6 @@ use thiserror::Error;
 
 const PLAN_VERSION: u32 = 2;
 const SERVER_NAME: &str = "again";
-const COMMAND: &str = "again";
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 64 * 1_024;
 const OWNERSHIP_SUFFIX: &str = ".again-owner-v2";
@@ -44,7 +43,7 @@ impl AgentGatewayClientV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StdioMcpCommandV1 {
     pub transport: &'static str,
-    pub command: &'static str,
+    pub command: PathBuf,
     pub args: Vec<String>,
 }
 
@@ -73,8 +72,23 @@ impl AgentGatewaySetupPlanV1 {
         config_path: impl AsRef<Path>,
         workspace: impl AsRef<Path>,
     ) -> Result<Self> {
+        let executable = std::env::current_exe().map_err(AgentGatewaySetupError::Io)?;
+        Self::dry_run_with_executable(client, config_path, workspace, executable)
+    }
+
+    /// Construct a deterministic dry-run plan pinned to an explicit Again
+    /// executable. The executable is resolved to its canonical regular file so
+    /// the installed MCP client cannot silently select another `again` through
+    /// `PATH`.
+    pub fn dry_run_with_executable(
+        client: AgentGatewayClientV1,
+        config_path: impl AsRef<Path>,
+        workspace: impl AsRef<Path>,
+        executable: impl AsRef<Path>,
+    ) -> Result<Self> {
         let config_path = validate_config_path(config_path.as_ref())?;
         let workspace = validate_workspace(workspace.as_ref())?;
+        let executable = validate_executable(executable.as_ref())?;
         let ownership_path = ownership_path_for(&config_path)?;
         let args = vec![
             "mcp".to_owned(),
@@ -82,8 +96,8 @@ impl AgentGatewaySetupPlanV1 {
             "--workspace".to_owned(),
             workspace.to_string_lossy().into_owned(),
         ];
-        let local_cli_command = local_cli_command(client, &args);
-        let config_document = managed_config_document(client, &args)?;
+        let local_cli_command = local_cli_command(client, &executable, &args);
+        let config_document = managed_config_document(client, &executable, &args)?;
         if config_document.len() > MAX_CONFIG_BYTES {
             return Err(AgentGatewaySetupError::ConfigTooLarge);
         }
@@ -94,7 +108,7 @@ impl AgentGatewaySetupPlanV1 {
             server_name: SERVER_NAME,
             stdio: StdioMcpCommandV1 {
                 transport: "stdio",
-                command: COMMAND,
+                command: executable,
                 args,
             },
             local_cli_command,
@@ -155,6 +169,8 @@ pub enum OwnedInstallOutcomeV1 {
 pub enum AgentGatewaySetupError {
     #[error("gateway config path must be an absolute, bounded UTF-8 file path")]
     InvalidConfigPath,
+    #[error("gateway executable must resolve to an absolute, bounded UTF-8 executable file")]
+    InvalidExecutablePath,
     #[error("gateway workspace must be an explicit canonical, bounded, non-symlink directory")]
     InvalidWorkspace,
     #[error("gateway managed config exceeds its fixed size bound")]
@@ -217,19 +233,20 @@ pub fn install_owned_config(plan: &AgentGatewaySetupPlanV1) -> Result<OwnedInsta
 
 fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
     let workspace = validate_workspace(&plan.workspace)?;
+    let executable = validate_executable(&plan.stdio.command)?;
     let expected_args = vec![
         "mcp".to_owned(),
         "serve".to_owned(),
         "--workspace".to_owned(),
         workspace.to_string_lossy().into_owned(),
     ];
-    let expected_document = managed_config_document(plan.client, &expected_args)?;
+    let expected_document = managed_config_document(plan.client, &executable, &expected_args)?;
     if plan.version != PLAN_VERSION
         || plan.server_name != SERVER_NAME
         || plan.stdio.transport != "stdio"
-        || plan.stdio.command != COMMAND
+        || plan.stdio.command != executable
         || plan.stdio.args != expected_args
-        || plan.local_cli_command != local_cli_command(plan.client, &expected_args)
+        || plan.local_cli_command != local_cli_command(plan.client, &executable, &expected_args)
         || plan.writes_by_default
         || plan.install_policy != "create_absent_or_verify_exact_owned_v1"
         || plan.config_document != expected_document
@@ -282,6 +299,40 @@ fn validate_workspace(path: &Path) -> Result<PathBuf> {
     Ok(canonical)
 }
 
+fn validate_executable(path: &Path) -> Result<PathBuf> {
+    let Some(path_text) = path.to_str() else {
+        return Err(AgentGatewaySetupError::InvalidExecutablePath);
+    };
+    if !path.is_absolute()
+        || path_text.is_empty()
+        || path_text.len() > MAX_PATH_BYTES
+        || path_text.contains('\0')
+    {
+        return Err(AgentGatewaySetupError::InvalidExecutablePath);
+    }
+    let canonical =
+        fs::canonicalize(path).map_err(|_| AgentGatewaySetupError::InvalidExecutablePath)?;
+    let Some(canonical_text) = canonical.to_str() else {
+        return Err(AgentGatewaySetupError::InvalidExecutablePath);
+    };
+    if canonical_text.len() > MAX_PATH_BYTES || canonical_text.contains('\0') {
+        return Err(AgentGatewaySetupError::InvalidExecutablePath);
+    }
+    let metadata = fs::symlink_metadata(&canonical)
+        .map_err(|_| AgentGatewaySetupError::InvalidExecutablePath)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AgentGatewaySetupError::InvalidExecutablePath);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(AgentGatewaySetupError::InvalidExecutablePath);
+        }
+    }
+    Ok(canonical)
+}
+
 fn validate_config_path(path: &Path) -> Result<PathBuf> {
     let Some(path_text) = path.to_str() else {
         return Err(AgentGatewaySetupError::InvalidConfigPath);
@@ -308,7 +359,14 @@ fn ownership_path_for(config_path: &Path) -> Result<PathBuf> {
     Ok(config_path.with_file_name(owned_name))
 }
 
-fn managed_config_document(client: AgentGatewayClientV1, args: &[String]) -> Result<String> {
+fn managed_config_document(
+    client: AgentGatewayClientV1,
+    executable: &Path,
+    args: &[String],
+) -> Result<String> {
+    let executable = executable
+        .to_str()
+        .ok_or(AgentGatewaySetupError::InvalidExecutablePath)?;
     match client {
         AgentGatewayClientV1::Codex => {
             let encoded = args
@@ -318,14 +376,15 @@ fn managed_config_document(client: AgentGatewayClientV1, args: &[String]) -> Res
                 .map_err(AgentGatewaySetupError::SerializePlan)?
                 .join(", ");
             Ok(format!(
-                "# Created and wholly owned by Again gateway setup v2.\n[mcp_servers.again]\ncommand = \"again\"\nargs = [{encoded}]\n"
+                "# Created and wholly owned by Again gateway setup v2.\n[mcp_servers.again]\ncommand = {}\nargs = [{encoded}]\n",
+                serde_json::to_string(executable).map_err(AgentGatewaySetupError::SerializePlan)?
             ))
         }
         AgentGatewayClientV1::Claude => serde_json::to_string_pretty(&serde_json::json!({
             "mcpServers": {
                 "again": {
                     "type": "stdio",
-                    "command": "again",
+                    "command": executable,
                     "args": args,
                 }
             }
@@ -335,11 +394,13 @@ fn managed_config_document(client: AgentGatewayClientV1, args: &[String]) -> Res
     }
 }
 
-fn local_cli_command(client: AgentGatewayClientV1, args: &[String]) -> String {
+fn local_cli_command(client: AgentGatewayClientV1, executable: &Path, args: &[String]) -> String {
     let mut command = match client {
-        AgentGatewayClientV1::Codex => "codex mcp add again -- again".to_owned(),
-        AgentGatewayClientV1::Claude => "claude mcp add -s user again -- again".to_owned(),
+        AgentGatewayClientV1::Codex => "codex mcp add again --".to_owned(),
+        AgentGatewayClientV1::Claude => "claude mcp add -s user again --".to_owned(),
     };
+    command.push(' ');
+    command.push_str(&shell_quote(&executable.to_string_lossy()));
     for argument in args {
         command.push(' ');
         command.push_str(&shell_quote(argument));
