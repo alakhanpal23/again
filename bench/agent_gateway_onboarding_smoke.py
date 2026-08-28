@@ -305,10 +305,15 @@ def _terminate_process_group(
             process.wait(timeout=PROCESS_STOP_SECONDS)
         except subprocess.TimeoutExpired:
             pass
-        if _process_group_exists(process_group):
+        if not _wait_for_process_group_exit(process_group, PROCESS_STOP_SECONDS):
             try:
                 os.killpg(process_group, signal.SIGKILL)
             except ProcessLookupError:
+                pass
+            except PermissionError:
+                # Darwin can transiently retain an adopted zombie group for
+                # which signal 0 succeeds while SIGKILL returns EPERM. It is
+                # safe only if the group then disappears within the deadline.
                 pass
         try:
             process.wait(timeout=PROCESS_STOP_SECONDS)
