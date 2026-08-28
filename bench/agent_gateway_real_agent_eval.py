@@ -31,7 +31,7 @@ from typing import Any
 
 
 SCHEMA = "again.agent-gateway-real-agent-eval.v1"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 MAX_AGENT_RUNS = 64
 MAX_TIMEOUT_SECONDS = 900.0
 MAX_TEMPLATE_ARGUMENTS = 96
@@ -328,28 +328,67 @@ def validate_again_binary(path: pathlib.Path) -> pathlib.Path:
 
 
 def _terminate_process(process: subprocess.Popen[bytes], timeout: float = 1.0) -> None:
+    if os.name == "posix":
+        # Every command is started in a new session whose process-group ID is
+        # the leader PID. The leader may exit before descendants, so poll() is
+        # deliberately not an early-return condition here.
+        def group_exists() -> bool:
+            try:
+                os.killpg(process.pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError as error:
+                raise HarnessRefusal(
+                    "process_cleanup", "could not verify the isolated process group"
+                ) from error
+
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError as error:
+            raise HarnessRefusal(
+                "process_cleanup", "could not terminate the isolated process group"
+            ) from error
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(timeout, 0.1))
+            except subprocess.TimeoutExpired:
+                pass
+        deadline = time.monotonic() + timeout
+        while group_exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if group_exists():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError as error:
+                raise HarnessRefusal(
+                    "process_cleanup", "could not kill the isolated process group"
+                ) from error
+        if process.poll() is None:
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=timeout)
+        return
+
     if process.poll() is not None:
         return
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except ProcessLookupError:
-        return
-    try:
+        process.terminate()
         process.wait(timeout=timeout)
-        return
     except subprocess.TimeoutExpired:
-        pass
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
-            process.kill()
+        process.kill()
+        process.wait(timeout=timeout)
     except ProcessLookupError:
         return
-    process.wait(timeout=timeout)
 
 
 def run_bounded_command(
@@ -428,6 +467,9 @@ def run_bounded_command(
                 timed_out = True
                 _terminate_process(process)
     finally:
+        # Clean the complete process group even when its leader exited zero.
+        # Detached descendants are never allowed to outlive a bounded command.
+        _terminate_process(process)
         selector.close()
         process.stdout.close()
         process.stderr.close()
@@ -1337,7 +1379,10 @@ def build_agent_run_record(
 ) -> dict[str, Any]:
     environment_refusal = bool(
         analysis.client_reported_error
-        or ((result.returncode != 0 or result.timed_out) and _looks_like_environment_refusal(redacted_stdout + redacted_stderr))
+        or (
+            (result.returncode != 0 or result.timed_out)
+            and _looks_like_environment_refusal(redacted_stdout + redacted_stderr)
+        )
     )
     if result.timed_out:
         classification = "timeout"
@@ -1356,12 +1401,17 @@ def build_agent_run_record(
     else:
         classification = "task_succeeded"
     final_bytes = len(analysis.final_text.encode("utf-8")) if analysis.final_text is not None else 0
-    return {
+    observed_final_response: Any = None
+    if analysis.final_text is not None:
+        try:
+            observed_final_response = strict_json_loads(analysis.final_text.strip())
+        except HarnessRefusal:
+            observed_final_response = None
+    record: dict[str, Any] = {
         "client": client,
         "condition": condition,
         "replica": replica,
         "classification": classification,
-        "task_outcome": "pass" if analysis.oracle_passed else "fail",
         "wall_time_ms": round(result.elapsed_ms, 3),
         "process": {
             "returncode": result.returncode,
@@ -1385,6 +1435,9 @@ def build_agent_run_record(
             "again_tool_result_mismatches": analysis.again_tool_result_mismatches,
             "environment_network_or_model_refusal": environment_refusal,
             "malformed_agent_output": analysis.malformed or result.output_limited,
+            "oracle_passed": analysis.oracle_passed,
+            "client_reported_error": analysis.client_reported_error,
+            "observed_final_response": observed_final_response,
         },
         "client_reported_tokens": {
             "source": "direct_client_output",
@@ -1392,6 +1445,84 @@ def build_agent_run_record(
         },
         "client_reported_model": analysis.client_reported_model,
     }
+    eligible, reason = comparison_eligibility(record)
+    record["comparison_eligible"] = eligible
+    record["comparison_ineligibility_reason"] = reason
+    record["task_outcome"] = "pass" if eligible else "fail"
+    return record
+
+
+def comparison_eligibility(run: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """The sole authority for whether one run may enter a comparison cohort."""
+
+    process = run.get("process")
+    observations = run.get("observations")
+    if not isinstance(process, Mapping) or not isinstance(observations, Mapping):
+        raise HarnessRefusal("comparison_run", "run lacks process or observation evidence")
+    returncode = process.get("returncode")
+    timed_out = process.get("timed_out")
+    output_limited = process.get("output_limited")
+    malformed = observations.get("malformed_agent_output")
+    client_error = observations.get("client_reported_error")
+    oracle_passed = observations.get("oracle_passed")
+    if (
+        not isinstance(returncode, int)
+        or isinstance(returncode, bool)
+        or not isinstance(timed_out, bool)
+        or not isinstance(output_limited, bool)
+        or not isinstance(malformed, bool)
+        or not isinstance(client_error, bool)
+        or not isinstance(oracle_passed, bool)
+    ):
+        raise HarnessRefusal("comparison_run", "run eligibility evidence has invalid types")
+    failures = (
+        (timed_out, "timeout"),
+        (output_limited, "output_limit"),
+        (malformed, "malformed_agent_output"),
+        (client_error, "client_reported_error"),
+        (returncode != 0, "client_nonzero_exit"),
+        (not oracle_passed, "oracle_failed"),
+    )
+    for failed, reason in failures:
+        if failed:
+            return False, reason
+    return True, None
+
+
+def _validated_eligible_cohort(
+    runs: Sequence[Mapping[str, Any]],
+    *,
+    condition: str | None = None,
+    client: str | None = None,
+    expected_count: int | None = None,
+) -> bool:
+    if expected_count is not None and len(runs) != expected_count:
+        return False
+    replicas: list[int] = []
+    for run in runs:
+        eligible, reason = comparison_eligibility(run)
+        if (
+            run.get("comparison_eligible") is not None
+            and run.get("comparison_eligible") is not eligible
+        ):
+            raise HarnessRefusal("comparison_run", "stored run eligibility disagrees with evidence")
+        if run.get("comparison_ineligibility_reason") is not None and run.get(
+            "comparison_ineligibility_reason"
+        ) != reason:
+            raise HarnessRefusal("comparison_run", "stored run refusal disagrees with evidence")
+        if not eligible:
+            return False
+        if condition is not None and run.get("condition") != condition:
+            raise HarnessRefusal("comparison_run", "run condition does not match its cohort")
+        if client is not None and run.get("client") != client:
+            raise HarnessRefusal("comparison_run", "run client does not match its pair")
+        replica = run.get("replica")
+        if not isinstance(replica, int) or isinstance(replica, bool) or replica < 0:
+            raise HarnessRefusal("comparison_run", "run replica is invalid")
+        replicas.append(replica)
+    if expected_count is not None and sorted(replicas) != list(range(expected_count)):
+        raise HarnessRefusal("comparison_run", "cohort replicas are not exact")
+    return True
 
 
 def classify_paired_run(
@@ -1407,7 +1538,9 @@ def classify_paired_run(
     enabled_again_calls = sum(
         int(run["metrics"]["again_tool_calls_requested"]) for run in enabled_runs
     )
-    task_failed = any(run["task_outcome"] != "pass" for run in enabled_runs)
+    baseline_eligible = _validated_eligible_cohort(baseline_runs)
+    enabled_eligible = _validated_eligible_cohort(enabled_runs)
+    task_failed = not (baseline_eligible and enabled_eligible)
     environment_refusal = any(
         bool(run["observations"]["environment_network_or_model_refusal"])
         for run in (*baseline_runs, *enabled_runs)
@@ -1425,27 +1558,39 @@ def classify_paired_run(
         and gateway_delta["requested"] == reuse_events
     )
     false_hits = min(reuse_events, mismatches) if reuse_only_cohort else 0
-    if enabled_again_calls == gateway_delta["requested"]:
-        reconciliation = "exact"
+    exact_positive_reconciliation = bool(
+        enabled_again_calls > 0
+        and gateway_delta["requested"] > 0
+        and enabled_again_calls == gateway_delta["requested"]
+    )
+    if exact_positive_reconciliation:
+        reconciliation = "exact_positive"
+    elif enabled_again_calls == 0 and gateway_delta["requested"] == 0:
+        reconciliation = "none_observed"
     elif enabled_again_calls == 0 and gateway_delta["requested"] > 0:
         reconciliation = "gateway_only_client_events_unobservable"
     else:
         reconciliation = "mismatch"
-    if environment_refusal:
+    if not (baseline_eligible and enabled_eligible):
+        classification = "comparison_ineligible"
+    elif environment_refusal:
         classification = "environment_network_or_model_refusal"
-    elif task_failed:
-        classification = "task_failed"
     elif enabled_again_calls == 0 and gateway_delta["requested"] == 0:
         classification = "agent_did_not_use_again"
     elif enabled_again_calls > 0 and gateway_delta["requested"] == 0:
         classification = "again_call_not_observed_by_gateway"
-    elif enabled_again_calls > 0 and gateway_delta["requested"] > 0:
+    elif exact_positive_reconciliation:
         classification = "end_to_end_again_observed"
+    elif enabled_again_calls > 0 and gateway_delta["requested"] > 0:
+        classification = "again_gateway_call_count_mismatch"
     else:
         classification = "gateway_use_observed_only_in_stats"
     return {
         "classification": classification,
-        "same_task_model_settings": True,
+        "same_requested_task_model_settings": True,
+        "baseline_comparison_eligible": baseline_eligible,
+        "enabled_comparison_eligible": enabled_eligible,
+        "exact_positive_call_reconciliation": exact_positive_reconciliation,
         "agent_did_not_use_tool": enabled_again_calls == 0 and gateway_delta["requested"] == 0,
         "gateway_provider_executed": gateway_delta["executed"] > 0,
         "gateway_joined_inflight": gateway_delta["inflight_joins"] > 0,
@@ -1471,6 +1616,88 @@ def classify_paired_run(
         ),
         "tool_call_reconciliation": reconciliation,
     }
+
+
+def validate_comparison_pair(
+    pair: Mapping[str, Any], expected_pair_id: str | None = None
+) -> dict[str, Any]:
+    """Re-derive a complete pair; stored flags and reconciliation are never authority."""
+
+    client = pair.get("client")
+    task_id = pair.get("task_id")
+    concurrency = pair.get("concurrency")
+    if (
+        client not in {"codex", "claude"}
+        or not isinstance(task_id, str)
+        or not re.fullmatch(r"[a-z0-9_]+", task_id)
+        or not isinstance(concurrency, int)
+        or isinstance(concurrency, bool)
+        or concurrency < 1
+        or concurrency > MAX_AGENT_RUNS
+    ):
+        raise HarnessRefusal("comparison_pair", "pair identity or concurrency is invalid")
+    pair_id = f"{client}--{task_id}"
+    if expected_pair_id is not None and pair_id != expected_pair_id:
+        raise HarnessRefusal("comparison_pair", "pair identity does not match its journal path")
+    task_spec = next((task for task in TASKS if task.task_id == task_id), None)
+    if task_spec is None or concurrency != task_spec.concurrency:
+        raise HarnessRefusal("comparison_pair", "pair cohort size is not the fixed task design")
+    baseline = pair.get("baseline")
+    enabled = pair.get("again_enabled")
+    journal_attempt = pair.get("journal_attempt")
+    treatment_order = pair.get("treatment_order")
+    if (
+        not isinstance(journal_attempt, int)
+        or isinstance(journal_attempt, bool)
+        or journal_attempt < 1
+        or treatment_order not in (
+            ["baseline", "again_enabled"],
+            ["again_enabled", "baseline"],
+        )
+    ):
+        raise HarnessRefusal("comparison_pair", "pair attempt or treatment order is invalid")
+    if not isinstance(baseline, Mapping) or not isinstance(enabled, Mapping):
+        raise HarnessRefusal("comparison_pair", "pair lacks both condition cohorts")
+    baseline_runs = baseline.get("runs")
+    enabled_runs = enabled.get("runs")
+    if not isinstance(baseline_runs, list) or not isinstance(enabled_runs, list):
+        raise HarnessRefusal("comparison_pair", "pair cohort runs are malformed")
+    if not _validated_eligible_cohort(
+        baseline_runs,
+        condition="baseline",
+        client=client,
+        expected_count=concurrency,
+    ) or not _validated_eligible_cohort(
+        enabled_runs,
+        condition="again_enabled",
+        client=client,
+        expected_count=concurrency,
+    ):
+        raise HarnessRefusal("comparison_ineligible", "pair contains an ineligible cohort")
+    expected_response = dict(task_spec.expected)
+    for run in (*baseline_runs, *enabled_runs):
+        observations = run.get("observations")
+        if (
+            not isinstance(observations, Mapping)
+            or observations.get("observed_final_response") != expected_response
+        ):
+            raise HarnessRefusal(
+                "comparison_pair", "eligible run does not retain the exact oracle response"
+            )
+    baseline_delta = baseline.get("gateway_stats_delta")
+    enabled_delta = enabled.get("gateway_stats_delta")
+    if not isinstance(baseline_delta, Mapping) or not isinstance(enabled_delta, Mapping):
+        raise HarnessRefusal("comparison_pair", "pair lacks gateway statistics")
+    if set(baseline_delta) != set(STATS_FIELDS) or set(enabled_delta) != set(STATS_FIELDS):
+        raise HarnessRefusal("comparison_pair", "pair gateway statistics are not exact")
+    normalized_baseline = normalize_stats(dict(baseline_delta))
+    normalized_enabled = normalize_stats(dict(enabled_delta))
+    if any(normalized_baseline.values()):
+        raise HarnessRefusal("baseline_contaminated", "baseline gateway statistics are nonzero")
+    rederived = classify_paired_run(baseline_runs, enabled_runs, normalized_enabled)
+    if pair.get("reconciliation") != rederived:
+        raise HarnessRefusal("comparison_pair", "stored reconciliation is not re-derived")
+    return rederived
 
 
 def _ensure_again_unavailable(path_directories: Sequence[pathlib.Path]) -> None:
@@ -1827,6 +2054,7 @@ def execute_live_pair(
         },
         "reconciliation": reconciliation,
     }
+    validate_comparison_pair(pair, f"{client}--{task.task_id}")
     return pair, [*baseline_runs, *enabled_runs]
 
 
@@ -1835,17 +2063,19 @@ def review_statistical_claims(
     pairs: Sequence[Mapping[str, Any]],
     all_runs: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
+    eligible_pairs = [pair for pair in pairs if _pair_is_eligible(pair)]
+    eligible_runs = [run for run in all_runs if comparison_eligibility(run)[0]]
     confirmed_delivery_pairs = sum(
         pair["reconciliation"]["classification"] == "end_to_end_again_observed"
-        for pair in pairs
+        for pair in eligible_pairs
     )
     direct_token_runs = sum(
-        bool(run["client_reported_tokens"]["counts"]) for run in all_runs
+        bool(run["client_reported_tokens"]["counts"]) for run in eligible_runs
     )
-    complete_matrix = mode == "live" and len(pairs) == len(TASKS) * 2
+    complete_matrix = mode == "live" and len(eligible_pairs) == len(TASKS) * 2
     return {
         "comparison_matrix_complete": complete_matrix,
-        "comparison_pairs_eligible": len(pairs) if mode == "live" else 0,
+        "comparison_pairs_eligible": len(eligible_pairs) if mode == "live" else 0,
         "confirmed_again_delivery_pairs": confirmed_delivery_pairs,
         "runs_with_direct_client_token_counts": direct_token_runs,
         "token_savings_claim_permitted": False,
@@ -1860,6 +2090,14 @@ def review_statistical_claims(
         "general_acceleration_claim_permitted": False,
         "dry_run_is_live_evidence": False,
     }
+
+
+def _pair_is_eligible(pair: Mapping[str, Any]) -> bool:
+    try:
+        validate_comparison_pair(pair)
+    except HarnessRefusal:
+        return False
+    return True
 
 
 def evaluate(
@@ -1938,7 +2176,8 @@ def evaluate(
         validate_runtime_pin(
             runtime_pins["again"], str(again["version"]), str(again["binary_sha256"])
         )
-        again["runtime_pin_verified"] = True
+        again["inspection_matched_supplied_pin"] = True
+        again["identity_scope"] = "path_contents_and_version_output_at_pre_run_inspection"
         for client in clients:
             validate_runtime_pin(
                 runtime_pins[client],
@@ -1991,7 +2230,7 @@ def evaluate(
             },
             "clients": {
                 client: {
-                    "model": models[client],
+                    "requested_model": models[client],
                     "settings_id": settings_ids[client],
                     "command_template_sha256": templates[client].identity(),
                 }
@@ -2098,11 +2337,17 @@ def evaluate(
                     pairs.append(pair)
                     all_runs.extend(pair_runs)
 
+        eligible_pairs = [pair for pair in pairs if _pair_is_eligible(pair)]
+        if len(eligible_pairs) != len(pairs):
+            raise HarnessRefusal("comparison_ineligible", "ineligible pair reached aggregation")
+        eligible_runs = [run for run in all_runs if comparison_eligibility(run)[0]]
+        if len(eligible_runs) != len(all_runs):
+            raise HarnessRefusal("comparison_ineligible", "ineligible run reached aggregation")
         aggregate_gateway = {name: 0 for name in STATS_FIELDS}
         false_hits = 0
         end_to_end_pairs = 0
         if mode == "live":
-            for pair in pairs:
+            for pair in eligible_pairs:
                 delta = pair["again_enabled"]["gateway_stats_delta"]
                 for name in STATS_FIELDS:
                     aggregate_gateway[name] += int(delta[name])
@@ -2133,14 +2378,22 @@ def evaluate(
                 "fixture_digest_sha256": fixture["fixture_digest_sha256"],
                 "platform": platform_identity,
                 "run_identity_sha256": sha256_bytes(canonical_json_bytes(run_identity)),
+                "publisher_authentication": "none_unsigned_local_file",
+                "descriptor_continuity_claimed": False,
             },
             "clients": {
                 client: {
-                    "version": inspections[client].version,
-                    "version_tuple": list(inspections[client].version_tuple),
-                    "executable_sha256": inspections[client].executable_sha256,
-                    "runtime_pin_verified": True,
-                    "model": models[client],
+                    "inspected_version_output": inspections[client].version,
+                    "inspected_version_tuple": list(inspections[client].version_tuple),
+                    "inspected_path_contents_sha256": inspections[client].executable_sha256,
+                    "inspection_matched_supplied_pin": True,
+                    "runtime_identity_scope": (
+                        "pre-run path inspection; no retained descriptor continuity or publisher authenticity"
+                    ),
+                    "requested_model": models[client],
+                    "model_identity_scope": (
+                        "command argument requested; client-reported observations are retained per eligible run"
+                    ),
                     "settings_id": settings_ids[client],
                     "command_template": list(templates[client].arguments),
                     "command_template_sha256": templates[client].identity(),
@@ -2156,6 +2409,7 @@ def evaluate(
                 ),
                 "planned_agent_runs": planned,
                 "executed_agent_runs": len(all_runs),
+                "comparison_eligible_agent_runs": len(eligible_runs),
                 "executed_agent_runs_this_invocation": invocation_agent_runs,
                 "resumed_completed_pairs": resumed_completed_pairs,
                 "tasks": [
@@ -2182,22 +2436,26 @@ def evaluate(
                 },
             },
             "dry_run_matrix": dry_run_matrix,
-            "paired_runs": pairs,
+            "paired_runs": eligible_pairs,
             "aggregate": {
                 "gateway": aggregate_gateway,
                 "again_tool_calls_requested": sum(
-                    int(run["metrics"]["again_tool_calls_requested"]) for run in all_runs
+                    int(run["metrics"]["again_tool_calls_requested"]) for run in eligible_runs
                 ),
-                "tool_call_count": sum(int(run["metrics"]["tool_call_count"]) for run in all_runs),
+                "tool_call_count": sum(
+                    int(run["metrics"]["tool_call_count"]) for run in eligible_runs
+                ),
                 "response_bytes": sum(
-                    int(run["metrics"]["again_tool_response_bytes"]) for run in all_runs
+                    int(run["metrics"]["again_tool_response_bytes"]) for run in eligible_runs
                 ),
-                "wall_time_ms": round(sum(float(run["wall_time_ms"]) for run in all_runs), 3),
+                "wall_time_ms": round(
+                    sum(float(run["wall_time_ms"]) for run in eligible_runs), 3
+                ),
                 "false_hit_count": false_hits,
                 "end_to_end_again_pairs": end_to_end_pairs,
                 "direct_client_token_counts": {
                     "source": "sum_of_direct_client_output_counts",
-                    "counts": _sum_direct_tokens(all_runs),
+                    "counts": _sum_direct_tokens(eligible_runs),
                 },
                 "estimated_tokens_avoided": {
                     "source": "again_stats_estimate",
@@ -2205,11 +2463,14 @@ def evaluate(
                 },
             },
             "run_journal": journal.summary() if journal is not None else None,
-            "statistical_review": review_statistical_claims(mode, pairs, all_runs),
+            "statistical_review": review_statistical_claims(
+                mode, eligible_pairs, eligible_runs
+            ),
             "limitations": [
                 "No model-quality improvement is inferred from these samples.",
                 "Token savings are not claimed; only direct client counts and explicitly labeled Again estimates are recorded.",
-                "End-to-end Again success requires both a client-observed Again call and a gateway requested-call counter.",
+                "End-to-end Again success requires eligible exact cohorts and exact positive equality between client-observed Again calls and the gateway requested delta.",
+                "Runtime hashes and model names are inspection/request observations, not retained-descriptor or publisher-authenticated identities.",
                 "The report does not establish general MCP acceleration, semantic reuse, or production readiness.",
                 "In-flight joins depend on naturally overlapping real-agent calls and may be zero.",
             ],
@@ -2218,9 +2479,7 @@ def evaluate(
         return evidence, secret_bytes
 
 
-def write_json_exclusive(
-    path: pathlib.Path, value: Mapping[str, Any], credentials: Sequence[bytes] = ()
-) -> None:
+def _ensure_credentials_absent(value: Mapping[str, Any], credentials: Sequence[bytes]) -> None:
     def contains_credential(node: Any, credential: str) -> bool:
         if isinstance(node, str):
             return credential in node
@@ -2233,7 +2492,6 @@ def write_json_exclusive(
             return any(contains_credential(item, credential) for item in node)
         return False
 
-    encoded = canonical_json_bytes(dict(value)) + b"\n"
     for credential in credentials:
         try:
             credential_text = credential.decode("utf-8", errors="strict")
@@ -2241,20 +2499,36 @@ def write_json_exclusive(
             raise HarnessRefusal(
                 "credential_persistence", "credential guard received non-UTF-8 material"
             ) from error
-        if credential and (
-            credential in encoded or contains_credential(value, credential_text)
-        ):
+        if credential and contains_credential(value, credential_text):
             raise HarnessRefusal(
                 "credential_persistence", "refusing evidence containing credential material"
             )
+
+
+def write_json_exclusive(
+    path: pathlib.Path, value: Mapping[str, Any], credentials: Sequence[bytes] = ()
+) -> None:
+    _ensure_credentials_absent(value, credentials)
+    encoded = canonical_json_bytes(dict(value)) + b"\n"
+    try:
+        parent_metadata = path.parent.lstat()
+    except OSError as error:
+        raise HarnessRefusal("evidence_directory", "evidence directory is unreadable") from error
+    if stat.S_ISLNK(parent_metadata.st_mode) or not stat.S_ISDIR(parent_metadata.st_mode):
+        raise HarnessRefusal("evidence_directory", "evidence directory is unsafe")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
+    temporary_path = path.parent / (
+        f".{path.name}.{os.getpid()}.{time.monotonic_ns()}.transaction"
+    )
+    descriptor = -1
+    directory_descriptor = -1
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(temporary_path, flags, 0o600)
     except FileExistsError as error:
         raise HarnessRefusal(
-            "evidence_exists", f"refusing to overwrite existing evidence: {path}"
+            "evidence_temporary_exists", "transactional evidence temporary already exists"
         ) from error
     try:
         view = memoryview(encoded)
@@ -2264,11 +2538,27 @@ def write_json_exclusive(
                 raise HarnessRefusal("evidence_write", "evidence write made no progress")
             view = view[written:]
         os.fsync(descriptor)
-    except BaseException:
         os.close(descriptor)
-        path.unlink(missing_ok=True)
-        raise
-    os.close(descriptor)
+        descriptor = -1
+        try:
+            os.link(temporary_path, path, follow_symlinks=False)
+        except FileExistsError as error:
+            raise HarnessRefusal(
+                "evidence_exists", f"refusing to overwrite existing evidence: {path}"
+            ) from error
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        os.fsync(directory_descriptor)
+        temporary_path.unlink()
+        os.fsync(directory_descriptor)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if directory_descriptor >= 0:
+            os.close(directory_descriptor)
+        if temporary_path.exists() or temporary_path.is_symlink():
+            temporary_path.unlink(missing_ok=True)
+        # Once linked, the final path is never removed on a later failure: it
+        # contains the already-fsynced complete bytes and remains no-replace.
 
 
 def read_bounded_json_object(path: pathlib.Path) -> dict[str, Any]:
@@ -2415,6 +2705,7 @@ class RunJournal:
         pair = envelope.get("pair")
         if not isinstance(pair, dict):
             raise HarnessRefusal("journal_pair", "completed journal pair is malformed")
+        validate_comparison_pair(pair, pair_id)
         expected = {
             "schema": self.SCHEMA,
             "identity_sha256": self.identity_sha256,
@@ -2503,6 +2794,10 @@ class RunJournal:
         credentials: Sequence[bytes] = (),
     ) -> None:
         pair_value = dict(pair)
+        _ensure_credentials_absent(pair_value, credentials)
+        if pair_value.get("journal_attempt") != attempt.number:
+            raise HarnessRefusal("journal_pair", "pair is bound to a different journal attempt")
+        validate_comparison_pair(pair_value, attempt.pair_id)
         pair_path = self._pair_path(attempt.pair_id)
         write_json_exclusive(
             pair_path,
@@ -2529,15 +2824,60 @@ class RunJournal:
         )
 
     def summary(self) -> dict[str, Any]:
-        completed = sorted(self.pairs.glob("*.complete.json"))
-        abandoned = sorted(self.attempts.glob("*.abandoned.json"))
-        failed = sorted(self.attempts.glob("*.failed.json"))
+        completed_paths = sorted(self.pairs.glob("*.complete.json"))
+        completed = 0
+        for path in completed_paths:
+            match = re.fullmatch(r"([a-z0-9_]+--[a-z0-9_]+)\.complete\.json", path.name)
+            if match is None or self.load_completed(match.group(1)) is None:
+                raise HarnessRefusal("journal_pair", "completed pair filename is invalid")
+            completed += 1
+
+        def validated_terminal_count(status: str) -> int:
+            count = 0
+            for path in sorted(self.attempts.glob(f"*.{status}.json")):
+                value = read_bounded_json_object(path)
+                match = re.fullmatch(
+                    rf"([a-z0-9_]+--[a-z0-9_]+)\.(\d{{4}})\.{status}\.json",
+                    path.name,
+                )
+                if match is None:
+                    raise HarnessRefusal("journal_attempt", "terminal attempt filename is invalid")
+                pair_id, number = match.group(1), int(match.group(2))
+                expected_keys = {
+                    "schema",
+                    "identity_sha256",
+                    "pair_id",
+                    "attempt",
+                    "status",
+                    "comparison_eligible",
+                }
+                if status == "failed":
+                    expected_keys.add("failure_code")
+                    failure_code = value.get("failure_code")
+                    if not isinstance(failure_code, str):
+                        raise HarnessRefusal("journal_attempt", "failure code is malformed")
+                    validate_identifier(failure_code, "failure code")
+                if (
+                    set(value) != expected_keys
+                    or value.get("schema") != self.SCHEMA
+                    or value.get("identity_sha256") != self.identity_sha256
+                    or value.get("pair_id") != pair_id
+                    or value.get("attempt") != number
+                    or value.get("status") != status
+                    or value.get("comparison_eligible") is not False
+                ):
+                    raise HarnessRefusal("journal_attempt", "terminal attempt failed validation")
+                count += 1
+            return count
+
+        abandoned = validated_terminal_count("abandoned")
+        failed = validated_terminal_count("failed")
         return {
             "schema": self.SCHEMA,
             "identity_sha256": self.identity_sha256,
-            "completed_pairs": len(completed),
-            "abandoned_attempts": len(abandoned),
-            "failed_attempts": len(failed),
+            "completed_pairs": completed,
+            "abandoned_attempts": abandoned,
+            "failed_attempts": failed,
             "only_complete_pairs_are_comparison_eligible": True,
         }
 

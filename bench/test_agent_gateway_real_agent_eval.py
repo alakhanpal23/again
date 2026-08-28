@@ -76,20 +76,39 @@ def claude_template(executable: str = "/usr/bin/true") -> str:
 
 def run_observation(
     *,
+    client: str = "codex",
+    condition: str = "again_enabled",
+    replica: int = 0,
     calls: int = 0,
     outcome: str = "pass",
     mismatch: int = 0,
     observed_results: int = 0,
     environment_refusal: bool = False,
 ) -> dict[str, Any]:
+    eligible = outcome == "pass" and not environment_refusal
     return {
+        "client": client,
+        "condition": condition,
+        "replica": replica,
         "task_outcome": outcome,
+        "comparison_eligible": eligible,
+        "comparison_ineligibility_reason": None if eligible else "oracle_failed",
+        "process": {
+            "returncode": 0,
+            "timed_out": False,
+            "output_limited": False,
+        },
         "metrics": {"again_tool_calls_requested": calls},
         "observations": {
             "again_tool_result_mismatches": mismatch,
             "again_tool_results_observed": observed_results,
             "environment_network_or_model_refusal": environment_refusal,
+            "malformed_agent_output": False,
+            "oracle_passed": outcome == "pass",
+            "client_reported_error": environment_refusal,
+            "observed_final_response": dict(real_eval.TASKS[1].expected),
         },
+        "client_reported_tokens": {"source": "direct_client_output", "counts": {}},
     }
 
 
@@ -97,6 +116,33 @@ def gateway_delta(**updates: int) -> dict[str, int]:
     value = {name: 0 for name in real_eval.STATS_FIELDS}
     value.update(updates)
     return value
+
+
+def comparison_pair(*, concurrency: int = 1) -> dict[str, Any]:
+    baseline = [
+        run_observation(condition="baseline", replica=replica)
+        for replica in range(concurrency)
+    ]
+    enabled = [
+        run_observation(condition="again_enabled", replica=replica, calls=1)
+        for replica in range(concurrency)
+    ]
+    delta = gateway_delta(requested=concurrency, executed=concurrency)
+    reconciliation = real_eval.classify_paired_run(baseline, enabled, delta)
+    return {
+        "client": "codex",
+        "task_id": "later_checksum_v1",
+        "concurrency": concurrency,
+        "treatment_order": ["baseline", "again_enabled"],
+        "journal_attempt": 1,
+        "baseline": {"runs": baseline, "gateway_stats_delta": gateway_delta()},
+        "again_enabled": {
+            "runs": enabled,
+            "gateway_stats_delta": delta,
+            "setup": {"observed": True},
+        },
+        "reconciliation": reconciliation,
+    }
 
 
 class RealAgentEvalTests(unittest.TestCase):
@@ -153,6 +199,34 @@ class RealAgentEvalTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn(b"$(touch", result.stdout)
+        self.assertFalse(sentinel.exists())
+
+    @unittest.skipUnless(os.name == "posix", "process-group cleanup requires POSIX")
+    def test_process_group_is_cleaned_after_leader_exits(self) -> None:
+        sentinel = self.root / "descendant-survived"
+        program = f"""
+import os
+import time
+pid = os.fork()
+if pid == 0:
+    os.close(1)
+    os.close(2)
+    time.sleep(0.4)
+    with open({str(sentinel)!r}, "w", encoding="utf-8") as output:
+        output.write("bad")
+    os._exit(0)
+os._exit(0)
+"""
+        result = real_eval.run_bounded_command(
+            (sys.executable, "-c", program),
+            cwd=self.root,
+            environment={**self.environment, "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout_seconds=2,
+        )
+        self.assertEqual(result.returncode, 0)
+        import time
+
+        time.sleep(0.6)
         self.assertFalse(sentinel.exists())
 
     def test_live_mode_requires_explicit_network_authorization(self) -> None:
@@ -228,7 +302,15 @@ class RealAgentEvalTests(unittest.TestCase):
         self.assertTrue(classified["gateway_provider_executed"])
         self.assertTrue(classified["gateway_joined_inflight"])
         self.assertTrue(classified["gateway_reused_exact"])
-        self.assertEqual(classified["tool_call_reconciliation"], "exact")
+        self.assertEqual(classified["tool_call_reconciliation"], "exact_positive")
+
+        mismatch = real_eval.classify_paired_run(
+            baseline,
+            enabled,
+            gateway_delta(requested=2, executed=1, exact_hits=1),
+        )
+        self.assertEqual(mismatch["classification"], "again_gateway_call_count_mismatch")
+        self.assertFalse(mismatch["exact_positive_call_reconciliation"])
 
         with self.assertRaises(real_eval.HarnessRefusal) as contaminated:
             real_eval.classify_paired_run(
@@ -377,6 +459,8 @@ class RealAgentEvalTests(unittest.TestCase):
             "codex", "baseline", 0, result, b"", b"", analysis
         )
         self.assertEqual(record["classification"], "timeout")
+        self.assertFalse(record["comparison_eligible"])
+        self.assertEqual(record["comparison_ineligibility_reason"], "timeout")
 
     def test_nonzero_exit_is_retained_without_becoming_success(self) -> None:
         result = real_eval.run_bounded_command(
@@ -387,13 +471,74 @@ class RealAgentEvalTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 7)
         analysis = real_eval.analyze_agent_output(
-            "codex", b'{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}\n', real_eval.TASKS[0]
+            "codex",
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"{}"}}\n',
+            real_eval.TASKS[0],
         )
         record = real_eval.build_agent_run_record(
             "codex", "again_enabled", 0, result, result.stdout, result.stderr, analysis
         )
         self.assertEqual(record["classification"], "client_nonzero_exit")
         self.assertEqual(record["task_outcome"], "fail")
+
+    def test_exact_answer_is_ineligible_after_every_execution_failure(self) -> None:
+        task = real_eval.TASKS[0]
+        exact = json.dumps(dict(task.expected), separators=(",", ":"))
+
+        def analysis(**updates: Any) -> real_eval.AgentOutputAnalysis:
+            values: dict[str, Any] = {
+                "malformed": False,
+                "malformed_reason": None,
+                "final_text": exact,
+                "oracle_passed": True,
+                "tool_call_count": 0,
+                "again_tool_calls_requested": 0,
+                "again_discovered": False,
+                "again_tool_response_bytes": 0,
+                "again_tool_results_observed": 0,
+                "again_tool_result_mismatches": 0,
+                "client_reported_tokens": {},
+                "client_reported_model": None,
+                "client_reported_error": False,
+            }
+            values.update(updates)
+            return real_eval.AgentOutputAnalysis(**values)
+
+        cases = (
+            (
+                real_eval.CommandResult(0, b"", b"", 1.0, True, False),
+                analysis(),
+                "timeout",
+            ),
+            (
+                real_eval.CommandResult(9, b"", b"", 1.0, False, False),
+                analysis(),
+                "client_nonzero_exit",
+            ),
+            (
+                real_eval.CommandResult(0, b"", b"", 1.0, False, True),
+                analysis(),
+                "output_limit",
+            ),
+            (
+                real_eval.CommandResult(0, b"", b"", 1.0, False, False),
+                analysis(malformed=True, malformed_reason="trailing malformed event"),
+                "malformed_agent_output",
+            ),
+            (
+                real_eval.CommandResult(0, b"", b"", 1.0, False, False),
+                analysis(client_reported_error=True),
+                "client_reported_error",
+            ),
+        )
+        for result, observed, reason in cases:
+            with self.subTest(reason=reason):
+                record = real_eval.build_agent_run_record(
+                    "codex", "baseline", 0, result, b"", b"", observed
+                )
+                self.assertFalse(record["comparison_eligible"])
+                self.assertEqual(record["comparison_ineligibility_reason"], reason)
+                self.assertEqual(record["task_outcome"], "fail")
 
     def test_mcp_crash_is_a_typed_command_failure(self) -> None:
         crash = real_eval.CommandResult(
@@ -549,7 +694,9 @@ class RealAgentEvalTests(unittest.TestCase):
     def test_stable_canonical_json_and_overwrite_refusal(self) -> None:
         left = {"z": [3, 2, 1], "a": {"two": 2, "one": 1}}
         right = {"a": {"one": 1, "two": 2}, "z": [3, 2, 1]}
-        self.assertEqual(real_eval.canonical_json_bytes(left), real_eval.canonical_json_bytes(right))
+        self.assertEqual(
+            real_eval.canonical_json_bytes(left), real_eval.canonical_json_bytes(right)
+        )
 
         first = self.root / "first.json"
         second = self.root / "second.json"
@@ -559,6 +706,15 @@ class RealAgentEvalTests(unittest.TestCase):
         with self.assertRaises(real_eval.HarnessRefusal) as overwrite:
             real_eval.write_json_exclusive(first, left)
         self.assertEqual(overwrite.exception.code, "evidence_exists")
+
+        transactional = self.root / "transactional.json"
+        with mock.patch.object(real_eval.os, "fsync", wraps=os.fsync) as fsync:
+            real_eval.write_json_exclusive(transactional, left)
+        self.assertGreaterEqual(
+            fsync.call_count, 3, "file and directory publication must be fsynced"
+        )
+        self.assertEqual(transactional.read_bytes(), real_eval.canonical_json_bytes(left) + b"\n")
+        self.assertEqual(list(self.root.glob(".*.transaction")), [])
 
     def test_interrupted_pairs_are_excluded_and_completed_pairs_resume(self) -> None:
         journal_root = self.root / "run-state"
@@ -577,12 +733,8 @@ class RealAgentEvalTests(unittest.TestCase):
         resumed.fail_attempt(second, "agent_crash")
 
         third = resumed.start_attempt(first.pair_id, 2)
-        complete_pair = {
-            "client": "codex",
-            "task_id": "later_checksum_v1",
-            "baseline": {"runs": [{"task_outcome": "pass"}]},
-            "again_enabled": {"runs": [{"task_outcome": "pass"}]},
-        }
+        complete_pair = comparison_pair()
+        complete_pair["journal_attempt"] = third.number
         resumed.complete_attempt(third, complete_pair)
         pair_path = journal_root / "pairs" / f"{first.pair_id}.complete.json"
         retained_bytes = pair_path.read_bytes()
@@ -598,13 +750,51 @@ class RealAgentEvalTests(unittest.TestCase):
         self.assertEqual(rerun.exception.code, "journal_pair_complete")
         self.assertEqual(pair_path.read_bytes(), retained_bytes)
 
+    def test_journal_rederives_eligibility_and_refuses_incomplete_pair_publication(self) -> None:
+        journal_root = self.root / "semantic-state"
+        journal = real_eval.RunJournal.open(journal_root, {"identity": "semantic"})
+        attempt = journal.start_attempt("codex--later_checksum_v1", 2)
+        pair = comparison_pair()
+        pair["journal_attempt"] = attempt.number
+        pair["again_enabled"]["runs"][0]["process"]["timed_out"] = True
+        pair["again_enabled"]["runs"][0]["comparison_eligible"] = True
+        with self.assertRaises(real_eval.HarnessRefusal) as refused:
+            journal.complete_attempt(attempt, pair)
+        self.assertEqual(refused.exception.code, "comparison_run")
+        self.assertIsNone(journal.load_completed(attempt.pair_id))
+
+        valid_root = self.root / "semantic-load-state"
+        valid = real_eval.RunJournal.open(valid_root, {"identity": "semantic-load"})
+        valid_attempt = valid.start_attempt("codex--later_checksum_v1", 2)
+        valid_pair = comparison_pair()
+        valid_pair["journal_attempt"] = valid_attempt.number
+        valid.complete_attempt(valid_attempt, valid_pair)
+        pair_path = valid_root / "pairs" / "codex--later_checksum_v1.complete.json"
+        envelope = real_eval.read_bounded_json_object(pair_path)
+        envelope["pair"]["baseline"]["runs"][0]["process"]["timed_out"] = True
+        envelope["pair"]["baseline"]["runs"][0]["comparison_eligible"] = True
+        envelope["pair_sha256"] = real_eval.sha256_bytes(
+            real_eval.canonical_json_bytes(envelope["pair"])
+        )
+        pair_path.write_bytes(real_eval.canonical_json_bytes(envelope) + b"\n")
+        with self.assertRaises(real_eval.HarnessRefusal) as loaded:
+            valid.load_completed(valid_attempt.pair_id)
+        self.assertEqual(loaded.exception.code, "comparison_run")
+
     def test_run_journal_refuses_identity_changes_and_secret_material(self) -> None:
         journal_root = self.root / "identity-state"
         journal = real_eval.RunJournal.open(journal_root, {"identity": "one"})
         attempt = journal.start_attempt("claude--marker_locations_v1", 2)
         secret = b"unit-test-live-secret"
+        pair = comparison_pair()
+        pair["client"] = "claude"
+        for condition in ("baseline", "again_enabled"):
+            pair[condition]["runs"][0]["client"] = "claude"
+        pair["task_id"] = "marker_locations_v1"
+        pair["journal_attempt"] = attempt.number
+        pair["leak"] = secret.decode()
         with self.assertRaises(real_eval.HarnessRefusal) as secret_refusal:
-            journal.complete_attempt(attempt, {"leak": secret.decode()}, (secret,))
+            journal.complete_attempt(attempt, pair, (secret,))
         self.assertEqual(secret_refusal.exception.code, "credential_persistence")
         self.assertIsNone(journal.load_completed(attempt.pair_id))
 
