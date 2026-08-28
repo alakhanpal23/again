@@ -59,23 +59,23 @@ pre-alpha until these gates close:
 Current checkpoint: item 1 is closed for the built-in tools, and acquisition
 events are only candidates; exact-hit and in-flight-join statistics are
 promoted after one-use proof consumption, result loading, and repository
-revalidation. Receipt protocol/storage scaffolding exists, but item 2 remains
-open because production stdio has no transport-authenticated recipient issuer.
-No compact delivery, bytes, tokens, or time savings are claimed. A phase-two
-retrieval/compact candidate was rejected because it exposed caller-asserted
-recipient identity, allowed legacy context clearing to erase receipts, collided
-with schema version 9, and bound compact accounting to the full-result streams
-rather than the exact compact presentation.
+revalidation. Additive schema-v10 receipt/grant storage exists, but item 2
+remains open because production stdio has no transport-authenticated recipient
+issuer. No compact delivery, bytes, tokens, or time savings are claimed. The
+phase-two response-bound candidate was rejected because it failed all-target
+compilation and did not add genuine production recipient authentication.
 
-The retained release-binary harness closes the deterministic portion of item 5
-with 8/8 scenarios, four real MCP processes, 12 provider executions, three
-avoided executions (two exact hits and one delivered join), and zero false hits
-at source `f1a646b60867de1cb688869df71c0425e5f92307`. The same binary passed the
+The retained schema-v10 release-binary harness closes the deterministic portion
+of item 5 with 8/8 scenarios, four real MCP processes, 12 provider executions,
+three avoided executions (two exact hits and one joined call), and zero false
+hits at source `850e7c4398adc25ef1210ee4260e27b29aaeb753`. The same binary passed the
 isolated onboarding and quick chaos harnesses. Three explicit clean real
 repositories passed, while the overall corpus correctly remains `non_pass`
-until a local Go repository is supplied. The real-agent harness passed only its
-offline dry run against Codex 0.150.1 and Claude 2.1.220; all 16 networked/paid
-paired runs remain manual and unexecuted.
+until an eligible local Go repository is supplied. The ten-scenario alpha-trial
+recorder exists, but zero outside users and zero of the required 50 attempts
+have been recorded. The real-agent harness passed only its offline dry run
+against Codex 0.150.1 and Claude 2.1.220; all 16 networked/paid paired runs
+remain manual and unexecuted.
 
 ## Critical path
 
@@ -156,11 +156,12 @@ implemented, bounded, offline-only, and exercised by portable CI tests. It
 requires explicit absolute paths to already-local Rust, Python, Go, and
 TypeScript Git worktrees, pins the exact Again binary, copies only selected
 tracked regular files, compares native/cold/warm streams and status exactly,
-and proves mutation invalidation. Unsupported hosts or profiles are typed
-`non_pass`, not evidence. No retained run against the four real repositories
-exists yet, so this advances the validation machinery without closing item 5
-or Gate 1. The audited-profile registry, richer doctor report, outside-user
-session corpus, and published prerelease remain separate unclosed work.
+and proves mutation invalidation. A retained schema-v10 run passed Rust, Python,
+and TypeScript with zero false hits but remains `non_pass` because the bounded
+offline search found no eligible Go repository. The alpha-trial harness freezes
+the required ten scenarios and exact five-user/50-attempt gate, while correctly
+refusing local simulation as outside-user evidence. No outside attempt or
+publisher-authenticated prerelease exists, so Gate 1 remains open.
 
 Product outcome:
 
