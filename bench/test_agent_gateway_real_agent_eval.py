@@ -11,6 +11,7 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from collections.abc import Mapping
 from typing import Any
 from unittest import mock
 
@@ -84,6 +85,7 @@ def run_observation(
     mismatch: int = 0,
     observed_results: int = 0,
     environment_refusal: bool = False,
+    observed_final_response: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     eligible = outcome == "pass" and not environment_refusal
     return {
@@ -106,7 +108,9 @@ def run_observation(
             "malformed_agent_output": False,
             "oracle_passed": outcome == "pass",
             "client_reported_error": environment_refusal,
-            "observed_final_response": dict(real_eval.TASKS[1].expected),
+            "observed_final_response": dict(
+                observed_final_response or real_eval.TASKS[1].expected
+            ),
         },
         "client_reported_tokens": {"source": "direct_client_output", "counts": {}},
     }
@@ -118,30 +122,60 @@ def gateway_delta(**updates: int) -> dict[str, int]:
     return value
 
 
-def comparison_pair(*, concurrency: int = 1) -> dict[str, Any]:
+def comparison_pair(
+    *, concurrency: int = 1, client: str = "codex", task_id: str = "later_checksum_v1"
+) -> dict[str, Any]:
+    task = next(task for task in real_eval.TASKS if task.task_id == task_id)
     baseline = [
-        run_observation(condition="baseline", replica=replica)
+        run_observation(
+            client=client,
+            condition="baseline",
+            replica=replica,
+            observed_final_response=task.expected,
+        )
         for replica in range(concurrency)
     ]
     enabled = [
-        run_observation(condition="again_enabled", replica=replica, calls=1)
+        run_observation(
+            client=client,
+            condition="again_enabled",
+            replica=replica,
+            calls=1,
+            observed_final_response=task.expected,
+        )
         for replica in range(concurrency)
     ]
     delta = gateway_delta(requested=concurrency, executed=concurrency)
     reconciliation = real_eval.classify_paired_run(baseline, enabled, delta)
     return {
-        "client": "codex",
-        "task_id": "later_checksum_v1",
+        "client": client,
+        "task_id": task_id,
         "concurrency": concurrency,
         "treatment_order": ["baseline", "again_enabled"],
         "journal_attempt": 1,
-        "baseline": {"runs": baseline, "gateway_stats_delta": gateway_delta()},
+        "baseline": {
+            "runs": baseline,
+            "gateway_stats_delta": gateway_delta(),
+            "workspace_identity": f"{client}--{task_id}--attempt-0001",
+        },
         "again_enabled": {
             "runs": enabled,
             "gateway_stats_delta": delta,
             "setup": {"observed": True},
+            "workspace_identity": f"{client}--{task_id}--attempt-0001",
         },
         "reconciliation": reconciliation,
+        "fresh_isolated_state": True,
+        "workspace_identity": f"{client}--{task_id}--attempt-0001",
+        "fixture_digest_sha256": "fixture-digest",
+        "binding": {
+            "requested_model": "model-v1",
+            "settings_id": "settings-v1",
+            "prompt_sha256": real_eval.sha256_bytes(task.prompt.encode("utf-8")),
+            "oracle_sha256": real_eval.sha256_bytes(
+                real_eval.canonical_json_bytes(dict(task.expected))
+            ),
+        },
     }
 
 
@@ -317,6 +351,59 @@ os._exit(0)
                 [run_observation(calls=1)], enabled, gateway_delta(requested=3)
             )
         self.assertEqual(contaminated.exception.code, "baseline_contaminated")
+
+    def test_matrix_reconciliation_rejects_duplicates_bindings_workspaces_and_counters(self) -> None:
+        pairs = []
+        models = {"claude": "model-v1", "codex": "model-v1"}
+        settings = {"claude": "settings-v1", "codex": "settings-v1"}
+        for client_index, client in enumerate(("claude", "codex")):
+            for task_index, task in enumerate(real_eval.TASKS):
+                pair = comparison_pair(
+                    client=client, task_id=task.task_id, concurrency=task.concurrency
+                )
+                pair["treatment_order"] = list(real_eval.treatment_order(client_index, task_index))
+                pairs.append(pair)
+        reconciled = real_eval.validate_evaluation_matrix(
+            pairs, expected_models=models, expected_settings_ids=settings
+        )
+        self.assertTrue(reconciled["complete"])
+        self.assertEqual(reconciled["workspace_count"], 6)
+
+        with self.assertRaises(real_eval.HarnessRefusal) as duplicate:
+            real_eval.validate_evaluation_matrix(
+                [*pairs, pairs[0]], expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(duplicate.exception.code, "comparison_matrix")
+
+        changed_binding = [dict(pair) for pair in pairs]
+        changed_binding[0] = {**changed_binding[0], "binding": {**changed_binding[0]["binding"], "requested_model": "other-model"}}
+        with self.assertRaises(real_eval.HarnessRefusal) as binding:
+            real_eval.validate_evaluation_matrix(
+                changed_binding, expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(binding.exception.code, "binding_mismatch")
+
+        reused_workspace = [dict(pair) for pair in pairs]
+        reused_workspace[1] = {**reused_workspace[1], "workspace_identity": pairs[0]["workspace_identity"]}
+        with self.assertRaises(real_eval.HarnessRefusal) as workspace:
+            real_eval.validate_evaluation_matrix(
+                reused_workspace, expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(workspace.exception.code, "workspace_reused")
+
+        impossible = [dict(pair) for pair in pairs]
+        impossible[0] = {
+            **impossible[0],
+            "again_enabled": {
+                **impossible[0]["again_enabled"],
+                "gateway_stats_delta": gateway_delta(requested=1, executed=1, exact_hits=1, inflight_joins=1),
+            },
+        }
+        with self.assertRaises(real_eval.HarnessRefusal) as counters:
+            real_eval.validate_evaluation_matrix(
+                impossible, expected_models=models, expected_settings_ids=settings
+            )
+        self.assertEqual(counters.exception.code, "counter_impossible")
 
     def test_matrix_is_exactly_16_runs_with_balanced_alternation(self) -> None:
         self.assertEqual(real_eval.planned_agent_runs(2), 16)

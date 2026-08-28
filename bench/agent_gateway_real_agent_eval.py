@@ -1700,6 +1700,123 @@ def validate_comparison_pair(
     return rederived
 
 
+def validate_evaluation_matrix(
+    pairs: Sequence[Mapping[str, Any]],
+    *,
+    expected_models: Mapping[str, str],
+    expected_settings_ids: Mapping[str, str],
+    expected_prompt_sha256: Mapping[str, str] | None = None,
+    expected_fixture_digest_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Reconcile the complete six-pair design without trusting stored summaries."""
+
+    expected_prompt_sha256 = expected_prompt_sha256 or {
+        task.task_id: sha256_bytes(task.prompt.encode("utf-8")) for task in TASKS
+    }
+    expected_pairs = {
+        f"{client}--{task.task_id}": (client, task)
+        for client in ("claude", "codex")
+        for task in TASKS
+    }
+    if len(pairs) != len(expected_pairs):
+        observed_ids = {
+            f"{pair.get('client')}--{pair.get('task_id')}" for pair in pairs
+        }
+        if set(expected_pairs) - observed_ids:
+            raise HarnessRefusal("missing_baseline_pair", "matrix is missing a required pair")
+        raise HarnessRefusal("comparison_matrix", "matrix does not contain exactly one pair per task/client")
+    seen: set[str] = set()
+    workspace_ids: set[str] = set()
+    for pair in pairs:
+        client = pair.get("client")
+        task_id = pair.get("task_id")
+        pair_id = f"{client}--{task_id}"
+        if pair_id in seen:
+            raise HarnessRefusal("duplicate_run", "matrix contains a duplicate pair")
+        seen.add(pair_id)
+        expected = expected_pairs.get(pair_id)
+        if expected is None:
+            raise HarnessRefusal("comparison_matrix", "matrix contains an unexpected pair")
+        _client, task = expected
+        for condition in ("baseline", "again_enabled"):
+            condition_value = pair.get(condition)
+            if isinstance(condition_value, Mapping) and isinstance(
+                condition_value.get("gateway_stats_delta"), Mapping
+            ):
+                early_delta = normalize_stats(dict(condition_value["gateway_stats_delta"]))
+                if (
+                    early_delta["executed"]
+                    + early_delta["exact_hits"]
+                    + early_delta["inflight_joins"]
+                    > early_delta["requested"]
+                ):
+                    raise HarnessRefusal(
+                        "counter_impossible", "gateway dispositions exceed requests"
+                    )
+        validate_comparison_pair(pair, pair_id)
+        expected_order = list(
+            treatment_order(
+                0 if client == "claude" else 1,
+                next(index for index, item in enumerate(TASKS) if item.task_id == task_id),
+            )
+        )
+        if pair.get("treatment_order") != expected_order:
+            raise HarnessRefusal("treatment_contamination", "pair treatment order is not deterministic")
+        if pair.get("fresh_isolated_state") is not True:
+            raise HarnessRefusal("workspace_reused", "pair does not prove fresh isolated state")
+        if expected_fixture_digest_sha256 is not None and pair.get(
+            "fixture_digest_sha256"
+        ) != expected_fixture_digest_sha256:
+            raise HarnessRefusal("binding_mismatch", "pair repository fixture binding differs")
+        workspace_id = pair.get("workspace_identity")
+        if not isinstance(workspace_id, str) or not workspace_id:
+            raise HarnessRefusal("workspace_reused", "pair lacks a workspace identity")
+        if workspace_id in workspace_ids:
+            raise HarnessRefusal("workspace_reused", "workspace identity was reused across pairs")
+        workspace_ids.add(workspace_id)
+        binding = pair.get("binding")
+        if not isinstance(binding, Mapping):
+            raise HarnessRefusal("binding_mismatch", "pair lacks task/model/settings binding")
+        if (
+            binding.get("requested_model") != expected_models.get(str(client))
+            or binding.get("settings_id") != expected_settings_ids.get(str(client))
+            or binding.get("prompt_sha256") != expected_prompt_sha256.get(str(task_id))
+            or binding.get("oracle_sha256")
+            != sha256_bytes(canonical_json_bytes(dict(task.expected)))
+        ):
+            raise HarnessRefusal("binding_mismatch", "pair task/model/settings binding differs")
+        for condition in ("baseline", "again_enabled"):
+            condition_record = pair[condition]
+            delta = normalize_stats(dict(condition_record["gateway_stats_delta"]))
+            if delta["executed"] + delta["exact_hits"] + delta["inflight_joins"] > delta["requested"]:
+                raise HarnessRefusal("counter_impossible", "gateway dispositions exceed requests")
+            if condition == "baseline" and any(delta.values()):
+                raise HarnessRefusal("treatment_contamination", "baseline gateway counters are nonzero")
+            condition_workspace = condition_record.get("workspace_identity")
+            if condition_workspace != workspace_id:
+                raise HarnessRefusal("workspace_reused", "condition workspace binding differs from pair")
+            for run in condition_record["runs"]:
+                reported_model = run.get("client_reported_model")
+                if reported_model is not None and reported_model != binding.get("requested_model"):
+                    raise HarnessRefusal("binding_mismatch", "client-reported model differs")
+                tokens = run.get("client_reported_tokens")
+                if not isinstance(tokens, Mapping) or tokens.get("source") != "direct_client_output":
+                    raise HarnessRefusal("token_accounting", "estimated output tokens cannot be actual tokens")
+                if any(
+                    not isinstance(value, int) or isinstance(value, bool) or value < 0
+                    for value in dict(tokens.get("counts", {})).values()
+                ):
+                    raise HarnessRefusal("token_accounting", "client token fields are invalid")
+    if seen != set(expected_pairs):
+        raise HarnessRefusal("missing_baseline_pair", "matrix is missing a required pair")
+    return {
+        "complete": True,
+        "pair_count": len(pairs),
+        "workspace_count": len(workspace_ids),
+        "quality_or_speed_claims_permitted": True,
+    }
+
+
 def _ensure_again_unavailable(path_directories: Sequence[pathlib.Path]) -> None:
     for directory in path_directories:
         candidate = directory / "again"
@@ -1919,6 +2036,7 @@ def execute_live_pair(
     attempt_number: int,
     template: CommandTemplate,
     model: str,
+    settings_id: str,
     credential_name: str,
     credential_value: str,
     again_binary: pathlib.Path,
@@ -2044,6 +2162,14 @@ def execute_live_pair(
         "treatment_order": list(order),
         "journal_attempt": attempt_number,
         "fresh_isolated_state": True,
+        "workspace_identity": f"{client}--{task.task_id}--attempt-{attempt_number:04d}",
+        "fixture_digest_sha256": fixture_digest_sha256,
+        "binding": {
+            "requested_model": model,
+            "settings_id": settings_id,
+            "prompt_sha256": sha256_bytes(task.prompt.encode("utf-8")),
+            "oracle_sha256": sha256_bytes(canonical_json_bytes(dict(task.expected))),
+        },
         "fixture_git_sha": pair_fixture["git_sha"],
         "initial_repository_diff": initial_repository_diff,
         "initial_repository_git_identity": initial_git_identity,
@@ -2315,6 +2441,7 @@ def evaluate(
                             attempt_number=attempt.number,
                             template=templates[client],
                             model=models[client],
+                            settings_id=settings_ids[client],
                             credential_name=credential_names[client],
                             credential_value=credentials[client],
                             again_binary=again_binary,
@@ -2337,6 +2464,16 @@ def evaluate(
                     pairs.append(pair)
                     all_runs.extend(pair_runs)
 
+        matrix_reconciliation = (
+            validate_evaluation_matrix(
+                pairs,
+                expected_models=models,
+                expected_settings_ids=settings_ids,
+                expected_fixture_digest_sha256=fixture["fixture_digest_sha256"],
+            )
+            if mode == "live"
+            else {"complete": False, "pair_count": 0, "workspace_count": 0}
+        )
         eligible_pairs = [pair for pair in pairs if _pair_is_eligible(pair)]
         if len(eligible_pairs) != len(pairs):
             raise HarnessRefusal("comparison_ineligible", "ineligible pair reached aggregation")
@@ -2412,6 +2549,7 @@ def evaluate(
                 "comparison_eligible_agent_runs": len(eligible_runs),
                 "executed_agent_runs_this_invocation": invocation_agent_runs,
                 "resumed_completed_pairs": resumed_completed_pairs,
+                "matrix_reconciliation": matrix_reconciliation,
                 "tasks": [
                     {
                         "task_id": task.task_id,
