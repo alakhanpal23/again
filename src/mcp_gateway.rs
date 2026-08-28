@@ -3313,6 +3313,14 @@ mod delivery_receipt_tests {
         type BindingMutationCaseV1 = (fn(&mut Value), DeliveryAuthorityRefusalV1);
         let cases: Vec<BindingMutationCaseV1> = vec![
             (
+                |value| value["schema_version"] = json!(2),
+                DeliveryAuthorityRefusalV1::MalformedAcknowledgement,
+            ),
+            (
+                |value| value["challenge_id"] = json!("dc_unknown"),
+                DeliveryAuthorityRefusalV1::Retired,
+            ),
+            (
                 |value| value["acknowledgement_token"] = json!("f".repeat(64)),
                 DeliveryAuthorityRefusalV1::MalformedAcknowledgement,
             ),
@@ -3342,6 +3350,22 @@ mod delivery_receipt_tests {
             ),
             (
                 |value| value["binding"]["streams"]["stdout_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongStreams,
+            ),
+            (
+                |value| value["binding"]["streams"]["exact_status"] = json!(9),
+                DeliveryAuthorityRefusalV1::WrongStreams,
+            ),
+            (
+                |value| value["binding"]["streams"]["stdout_bytes"] = json!(18),
+                DeliveryAuthorityRefusalV1::WrongStreams,
+            ),
+            (
+                |value| value["binding"]["streams"]["stderr_digest"] = json!("f".repeat(64)),
+                DeliveryAuthorityRefusalV1::WrongStreams,
+            ),
+            (
+                |value| value["binding"]["streams"]["stderr_bytes"] = json!(4),
                 DeliveryAuthorityRefusalV1::WrongStreams,
             ),
             (

@@ -17,7 +17,7 @@ use crate::agent_gateway::protocol::{
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 use crate::mcp_gateway::ConfirmedDeliveryV1;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -681,7 +681,7 @@ impl Store {
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
         };
         store.migrate()?;
-        store.verify_gateway_schema_v8()?;
+        store.verify_gateway_schema_current()?;
         store.maybe_cleanup()?;
         set_private_file(&database)?;
         set_private_file(&store.root.join("again.sqlite-wal"))?;
@@ -1029,11 +1029,26 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 9 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                UPDATE gateway_events
+                SET estimated_tokens_avoided = 0
+                WHERE event_type = 'compact_delivery';
+                UPDATE gateway_deliveries
+                SET estimated_tokens_avoided = 0
+                WHERE presentation = 'compact';
+                PRAGMA user_version = 9;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
-    fn verify_gateway_schema_v8(&self) -> Result<()> {
-        verify_gateway_schema_v8(&self.conn)
+    fn verify_gateway_schema_current(&self) -> Result<()> {
+        verify_gateway_schema_current(&self.conn)
     }
 
     pub fn create_call(
@@ -2529,9 +2544,13 @@ impl Store {
                 "exact_hit" => stats.exact_hits += count,
                 "coverage_hit" => stats.coverage_hits += count,
                 "inflight_join" => stats.inflight_joins += count,
+                // Legacy compact-delivery events predate recipient-bound
+                // acknowledgements. They remain audit history, but neither
+                // their count nor their estimated savings is delivery proof.
+                // A future compact path must derive these counters from an
+                // authenticated receipt rather than from a producer event.
                 "compact_delivery" => {
-                    stats.compact_deliveries += count;
-                    stats.estimated_tokens_avoided += tokens;
+                    let _ = (count, tokens);
                 }
                 "stale_completion" | "divergent_result" | "binding_quarantined" => {
                     stats.stale_or_divergent_quarantines += count;
@@ -3365,7 +3384,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
     (if integer { "INTEGER" } else { "TEXT" }, !nullable)
 }
 
-fn verify_gateway_schema_v8(connection: &Connection) -> Result<()> {
+fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != SCHEMA_VERSION {
         bail!("Again gateway schema verification requires version {SCHEMA_VERSION}, got {version}");
@@ -4776,7 +4795,7 @@ mod tests {
     }
 
     #[test]
-    fn version_eight_verifier_requires_every_delivery_receipt_constraint() {
+    fn current_schema_verifier_requires_every_delivery_receipt_constraint() {
         let temp = TempDir::new().unwrap();
         set_private_dir(temp.path()).unwrap();
         let store = Store::open(temp.path()).unwrap();
@@ -4805,7 +4824,43 @@ mod tests {
             .conn
             .execute_batch("PRAGMA writable_schema=OFF;")
             .unwrap();
-        assert!(verify_gateway_schema_v8(&store.conn).is_err());
+        assert!(verify_gateway_schema_current(&store.conn).is_err());
+    }
+
+    #[test]
+    fn version_eight_compact_savings_are_neutralized_without_a_receipt() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .conn
+                .execute(
+                    "INSERT INTO gateway_events (event_type, estimated_tokens_avoided, created_ms) VALUES ('compact_delivery', 777, 1)",
+                    [],
+                )
+                .unwrap();
+            store.conn.pragma_update(None, "user_version", 8).unwrap();
+        }
+
+        let reopened = Store::open(temp.path()).unwrap();
+        let version: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let legacy_tokens: i64 = reopened
+            .conn
+            .query_row(
+                "SELECT estimated_tokens_avoided FROM gateway_events WHERE event_type = 'compact_delivery'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_tokens, 0);
+        let stats = reopened.gateway_stats().unwrap();
+        assert_eq!(stats.compact_deliveries, 0);
+        assert_eq!(stats.estimated_tokens_avoided, 0);
     }
 
     #[test]
