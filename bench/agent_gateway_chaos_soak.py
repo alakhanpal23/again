@@ -335,16 +335,22 @@ class Session:
         pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
         pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700)
         state.mkdir(mode=0o700, exist_ok=True)
-        self.process = subprocess.Popen(
-            self.argv,
-            cwd=repo,
-            env=environment,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0,
-            start_new_session=os.name == "posix",
-        )
+        try:
+            self.process = subprocess.Popen(
+                self.argv,
+                cwd=repo,
+                env=environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=os.name == "posix",
+            )
+        except OSError as error:
+            raise HarnessRefusal(
+                "host_resource_exhausted",
+                "host resources prevented MCP process creation",
+            ) from error
         if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
             terminate_owned_process_group(self.process.pid)
             raise HarnessRefusal("process_pipe", "MCP stdio pipes were not created")
@@ -376,9 +382,16 @@ class Session:
 
     def _read_line(self, timeout: float) -> bytes:
         deadline = time.monotonic() + timeout
-        selector = selectors.DefaultSelector()
-        selector.register(self.stdout, selectors.EVENT_READ)
+        selector: selectors.BaseSelector | None = None
         try:
+            try:
+                selector = selectors.DefaultSelector()
+                selector.register(self.stdout, selectors.EVENT_READ)
+            except OSError as error:
+                raise HarnessRefusal(
+                    "host_resource_exhausted",
+                    "host resources prevented bounded MCP response polling",
+                ) from error
             while True:
                 newline = self.buffer.find(b"\n")
                 if newline >= 0:
@@ -399,7 +412,8 @@ class Session:
                     raise HarnessRefusal(code, "MCP response stream ended unexpectedly")
                 self.buffer.extend(block)
         finally:
-            selector.close()
+            if selector is not None:
+                selector.close()
 
     def request(
         self,
@@ -423,8 +437,11 @@ class Session:
 
     def notify(self, method: str) -> None:
         with self.lock:
-            self.stdin.write(canonical_json({"jsonrpc": "2.0", "method": method}))
-            self.stdin.flush()
+            try:
+                self.stdin.write(canonical_json({"jsonrpc": "2.0", "method": method}))
+                self.stdin.flush()
+            except (BrokenPipeError, OSError) as error:
+                raise HarnessRefusal("server_pipe", "MCP notification pipe closed") from error
 
     def handshake(self) -> None:
         response = self.request(

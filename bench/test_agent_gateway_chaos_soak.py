@@ -143,6 +143,19 @@ class ChaosSoakHarnessTests(unittest.TestCase):
             os.close(write_fd)
             read.close()
 
+    def test_selector_resource_exhaustion_is_typed(self) -> None:
+        fake = object.__new__(harness.Session)
+        fake.stdout = object()
+        fake.buffer = bytearray()
+        with mock.patch.object(
+            harness.selectors,
+            "DefaultSelector",
+            side_effect=OSError(24, "too many open files"),
+        ):
+            with self.assertRaises(harness.HarnessRefusal) as refused:
+                fake._read_line(1.0)
+        self.assertEqual(refused.exception.code, "host_resource_exhausted")
+
     def test_false_hits_are_derived_from_result_ids_outputs_and_events(self) -> None:
         report = scenario_report()
         count, cases = harness.derive_false_hits(report)
