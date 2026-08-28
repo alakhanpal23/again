@@ -9,11 +9,18 @@ use std::cell::Cell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::io::{self, BufRead, Write};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use crate::agent_gateway::protocol::{
     DeliveryAcknowledgementV1, DeliveryAuthorityRefusalV1, DeliveryBindingV1, DeliveryChallengeV1,
@@ -32,6 +39,13 @@ const STDIO_MAX_INFLIGHT_V1: usize = 16;
 const STDIO_RESPONSE_QUEUE_V1: usize = STDIO_MAX_INFLIGHT_V1 * 2;
 const MAX_OUTSTANDING_DELIVERY_CHALLENGES_V1: usize = 128;
 const MAX_RETIRED_DELIVERY_CHALLENGES_V1: usize = 256;
+const MAX_UPSTREAM_ARGUMENTS_V1: usize = 64;
+const MAX_UPSTREAM_ENVIRONMENT_V1: usize = 64;
+const MAX_UPSTREAM_CONFIG_STRING_BYTES_V1: usize = 4_096;
+const MAX_UPSTREAM_EXECUTABLE_BYTES_V1: u64 = 256 * 1024 * 1024;
+const MAX_UPSTREAM_NOTIFICATIONS_V1: usize = 1_024;
+const MAX_UPSTREAM_TOOL_PAGES_V1: usize = 32;
+const UPSTREAM_RESPONSE_QUEUE_V1: usize = 32;
 
 struct StdioActivationV1 {
     sender: SyncSender<()>,
@@ -737,6 +751,16 @@ pub struct ProviderCancellation {
 pub trait ToolDiscovery: Send + Sync {
     fn descriptor(&self) -> ProviderDescriptor;
     fn discover_tools(&self) -> Result<Vec<ProviderTool>, ProviderError>;
+
+    /// Discovery credentials are borrowed only for the discovery invocation.
+    /// Existing in-process providers remain credential-free by default.
+    fn discover_tools_with_secrets(
+        &self,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Vec<ProviderTool>, ProviderError> {
+        let _ = secrets;
+        self.discover_tools()
+    }
 }
 
 pub trait ToolExecution: Send + Sync {
@@ -805,6 +829,923 @@ impl ProviderRegistration {
             annotations_trusted: true,
         }
     }
+}
+
+/// Validated configuration for one real newline-delimited stdio MCP server.
+/// Secret values are intentionally absent; only logical secret-to-environment
+/// bindings are retained.
+pub struct StdioMcpProviderConfigV1 {
+    descriptor: ProviderDescriptor,
+    program: PathBuf,
+    arguments: Vec<String>,
+    current_dir: PathBuf,
+    environment: BTreeMap<String, String>,
+    secret_environment: BTreeMap<String, String>,
+    tool_effects: BTreeMap<String, EffectClass>,
+    limits: GatewayLimits,
+    request_timeout: Duration,
+}
+
+impl StdioMcpProviderConfigV1 {
+    pub fn new(
+        descriptor: ProviderDescriptor,
+        program: impl Into<PathBuf>,
+        current_dir: impl Into<PathBuf>,
+        limits: GatewayLimits,
+        request_timeout: Duration,
+    ) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        if request_timeout.is_zero() || request_timeout > Duration::from_secs(300) {
+            return Err(StdioMcpProviderBuildErrorV1::InvalidTimeout);
+        }
+        let program = validate_upstream_program_v1(&program.into())?;
+        let current_dir = validate_upstream_directory_v1(&current_dir.into())?;
+        Ok(Self {
+            descriptor,
+            program,
+            arguments: Vec::new(),
+            current_dir,
+            environment: BTreeMap::new(),
+            secret_environment: BTreeMap::new(),
+            tool_effects: BTreeMap::new(),
+            limits,
+            request_timeout,
+        })
+    }
+
+    pub fn with_argument(
+        mut self,
+        argument: impl Into<String>,
+    ) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        let argument = argument.into();
+        validate_upstream_config_string_v1(&argument)?;
+        if self.arguments.len() >= MAX_UPSTREAM_ARGUMENTS_V1 {
+            return Err(StdioMcpProviderBuildErrorV1::ConfigurationLimit);
+        }
+        self.arguments.push(argument);
+        Ok(self)
+    }
+
+    pub fn with_environment(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        let name = name.into();
+        let value = value.into();
+        validate_upstream_environment_name_v1(&name)?;
+        validate_upstream_config_string_v1(&value)?;
+        if self
+            .secret_environment
+            .values()
+            .any(|environment_name| environment_name == &name)
+        {
+            return Err(StdioMcpProviderBuildErrorV1::DuplicateConfiguration);
+        }
+        if self.environment.len() >= MAX_UPSTREAM_ENVIRONMENT_V1
+            && !self.environment.contains_key(&name)
+        {
+            return Err(StdioMcpProviderBuildErrorV1::ConfigurationLimit);
+        }
+        if self.environment.insert(name, value).is_some() {
+            return Err(StdioMcpProviderBuildErrorV1::DuplicateConfiguration);
+        }
+        Ok(self)
+    }
+
+    pub fn with_secret_environment(
+        mut self,
+        secret_name: impl Into<String>,
+        environment_name: impl Into<String>,
+    ) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        let secret_name = secret_name.into();
+        let environment_name = environment_name.into();
+        validate_boundary_identifier("secret", &secret_name)
+            .map_err(|_| StdioMcpProviderBuildErrorV1::InvalidConfiguration)?;
+        validate_upstream_environment_name_v1(&environment_name)?;
+        if self.environment.contains_key(&environment_name)
+            || self
+                .secret_environment
+                .values()
+                .any(|existing| existing == &environment_name)
+        {
+            return Err(StdioMcpProviderBuildErrorV1::DuplicateConfiguration);
+        }
+        if self.secret_environment.len() >= MAX_UPSTREAM_ENVIRONMENT_V1
+            && !self.secret_environment.contains_key(&secret_name)
+        {
+            return Err(StdioMcpProviderBuildErrorV1::ConfigurationLimit);
+        }
+        if self
+            .secret_environment
+            .insert(secret_name, environment_name)
+            .is_some()
+        {
+            return Err(StdioMcpProviderBuildErrorV1::DuplicateConfiguration);
+        }
+        Ok(self)
+    }
+
+    pub fn with_tool_effect(
+        mut self,
+        tool_name: impl Into<String>,
+        effect: EffectClass,
+    ) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        let tool_name = tool_name.into();
+        validate_upstream_tool_name_v1(&tool_name)?;
+        if self.tool_effects.len() >= self.limits.max_tools
+            && !self.tool_effects.contains_key(&tool_name)
+        {
+            return Err(StdioMcpProviderBuildErrorV1::ConfigurationLimit);
+        }
+        if self.tool_effects.insert(tool_name, effect).is_some() {
+            return Err(StdioMcpProviderBuildErrorV1::DuplicateConfiguration);
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+pub enum StdioMcpProviderBuildErrorV1 {
+    #[error("invalid_program")]
+    InvalidProgram,
+    #[error("invalid_current_directory")]
+    InvalidCurrentDirectory,
+    #[error("invalid_configuration")]
+    InvalidConfiguration,
+    #[error("duplicate_configuration")]
+    DuplicateConfiguration,
+    #[error("configuration_limit")]
+    ConfigurationLimit,
+    #[error("invalid_timeout")]
+    InvalidTimeout,
+    #[error("unstable_program")]
+    UnstableProgram,
+}
+
+/// A real upstream MCP provider. Each discovery or execution receives a fresh
+/// child process, so cancellation, malformed output, timeout and completion all
+/// have an unambiguous kill/reap owner.
+pub struct StdioMcpProviderV1 {
+    descriptor: ProviderDescriptor,
+    program: PathBuf,
+    arguments: Vec<String>,
+    current_dir: PathBuf,
+    environment: BTreeMap<String, String>,
+    secret_environment: BTreeMap<String, String>,
+    tool_effects: BTreeMap<String, EffectClass>,
+    limits: GatewayLimits,
+    request_timeout: Duration,
+    freshness_revision: String,
+    program_digest: [u8; 32],
+    attempts: Mutex<BTreeMap<PhysicalAttemptId, StdioAttemptStateV1>>,
+}
+
+enum StdioAttemptStateV1 {
+    Starting,
+    Active(Arc<StdioChildControlV1>),
+    Cancelled,
+}
+
+impl StdioMcpProviderV1 {
+    pub fn new(mut config: StdioMcpProviderConfigV1) -> Result<Self, StdioMcpProviderBuildErrorV1> {
+        let (configuration_digest, program_digest) = upstream_configuration_digest_v1(&config)?;
+        config.descriptor.endpoint_identity = format!("stdio-v1:{configuration_digest}");
+        Ok(Self {
+            descriptor: config.descriptor,
+            program: config.program,
+            arguments: config.arguments,
+            current_dir: config.current_dir,
+            environment: config.environment,
+            secret_environment: config.secret_environment,
+            tool_effects: config.tool_effects,
+            limits: config.limits,
+            request_timeout: config.request_timeout,
+            freshness_revision: configuration_digest,
+            program_digest,
+            attempts: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    fn start_session_v1(
+        &self,
+        secrets: EphemeralSecrets<'_>,
+        require_secrets: bool,
+    ) -> Result<StdioUpstreamSessionV1, ProviderError> {
+        if hash_upstream_program_v1(&self.program)
+            .map_err(|_| upstream_transport_error_v1("upstream executable changed"))?
+            != self.program_digest
+        {
+            return Err(upstream_transport_error_v1("upstream executable changed"));
+        }
+        let current_dir_metadata = fs::symlink_metadata(&self.current_dir)
+            .map_err(|_| upstream_transport_error_v1("upstream directory changed"))?;
+        if current_dir_metadata.file_type().is_symlink() || !current_dir_metadata.is_dir() {
+            return Err(upstream_transport_error_v1("upstream directory changed"));
+        }
+        let mut command = Command::new(&self.program);
+        command
+            .args(&self.arguments)
+            .current_dir(&self.current_dir)
+            .env_clear()
+            .envs(&self.environment)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        for (secret_name, environment_name) in &self.secret_environment {
+            let Some(value) = secrets.get(secret_name) else {
+                if require_secrets {
+                    return Err(upstream_transport_error_v1("missing ephemeral credential"));
+                }
+                continue;
+            };
+            let value = std::str::from_utf8(value)
+                .map_err(|_| upstream_transport_error_v1("invalid ephemeral credential"))?;
+            command.env(environment_name, value);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|_| upstream_transport_error_v1("upstream spawn failed"))?;
+        let Some(stdin) = child.stdin.take() else {
+            kill_and_reap_child_v1(&mut child);
+            return Err(upstream_transport_error_v1("upstream stdin unavailable"));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            drop(stdin);
+            kill_and_reap_child_v1(&mut child);
+            return Err(upstream_transport_error_v1("upstream stdout unavailable"));
+        };
+        let control = Arc::new(StdioChildControlV1 {
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(Some(stdin)),
+            terminated: AtomicBool::new(false),
+            cancelled: AtomicBool::new(false),
+        });
+        let (sender, receiver) = mpsc::sync_channel(UPSTREAM_RESPONSE_QUEUE_V1);
+        let frame_limit = self.limits.max_message_bytes;
+        let reader = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let frame = match read_bounded_frame(&mut stdout, frame_limit) {
+                    Ok(Some(Ok(frame))) => UpstreamFrameV1::Frame(frame),
+                    Ok(Some(Err(_))) => UpstreamFrameV1::Limit,
+                    Ok(None) => UpstreamFrameV1::Eof,
+                    Err(_) => UpstreamFrameV1::Io,
+                };
+                let terminal = !matches!(frame, UpstreamFrameV1::Frame(_));
+                if sender.try_send(frame).is_err() || terminal {
+                    break;
+                }
+            }
+        });
+        Ok(StdioUpstreamSessionV1 {
+            control,
+            receiver,
+            reader: Some(reader),
+            timeout: self.request_timeout,
+            limits: self.limits,
+            next_request_id: 1,
+        })
+    }
+
+    fn initialize_session_v1(
+        &self,
+        session: &mut StdioUpstreamSessionV1,
+    ) -> Result<(), ProviderError> {
+        let result = session.request_v1(
+            "initialize",
+            Some(json!({
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": GATEWAY_NAME, "version": GATEWAY_VERSION }
+            })),
+        )?;
+        if result.get("protocolVersion").and_then(Value::as_str) != Some(MCP_PROTOCOL_VERSION) {
+            return Err(upstream_transport_error_v1(
+                "upstream protocol version mismatch",
+            ));
+        }
+        session.notify_v1("notifications/initialized", None)
+    }
+
+    fn discover_tools_v1(
+        &self,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Vec<ProviderTool>, ProviderError> {
+        let mut session = self.start_session_v1(secrets, false)?;
+        self.initialize_session_v1(&mut session)?;
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        for _ in 0..MAX_UPSTREAM_TOOL_PAGES_V1 {
+            let params = cursor.as_ref().map(|cursor| json!({ "cursor": cursor }));
+            let result = session.request_v1("tools/list", params)?;
+            let (mut page, next_cursor) = parse_upstream_tools_page_v1(result, self.limits)?;
+            if tools.len().saturating_add(page.len()) > self.limits.max_tools {
+                return Err(upstream_transport_error_v1(
+                    "upstream tool catalog exceeded limit",
+                ));
+            }
+            tools.append(&mut page);
+            match next_cursor {
+                Some(next) => cursor = Some(next),
+                None => return Ok(tools),
+            }
+        }
+        Err(upstream_transport_error_v1(
+            "upstream pagination exceeded limit",
+        ))
+    }
+}
+
+impl ToolDiscovery for StdioMcpProviderV1 {
+    fn descriptor(&self) -> ProviderDescriptor {
+        self.descriptor.clone()
+    }
+
+    fn discover_tools(&self) -> Result<Vec<ProviderTool>, ProviderError> {
+        self.discover_tools_v1(EphemeralSecrets::empty())
+    }
+
+    fn discover_tools_with_secrets(
+        &self,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Vec<ProviderTool>, ProviderError> {
+        self.discover_tools_v1(secrets)
+    }
+}
+
+impl ToolExecution for StdioMcpProviderV1 {
+    fn execute(
+        &self,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if attempts
+                .insert(call.physical_attempt_id, StdioAttemptStateV1::Starting)
+                .is_some()
+            {
+                return Err(upstream_transport_error_v1(
+                    "duplicate upstream attempt identity",
+                ));
+            }
+        }
+        let mut session = match self.start_session_v1(secrets, true) {
+            Ok(session) => session,
+            Err(error) => {
+                self.attempts
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .remove(&call.physical_attempt_id);
+                return Err(error);
+            }
+        };
+        let was_cancelled = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match attempts.get(&call.physical_attempt_id) {
+                Some(StdioAttemptStateV1::Starting) => {
+                    attempts.insert(
+                        call.physical_attempt_id,
+                        StdioAttemptStateV1::Active(Arc::clone(&session.control)),
+                    );
+                    false
+                }
+                Some(StdioAttemptStateV1::Cancelled) => {
+                    attempts.remove(&call.physical_attempt_id);
+                    true
+                }
+                Some(StdioAttemptStateV1::Active(_)) | None => {
+                    attempts.remove(&call.physical_attempt_id);
+                    return Err(upstream_transport_error_v1(
+                        "invalid upstream attempt state",
+                    ));
+                }
+            }
+        };
+        if was_cancelled {
+            session.control.cancel_v1();
+            return Err(ProviderError(McpError::typed(
+                McpErrorCode::RequestCancelled,
+                "upstream request cancelled",
+            )));
+        }
+        let outcome = (|| {
+            self.initialize_session_v1(&mut session)?;
+            session.request_v1(
+                "tools/call",
+                Some(json!({
+                    "name": call.upstream_tool_name,
+                    "arguments": call.arguments
+                })),
+            )
+        })();
+        self.attempts
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(&call.physical_attempt_id);
+        outcome
+    }
+}
+
+impl ToolCancellation for StdioMcpProviderV1 {
+    fn cancel(&self, cancellation: ProviderCancellation) -> Result<(), ProviderError> {
+        let control = {
+            let mut attempts = self
+                .attempts
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match attempts.get(&cancellation.physical_attempt_id) {
+                Some(StdioAttemptStateV1::Starting) => {
+                    attempts.insert(
+                        cancellation.physical_attempt_id,
+                        StdioAttemptStateV1::Cancelled,
+                    );
+                    None
+                }
+                Some(StdioAttemptStateV1::Active(control)) => Some(Arc::clone(control)),
+                Some(StdioAttemptStateV1::Cancelled) | None => None,
+            }
+        };
+        if let Some(control) = control {
+            control.cancel_v1();
+        }
+        Ok(())
+    }
+}
+
+impl FreshnessMetadata for StdioMcpProviderV1 {
+    fn freshness(&self) -> Freshness {
+        Freshness {
+            revision: self.freshness_revision.clone(),
+            observed_at_unix_ms: None,
+        }
+    }
+}
+
+impl SideEffectClassification for StdioMcpProviderV1 {
+    fn classify_effect(&self, upstream_tool_name: &str) -> EffectClass {
+        self.tool_effects
+            .get(upstream_tool_name)
+            .copied()
+            .unwrap_or(EffectClass::Unknown)
+    }
+}
+
+impl StructuredResultCapture for StdioMcpProviderV1 {
+    fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
+        Ok(CapturedToolResult::exact(result))
+    }
+}
+
+enum UpstreamFrameV1 {
+    Frame(Vec<u8>),
+    Limit,
+    Eof,
+    Io,
+}
+
+struct StdioChildControlV1 {
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<Option<ChildStdin>>,
+    terminated: AtomicBool,
+    cancelled: AtomicBool,
+}
+
+impl StdioChildControlV1 {
+    fn write_value_v1(&self, value: &Value) -> Result<(), ProviderError> {
+        let mut encoded = serde_json::to_vec(value)
+            .map_err(|_| upstream_transport_error_v1("upstream request encoding failed"))?;
+        encoded.push(b'\n');
+        let mut stdin = self
+            .stdin
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let stdin = stdin
+            .as_mut()
+            .ok_or_else(|| upstream_transport_error_v1("upstream stdin closed"))?;
+        stdin
+            .write_all(&encoded)
+            .and_then(|()| stdin.flush())
+            .map_err(|_| upstream_transport_error_v1("upstream write failed"))
+    }
+
+    fn cancel_v1(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        let _ = self.write_value_v1(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": 2, "reason": "cancelled" }
+        }));
+        self.terminate_v1();
+    }
+
+    fn terminate_v1(&self) {
+        if self.terminated.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.stdin
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .take();
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(mut child) = child.take() {
+            kill_and_reap_child_v1(&mut child);
+        }
+    }
+}
+
+fn kill_and_reap_child_v1(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        // The child was created as its own process group. Killing the group
+        // closes descendants before the direct child is reaped.
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+struct StdioUpstreamSessionV1 {
+    control: Arc<StdioChildControlV1>,
+    receiver: Receiver<UpstreamFrameV1>,
+    reader: Option<thread::JoinHandle<()>>,
+    timeout: Duration,
+    limits: GatewayLimits,
+    next_request_id: i64,
+}
+
+impl StdioUpstreamSessionV1 {
+    fn request_v1(&mut self, method: &str, params: Option<Value>) -> Result<Value, ProviderError> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| upstream_transport_error_v1("upstream request id exhausted"))?;
+        let mut request = Map::new();
+        request.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+        request.insert("id".to_owned(), Value::Number(request_id.into()));
+        request.insert("method".to_owned(), Value::String(method.to_owned()));
+        if let Some(params) = params {
+            request.insert("params".to_owned(), params);
+        }
+        let request = Value::Object(request);
+        if serde_json::to_vec(&request).map_or(true, |encoded| {
+            encoded.len() > self.limits.max_message_bytes
+        }) {
+            return Err(upstream_transport_error_v1(
+                "upstream request exceeded limit",
+            ));
+        }
+        self.control.write_value_v1(&request)?;
+        let mut notifications = 0_usize;
+        let deadline = Instant::now()
+            .checked_add(self.timeout)
+            .ok_or_else(|| upstream_transport_error_v1("invalid upstream deadline"))?;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.control.terminate_v1();
+                return Err(upstream_transport_error_v1("upstream request timed out"));
+            }
+            let frame = match self.receiver.recv_timeout(remaining) {
+                Ok(frame) => frame,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.control.terminate_v1();
+                    return Err(upstream_transport_error_v1("upstream request timed out"));
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(self.receive_failure_v1("upstream disconnected"));
+                }
+            };
+            let bytes = match frame {
+                UpstreamFrameV1::Frame(bytes) => bytes,
+                UpstreamFrameV1::Limit => {
+                    return Err(upstream_transport_error_v1(
+                        "upstream response exceeded limit",
+                    ));
+                }
+                UpstreamFrameV1::Eof => {
+                    return Err(self.receive_failure_v1("upstream closed early"));
+                }
+                UpstreamFrameV1::Io => {
+                    return Err(upstream_transport_error_v1("upstream read failed"));
+                }
+            };
+            let message = parse_bounded_json(&bytes, self.limits)
+                .map_err(|_| upstream_transport_error_v1("invalid upstream response"))?;
+            let object = message
+                .as_object()
+                .ok_or_else(|| upstream_transport_error_v1("invalid upstream response"))?;
+            if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+                return Err(upstream_transport_error_v1("invalid upstream response"));
+            }
+            if object.get("id").is_none() && object.get("method").is_some() {
+                notifications = notifications.saturating_add(1);
+                if notifications > MAX_UPSTREAM_NOTIFICATIONS_V1 {
+                    return Err(upstream_transport_error_v1(
+                        "upstream notification limit exceeded",
+                    ));
+                }
+                continue;
+            }
+            if object.get("id").and_then(Value::as_i64) != Some(request_id)
+                || object
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "result" | "error"))
+            {
+                return Err(upstream_transport_error_v1("invalid upstream response"));
+            }
+            match (object.get("result"), object.get("error")) {
+                (Some(result), None) => return Ok(result.clone()),
+                (None, Some(error)) => {
+                    let error =
+                        serde_json::from_value::<McpError>(error.clone()).map_err(|_| {
+                            upstream_transport_error_v1("invalid upstream error response")
+                        })?;
+                    return Err(ProviderError(error));
+                }
+                _ => return Err(upstream_transport_error_v1("invalid upstream response")),
+            }
+        }
+    }
+
+    fn notify_v1(&self, method: &str, params: Option<Value>) -> Result<(), ProviderError> {
+        let mut notification = Map::new();
+        notification.insert("jsonrpc".to_owned(), Value::String("2.0".to_owned()));
+        notification.insert("method".to_owned(), Value::String(method.to_owned()));
+        if let Some(params) = params {
+            notification.insert("params".to_owned(), params);
+        }
+        self.control.write_value_v1(&Value::Object(notification))
+    }
+
+    fn receive_failure_v1(&self, message: &'static str) -> ProviderError {
+        if self.control.cancelled.load(Ordering::Acquire) {
+            ProviderError(McpError::typed(
+                McpErrorCode::RequestCancelled,
+                "upstream request cancelled",
+            ))
+        } else {
+            upstream_transport_error_v1(message)
+        }
+    }
+}
+
+impl Drop for StdioUpstreamSessionV1 {
+    fn drop(&mut self) {
+        self.control.terminate_v1();
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+fn parse_upstream_tools_page_v1(
+    result: Value,
+    limits: GatewayLimits,
+) -> Result<(Vec<ProviderTool>, Option<String>), ProviderError> {
+    validate_value_bounds(
+        &result,
+        limits.max_result_depth,
+        limits.max_result_nodes,
+        limits.max_tool_list_bytes,
+    )
+    .map_err(|_| upstream_transport_error_v1("upstream tool page exceeded limit"))?;
+    let object = result
+        .as_object()
+        .ok_or_else(|| upstream_transport_error_v1("invalid upstream tool page"))?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "tools" | "nextCursor" | "_meta"))
+    {
+        return Err(upstream_transport_error_v1("invalid upstream tool page"));
+    }
+    let values = object
+        .get("tools")
+        .and_then(Value::as_array)
+        .ok_or_else(|| upstream_transport_error_v1("invalid upstream tool page"))?;
+    let mut tools = Vec::with_capacity(values.len());
+    for value in values {
+        let tool = value
+            .as_object()
+            .ok_or_else(|| upstream_transport_error_v1("invalid upstream tool definition"))?;
+        if tool.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "name"
+                    | "title"
+                    | "description"
+                    | "inputSchema"
+                    | "outputSchema"
+                    | "annotations"
+                    | "_meta"
+            )
+        }) {
+            return Err(upstream_transport_error_v1(
+                "invalid upstream tool definition",
+            ));
+        }
+        let name = tool
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| upstream_transport_error_v1("invalid upstream tool definition"))?
+            .to_owned();
+        let optional_string = |field: &str| -> Result<Option<String>, ProviderError> {
+            tool.get(field)
+                .map(|value| {
+                    value.as_str().map(str::to_owned).ok_or_else(|| {
+                        upstream_transport_error_v1("invalid upstream tool definition")
+                    })
+                })
+                .transpose()
+        };
+        let input_schema = tool
+            .get("inputSchema")
+            .cloned()
+            .ok_or_else(|| upstream_transport_error_v1("invalid upstream tool definition"))?;
+        tools.push(ProviderTool {
+            name,
+            title: optional_string("title")?,
+            description: optional_string("description")?,
+            input_schema,
+            output_schema: tool.get("outputSchema").cloned(),
+            annotations: tool.get("annotations").cloned(),
+            meta: tool.get("_meta").cloned(),
+        });
+    }
+    let next_cursor = object
+        .get("nextCursor")
+        .map(|cursor| {
+            cursor
+                .as_str()
+                .filter(|cursor| !cursor.is_empty() && cursor.len() <= limits.max_metadata_bytes)
+                .map(str::to_owned)
+                .ok_or_else(|| upstream_transport_error_v1("invalid upstream cursor"))
+        })
+        .transpose()?;
+    Ok((tools, next_cursor))
+}
+
+fn upstream_transport_error_v1(message: &'static str) -> ProviderError {
+    ProviderError(McpError::typed(McpErrorCode::InternalError, message))
+}
+
+fn validate_upstream_program_v1(program: &Path) -> Result<PathBuf, StdioMcpProviderBuildErrorV1> {
+    if !program.is_absolute() {
+        return Err(StdioMcpProviderBuildErrorV1::InvalidProgram);
+    }
+    let metadata =
+        fs::symlink_metadata(program).map_err(|_| StdioMcpProviderBuildErrorV1::InvalidProgram)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.len() > MAX_UPSTREAM_EXECUTABLE_BYTES_V1
+    {
+        return Err(StdioMcpProviderBuildErrorV1::InvalidProgram);
+    }
+    fs::canonicalize(program).map_err(|_| StdioMcpProviderBuildErrorV1::InvalidProgram)
+}
+
+fn validate_upstream_directory_v1(
+    directory: &Path,
+) -> Result<PathBuf, StdioMcpProviderBuildErrorV1> {
+    if !directory.is_absolute() {
+        return Err(StdioMcpProviderBuildErrorV1::InvalidCurrentDirectory);
+    }
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|_| StdioMcpProviderBuildErrorV1::InvalidCurrentDirectory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(StdioMcpProviderBuildErrorV1::InvalidCurrentDirectory);
+    }
+    fs::canonicalize(directory).map_err(|_| StdioMcpProviderBuildErrorV1::InvalidCurrentDirectory)
+}
+
+fn validate_upstream_config_string_v1(value: &str) -> Result<(), StdioMcpProviderBuildErrorV1> {
+    if value.is_empty() || value.len() > MAX_UPSTREAM_CONFIG_STRING_BYTES_V1 || value.contains('\0')
+    {
+        Err(StdioMcpProviderBuildErrorV1::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_upstream_environment_name_v1(value: &str) -> Result<(), StdioMcpProviderBuildErrorV1> {
+    if value.is_empty()
+        || value.len() > 128
+        || value.contains('=')
+        || value.contains('\0')
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        Err(StdioMcpProviderBuildErrorV1::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_upstream_tool_name_v1(value: &str) -> Result<(), StdioMcpProviderBuildErrorV1> {
+    if value.is_empty()
+        || value.len() > 96
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        Err(StdioMcpProviderBuildErrorV1::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
+}
+
+fn hash_upstream_program_v1(program: &Path) -> Result<[u8; 32], StdioMcpProviderBuildErrorV1> {
+    let link_metadata =
+        fs::symlink_metadata(program).map_err(|_| StdioMcpProviderBuildErrorV1::UnstableProgram)?;
+    if link_metadata.file_type().is_symlink() || !link_metadata.is_file() {
+        return Err(StdioMcpProviderBuildErrorV1::UnstableProgram);
+    }
+    let before =
+        fs::metadata(program).map_err(|_| StdioMcpProviderBuildErrorV1::UnstableProgram)?;
+    if !before.is_file() || before.len() > MAX_UPSTREAM_EXECUTABLE_BYTES_V1 {
+        return Err(StdioMcpProviderBuildErrorV1::UnstableProgram);
+    }
+    let mut file =
+        File::open(program).map_err(|_| StdioMcpProviderBuildErrorV1::UnstableProgram)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.mcp.upstream-program.v1\0");
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut read_bytes = 0_u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|_| StdioMcpProviderBuildErrorV1::UnstableProgram)?;
+        if count == 0 {
+            break;
+        }
+        read_bytes = read_bytes.saturating_add(count as u64);
+        if read_bytes > MAX_UPSTREAM_EXECUTABLE_BYTES_V1 {
+            return Err(StdioMcpProviderBuildErrorV1::UnstableProgram);
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| StdioMcpProviderBuildErrorV1::UnstableProgram)?;
+    if read_bytes != before.len()
+        || before.len() != after.len()
+        || before.modified().ok() != after.modified().ok()
+    {
+        return Err(StdioMcpProviderBuildErrorV1::UnstableProgram);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn upstream_configuration_digest_v1(
+    config: &StdioMcpProviderConfigV1,
+) -> Result<(String, [u8; 32]), StdioMcpProviderBuildErrorV1> {
+    let program_digest = hash_upstream_program_v1(&config.program)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.mcp.upstream-configuration.v1\0");
+    fn field(hasher: &mut blake3::Hasher, value: &[u8]) {
+        hasher.update(&(value.len() as u64).to_be_bytes());
+        hasher.update(value);
+    }
+    for value in [
+        config.descriptor.id.as_bytes(),
+        config.descriptor.implementation.as_bytes(),
+        config.descriptor.version.as_bytes(),
+        config.descriptor.endpoint_identity.as_bytes(),
+        config.program.to_string_lossy().as_bytes(),
+        config.current_dir.to_string_lossy().as_bytes(),
+        &program_digest,
+    ] {
+        field(&mut hasher, value);
+    }
+    for argument in &config.arguments {
+        field(&mut hasher, argument.as_bytes());
+    }
+    for (name, value) in &config.environment {
+        field(&mut hasher, name.as_bytes());
+        field(&mut hasher, value.as_bytes());
+    }
+    for (secret_name, environment_name) in &config.secret_environment {
+        field(&mut hasher, secret_name.as_bytes());
+        field(&mut hasher, environment_name.as_bytes());
+    }
+    for (tool, effect) in &config.tool_effects {
+        field(&mut hasher, tool.as_bytes());
+        field(&mut hasher, effect.wire_name().as_bytes());
+    }
+    Ok((hasher.finalize().to_hex().to_string(), program_digest))
 }
 
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
@@ -1179,6 +2120,16 @@ impl McpGateway {
         registrations: Vec<ProviderRegistration>,
         limits: GatewayLimits,
     ) -> Result<Self, GatewayBuildError> {
+        Self::new_with_discovery_secrets(registrations, limits, EphemeralSecrets::empty())
+    }
+
+    /// Construct a gateway while borrowing any credentials needed for initial
+    /// upstream discovery. The gateway never retains these bytes.
+    pub fn new_with_discovery_secrets(
+        registrations: Vec<ProviderRegistration>,
+        limits: GatewayLimits,
+        discovery_secrets: EphemeralSecrets<'_>,
+    ) -> Result<Self, GatewayBuildError> {
         let mut provider_ids = BTreeSet::new();
         let mut routes = BTreeMap::new();
 
@@ -1192,12 +2143,13 @@ impl McpGateway {
             }
             validate_provider_descriptor(&descriptor)?;
             let provider_identity = provider_identity(&descriptor);
-            let tools = registration.provider.discover_tools().map_err(|source| {
-                GatewayBuildError::Discovery {
+            let tools = registration
+                .provider
+                .discover_tools_with_secrets(discovery_secrets)
+                .map_err(|source| GatewayBuildError::Discovery {
                     provider_id: descriptor.id.clone(),
                     source,
-                }
-            })?;
+                })?;
             let mut upstream_names = BTreeSet::new();
             for definition in tools {
                 validate_tool(&descriptor.id, &definition, limits)?;
