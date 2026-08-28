@@ -10,6 +10,7 @@ pub mod context_compiler;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufReader};
@@ -23,6 +24,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
+use crate::agent_gateway::context::{
+    ReasoningBriefInputV1, ReasoningRecipientV1, ReasoningScopeV1,
+};
 use crate::agent_gateway::protocol::{
     AgentCallIdentityV1, CanonicalArguments, DeliveryAuthorityRefusalV1, DeliveryStreamsV1,
     DigestReferenceV1, EffectClass as CoreEffectClass, FreshnessRequirementV1,
@@ -31,18 +35,27 @@ use crate::agent_gateway::protocol::{
     ToolIdentityV1, WorkspaceIdentityV1,
 };
 use crate::agent_gateway::router::{GatewayDecision, RoutingCandidatesV1, route};
+use crate::agent_gateway_runtime::context_compiler::{
+    CompiledReasoningBriefV1, ReasoningBriefPresentationRequestV1, ReasoningBriefPresentationV1,
+    ReasoningDeliveryAcknowledgmentV1, compile_reasoning_brief_v1,
+    complete_reasoning_brief_delivery_v1,
+};
 use crate::mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
     EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, GatewayLimits, McpError,
-    McpErrorCode, McpGateway, ProviderCall, ProviderCancellation, ProviderDescriptor,
-    ProviderError, ProviderRegistration, ProviderTool, SideEffectClassification,
-    StructuredResultCapture, ToolCancellation, ToolDiscovery, ToolExecution, UpstreamProvider,
+    McpErrorCode, McpGateway, OpaqueReasoningAcknowledgmentV1, PreparedReasoningContextV1,
+    ProviderCall, ProviderCancellation, ProviderDescriptor, ProviderError, ProviderRegistration,
+    ProviderTool, ReasoningContextCandidateV1, ReasoningDeliveryCompletionV1,
+    ReasoningTransportPresentationV1, ReasoningTransportRecipientV1, ReasoningTransportScopeV1,
+    SideEffectClassification, StructuredResultCapture, ToolCancellation, ToolDiscovery,
+    ToolExecution, UpstreamProvider, authorization_scope_digest_v1,
 };
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
     GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayRouteProofObservationV1,
-    GatewayServedRouteV1, GatewayStats, Store, ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayReasoningContextQueryV1,
+    GatewayRouteProofObservationV1, GatewayServedRouteV1, GatewayStats, Store,
+    ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -63,6 +76,89 @@ const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
 const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_millis(250);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
+const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
+const INTERNAL_REASONING_CONTEXT_TOKEN_V1: &str = "__again_internal_reasoning_context_v1";
+
+struct RuntimeReasoningContextV1 {
+    input: ReasoningBriefInputV1,
+}
+
+impl ReasoningContextCandidateV1 for RuntimeReasoningContextV1 {
+    fn scope(&self) -> ReasoningTransportScopeV1 {
+        ReasoningTransportScopeV1 {
+            task_id: self.input.scope.task_id().to_owned(),
+            repository_id: self.input.scope.repository_id().to_owned(),
+            workspace_id: self.input.scope.workspace_id().to_owned(),
+            state_digest: self.input.scope.state_digest().to_owned(),
+            dependency_digest: self.input.scope.dependency_digest().to_owned(),
+            authorization_scope_digest: self.input.scope.authorization_scope_digest().to_owned(),
+        }
+    }
+
+    fn compile(
+        mut self: Box<Self>,
+        recipient: &ReasoningTransportRecipientV1,
+        acknowledgment: Option<&(dyn Any + Send + Sync)>,
+    ) -> Result<PreparedReasoningContextV1, ()> {
+        let recipient = ReasoningRecipientV1::new(
+            &recipient.agent_id,
+            &recipient.session_id,
+            &recipient.turn_id,
+            &recipient.connection_generation,
+            recipient.compaction_generation,
+            recipient.lifecycle_generation,
+        )
+        .map_err(|_| ())?;
+        self.input.recipient = recipient.clone();
+        let acknowledgment = acknowledgment
+            .and_then(|value| value.downcast_ref::<ReasoningDeliveryAcknowledgmentV1>());
+        let compiled = compile_reasoning_brief_v1(
+            &self.input,
+            ReasoningBriefPresentationRequestV1::PreferCompact { acknowledgment },
+        )
+        .map_err(|_| ())?;
+        let brief = serde_json::from_slice(compiled.bytes()).map_err(|_| ())?;
+        let metrics = serde_json::to_value(compiled.metrics()).map_err(|_| ())?;
+        let (presentation, completion) = match compiled.presentation() {
+            ReasoningBriefPresentationV1::Full => (
+                ReasoningTransportPresentationV1::Full,
+                Some(Box::new(RuntimeReasoningDeliveryCompletionV1 {
+                    recipient,
+                    compiled,
+                }) as Box<dyn ReasoningDeliveryCompletionV1>),
+            ),
+            ReasoningBriefPresentationV1::CompactReference => {
+                (ReasoningTransportPresentationV1::CompactReference, None)
+            }
+        };
+        Ok(PreparedReasoningContextV1 {
+            presentation,
+            brief,
+            metrics,
+            completion,
+        })
+    }
+}
+
+struct RuntimeReasoningDeliveryCompletionV1 {
+    recipient: ReasoningRecipientV1,
+    compiled: CompiledReasoningBriefV1,
+}
+
+impl ReasoningDeliveryCompletionV1 for RuntimeReasoningDeliveryCompletionV1 {
+    fn complete(self: Box<Self>) -> Result<OpaqueReasoningAcknowledgmentV1, ()> {
+        let acknowledgment = complete_reasoning_brief_delivery_v1(
+            &self.recipient,
+            &self.compiled,
+            self.compiled.bytes(),
+            true,
+            true,
+            true,
+        )
+        .map_err(|_| ())?;
+        Ok(Arc::new(acknowledgment))
+    }
+}
 
 fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
     WorkspaceAuthorityLimitsV1 {
@@ -172,6 +268,7 @@ pub(crate) struct GatewayControlledProviderV1 {
     workspace: PathBuf,
     store: Arc<Mutex<Store>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
+    pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
 }
 
 struct ActiveRegistrationV1<'a> {
@@ -200,6 +297,7 @@ impl GatewayControlledProviderV1 {
             workspace,
             store,
             active: Mutex::new(BTreeMap::new()),
+            pending_reasoning: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -261,6 +359,7 @@ impl GatewayControlledProviderV1 {
         &self,
         resolved: &ResolvedRequestV1,
         gateway_result_id: &str,
+        call: &ProviderCall,
     ) -> Result<Option<Value>> {
         let store = self
             .store
@@ -271,10 +370,26 @@ impl GatewayControlledProviderV1 {
         };
         let value: Value = serde_json::from_slice(&result.stdout)
             .context("decode exact gateway provider result")?;
+        let reasoning = reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
+            .ok()
+            .flatten();
+        let reasoning_token = reasoning.and_then(|reasoning| {
+            let mut pending = self
+                .pending_reasoning
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if pending.len() >= MAX_PENDING_REASONING_CONTEXTS_V1 {
+                return None;
+            }
+            let token = format!("rc_{}", uuid::Uuid::new_v4().simple());
+            pending.insert(token.clone(), reasoning);
+            Some(token)
+        });
         Ok(Some(attach_result_reference_v1(
             value,
             gateway_result_id,
             &result.result,
+            reasoning_token.as_deref(),
         )))
     }
 
@@ -396,7 +511,7 @@ impl GatewayControlledProviderV1 {
                     })
                     | Ok(GatewayCompletion::AlreadyCompleted {
                         gateway_result_id, ..
-                    }) => match self.load_exact(resolved, &gateway_result_id) {
+                    }) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
                         Ok(Some(exact)) => Ok(exact),
                         Ok(None) | Err(_) => Ok(value),
                     },
@@ -450,12 +565,14 @@ impl GatewayControlledProviderV1 {
                     {
                         break Ok(None);
                     }
-                    let loaded = self.load_exact(resolved, &gateway_result_id).map_err(|_| {
-                        ProviderError(McpError::typed(
-                            McpErrorCode::InternalError,
-                            "verified gateway result became unavailable",
-                        ))
-                    });
+                    let loaded =
+                        self.load_exact(resolved, &gateway_result_id, call)
+                            .map_err(|_| {
+                                ProviderError(McpError::typed(
+                                    McpErrorCode::InternalError,
+                                    "verified gateway result became unavailable",
+                                ))
+                            });
                     if matches!(loaded, Ok(Some(_))) {
                         let _ = self
                             .store
@@ -513,16 +630,26 @@ impl SideEffectClassification for GatewayControlledProviderV1 {
 }
 
 impl StructuredResultCapture for GatewayControlledProviderV1 {
-    fn capture_result(&self, result: Value) -> Result<CapturedToolResult, ProviderError> {
+    fn capture_result(&self, mut result: Value) -> Result<CapturedToolResult, ProviderError> {
         let delivery = delivery_capture_v1(&result);
+        let reasoning = take_reasoning_context_v1(&mut result).and_then(|token| {
+            self.pending_reasoning
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&token)
+        });
         let exact = self.inner.capture_result(result)?.into_exact();
         match delivery {
             Some((gateway_result_id, result_digest, streams)) => {
-                Ok(CapturedToolResult::exact_with_delivery(
+                Ok(CapturedToolResult::exact_with_delivery_and_reasoning(
                     exact,
                     gateway_result_id,
                     result_digest,
                     streams,
+                    reasoning.map(|input| {
+                        Box::new(RuntimeReasoningContextV1 { input })
+                            as Box<dyn ReasoningContextCandidateV1>
+                    }),
                 ))
             }
             None => Ok(CapturedToolResult::exact(exact)),
@@ -617,7 +744,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     _ => GatewayDecision::Execute,
                 };
                 if decision == GatewayDecision::ServeExact {
-                    let value = self.load_exact(&resolved, &gateway_result_id);
+                    let value = self.load_exact(&resolved, &gateway_result_id, &call);
                     let revalidated = self.resolve(&epoch, &call);
                     if revalidated
                         .as_ref()
@@ -1178,10 +1305,17 @@ fn attach_result_reference_v1(
     mut value: Value,
     gateway_result_id: &str,
     result: &crate::store::StoredResult,
+    reasoning_token: Option<&str>,
 ) -> Value {
     let Some(object) = value.as_object_mut() else {
         return value;
     };
+    if let Some(reasoning_token) = reasoning_token {
+        object.insert(
+            INTERNAL_REASONING_CONTEXT_TOKEN_V1.to_owned(),
+            Value::String(reasoning_token.to_owned()),
+        );
+    }
     let metadata = object
         .entry("_meta")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -1205,6 +1339,61 @@ fn attach_result_reference_v1(
         }),
     );
     value
+}
+
+fn take_reasoning_context_v1(value: &mut Value) -> Option<String> {
+    value
+        .as_object_mut()?
+        .remove(INTERNAL_REASONING_CONTEXT_TOKEN_V1)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn reasoning_context_for_result_v1(
+    store: &Store,
+    workspace: &Path,
+    resolved: &ResolvedRequestV1,
+    call: &ProviderCall,
+) -> Result<Option<ReasoningBriefInputV1>> {
+    let mut identity_hasher = blake3::Hasher::new();
+    identity_hasher.update(b"again.reasoning.workspace-identity.v1\0");
+    identity_hasher.update(workspace.as_os_str().as_encoded_bytes());
+    let workspace_identity = identity_hasher.finalize().to_hex().to_string();
+    let scope = ReasoningScopeV1::new(
+        resolved.binding.request_digest(),
+        &format!("repository:{}", &workspace_identity[..24]),
+        &format!("workspace:{}", &workspace_identity[..24]),
+        resolved.binding.state_digest(),
+        &resolved.binding.dependency_digest(),
+        &authorization_scope_digest_v1(&call.authorization_scope),
+    )
+    .map_err(|reason| anyhow!(reason.code()))?;
+    // This placeholder is never delivered. The authenticated transport
+    // replaces it before compilation, keeping recipient identity outside the
+    // provider and out of repository result metadata.
+    let placeholder_recipient = ReasoningRecipientV1::new(
+        "pending-agent",
+        "pending-session",
+        "pending-turn",
+        &delivery_context_digest_v1(call),
+        0,
+        1,
+    )
+    .map_err(|reason| anyhow!(reason.code()))?;
+    let query = GatewayReasoningContextQueryV1::new(
+        scope,
+        placeholder_recipient,
+        resolved.binding.clone(),
+    )?;
+    store.reasoning_context_v1(&query).map(Some)
+}
+
+fn delivery_context_digest_v1(call: &ProviderCall) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.reasoning.pending-delivery.v1\0");
+    hasher.update(call.logical_call_id.as_str().as_bytes());
+    hasher.update(&call.physical_attempt_id.get().to_le_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn delivery_capture_v1(value: &Value) -> Option<(String, String, DeliveryStreamsV1)> {

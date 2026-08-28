@@ -5,6 +5,7 @@
 //! not persist credentials, approve sensitive calls, invoke an AI model, or
 //! perform local command execution.
 
+use std::any::Any;
 use std::cell::Cell;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -46,6 +47,7 @@ const MAX_UPSTREAM_EXECUTABLE_BYTES_V1: u64 = 256 * 1024 * 1024;
 const MAX_UPSTREAM_NOTIFICATIONS_V1: usize = 1_024;
 const MAX_UPSTREAM_TOOL_PAGES_V1: usize = 32;
 const UPSTREAM_RESPONSE_QUEUE_V1: usize = 32;
+const MAX_REASONING_DELIVERY_ACKNOWLEDGMENTS_V1: usize = 128;
 
 struct StdioActivationV1 {
     sender: SyncSender<()>,
@@ -55,7 +57,7 @@ struct StdioActivationV1 {
 }
 
 #[derive(Clone)]
-struct AuthenticatedStdioRecipientV1 {
+pub(crate) struct AuthenticatedStdioRecipientV1 {
     agent_id: String,
     session_id: String,
     turn_id: String,
@@ -66,7 +68,7 @@ impl AuthenticatedStdioRecipientV1 {
     /// Test-only issuance. Production has no recipient-authentication
     /// composition yet, so no production caller can construct this value.
     #[cfg(test)]
-    fn issue_for_test(
+    pub(crate) fn issue_for_test(
         agent_id: &str,
         session_id: &str,
         turn_id: &str,
@@ -94,6 +96,59 @@ impl AuthenticatedStdioRecipientV1 {
 }
 
 #[derive(Clone)]
+pub(crate) struct ReasoningTransportRecipientV1 {
+    pub(crate) agent_id: String,
+    pub(crate) session_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) connection_generation: String,
+    pub(crate) compaction_generation: u64,
+    pub(crate) lifecycle_generation: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct ReasoningTransportScopeV1 {
+    pub(crate) task_id: String,
+    pub(crate) repository_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) state_digest: String,
+    pub(crate) dependency_digest: String,
+    pub(crate) authorization_scope_digest: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "standalone protocol tests do not install a reasoning compiler"
+)]
+pub(crate) enum ReasoningTransportPresentationV1 {
+    Full,
+    CompactReference,
+}
+
+pub(crate) type OpaqueReasoningAcknowledgmentV1 = Arc<dyn Any + Send + Sync>;
+
+pub(crate) trait ReasoningDeliveryCompletionV1: Send {
+    fn complete(self: Box<Self>) -> Result<OpaqueReasoningAcknowledgmentV1, ()>;
+}
+
+pub(crate) struct PreparedReasoningContextV1 {
+    pub(crate) presentation: ReasoningTransportPresentationV1,
+    pub(crate) brief: Value,
+    pub(crate) metrics: Value,
+    pub(crate) completion: Option<Box<dyn ReasoningDeliveryCompletionV1>>,
+}
+
+pub(crate) trait ReasoningContextCandidateV1: Send {
+    fn scope(&self) -> ReasoningTransportScopeV1;
+
+    fn compile(
+        self: Box<Self>,
+        recipient: &ReasoningTransportRecipientV1,
+        acknowledgment: Option<&(dyn Any + Send + Sync)>,
+    ) -> Result<PreparedReasoningContextV1, ()>;
+}
+
+#[derive(Clone)]
 enum StdioRecipientV1 {
     Unknown,
     #[allow(
@@ -109,6 +164,7 @@ struct StdioConnectionV1 {
     authorization_scope_digest: String,
     recipient: StdioRecipientV1,
     compaction_generation: AtomicU64,
+    lifecycle_generation: Arc<AtomicU64>,
 }
 
 impl StdioConnectionV1 {
@@ -126,6 +182,20 @@ impl StdioConnectionV1 {
                 Ok(recipient)
             }
         }
+    }
+
+    fn current_reasoning_recipient(
+        &self,
+    ) -> Result<ReasoningTransportRecipientV1, DeliveryAuthorityRefusalV1> {
+        let recipient = self.current_recipient()?;
+        Ok(ReasoningTransportRecipientV1 {
+            agent_id: recipient.agent_id,
+            session_id: recipient.session_id,
+            turn_id: recipient.turn_id,
+            connection_generation: self.connection_digest.clone(),
+            compaction_generation: self.compaction_generation.load(Ordering::Acquire),
+            lifecycle_generation: self.lifecycle_generation.load(Ordering::Acquire),
+        })
     }
 }
 
@@ -480,10 +550,10 @@ impl ProviderTool {
     }
 }
 
-#[derive(Clone, PartialEq)]
 pub struct CapturedToolResult {
     exact: Value,
     delivery: Option<CapturedDeliveryV1>,
+    reasoning: Option<Box<dyn ReasoningContextCandidateV1>>,
 }
 
 impl fmt::Debug for CapturedToolResult {
@@ -498,15 +568,17 @@ impl CapturedToolResult {
         Self {
             exact: value,
             delivery: None,
+            reasoning: None,
         }
     }
 
     #[must_use]
-    pub(crate) fn exact_with_delivery(
+    pub(crate) fn exact_with_delivery_and_reasoning(
         value: Value,
         gateway_result_id: String,
         result_digest: String,
         streams: DeliveryStreamsV1,
+        reasoning: Option<Box<dyn ReasoningContextCandidateV1>>,
     ) -> Self {
         Self {
             exact: value,
@@ -515,12 +587,19 @@ impl CapturedToolResult {
                 result_digest,
                 streams,
             }),
+            reasoning,
         }
     }
 
     #[must_use]
-    fn into_parts(self) -> (Value, Option<CapturedDeliveryV1>) {
-        (self.exact, self.delivery)
+    fn into_parts(
+        self,
+    ) -> (
+        Value,
+        Option<CapturedDeliveryV1>,
+        Option<Box<dyn ReasoningContextCandidateV1>>,
+    ) {
+        (self.exact, self.delivery, self.reasoning)
     }
 
     #[must_use]
@@ -2079,6 +2158,89 @@ impl DeliveryLedgerV1 {
     }
 }
 
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct ReasoningDeliveryKeyV1 {
+    stdio_session_id: u64,
+    task_id: String,
+    repository_id: String,
+    workspace_id: String,
+    state_digest: String,
+    dependency_digest: String,
+    authorization_scope_digest: String,
+    agent_id: String,
+    session_id: String,
+    turn_id: String,
+    connection_generation: String,
+    compaction_generation: u64,
+    lifecycle_generation: u64,
+}
+
+impl ReasoningDeliveryKeyV1 {
+    fn from_scope(
+        stdio_session_id: u64,
+        scope: &ReasoningTransportScopeV1,
+        recipient: &ReasoningTransportRecipientV1,
+    ) -> Self {
+        Self {
+            stdio_session_id,
+            task_id: scope.task_id.clone(),
+            repository_id: scope.repository_id.clone(),
+            workspace_id: scope.workspace_id.clone(),
+            state_digest: scope.state_digest.clone(),
+            dependency_digest: scope.dependency_digest.clone(),
+            authorization_scope_digest: scope.authorization_scope_digest.clone(),
+            agent_id: recipient.agent_id.clone(),
+            session_id: recipient.session_id.clone(),
+            turn_id: recipient.turn_id.clone(),
+            connection_generation: recipient.connection_generation.clone(),
+            compaction_generation: recipient.compaction_generation,
+            lifecycle_generation: recipient.lifecycle_generation,
+        }
+    }
+}
+
+#[derive(Default)]
+struct ReasoningDeliveryLedgerV1 {
+    confirmed: BTreeMap<ReasoningDeliveryKeyV1, OpaqueReasoningAcknowledgmentV1>,
+    order: VecDeque<ReasoningDeliveryKeyV1>,
+}
+
+impl ReasoningDeliveryLedgerV1 {
+    fn remember(
+        &mut self,
+        key: ReasoningDeliveryKeyV1,
+        acknowledgment: OpaqueReasoningAcknowledgmentV1,
+    ) {
+        if self.confirmed.insert(key.clone(), acknowledgment).is_none() {
+            self.order.push_back(key);
+        }
+        while self.order.len() > MAX_REASONING_DELIVERY_ACKNOWLEDGMENTS_V1 {
+            if let Some(oldest) = self.order.pop_front() {
+                self.confirmed.remove(&oldest);
+            }
+        }
+    }
+
+    fn retire_session(&mut self, stdio_session_id: u64) {
+        self.confirmed
+            .retain(|key, _| key.stdio_session_id != stdio_session_id);
+        self.order
+            .retain(|key| key.stdio_session_id != stdio_session_id);
+    }
+}
+
+struct ReasoningWriteCompletionV1 {
+    key: ReasoningDeliveryKeyV1,
+    recipient: ReasoningTransportRecipientV1,
+    completion: Box<dyn ReasoningDeliveryCompletionV1>,
+    lifecycle_generation: Arc<AtomicU64>,
+}
+
+struct StdioResponseV1 {
+    bytes: Vec<u8>,
+    reasoning_completion: Option<ReasoningWriteCompletionV1>,
+}
+
 fn hex_v1(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -2089,6 +2251,10 @@ fn delivery_digest_v1(domain: &[u8], value: &[u8]) -> String {
     hasher.update(&(value.len() as u64).to_be_bytes());
     hasher.update(value);
     hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn authorization_scope_digest_v1(scope: &AuthorizationScopeId) -> String {
+    delivery_digest_v1(b"again.mcp.delivery-scope.v1\0", scope.as_str().as_bytes())
 }
 
 fn delivery_acknowledgement_token_v1(challenge_id: &str, binding: &DeliveryBindingV1) -> String {
@@ -2113,6 +2279,10 @@ pub struct McpGateway {
     audit: Arc<dyn GatewayAuditSink>,
     delivery_ledger: Mutex<DeliveryLedgerV1>,
     delivery_sink: Arc<dyn DeliveryConfirmationSink>,
+    reasoning_delivery_ledger: Mutex<ReasoningDeliveryLedgerV1>,
+    pending_reasoning_writes: Mutex<BTreeMap<(u64, JsonRpcId), ReasoningWriteCompletionV1>>,
+    #[cfg(test)]
+    reasoning_confirmation_count: Arc<AtomicU64>,
 }
 
 impl McpGateway {
@@ -2213,6 +2383,10 @@ impl McpGateway {
             audit: Arc::new(NoopAuditSink),
             delivery_ledger: Mutex::new(DeliveryLedgerV1::default()),
             delivery_sink: Arc::new(NoopDeliveryConfirmationSink),
+            reasoning_delivery_ledger: Mutex::new(ReasoningDeliveryLedgerV1::default()),
+            pending_reasoning_writes: Mutex::new(BTreeMap::new()),
+            #[cfg(test)]
+            reasoning_confirmation_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -2234,6 +2408,134 @@ impl McpGateway {
     #[must_use]
     pub const fn limits(&self) -> GatewayLimits {
         self.limits
+    }
+
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "used by authenticated transport integration tests"
+    )]
+    pub(crate) fn reasoning_acknowledgment_count_for_test_v1(&self) -> usize {
+        self.reasoning_delivery_ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .confirmed
+            .len()
+    }
+
+    #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "used by authenticated transport integration tests"
+    )]
+    pub(crate) fn reasoning_confirmation_counter_for_test_v1(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.reasoning_confirmation_count)
+    }
+
+    fn attach_reasoning_context_v1(
+        &self,
+        exact: &mut Value,
+        candidate: Box<dyn ReasoningContextCandidateV1>,
+        connection: &StdioConnectionV1,
+        request_id: &JsonRpcId,
+    ) {
+        let Ok(recipient) = connection.current_reasoning_recipient() else {
+            return;
+        };
+        let scope = candidate.scope();
+        if scope.authorization_scope_digest != connection.authorization_scope_digest {
+            return;
+        }
+        let key = ReasoningDeliveryKeyV1::from_scope(connection.session_id, &scope, &recipient);
+        let acknowledgment = self
+            .reasoning_delivery_ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .confirmed
+            .get(&key)
+            .cloned();
+        let Ok(mut prepared) = candidate.compile(&recipient, acknowledgment.as_deref()) else {
+            return;
+        };
+        if prepared.presentation == ReasoningTransportPresentationV1::Full
+            && prepared.completion.is_none()
+        {
+            return;
+        }
+        let Some(object) = exact.as_object_mut() else {
+            return;
+        };
+        let metadata = object
+            .entry("_meta")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(metadata) = metadata.as_object_mut() else {
+            return;
+        };
+        let again = metadata
+            .entry("again")
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Some(again) = again.as_object_mut() else {
+            return;
+        };
+        let presentation = match prepared.presentation {
+            ReasoningTransportPresentationV1::Full => "full",
+            ReasoningTransportPresentationV1::CompactReference => "compact_reference",
+        };
+        again.insert(
+            "reasoningContext".to_owned(),
+            json!({
+                "schemaVersion": 1,
+                "presentation": presentation,
+                "brief": prepared.brief,
+                "metrics": prepared.metrics
+            }),
+        );
+        if let Some(completion) = prepared.completion.take() {
+            self.pending_reasoning_writes
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .insert(
+                    (connection.session_id, request_id.clone()),
+                    ReasoningWriteCompletionV1 {
+                        key,
+                        recipient,
+                        completion,
+                        lifecycle_generation: Arc::clone(&connection.lifecycle_generation),
+                    },
+                );
+        }
+    }
+
+    fn confirm_reasoning_write_v1(&self, completion: ReasoningWriteCompletionV1) {
+        if completion.lifecycle_generation.load(Ordering::Acquire)
+            != completion.recipient.lifecycle_generation
+        {
+            return;
+        }
+        let acknowledgment = completion.completion.complete();
+        if let Ok(acknowledgment) = acknowledgment {
+            self.reasoning_delivery_ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remember(completion.key, acknowledgment);
+            #[cfg(test)]
+            self.reasoning_confirmation_count
+                .fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn invalidate_reasoning_session_v1(&self, connection: &StdioConnectionV1) {
+        connection
+            .lifecycle_generation
+            .fetch_add(1, Ordering::AcqRel);
+        self.reasoning_delivery_ledger
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retire_session(connection.session_id);
+        self.pending_reasoning_writes
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|(session_id, _), _| *session_id != connection.session_id);
     }
 
     /// Parse one JSON-RPC frame, rejecting duplicate keys before constructing a
@@ -2292,7 +2594,7 @@ impl McpGateway {
     }
 
     #[cfg(test)]
-    fn serve_stdio_for_authenticated_recipient_v1<R: BufRead, W: Write + Send>(
+    pub(crate) fn serve_stdio_for_authenticated_recipient_v1<R: BufRead, W: Write + Send>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -2320,6 +2622,7 @@ impl McpGateway {
         struct StdioJobV1 {
             bytes: Vec<u8>,
             context: GatewayRequestContext,
+            request_id: JsonRpcId,
             response_id: Value,
             activation: Arc<StdioActivationV1>,
         }
@@ -2336,19 +2639,17 @@ impl McpGateway {
                 b"again.mcp.delivery-connection.v1\0",
                 connection_nonce.as_bytes(),
             ),
-            authorization_scope_digest: delivery_digest_v1(
-                b"again.mcp.delivery-scope.v1\0",
-                authorization_scope.as_str().as_bytes(),
-            ),
+            authorization_scope_digest: authorization_scope_digest_v1(authorization_scope),
             recipient,
             compaction_generation: AtomicU64::new(initial_generation),
+            lifecycle_generation: Arc::new(AtomicU64::new(1)),
         });
         thread::scope(|scope| {
             let (job_sender, job_receiver) =
                 mpsc::sync_channel::<StdioJobV1>(STDIO_MAX_INFLIGHT_V1);
             let job_receiver = Arc::new(Mutex::new(job_receiver));
             let (response_sender, response_receiver) =
-                mpsc::sync_channel::<Vec<u8>>(STDIO_RESPONSE_QUEUE_V1);
+                mpsc::sync_channel::<StdioResponseV1>(STDIO_RESPONSE_QUEUE_V1);
             let inflight = Arc::new(AtomicUsize::new(0));
             let session_closed = Arc::new(AtomicBool::new(false));
             let writer_session_closed = Arc::clone(&session_closed);
@@ -2356,9 +2657,12 @@ impl McpGateway {
             let writer_handle = scope.spawn(move || -> io::Result<()> {
                 let result = (|| {
                     while let Ok(response) = response_receiver.recv() {
-                        writer.write_all(&response)?;
+                        writer.write_all(&response.bytes)?;
                         writer.write_all(b"\n")?;
                         writer.flush()?;
+                        if let Some(completion) = response.reasoning_completion {
+                            self.confirm_reasoning_write_v1(completion);
+                        }
                     }
                     Ok(())
                 })();
@@ -2407,11 +2711,22 @@ impl McpGateway {
                                 )
                             });
                         job.activation.signal();
-                        if let Some(response) = response
-                            && responses.send(response).is_err()
-                        {
-                            inflight.fetch_sub(1, Ordering::AcqRel);
-                            break;
+                        if let Some(response) = response {
+                            let reasoning_completion = self
+                                .pending_reasoning_writes
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .remove(&(connection.session_id, job.request_id));
+                            if responses
+                                .send(StdioResponseV1 {
+                                    bytes: response,
+                                    reasoning_completion,
+                                })
+                                .is_err()
+                            {
+                                inflight.fetch_sub(1, Ordering::AcqRel);
+                                break;
+                            }
                         }
                         inflight.fetch_sub(1, Ordering::AcqRel);
                     }
@@ -2435,7 +2750,9 @@ impl McpGateway {
                     );
                     match frame {
                         Ok(bytes) => {
-                            if let Some(response_id) = self.stdio_tool_call_response_id(&bytes) {
+                            if let Some((request_id, response_id)) =
+                                self.stdio_tool_call_response_id(&bytes)
+                            {
                                 let admitted = inflight
                                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                                         (current < STDIO_MAX_INFLIGHT_V1).then_some(current + 1)
@@ -2464,6 +2781,7 @@ impl McpGateway {
                                 let job = StdioJobV1 {
                                     bytes,
                                     context,
+                                    request_id,
                                     response_id,
                                     activation,
                                 };
@@ -2513,6 +2831,7 @@ impl McpGateway {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .retire_session(session_id);
+            self.invalidate_reasoning_session_v1(&connection);
             drop(job_sender);
             for worker in workers {
                 if worker.join().is_err() && read_result.is_ok() {
@@ -2529,12 +2848,14 @@ impl McpGateway {
         })
     }
 
-    fn stdio_tool_call_response_id(&self, input: &[u8]) -> Option<Value> {
+    fn stdio_tool_call_response_id(&self, input: &[u8]) -> Option<(JsonRpcId, Value)> {
         let message = self.parse_message(input).ok()?;
         let request = ParsedRequest::from_value(message).ok()?;
-        (request.method == "tools/call")
-            .then(|| request.id.map(|id| id.to_value()))
-            .flatten()
+        if request.method != "tools/call" {
+            return None;
+        }
+        let request_id = request.id?;
+        Some((request_id.clone(), request_id.to_value()))
     }
 
     fn handle_message(
@@ -2777,7 +3098,11 @@ impl McpGateway {
         };
         let delivery_call_digest = *call.translation.canonical_digest();
         enum CallResult {
-            Success(Value, Option<CapturedDeliveryV1>),
+            Success(
+                Value,
+                Option<CapturedDeliveryV1>,
+                Option<Box<dyn ReasoningContextCandidateV1>>,
+            ),
             Error(McpError),
         }
 
@@ -2789,10 +3114,10 @@ impl McpGateway {
         }));
         let (mut result, mut outcome) = match upstream {
             Ok(Ok(captured)) => {
-                let (exact, delivery) = captured.into_parts();
+                let (exact, delivery, reasoning) = captured.into_parts();
                 match validate_tool_result(&exact, self.limits) {
                     Ok(()) => (
-                        CallResult::Success(exact, delivery),
+                        CallResult::Success(exact, delivery, reasoning),
                         AuditOutcome::Succeeded,
                     ),
                     Err(error) => (CallResult::Error(error), AuditOutcome::Rejected),
@@ -2817,7 +3142,7 @@ impl McpGateway {
             ),
         };
 
-        if active_registration.complete() && matches!(result, CallResult::Success(_, _)) {
+        if active_registration.complete() && matches!(result, CallResult::Success(_, _, _)) {
             result = CallResult::Error(McpError::typed(
                 McpErrorCode::RequestCancelled,
                 "request was cancelled",
@@ -2826,7 +3151,7 @@ impl McpGateway {
         }
         self.record_call_audit(context, &route, physical_attempt_id, outcome);
         Some(match result {
-            CallResult::Success(mut exact, delivery) => {
+            CallResult::Success(mut exact, delivery, reasoning) => {
                 if let Some(delivery) = delivery {
                     let authority = match connection {
                         Some(connection) => self
@@ -2837,6 +3162,14 @@ impl McpGateway {
                         None => Err(DeliveryAuthorityRefusalV1::UnsupportedRecipientAuthority),
                     };
                     attach_delivery_authority_v1(&mut exact, authority);
+                }
+                if let (Some(reasoning), Some(connection)) = (reasoning, connection) {
+                    self.attach_reasoning_context_v1(
+                        &mut exact,
+                        reasoning,
+                        connection,
+                        &request_id,
+                    );
                 }
                 success_response(response_id, exact)
             }
@@ -2912,6 +3245,7 @@ impl McpGateway {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .retire_session(connection.session_id);
+        self.invalidate_reasoning_session_v1(connection);
         let Some(object) = params.as_ref().and_then(Value::as_object) else {
             return;
         };
@@ -2943,6 +3277,7 @@ impl McpGateway {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .retire_request(connection.session_id, &request_id);
+            self.invalidate_reasoning_session_v1(connection);
         }
         let active = self.request_cancellation(&request_id, Some(&context.authorization_scope));
         let Some(active) = active else {
@@ -3222,9 +3557,15 @@ fn provider_panic_error() -> McpError {
     McpError::typed(McpErrorCode::InternalError, "upstream provider failed")
 }
 
-fn enqueue_stdio_response(sender: &SyncSender<Vec<u8>>, response: Vec<u8>) -> io::Result<()> {
+fn enqueue_stdio_response(
+    sender: &SyncSender<StdioResponseV1>,
+    response: Vec<u8>,
+) -> io::Result<()> {
     sender
-        .send(response)
+        .send(StdioResponseV1 {
+            bytes: response,
+            reasoning_completion: None,
+        })
         .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "stdio response writer stopped"))
 }
 
@@ -4078,6 +4419,7 @@ mod delivery_receipt_tests {
             ),
             recipient: StdioRecipientV1::Authenticated(recipient),
             compaction_generation: AtomicU64::new(generation),
+            lifecycle_generation: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -4190,6 +4532,7 @@ mod delivery_receipt_tests {
             authorization_scope_digest: "e".repeat(64),
             recipient: StdioRecipientV1::Unknown,
             compaction_generation: AtomicU64::new(0),
+            lifecycle_generation: Arc::new(AtomicU64::new(1)),
         };
         let mut ledger = DeliveryLedgerV1::default();
         assert_eq!(
@@ -4233,11 +4576,12 @@ mod delivery_receipt_tests {
     #[test]
     fn delivery_only_capture_and_authenticated_composition_point_are_bounded() {
         let streams = DeliveryStreamsV1::new(0, &"b".repeat(64), 0, &"c".repeat(64), 0).unwrap();
-        let captured = CapturedToolResult::exact_with_delivery(
+        let captured = CapturedToolResult::exact_with_delivery_and_reasoning(
             json!({"ok": true}),
             "a".repeat(64),
             "a".repeat(64),
             streams,
+            None,
         );
         assert_eq!(captured.into_exact(), json!({"ok": true}));
 
