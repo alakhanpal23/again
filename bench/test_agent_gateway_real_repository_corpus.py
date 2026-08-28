@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Offline unit tests for the real-repository gateway corpus."""
+"""Network-avoiding unit tests for the real-repository gateway corpus."""
 
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -92,7 +93,14 @@ class EvidenceSession:
         self.pid = pid
 
     def evidence(self) -> dict[str, Any]:
-        return {"label": self.label, "pid": self.pid}
+        return {
+            "label": self.label,
+            "pid": self.pid,
+            "return_code": 0,
+            "process_group_reaped": True,
+            "stderr_complete": True,
+            "cleanup_complete": True,
+        }
 
 
 def mcp_result(value: Mapping[str, Any], result_id: str = "a" * 64) -> dict[str, Any]:
@@ -413,7 +421,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 reason TEXT,
                 created_ms INTEGER NOT NULL
             );
-            PRAGMA user_version=7;
+            PRAGMA user_version=9;
             """
         )
         now = int(corpus.time.time() * 1000)
@@ -508,11 +516,29 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             EvidenceSession("retired-before-restart", 102),
             EvidenceSession("restarted", 103),
         ]
-        records = corpus.process_evidence(sessions)
+        raw = [session.evidence() for session in sessions]
+        records = corpus.process_evidence(
+            raw, ["first", "retired-before-restart", "restarted"]
+        )
         self.assertEqual([item["pid"] for item in records], [101, 102, 103])
         with self.assertRaises(corpus.HarnessRefusal) as refused:
-            corpus.process_evidence([EvidenceSession("same", 1), EvidenceSession("same", 2)])
+            corpus.process_evidence(
+                [EvidenceSession("same", 1).evidence(), EvidenceSession("same", 2).evidence()],
+                ["same", "same"],
+            )
         self.assertEqual(refused.exception.code, "process_ledger")
+        live = EvidenceSession("live", 4).evidence()
+        live["return_code"] = None
+        with self.assertRaises(corpus.HarnessRefusal):
+            corpus.process_evidence([live], ["live"])
+        invalid = EvidenceSession("invalid", 5).evidence()
+        invalid["return_code"] = True
+        with self.assertRaises(corpus.HarnessRefusal):
+            corpus.process_evidence([invalid], ["invalid"])
+        failed = EvidenceSession("failed", 6).evidence()
+        failed["return_code"] = 1
+        with self.assertRaises(corpus.HarnessRefusal):
+            corpus.process_evidence([failed], ["failed"])
 
     def test_workspace_manifest_rejects_symlinks_and_is_stable(self) -> None:
         workspace = self.root / "manifest"
@@ -552,7 +578,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
             corpus.validate_output_location(output, [source])
         self.assertEqual(refused.exception.code, "output_exists")
 
-    def test_server_environment_is_offline_minimal_and_state_scoped(self) -> None:
+    def test_server_environment_is_network_avoiding_and_state_scoped(self) -> None:
         environment = corpus._server_environment(
             self.root / "state", self.root / "home", self.root / "tmp"
         )
@@ -562,6 +588,197 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         self.assertEqual(environment["NO_PROXY"], "")
         self.assertNotIn("SSH_AUTH_SOCK", environment)
         self.assertNotIn("AWS_SECRET_ACCESS_KEY", environment)
+
+    def test_network_boundary_does_not_claim_socket_containment(self) -> None:
+        boundary = corpus.network_boundary_record()
+        self.assertFalse(boundary["harness_clone_download_or_network_client_path"])
+        self.assertFalse(boundary["network_namespace_sandbox"])
+        self.assertFalse(boundary["fresh_socket_creation_blocked"])
+        self.assertEqual(boundary["trusted_product_operations"], ["repo.read", "repo.search"])
+
+    def test_repository_count_language_and_root_bounds_precede_execution(self) -> None:
+        roots = []
+        for index in range(5):
+            root = self.root / f"repository-{index}"
+            root.mkdir()
+            roots.append(root)
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.validate_repository_inputs(
+                [corpus.RepositoryInput("rust", root) for root in roots]
+            )
+        self.assertEqual(refused.exception.code, "repository_count_bound")
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.validate_repository_inputs(
+                [
+                    corpus.RepositoryInput("rust", roots[0]),
+                    corpus.RepositoryInput("rust", roots[1]),
+                ]
+            )
+        self.assertEqual(refused.exception.code, "duplicate_repository_language")
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.validate_repository_inputs(
+                [
+                    corpus.RepositoryInput("rust", roots[0]),
+                    corpus.RepositoryInput("python", roots[0]),
+                ]
+            )
+        self.assertEqual(refused.exception.code, "duplicate_repository_root")
+
+    def test_handshake_failure_is_registered_and_cleaned_immediately(self) -> None:
+        workspace = self.root / "workspace-session"
+        state = self.root / "state-session"
+        workspace.mkdir()
+        state.mkdir()
+        sessions: list[Any] = []
+
+        class FailingSession:
+            close_calls = 0
+
+            def __init__(self, **arguments: Any):
+                self.label = arguments["label"]
+                self.environment = corpus._server_environment(
+                    arguments["state"], arguments["home"], arguments["temporary"]
+                )
+
+            def handshake(self, _name: str) -> None:
+                raise corpus.HarnessRefusal("handshake_failed", "injected")
+
+            def close_and_evidence(self) -> tuple[dict[str, Any], tuple[str, ...]]:
+                type(self).close_calls += 1
+                return {"cleanup_complete": True}, ()
+
+        with mock.patch.object(corpus, "CorpusMcpSession", FailingSession):
+            with self.assertRaises(corpus.HarnessRefusal) as refused:
+                corpus.start_session(
+                    self.root / "again",
+                    workspace,
+                    state,
+                    self.root,
+                    "failure",
+                    10,
+                    sessions,
+                )
+        self.assertEqual(refused.exception.code, "handshake_failed")
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(FailingSession.close_calls, 1)
+        self.assertTrue(refused.exception.cleanup_complete)
+
+    def test_process_group_cleanup_handles_an_exited_leader_with_descendant(self) -> None:
+        if os.name != "posix":
+            self.skipTest("process-group cleanup requires POSIX")
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])",
+            ),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        process.wait(timeout=5)
+        self.assertTrue(corpus._process_group_exists(process.pid))
+        corpus._terminate_process_group(process, process.pid)
+        self.assertFalse(corpus._process_group_exists(process.pid))
+
+    def test_session_allows_bounded_natural_process_group_teardown(self) -> None:
+        class ExitedProcess:
+            pid = 81
+            returncode = 0
+
+            def poll(self) -> int:
+                return 0
+
+        class FinishedThread:
+            def join(self, timeout: float) -> None:
+                self.timeout = timeout
+
+            def is_alive(self) -> bool:
+                return False
+
+        session = corpus.CorpusMcpSession.__new__(corpus.CorpusMcpSession)
+        session.label = "natural-exit"
+        session.argv = ("/pinned/again", "mcp", "serve")
+        session.process = ExitedProcess()
+        session.process_group = session.process.pid
+        session._stdin = io.BytesIO()
+        session._stdout = io.BytesIO()
+        session._stderr = io.BytesIO()
+        session._stderr_thread = FinishedThread()
+        session._stderr_capture = bytearray()
+        session._stderr_overflow = False
+        session.request_hashes = []
+        session.response_hashes = []
+        session._closed_record = None
+        with (
+            mock.patch.object(corpus, "_wait_for_process_group_exit", return_value=True),
+            mock.patch.object(corpus, "_process_group_exists", return_value=False),
+            mock.patch.object(corpus, "_terminate_process_group") as terminate,
+        ):
+            record, failures = session.close_and_evidence()
+        terminate.assert_not_called()
+        self.assertEqual(failures, ())
+        self.assertTrue(record["cleanup_complete"])
+
+    def test_pinned_executable_is_revalidated_after_mutation(self) -> None:
+        binary = self.root / "pinned-again"
+        binary.write_bytes(b"first executable bytes")
+        binary.chmod(0o500)
+        identity = corpus.pinned_executable_identity(binary)
+        corpus.verify_pinned_executable_unchanged(binary, identity)
+        binary.chmod(0o700)
+        binary.write_bytes(b"second executable bytes")
+        binary.chmod(0o500)
+        with self.assertRaises(corpus.HarnessRefusal) as refused:
+            corpus.verify_pinned_executable_unchanged(binary, identity)
+        self.assertEqual(refused.exception.code, "pinned_binary_changed")
+
+    def test_evidence_is_staged_before_atomic_no_replace_publication(self) -> None:
+        output = self.root / "staged-evidence.json"
+        real_link = os.link
+        observed = {"called": False}
+
+        def checked_link(source: str, target: str, **arguments: Any) -> None:
+            observed["called"] = True
+            self.assertFalse(output.exists())
+            self.assertTrue((output.parent / source).is_file())
+            real_link(source, target, **arguments)
+
+        with mock.patch.object(corpus.os, "link", side_effect=checked_link):
+            corpus.write_json_exclusive(output, {"stable": True})
+        self.assertTrue(observed["called"])
+        metadata = output.stat()
+        self.assertEqual(metadata.st_mode & 0o777, 0o600)
+        self.assertEqual(metadata.st_nlink, 1)
+
+    def test_effect_then_error_publication_removes_only_created_identity(self) -> None:
+        output = self.root / "ambiguous-evidence.json"
+        real_link = os.link
+
+        def link_then_error(source: str, target: str, **arguments: Any) -> None:
+            real_link(source, target, **arguments)
+            raise OSError("injected post-effect error")
+
+        with mock.patch.object(corpus.os, "link", side_effect=link_then_error):
+            with self.assertRaises(corpus.HarnessRefusal) as refused:
+                corpus.write_json_exclusive(output, {"never": "published"})
+        self.assertEqual(refused.exception.code, "output_publish")
+        self.assertTrue(refused.exception.cleanup_complete)
+        self.assertFalse(output.exists())
+        self.assertEqual(list(self.root.glob(".again-evidence-*.tmp")), [])
+
+    def test_refusal_retains_primary_and_independent_cleanup_codes(self) -> None:
+        refusal = corpus.HarnessRefusal(
+            "primary_failure",
+            "primary",
+            cleanup_complete=False,
+            cleanup_codes=("wait_failed", "stream_close_failed"),
+        )
+        record = corpus.refusal_record(corpus.RepositoryInput("go", self.root), refusal)
+        self.assertEqual(record["refusal"]["code"], "primary_failure")
+        self.assertFalse(record["cleanup"]["complete"])
+        self.assertEqual(record["cleanup"]["codes"], ["wait_failed", "stream_close_failed"])
 
     def test_records_contain_hashes_not_native_source_payloads(self) -> None:
         native = corpus.NativeObservation(
@@ -592,7 +809,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 repositories=[],
                 timeout_seconds=90,
             )
-        self.assertEqual(refused.exception.code, "repositories_missing")
+        self.assertEqual(refused.exception.code, "repository_count_bound")
 
     def test_refusal_record_is_explicitly_non_pass(self) -> None:
         requested = corpus.RepositoryInput("go", self.root)

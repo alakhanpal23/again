@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline, fail-closed real-repository corpus for the Again MCP binary.
+"""Network-avoiding, fail-closed real-repository corpus for the Again MCP binary.
 
 The harness accepts only explicit canonical repository roots.  It inspects them
 with read-only Git commands, copies a deterministic pair of tracked language
@@ -23,6 +23,8 @@ import json
 import os
 import pathlib
 import platform
+import secrets
+import signal
 import shutil
 import sqlite3
 import stat
@@ -38,7 +40,7 @@ from typing import Any
 SCHEMA = "again.agent-gateway-real-repository-corpus.v1"
 HARNESS_VERSION = "1.1.0"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-EXPECTED_DATABASE_SCHEMA = 7
+EXPECTED_DATABASE_SCHEMA = 9
 LANGUAGES = ("rust", "python", "go", "typescript")
 LANGUAGE_SUFFIXES = {
     "rust": (".rs",),
@@ -58,6 +60,8 @@ IRRELEVANT_MARKER = "AGAIN_REAL_CORPUS_IRRELEVANT_V1"
 CONCURRENT_MARKER = "AGAIN_REAL_CORPUS_CONCURRENT_V1"
 ORDER_MARKER = "AGAIN_REAL_CORPUS_ORDER_V1"
 MAX_EVIDENCE_BYTES = 8 * 1024 * 1024
+MAX_REPOSITORIES = len(LANGUAGES)
+PROCESS_STOP_SECONDS = 2.0
 
 
 def _load_sibling(name: str) -> Any:
@@ -78,9 +82,18 @@ gateway_support = _load_sibling("agent_gateway_product_e2e")
 class HarnessRefusal(RuntimeError):
     """Typed non-pass result; a refusal can never be reported as a pass."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        cleanup_complete: bool = True,
+        cleanup_codes: Sequence[str] = (),
+    ):
         super().__init__(message)
         self.code = code
+        self.cleanup_complete = cleanup_complete
+        self.cleanup_codes = tuple(cleanup_codes)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -100,6 +113,17 @@ class NativeObservation:
 class EventCursor:
     event_id: int
     started_ms: int
+
+
+@dataclasses.dataclass(frozen=True)
+class PinnedExecutableIdentity:
+    device: int
+    inode: int
+    mode: int
+    uid: int
+    gid: int
+    size: int
+    sha256: str
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -134,6 +158,68 @@ def sha256_file(path: pathlib.Path, maximum: int | None = None) -> str:
     return digest.hexdigest()
 
 
+def pinned_executable_identity(path: pathlib.Path) -> PinnedExecutableIdentity:
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as error:
+        raise HarnessRefusal("pinned_binary_changed", "cannot open pinned executable") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size <= 0
+            or metadata.st_size > repository_support.DEFAULT_LIMITS.max_binary_bytes
+            or metadata.st_mode & 0o111 == 0
+        ):
+            raise HarnessRefusal("pinned_binary_changed", "pinned executable metadata changed")
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            block = os.read(descriptor, 1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > repository_support.DEFAULT_LIMITS.max_binary_bytes:
+                raise HarnessRefusal("pinned_binary_changed", "pinned executable exceeds bound")
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    fields = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_uid,
+        value.st_gid,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if fields(metadata) != fields(after) or total != metadata.st_size:
+        raise HarnessRefusal("pinned_binary_changed", "pinned executable changed while hashing")
+    return PinnedExecutableIdentity(
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_size,
+        digest.hexdigest(),
+    )
+
+
+def verify_pinned_executable_unchanged(
+    path: pathlib.Path, expected: PinnedExecutableIdentity
+) -> None:
+    if pinned_executable_identity(path) != expected:
+        raise HarnessRefusal("pinned_binary_changed", "pinned executable changed during corpus")
+
+
 def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
     if not path.is_absolute() or path.resolve(strict=False) != path:
         raise HarnessRefusal("output_not_canonical", "evidence path must be absolute and canonical")
@@ -141,21 +227,180 @@ def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
     if len(encoded) > MAX_EVIDENCE_BYTES:
         raise HarnessRefusal("evidence_oversized", "evidence exceeds its fixed bound")
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError as error:
-        raise HarnessRefusal("output_exists", f"refusing to overwrite evidence: {path}") from error
+        directory = os.open(path.parent, directory_flags)
+    except OSError as error:
+        raise HarnessRefusal("output_directory", "cannot open evidence directory") from error
+    staging_name: str | None = None
+    staging_identity: tuple[int, int] | None = None
+    final_identity: tuple[int, int] | None = None
+    published = False
     try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(encoded)
-            output.flush()
-            os.fsync(output.fileno())
-    except BaseException:
+        for _ in range(16):
+            try:
+                staging_name = f".again-evidence-{secrets.token_hex(16)}.tmp"
+            except BaseException as error:
+                raise HarnessRefusal("output_staging_name", "cannot create staging name") from error
+            try:
+                descriptor = os.open(
+                    staging_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=directory,
+                )
+                initial = os.fstat(descriptor)
+                staging_identity = (initial.st_dev, initial.st_ino)
+                break
+            except FileExistsError:
+                staging_name = None
+        else:
+            raise HarnessRefusal("output_staging_exhausted", "cannot reserve evidence staging file")
         try:
-            path.unlink()
+            with os.fdopen(descriptor, "wb") as output:
+                output.write(encoded)
+                output.flush()
+                os.fsync(output.fileno())
+                metadata = os.fstat(output.fileno())
+                if (
+                    (metadata.st_dev, metadata.st_ino) != staging_identity
+                    or not stat.S_ISREG(metadata.st_mode)
+                    or stat.S_IMODE(metadata.st_mode) != 0o600
+                    or metadata.st_nlink != 1
+                    or metadata.st_size != len(encoded)
+                ):
+                    raise HarnessRefusal("output_staging_invalid", "staged evidence identity changed")
+        except BaseException:
+            raise
+
+        assert staging_name is not None and staging_identity is not None
+        try:
+            os.link(
+                staging_name,
+                path.name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+            published = True
+            final_identity = staging_identity
+        except FileExistsError as error:
+            raise HarnessRefusal("output_exists", f"refusing to overwrite evidence: {path}") from error
+        except OSError as error:
+            # Reconcile effect-then-error ambiguity without touching an
+            # unrelated final inode.
+            try:
+                observed = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+            except OSError:
+                observed = None
+            if observed is not None and (observed.st_dev, observed.st_ino) == staging_identity:
+                published = True
+                final_identity = staging_identity
+            raise HarnessRefusal("output_publish", "atomic evidence publication failed") from error
+
+        os.unlink(staging_name, dir_fd=directory)
+        staging_name = None
+        os.fsync(directory)
+        final_descriptor = os.open(
+            path.name,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory,
+        )
+        try:
+            final = os.fstat(final_descriptor)
+            digest = hashlib.sha256()
+            total = 0
+            while True:
+                block = os.read(final_descriptor, 1024 * 1024)
+                if not block:
+                    break
+                total += len(block)
+                if total > MAX_EVIDENCE_BYTES:
+                    raise HarnessRefusal("output_revalidation", "published evidence exceeds bound")
+                digest.update(block)
+            final_after = os.fstat(final_descriptor)
+        finally:
+            os.close(final_descriptor)
+        if (
+            (final.st_dev, final.st_ino) != final_identity
+            or (final_after.st_dev, final_after.st_ino) != final_identity
+            or (
+                final.st_mode,
+                final.st_nlink,
+                final.st_uid,
+                final.st_gid,
+                final.st_size,
+                final.st_mtime_ns,
+                final.st_ctime_ns,
+            )
+            != (
+                final_after.st_mode,
+                final_after.st_nlink,
+                final_after.st_uid,
+                final_after.st_gid,
+                final_after.st_size,
+                final_after.st_mtime_ns,
+                final_after.st_ctime_ns,
+            )
+            or not stat.S_ISREG(final.st_mode)
+            or stat.S_IMODE(final.st_mode) != 0o600
+            or final.st_nlink != 1
+            or total != len(encoded)
+            or digest.hexdigest() != sha256_bytes(encoded)
+        ):
+            raise HarnessRefusal("output_revalidation", "published evidence failed revalidation")
+    except BaseException as primary:
+        cleanup_complete = True
+        if staging_name is not None and staging_identity is not None:
+            try:
+                observed = os.stat(staging_name, dir_fd=directory, follow_symlinks=False)
+                if (observed.st_dev, observed.st_ino) == staging_identity:
+                    os.unlink(staging_name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_complete = False
+        if published and final_identity is not None:
+            try:
+                observed = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                if (observed.st_dev, observed.st_ino) == final_identity:
+                    os.unlink(path.name, dir_fd=directory)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                cleanup_complete = False
+        try:
+            os.fsync(directory)
         except OSError:
-            pass
-        raise
+            cleanup_complete = False
+        if isinstance(primary, HarnessRefusal):
+            combined_cleanup_complete = primary.cleanup_complete and cleanup_complete
+            combined_cleanup_codes = tuple(
+                dict.fromkeys(
+                    (
+                        *primary.cleanup_codes,
+                        *(() if cleanup_complete else ("output_cleanup",)),
+                    )
+                )
+            )
+            raise HarnessRefusal(
+                primary.code,
+                str(primary),
+                cleanup_complete=combined_cleanup_complete,
+                cleanup_codes=combined_cleanup_codes,
+            ) from primary
+        raise HarnessRefusal(
+            "output_write",
+            "evidence write failed",
+            cleanup_complete=cleanup_complete,
+            cleanup_codes=(() if cleanup_complete else ("output_cleanup",)),
+        ) from primary
+    finally:
+        os.close(directory)
 
 
 def validate_output_location(
@@ -659,6 +904,231 @@ def _server_environment(
     }
 
 
+def network_boundary_record() -> dict[str, Any]:
+    return {
+        "harness_clone_download_or_network_client_path": False,
+        "git_protocol_allowlist": "file",
+        "proxy_environment_redirected_to_loopback_refusal": True,
+        "network_namespace_sandbox": False,
+        "fresh_socket_creation_blocked": False,
+        "trusted_product_operations": ["repo.read", "repo.search"],
+    }
+
+
+def _process_group_exists(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _terminate_process_group(process: subprocess.Popen[bytes], process_group: int) -> None:
+    if _process_group_exists(process_group):
+        try:
+            os.killpg(process_group, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    if not _wait_for_process_group_exit(process_group, PROCESS_STOP_SECONDS):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+    try:
+        process.wait(timeout=PROCESS_STOP_SECONDS)
+    except subprocess.TimeoutExpired as error:
+        raise HarnessRefusal("process_leader_remaining", "MCP leader did not terminate") from error
+    if not _wait_for_process_group_exit(process_group, PROCESS_STOP_SECONDS):
+        raise HarnessRefusal("process_group_remaining", "MCP process group did not terminate")
+
+
+class CorpusMcpSession(gateway_support.McpSession):
+    """Product protocol session with corpus-owned whole-group cleanup."""
+
+    def __init__(
+        self,
+        *,
+        binary: pathlib.Path,
+        workspace: pathlib.Path,
+        state: pathlib.Path,
+        home: pathlib.Path,
+        temporary: pathlib.Path,
+        label: str,
+        timeout_seconds: float,
+    ) -> None:
+        self.label = label
+        self.timeout_seconds = timeout_seconds
+        self.argv = (
+            str(binary),
+            "mcp",
+            "serve",
+            "--workspace",
+            str(workspace),
+            "--authorization-scope",
+            "again-real-repository-corpus:shared-v1",
+        )
+        self.environment = _server_environment(state, home, temporary)
+        try:
+            self.process = subprocess.Popen(
+                self.argv,
+                cwd=workspace,
+                env=self.environment,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise HarnessRefusal("process_launch", "MCP process did not launch") from error
+        self.process_group = self.process.pid
+        if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
+            cleanup_codes: list[str] = []
+            try:
+                _terminate_process_group(self.process, self.process_group)
+            except HarnessRefusal as cleanup:
+                cleanup_codes.append(cleanup.code)
+            for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        cleanup_codes.append("pipe_close")
+            raise HarnessRefusal(
+                "process_pipe_failure",
+                "MCP pipes were not created",
+                cleanup_complete=not cleanup_codes,
+                cleanup_codes=tuple(dict.fromkeys(cleanup_codes)),
+            )
+        self._stdin = self.process.stdin
+        self._stdout = self.process.stdout
+        self._stderr = self.process.stderr
+        self._stdout_buffer = bytearray()
+        self._stderr_capture = bytearray()
+        self._stderr_overflow = False
+        self._write_lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self.request_hashes: list[str] = []
+        self.response_hashes: list[str] = []
+        self.advertised_tools: set[str] = set()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        try:
+            self._stderr_thread.start()
+        except BaseException as primary:
+            cleanup_codes = []
+            try:
+                _terminate_process_group(self.process, self.process_group)
+            except HarnessRefusal as cleanup:
+                cleanup_codes.append(cleanup.code)
+            for stream in (self._stdin, self._stdout, self._stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    cleanup_codes.append("pipe_close")
+            raise HarnessRefusal(
+                "stderr_thread_start",
+                "MCP stderr drain did not start",
+                cleanup_complete=not cleanup_codes,
+                cleanup_codes=tuple(dict.fromkeys(cleanup_codes)),
+            ) from primary
+        self._closed_record: dict[str, Any] | None = None
+
+    def close_and_evidence(self) -> tuple[dict[str, Any], tuple[str, ...]]:
+        if self._closed_record is not None:
+            return dict(self._closed_record), ()
+        failures: list[str] = []
+        if not self._stdin.closed:
+            try:
+                self._stdin.close()
+            except (BrokenPipeError, OSError):
+                failures.append("stdin_close")
+        if self.process.poll() is None:
+            try:
+                self.process.wait(timeout=PROCESS_STOP_SECONDS)
+            except subprocess.TimeoutExpired:
+                failures.append("leader_grace_timeout")
+        if self.process.poll() is not None:
+            # A just-reaped leader can leave a short-lived process-group view
+            # while the kernel finishes accounting for the final member. Give
+            # a naturally exiting group one bounded grace period before
+            # signaling it or classifying it as descendant-bearing evidence.
+            descendants_observed = not _wait_for_process_group_exit(
+                self.process_group, PROCESS_STOP_SECONDS
+            )
+        else:
+            descendants_observed = _process_group_exists(self.process_group)
+        if descendants_observed:
+            try:
+                _terminate_process_group(self.process, self.process_group)
+            except HarnessRefusal as error:
+                failures.append(error.code)
+            if self.process.poll() is not None and self.process.returncode == 0:
+                failures.append("process_group_descendant")
+        for name, stream in (
+            ("stdin", self._stdin),
+            ("stdout", self._stdout),
+            ("stderr", self._stderr),
+        ):
+            if not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    failures.append(f"{name}_close")
+        self._stderr_thread.join(timeout=PROCESS_STOP_SECONDS)
+        if self._stderr_thread.is_alive():
+            failures.append("stderr_drain_timeout")
+        if self._stderr_overflow:
+            failures.append("stderr_oversized")
+        return_code = self.process.poll()
+        group_reaped = not _process_group_exists(self.process_group)
+        streams_closed = all(stream.closed for stream in (self._stdin, self._stdout, self._stderr))
+        cleanup_complete = (
+            return_code is not None
+            and group_reaped
+            and streams_closed
+            and not self._stderr_thread.is_alive()
+        )
+        record = {
+            "label": self.label,
+            "argv": list(self.argv),
+            "pid": self.process.pid,
+            "return_code": return_code,
+            "process_group_reaped": group_reaped,
+            "stderr_complete": not self._stderr_thread.is_alive() and not self._stderr_overflow,
+            "cleanup_complete": cleanup_complete,
+            "stdout": {
+                "frame_count": len(self.response_hashes),
+                "response_sha256": list(self.response_hashes),
+            },
+            "stderr": {
+                "bytes": len(self._stderr_capture),
+                "sha256": sha256_bytes(bytes(self._stderr_capture)),
+                "truncated": self._stderr_overflow,
+            },
+            "request_sha256": list(self.request_hashes),
+        }
+        if cleanup_complete:
+            self._closed_record = dict(record)
+        return record, tuple(dict.fromkeys(failures))
+
+
 def start_session(
     binary: pathlib.Path,
     workspace: pathlib.Path,
@@ -666,28 +1136,43 @@ def start_session(
     root: pathlib.Path,
     label: str,
     timeout_seconds: float,
+    sessions: list[CorpusMcpSession],
 ) -> Any:
     home = root / f"home-{label}"
     temporary = root / f"tmp-{label}"
     home.mkdir(mode=0o700)
     temporary.mkdir(mode=0o700)
-    session = gateway_support.McpSession(
+    session = CorpusMcpSession(
         binary=binary,
         workspace=workspace,
-        again_home=state,
+        state=state,
         home=home,
         temporary=temporary,
-        authorization_scope="again-real-repository-corpus:shared-v1",
         label=label,
         timeout_seconds=timeout_seconds,
     )
-    # McpSession constructs the same environment internally.  Verify the
-    # complete offline boundary rather than relying on inherited variables.
-    expected = _server_environment(state, home, temporary)
-    if session.environment != expected:
-        session.close()
-        raise HarnessRefusal("server_environment", "MCP server environment is not isolated")
-    session.handshake(f"again-real-repository-corpus-{label}")
+    sessions.append(session)
+    try:
+        expected = _server_environment(state, home, temporary)
+        if session.environment != expected:
+            raise HarnessRefusal("server_environment", "MCP server environment is not isolated")
+        session.handshake(f"again-real-repository-corpus-{label}")
+    except BaseException as primary:
+        cleanup_record, cleanup_codes = session.close_and_evidence()
+        cleanup_complete = bool(cleanup_record.get("cleanup_complete"))
+        if isinstance(primary, HarnessRefusal):
+            raise HarnessRefusal(
+                primary.code,
+                str(primary),
+                cleanup_complete=cleanup_complete,
+                cleanup_codes=cleanup_codes,
+            ) from primary
+        raise HarnessRefusal(
+            "session_handshake",
+            "MCP session handshake failed",
+            cleanup_complete=cleanup_complete,
+            cleanup_codes=cleanup_codes,
+        ) from primary
     return session
 
 
@@ -796,11 +1281,38 @@ def reconcile_gateway_counters(totals: Mapping[str, int]) -> dict[str, int]:
     return counters
 
 
-def process_evidence(sessions: Sequence[Any]) -> list[dict[str, Any]]:
-    records = [session.evidence() for session in sessions]
+def process_evidence(
+    records: Sequence[Mapping[str, Any]],
+    expected_labels: Sequence[str],
+    expected_binary: pathlib.Path | None = None,
+) -> list[dict[str, Any]]:
+    records = [dict(record) for record in records]
     labels = [record.get("label") for record in records]
     pids = [record.get("pid") for record in records]
-    if len(set(labels)) != len(labels) or len(set(pids)) != len(pids):
+    if (
+        labels != list(expected_labels)
+        or len(set(labels)) != len(labels)
+        or len(set(pids)) != len(pids)
+        or any(not isinstance(pid, int) or pid <= 0 for pid in pids)
+        or any(
+            record.get("return_code") != 0
+            or not isinstance(record.get("return_code"), int)
+            or isinstance(record.get("return_code"), bool)
+            for record in records
+        )
+        or any(record.get("process_group_reaped") is not True for record in records)
+        or any(record.get("stderr_complete") is not True for record in records)
+        or any(record.get("cleanup_complete") is not True for record in records)
+        or (
+            expected_binary is not None
+            and any(
+                not isinstance(record.get("argv"), list)
+                or not record["argv"]
+                or record["argv"][0] != str(expected_binary)
+                for record in records
+            )
+        )
+    ):
         raise HarnessRefusal("process_ledger", "MCP process ledger is not one-to-one")
     return records
 
@@ -876,14 +1388,31 @@ def run_repository(
     state = temporary_root / f"state-{snapshot.language}"
     state.mkdir(mode=0o700)
     prepared = prepare_workspace(snapshot, workspace)
-    sessions: list[Any] = []
+    sessions: list[CorpusMcpSession] = []
     scenarios: dict[str, Any] = {}
     false_hits = 0
     started_ns = time.perf_counter_ns()
+    report: dict[str, Any] | None = None
+    primary_error: BaseException | None = None
     try:
-        first = start_session(binary, workspace, state, temporary_root, f"{snapshot.language}-a", timeout_seconds)
-        second = start_session(binary, workspace, state, temporary_root, f"{snapshot.language}-b", timeout_seconds)
-        sessions.extend((first, second))
+        first = start_session(
+            binary,
+            workspace,
+            state,
+            temporary_root,
+            f"{snapshot.language}-a",
+            timeout_seconds,
+            sessions,
+        )
+        second = start_session(
+            binary,
+            workspace,
+            state,
+            temporary_root,
+            f"{snapshot.language}-b",
+            timeout_seconds,
+            sessions,
+        )
         audit = GatewayAudit(state / "again.sqlite")
 
         first_path = prepared["first_path"]
@@ -971,11 +1500,23 @@ def run_repository(
             raise HarnessRefusal("later_reuse_identity", "later reuse selected another result")
         scenarios["later_reuse"] = later
 
-        second.close()
+        _second_record, second_failures = second.close_and_evidence()
+        if second_failures:
+            raise HarnessRefusal(
+                "process_cleanup",
+                "retired MCP session did not close cleanly",
+                cleanup_complete=False,
+                cleanup_codes=second_failures,
+            )
         restarted = start_session(
-            binary, workspace, state, temporary_root, f"{snapshot.language}-restarted", timeout_seconds
+            binary,
+            workspace,
+            state,
+            temporary_root,
+            f"{snapshot.language}-restarted",
+            timeout_seconds,
+            sessions,
         )
-        sessions.append(restarted)
         restart = run_verified_call(
             restarted,
             audit,
@@ -1220,7 +1761,7 @@ def run_repository(
         counters = {**reconcile_gateway_counters(totals), "false_hits": false_hits}
         if counters["false_hits"] != 0:
             raise HarnessRefusal("false_hits", "one or more reuse results were incorrect")
-        return {
+        report = {
             "outcome": "pass",
             "language": snapshot.language,
             "repository": {
@@ -1238,17 +1779,56 @@ def run_repository(
             "gateway_event_totals": totals,
             "counters": counters,
             "elapsed_ms": (time.perf_counter_ns() - started_ns) / 1_000_000,
-            "processes": process_evidence(sessions),
         }
-    finally:
-        failures: list[str] = []
-        for session in reversed(sessions):
-            try:
-                session.close()
-            except BaseException as error:
-                failures.append(str(error))
-        if failures and sys.exc_info()[0] is None:
-            raise HarnessRefusal("process_cleanup", "; ".join(failures))
+    except BaseException as error:
+        primary_error = error
+
+    cleanup_records_by_pid: dict[int, dict[str, Any]] = {}
+    cleanup_codes: list[str] = []
+    cleanup_complete = True
+    for session in reversed(sessions):
+        try:
+            record, failures = session.close_and_evidence()
+        except BaseException:
+            cleanup_complete = False
+            cleanup_codes.append("cleanup_internal")
+            continue
+        cleanup_records_by_pid[session.process.pid] = record
+        cleanup_codes.extend(failures)
+        cleanup_complete = cleanup_complete and bool(record.get("cleanup_complete"))
+
+    if primary_error is not None:
+        if isinstance(primary_error, HarnessRefusal):
+            combined_codes = (*primary_error.cleanup_codes, *dict.fromkeys(cleanup_codes))
+            raise HarnessRefusal(
+                primary_error.code,
+                str(primary_error),
+                cleanup_complete=primary_error.cleanup_complete and cleanup_complete,
+                cleanup_codes=combined_codes,
+            ) from primary_error
+        raise HarnessRefusal(
+            "repository_run_internal",
+            "repository corpus run failed",
+            cleanup_complete=cleanup_complete,
+            cleanup_codes=tuple(dict.fromkeys(cleanup_codes)),
+        ) from primary_error
+    if cleanup_codes or not cleanup_complete:
+        raise HarnessRefusal(
+            "process_cleanup",
+            "one or more MCP sessions did not clean up",
+            cleanup_complete=cleanup_complete,
+            cleanup_codes=tuple(dict.fromkeys(cleanup_codes)),
+        )
+    if report is None:
+        raise HarnessRefusal("repository_run_internal", "repository report was not constructed")
+    ordered_records = [cleanup_records_by_pid[session.process.pid] for session in sessions]
+    labels = (
+        f"{snapshot.language}-a",
+        f"{snapshot.language}-b",
+        f"{snapshot.language}-restarted",
+    )
+    report["processes"] = process_evidence(ordered_records, labels, binary)
+    return report
 
 
 def repository_record(snapshot: Any) -> dict[str, Any]:
@@ -1269,7 +1849,38 @@ def refusal_record(repository: RepositoryInput, error: HarnessRefusal) -> dict[s
         "language": repository.language,
         "repository_root": str(repository.root),
         "refusal": {"code": error.code, "detail": str(error)},
+        "cleanup": {
+            "complete": error.cleanup_complete,
+            "codes": list(error.cleanup_codes),
+        },
     }
+
+
+def validate_repository_inputs(repositories: Sequence[RepositoryInput]) -> None:
+    if not 1 <= len(repositories) <= MAX_REPOSITORIES:
+        raise HarnessRefusal(
+            "repository_count_bound",
+            f"repository count must be within 1..={MAX_REPOSITORIES}",
+        )
+    languages: set[str] = set()
+    roots: set[pathlib.Path] = set()
+    for repository in repositories:
+        try:
+            canonical = repository.root.resolve(strict=True)
+        except OSError as error:
+            raise HarnessRefusal("repository_unavailable", "repository root is unavailable") from error
+        if canonical != repository.root or not canonical.is_dir():
+            raise HarnessRefusal("repository_not_canonical", "repository root is not canonical")
+        if repository.language in languages:
+            raise HarnessRefusal(
+                "duplicate_repository_language", "each language may be supplied only once"
+            )
+        if canonical in roots:
+            raise HarnessRefusal(
+                "duplicate_repository_root", "each repository root may be supplied only once"
+            )
+        languages.add(repository.language)
+        roots.add(canonical)
 
 
 def evaluate(
@@ -1282,10 +1893,13 @@ def evaluate(
 ) -> dict[str, Any]:
     if not again_binary.is_absolute() or not source_root.is_absolute():
         raise HarnessRefusal("path_not_absolute", "binary and source root must be absolute")
+    if os.name != "posix" or not hasattr(os, "killpg"):
+        raise HarnessRefusal(
+            "unsupported_process_group", "whole-process-group cleanup requires POSIX"
+        )
     if timeout_seconds < 10 or timeout_seconds > 300:
         raise HarnessRefusal("timeout_bound", "timeout must be within 10..=300 seconds")
-    if not repositories:
-        raise HarnessRefusal("repositories_missing", "at least one explicit repository is required")
+    validate_repository_inputs(repositories)
     harness = pathlib.Path(__file__).resolve()
     sibling_hashes = {
         path.name: sha256_file(path)
@@ -1321,22 +1935,22 @@ def evaluate(
             if hasattr(error, "code"):
                 raise _translate_support_refusal(error) from error
             raise
+        pinned_identity = pinned_executable_identity(pinned.executable)
         for repository, snapshot in snapshots:
             before = snapshot_identity(snapshot)
             try:
-                reports.append(
-                    run_repository(
-                        binary=pinned.executable,
-                        snapshot=snapshot,
-                        temporary_root=root / f"run-{len(reports)}",
-                        timeout_seconds=timeout_seconds,
-                    )
+                repository_report = run_repository(
+                    binary=pinned.executable,
+                    snapshot=snapshot,
+                    temporary_root=root / f"run-{len(reports)}",
+                    timeout_seconds=timeout_seconds,
                 )
                 after = inspect_input_repository(repository)
                 if snapshot_identity(after) != before:
                     raise HarnessRefusal(
                         "source_changed_during_run", "source repository changed during the corpus"
                     )
+                reports.append(repository_report)
             except HarnessRefusal as error:
                 reports.append(refusal_record(repository, error))
         try:
@@ -1345,10 +1959,12 @@ def evaluate(
             if hasattr(error, "code"):
                 raise _translate_support_refusal(error) from error
             raise
+        verify_pinned_executable_unchanged(pinned.executable, pinned_identity)
         binary_record = {
             "requested_path": str(pinned.source),
             "sha256": pinned.sha256,
             "bytes": pinned.size,
+            "executed_copy_revalidated": True,
         }
     if sibling_hashes != {
         path.name: sha256_file(path)
@@ -1379,7 +1995,7 @@ def evaluate(
         "schema": SCHEMA,
         "harness_version": HARNESS_VERSION,
         "outcome": "pass" if passed and non_pass == 0 else "non_pass",
-        "offline": True,
+        "network_boundary": network_boundary_record(),
         "source_repositories_read_only": True,
         "binary": binary_record,
         "again_source": source,
@@ -1448,6 +2064,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "schema": SCHEMA,
             "outcome": "non_pass",
             "refusal": {"code": error.code, "detail": str(error)},
+            "cleanup": {
+                "complete": error.cleanup_complete,
+                "codes": list(error.cleanup_codes),
+            },
         }
         try:
             write_json_exclusive(output, refusal)
