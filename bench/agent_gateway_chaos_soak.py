@@ -840,7 +840,7 @@ def _exact_probe(
                 raise HarnessRefusal("exact_result", "repo.read did not return a result")
             expected = {
                 "content": [{"type": "text", "text": "chaos fixture\n"}],
-                "structuredContent": {"path": "README.md", "bytes": 14},
+                "structuredContent": {"schemaVersion": 1, "path": "README.md", "bytes": 14},
             }
             if product.result_without_reference(result) != expected:
                 raise HarnessRefusal("exact_result", "repo.read result bytes changed")
