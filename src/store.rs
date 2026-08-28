@@ -4772,6 +4772,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "DROP TABLE gateway_deliveries;
+                     DROP TABLE gateway_delivery_receipts;
                      DROP TABLE result_dependencies;
                      DROP TABLE gateway_results;
                      DROP TABLE gateway_request_dependencies;
