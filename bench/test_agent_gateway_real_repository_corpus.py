@@ -504,7 +504,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 reason TEXT,
                 created_ms INTEGER NOT NULL
             );
-            PRAGMA user_version=9;
+            PRAGMA user_version=10;
             """
         )
         now = int(corpus.time.time() * 1000)

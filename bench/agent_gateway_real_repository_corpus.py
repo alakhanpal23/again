@@ -40,7 +40,7 @@ from typing import Any
 SCHEMA = "again.agent-gateway-real-repository-corpus.v1"
 HARNESS_VERSION = "1.1.0"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-EXPECTED_DATABASE_SCHEMA = 9
+EXPECTED_DATABASE_SCHEMA = 10
 LANGUAGES = ("rust", "python", "go", "typescript")
 LANGUAGE_SUFFIXES = {
     "rust": (".rs",),
