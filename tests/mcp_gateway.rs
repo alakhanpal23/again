@@ -826,7 +826,7 @@ fn canonical_translation_digest_binds_every_declared_identity_dimension() {
 }
 
 #[test]
-fn provider_error_is_forwarded_exactly() {
+fn opaque_provider_error_preserves_only_a_safe_numeric_diagnostic() {
     let upstream = McpError {
         code: -31_777,
         message: "provider-specific".into(),
@@ -834,7 +834,7 @@ fn provider_error_is_forwarded_exactly() {
     };
     let provider = Arc::new(
         FakeProvider::new("fake", vec![tool("fail")])
-            .with_result(Err(ProviderError(upstream.clone()))),
+            .with_result(Err(ProviderError::opaque(upstream.clone()))),
     );
     let gateway = gateway(provider);
     initialize(&gateway);
@@ -846,11 +846,22 @@ fn provider_error_is_forwarded_exactly() {
         }),
         &context("logical:error"),
     );
-    assert_eq!(response["error"], serde_json::to_value(upstream).unwrap());
+    assert_eq!(
+        response["error"]["code"],
+        McpErrorCode::InternalError as i64
+    );
+    assert_eq!(
+        response["error"]["message"],
+        "tool provider rejected the request"
+    );
+    assert_eq!(response["error"]["data"]["reason"], "provider_error");
+    assert_eq!(response["error"]["data"]["providerCode"], upstream.code);
+    assert!(!response.to_string().contains("provider-specific"));
+    assert!(!response.to_string().contains("opaque"));
 }
 
 #[test]
-fn oversized_or_deep_provider_errors_become_payload_free_limit_refusals() {
+fn oversized_or_deep_opaque_provider_errors_are_redacted_before_validation() {
     let mut deep_data = json!({ "must_not_escape": true });
     for _ in 0..GatewayLimits::default().max_result_depth {
         deep_data = json!({ "nested": deep_data });
@@ -868,7 +879,8 @@ fn oversized_or_deep_provider_errors_become_payload_free_limit_refusals() {
         },
     ] {
         let provider = Arc::new(
-            FakeProvider::new("fake", vec![tool("fail")]).with_result(Err(ProviderError(upstream))),
+            FakeProvider::new("fake", vec![tool("fail")])
+                .with_result(Err(ProviderError::opaque(upstream.clone()))),
         );
         let gateway = McpGateway::new(
             vec![ProviderRegistration::untrusted(provider)],
@@ -886,10 +898,12 @@ fn oversized_or_deep_provider_errors_become_payload_free_limit_refusals() {
         );
         assert_eq!(
             response["error"]["code"],
-            McpErrorCode::LimitExceeded as i64
+            McpErrorCode::InternalError as i64
         );
-        assert!(response["error"].get("data").is_none());
+        assert_eq!(response["error"]["data"]["reason"], "provider_error");
+        assert_eq!(response["error"]["data"]["providerCode"], upstream.code);
         assert!(!response.to_string().contains("must_not_escape"));
+        assert!(!response.to_string().contains(&"x".repeat(128)));
     }
 }
 
@@ -917,7 +931,57 @@ fn malformed_oversized_deep_node_heavy_and_duplicate_input_are_rejected() {
         Err(GatewayInputError::DuplicateKey)
     );
 
+    let malformed: Value = serde_json::from_slice(
+        &gateway
+            .process_bytes(
+                br#"{"jsonrpc":"2.0",]"#,
+                &context("logical:malformed-diagnostic"),
+                EphemeralSecrets::empty(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(malformed["error"]["data"]["reason"], "malformed_json");
+
+    let duplicate: Value = serde_json::from_slice(
+        &gateway
+            .process_bytes(
+                br#"{"jsonrpc":"2.0","id":1,"method":"ping","secret-key":1,"secret-key":2}"#,
+                &context("logical:duplicate-diagnostic"),
+                EphemeralSecrets::empty(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(duplicate["error"]["data"]["reason"], "duplicate_json_key");
+    assert!(!duplicate.to_string().contains("secret-key"));
+
+    let oversized: Value = serde_json::from_slice(
+        &gateway
+            .process_bytes(
+                &vec![b'x'; 513],
+                &context("logical:oversized-diagnostic"),
+                EphemeralSecrets::empty(),
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(oversized["error"]["data"]["reason"], "message_too_large");
+    assert_eq!(oversized["error"]["data"]["limitBytes"], 512);
+    assert_eq!(oversized["error"]["data"]["actualBytes"], 513);
+
     initialize(&gateway);
+    let unknown = invoke(
+        &gateway,
+        json!({
+            "jsonrpc":"2.0", "id": 20, "method":"tools/call",
+            "params":{"name":"secret-provider.secret-tool","arguments":{}}
+        }),
+        &context("logical:unknown-tool"),
+    );
+    assert_eq!(unknown["error"]["data"]["reason"], "unknown_tool");
+    assert!(!unknown.to_string().contains("secret-provider"));
+
     let deep = invoke(
         &gateway,
         json!({
@@ -976,7 +1040,7 @@ fn cancellation_propagates_to_the_matching_physical_attempt() {
     };
     let provider = Arc::new(
         FakeProvider::new("fake", vec![tool("wait")])
-            .with_result(Err(ProviderError(cancelled.clone())))
+            .with_result(Err(ProviderError::opaque(cancelled.clone())))
             .blocking(Arc::clone(&block)),
     );
     let gateway = Arc::new(gateway(Arc::clone(&provider)));
@@ -1033,7 +1097,14 @@ fn cancellation_propagates_to_the_matching_physical_attempt() {
     assert!(notification.is_none());
 
     let response = call_thread.join().unwrap();
-    assert_eq!(response["error"], serde_json::to_value(cancelled).unwrap());
+    assert_eq!(
+        response["error"]["code"],
+        McpErrorCode::RequestCancelled as i64
+    );
+    assert_eq!(response["error"]["data"]["reason"], "provider_cancelled");
+    assert_eq!(response["error"]["data"]["providerCode"], cancelled.code);
+    assert!(!response.to_string().contains("cancelled upstream"));
+    assert!(!response.to_string().contains("fake"));
     let calls = provider.calls.lock().unwrap();
     let cancellations = provider.cancellations.lock().unwrap();
     assert_eq!(cancellations.len(), 1);
@@ -1480,7 +1551,7 @@ fn stdio_reads_cancellation_while_the_provider_call_is_running() {
     };
     let provider = Arc::new(
         FakeProvider::new("fake", vec![tool("wait")])
-            .with_result(Err(ProviderError(cancelled.clone())))
+            .with_result(Err(ProviderError::opaque(cancelled.clone())))
             .blocking(Arc::clone(&block)),
     );
     let gateway = gateway(Arc::clone(&provider));
@@ -1512,7 +1583,12 @@ fn stdio_reads_cancellation_while_the_provider_call_is_running() {
         .iter()
         .find(|response| response["id"] == "running")
         .unwrap();
-    assert_eq!(running["error"], serde_json::to_value(cancelled).unwrap());
+    assert_eq!(
+        running["error"]["code"],
+        McpErrorCode::RequestCancelled as i64
+    );
+    assert_eq!(running["error"]["data"]["reason"], "provider_cancelled");
+    assert!(!running.to_string().contains("cancelled upstream"));
     assert!(
         responses
             .iter()

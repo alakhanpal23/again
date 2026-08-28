@@ -569,10 +569,13 @@ impl GatewayControlledProviderV1 {
                     let loaded =
                         self.load_exact(resolved, &gateway_result_id, call)
                             .map_err(|_| {
-                                ProviderError(McpError::typed(
-                                    McpErrorCode::InternalError,
-                                    "verified gateway result became unavailable",
-                                ))
+                                ProviderError::gateway_authored(
+                                    McpError::typed(
+                                        McpErrorCode::InternalError,
+                                        "verified gateway result became unavailable",
+                                    )
+                                    .with_data(json!({ "reason": "verified_result_unavailable" })),
+                                )
                             });
                     if matches!(loaded, Ok(Some(_))) {
                         let _ = self
@@ -1507,25 +1510,35 @@ fn now_millis_i64_v1() -> i64 {
 
 fn invalid_arguments_v1(error: impl std::fmt::Display) -> ProviderError {
     let _ = error;
-    ProviderError(McpError::typed(
-        McpErrorCode::InvalidParams,
-        "invalid repository tool arguments",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(
+            McpErrorCode::InvalidParams,
+            "invalid repository tool arguments",
+        )
+        .with_data(json!({
+            "reason": "invalid_repository_arguments",
+            "hint": "Check this tool's inputSchema from tools/list"
+        })),
+    )
 }
 
 fn provider_io_v1(error: impl std::fmt::Display) -> ProviderError {
     let _ = error;
-    ProviderError(McpError::typed(
-        McpErrorCode::InternalError,
-        "repository observation failed",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(McpErrorCode::InternalError, "repository observation failed").with_data(
+            json!({
+                "reason": "repository_observation_failed",
+                "retryable": true
+            }),
+        ),
+    )
 }
 
 fn cancelled_provider_error_v1() -> ProviderError {
-    ProviderError(McpError::typed(
-        McpErrorCode::RequestCancelled,
-        "gateway call cancelled",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(McpErrorCode::RequestCancelled, "gateway call cancelled")
+            .with_data(json!({ "reason": "gateway_call_cancelled" })),
+    )
 }
 
 #[cfg(test)]

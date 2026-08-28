@@ -1444,6 +1444,19 @@ def run_product_e2e(
             }
             false_hit_cases.append({"classification": "crashed", "published": False})
 
+            # Resolve the CAS digest while the recovered gateway still owns a
+            # live SQLite connection. After an intentionally killed writer,
+            # reopening a WAL database read-only may require recovery and can
+            # fail even though the database bytes are intact. The digest is
+            # metadata only; the subsequent copy still happens after every
+            # gateway process is stopped.
+            current_result_id = result_id(recovery_result)
+            if current_result_id is None:
+                raise HarnessRefusal(
+                    "result_reference_missing", "recovery result has no current result ID"
+                )
+            stdout_digest = reader.stdout_digest_for_result(current_result_id)
+
             # Stop all primary processes before making a consistent byte-for-byte copy.
             restarted.close()
             for session in sessions:
@@ -1452,12 +1465,6 @@ def run_product_e2e(
             # 9: corrupt only the copied evidence state; output must be recomputed.
             copied_state = root / "corrupted-state-copy"
             shutil.copytree(state, copied_state, copy_function=shutil.copy2)
-            current_result_id = result_id(recovery_result)
-            if current_result_id is None:
-                raise HarnessRefusal(
-                    "result_reference_missing", "recovery result has no current result ID"
-                )
-            stdout_digest = reader.stdout_digest_for_result(current_result_id)
             corruption = corrupt_copied_blob(copied_state, stdout_digest)
             corrupt_reader = GatewayEvents(copied_state / "again.sqlite")
             corrupt_session = _session(

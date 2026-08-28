@@ -355,10 +355,10 @@ pub(super) fn execute_repository_tool_v1(
         "glob" => repository_glob_v1(epoch, arguments),
         "references" => repository_references_v1(epoch, arguments),
         "manifest" => repository_manifest_v1(epoch, arguments),
-        _ => Err(ProviderError(McpError::typed(
-            McpErrorCode::MethodNotFound,
-            "unknown repository tool",
-        ))),
+        _ => Err(ProviderError::gateway_authored(
+            McpError::typed(McpErrorCode::MethodNotFound, "unknown repository tool")
+                .with_data(json!({ "reason": "unknown_repository_tool" })),
+        )),
     }
 }
 
@@ -774,10 +774,10 @@ pub(super) fn execute_git_tool_v1(
         "log" => git_log_v1(epoch, arguments),
         "show" => git_show_v1(epoch, arguments),
         "blame" => git_blame_v1(epoch, arguments),
-        _ => Err(ProviderError(McpError::typed(
-            McpErrorCode::MethodNotFound,
-            "unknown Git tool",
-        ))),
+        _ => Err(ProviderError::gateway_authored(
+            McpError::typed(McpErrorCode::MethodNotFound, "unknown Git tool")
+                .with_data(json!({ "reason": "unknown_git_tool" })),
+        )),
     }
 }
 
@@ -1490,7 +1490,10 @@ fn ensure_deadline_v1(deadline: Instant) -> Result<(), ProviderError> {
 }
 
 fn limit_error_v1(message: &'static str) -> ProviderError {
-    ProviderError(McpError::typed(McpErrorCode::LimitExceeded, message))
+    ProviderError::gateway_authored(
+        McpError::typed(McpErrorCode::LimitExceeded, message)
+            .with_data(json!({ "reason": "repository_limit_exceeded" })),
+    )
 }
 
 fn is_identifier_byte_v1(byte: u8) -> bool {

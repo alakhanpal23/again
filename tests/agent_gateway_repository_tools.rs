@@ -82,6 +82,35 @@ fn git(root: &Path, arguments: &[&str]) -> String {
 }
 
 #[test]
+fn repository_refusals_are_actionable_without_echoing_sensitive_paths() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "visible.txt", "public\n");
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+
+    let secret_path = "customer-secrets/private-token.txt";
+    let response = call(
+        server.gateway(),
+        2,
+        "repo.read",
+        json!({ "path": secret_path }),
+    );
+    assert_eq!(response["error"]["code"], -32_602);
+    assert_eq!(
+        response["error"]["data"]["reason"],
+        "invalid_repository_arguments"
+    );
+    assert!(
+        response["error"]["data"]["hint"]
+            .as_str()
+            .unwrap()
+            .contains("tools/list")
+    );
+    assert!(!response.to_string().contains(secret_path));
+    assert!(!format!("{response:?}").contains("private-token"));
+}
+
+#[test]
 fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable() {
     let workspace = TempDir::new().unwrap();
     write(
