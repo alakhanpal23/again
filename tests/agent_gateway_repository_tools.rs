@@ -230,11 +230,23 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
         json!([]),
         "{clean_status}"
     );
+    let before_config_change = server.stats().unwrap();
     git(workspace.path(), &["config", "diff.algorithm", "histogram"]);
     let configured_status = call(server.gateway(), 181, "git.status", json!({ "path": "." }));
-    assert_ne!(
-        clean_status["result"]["_meta"]["again"]["resultId"],
-        configured_status["result"]["_meta"]["again"]["resultId"]
+    assert_eq!(
+        configured_status["result"]["structuredContent"]["entries"],
+        json!([]),
+        "{configured_status}"
+    );
+    let after_config_change = server.stats().unwrap();
+    assert_eq!(
+        after_config_change.executed,
+        before_config_change.executed + 1,
+        "a repository-control mutation must execute instead of reusing: before={before_config_change:?} after={after_config_change:?}"
+    );
+    assert_eq!(
+        after_config_change.exact_hits, before_config_change.exact_hits,
+        "a repository-control mutation must not count as an exact hit: before={before_config_change:?} after={after_config_change:?}"
     );
     let log = call(server.gateway(), 19, "git.log", json!({ "maxResults": 10 }));
     assert_eq!(
