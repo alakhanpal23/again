@@ -326,8 +326,8 @@ pub enum McpErrorCode {
     RequestCancelled = -32_800,
 }
 
-/// JSON-RPC/MCP error object.  Provider errors use this same type and are
-/// forwarded without code, message, or data rewriting.
+/// JSON-RPC/MCP error object. Provider-originated messages and data are opaque
+/// unless the gateway itself constructed and marked them safe for disclosure.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpError {
@@ -365,12 +365,85 @@ impl McpError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ProviderError(pub McpError);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProviderErrorDisclosureV1 {
+    Opaque,
+    GatewayAuthored,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct ProviderError {
+    error: McpError,
+    disclosure: ProviderErrorDisclosureV1,
+}
+
+impl ProviderError {
+    /// Treat an error received from an arbitrary provider as opaque. The
+    /// numeric provider code may be reported, but its message and data never
+    /// cross the gateway because they may contain paths, tool output, or
+    /// credentials.
+    #[must_use]
+    pub fn opaque(error: McpError) -> Self {
+        Self {
+            error,
+            disclosure: ProviderErrorDisclosureV1::Opaque,
+        }
+    }
+
+    /// Only gateway-owned providers and transports may disclose an error they
+    /// constructed from fixed, payload-free text and bounded metadata.
+    pub(crate) fn gateway_authored(error: McpError) -> Self {
+        Self {
+            error,
+            disclosure: ProviderErrorDisclosureV1::GatewayAuthored,
+        }
+    }
+
+    fn into_client_error_v1(self, limits: GatewayLimits) -> Result<McpError, ()> {
+        match self.disclosure {
+            ProviderErrorDisclosureV1::GatewayAuthored => {
+                validate_provider_error(&self.error, limits)
+                    .then_some(self.error)
+                    .ok_or(())
+            }
+            ProviderErrorDisclosureV1::Opaque => {
+                let cancelled = self.error.code == McpErrorCode::RequestCancelled as i64;
+                Ok(McpError::typed(
+                    if cancelled {
+                        McpErrorCode::RequestCancelled
+                    } else {
+                        McpErrorCode::InternalError
+                    },
+                    if cancelled {
+                        "tool provider cancelled the request"
+                    } else {
+                        "tool provider rejected the request"
+                    },
+                )
+                .with_data(json!({
+                    "reason": if cancelled { "provider_cancelled" } else { "provider_error" },
+                    "providerCode": self.error.code
+                })))
+            }
+        }
+    }
+}
+
+impl fmt::Debug for ProviderError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProviderError")
+            .field("code", &self.error.code)
+            .field("message", &"<redacted>")
+            .field("data", &self.error.data.as_ref().map(|_| "<redacted>"))
+            .field("disclosure", &self.disclosure)
+            .finish()
+    }
+}
 
 impl fmt::Display for ProviderError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "upstream MCP error {}", self.0.code)
+        write!(formatter, "upstream MCP error {}", self.error.code)
     }
 }
 
@@ -1528,7 +1601,7 @@ impl ToolExecution for StdioMcpProviderV1 {
         };
         if was_cancelled {
             session.control.cancel_v1();
-            return Err(ProviderError(McpError::typed(
+            return Err(ProviderError::gateway_authored(McpError::typed(
                 McpErrorCode::RequestCancelled,
                 "upstream request cancelled",
             )));
@@ -1769,7 +1842,7 @@ impl StdioUpstreamSessionV1 {
                         serde_json::from_value::<McpError>(error.clone()).map_err(|_| {
                             upstream_transport_error_v1("invalid upstream error response")
                         })?;
-                    return Err(ProviderError(error));
+                    return Err(ProviderError::opaque(error));
                 }
                 _ => return Err(upstream_transport_error_v1("invalid upstream response")),
             }
@@ -1788,7 +1861,7 @@ impl StdioUpstreamSessionV1 {
 
     fn receive_failure_v1(&self, message: &'static str) -> ProviderError {
         if self.control.cancelled.load(Ordering::Acquire) {
-            ProviderError(McpError::typed(
+            ProviderError::gateway_authored(McpError::typed(
                 McpErrorCode::RequestCancelled,
                 "upstream request cancelled",
             ))
@@ -1894,7 +1967,7 @@ fn parse_upstream_tools_page_v1(
 }
 
 fn upstream_transport_error_v1(message: &'static str) -> ProviderError {
-    ProviderError(McpError::typed(McpErrorCode::InternalError, message))
+    ProviderError::gateway_authored(McpError::typed(McpErrorCode::InternalError, message))
 }
 
 fn validate_upstream_program_v1(program: &Path) -> Result<PathBuf, StdioMcpProviderBuildErrorV1> {
@@ -3367,7 +3440,10 @@ impl McpGateway {
         let Some(route) = self.routes.get(&name).cloned() else {
             return Some(error_response(
                 response_id,
-                McpError::typed(McpErrorCode::InvalidParams, "unknown tool"),
+                McpError::typed(McpErrorCode::InvalidParams, "unknown tool").with_data(json!({
+                    "reason": "unknown_tool",
+                    "hint": "Call tools/list and use an advertised tool name"
+                })),
             ));
         };
         let freshness = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3503,19 +3579,19 @@ impl McpGateway {
                     Err(error) => (CallResult::Error(error), AuditOutcome::Rejected),
                 }
             }
-            Ok(Err(error)) => {
-                if validate_provider_error(&error.0, self.limits) {
-                    (CallResult::Error(error.0), AuditOutcome::ProviderError)
-                } else {
-                    (
-                        CallResult::Error(McpError::typed(
+            Ok(Err(error)) => match error.into_client_error_v1(self.limits) {
+                Ok(error) => (CallResult::Error(error), AuditOutcome::ProviderError),
+                Err(()) => (
+                    CallResult::Error(
+                        McpError::typed(
                             McpErrorCode::LimitExceeded,
-                            "upstream provider error exceeded gateway limits",
-                        )),
-                        AuditOutcome::Rejected,
-                    )
-                }
-            }
+                            "gateway-authored provider error exceeded limits",
+                        )
+                        .with_data(json!({ "reason": "provider_error_limit" })),
+                    ),
+                    AuditOutcome::Rejected,
+                ),
+            },
             Err(_) => (
                 CallResult::Error(provider_panic_error()),
                 AuditOutcome::Rejected,
@@ -4099,16 +4175,35 @@ fn enqueue_stdio_response(
 
 fn input_error_to_mcp(error: &GatewayInputError) -> McpError {
     match error {
-        GatewayInputError::MalformedJson | GatewayInputError::DuplicateKey => {
-            McpError::typed(McpErrorCode::ParseError, "invalid JSON")
+        GatewayInputError::MalformedJson => {
+            McpError::typed(McpErrorCode::ParseError, "JSON-RPC frame is not valid JSON")
+                .with_data(json!({ "reason": "malformed_json" }))
         }
-        GatewayInputError::MessageTooLarge { .. }
-        | GatewayInputError::DepthLimit { .. }
-        | GatewayInputError::NodeLimit { .. } => {
-            McpError::typed(McpErrorCode::LimitExceeded, "JSON input limit exceeded")
-        }
-        GatewayInputError::InvalidRequest { .. } => {
-            McpError::typed(McpErrorCode::InvalidRequest, "invalid JSON-RPC request")
+        GatewayInputError::DuplicateKey => McpError::typed(
+            McpErrorCode::ParseError,
+            "JSON-RPC frame contains a duplicate object key",
+        )
+        .with_data(json!({ "reason": "duplicate_json_key" })),
+        GatewayInputError::MessageTooLarge { limit, actual } => McpError::typed(
+            McpErrorCode::LimitExceeded,
+            "JSON-RPC frame is too large",
+        )
+        .with_data(
+            json!({ "reason": "message_too_large", "limitBytes": limit, "actualBytes": actual }),
+        ),
+        GatewayInputError::DepthLimit { limit, actual } => McpError::typed(
+            McpErrorCode::LimitExceeded,
+            "JSON-RPC frame nesting is too deep",
+        )
+        .with_data(json!({ "reason": "json_depth_limit", "limit": limit, "actual": actual })),
+        GatewayInputError::NodeLimit { limit } => McpError::typed(
+            McpErrorCode::LimitExceeded,
+            "JSON-RPC frame contains too many values",
+        )
+        .with_data(json!({ "reason": "json_node_limit", "limit": limit })),
+        GatewayInputError::InvalidRequest { message } => {
+            McpError::typed(McpErrorCode::InvalidRequest, message.clone())
+                .with_data(json!({ "reason": "invalid_jsonrpc_request" }))
         }
     }
 }

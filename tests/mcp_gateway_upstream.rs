@@ -277,7 +277,9 @@ fn timeout_kills_and_reaps_the_complete_upstream_process_group() {
     let pid_file = temporary.path().join("descendant.pid");
     let gateway = gateway(
         "hang_descendant",
-        Duration::from_millis(250),
+        // Include cold interpreter startup and discovery headroom while still
+        // proving a sub-second bounded call timeout under parallel test load.
+        Duration::from_millis(750),
         temporary.path(),
         |config| {
             config
