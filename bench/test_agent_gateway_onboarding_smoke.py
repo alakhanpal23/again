@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,34 +24,14 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
 
     def plan(self, client: str, config_path: pathlib.Path) -> dict[str, object]:
         args = ["mcp", "serve", "--workspace", str(self.workspace)]
-        if client == "codex":
-            config_document = (
-                "# Created and wholly owned by Again gateway setup v2.\n"
-                "[mcp_servers.again]\n"
-                "command = \"again\"\n"
-                f"args = [\"mcp\", \"serve\", \"--workspace\", {json.dumps(str(self.workspace))}]\n"
-            )
-            local_cli = (
-                "codex mcp add again -- again mcp serve --workspace "
-                f"{self.workspace}"
-            )
-        else:
-            config_document = json.dumps(
-                {
-                    "mcpServers": {
-                        "again": {
-                            "type": "stdio",
-                            "command": "again",
-                            "args": args,
-                        }
-                    }
-                },
-                indent=2,
-            ) + "\n"
-            local_cli = (
-                "claude mcp add -s user again -- again mcp serve --workspace "
-                f"{self.workspace}"
-            )
+        config_document = smoke._expected_config_document(client, args)
+        local_cli = smoke._expected_local_cli(client, args)
+        ownership_digest = smoke.expected_ownership_digest(
+            client=client,
+            config_path=config_path,
+            workspace=self.workspace,
+            config_document=config_document,
+        )
         return {
             "version": 2,
             "client": client,
@@ -61,7 +43,7 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
             "ownership_path": str(
                 config_path.with_name(config_path.name + smoke.OWNER_SUFFIX)
             ),
-            "ownership_digest": "d" * 64,
+            "ownership_digest": ownership_digest,
             "writes_by_default": False,
             "install_policy": "create_absent_or_verify_exact_owned_v1",
             "config_document": config_document,
@@ -81,7 +63,7 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
             "again-agent-gateway-owner-v2\n"
             f"client={plan['client']}\n"
             "server=again\n"
-            f"workspace_digest={'a' * 64}\n"
+            f"workspace_digest={smoke.expected_workspace_digest(self.workspace)}\n"
             f"digest={plan['ownership_digest']}\n"
         ).encode()
         self.write_private(owner, owner_record)
@@ -115,6 +97,16 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
         left = {"z": [3, {"b": 2, "a": 1}], "a": "snow"}
         right = {"a": "snow", "z": [3, {"a": 1, "b": 2}]}
         self.assertEqual(smoke.canonical_json_bytes(left), smoke.canonical_json_bytes(right))
+
+    def test_embedded_blake3_matches_standard_vectors(self) -> None:
+        self.assertEqual(
+            smoke.blake3_single_chunk(b""),
+            "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+        )
+        self.assertEqual(
+            smoke.blake3_single_chunk(b"abc"),
+            "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85",
+        )
 
     def test_output_is_exclusive_and_never_overwritten(self) -> None:
         output = self.root / "evidence.json"
@@ -184,7 +176,10 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
         self.install_pair(plan)
         raw = pathlib.Path(str(plan["ownership_path"])).read_bytes()
         fields = smoke.parse_owner_record(raw, plan)
-        self.assertEqual(fields["digest"], "d" * 64)
+        self.assertEqual(fields["digest"], plan["ownership_digest"])
+        self.assertEqual(
+            fields["workspace_digest"], smoke.expected_workspace_digest(self.workspace)
+        )
         with self.assertRaises(smoke.HarnessRefusal) as refused:
             smoke.parse_owner_record(raw + b"extra=value\n", plan)
         self.assertEqual(refused.exception.code, "owner_record_invalid")
@@ -221,6 +216,77 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
             smoke.inspect_private_regular(link, b"user data")
         self.assertEqual(refused.exception.code, "owned_file_unsafe")
         self.assertEqual(target.read_bytes(), b"user data")
+
+    def test_installed_commands_are_derived_from_exact_config_bytes(self) -> None:
+        for client, name in (("codex", "config.toml"), ("claude", "claude.json")):
+            with self.subTest(client=client):
+                path = self.root / name
+                plan = self.plan(client, path)
+                self.write_private(path, str(plan["config_document"]).encode())
+                command, args = smoke.installed_stdio_command(
+                    client=client,
+                    config_path=path,
+                    workspace=self.workspace,
+                    expected_document=str(plan["config_document"]),
+                )
+                self.assertEqual(command, "again")
+                self.assertEqual(args, plan["stdio"]["args"])
+
+    def test_exact_search_validation_rejects_echo_only_and_stale_content(self) -> None:
+        echo_only = {
+            "content": [{"type": "text", "text": ""}],
+            "structuredContent": {
+                "pattern": "ONBOARDING_SEARCH_V1",
+                "path": "scope",
+                "matches": [],
+                "truncated": False,
+            },
+            "_meta": {"again": {"resultId": "a" * 64}},
+        }
+        with self.assertRaises(smoke.HarnessRefusal) as missing:
+            smoke.require_exact_search_result(
+                echo_only,
+                expected_matches=[
+                    {
+                        "path": "scope/search.txt",
+                        "line": 1,
+                        "text": "ONBOARDING_SEARCH_V1",
+                        "lineTruncated": False,
+                    }
+                ],
+                expected_text="scope/search.txt:1:ONBOARDING_SEARCH_V1",
+            )
+        self.assertEqual(missing.exception.code, "search_output_mismatch")
+
+        stale_content = dict(echo_only)
+        stale_content["content"] = [
+            {"type": "text", "text": "scope/search.txt:1:ONBOARDING_SEARCH_V1"}
+        ]
+        with self.assertRaises(smoke.HarnessRefusal) as stale:
+            smoke.require_exact_search_result(
+                stale_content, expected_matches=[], expected_text=""
+            )
+        self.assertEqual(stale.exception.code, "search_output_mismatch")
+
+    def test_cleanup_kills_descendant_after_process_leader_exits(self) -> None:
+        if os.name != "posix":
+            self.skipTest("process-group assertion requires POSIX")
+        process = subprocess.Popen(
+            (
+                sys.executable,
+                "-c",
+                "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(30)'])",
+            ),
+            cwd=self.root,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        process.wait(timeout=5)
+        self.assertTrue(smoke._process_group_exists(process.pid))
+        smoke._terminate_process_group(process, process.pid)
+        self.assertFalse(smoke._process_group_exists(process.pid))
 
     def test_bounded_command_stops_oversized_output(self) -> None:
         with self.assertRaises(smoke.HarnessRefusal) as refused:

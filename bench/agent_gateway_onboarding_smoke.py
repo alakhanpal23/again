@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Isolated production-binary onboarding smoke test for the Again MCP gateway.
 
-The harness runs the real ``again`` binary with a closed environment.  It
-never reads or writes the user's actual Codex, Claude, Again, Git, or temporary
-configuration.  MCP configuration removal is deliberately a harness cleanup
-operation: the released CLI does not currently expose an MCP-config remover,
-and this program removes only an exact unchanged Again-owned pair that it
-created inside its private temporary directory.
+The harness runs the real ``again`` binary with a closed environment whose
+standard Codex, Claude, Again, Git, and temporary locations are redirected into
+a private temporary root. MCP configuration removal is deliberately a harness
+cleanup operation: the released CLI does not currently expose an MCP-config
+remover, and this program removes only an exact unchanged Again-owned pair that
+it created in that non-concurrent private root.
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -50,6 +51,21 @@ PROCESS_STOP_SECONDS = 2.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 OWNER_SUFFIX = ".again-owner-v2"
 HEX_64 = re.compile(r"^[0-9a-f]{64}$")
+_BLAKE3_IV = (
+    0x6A09E667,
+    0xBB67AE85,
+    0x3C6EF372,
+    0xA54FF53A,
+    0x510E527F,
+    0x9B05688C,
+    0x1F83D9AB,
+    0x5BE0CD19,
+)
+_BLAKE3_PERMUTATION = (2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8)
+_BLAKE3_CHUNK_START = 1
+_BLAKE3_CHUNK_END = 2
+_BLAKE3_ROOT = 8
+_BLAKE3_SINGLE_CHUNK_BYTES = 1_024
 
 
 class HarnessRefusal(RuntimeError):
@@ -128,6 +144,94 @@ def sha256_file(path: pathlib.Path, maximum: int | None = None) -> str:
     return product.sha256_file(path, maximum)
 
 
+def _rotate_right_32(value: int, count: int) -> int:
+    return ((value >> count) | (value << (32 - count))) & 0xFFFF_FFFF
+
+
+def _blake3_mix(
+    state: list[int], a: int, b: int, c: int, d: int, first: int, second: int
+) -> None:
+    state[a] = (state[a] + state[b] + first) & 0xFFFF_FFFF
+    state[d] = _rotate_right_32(state[d] ^ state[a], 16)
+    state[c] = (state[c] + state[d]) & 0xFFFF_FFFF
+    state[b] = _rotate_right_32(state[b] ^ state[c], 12)
+    state[a] = (state[a] + state[b] + second) & 0xFFFF_FFFF
+    state[d] = _rotate_right_32(state[d] ^ state[a], 8)
+    state[c] = (state[c] + state[d]) & 0xFFFF_FFFF
+    state[b] = _rotate_right_32(state[b] ^ state[c], 7)
+
+
+def _blake3_compress(
+    chaining_value: Sequence[int], block_words: Sequence[int], block_length: int, flags: int
+) -> list[int]:
+    state = [*chaining_value, *_BLAKE3_IV[:4], 0, 0, block_length, flags]
+    message = list(block_words)
+    for _round in range(7):
+        _blake3_mix(state, 0, 4, 8, 12, message[0], message[1])
+        _blake3_mix(state, 1, 5, 9, 13, message[2], message[3])
+        _blake3_mix(state, 2, 6, 10, 14, message[4], message[5])
+        _blake3_mix(state, 3, 7, 11, 15, message[6], message[7])
+        _blake3_mix(state, 0, 5, 10, 15, message[8], message[9])
+        _blake3_mix(state, 1, 6, 11, 12, message[10], message[11])
+        _blake3_mix(state, 2, 7, 8, 13, message[12], message[13])
+        _blake3_mix(state, 3, 4, 9, 14, message[14], message[15])
+        message = [message[index] for index in _BLAKE3_PERMUTATION]
+    return [
+        *(state[index] ^ state[index + 8] for index in range(8)),
+        *(state[index + 8] ^ chaining_value[index] for index in range(8)),
+    ]
+
+
+def blake3_single_chunk(value: bytes) -> str:
+    """Compute unkeyed BLAKE3 for the small setup commitments used here."""
+
+    if len(value) > _BLAKE3_SINGLE_CHUNK_BYTES:
+        raise HarnessRefusal("commitment_oversized", "setup commitment exceeds one BLAKE3 chunk")
+    blocks = [value[offset : offset + 64] for offset in range(0, len(value), 64)] or [b""]
+    chaining_value = list(_BLAKE3_IV)
+    for index, block in enumerate(blocks):
+        padded = block + b"\0" * (64 - len(block))
+        words = [
+            int.from_bytes(padded[offset : offset + 4], "little")
+            for offset in range(0, 64, 4)
+        ]
+        flags = _BLAKE3_CHUNK_START if index == 0 else 0
+        if index == len(blocks) - 1:
+            flags |= _BLAKE3_CHUNK_END | _BLAKE3_ROOT
+            output = _blake3_compress(chaining_value, words, len(block), flags)
+            return b"".join(word.to_bytes(4, "little") for word in output)[:32].hex()
+        chaining_value = _blake3_compress(
+            chaining_value, words, len(block), flags
+        )[:8]
+    raise AssertionError("BLAKE3 input always has a final block")
+
+
+def _hash_field(value: bytes) -> bytes:
+    return len(value).to_bytes(8, "little") + value
+
+
+def expected_workspace_digest(workspace: pathlib.Path) -> str:
+    return blake3_single_chunk(os.fsencode(workspace))
+
+
+def expected_ownership_digest(
+    *,
+    client: str,
+    config_path: pathlib.Path,
+    workspace: pathlib.Path,
+    config_document: str,
+) -> str:
+    commitment = bytearray(b"again.agent-gateway-setup.owner.v2\0")
+    for field in (
+        client.encode("utf-8"),
+        os.fsencode(config_path),
+        os.fsencode(workspace),
+        config_document.encode("utf-8"),
+    ):
+        commitment.extend(_hash_field(field))
+    return blake3_single_chunk(bytes(commitment))
+
+
 def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
     product.write_json_exclusive(path, value)
 
@@ -164,29 +268,125 @@ def closed_environment(
     }
 
 
-def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
-    if process.poll() is not None:
-        return
+def _process_group_exists(process_group: int) -> bool:
+    if os.name != "posix":
+        return False
     try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGTERM)
-        else:
-            process.terminate()
+        os.killpg(process_group, 0)
     except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for_process_group_exit(process_group: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while _process_group_exists(process_group):
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+    return True
+
+
+def _terminate_process_group(
+    process: subprocess.Popen[bytes], process_group: int | None = None
+) -> None:
+    """Terminate the complete private process group, even if its leader exited."""
+
+    process_group = process.pid if process_group is None else process_group
+    if os.name == "posix":
+        if _process_group_exists(process_group):
+            try:
+                os.killpg(process_group, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=PROCESS_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+        if _process_group_exists(process_group):
+            try:
+                os.killpg(process_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.wait(timeout=PROCESS_STOP_SECONDS)
+        except subprocess.TimeoutExpired as error:
+            raise HarnessRefusal("process_cleanup", "process leader did not terminate") from error
+        if not _wait_for_process_group_exit(process_group, PROCESS_STOP_SECONDS):
+            raise HarnessRefusal("process_cleanup", "process descendants remained after SIGKILL")
         return
-    try:
-        process.wait(timeout=PROCESS_STOP_SECONDS)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        if os.name == "posix":
-            os.killpg(process.pid, signal.SIGKILL)
-        else:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=PROCESS_STOP_SECONDS)
+        except subprocess.TimeoutExpired:
             process.kill()
-    except ProcessLookupError:
-        return
-    process.wait(timeout=PROCESS_STOP_SECONDS)
+            process.wait(timeout=PROCESS_STOP_SECONDS)
+
+
+def pin_binary_exact(requested: pathlib.Path, destination: pathlib.Path) -> product.PinnedBinary:
+    """Copy and hash the executable through one no-follow source descriptor."""
+
+    if not requested.is_absolute() or requested.resolve() != requested:
+        raise HarnessRefusal("binary_not_canonical", "--again-binary must be absolute and canonical")
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(requested, source_flags)
+    except OSError as error:
+        raise HarnessRefusal("binary_open", "Again binary could not be opened safely") from error
+    destination_fd: int | None = None
+    try:
+        before = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_size <= 0
+            or before.st_size > product.MAX_BINARY_BYTES
+            or before.st_mode & 0o111 == 0
+        ):
+            raise HarnessRefusal("binary_invalid", "Again binary is not a bounded executable file")
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=False)
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o500,
+        )
+        digest = hashlib.sha256()
+        total = 0
+        while True:
+            block = os.read(source_fd, 1024 * 1024)
+            if not block:
+                break
+            total += len(block)
+            if total > product.MAX_BINARY_BYTES:
+                raise HarnessRefusal("binary_invalid", "Again binary exceeded its byte bound")
+            digest.update(block)
+            view = memoryview(block)
+            while view:
+                written = os.write(destination_fd, view)
+                view = view[written:]
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        path_after = os.stat(requested, follow_symlinks=False)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if before.st_size != total or identity(before) != identity(after) or identity(after) != identity(path_after):
+            raise HarnessRefusal("binary_changed", "Again binary identity changed while being pinned")
+        return product.PinnedBinary(requested, destination, digest.hexdigest(), total)
+    finally:
+        if destination_fd is not None:
+            os.close(destination_fd)
+        os.close(source_fd)
 
 
 def run_bounded_command(
@@ -251,6 +451,11 @@ def run_bounded_command(
         except subprocess.TimeoutExpired as error:
             _terminate_process_group(process)
             raise HarnessRefusal("command_timeout", "Again CLI command timed out") from error
+        if os.name == "posix" and _process_group_exists(process.pid):
+            _terminate_process_group(process)
+            raise HarnessRefusal(
+                "command_descendant", "Again CLI left a descendant in its process group"
+            )
     finally:
         selector.close()
         process.stdout.close()
@@ -301,6 +506,54 @@ def setup_command(
     )
 
 
+def _shell_quote(value: str) -> str:
+    safe = b"_./,:=@%+-"
+    encoded = value.encode("utf-8")
+    if encoded and all(byte < 128 and (chr(byte).isalnum() or byte in safe) for byte in encoded):
+        return value
+    return "'" + value.replace("'", "'\\''") + "'"
+
+
+def _expected_local_cli(client: str, arguments: Sequence[str]) -> str:
+    prefix = (
+        "codex mcp add again -- again"
+        if client == "codex"
+        else "claude mcp add -s user again -- again"
+    )
+    return prefix + "".join(f" {_shell_quote(argument)}" for argument in arguments)
+
+
+def _expected_config_document(client: str, arguments: Sequence[str]) -> str:
+    if client == "codex":
+        encoded = ", ".join(
+            json.dumps(argument, ensure_ascii=False, separators=(",", ":"))
+            for argument in arguments
+        )
+        return (
+            "# Created and wholly owned by Again gateway setup v2.\n"
+            "[mcp_servers.again]\n"
+            "command = \"again\"\n"
+            f"args = [{encoded}]\n"
+        )
+    return (
+        json.dumps(
+            {
+                "mcpServers": {
+                    "again": {
+                        "args": list(arguments),
+                        "command": "again",
+                        "type": "stdio",
+                    }
+                }
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
 def validate_setup_plan(
     value: Any,
     *,
@@ -313,6 +566,13 @@ def validate_setup_plan(
     stdio = value.get("stdio")
     expected_args = ["mcp", "serve", "--workspace", str(workspace)]
     expected_owner = config_path.with_name(config_path.name + OWNER_SUFFIX)
+    expected_document = _expected_config_document(client, expected_args)
+    expected_owner_digest = expected_ownership_digest(
+        client=client,
+        config_path=config_path,
+        workspace=workspace,
+        config_document=expected_document,
+    )
     if (
         set(value)
         != {
@@ -337,42 +597,67 @@ def validate_setup_plan(
         or stdio.get("transport") != "stdio"
         or stdio.get("command") != "again"
         or stdio.get("args") != expected_args
+        or value.get("local_cli_command") != _expected_local_cli(client, expected_args)
         or value.get("workspace") != str(workspace)
         or value.get("config_path") != str(config_path)
         or value.get("ownership_path") != str(expected_owner)
-        or not isinstance(value.get("ownership_digest"), str)
-        or not HEX_64.fullmatch(value["ownership_digest"])
+        or value.get("ownership_digest") != expected_owner_digest
         or value.get("writes_by_default") is not False
         or value.get("install_policy") != "create_absent_or_verify_exact_owned_v1"
-        or not isinstance(value.get("config_document"), str)
-        or len(value["config_document"].encode("utf-8")) > MAX_CONFIG_BYTES
+        or value.get("config_document") != expected_document
+        or len(expected_document.encode("utf-8")) > MAX_CONFIG_BYTES
     ):
         raise HarnessRefusal("setup_plan_invalid", "setup plan violated its closed schema")
     if client == "claude":
         document = strict_json_loads(value["config_document"].encode("utf-8"))
-        server = document.get("mcpServers", {}).get("again") if isinstance(document, dict) else None
-        if not isinstance(server, dict) or server.get("command") != "again" or server.get("args") != expected_args:
+        expected = {
+            "mcpServers": {
+                "again": {"args": expected_args, "command": "again", "type": "stdio"}
+            }
+        }
+        if document != expected:
             raise HarnessRefusal("setup_config_invalid", "Claude config does not bind the plan")
-    else:
-        expected = (
-            "# Created and wholly owned by Again gateway setup v2.\n"
-            "[mcp_servers.again]\n"
-            "command = \"again\"\n"
-            f"args = [\"mcp\", \"serve\", \"--workspace\", {json.dumps(str(workspace))}]\n"
-        )
-        if value["config_document"] != expected:
-            raise HarnessRefusal("setup_config_invalid", "Codex config does not bind the plan")
     return value
 
 
-def inspect_private_regular(path: pathlib.Path, expected: bytes) -> dict[str, Any]:
+def read_private_regular(path: pathlib.Path, maximum: int) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        metadata = path.lstat()
-        observed = path.read_bytes()
+        descriptor = os.open(path, flags)
     except OSError as error:
-        raise HarnessRefusal("owned_file_missing", f"missing owned file: {path.name}") from error
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise HarnessRefusal("owned_file_unsafe", f"owned path is not regular: {path.name}")
+        raise HarnessRefusal("owned_file_unsafe", f"owned path could not be opened safely: {path.name}") from error
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_size < 0 or before.st_size > maximum:
+            raise HarnessRefusal("owned_file_unsafe", f"owned path is not bounded regular data: {path.name}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            block = os.read(descriptor, min(65_536, maximum + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > maximum:
+                raise HarnessRefusal("owned_file_oversized", f"owned path exceeded its bound: {path.name}")
+        after = os.fstat(descriptor)
+        path_after = os.stat(path, follow_symlinks=False)
+        identity = lambda item: (
+            item.st_dev,
+            item.st_ino,
+            item.st_size,
+            item.st_mtime_ns,
+            item.st_ctime_ns,
+        )
+        if identity(before) != identity(after) or identity(after) != identity(path_after):
+            raise HarnessRefusal("owned_file_changed", f"owned path changed while inspected: {path.name}")
+        return b"".join(chunks), after
+    finally:
+        os.close(descriptor)
+
+
+def inspect_private_regular(path: pathlib.Path, expected: bytes) -> dict[str, Any]:
+    observed, metadata = read_private_regular(path, max(len(expected), MAX_CONFIG_BYTES))
     if observed != expected:
         raise HarnessRefusal("owned_file_changed", f"owned bytes changed: {path.name}")
     if os.name == "posix" and stat.S_IMODE(metadata.st_mode) != 0o600:
@@ -405,22 +690,70 @@ def parse_owner_record(raw: bytes, plan: Mapping[str, Any]) -> dict[str, str]:
     if (
         fields.get("client") != plan["client"]
         or fields.get("server") != "again"
-        or not HEX_64.fullmatch(fields.get("workspace_digest", ""))
+        or fields.get("workspace_digest")
+        != expected_workspace_digest(pathlib.Path(str(plan["workspace"])))
+        or fields.get("digest")
+        != expected_ownership_digest(
+            client=str(plan["client"]),
+            config_path=pathlib.Path(str(plan["config_path"])),
+            workspace=pathlib.Path(str(plan["workspace"])),
+            config_document=str(plan["config_document"]),
+        )
         or fields.get("digest") != plan["ownership_digest"]
     ):
         raise HarnessRefusal("owner_record_invalid", "ownership record does not match the plan")
     return fields
 
 
+def installed_stdio_command(
+    *,
+    client: str,
+    config_path: pathlib.Path,
+    workspace: pathlib.Path,
+    expected_document: str,
+) -> tuple[str, list[str]]:
+    """Parse the exact installed file and derive the command actually launched."""
+
+    raw, _metadata = read_private_regular(config_path, MAX_CONFIG_BYTES)
+    if raw != expected_document.encode("utf-8"):
+        raise HarnessRefusal("installed_config_changed", "installed configuration bytes changed")
+    expected_args = ["mcp", "serve", "--workspace", str(workspace)]
+    if client == "claude":
+        value = strict_json_loads(raw)
+        expected = {
+            "mcpServers": {
+                "again": {"args": expected_args, "command": "again", "type": "stdio"}
+            }
+        }
+        if value != expected:
+            raise HarnessRefusal("installed_config_invalid", "installed Claude topology changed")
+        return "again", list(value["mcpServers"]["again"]["args"])
+    try:
+        text = raw.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as error:
+        raise HarnessRefusal("installed_config_invalid", "installed Codex config is not UTF-8") from error
+    lines = text.splitlines()
+    if len(lines) != 4 or lines[:3] != [
+        "# Created and wholly owned by Again gateway setup v2.",
+        "[mcp_servers.again]",
+        'command = "again"',
+    ] or not lines[3].startswith("args = "):
+        raise HarnessRefusal("installed_config_invalid", "installed Codex topology changed")
+    arguments = strict_json_loads(lines[3][len("args = ") :].encode("utf-8"))
+    if arguments != expected_args:
+        raise HarnessRefusal("installed_config_invalid", "installed Codex arguments changed")
+    return "again", list(arguments)
+
+
 def remove_exact_owned_pair(config_path: pathlib.Path, plan: Mapping[str, Any]) -> dict[str, Any]:
-    """Remove only the exact temporary pair described by this setup plan."""
+    """Remove an exact pair in the harness's private, non-concurrent root."""
 
     owner_path = pathlib.Path(plan["ownership_path"])
     if owner_path != config_path.with_name(config_path.name + OWNER_SUFFIX):
         raise HarnessRefusal("removal_path_mismatch", "ownership path is not the expected sibling")
     config_expected = plan["config_document"].encode("utf-8")
     config_record = inspect_private_regular(config_path, config_expected)
-    owner_raw = owner_path.read_bytes()
+    owner_raw, _metadata = read_private_regular(owner_path, 1_024)
     owner_record = inspect_private_regular(owner_path, owner_raw)
     parse_owner_record(owner_raw, plan)
     config_path.unlink()
@@ -431,30 +764,38 @@ def remove_exact_owned_pair(config_path: pathlib.Path, plan: Mapping[str, Any]) 
 
 
 class ConfiguredMcpSession:
-    """A bounded session launched from an exact installed setup plan."""
+    """A bounded session launched from an exact installed configuration file."""
 
     def __init__(
         self,
         *,
         binary: pathlib.Path,
+        client: str,
+        config_path: pathlib.Path,
         plan: Mapping[str, Any],
         workspace: pathlib.Path,
         environment: Mapping[str, str],
         label: str,
         timeout_seconds: float,
     ) -> None:
+        command, arguments = installed_stdio_command(
+            client=client,
+            config_path=config_path,
+            workspace=workspace,
+            expected_document=str(plan["config_document"]),
+        )
         stdio = plan["stdio"]
-        if stdio["command"] != "again" or stdio["args"] != [
+        if command != "again" or arguments != [
             "mcp",
             "serve",
             "--workspace",
             str(workspace),
-        ]:
+        ] or stdio != {"transport": "stdio", "command": command, "args": arguments}:
             raise HarnessRefusal("configured_command_invalid", "installed command changed")
         resolved = pathlib.Path(environment["PATH"].split(os.pathsep, 1)[0]) / "again"
         if resolved.resolve() != binary.resolve():
             raise HarnessRefusal("configured_binary_mismatch", "installed command does not resolve to pinned binary")
-        self.argv = (stdio["command"], *stdio["args"])
+        self.argv = (command, *arguments)
         self.label = label
         self.timeout_seconds = timeout_seconds
         try:
@@ -474,6 +815,7 @@ class ConfiguredMcpSession:
         if self.process.stdin is None or self.process.stdout is None or self.process.stderr is None:
             _terminate_process_group(self.process)
             raise HarnessRefusal("mcp_pipe_failed", "MCP pipes were not created")
+        self.process_group = self.process.pid
         self.stdin: BinaryIO = self.process.stdin
         self.stdout: BinaryIO = self.process.stdout
         self.stderr: BinaryIO = self.process.stderr
@@ -576,31 +918,49 @@ class ConfiguredMcpSession:
         )
 
     def close(self) -> dict[str, Any]:
+        cleanup_failure: HarnessRefusal | None = None
         if self.process.poll() is None:
             try:
                 self.stdin.close()
                 self.process.wait(timeout=PROCESS_STOP_SECONDS)
-            except (BrokenPipeError, OSError, subprocess.TimeoutExpired):
-                _terminate_process_group(self.process)
-        self.stderr_thread.join(timeout=PROCESS_STOP_SECONDS)
-        if self.stderr_thread.is_alive() or self.stderr_overflow:
-            raise HarnessRefusal("mcp_stderr", "MCP stderr did not drain within bounds")
-        returncode = self.process.poll()
-        group_reaped = True
-        if os.name == "posix":
+            except (BrokenPipeError, OSError, subprocess.TimeoutExpired) as error:
+                cleanup_failure = HarnessRefusal(
+                    "mcp_cleanup", "MCP leader did not stop after request-stream closure"
+                )
+                try:
+                    _terminate_process_group(self.process, self.process_group)
+                except HarnessRefusal as terminate_error:
+                    cleanup_failure = cleanup_failure or terminate_error
+        descendants_observed = os.name == "posix" and _process_group_exists(self.process_group)
+        if descendants_observed:
             try:
-                os.killpg(self.process.pid, 0)
-            except ProcessLookupError:
-                group_reaped = True
-            except PermissionError:
-                group_reaped = False
-            else:
-                group_reaped = False
+                _terminate_process_group(self.process, self.process_group)
+            except HarnessRefusal as error:
+                cleanup_failure = cleanup_failure or error
+            cleanup_failure = cleanup_failure or HarnessRefusal(
+                "mcp_cleanup", "MCP leader left a live process-group descendant"
+            )
         for stream in (self.stdin, self.stdout, self.stderr):
             if not stream.closed:
-                stream.close()
+                try:
+                    stream.close()
+                except OSError as error:
+                    cleanup_failure = cleanup_failure or HarnessRefusal(
+                        "mcp_cleanup", f"MCP stream close failed: {type(error).__name__}"
+                    )
+        self.stderr_thread.join(timeout=PROCESS_STOP_SECONDS)
+        if self.stderr_thread.is_alive() or self.stderr_overflow:
+            cleanup_failure = cleanup_failure or HarnessRefusal(
+                "mcp_stderr", "MCP stderr did not drain within bounds"
+            )
+        returncode = self.process.poll()
+        group_reaped = not _process_group_exists(self.process_group)
         if returncode != 0 or not group_reaped:
-            raise HarnessRefusal("mcp_cleanup", "MCP process did not exit and reap cleanly")
+            cleanup_failure = cleanup_failure or HarnessRefusal(
+                "mcp_cleanup", "MCP process did not exit and reap cleanly"
+            )
+        if cleanup_failure is not None:
+            raise cleanup_failure
         return {
             "argv": list(self.argv),
             "return_code": returncode,
@@ -704,10 +1064,13 @@ def _install_and_verify(
     )
     config = inspect_private_regular(config_path, plan["config_document"].encode("utf-8"))
     owner_path = pathlib.Path(plan["ownership_path"])
-    owner_raw = owner_path.read_bytes()
+    owner_raw, _metadata = read_private_regular(owner_path, 1_024)
     owner = inspect_private_regular(owner_path, owner_raw)
     parse_owner_record(owner_raw, plan)
-    before = (config_path.read_bytes(), owner_raw)
+    before = (
+        read_private_regular(config_path, MAX_CONFIG_BYTES)[0],
+        owner_raw,
+    )
     reinstall = setup_command(
         binary,
         client,
@@ -722,7 +1085,10 @@ def _install_and_verify(
         workspace=workspace,
         config_path=config_path,
     )
-    if repeated_plan != plan or before != (config_path.read_bytes(), owner_path.read_bytes()):
+    if repeated_plan != plan or before != (
+        read_private_regular(config_path, MAX_CONFIG_BYTES)[0],
+        read_private_regular(owner_path, 1_024)[0],
+    ):
         raise HarnessRefusal("setup_not_idempotent", f"{client} reinstall changed owned state")
     if b"already_installed_owned" not in reinstall.stderr:
         raise HarnessRefusal("setup_outcome", f"{client} reinstall outcome was not explicit")
@@ -773,22 +1139,119 @@ def _test_symlink_refusal(
 ) -> dict[str, Any]:
     if os.name != "posix":
         return {"classification": "unsupported_host", "reason": "symlink_requires_posix"}
-    parent = root / "symlink"
-    parent.mkdir(mode=0o700)
-    target = parent / "user-target.toml"
-    sentinel = b"user target must not change\n"
-    target.write_bytes(sentinel)
-    path = parent / "config.toml"
-    path.symlink_to(target)
-    result = setup_command(
-        binary, "codex", workspace, environment, timeout_seconds, path
+    scenarios: dict[str, Any] = {}
+
+    config_parent = root / "symlink-config"
+    config_parent.mkdir(mode=0o700)
+    config_target = config_parent / "user-target.toml"
+    config_sentinel = b"user config target must not change\n"
+    config_target.write_bytes(config_sentinel)
+    config_path = config_parent / "config.toml"
+    config_path.symlink_to(config_target)
+    config_result = setup_command(
+        binary, "codex", workspace, environment, timeout_seconds, config_path
     )
-    if result.returncode == 0 or target.read_bytes() != sentinel or not path.is_symlink():
+    config_owner = config_path.with_name(config_path.name + OWNER_SUFFIX)
+    if (
+        config_result.returncode == 0
+        or config_target.read_bytes() != config_sentinel
+        or not config_path.is_symlink()
+        or config_owner.exists()
+        or config_owner.is_symlink()
+    ):
         raise HarnessRefusal("symlink_followed", "symlinked config was not safely refused")
+    scenarios["config_file"] = {
+        "return_code": config_result.returncode,
+        "target_preserved_sha256": sha256_bytes(config_sentinel),
+        "counterpart_absent": True,
+    }
+
+    owner_parent = root / "symlink-owner"
+    owner_parent.mkdir(mode=0o700)
+    owner_path_config = owner_parent / "config.toml"
+    owner_path = owner_path_config.with_name(owner_path_config.name + OWNER_SUFFIX)
+    owner_target = owner_parent / "user-owner-target"
+    owner_sentinel = b"user owner target must not change\n"
+    owner_target.write_bytes(owner_sentinel)
+    owner_path.symlink_to(owner_target)
+    owner_result = setup_command(
+        binary, "codex", workspace, environment, timeout_seconds, owner_path_config
+    )
+    if (
+        owner_result.returncode == 0
+        or owner_target.read_bytes() != owner_sentinel
+        or not owner_path.is_symlink()
+        or owner_path_config.exists()
+        or owner_path_config.is_symlink()
+    ):
+        raise HarnessRefusal("symlink_followed", "symlinked ownership was not safely refused")
+    scenarios["ownership_file"] = {
+        "return_code": owner_result.returncode,
+        "target_preserved_sha256": sha256_bytes(owner_sentinel),
+        "counterpart_absent": True,
+    }
+
+    parent_target = root / "symlink-parent-target"
+    parent_target.mkdir(mode=0o700)
+    parent_link = root / "symlink-parent-link"
+    parent_link.symlink_to(parent_target, target_is_directory=True)
+    parent_config = parent_link / "config.toml"
+    parent_result = setup_command(
+        binary, "codex", workspace, environment, timeout_seconds, parent_config
+    )
+    parent_owner = parent_target / (parent_config.name + OWNER_SUFFIX)
+    if (
+        parent_result.returncode == 0
+        or not parent_link.is_symlink()
+        or (parent_target / "config.toml").exists()
+        or parent_owner.exists()
+        or parent_owner.is_symlink()
+    ):
+        raise HarnessRefusal("symlink_followed", "symlinked config parent was not safely refused")
+    scenarios["config_parent"] = {
+        "return_code": parent_result.returncode,
+        "target_directory_unchanged": True,
+    }
     return {
-        "classification": "unsafe_existing_path_refused",
-        "return_code": result.returncode,
-        "target_preserved_sha256": sha256_bytes(sentinel),
+        "classification": "all_symlink_surfaces_refused",
+        "scenarios": scenarios,
+    }
+
+
+def require_exact_search_result(
+    result: Mapping[str, Any], *, expected_matches: Sequence[Mapping[str, Any]], expected_text: str
+) -> str:
+    expected_structured = {
+        "pattern": "ONBOARDING_SEARCH_V1",
+        "path": "scope",
+        "matches": [dict(item) for item in expected_matches],
+        "truncated": False,
+    }
+    if result.get("structuredContent") != expected_structured or result.get("content") != [
+        {"type": "text", "text": expected_text}
+    ]:
+        raise HarnessRefusal("search_output_mismatch", "repo.search returned unexpected exact bytes")
+    result_identifier = product.result_id(result)
+    if result_identifier is None or not HEX_64.fullmatch(result_identifier):
+        raise HarnessRefusal("search_result_identity", "repo.search omitted its exact result identity")
+    return result_identifier
+
+
+def revalidate_pinned_binary(pinned: product.PinnedBinary) -> dict[str, Any]:
+    metadata = os.stat(pinned.executable_path, follow_symlinks=False)
+    digest = sha256_file(pinned.executable_path, product.MAX_BINARY_BYTES)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size != pinned.size
+        or digest != pinned.sha256
+        or metadata.st_mode & 0o111 == 0
+    ):
+        raise HarnessRefusal("pinned_binary_changed", "pinned executable changed during smoke run")
+    return {
+        "sha256": digest,
+        "bytes": metadata.st_size,
+        "mode": f"{stat.S_IMODE(metadata.st_mode):04o}",
+        "stable_after_run": True,
     }
 
 
@@ -808,7 +1271,7 @@ def run_onboarding_smoke(
         source_home = root / "source-home"
         source_home.mkdir(mode=0o700)
         source = product.inspect_clean_source(source_root, source_git_sha, source_home)
-        pinned = product.pin_binary(again_binary, root / "pinned" / "again")
+        pinned = pin_binary_exact(again_binary, root / "pinned" / "again")
         workspace = root / "fixture-repository"
         fixture = create_fixture(workspace, source_home)
         home = root / "isolated-home"
@@ -891,6 +1354,8 @@ def run_onboarding_smoke(
         try:
             codex = ConfiguredMcpSession(
                 binary=pinned.executable_path,
+                client="codex",
+                config_path=pathlib.Path(plans["codex"]["config_path"]),
                 plan=plans["codex"],
                 workspace=workspace,
                 environment=environment,
@@ -913,11 +1378,23 @@ def run_onboarding_smoke(
             baseline_result = product.require_success(
                 baseline_response, "installed Codex repo.search"
             )
-            if b"ONBOARDING_SEARCH_V1" not in canonical_json_bytes(baseline_result):
-                raise HarnessRefusal("search_output_mismatch", "installed search lost fixture match")
+            baseline_result_id = require_exact_search_result(
+                baseline_result,
+                expected_matches=[
+                    {
+                        "path": "scope/search.txt",
+                        "line": 1,
+                        "text": "ONBOARDING_SEARCH_V1",
+                        "lineTruncated": False,
+                    }
+                ],
+                expected_text="scope/search.txt:1:ONBOARDING_SEARCH_V1",
+            )
 
             claude = ConfiguredMcpSession(
                 binary=pinned.executable_path,
+                client="claude",
+                config_path=pathlib.Path(plans["claude"]["config_path"]),
                 plan=plans["claude"],
                 workspace=workspace,
                 environment=environment,
@@ -949,32 +1426,35 @@ def run_onboarding_smoke(
             changed_result = product.require_success(
                 changed_response, "installed Claude mutated repo.search"
             )
-            structured = changed_result.get("structuredContent")
-            matches = structured.get("matches") if isinstance(structured, dict) else None
-            if matches != [] or changed_result == baseline_result:
+            changed_result_id = require_exact_search_result(
+                changed_result, expected_matches=[], expected_text=""
+            )
+            if changed_result_id == baseline_result_id or changed_result == baseline_result:
                 raise HarnessRefusal("mutation_replayed", "relevant mutation returned stale search")
             mutation = {
                 "classification": "relevant_mutation_invalidated",
                 "sha256_before": sha256_bytes(before),
                 "sha256_after": sha256_bytes(after),
-                "baseline_result_id": product.result_id(baseline_result),
-                "changed_result_id": product.result_id(changed_result),
+                "baseline_result_id": baseline_result_id,
+                "changed_result_id": changed_result_id,
                 "old_result_served": False,
             }
         finally:
-            cleanup_errors: list[HarnessRefusal] = []
+            active_error = sys.exc_info()[1]
+            cleanup_errors: list[BaseException] = []
             for session in reversed(sessions):
                 try:
                     session_evidence.append(session.close())
-                except HarnessRefusal as error:
+                except BaseException as error:
                     cleanup_errors.append(error)
             session_evidence.reverse()
-            if cleanup_errors:
+            if cleanup_errors and active_error is None:
                 raise cleanup_errors[0]
 
         removal: dict[str, Any] = {
             "product_mcp_remove_command": False,
-            "classification": "harness_exact_owned_pair_cleanup",
+            "classification": "harness_private_nonconcurrent_exact_owned_pair_cleanup",
+            "concurrent_path_adversary_proven": False,
             "clients": {},
         }
         for client, plan in plans.items():
@@ -1005,6 +1485,8 @@ def run_onboarding_smoke(
                 "requested_path": str(pinned.requested_path),
                 "sha256": pinned.sha256,
                 "bytes": pinned.size,
+                "descriptor_pinned": True,
+                "post_run": revalidate_pinned_binary(pinned),
             },
             "harness": {
                 "path": str(harness_path),
@@ -1025,7 +1507,10 @@ def run_onboarding_smoke(
                     if any(token in name.casefold() for token in ("token", "secret", "password", "credential", "api_key"))
                 ),
                 "network_proxies": NETWORK_BLOCK_ENDPOINT,
-                "real_user_configuration_accessed": False,
+                "standard_user_config_roots_redirected": True,
+                "ambient_parent_environment_inherited": False,
+                "filesystem_access_denial_proven": False,
+                "repository_local_git_configuration_may_be_read": True,
             },
             "fixture": fixture,
             "setup": setup_evidence,
