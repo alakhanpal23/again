@@ -273,8 +273,12 @@ jobs:
           install_root=$(mktemp -d)
           trap 'rm -rf "$install_root"' EXIT
           destination="$install_root/again"
-          sh scripts/install.sh --version "$TAG" --dest "$destination"
-          test "$("$destination" --version)" = "again ${TAG#v}"
+          sh scripts/install.sh \
+            --version "$TAG" \
+            --source-commit "$GITHUB_SHA" \
+            --dest "$destination"
+          release_version=${TAG#v}
+          test "$("$destination" --version)" = "again ${release_version%%-*}"
           sh scripts/uninstall.sh --dest "$destination"
           test ! -e "$destination"
           test ! -e "${destination}.again-install"

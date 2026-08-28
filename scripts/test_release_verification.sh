@@ -72,7 +72,9 @@ cat > "$fake_bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$GH_CALL_LOG"
-[ "${GH_FAIL:-0}" -eq 0 ] || exit 1
+[ "${GH_FAIL:-0}" -eq 0 ] || {
+    [ "$1:$2" != attestation:verify ] || exit 1
+}
 case "$1:$2" in
     release:view)
         cat "$PUBLISHED_VIEW"
@@ -223,24 +225,36 @@ fi
 
 # The public installer authenticates both downloaded inputs with the same
 # pinned provenance policy before it extracts or installs the archive.
+sed '3s/true/false/' "$published_view" > "$fixture/mutable-published-view"
 install_call_log=$fixture/install-gh-calls
 install_destination=$fixture/installed/again
-GH_CALL_LOG=$install_call_log REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+GH_CALL_LOG=$install_call_log PUBLISHED_VIEW=$published_view \
+    SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
     sh "$repository/scripts/install.sh" \
     --version "$version" \
+    --source-commit "$source_commit" \
     --base-url https://releases.example.invalid/download \
     --dest "$install_destination" \
     > "$fixture/install.out"
 test "$("$install_destination")" = authenticated-release
-test "$(wc -l < "$install_call_log" | tr -d ' ')" -eq 2
+test "$(wc -l < "$install_call_log" | tr -d ' ')" -eq 4
+grep -F "release view $version --repo alakhanpal23/again --json assets,isDraft,isImmutable,isPrerelease,tagName" \
+    "$install_call_log" >/dev/null
+grep -F "api repos/alakhanpal23/again/commits/$version --jq .sha" \
+    "$install_call_log" >/dev/null
 grep -F "/SHA256SUMS --repo alakhanpal23/again" "$install_call_log" >/dev/null
 grep -F "/again-${version}-${target}.tar.gz --repo alakhanpal23/again" \
     "$install_call_log" >/dev/null
+grep '^attestation verify ' "$install_call_log" > "$fixture/install-attestation-calls"
 while IFS= read -r call; do
     for required in \
         "--repo alakhanpal23/again" \
         "--signer-workflow alakhanpal23/again/.github/workflows/release.yml" \
+        "--signer-digest $source_commit" \
         "--source-ref refs/tags/$version" \
+        "--source-digest $source_commit" \
+        "--cert-oidc-issuer https://token.actions.githubusercontent.com" \
+        "--predicate-type https://slsa.dev/provenance/v1" \
         "--deny-self-hosted-runners"
     do
         printf '%s\n' "$call" | grep -F -- "$required" >/dev/null || {
@@ -248,12 +262,14 @@ while IFS= read -r call; do
             exit 1
         }
     done
-done < "$install_call_log"
+done < "$fixture/install-attestation-calls"
 
 failed_install_destination=$fixture/failed-install/again
-if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-install-calls REMOTE_ASSETS=$assets \
+if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-install-calls \
+    PUBLISHED_VIEW=$published_view SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \
     PATH="$fake_bin:$PATH" sh "$repository/scripts/install.sh" \
     --version "$version" \
+    --source-commit "$source_commit" \
     --base-url https://releases.example.invalid/download \
     --dest "$failed_install_destination" \
     > /dev/null 2>&1; then
@@ -261,6 +277,27 @@ if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-install-calls REMOTE_ASSETS=$assets \
     exit 1
 fi
 test ! -e "$failed_install_destination"
+
+if GH_CALL_LOG=$fixture/missing-source-install-calls \
+    PUBLISHED_VIEW=$published_view SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \
+    PATH="$fake_bin:$PATH" sh "$repository/scripts/install.sh" \
+    --version "$version" \
+    --base-url https://releases.example.invalid/download \
+    --dest "$fixture/missing-source-install/again" > /dev/null 2>&1; then
+    echo "error: remote installer accepted a missing source commit" >&2
+    exit 1
+fi
+
+if GH_CALL_LOG=$fixture/mutable-install-calls \
+    PUBLISHED_VIEW=$fixture/mutable-published-view SOURCE_COMMIT=$source_commit \
+    REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    sh "$repository/scripts/install.sh" \
+    --version "$version" --source-commit "$source_commit" \
+    --base-url https://releases.example.invalid/download \
+    --dest "$fixture/mutable-install/again" > /dev/null 2>&1; then
+    echo "error: remote installer accepted a mutable release" >&2
+    exit 1
+fi
 
 tampered=$assets/again-${version}-aarch64-apple-darwin.tar.gz
 cp "$tampered" "$fixture/tampered-original"

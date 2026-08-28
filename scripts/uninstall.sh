@@ -35,13 +35,22 @@ case "$destination" in
 esac
 
 destination_dir=$(dirname "$destination")
-metadata=${destination}.again-install
-backup=${destination}.previous
-lock=${destination}.again-lock
-[ -d "$destination_dir" ] || {
+destination_name=$(basename "$destination")
+case "$destination_name" in
+    ''|.|..)
+        echo "error: destination must name one binary file" >&2
+        exit 2
+        ;;
+esac
+[ -d "$destination_dir" ] && [ ! -L "$destination_dir" ] || {
     echo "error: destination parent is not a directory" >&2
     exit 1
 }
+destination_dir=$(CDPATH= cd -- "$destination_dir" && pwd -P)
+destination="$destination_dir/$destination_name"
+metadata=${destination}.again-install
+backup=${destination}.previous
+lock=${destination}.again-lock
 
 removed_tmp=
 marker_tmp=
@@ -119,11 +128,30 @@ acquire_lock
     echo "error: managed destination is missing or not a regular file" >&2
     exit 1
 }
-recorded=$(awk -F= '$1 == "installed_sha256" { print $2; exit }' "$metadata")
-[ -n "$recorded" ] || {
+semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+validate_marker() {
+    marker=$1
+    [ "$(wc -l < "$marker" | tr -d ' ')" -eq 5 ] &&
+        awk -F= '
+            NF != 2 { exit 1 }
+            NR == 1 && $1 != "version" { exit 1 }
+            NR == 2 && $1 != "target" { exit 1 }
+            NR == 3 && $1 != "source_commit" { exit 1 }
+            NR == 4 && $1 != "archive_sha256" { exit 1 }
+            NR == 5 && $1 != "installed_sha256" { exit 1 }
+            END { if (NR != 5) exit 1 }
+        ' "$marker" &&
+        sed -n '1s/^version=//p' "$marker" | grep -Eq "$semver_re" &&
+        sed -n '2s/^target=//p' "$marker" | grep -Eq '^(aarch64|x86_64)-(apple-darwin|unknown-linux-gnu)$' &&
+        sed -n '3s/^source_commit=//p' "$marker" | grep -Eq '^(local-unattested|[0-9a-f]{40})$' &&
+        sed -n '4s/^archive_sha256=//p' "$marker" | grep -Eq '^[0-9a-f]{64}$' &&
+        sed -n '5s/^installed_sha256=//p' "$marker" | grep -Eq '^[0-9a-f]{64}$'
+}
+validate_marker "$metadata" || {
     echo "error: invalid Again install marker" >&2
     exit 1
 }
+recorded=$(sed -n '5s/^installed_sha256=//p' "$metadata")
 if command -v sha256sum >/dev/null 2>&1; then
     current=$(sha256sum "$destination" | awk '{ print tolower($1) }')
 else

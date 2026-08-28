@@ -3,6 +3,7 @@ set -eu
 
 repository=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 fixture=$(mktemp -d "${TMPDIR:-/tmp}/again-package-test.XXXXXXXX")
+fixture=$(CDPATH= cd -- "$fixture" && pwd -P)
 cleanup() {
     status=$1
     trap - EXIT HUP INT TERM
@@ -72,6 +73,80 @@ python3 "$repository/scripts/package_release.py" \
     --source-date-epoch 1700000000
 cmp "$fixture/v0.1.0/again-v0.1.0-${target}.tar.gz" "$fixture/repeat.tar.gz"
 test "$(tar -tzf "$fixture/repeat.tar.gz")" = again
+
+# Local development inputs remain explicitly unauthenticated, but malformed
+# filesystem and archive shapes are still rejected before destination mutation.
+artifact_symlink=$fixture/artifact-directory-symlink
+ln -s "$fixture/v0.1.0" "$artifact_symlink"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$artifact_symlink" \
+    --dest "$fixture/rejected-artifact-directory/again"; then
+    echo "error: installer accepted a symlinked artifact directory" >&2
+    exit 1
+fi
+
+symlink_input=$fixture/symlink-input
+mkdir "$symlink_input"
+ln -s "$fixture/v0.1.0/again-v0.1.0-${target}.tar.gz" \
+    "$symlink_input/again-v0.1.0-${target}.tar.gz"
+ln -s "$fixture/v0.1.0/SHA256SUMS" "$symlink_input/SHA256SUMS"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$symlink_input" \
+    --dest "$fixture/rejected-symlink-input/again"; then
+    echo "error: installer accepted symlinked release inputs" >&2
+    exit 1
+fi
+
+duplicate_manifest=$fixture/duplicate-manifest
+mkdir "$duplicate_manifest"
+cp "$fixture/v0.1.0/again-v0.1.0-${target}.tar.gz" "$duplicate_manifest/"
+cp "$fixture/v0.1.0/SHA256SUMS" "$duplicate_manifest/SHA256SUMS"
+head -n 1 "$duplicate_manifest/SHA256SUMS" >> "$duplicate_manifest/SHA256SUMS"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$duplicate_manifest" \
+    --dest "$fixture/rejected-duplicate-manifest/again"; then
+    echo "error: installer accepted a duplicate checksum entry" >&2
+    exit 1
+fi
+
+trailing_archive=$fixture/trailing-archive
+mkdir "$trailing_archive"
+cp "$fixture/v0.1.0/again-v0.1.0-${target}.tar.gz" \
+    "$trailing_archive/again-v0.1.0-${target}.tar.gz"
+printf 'trailing payload\n' >> "$trailing_archive/again-v0.1.0-${target}.tar.gz"
+checksum_manifest "$trailing_archive" "again-v0.1.0-${target}.tar.gz"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$trailing_archive" \
+    --dest "$fixture/rejected-trailing-archive/again"; then
+    echo "error: installer accepted an archive with trailing payload" >&2
+    exit 1
+fi
+
+symlink_archive=$fixture/symlink-archive
+symlink_archive_source=$fixture/symlink-archive-source
+mkdir "$symlink_archive" "$symlink_archive_source"
+ln -s outside "$symlink_archive_source/again"
+tar -czf "$symlink_archive/again-v0.1.0-${target}.tar.gz" \
+    -C "$symlink_archive_source" again
+checksum_manifest "$symlink_archive" "again-v0.1.0-${target}.tar.gz"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$symlink_archive" \
+    --dest "$fixture/rejected-symlink-archive/again"; then
+    echo "error: installer accepted a symbolic-link archive member" >&2
+    exit 1
+fi
+
+real_destination_parent=$fixture/real-destination-parent
+symlink_destination_parent=$fixture/symlink-destination-parent
+mkdir "$real_destination_parent"
+ln -s "$real_destination_parent" "$symlink_destination_parent"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.0 --artifact-dir "$fixture/v0.1.0" \
+    --dest "$symlink_destination_parent/again"; then
+    echo "error: installer accepted a symlinked destination parent" >&2
+    exit 1
+fi
+test ! -e "$real_destination_parent/again"
 
 # A destination typo must not rename and replace an existing directory tree.
 directory_destination="$fixture/directory-destination"
@@ -163,6 +238,24 @@ test "$("${destination}.previous")" = original-user-file
 # old marker while preserving the user's original backup.
 old_binary_hash=$(file_hash "$destination")
 old_marker_hash=$(file_hash "${destination}.again-install")
+
+# Install-marker authority is an exact five-field record. Duplicate or
+# appended fields cannot authorize upgrade or uninstall.
+cp "${destination}.again-install" "$fixture/valid-install-marker"
+printf 'installed_sha256=%s\n' "$old_binary_hash" >> "${destination}.again-install"
+if sh "$repository/scripts/install.sh" \
+    --version v0.1.1 --artifact-dir "$fixture/v0.1.1" --dest "$destination"; then
+    echo "error: installer accepted a duplicate ownership field" >&2
+    exit 1
+fi
+if sh "$repository/scripts/uninstall.sh" --dest "$destination"; then
+    echo "error: uninstaller accepted a duplicate ownership field" >&2
+    exit 1
+fi
+cp "$fixture/valid-install-marker" "${destination}.again-install"
+test "$(file_hash "$destination")" = "$old_binary_hash"
+test "$($destination)" = payload-one
+
 printf '%s\n' '#!/bin/sh' 'last=' 'for value do last=$value; done' \
     'case "$last" in *.again-install) exit 73 ;; esac' \
     "exec \"$real_mv\" \"\$@\"" > "$fixture/fake-bin/mv"

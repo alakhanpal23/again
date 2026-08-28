@@ -8,18 +8,21 @@ MAX_CHECKSUM_BYTES=1048576
 
 usage() {
     cat >&2 <<'EOF'
-Usage: install.sh --version TAG --dest PATH [--base-url URL | --artifact-dir DIR]
+Usage: install.sh --version TAG --dest PATH [--source-commit SHA]
+       [--base-url URL | --artifact-dir DIR]
 
 TAG must be a release tag such as v0.1.0. PATH is the exact binary destination.
 With --artifact-dir, a local development directory must contain the archive and
 SHA256SUMS. Without it, assets are downloaded from the Again GitHub release URL
-and the GitHub CLI authenticates their release-workflow provenance.
+and --source-commit is required so the GitHub CLI can authenticate the immutable
+release, tag, and release-workflow provenance.
 EOF
     exit 2
 }
 
 version=
 destination=
+source_commit=
 base_url=${AGAIN_RELEASE_BASE_URL:-https://github.com/alakhanpal23/again/releases/download}
 artifact_dir=
 
@@ -33,6 +36,11 @@ while [ "$#" -gt 0 ]; do
         --dest)
             [ "$#" -ge 2 ] || usage
             destination=$2
+            shift 2
+            ;;
+        --source-commit)
+            [ "$#" -ge 2 ] || usage
+            source_commit=$2
             shift 2
             ;;
         --base-url)
@@ -61,6 +69,10 @@ printf '%s\n' "$version" | grep -Eq "$semver_re" || {
     exit 2
 }
 if [ -z "$artifact_dir" ]; then
+    printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
+        echo "error: remote installation requires a 40-character lowercase source commit" >&2
+        exit 2
+    }
     case "$base_url" in
         https://*) ;;
         *)
@@ -71,6 +83,11 @@ if [ -z "$artifact_dir" ]; then
     command -v gh >/dev/null 2>&1 || {
         echo "error: GitHub CLI with attestation support is required for remote installation" >&2
         exit 1
+    }
+elif [ -n "$source_commit" ]; then
+    printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
+        echo "error: source commit must be 40 lowercase hexadecimal characters" >&2
+        exit 2
     }
 fi
 
@@ -105,11 +122,20 @@ case "$destination" in
     *) destination="$(pwd)/$destination" ;;
 esac
 destination_dir=$(dirname "$destination")
+destination_name=$(basename "$destination")
+case "$destination_name" in
+    ''|.|..)
+        echo "error: destination must name one binary file" >&2
+        exit 2
+        ;;
+esac
 mkdir -p "$destination_dir"
-[ -d "$destination_dir" ] || {
+[ -d "$destination_dir" ] && [ ! -L "$destination_dir" ] || {
     echo "error: destination parent is not a directory" >&2
     exit 1
 }
+destination_dir=$(CDPATH= cd -- "$destination_dir" && pwd -P)
+destination="$destination_dir/$destination_name"
 
 metadata=${destination}.again-install
 backup=${destination}.previous
@@ -223,16 +249,50 @@ bounded_file() {
         exit 1
     }
     size=$(wc -c < "$path" | tr -d ' ')
-    [ "$size" -le "$maximum" ] || {
-        echo "error: $description exceeds the size limit" >&2
+    [ "$size" -gt 0 ] && [ "$size" -le "$maximum" ] || {
+        echo "error: $description is empty or exceeds the size limit" >&2
         exit 1
     }
 }
 
 if [ -n "$artifact_dir" ]; then
+    [ -d "$artifact_dir" ] && [ ! -L "$artifact_dir" ] || {
+        echo "error: artifact directory is missing or is a symlink" >&2
+        exit 1
+    }
+    bounded_file "$artifact_dir/$asset" "$MAX_ARCHIVE_BYTES" "local release archive"
+    bounded_file "$artifact_dir/SHA256SUMS" "$MAX_CHECKSUM_BYTES" "local checksum manifest"
     cp "$artifact_dir/$asset" "$tmp/$asset"
     cp "$artifact_dir/SHA256SUMS" "$tmp/SHA256SUMS"
 else
+    expected_prerelease=false
+    case "$version" in *-*) expected_prerelease=true ;; esac
+    expected_release=$tmp/expected-release
+    observed_release=$tmp/observed-release
+    {
+        printf '%s\n' "$version" false true "$expected_prerelease"
+        printf '%s\n' \
+            SHA256SUMS \
+            "again-${version}-aarch64-apple-darwin.tar.gz" \
+            "again-${version}-aarch64-unknown-linux-gnu.tar.gz" \
+            "again-${version}-source.cdx.json" \
+            "again-${version}-x86_64-apple-darwin.tar.gz" \
+            "again-${version}-x86_64-unknown-linux-gnu.tar.gz"
+    } > "$expected_release"
+    gh release view "$version" \
+        --repo alakhanpal23/again \
+        --json assets,isDraft,isImmutable,isPrerelease,tagName \
+        --jq '[.tagName,(.isDraft|tostring),(.isImmutable|tostring),(.isPrerelease|tostring)] + ([.assets[].name] | sort) | .[]' \
+        > "$observed_release"
+    cmp "$expected_release" "$observed_release" >/dev/null 2>&1 || {
+        echo "error: remote release identity, immutability, kind, or inventory is invalid" >&2
+        exit 1
+    }
+    current_sha=$(gh api "repos/alakhanpal23/again/commits/${version}" --jq .sha)
+    [ "$current_sha" = "$source_commit" ] || {
+        echo "error: release tag does not resolve to the requested source commit" >&2
+        exit 1
+    }
     download "${base_url%/}/${version}/${asset}" "$tmp/$asset"
     download "${base_url%/}/${version}/SHA256SUMS" "$tmp/SHA256SUMS"
 fi
@@ -246,7 +306,11 @@ if [ -z "$artifact_dir" ]; then
         gh attestation verify "$subject" \
             --repo alakhanpal23/again \
             --signer-workflow alakhanpal23/again/.github/workflows/release.yml \
+            --signer-digest "$source_commit" \
             --source-ref "refs/tags/$version" \
+            --source-digest "$source_commit" \
+            --cert-oidc-issuer https://token.actions.githubusercontent.com \
+            --predicate-type https://slsa.dev/provenance/v1 \
             --deny-self-hosted-runners >/dev/null || {
             echo "error: publisher attestation verification failed for $description" >&2
             exit 1
@@ -256,11 +320,36 @@ if [ -z "$artifact_dir" ]; then
     verify_attestation "$tmp/$asset" "release archive"
 fi
 
-expected=$(awk -v file="$asset" '
-    length($1) == 64 && tolower($1) !~ /[^0-9a-f]/ && ($2 == file || $2 == "*" file) {
-        print tolower($1); exit
+parsed_manifest=$tmp/parsed-manifest
+manifest_names=$tmp/manifest-names
+awk '
+    NF != 2 || length($1) != 64 || tolower($1) ~ /[^0-9a-f]/ { exit 1 }
+    {
+        name=$2
+        sub(/^\*/, "", name)
+        if (name !~ /^again-v[0-9A-Za-z.-]+-(aarch64-apple-darwin|aarch64-unknown-linux-gnu|x86_64-apple-darwin|x86_64-unknown-linux-gnu)\.tar\.gz$/ &&
+            name !~ /^again-v[0-9A-Za-z.-]+-source\.cdx\.json$/) { exit 1 }
+        print tolower($1), name
     }
-' "$tmp/SHA256SUMS")
+' "$tmp/SHA256SUMS" > "$parsed_manifest" || {
+    echo "error: checksum manifest contains a malformed or unsafe entry" >&2
+    exit 1
+}
+awk '{ print $2 }' "$parsed_manifest" | LC_ALL=C sort > "$manifest_names"
+if [ -z "$artifact_dir" ]; then
+    sed '1,5d' "$expected_release" > "$tmp/expected-checksum-names"
+    cmp "$tmp/expected-checksum-names" "$manifest_names" >/dev/null 2>&1 || {
+        echo "error: checksum manifest does not contain the exact release assets" >&2
+        exit 1
+    }
+else
+    printf '%s\n' "$asset" > "$tmp/local-checksum-name"
+    cmp "$tmp/local-checksum-name" "$manifest_names" >/dev/null 2>&1 || {
+        echo "error: local checksum manifest must contain exactly the selected archive" >&2
+        exit 1
+    }
+fi
+expected=$(awk -v file="$asset" '$2 == file { print $1 }' "$parsed_manifest")
 [ -n "$expected" ] || {
     echo "error: SHA256SUMS has no valid entry for $asset" >&2
     exit 1
@@ -275,9 +364,19 @@ fi
     exit 1
 }
 
+gzip -t "$tmp/$asset" 2>/dev/null || {
+    echo "error: archive is not a complete gzip stream" >&2
+    exit 1
+}
+
 members=$(tar -tzf "$tmp/$asset")
 [ "$members" = "again" ] || {
     echo "error: archive must contain exactly one top-level member named again" >&2
+    exit 1
+}
+archive_mode=$(tar -tvzf "$tmp/$asset" | awk 'NR == 1 { print $1 }')
+[ "$archive_mode" = "-rwxr-xr-x" ] || {
+    echo "error: archive member must be a normalized regular executable" >&2
     exit 1
 }
 mkdir "$tmp/unpack"
@@ -299,6 +398,12 @@ fi
 {
     printf 'version=%s\n' "$version"
     printf 'target=%s\n' "$target"
+    if [ -n "$source_commit" ]; then
+        printf 'source_commit=%s\n' "$source_commit"
+    else
+        printf 'source_commit=local-unattested\n'
+    fi
+    printf 'archive_sha256=%s\n' "$actual"
     printf 'installed_sha256=%s\n' "$installed_hash"
 } > "$metadata_tmp"
 chmod 0600 "$metadata_tmp"
@@ -315,11 +420,29 @@ if [ -e "$metadata" ]; then
         echo "error: managed installation shape is invalid" >&2
         exit 1
     }
-    recorded=$(awk -F= '$1 == "installed_sha256" { print $2; exit }' "$metadata")
-    [ -n "$recorded" ] || {
+    validate_marker() {
+        marker=$1
+        [ "$(wc -l < "$marker" | tr -d ' ')" -eq 5 ] &&
+            awk -F= '
+                NF != 2 { exit 1 }
+                NR == 1 && $1 != "version" { exit 1 }
+                NR == 2 && $1 != "target" { exit 1 }
+                NR == 3 && $1 != "source_commit" { exit 1 }
+                NR == 4 && $1 != "archive_sha256" { exit 1 }
+                NR == 5 && $1 != "installed_sha256" { exit 1 }
+                END { if (NR != 5) exit 1 }
+            ' "$marker" &&
+            sed -n '1s/^version=//p' "$marker" | grep -Eq "$semver_re" &&
+            sed -n '2s/^target=//p' "$marker" | grep -Eq '^(aarch64|x86_64)-(apple-darwin|unknown-linux-gnu)$' &&
+            sed -n '3s/^source_commit=//p' "$marker" | grep -Eq '^(local-unattested|[0-9a-f]{40})$' &&
+            sed -n '4s/^archive_sha256=//p' "$marker" | grep -Eq '^[0-9a-f]{64}$' &&
+            sed -n '5s/^installed_sha256=//p' "$marker" | grep -Eq '^[0-9a-f]{64}$'
+    }
+    validate_marker "$metadata" || {
         echo "error: refusing to replace an invalid install marker" >&2
         exit 1
     }
+    recorded=$(sed -n '5s/^installed_sha256=//p' "$metadata")
     if command -v sha256sum >/dev/null 2>&1; then
         current=$(sha256sum "$destination" | awk '{ print tolower($1) }')
     else
