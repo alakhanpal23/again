@@ -74,6 +74,67 @@ python3 "$repository/scripts/package_release.py" \
 cmp "$fixture/v0.1.0/again-v0.1.0-${target}.tar.gz" "$fixture/repeat.tar.gz"
 test "$(tar -tzf "$fixture/repeat.tar.gz")" = again
 
+# The signed predicate is deterministic and binds one workflow run, tag, and
+# source commit without accepting partial or malformed identities.
+provenance=$fixture/provenance.json
+provenance_repeat=$fixture/provenance-repeat.json
+python3 "$repository/scripts/package_release.py" \
+    --provenance-output "$provenance" \
+    --repository alakhanpal23/again \
+    --tag v0.1.0-alpha.1 \
+    --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --workflow-run-id 123456789 \
+    --workflow-run-attempt 2
+python3 "$repository/scripts/package_release.py" \
+    --provenance-output "$provenance_repeat" \
+    --repository alakhanpal23/again \
+    --tag v0.1.0-alpha.1 \
+    --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --workflow-run-id 123456789 \
+    --workflow-run-attempt 2
+cmp "$provenance" "$provenance_repeat"
+python3 - "$provenance" <<'PY'
+import json
+import pathlib
+import sys
+
+predicate = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert predicate["buildDefinition"]["buildType"] == (
+    "https://github.com/Attestations/GitHubActionsWorkflow@v1"
+)
+assert predicate["buildDefinition"]["externalParameters"] == {
+    "repository": "alakhanpal23/again",
+    "sourceRef": "refs/tags/v0.1.0-alpha.1",
+    "workflow": ".github/workflows/release.yml",
+}
+assert predicate["buildDefinition"]["resolvedDependencies"] == [{
+    "digest": {"gitCommit": "0123456789abcdef0123456789abcdef01234567"},
+    "uri": "git+https://github.com/alakhanpal23/again@refs/tags/v0.1.0-alpha.1",
+}]
+assert predicate["runDetails"]["metadata"]["invocationId"] == (
+    "https://github.com/alakhanpal23/again/actions/runs/123456789/attempts/2"
+)
+PY
+if python3 "$repository/scripts/package_release.py" \
+    --provenance-output "$provenance" \
+    --repository alakhanpal23/again \
+    --tag v0.1.0-alpha.1 \
+    --source-commit 0123456789abcdef0123456789abcdef01234567 \
+    --workflow-run-id 123456789 --workflow-run-attempt 2 \
+    > /dev/null 2>&1; then
+    echo "error: provenance generator overwrote an existing output" >&2
+    exit 1
+fi
+if python3 "$repository/scripts/package_release.py" \
+    --provenance-output "$fixture/malformed-provenance.json" \
+    --repository ../other --tag v0.1.0-alpha.1 \
+    --source-commit not-a-commit \
+    --workflow-run-id 0 --workflow-run-attempt 0 \
+    > /dev/null 2>&1; then
+    echo "error: provenance generator accepted a malformed identity" >&2
+    exit 1
+fi
+
 # Local development inputs remain explicitly unauthenticated, but malformed
 # filesystem and archive shapes are still rejected before destination mutation.
 artifact_symlink=$fixture/artifact-directory-symlink

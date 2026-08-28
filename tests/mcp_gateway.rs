@@ -1455,10 +1455,17 @@ fn public_stdio_never_emits_delivery_authority_even_when_negotiated() {
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
         .collect::<Vec<_>>();
     assert_eq!(responses.len(), 3);
-    assert_eq!(responses[1]["id"], 2);
-    assert!(responses[1].get("__again_internal_delivery_v2").is_none());
+    let tool_response = responses
+        .iter()
+        .find(|response| response["id"] == 2)
+        .expect("tools/call response");
+    let acknowledgement_response = responses
+        .iter()
+        .find(|response| response["id"] == 3)
+        .expect("delivery acknowledgement response");
+    assert!(tool_response.get("__again_internal_delivery_v2").is_none());
     assert_eq!(
-        responses[2]["error"]["data"]["reason"],
+        acknowledgement_response["error"]["data"]["reason"],
         "unsupported_recipient_authority"
     );
 }

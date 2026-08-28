@@ -4,8 +4,11 @@
 set -eu
 
 MAX_ASSET_BYTES=67108864
+MAX_BUNDLE_BYTES=4194304
 MAX_CHECKSUM_BYTES=1048576
 MAX_FORMULA_BYTES=131072
+COSIGN_VERSION=v3.1.3
+COSIGN_COMMIT=11926fa5bbbbde47e88fc006b625a17769b743b2
 
 usage() {
     cat >&2 <<'EOF'
@@ -14,9 +17,9 @@ Usage: verify_release.sh --version TAG --source-commit SHA --artifact-dir DIR
 
 DIR must contain SHA256SUMS, all four native archives, the source SBOM, and the
 deterministically generated again-alpha.rb formula.
-The GitHub CLI must be authenticated or otherwise able to read public
-attestations. Verification pins the Again release workflow, tag ref, repository,
-and GitHub-hosted runner provenance.
+Cosign 3.1.3 must be installed. Verification pins the Again release workflow,
+tag ref, repository, source commit, trigger, SLSA provenance predicate,
+Fulcio identity, RFC3161 timestamp, and Rekor transparency proof.
 EOF
     exit 2
 }
@@ -85,8 +88,21 @@ artifact_dir=$(CDPATH= cd -- "$artifact_dir" && pwd -P) || {
     echo "error: artifact directory cannot be resolved" >&2
     exit 1
 }
-command -v gh >/dev/null 2>&1 || {
-    echo "error: GitHub CLI with attestation support is required" >&2
+command -v cosign >/dev/null 2>&1 || {
+    echo "error: Cosign $COSIGN_VERSION is required" >&2
+    exit 1
+}
+cosign_metadata=$(cosign version --json 2>/dev/null) || {
+    echo "error: Cosign version cannot be established" >&2
+    exit 1
+}
+cosign_version=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitVersion":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+cosign_commit=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitCommit":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+cosign_tree_state=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitTreeState":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+[ "$cosign_version" = "$COSIGN_VERSION" ] && \
+    [ "$cosign_commit" = "$COSIGN_COMMIT" ] && \
+    [ "$cosign_tree_state" = clean ] || {
+    echo "error: Cosign verifier is not the pinned clean build" >&2
     exit 1
 }
 script_dir=$(CDPATH= cd -- "$(dirname "$0")" && pwd -P)
@@ -119,41 +135,34 @@ verify_attestation() {
     subject=$1
     subject_name=$2
     subject_digest=$3
+    bundle=$subject.sigstore.json
+    bounded_regular_file "$bundle" "$MAX_BUNDLE_BYTES" \
+        "Sigstore bundle for $subject_name"
+    cosign verify-blob-attestation \
+        --bundle "$bundle" \
+        --certificate-identity "https://github.com/${repository}/.github/workflows/release.yml@refs/tags/${version}" \
+        --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+        --certificate-github-workflow-ref "refs/tags/$version" \
+        --certificate-github-workflow-repository "$repository" \
+        --certificate-github-workflow-sha "$source_commit" \
+        --certificate-github-workflow-trigger push \
+        --type slsaprovenance1 \
+        --check-claims=true \
+        --use-signed-timestamps \
+        "$subject" >/dev/null
     if [ "$collect_attestation_summaries" -eq 0 ]; then
-        gh attestation verify "$subject" \
-            --repo "$repository" \
-            --signer-workflow "$repository/.github/workflows/release.yml" \
-            --signer-digest "$source_commit" \
-            --source-ref "refs/tags/$version" \
-            --source-digest "$source_commit" \
-            --cert-oidc-issuer https://token.actions.githubusercontent.com \
-            --predicate-type https://slsa.dev/provenance/v1 \
-            --deny-self-hosted-runners \
-            >/dev/null
         attestation_index=$((attestation_index + 1))
         return
     fi
     summary_name=$(printf '%03d.json' "$attestation_index")
-    raw_result=$temporary/attestation-result.json
-    (ulimit -f 8192; gh attestation verify "$subject" \
-        --repo "$repository" \
-        --signer-workflow "$repository/.github/workflows/release.yml" \
-        --signer-digest "$source_commit" \
-        --source-ref "refs/tags/$version" \
-        --source-digest "$source_commit" \
-        --cert-oidc-issuer https://token.actions.githubusercontent.com \
-        --predicate-type https://slsa.dev/provenance/v1 \
-        --deny-self-hosted-runners \
-        --format json > "$raw_result")
     python3 "$evidence_tool" attestation \
-        --input "$raw_result" \
+        --input "$bundle" \
         --subject-name "$subject_name" \
         --subject-digest "$subject_digest" \
         --repository "$repository" \
         --tag "$version" \
         --source-commit "$source_commit" \
         --output "$attestation_summary_dir/$summary_name"
-    rm -f "$raw_result"
     attestation_index=$((attestation_index + 1))
 }
 
@@ -199,6 +208,7 @@ manifest_digest=$(file_hash "$manifest")
 verify_attestation "$manifest" SHA256SUMS "$manifest_digest"
 
 expected=$temporary/expected
+expected_inventory_unsorted=$temporary/expected-inventory-unsorted
 expected_inventory=$temporary/expected-inventory
 parsed=$temporary/parsed
 actual=$temporary/actual
@@ -211,11 +221,15 @@ again-${version}-source.cdx.json
 again-${version}-x86_64-apple-darwin.tar.gz
 again-${version}-x86_64-unknown-linux-gnu.tar.gz
 EOF
-{
-    printf '%s\n' SHA256SUMS
-    printf '%s\n' again-alpha.rb
-    cat "$expected"
-} > "$expected_inventory"
+: > "$expected_inventory_unsorted"
+while IFS= read -r name; do
+    printf '%s\n' "$name" "$name.sigstore.json"
+done < "$expected" >> "$expected_inventory_unsorted"
+printf '%s\n' \
+    SHA256SUMS SHA256SUMS.sigstore.json \
+    again-alpha.rb again-alpha.rb.sigstore.json \
+    >> "$expected_inventory_unsorted"
+LC_ALL=C sort "$expected_inventory_unsorted" > "$expected_inventory"
 
 : > "$observed_inventory_unsorted"
 for path in "$artifact_dir"/* "$artifact_dir"/.[!.]* "$artifact_dir"/..?*; do
@@ -226,15 +240,7 @@ for path in "$artifact_dir"/* "$artifact_dir"/.[!.]* "$artifact_dir"/..?*; do
         echo "error: artifact directory contains a non-regular member" >&2
         exit 1
     }
-    name=$(basename "$path")
-    case "$name" in
-        SHA256SUMS|again-alpha.rb|again-"${version}"-aarch64-apple-darwin.tar.gz|again-"${version}"-aarch64-unknown-linux-gnu.tar.gz|again-"${version}"-source.cdx.json|again-"${version}"-x86_64-apple-darwin.tar.gz|again-"${version}"-x86_64-unknown-linux-gnu.tar.gz) ;;
-        *)
-            echo "error: artifact directory contains an unexpected member" >&2
-            exit 1
-            ;;
-    esac
-    printf '%s\n' "$name" >> "$observed_inventory_unsorted"
+    basename "$path" >> "$observed_inventory_unsorted"
 done
 LC_ALL=C sort "$observed_inventory_unsorted" > "$observed_inventory"
 cmp "$expected_inventory" "$observed_inventory" >/dev/null || {

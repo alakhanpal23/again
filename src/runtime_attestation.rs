@@ -2830,11 +2830,19 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn real_spoofed_executable_path_is_rejected_before_runtime_sealing() {
-        assert!(matches!(
-            attest_team_runtime_v1("cat", Path::new("/usr/bin/head")),
-            Err(RuntimeAttestationError::ExecutableNotAudited(_))
-                | Err(RuntimeAttestationError::ExecutableIdentityMismatch)
-        ));
+        let result = attest_team_runtime_v1("cat", Path::new("/usr/bin/head"));
+        if std::env::consts::ARCH == AUDITED_TARGET_ARCH {
+            assert!(matches!(
+                result,
+                Err(RuntimeAttestationError::ExecutableNotAudited(_))
+                    | Err(RuntimeAttestationError::ExecutableIdentityMismatch)
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeAttestationError::UnsupportedArchitecture)
+            ));
+        }
     }
 
     #[test]

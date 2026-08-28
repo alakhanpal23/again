@@ -56,7 +56,9 @@ grep -F 'doctor --json' "$formula" >/dev/null
 grep -F "'\"trace_backed_replay\": false'" "$formula" >/dev/null
 grep -F "'\"seatbelt_used_for_profile\": false'" "$formula" >/dev/null
 grep -F -- '--output dist/again-alpha.rb' "$workflow" >/dev/null
-grep -F 'subject-path: dist/again-alpha.rb' "$workflow" >/dev/null
+grep -F 'for subject in dist/SHA256SUMS dist/again-alpha.rb; do' "$workflow" >/dev/null
+grep -F 'cosign attest-blob --yes' "$workflow" >/dev/null
+grep -F 'dist/again-alpha.rb.sigstore.json \' "$workflow" >/dev/null
 grep -F 'dist/again-alpha.rb \' "$workflow" >/dev/null
 if grep -Eq 'setup|config enable|reuse authority' "$formula"; then
     echo "error: formula contains an unsupported authority-enabling action" >&2

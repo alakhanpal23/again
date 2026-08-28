@@ -14,6 +14,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import tarfile
 import tempfile
@@ -24,6 +25,15 @@ import zlib
 MAX_BINARY_BYTES = 64 * 1024 * 1024
 MAX_SBOM_BYTES = 16 * 1024 * 1024
 MAX_TAR_BYTES = MAX_BINARY_BYTES + 1024 * 1024
+REPOSITORY = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
+SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}")
+SEMVER_TAG = re.compile(
+    r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+    r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+    r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+)
+WORKFLOW_PATH = ".github/workflows/release.yml"
+BUILD_TYPE = "https://github.com/Attestations/GitHubActionsWorkflow@v1"
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verify-archive", type=Path)
     parser.add_argument("--verify-sbom", type=Path)
     parser.add_argument("--version")
+    parser.add_argument("--provenance-output", type=Path)
+    parser.add_argument("--repository")
+    parser.add_argument("--tag")
+    parser.add_argument("--source-commit")
+    parser.add_argument("--workflow-run-id", type=int)
+    parser.add_argument("--workflow-run-attempt", type=int)
     return parser.parse_args()
 
 
@@ -191,6 +207,76 @@ def package(binary_path: Path, output: Path, source_date_epoch: int) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def write_provenance(
+    output: Path,
+    repository: str,
+    tag: str,
+    source_commit: str,
+    workflow_run_id: int,
+    workflow_run_attempt: int,
+) -> None:
+    if (
+        REPOSITORY.fullmatch(repository) is None
+        or SEMVER_TAG.fullmatch(tag) is None
+        or SOURCE_COMMIT.fullmatch(source_commit) is None
+        or workflow_run_id <= 0
+        or workflow_run_attempt <= 0
+    ):
+        raise SystemExit("release provenance identity is invalid")
+    if output.exists() or output.is_symlink():
+        raise SystemExit("provenance output already exists; refusing to overwrite it")
+    source_ref = f"refs/tags/{tag}"
+    workflow_identity = (
+        f"https://github.com/{repository}/{WORKFLOW_PATH}@{source_ref}"
+    )
+    provenance = {
+        "buildDefinition": {
+            "buildType": BUILD_TYPE,
+            "externalParameters": {
+                "repository": repository,
+                "sourceRef": source_ref,
+                "workflow": WORKFLOW_PATH,
+            },
+            "internalParameters": {},
+            "resolvedDependencies": [
+                {
+                    "digest": {"gitCommit": source_commit},
+                    "uri": f"git+https://github.com/{repository}@{source_ref}",
+                }
+            ],
+        },
+        "runDetails": {
+            "builder": {"id": workflow_identity},
+            "metadata": {
+                "invocationId": (
+                    f"https://github.com/{repository}/actions/runs/"
+                    f"{workflow_run_id}/attempts/{workflow_run_attempt}"
+                )
+            },
+        },
+    }
+    payload = (json.dumps(provenance, indent=2, sort_keys=True) + "\n").encode()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{output.name}.", dir=output.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as raw:
+            raw.write(payload)
+            raw.flush()
+            os.fsync(raw.fileno())
+        try:
+            os.link(temporary, output)
+        except FileExistsError as error:
+            raise SystemExit(
+                "provenance output appeared; refusing to overwrite it"
+            ) from error
+        output.chmod(0o644)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> None:
     args = parse_args()
     modes = sum(
@@ -198,22 +284,86 @@ def main() -> None:
             args.binary is not None,
             args.verify_archive is not None,
             args.verify_sbom is not None,
+            args.provenance_output is not None,
         )
     )
     if modes != 1:
         raise SystemExit("select exactly one packaging or verification mode")
     if args.binary is not None:
-        if args.output is None or args.source_date_epoch is None or args.version is not None:
+        if (
+            args.output is None
+            or args.source_date_epoch is None
+            or args.version is not None
+            or args.repository is not None
+            or args.tag is not None
+            or args.source_commit is not None
+            or args.workflow_run_id is not None
+            or args.workflow_run_attempt is not None
+        ):
             raise SystemExit("packaging requires --binary, --output, and --source-date-epoch")
         package(args.binary, args.output, args.source_date_epoch)
     elif args.verify_archive is not None:
-        if args.output is not None or args.source_date_epoch is not None or args.version is not None:
+        if any(
+            value is not None
+            for value in (
+                args.output,
+                args.source_date_epoch,
+                args.version,
+                args.repository,
+                args.tag,
+                args.source_commit,
+                args.workflow_run_id,
+                args.workflow_run_attempt,
+            )
+        ):
             raise SystemExit("archive verification accepts only --verify-archive")
         verify_archive(args.verify_archive)
-    else:
-        if args.version is None or args.output is not None or args.source_date_epoch is not None:
+    elif args.verify_sbom is not None:
+        if (
+            args.version is None
+            or any(
+                value is not None
+                for value in (
+                    args.output,
+                    args.source_date_epoch,
+                    args.repository,
+                    args.tag,
+                    args.source_commit,
+                    args.workflow_run_id,
+                    args.workflow_run_attempt,
+                )
+            )
+        ):
             raise SystemExit("SBOM verification requires --verify-sbom and --version")
         verify_sbom(args.verify_sbom, args.version)
+    else:
+        if (
+            args.repository is None
+            or args.tag is None
+            or args.source_commit is None
+            or args.workflow_run_id is None
+            or args.workflow_run_attempt is None
+            or any(
+                value is not None
+                for value in (
+                    args.binary,
+                    args.output,
+                    args.source_date_epoch,
+                    args.verify_archive,
+                    args.verify_sbom,
+                    args.version,
+                )
+            )
+        ):
+            raise SystemExit("provenance generation requires its complete identity")
+        write_provenance(
+            args.provenance_output,
+            args.repository,
+            args.tag,
+            args.source_commit,
+            args.workflow_run_id,
+            args.workflow_run_attempt,
+        )
 
 
 if __name__ == "__main__":

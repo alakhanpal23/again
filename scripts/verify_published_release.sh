@@ -9,9 +9,10 @@ Usage: verify_published_release.sh --version TAG --source-commit SHA
        [--repository OWNER/REPO]
        [--evidence-output FILE [--verified-at YYYY-MM-DDTHH:MM:SSZ]]
 
-The GitHub CLI must be able to read the release and its GitHub attestations.
-The release must contain exactly the four native archives, source SBOM,
-SHA256SUMS, and deterministic alpha formula expected for TAG.
+The GitHub CLI must be able to read the release, and pinned Cosign 3.1.3 must
+verify its Sigstore bundles. The release must contain exactly the four native
+archives, source SBOM, SHA256SUMS, deterministic alpha formula, and one
+publisher-authenticated bundle for each of those seven subjects.
 EOF
     exit 2
 }
@@ -76,7 +77,7 @@ printf '%s\n' "$source_commit" | grep -Eq '^[0-9a-f]{40}$' || {
     exit 2
 }
 command -v gh >/dev/null 2>&1 || {
-    echo "error: GitHub CLI with attestation support is required" >&2
+    echo "error: GitHub CLI is required to read the private release" >&2
     exit 1
 }
 
@@ -103,12 +104,19 @@ downloaded_sorted=$temporary/downloaded-sorted
 attestation_summaries=$temporary/attestation-summaries
 cat > "$expected" <<EOF
 SHA256SUMS
+SHA256SUMS.sigstore.json
 again-alpha.rb
+again-alpha.rb.sigstore.json
 again-${version}-aarch64-apple-darwin.tar.gz
+again-${version}-aarch64-apple-darwin.tar.gz.sigstore.json
 again-${version}-aarch64-unknown-linux-gnu.tar.gz
+again-${version}-aarch64-unknown-linux-gnu.tar.gz.sigstore.json
 again-${version}-source.cdx.json
+again-${version}-source.cdx.json.sigstore.json
 again-${version}-x86_64-apple-darwin.tar.gz
+again-${version}-x86_64-apple-darwin.tar.gz.sigstore.json
 again-${version}-x86_64-unknown-linux-gnu.tar.gz
+again-${version}-x86_64-unknown-linux-gnu.tar.gz.sigstore.json
 EOF
 
 case "$version" in
@@ -178,6 +186,7 @@ if [ -n "$evidence_output" ]; then
         --source-commit "$source_commit" \
         --verified-at "$verified_at" \
         --github-cli-version "$github_cli_version" \
+        --cosign-version 'cosign v3.1.3 (11926fa5bbbbde47e88fc006b625a17769b743b2)' \
         --harness-root "$repository_root" \
         --output "$evidence_output"
 else

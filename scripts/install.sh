@@ -4,7 +4,10 @@
 set -eu
 
 MAX_ARCHIVE_BYTES=67108864
+MAX_BUNDLE_BYTES=4194304
 MAX_CHECKSUM_BYTES=1048576
+COSIGN_VERSION=v3.1.3
+COSIGN_COMMIT=11926fa5bbbbde47e88fc006b625a17769b743b2
 
 usage() {
     cat >&2 <<'EOF'
@@ -15,7 +18,7 @@ TAG must be a release tag such as v0.1.0. PATH is the exact binary destination.
 With --artifact-dir, a local development directory must contain the archive and
 SHA256SUMS. Without it, assets are downloaded from the Again GitHub release URL
 and --source-commit is required so the GitHub CLI can authenticate the immutable
-release, tag, and release-workflow provenance.
+release and tag while pinned Cosign verifies its release-workflow provenance.
 EOF
     exit 2
 }
@@ -23,7 +26,13 @@ EOF
 version=
 destination=
 source_commit=
-base_url=${AGAIN_RELEASE_BASE_URL:-https://github.com/alakhanpal23/again/releases/download}
+if [ "${AGAIN_RELEASE_BASE_URL+x}" = x ]; then
+    base_url=$AGAIN_RELEASE_BASE_URL
+    base_url_explicit=1
+else
+    base_url=https://github.com/alakhanpal23/again/releases/download
+    base_url_explicit=0
+fi
 artifact_dir=
 
 while [ "$#" -gt 0 ]; do
@@ -46,6 +55,7 @@ while [ "$#" -gt 0 ]; do
         --base-url)
             [ "$#" -ge 2 ] || usage
             base_url=$2
+            base_url_explicit=1
             shift 2
             ;;
         --artifact-dir)
@@ -81,7 +91,24 @@ if [ -z "$artifact_dir" ]; then
             ;;
     esac
     command -v gh >/dev/null 2>&1 || {
-        echo "error: GitHub CLI with attestation support is required for remote installation" >&2
+        echo "error: GitHub CLI is required for remote installation" >&2
+        exit 1
+    }
+    command -v cosign >/dev/null 2>&1 || {
+        echo "error: Cosign $COSIGN_VERSION is required for remote installation" >&2
+        exit 1
+    }
+    cosign_metadata=$(cosign version --json 2>/dev/null) || {
+        echo "error: Cosign version cannot be established" >&2
+        exit 1
+    }
+    cosign_version=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitVersion":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+    cosign_commit=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitCommit":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+    cosign_tree_state=$(printf '%s\n' "$cosign_metadata" | sed -n 's/^[[:space:]]*"gitTreeState":[[:space:]]*"\([^"]*\)"[,]\{0,1\}$/\1/p')
+    [ "$cosign_version" = "$COSIGN_VERSION" ] && \
+        [ "$cosign_commit" = "$COSIGN_COMMIT" ] && \
+        [ "$cosign_tree_state" = clean ] || {
+        echo "error: Cosign verifier is not the pinned clean build" >&2
         exit 1
     }
 elif [ -n "$source_commit" ]; then
@@ -339,12 +366,19 @@ else
         printf '%s\n' "$version" false true "$expected_prerelease"
         printf '%s\n' \
             SHA256SUMS \
+            SHA256SUMS.sigstore.json \
             again-alpha.rb \
+            again-alpha.rb.sigstore.json \
             "again-${version}-aarch64-apple-darwin.tar.gz" \
+            "again-${version}-aarch64-apple-darwin.tar.gz.sigstore.json" \
             "again-${version}-aarch64-unknown-linux-gnu.tar.gz" \
+            "again-${version}-aarch64-unknown-linux-gnu.tar.gz.sigstore.json" \
             "again-${version}-source.cdx.json" \
+            "again-${version}-source.cdx.json.sigstore.json" \
             "again-${version}-x86_64-apple-darwin.tar.gz" \
-            "again-${version}-x86_64-unknown-linux-gnu.tar.gz"
+            "again-${version}-x86_64-apple-darwin.tar.gz.sigstore.json" \
+            "again-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            "again-${version}-x86_64-unknown-linux-gnu.tar.gz.sigstore.json"
     } > "$expected_release"
     gh release view "$version" \
         --repo alakhanpal23/again \
@@ -360,8 +394,22 @@ else
         echo "error: release tag does not resolve to the requested source commit" >&2
         exit 1
     }
-    download "${base_url%/}/${version}/${asset}" "$tmp/$asset"
-    download "${base_url%/}/${version}/SHA256SUMS" "$tmp/SHA256SUMS"
+    if [ "$base_url_explicit" -eq 0 ]; then
+        gh release download "$version" \
+            --repo alakhanpal23/again \
+            --dir "$tmp" \
+            --pattern "$asset" \
+            --pattern "${asset}.sigstore.json" \
+            --pattern SHA256SUMS \
+            --pattern SHA256SUMS.sigstore.json
+    else
+        download "${base_url%/}/${version}/${asset}" "$tmp/$asset"
+        download "${base_url%/}/${version}/SHA256SUMS" "$tmp/SHA256SUMS"
+        download "${base_url%/}/${version}/${asset}.sigstore.json" \
+            "$tmp/${asset}.sigstore.json"
+        download "${base_url%/}/${version}/SHA256SUMS.sigstore.json" \
+            "$tmp/SHA256SUMS.sigstore.json"
+    fi
 fi
 bounded_file "$tmp/$asset" "$MAX_ARCHIVE_BYTES" "release archive"
 bounded_file "$tmp/SHA256SUMS" "$MAX_CHECKSUM_BYTES" "checksum manifest"
@@ -370,15 +418,21 @@ if [ -z "$artifact_dir" ]; then
     verify_attestation() {
         subject=$1
         description=$2
-        gh attestation verify "$subject" \
-            --repo alakhanpal23/again \
-            --signer-workflow alakhanpal23/again/.github/workflows/release.yml \
-            --signer-digest "$source_commit" \
-            --source-ref "refs/tags/$version" \
-            --source-digest "$source_commit" \
-            --cert-oidc-issuer https://token.actions.githubusercontent.com \
-            --predicate-type https://slsa.dev/provenance/v1 \
-            --deny-self-hosted-runners >/dev/null || {
+        bundle=$subject.sigstore.json
+        bounded_file "$bundle" "$MAX_BUNDLE_BYTES" \
+            "Sigstore bundle for $description"
+        cosign verify-blob-attestation \
+            --bundle "$bundle" \
+            --certificate-identity "https://github.com/alakhanpal23/again/.github/workflows/release.yml@refs/tags/${version}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-ref "refs/tags/$version" \
+            --certificate-github-workflow-repository alakhanpal23/again \
+            --certificate-github-workflow-sha "$source_commit" \
+            --certificate-github-workflow-trigger push \
+            --type slsaprovenance1 \
+            --check-claims=true \
+            --use-signed-timestamps \
+            "$subject" >/dev/null || {
             echo "error: publisher attestation verification failed for $description" >&2
             exit 1
         }
@@ -404,7 +458,13 @@ awk '
 }
 awk '{ print $2 }' "$parsed_manifest" | LC_ALL=C sort > "$manifest_names"
 if [ -z "$artifact_dir" ]; then
-    sed '1,6d' "$expected_release" > "$tmp/expected-checksum-names"
+    printf '%s\n' \
+        "again-${version}-aarch64-apple-darwin.tar.gz" \
+        "again-${version}-aarch64-unknown-linux-gnu.tar.gz" \
+        "again-${version}-source.cdx.json" \
+        "again-${version}-x86_64-apple-darwin.tar.gz" \
+        "again-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+        > "$tmp/expected-checksum-names"
     cmp "$tmp/expected-checksum-names" "$manifest_names" >/dev/null 2>&1 || {
         echo "error: checksum manifest does not contain the exact release assets" >&2
         exit 1

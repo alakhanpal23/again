@@ -79,7 +79,6 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     permissions:
-      attestations: write
       contents: read
       id-token: write
     steps:
@@ -115,15 +114,51 @@ jobs:
           crate_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
           test "$("$smoke_dir/again" --version)" = "again ${crate_version}"
           python3 scripts/package_release.py --verify-archive "$archive"
-      - name: Attest the exact platform archive at its build origin
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      - name: Install the pinned patched Cosign verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          subject-path: dist/again-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-      - name: Upload the platform archive
+          cosign-release: v3.1.3
+      - name: Attest and verify the exact platform archive at its build origin
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          archive="dist/again-${TAG}-${TARGET}.tar.gz"
+          predicate="dist/platform-provenance.json"
+          trap 'rm -f "$predicate"' EXIT
+          python3 scripts/package_release.py \
+            --provenance-output "$predicate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          cosign attest-blob --yes \
+            --predicate "$predicate" \
+            --type slsaprovenance1 \
+            --bundle "${archive}.sigstore.json" \
+            "$archive"
+          cosign verify-blob-attestation \
+            --bundle "${archive}.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-ref "refs/tags/${TAG}" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger push \
+            --type slsaprovenance1 \
+            --check-claims=true \
+            --use-signed-timestamps \
+            "$archive"
+      - name: Upload the platform archive and provenance bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-${{ matrix.target }}
-          path: dist/again-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: |
+            dist/again-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            dist/again-${{ github.ref_name }}-${{ matrix.target }}.tar.gz.sigstore.json
           if-no-files-found: error
           retention-days: 7
 
@@ -133,7 +168,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
-      attestations: write
       contents: read
       id-token: write
     steps:
@@ -152,23 +186,59 @@ jobs:
           mkdir -p dist
           export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
-          sbom="again-${TAG}-source.cdx.json"
+          sbom_basename="again-${TAG}-source.cdx"
+          sbom="${sbom_basename}.json"
           cargo +1.88.0 cyclonedx --quiet --all-features --format json --spec-version 1.5 \
-            --override-filename "$sbom"
+            --override-filename "$sbom_basename"
           test -s "$sbom"
           mv "$sbom" "dist/$sbom"
           python3 scripts/package_release.py \
             --verify-sbom "dist/$sbom" \
             --version "$TAG"
-      - name: Attest the exact CycloneDX SBOM at its build origin
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+      - name: Install the pinned patched Cosign verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
         with:
-          subject-path: dist/again-${{ github.ref_name }}-source.cdx.json
-      - name: Upload the source dependency SBOM
+          cosign-release: v3.1.3
+      - name: Attest and verify the exact CycloneDX SBOM at its build origin
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          sbom="dist/again-${TAG}-source.cdx.json"
+          predicate="dist/sbom-provenance.json"
+          trap 'rm -f "$predicate"' EXIT
+          python3 scripts/package_release.py \
+            --provenance-output "$predicate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          cosign attest-blob --yes \
+            --predicate "$predicate" \
+            --type slsaprovenance1 \
+            --bundle "${sbom}.sigstore.json" \
+            "$sbom"
+          cosign verify-blob-attestation \
+            --bundle "${sbom}.sigstore.json" \
+            --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-github-workflow-ref "refs/tags/${TAG}" \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+            --certificate-github-workflow-sha "$GITHUB_SHA" \
+            --certificate-github-workflow-trigger push \
+            --type slsaprovenance1 \
+            --check-claims=true \
+            --use-signed-timestamps \
+            "$sbom"
+      - name: Upload the source dependency SBOM and provenance bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-source-sbom
-          path: dist/again-${{ github.ref_name }}-source.cdx.json
+          path: |
+            dist/again-${{ github.ref_name }}-source.cdx.json
+            dist/again-${{ github.ref_name }}-source.cdx.json.sigstore.json
           if-no-files-found: error
           retention-days: 7
 
@@ -179,7 +249,6 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: read
-      attestations: write
       contents: write
       id-token: write
     steps:
@@ -192,6 +261,10 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      - name: Install the pinned patched Cosign verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
       - name: Revalidate the tag and create SHA-256 manifest
         shell: bash
         env:
@@ -213,6 +286,22 @@ jobs:
           done
           sbom="again-${TAG}-source.cdx.json"
           test -s "$sbom"
+          subjects=("${archives[@]}" "$sbom")
+          for subject in "${subjects[@]}"; do
+            test -s "${subject}.sigstore.json"
+            cosign verify-blob-attestation \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-ref "refs/tags/${TAG}" \
+              --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-sha "$GITHUB_SHA" \
+              --certificate-github-workflow-trigger push \
+              --type slsaprovenance1 \
+              --check-claims=true \
+              --use-signed-timestamps \
+              "$subject"
+          done
           sha256sum "${archives[@]}" "$sbom" > SHA256SUMS
           sha256sum --check SHA256SUMS
       - name: Generate the exact alpha Homebrew formula
@@ -225,14 +314,40 @@ jobs:
             --source-commit "$GITHUB_SHA" \
             --checksums dist/SHA256SUMS \
             --output dist/again-alpha.rb
-      - name: Attest the checksum manifest
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/SHA256SUMS
-      - name: Attest the deterministic alpha Homebrew formula
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: dist/again-alpha.rb
+      - name: Attest and verify the checksum manifest and alpha formula
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          predicate="dist/publish-provenance.json"
+          trap 'rm -f "$predicate"' EXIT
+          python3 scripts/package_release.py \
+            --provenance-output "$predicate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$TAG" \
+            --source-commit "$GITHUB_SHA" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --workflow-run-attempt "$GITHUB_RUN_ATTEMPT"
+          for subject in dist/SHA256SUMS dist/again-alpha.rb; do
+            cosign attest-blob --yes \
+              --predicate "$predicate" \
+              --type slsaprovenance1 \
+              --bundle "${subject}.sigstore.json" \
+              "$subject"
+            cosign verify-blob-attestation \
+              --bundle "${subject}.sigstore.json" \
+              --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@refs/tags/${TAG}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-github-workflow-ref "refs/tags/${TAG}" \
+              --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+              --certificate-github-workflow-sha "$GITHUB_SHA" \
+              --certificate-github-workflow-trigger push \
+              --type slsaprovenance1 \
+              --check-claims=true \
+              --use-signed-timestamps \
+              "$subject"
+          done
       - name: Publish release assets
         shell: bash
         env:
@@ -252,12 +367,19 @@ jobs:
             --generate-notes \
             "${release_kind[@]}" \
             "dist/again-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz.sigstore.json" \
             "dist/again-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-x86_64-apple-darwin.tar.gz.sigstore.json" \
             "dist/again-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-aarch64-unknown-linux-gnu.tar.gz.sigstore.json" \
             "dist/again-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/again-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz.sigstore.json" \
             "dist/again-${GITHUB_REF_NAME}-source.cdx.json" \
+            "dist/again-${GITHUB_REF_NAME}-source.cdx.json.sigstore.json" \
             dist/again-alpha.rb \
-            dist/SHA256SUMS
+            dist/again-alpha.rb.sigstore.json \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sigstore.json
           gh release edit "${GITHUB_REF_NAME}" --draft=false
 
   verify-published-release:
@@ -267,13 +389,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      attestations: read
       contents: read
     steps:
       - name: Check out the exact released source without persisting credentials
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Install the pinned patched Cosign verifier
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
       - name: Download and authenticate the exact published release inventory
         shell: bash
         env:

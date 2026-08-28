@@ -60,10 +60,15 @@ do
 done
 
 checksum_manifest() {
+    checksum_names="again-${version}-aarch64-apple-darwin.tar.gz
+again-${version}-aarch64-unknown-linux-gnu.tar.gz
+again-${version}-source.cdx.json
+again-${version}-x86_64-apple-darwin.tar.gz
+again-${version}-x86_64-unknown-linux-gnu.tar.gz"
     if command -v sha256sum >/dev/null 2>&1; then
-        (cd "$assets" && sha256sum "again-${version}-"* > SHA256SUMS)
+        (cd "$assets" && printf '%s\n' "$checksum_names" | xargs sha256sum > SHA256SUMS)
     else
-        (cd "$assets" && shasum -a 256 "again-${version}-"* > SHA256SUMS)
+        (cd "$assets" && printf '%s\n' "$checksum_names" | xargs shasum -a 256 > SHA256SUMS)
     fi
 }
 checksum_manifest
@@ -72,14 +77,22 @@ python3 "$repository/packaging/homebrew/generate_formula.py" \
     --source-commit "$source_commit" \
     --checksums "$assets/SHA256SUMS" \
     --output "$assets/again-alpha.rb"
+for subject in \
+    SHA256SUMS \
+    again-alpha.rb \
+    "again-${version}-aarch64-apple-darwin.tar.gz" \
+    "again-${version}-aarch64-unknown-linux-gnu.tar.gz" \
+    "again-${version}-source.cdx.json" \
+    "again-${version}-x86_64-apple-darwin.tar.gz" \
+    "again-${version}-x86_64-unknown-linux-gnu.tar.gz"
+do
+    printf '{"fixture":"%s"}\n' "$subject" > "$assets/$subject.sigstore.json"
+done
 
 cat > "$fake_bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
 printf '%s\n' "$*" >> "$GH_CALL_LOG"
-[ "${GH_FAIL:-0}" -eq 0 ] || {
-    [ "$1:$2" != attestation:verify ] || exit 1
-}
 case "$1:$2" in
     release:view)
         cat "$PUBLISHED_VIEW"
@@ -109,6 +122,31 @@ esac
 EOF
 chmod 0755 "$fake_bin/gh"
 
+cat > "$fake_bin/cosign" <<'EOF'
+#!/bin/sh
+set -eu
+case "${1:-}" in
+    version)
+        cat <<'JSON'
+{
+  "gitVersion": "v3.1.3",
+  "gitCommit": "11926fa5bbbbde47e88fc006b625a17769b743b2",
+  "gitTreeState": "clean"
+}
+JSON
+        ;;
+    verify-blob-attestation)
+        printf '%s\n' "$*" >> "${COSIGN_CALL_LOG:-/dev/null}"
+        [ "${COSIGN_FAIL:-0}" -eq 0 ]
+        ;;
+    *)
+        echo "error: unexpected cosign command: $*" >&2
+        exit 1
+        ;;
+esac
+EOF
+chmod 0755 "$fake_bin/cosign"
+
 cat > "$fake_bin/curl" <<'EOF'
 #!/bin/sh
 set -eu
@@ -131,8 +169,8 @@ cp "$REMOTE_ASSETS/${url##*/}" "$output"
 EOF
 chmod 0755 "$fake_bin/curl"
 
-call_log=$fixture/gh-calls
-GH_CALL_LOG=$call_log PATH="$fake_bin:$PATH" \
+call_log=$fixture/cosign-calls
+COSIGN_CALL_LOG=$call_log PATH="$fake_bin:$PATH" \
     sh "$repository/scripts/verify_release.sh" \
     --version "$version" --source-commit "$source_commit" \
     --artifact-dir "$assets" --repository alakhanpal23/again \
@@ -142,14 +180,15 @@ grep -Fx "Verified authenticated Again release $version from alakhanpal23/again"
 test "$(wc -l < "$call_log" | tr -d ' ')" -eq 7
 while IFS= read -r call; do
     for required in \
-        "--repo alakhanpal23/again" \
-        "--signer-workflow alakhanpal23/again/.github/workflows/release.yml" \
-        "--signer-digest $source_commit" \
-        "--source-ref refs/tags/$version" \
-        "--source-digest $source_commit" \
-        "--cert-oidc-issuer https://token.actions.githubusercontent.com" \
-        "--predicate-type https://slsa.dev/provenance/v1" \
-        "--deny-self-hosted-runners"
+        "--certificate-identity https://github.com/alakhanpal23/again/.github/workflows/release.yml@refs/tags/$version" \
+        "--certificate-oidc-issuer https://token.actions.githubusercontent.com" \
+        "--certificate-github-workflow-ref refs/tags/$version" \
+        "--certificate-github-workflow-repository alakhanpal23/again" \
+        "--certificate-github-workflow-sha $source_commit" \
+        "--certificate-github-workflow-trigger push" \
+        "--type slsaprovenance1" \
+        "--check-claims=true" \
+        "--use-signed-timestamps"
     do
         printf '%s\n' "$call" | grep -F -- "$required" >/dev/null || {
             echo "error: verifier did not pin the complete provenance policy: $call" >&2
@@ -163,12 +202,19 @@ done < "$call_log"
 published_inventory=$fixture/published-inventory
 cat > "$published_inventory" <<EOF
 SHA256SUMS
+SHA256SUMS.sigstore.json
 again-alpha.rb
+again-alpha.rb.sigstore.json
 again-${version}-aarch64-apple-darwin.tar.gz
+again-${version}-aarch64-apple-darwin.tar.gz.sigstore.json
 again-${version}-aarch64-unknown-linux-gnu.tar.gz
+again-${version}-aarch64-unknown-linux-gnu.tar.gz.sigstore.json
 again-${version}-source.cdx.json
+again-${version}-source.cdx.json.sigstore.json
 again-${version}-x86_64-apple-darwin.tar.gz
+again-${version}-x86_64-apple-darwin.tar.gz.sigstore.json
 again-${version}-x86_64-unknown-linux-gnu.tar.gz
+again-${version}-x86_64-unknown-linux-gnu.tar.gz.sigstore.json
 EOF
 published_view=$fixture/published-view
 {
@@ -176,17 +222,18 @@ published_view=$fixture/published-view
     cat "$published_inventory"
 } > "$published_view"
 published_call_log=$fixture/published-gh-calls
+published_cosign_log=$fixture/published-cosign-calls
 GH_CALL_LOG=$published_call_log PUBLISHED_VIEW=$published_view \
     PUBLISHED_INVENTORY=$published_inventory SOURCE_COMMIT=$source_commit \
-    REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    REMOTE_ASSETS=$assets COSIGN_CALL_LOG=$published_cosign_log PATH="$fake_bin:$PATH" \
     sh "$repository/scripts/verify_published_release.sh" \
     --version "$version" --source-commit "$source_commit" \
     --repository alakhanpal23/again \
     > "$fixture/published.out"
 grep -Fx "Verified exact published Again release $version from alakhanpal23/again" \
     "$fixture/published.out" >/dev/null
-test "$(wc -l < "$published_call_log" | tr -d ' ')" -eq 10
-test "$(grep -c '^attestation verify ' "$published_call_log")" -eq 7
+test "$(wc -l < "$published_call_log" | tr -d ' ')" -eq 3
+test "$(wc -l < "$published_cosign_log" | tr -d ' ')" -eq 7
 grep -F "release view $version --repo alakhanpal23/again --json assets,isDraft,isImmutable,isPrerelease,tagName" \
     "$published_call_log" >/dev/null
 grep -F "api repos/alakhanpal23/again/commits/$version --jq .sha" \
@@ -233,9 +280,11 @@ fi
 # pinned provenance policy before it extracts or installs the archive.
 sed '3s/true/false/' "$published_view" > "$fixture/mutable-published-view"
 install_call_log=$fixture/install-gh-calls
+install_cosign_log=$fixture/install-cosign-calls
 install_destination=$fixture/installed/again
 GH_CALL_LOG=$install_call_log PUBLISHED_VIEW=$published_view \
-    SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \
+    COSIGN_CALL_LOG=$install_cosign_log PATH="$fake_bin:$PATH" \
     sh "$repository/scripts/install.sh" \
     --version "$version" \
     --source-commit "$source_commit" \
@@ -243,25 +292,24 @@ GH_CALL_LOG=$install_call_log PUBLISHED_VIEW=$published_view \
     --dest "$install_destination" \
     > "$fixture/install.out"
 test "$("$install_destination")" = authenticated-release
-test "$(wc -l < "$install_call_log" | tr -d ' ')" -eq 4
+test "$(wc -l < "$install_call_log" | tr -d ' ')" -eq 2
+test "$(wc -l < "$install_cosign_log" | tr -d ' ')" -eq 2
 grep -F "release view $version --repo alakhanpal23/again --json assets,isDraft,isImmutable,isPrerelease,tagName" \
     "$install_call_log" >/dev/null
 grep -F "api repos/alakhanpal23/again/commits/$version --jq .sha" \
     "$install_call_log" >/dev/null
-grep -F "/SHA256SUMS --repo alakhanpal23/again" "$install_call_log" >/dev/null
-grep -F "/again-${version}-${target}.tar.gz --repo alakhanpal23/again" \
-    "$install_call_log" >/dev/null
-grep '^attestation verify ' "$install_call_log" > "$fixture/install-attestation-calls"
+cp "$install_cosign_log" "$fixture/install-attestation-calls"
 while IFS= read -r call; do
     for required in \
-        "--repo alakhanpal23/again" \
-        "--signer-workflow alakhanpal23/again/.github/workflows/release.yml" \
-        "--signer-digest $source_commit" \
-        "--source-ref refs/tags/$version" \
-        "--source-digest $source_commit" \
-        "--cert-oidc-issuer https://token.actions.githubusercontent.com" \
-        "--predicate-type https://slsa.dev/provenance/v1" \
-        "--deny-self-hosted-runners"
+        "--certificate-identity https://github.com/alakhanpal23/again/.github/workflows/release.yml@refs/tags/$version" \
+        "--certificate-oidc-issuer https://token.actions.githubusercontent.com" \
+        "--certificate-github-workflow-ref refs/tags/$version" \
+        "--certificate-github-workflow-repository alakhanpal23/again" \
+        "--certificate-github-workflow-sha $source_commit" \
+        "--certificate-github-workflow-trigger push" \
+        "--type slsaprovenance1" \
+        "--check-claims=true" \
+        "--use-signed-timestamps"
     do
         printf '%s\n' "$call" | grep -F -- "$required" >/dev/null || {
             echo "error: installer did not pin the complete provenance policy: $call" >&2
@@ -270,8 +318,26 @@ while IFS= read -r call; do
     done
 done < "$fixture/install-attestation-calls"
 
+# The default private-repository path downloads the authenticated inputs with
+# `gh`, while an explicitly configured HTTPS mirror uses curl/wget above.
+private_install_gh_log=$fixture/private-install-gh-calls
+private_install_cosign_log=$fixture/private-install-cosign-calls
+private_install_destination=$fixture/private-installed/again
+GH_CALL_LOG=$private_install_gh_log COSIGN_CALL_LOG=$private_install_cosign_log \
+    PUBLISHED_VIEW=$published_view PUBLISHED_INVENTORY=$published_inventory \
+    SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets PATH="$fake_bin:$PATH" \
+    sh "$repository/scripts/install.sh" \
+    --version "$version" --source-commit "$source_commit" \
+    --dest "$private_install_destination" > "$fixture/private-install.out"
+test "$("$private_install_destination")" = authenticated-release
+test "$(wc -l < "$private_install_gh_log" | tr -d ' ')" -eq 3
+test "$(wc -l < "$private_install_cosign_log" | tr -d ' ')" -eq 2
+grep -F "release download $version --repo alakhanpal23/again --dir " \
+    "$private_install_gh_log" >/dev/null
+
 failed_install_destination=$fixture/failed-install/again
-if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-install-calls \
+if COSIGN_FAIL=1 GH_CALL_LOG=$fixture/failed-install-gh-calls \
+    COSIGN_CALL_LOG=$fixture/failed-install-calls \
     PUBLISHED_VIEW=$published_view SOURCE_COMMIT=$source_commit REMOTE_ASSETS=$assets \
     PATH="$fake_bin:$PATH" sh "$repository/scripts/install.sh" \
     --version "$version" \
@@ -358,7 +424,7 @@ if GH_CALL_LOG=$fixture/malformed-calls PATH="$fake_bin:$PATH" \
 fi
 checksum_manifest
 
-if GH_FAIL=1 GH_CALL_LOG=$fixture/failed-attestation-calls PATH="$fake_bin:$PATH" \
+if COSIGN_FAIL=1 COSIGN_CALL_LOG=$fixture/failed-attestation-calls PATH="$fake_bin:$PATH" \
     sh "$repository/scripts/verify_release.sh" \
     --version "$version" --source-commit "$source_commit" \
     --artifact-dir "$assets" --repository alakhanpal23/again \

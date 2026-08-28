@@ -13,12 +13,11 @@ as stable releases.
 Only a named human release authority may create or push a release tag. Before
 tagging, that person must verify that the applicable exact-SHA CI jobs actually
 ran and passed; a skipped, canceled, zero-step, or billing-blocked run is not a
-release gate. The workflow contains a reviewed keyless GitHub-attestation and
-independent-verification design, but the current private user-owned repository
-cannot run that design on GitHub Free. No release is eligible for the
-outside-alpha gate until the repository is public or hosted by an organization
-with GitHub Enterprise Cloud, the exact release run succeeds, and publisher
-identity is independently verified. See
+release gate. The repository remains private: the workflow uses a reviewed,
+pinned keyless Sigstore design instead of GitHub's Enterprise-only private-repo
+artifact-attestation service. No release is eligible for the outside-alpha gate
+until the exact release run succeeds and publisher identity is independently
+verified. See
 [DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md#evidence-and-release-authority)
 and [Roadmap Gate 1](ROADMAP.md#gate-1--distributable-local-alpha).
 
@@ -26,8 +25,9 @@ The release workflow uses Rust `1.88.0` explicitly for verification, native
 tests, builds, and SBOM generation. `rust-toolchain.toml` pins the same version,
 and release builds use `Cargo.lock` through `--locked`. All referenced GitHub
 Actions are pinned to full commit SHAs and use Node 24 action runtimes.
-Checkout credentials are not persisted, and the verify, build, and SBOM jobs
-receive only read access. The publishing job checks out the exact tagged
+Checkout credentials are not persisted. The build, SBOM, and publishing jobs
+receive only the OIDC permission needed for keyless Sigstore certificates; the
+verify job remains read-only. The publishing job checks out the exact tagged
 release definitions without persisted credentials; that job alone receives
 `contents: write` and exposes its token only to tag revalidation and release
 publication.
@@ -80,33 +80,35 @@ not identify or authenticate the publisher.
 
 ## Signing and verification status
 
-The release workflow requests GitHub artifact attestations for each native
-archive at its build origin, the source SBOM, the checksum manifest, and the
-generated Homebrew formula. The post-publication verifier binds each downloaded
-asset to the exact repository, release workflow, signer/source commit, tag ref,
-GitHub OIDC issuer, SLSA provenance predicate, and GitHub-hosted runner policy.
-It also checks the exact immutable release inventory and tag commit.
+GitHub-native artifact attestations are unavailable for this private,
+user-owned repository without GitHub Enterprise Cloud. The repository remains
+private. The release workflow instead uses pinned clean Cosign `v3.1.3` keyless
+signing for each native archive at its build origin, the source SBOM, the
+checksum manifest, and the generated Homebrew formula. Every subject is
+published with a standardized Sigstore bundle containing its Fulcio
+certificate, RFC3161 timestamp, and Rekor transparency proof.
 
-The retained `again.release-verification-summary.v1` JSON is deliberately
-non-authoritative when detached. It records hashes and the policy passed to the
-successful verifier, but omits the raw cryptographic bundles and explicitly
-requires the enclosing GitHub Actions run. A consumer must still run
-`gh attestation verify` or authenticate that enclosing run; the summary itself
-is not a bearer proof of publisher identity.
+The post-publication verifier requires the patched Cosign build at commit
+`11926fa5bbbbde47e88fc006b625a17769b743b2`, checks signed claims, the trusted
+timestamp, and the transparency log, and binds each downloaded subject to the
+exact repository, release workflow identity, source commit, tag ref, GitHub
+OIDC issuer, workflow trigger, and SLSA provenance predicate. It also checks
+the exact immutable 14-asset release inventory and tag commit. The Sigstore
+transparency log is public even though the GitHub repository and release remain
+private; it records signing metadata and subject digests, not private artifact
+contents.
 
-No release has run. GitHub-native artifact attestations for private or internal
-repositories require GitHub Enterprise Cloud, while this repository is private
-and user-owned on GitHub Free. The first release therefore remains blocked
-until the repository is public or moved to an eligible Enterprise Cloud
-organization. GitHub release immutability is a repository setting outside this
-workflow and must also be enabled and verified before tagging. Checksums alone
-do not authenticate the publisher.
+The retained `again.release-verification-summary.v2` JSON is deliberately
+non-authoritative when detached. It records artifact, bundle, certificate, and
+verification-harness hashes but does not embed the cryptographic proofs. An
+independent verifier uses the seven published `.sigstore.json` bundles with
+the seven subjects. Checksums alone do not authenticate the publisher.
 
 ## Maintainer checklist
 
 1. Confirm the named human release authority, intended release class, exact
-   candidate SHA, successful nonempty applicable CI jobs, an attestation-eligible
-   repository plan/visibility, and enabled immutable releases. Do not tag while
+   candidate SHA, successful nonempty applicable CI jobs, the pinned Sigstore
+   verifier, and enabled immutable releases. Do not tag while
    any prerequisite is unverified.
 2. Confirm that `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, and the
    intended release notes are correct on `main`.
@@ -135,9 +137,10 @@ do not authenticate the publisher.
 
 5. Review the source verification, all four native build jobs, the source SBOM
    job, and the final tag revalidation and publication job.
-6. Download an archive and `SHA256SUMS`, verify the checksum, and exercise
-   install, managed upgrade, lock contention, injected-error and injected-signal
-   rollback, and uninstall in a temporary trusted destination.
+6. Download all 14 release assets, independently verify all seven Sigstore
+   bundles plus `SHA256SUMS`, and exercise install, managed upgrade, lock
+   contention, injected-error and injected-signal rollback, and uninstall in a
+   temporary trusted destination.
 
 ## Installation
 
@@ -164,11 +167,11 @@ file in the destination directory, so archive ownership is not inherited.
   --dest "$HOME/.local/bin/again"
 ```
 
-The default URL is an unauthenticated GitHub release URL. While the repository
-is private, that path will not work for an ordinary `curl` or `wget` request.
-Download private release assets with an authenticated tool such as
-`gh release download` first and use `--artifact-dir`; the installer does not
-accept a GitHub token or add authentication headers itself.
+For the default private GitHub repository, the installer uses the authenticated
+GitHub CLI to inspect the immutable release and download the archive, manifest,
+and their Sigstore bundles. `GH_TOKEN` or an authenticated `gh` session must be
+able to read the private release. An explicitly configured HTTPS mirror uses
+`curl` or `wget` and must expose the same authenticated bytes.
 
 ```sh
 ./scripts/install.sh --version v0.1.0 \
