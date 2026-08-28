@@ -175,6 +175,52 @@ def create_fixture(root: Path, files: int, total_bytes: int | None = None) -> di
     return {"files": len(manifest), "bytes": total, "entries": manifest}
 
 
+def create_language_fixture(root: Path, language: str) -> dict[str, str]:
+    definitions = {
+        "rust": {
+            "Cargo.toml": '[package]\nname = "rust-e2e"\nversion = "0.1.0"\n',
+            "src/lib.rs": "pub fn language_needle() -> usize { 1 }\n",
+        },
+        "python": {
+            "pyproject.toml": '[project]\nname = "python-e2e"\nversion = "0.1.0"\n',
+            "python/app.py": "def language_needle():\n    return 1\n",
+        },
+        "go": {
+            "go.mod": "module example.invalid/language-e2e\ngo 1.23\n",
+            "go/main.go": "package main\nfunc language_needle() int { return 1 }\n",
+        },
+        "typescript": {
+            "package.json": '{"name":"typescript-e2e","private":true}\n',
+            "web/index.ts": "export const language_needle = (): number => 1;\n",
+        },
+    }
+    files = definitions.get(language)
+    if files is None:
+        raise HarnessError(f"unsupported language fixture: {language}")
+    root.mkdir(parents=True)
+    for relative, content in files.items():
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    run_checked(["/usr/bin/git", "init", "-q"], root)
+    run_checked(["/usr/bin/git", "config", "user.name", "Again Language E2E"], root)
+    run_checked(
+        [
+            "/usr/bin/git",
+            "config",
+            "user.email",
+            "again-language-e2e@example.invalid",
+        ],
+        root,
+    )
+    run_checked(["/usr/bin/git", "add", "--all"], root)
+    run_checked(
+        ["/usr/bin/git", "-c", "commit.gpgsign=false", "commit", "-q", "-m", language],
+        root,
+    )
+    return {"language": language, "head": run_checked(["/usr/bin/git", "rev-parse", "HEAD"], root).strip()}
+
+
 @dataclass
 class Response:
     value: dict[str, Any]
@@ -461,6 +507,45 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
         state.mkdir(mode=0o700)
         fixture = create_fixture(workspace, fixture_files)
         database = state / "again.sqlite"
+        language_evidence = []
+        for language_index, language in enumerate(
+            ["rust", "python", "go", "typescript"]
+        ):
+            language_workspace = temporary / f"language-{language}"
+            language_state = temporary / f"language-{language}-state"
+            language_state.mkdir(mode=0o700)
+            identity = create_language_fixture(language_workspace, language)
+            with McpProcess(
+                binary, language_workspace, language_state, f"e2e-{language}"
+            ) as language_process:
+                manifest_response = language_process.call(
+                    10 + language_index * 2, "repo.manifest", {}
+                )
+                search_response = language_process.call(
+                    11 + language_index * 2,
+                    "repo.search",
+                    {"pattern": "language_needle", "path": "."},
+                )
+                expect_success(manifest_response, f"{language} manifest")
+                expect_success(search_response, f"{language} search")
+                if not manifest_response.result["structuredContent"]["manifests"]:
+                    raise HarnessError(f"{language} manifest was not discovered")
+                if not search_response.result["structuredContent"]["matches"]:
+                    raise HarnessError(f"{language} source search returned no match")
+                language_evidence.append(
+                    {
+                        **identity,
+                        "manifestHash": manifest_response.result_hash,
+                        "searchHash": search_response.result_hash,
+                    }
+                )
+        scenarios.append(
+            {
+                "name": "independent_language_repositories",
+                "classification": "pass",
+                "repositories": language_evidence,
+            }
+        )
         left = McpProcess(binary, workspace, state, "e2e-left")
         right = McpProcess(binary, workspace, state, "e2e-right")
         try:

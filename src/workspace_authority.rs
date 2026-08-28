@@ -379,6 +379,7 @@ pub enum RepositoryGitStateV1 {
         head_object: Option<String>,
         head_digest: StateDigestV1,
         index_digest: Option<StateDigestV1>,
+        control_digest: StateDigestV1,
     },
 }
 impl std::fmt::Debug for RepositoryGitStateV1 {
@@ -390,6 +391,7 @@ impl std::fmt::Debug for RepositoryGitStateV1 {
                 head_object,
                 head_digest,
                 index_digest,
+                control_digest,
                 ..
             } => f
                 .debug_struct("Git")
@@ -398,6 +400,7 @@ impl std::fmt::Debug for RepositoryGitStateV1 {
                 .field("head_object", &head_object.as_ref().map(|_| "<redacted>"))
                 .field("head_digest", head_digest)
                 .field("index_digest", index_digest)
+                .field("control_digest", control_digest)
                 .finish(),
         }
     }
@@ -2878,6 +2881,7 @@ fn observe_git_state(
         }
         None => None,
     };
+    let control_digest = observe_git_control_digest(&git_directory, &common_directory, limits)?;
 
     Ok(RepositoryGitStateV1::Git {
         worktree_root,
@@ -2886,7 +2890,78 @@ fn observe_git_state(
         head_object,
         head_digest,
         index_digest,
+        control_digest,
     })
+}
+
+fn observe_git_control_digest(
+    git_directory: &Path,
+    common_directory: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<StateDigestV1> {
+    for path in [
+        common_directory.join("objects/info/alternates"),
+        common_directory.join("info/grafts"),
+        common_directory.join("refs/replace"),
+    ] {
+        if secure_node_kind(
+            &path,
+            StateDimensionV1::RepositoryGit,
+            "inspect unsupported Git object indirection",
+        )?
+        .is_some()
+        {
+            return Err(incomplete_plan(
+                StateDimensionV1::RepositoryGit,
+                Some(&path),
+                "reject Git object indirection",
+            ));
+        }
+    }
+
+    let mut candidates = vec![
+        ("worktree-config", git_directory.join("config.worktree")),
+        ("worktree-exclude", git_directory.join("info/exclude")),
+        ("worktree-attributes", git_directory.join("info/attributes")),
+        ("common-config", common_directory.join("config")),
+        ("common-exclude", common_directory.join("info/exclude")),
+        (
+            "common-attributes",
+            common_directory.join("info/attributes"),
+        ),
+        ("packed-refs", common_directory.join("packed-refs")),
+        ("shallow", common_directory.join("shallow")),
+    ];
+    candidates.sort_by(|left, right| left.0.cmp(right.0));
+    let maximum = limits
+        .max_file_bytes
+        .min((limits.max_identity_bytes as u64).saturating_mul(16));
+    let mut encoder = CanonicalEncoder::new(b"again.git-control-state.v1");
+    for (label, path) in candidates {
+        encoder.bytes(label.as_bytes());
+        match secure_node_kind(
+            &path,
+            StateDimensionV1::RepositoryGit,
+            "inspect Git control input",
+        )? {
+            None => encoder.u8(0),
+            Some(SecureNodeKindV1::Regular) => {
+                encoder.u8(1);
+                let bytes =
+                    read_bounded_stable_file(&path, maximum, StateDimensionV1::RepositoryGit)?;
+                encoder.bytes(&bytes);
+            }
+            Some(SecureNodeKindV1::Directory) => {
+                return Err(IncompleteToolStateV1::single(
+                    IncompleteReasonCodeV1::SpecialFileRefused,
+                    StateDimensionV1::RepositoryGit,
+                    Some(path),
+                    "observe Git control input",
+                ));
+            }
+        }
+    }
+    Ok(encoder.finish())
 }
 
 fn find_git_marker(
@@ -4680,6 +4755,7 @@ fn encode_repository_epoch(epoch: &RepositoryEpochV1) -> Vec<u8> {
             head_object,
             head_digest,
             index_digest,
+            control_digest,
         } => {
             encoder.u8(1);
             encoder.path(worktree_root);
@@ -4688,6 +4764,7 @@ fn encode_repository_epoch(epoch: &RepositoryEpochV1) -> Vec<u8> {
             encoder.optional_bytes(head_object.as_ref().map(String::as_bytes));
             encoder.digest(*head_digest);
             encoder.optional_digest(*index_digest);
+            encoder.digest(*control_digest);
         }
     }
     encode_repository_plan(&epoch.plan, &mut encoder);

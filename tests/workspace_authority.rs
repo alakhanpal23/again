@@ -268,6 +268,20 @@ fn git_head_and_index_changes_are_bound() {
 }
 
 #[test]
+fn git_control_configuration_changes_are_bound() {
+    let fixture = RepositoryFixture::git();
+    fixture.write("src/input.rs", b"fn input() {}\n");
+    fixture.commit_all("initial");
+    let before = observe_repository_v1(fixture.root(), &content_plan("src/input.rs"), &limits())
+        .expect("initial Git control state");
+
+    fixture.run_git(&["config", "diff.algorithm", "histogram"]);
+    let after = observe_repository_v1(fixture.root(), &content_plan("src/input.rs"), &limits())
+        .expect("changed Git control state");
+    assert_ne!(before.digest(), after.digest());
+}
+
+#[test]
 fn nested_workspace_discovers_its_enclosing_git_identity() {
     let fixture = RepositoryFixture::git();
     fixture.write("nested/workspace/input", b"input\n");

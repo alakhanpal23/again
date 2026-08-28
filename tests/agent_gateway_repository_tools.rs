@@ -230,6 +230,12 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
         json!([]),
         "{clean_status}"
     );
+    git(workspace.path(), &["config", "diff.algorithm", "histogram"]);
+    let configured_status = call(server.gateway(), 181, "git.status", json!({ "path": "." }));
+    assert_ne!(
+        clean_status["result"]["_meta"]["again"]["resultId"],
+        configured_status["result"]["_meta"]["again"]["resultId"]
+    );
     let log = call(server.gateway(), 19, "git.log", json!({ "maxResults": 10 }));
     assert_eq!(
         log["result"]["structuredContent"]["commits"][0]["subject"],
@@ -393,5 +399,5 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     // observed index/executable binding while answering the first request;
     // that is a safe miss, and its exact response equality is asserted above.
     assert!((2..=3).contains(&stats.exact_hits), "{stats:?}");
-    assert_eq!(stats.executed + stats.exact_hits, 24, "{stats:?}");
+    assert_eq!(stats.executed + stats.exact_hits, 25, "{stats:?}");
 }
