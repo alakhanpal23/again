@@ -424,6 +424,808 @@ pub fn select_presentation(
     }
 }
 
+pub const REASONING_BRIEF_SCHEMA_VERSION_V1: u16 = 1;
+pub const MAX_REASONING_BRIEF_BYTES_V1: usize = 64 * 1024;
+pub const MAX_REASONING_ITEMS_V1: usize = 64;
+pub const MAX_REASONING_SOURCE_REFERENCES_V1: usize = 128;
+pub const MAX_REASONING_SOURCES_PER_ITEM_V1: usize = 8;
+pub const MAX_REASONING_DEPTH_V1: usize = 6;
+pub const MAX_REASONING_TEXT_BYTES_V1: usize = 1024;
+const MAX_REASONING_LOCATOR_BYTES_V1: usize = 512;
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningScopeV1 {
+    task_id: String,
+    repository_id: String,
+    workspace_id: String,
+    state_digest: String,
+    dependency_digest: String,
+    authorization_scope_digest: String,
+}
+
+impl fmt::Debug for ReasoningScopeV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReasoningScopeV1(<redacted>)")
+    }
+}
+
+impl ReasoningScopeV1 {
+    pub fn new(
+        task_id: &str,
+        repository_id: &str,
+        workspace_id: &str,
+        state_digest: &str,
+        dependency_digest: &str,
+        authorization_scope_digest: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        for value in [task_id, repository_id, workspace_id] {
+            validate_reasoning_identifier_v1(value)?;
+        }
+        for value in [state_digest, dependency_digest, authorization_scope_digest] {
+            validate_reasoning_digest_v1(value)?;
+        }
+        Ok(Self {
+            task_id: task_id.to_owned(),
+            repository_id: repository_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            state_digest: state_digest.to_owned(),
+            dependency_digest: dependency_digest.to_owned(),
+            authorization_scope_digest: authorization_scope_digest.to_owned(),
+        })
+    }
+
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn state_digest(&self) -> &str {
+        &self.state_digest
+    }
+
+    pub fn dependency_digest(&self) -> &str {
+        &self.dependency_digest
+    }
+
+    pub fn authorization_scope_digest(&self) -> &str {
+        &self.authorization_scope_digest
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningRecipientV1 {
+    agent_id: String,
+    session_id: String,
+    turn_id: String,
+    connection_generation: String,
+    compaction_generation: u64,
+    lifecycle_generation: u64,
+    active: bool,
+}
+
+impl fmt::Debug for ReasoningRecipientV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReasoningRecipientV1(<redacted>)")
+    }
+}
+
+impl ReasoningRecipientV1 {
+    pub fn new(
+        agent_id: &str,
+        session_id: &str,
+        turn_id: &str,
+        connection_generation: &str,
+        compaction_generation: u64,
+        lifecycle_generation: u64,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        for value in [agent_id, session_id, turn_id] {
+            validate_reasoning_identifier_v1(value)?;
+        }
+        validate_reasoning_digest_v1(connection_generation)?;
+        if lifecycle_generation == 0 {
+            return Err(ReasoningContextRefusalV1::InvalidGeneration);
+        }
+        Ok(Self {
+            agent_id: agent_id.to_owned(),
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            connection_generation: connection_generation.to_owned(),
+            compaction_generation,
+            lifecycle_generation,
+            active: true,
+        })
+    }
+
+    pub fn after_compaction(&self) -> Result<Self, ReasoningContextRefusalV1> {
+        let mut next = self.clone();
+        next.compaction_generation = next
+            .compaction_generation
+            .checked_add(1)
+            .ok_or(ReasoningContextRefusalV1::InvalidGeneration)?;
+        Ok(next)
+    }
+
+    pub fn after_restart(
+        &self,
+        connection_generation: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_digest_v1(connection_generation)?;
+        let mut next = self.clone();
+        next.connection_generation = connection_generation.to_owned();
+        next.lifecycle_generation = next
+            .lifecycle_generation
+            .checked_add(1)
+            .ok_or(ReasoningContextRefusalV1::InvalidGeneration)?;
+        Ok(next)
+    }
+
+    pub fn after_cancellation(&self) -> Result<Self, ReasoningContextRefusalV1> {
+        let mut next = self.clone();
+        next.lifecycle_generation = next
+            .lifecycle_generation
+            .checked_add(1)
+            .ok_or(ReasoningContextRefusalV1::InvalidGeneration)?;
+        next.active = false;
+        Ok(next)
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+
+    pub fn connection_generation(&self) -> &str {
+        &self.connection_generation
+    }
+
+    pub const fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningFactScopeV1 {
+    RepositoryWide,
+    TaskSpecific,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningSourceReferenceV1 {
+    result_id: String,
+    result_digest: String,
+    repository_id: String,
+    workspace_id: String,
+    state_digest: String,
+    dependency_digest: String,
+    authorization_scope_digest: String,
+    locator: String,
+}
+
+impl fmt::Debug for ReasoningSourceReferenceV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReasoningSourceReferenceV1(<redacted>)")
+    }
+}
+
+impl ReasoningSourceReferenceV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        result_id: &str,
+        result_digest: &str,
+        repository_id: &str,
+        workspace_id: &str,
+        state_digest: &str,
+        dependency_digest: &str,
+        authorization_scope_digest: &str,
+        locator: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        for value in [result_id, repository_id, workspace_id] {
+            validate_reasoning_identifier_v1(value)?;
+        }
+        for value in [
+            result_digest,
+            state_digest,
+            dependency_digest,
+            authorization_scope_digest,
+        ] {
+            validate_reasoning_digest_v1(value)?;
+        }
+        validate_reasoning_text_v1(locator, MAX_REASONING_LOCATOR_BYTES_V1)?;
+        Ok(Self {
+            result_id: result_id.to_owned(),
+            result_digest: result_digest.to_owned(),
+            repository_id: repository_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            state_digest: state_digest.to_owned(),
+            dependency_digest: dependency_digest.to_owned(),
+            authorization_scope_digest: authorization_scope_digest.to_owned(),
+            locator: locator.to_owned(),
+        })
+    }
+
+    pub fn result_id(&self) -> &str {
+        &self.result_id
+    }
+
+    pub fn result_digest(&self) -> &str {
+        &self.result_digest
+    }
+
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+
+    pub fn state_digest(&self) -> &str {
+        &self.state_digest
+    }
+
+    pub fn dependency_digest(&self) -> &str {
+        &self.dependency_digest
+    }
+
+    pub fn authorization_scope_digest(&self) -> &str {
+        &self.authorization_scope_digest
+    }
+
+    pub fn locator(&self) -> &str {
+        &self.locator
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningFactV1 {
+    fact_id: String,
+    topic: String,
+    statement: String,
+    value_digest: String,
+    scope: ReasoningFactScopeV1,
+    task_id: Option<String>,
+    sources: Vec<ReasoningSourceReferenceV1>,
+}
+
+impl fmt::Debug for ReasoningFactV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReasoningFactV1(<redacted>)")
+    }
+}
+
+impl ReasoningFactV1 {
+    pub fn new(
+        fact_id: &str,
+        topic: &str,
+        statement: &str,
+        value_digest: &str,
+        scope: ReasoningFactScopeV1,
+        task_id: Option<&str>,
+        sources: Vec<ReasoningSourceReferenceV1>,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(fact_id)?;
+        validate_reasoning_identifier_v1(topic)?;
+        validate_reasoning_text_v1(statement, MAX_REASONING_TEXT_BYTES_V1)?;
+        validate_reasoning_digest_v1(value_digest)?;
+        if sources.is_empty() || sources.len() > MAX_REASONING_SOURCES_PER_ITEM_V1 {
+            return Err(ReasoningContextRefusalV1::SourceReferenceBound);
+        }
+        match (scope, task_id) {
+            (ReasoningFactScopeV1::RepositoryWide, None) => {}
+            (ReasoningFactScopeV1::TaskSpecific, Some(task_id)) => {
+                validate_reasoning_identifier_v1(task_id)?;
+            }
+            _ => return Err(ReasoningContextRefusalV1::TaskScopeMismatch),
+        }
+        Ok(Self {
+            fact_id: fact_id.to_owned(),
+            topic: topic.to_owned(),
+            statement: statement.to_owned(),
+            value_digest: value_digest.to_owned(),
+            scope,
+            task_id: task_id.map(str::to_owned),
+            sources,
+        })
+    }
+
+    pub fn fact_id(&self) -> &str {
+        &self.fact_id
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn value_digest(&self) -> &str {
+        &self.value_digest
+    }
+
+    pub const fn scope(&self) -> ReasoningFactScopeV1 {
+        self.scope
+    }
+
+    pub fn task_id(&self) -> Option<&str> {
+        self.task_id.as_deref()
+    }
+
+    pub fn sources(&self) -> &[ReasoningSourceReferenceV1] {
+        &self.sources
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningInvalidationV1 {
+    RepositoryChanged,
+    WorkspaceChanged,
+    StateChanged,
+    DependencyChanged,
+    AuthorizationChanged,
+    TaskChanged,
+    SourceUnavailable,
+    ContradictoryEvidence,
+    Quarantined,
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningChangeV1 {
+    dimension: String,
+    prior_digest: String,
+    current_digest: String,
+}
+
+impl ReasoningChangeV1 {
+    pub fn new(
+        dimension: &str,
+        prior_digest: &str,
+        current_digest: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(dimension)?;
+        validate_reasoning_digest_v1(prior_digest)?;
+        validate_reasoning_digest_v1(current_digest)?;
+        Ok(Self {
+            dimension: dimension.to_owned(),
+            prior_digest: prior_digest.to_owned(),
+            current_digest: current_digest.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InvalidatedReasoningFactV1 {
+    fact: ReasoningFactV1,
+    reason: ReasoningInvalidationV1,
+    changes_since_observation: Vec<ReasoningChangeV1>,
+}
+
+impl InvalidatedReasoningFactV1 {
+    pub fn new(
+        fact: ReasoningFactV1,
+        reason: ReasoningInvalidationV1,
+        changes_since_observation: Vec<ReasoningChangeV1>,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        if changes_since_observation.len() > MAX_REASONING_SOURCES_PER_ITEM_V1 {
+            return Err(ReasoningContextRefusalV1::ItemBound);
+        }
+        Ok(Self {
+            fact,
+            reason,
+            changes_since_observation,
+        })
+    }
+
+    pub fn fact(&self) -> &ReasoningFactV1 {
+        &self.fact
+    }
+
+    pub const fn reason(&self) -> ReasoningInvalidationV1 {
+        self.reason
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningUnknownV1 {
+    subject: String,
+    explanation: String,
+}
+
+impl ReasoningUnknownV1 {
+    pub fn new(subject: &str, explanation: &str) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(subject)?;
+        validate_reasoning_text_v1(explanation, MAX_REASONING_TEXT_BYTES_V1)?;
+        Ok(Self {
+            subject: subject.to_owned(),
+            explanation: explanation.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningRetrievalIdentityV1 {
+    result_id: String,
+    result_digest: String,
+    total_bytes: u64,
+}
+
+impl ReasoningRetrievalIdentityV1 {
+    pub fn new(
+        result_id: &str,
+        result_digest: &str,
+        total_bytes: u64,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(result_id)?;
+        validate_reasoning_digest_v1(result_digest)?;
+        Ok(Self {
+            result_id: result_id.to_owned(),
+            result_digest: result_digest.to_owned(),
+            total_bytes,
+        })
+    }
+
+    pub fn result_id(&self) -> &str {
+        &self.result_id
+    }
+
+    pub fn result_digest(&self) -> &str {
+        &self.result_digest
+    }
+
+    pub const fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompletedReasoningObservationV1 {
+    observation_id: String,
+    summary: String,
+    duration_ms: u64,
+    retrieval: ReasoningRetrievalIdentityV1,
+    sources: Vec<ReasoningSourceReferenceV1>,
+}
+
+impl CompletedReasoningObservationV1 {
+    pub fn new(
+        observation_id: &str,
+        summary: &str,
+        duration_ms: u64,
+        retrieval: ReasoningRetrievalIdentityV1,
+        sources: Vec<ReasoningSourceReferenceV1>,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(observation_id)?;
+        validate_reasoning_text_v1(summary, MAX_REASONING_TEXT_BYTES_V1)?;
+        if sources.is_empty() || sources.len() > MAX_REASONING_SOURCES_PER_ITEM_V1 {
+            return Err(ReasoningContextRefusalV1::SourceReferenceBound);
+        }
+        Ok(Self {
+            observation_id: observation_id.to_owned(),
+            summary: summary.to_owned(),
+            duration_ms,
+            retrieval,
+            sources,
+        })
+    }
+
+    pub const fn retrieval(&self) -> &ReasoningRetrievalIdentityV1 {
+        &self.retrieval
+    }
+
+    pub fn sources(&self) -> &[ReasoningSourceReferenceV1] {
+        &self.sources
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InflightReasoningWorkV1 {
+    call_id: String,
+    agent_id: String,
+    lifecycle_generation: u64,
+    summary: String,
+}
+
+impl InflightReasoningWorkV1 {
+    pub fn new(
+        call_id: &str,
+        agent_id: &str,
+        lifecycle_generation: u64,
+        summary: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(call_id)?;
+        validate_reasoning_identifier_v1(agent_id)?;
+        validate_reasoning_text_v1(summary, MAX_REASONING_TEXT_BYTES_V1)?;
+        if lifecycle_generation == 0 {
+            return Err(ReasoningContextRefusalV1::InvalidGeneration);
+        }
+        Ok(Self {
+            call_id: call_id.to_owned(),
+            agent_id: agent_id.to_owned(),
+            lifecycle_generation,
+            summary: summary.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailedReasoningApproachV1 {
+    approach_id: String,
+    approach: String,
+    verified_cause: String,
+    sources: Vec<ReasoningSourceReferenceV1>,
+}
+
+impl FailedReasoningApproachV1 {
+    pub fn new(
+        approach_id: &str,
+        approach: &str,
+        verified_cause: &str,
+        sources: Vec<ReasoningSourceReferenceV1>,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(approach_id)?;
+        validate_reasoning_text_v1(approach, MAX_REASONING_TEXT_BYTES_V1)?;
+        validate_reasoning_text_v1(verified_cause, MAX_REASONING_TEXT_BYTES_V1)?;
+        if sources.is_empty() || sources.len() > MAX_REASONING_SOURCES_PER_ITEM_V1 {
+            return Err(ReasoningContextRefusalV1::SourceReferenceBound);
+        }
+        Ok(Self {
+            approach_id: approach_id.to_owned(),
+            approach: approach.to_owned(),
+            verified_cause: verified_cause.to_owned(),
+            sources,
+        })
+    }
+
+    pub fn sources(&self) -> &[ReasoningSourceReferenceV1] {
+        &self.sources
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningRouteDecisionV1 {
+    ExactVerifiedFact,
+    SharedVerifiedFact,
+    InflightJoin,
+    ExecuteForUnknown,
+    ExecuteForStateChange,
+    ExecuteForAuthorization,
+    QuarantineContradiction,
+    FullDeliveryRequired,
+    CompactDeliveryConfirmed,
+}
+
+impl ReasoningRouteDecisionV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ExactVerifiedFact => "exact_verified_fact",
+            Self::SharedVerifiedFact => "shared_verified_fact",
+            Self::InflightJoin => "inflight_join",
+            Self::ExecuteForUnknown => "execute_for_unknown",
+            Self::ExecuteForStateChange => "execute_for_state_change",
+            Self::ExecuteForAuthorization => "execute_for_authorization",
+            Self::QuarantineContradiction => "quarantine_contradiction",
+            Self::FullDeliveryRequired => "full_delivery_required",
+            Self::CompactDeliveryConfirmed => "compact_delivery_confirmed",
+        }
+    }
+
+    pub const fn explanation(self) -> &'static str {
+        match self {
+            Self::ExactVerifiedFact => "verified observation matches the exact bounded context",
+            Self::SharedVerifiedFact => {
+                "verified observation is shared under matching repository and authorization scope"
+            }
+            Self::InflightJoin => "matching active work exists; do not execute independently",
+            Self::ExecuteForUnknown => "required evidence is unknown; execute an observation",
+            Self::ExecuteForStateChange => {
+                "prior evidence is stale for the current repository or dependency state"
+            }
+            Self::ExecuteForAuthorization => {
+                "prior evidence was observed under a different authorization scope"
+            }
+            Self::QuarantineContradiction => {
+                "verified sources disagree; no output is selected for reuse"
+            }
+            Self::FullDeliveryRequired => {
+                "recipient has not authenticated complete delivery of this exact brief"
+            }
+            Self::CompactDeliveryConfirmed => {
+                "recipient authenticated complete delivery of this exact brief"
+            }
+        }
+    }
+
+    pub const fn grants_reuse(self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestedReasoningToolCallV1 {
+    provider: String,
+    tool: String,
+    purpose: String,
+    route: ReasoningRouteDecisionV1,
+}
+
+impl SuggestedReasoningToolCallV1 {
+    pub fn new(
+        provider: &str,
+        tool: &str,
+        purpose: &str,
+        route: ReasoningRouteDecisionV1,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(provider)?;
+        validate_reasoning_identifier_v1(tool)?;
+        validate_reasoning_text_v1(purpose, MAX_REASONING_TEXT_BYTES_V1)?;
+        Ok(Self {
+            provider: provider.to_owned(),
+            tool: tool.to_owned(),
+            purpose: purpose.to_owned(),
+            route,
+        })
+    }
+
+    pub const fn grants_reuse(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReasoningEvidenceMetricsV1 {
+    pub investigations_avoided: u64,
+    pub provider_calls_avoided: u64,
+    pub inflight_joins: u64,
+    pub false_hit_quarantines: u64,
+    pub estimated_execution_time_saved_ms: u64,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReasoningBriefInputV1 {
+    pub scope: ReasoningScopeV1,
+    pub recipient: ReasoningRecipientV1,
+    pub known_facts: Vec<ReasoningFactV1>,
+    pub invalidated_facts: Vec<InvalidatedReasoningFactV1>,
+    pub explicit_unknowns: Vec<ReasoningUnknownV1>,
+    pub completed_observations: Vec<CompletedReasoningObservationV1>,
+    pub inflight_work: Vec<InflightReasoningWorkV1>,
+    pub failed_approaches: Vec<FailedReasoningApproachV1>,
+    pub suggested_next_tool_calls: Vec<SuggestedReasoningToolCallV1>,
+    pub route_decisions: Vec<ReasoningRouteDecisionV1>,
+    pub evidence_metrics: ReasoningEvidenceMetricsV1,
+}
+
+impl fmt::Debug for ReasoningBriefInputV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReasoningBriefInputV1(<redacted>)")
+    }
+}
+
+impl ReasoningBriefInputV1 {
+    pub fn empty(scope: ReasoningScopeV1, recipient: ReasoningRecipientV1) -> Self {
+        Self {
+            scope,
+            recipient,
+            known_facts: Vec::new(),
+            invalidated_facts: Vec::new(),
+            explicit_unknowns: Vec::new(),
+            completed_observations: Vec::new(),
+            inflight_work: Vec::new(),
+            failed_approaches: Vec::new(),
+            suggested_next_tool_calls: Vec::new(),
+            route_decisions: Vec::new(),
+            evidence_metrics: ReasoningEvidenceMetricsV1::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningContextRefusalV1 {
+    InvalidIdentifier,
+    InvalidDigest,
+    InvalidText,
+    SensitiveContent,
+    InvalidGeneration,
+    ItemBound,
+    SourceReferenceBound,
+    TaskScopeMismatch,
+    ByteBound,
+    Canonicalization,
+    DeliveryIncomplete,
+}
+
+impl ReasoningContextRefusalV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InvalidIdentifier => "invalid_identifier",
+            Self::InvalidDigest => "invalid_digest",
+            Self::InvalidText => "invalid_text",
+            Self::SensitiveContent => "sensitive_content",
+            Self::InvalidGeneration => "invalid_generation",
+            Self::ItemBound => "reasoning_item_bound_exceeded",
+            Self::SourceReferenceBound => "source_reference_bound_exceeded",
+            Self::TaskScopeMismatch => "task_scope_mismatch",
+            Self::ByteBound => "reasoning_byte_bound_exceeded",
+            Self::Canonicalization => "reasoning_canonicalization_failed",
+            Self::DeliveryIncomplete => "reasoning_delivery_incomplete",
+        }
+    }
+}
+
+pub(crate) fn validate_reasoning_identifier_v1(
+    value: &str,
+) -> Result<(), ReasoningContextRefusalV1> {
+    if value.is_empty()
+        || value.len() > MAX_CONTEXT_IDENTIFIER_BYTES_V1
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ReasoningContextRefusalV1::InvalidIdentifier);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reasoning_digest_v1(value: &str) -> Result<(), ReasoningContextRefusalV1> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(ReasoningContextRefusalV1::InvalidDigest);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_reasoning_text_v1(
+    value: &str,
+    maximum: usize,
+) -> Result<(), ReasoningContextRefusalV1> {
+    if value.is_empty()
+        || value.len() > maximum
+        || value
+            .chars()
+            .any(|character| character.is_control() && character != '\n' && character != '\t')
+    {
+        return Err(ReasoningContextRefusalV1::InvalidText);
+    }
+    Ok(())
+}
+
 fn validate_context_identifier(value: &str) -> Result<(), PresentationRefusalV1> {
     if value.is_empty()
         || value.len() > MAX_CONTEXT_IDENTIFIER_BYTES_V1

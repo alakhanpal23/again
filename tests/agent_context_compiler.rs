@@ -1,11 +1,28 @@
 #[allow(dead_code)]
+#[path = "../src/agent_gateway/context.rs"]
+mod context;
+#[allow(dead_code)]
+#[path = "../src/agent_gateway/protocol.rs"]
+mod protocol;
+
+mod agent_gateway {
+    pub(crate) use crate::context;
+    pub(crate) use crate::protocol;
+}
+
+#[allow(dead_code)]
 #[path = "../src/agent_gateway_runtime/context_compiler.rs"]
 mod context_compiler;
 
+use context::{
+    ReasoningBriefInputV1, ReasoningFactScopeV1, ReasoningFactV1, ReasoningRecipientV1,
+    ReasoningScopeV1, ReasoningSourceReferenceV1,
+};
 use context_compiler::{
     ContextCompilerRefusalV1, ContextIdentityV1, ContextPresentationRequestV1, ContextResultV1,
-    MAX_CONTEXT_EXCERPT_BYTES_V1, MAX_CONTEXT_RESULT_BYTES_V1, compile_context_presentation_v1,
-    complete_exact_delivery_v1,
+    MAX_CONTEXT_EXCERPT_BYTES_V1, MAX_CONTEXT_RESULT_BYTES_V1, ReasoningBriefPresentationRequestV1,
+    ReasoningBriefPresentationV1, compile_context_presentation_v1, compile_reasoning_brief_v1,
+    complete_exact_delivery_v1, complete_reasoning_brief_delivery_v1,
 };
 
 fn context(agent: &str, session: &str, turn: &str, generation: u64) -> ContextIdentityV1 {
@@ -14,6 +31,49 @@ fn context(agent: &str, session: &str, turn: &str, generation: u64) -> ContextId
 
 fn result() -> ContextResultV1 {
     ContextResultV1::new("result-01", &[0xff, b'A', 0x80, b'B', b'C', b'D']).unwrap()
+}
+
+fn digest(byte: char) -> String {
+    std::iter::repeat_n(byte, 64).collect()
+}
+
+fn reasoning_input() -> ReasoningBriefInputV1 {
+    let scope = ReasoningScopeV1::new(
+        "task-01",
+        "repo-01",
+        "workspace-01",
+        &digest('a'),
+        &digest('b'),
+        &digest('c'),
+    )
+    .unwrap();
+    let recipient =
+        ReasoningRecipientV1::new("agent-01", "session-01", "turn-01", &digest('d'), 3, 1).unwrap();
+    let source = ReasoningSourceReferenceV1::new(
+        "result-01",
+        &digest('e'),
+        "repo-01",
+        "workspace-01",
+        &digest('a'),
+        &digest('b'),
+        &digest('c'),
+        "src/lib.rs:17",
+    )
+    .unwrap();
+    let mut input = ReasoningBriefInputV1::empty(scope, recipient);
+    input.known_facts.push(
+        ReasoningFactV1::new(
+            "fact-01",
+            "compiler-state",
+            &"the verified compiler observation remains current ".repeat(12),
+            &digest('f'),
+            ReasoningFactScopeV1::RepositoryWide,
+            None,
+            vec![source],
+        )
+        .unwrap(),
+    );
+    input
 }
 
 #[test]
@@ -254,5 +314,95 @@ fn compaction_overflow_and_debug_output_are_payload_free() {
     assert_eq!(
         ContextCompilerRefusalV1::DeliveryAuthority.code(),
         "delivery_authority_mismatch"
+    );
+}
+
+#[test]
+fn reasoning_brief_is_canonical_and_unconfirmed_delivery_saves_nothing() {
+    let input = reasoning_input();
+    let first = compile_reasoning_brief_v1(
+        &input,
+        ReasoningBriefPresentationRequestV1::PreferCompact {
+            acknowledgment: None,
+        },
+    )
+    .unwrap();
+    let second =
+        compile_reasoning_brief_v1(&input, ReasoningBriefPresentationRequestV1::Full).unwrap();
+
+    assert_eq!(first.bytes(), second.bytes());
+    assert_eq!(first.full_digest(), second.full_digest());
+    assert_eq!(first.presentation(), ReasoningBriefPresentationV1::Full);
+    assert_eq!(first.metrics().delivery_confirmed_bytes_omitted, 0);
+    assert_eq!(first.metrics().confirmed_tokens_avoided, 0);
+    assert!(!first.grants_reuse());
+    assert!(!first.grants_execution());
+}
+
+#[test]
+fn compact_reasoning_reference_requires_exact_recipient_acknowledgment() {
+    let input = reasoning_input();
+    let full =
+        compile_reasoning_brief_v1(&input, ReasoningBriefPresentationRequestV1::Full).unwrap();
+    let acknowledgment = complete_reasoning_brief_delivery_v1(
+        &input.recipient,
+        &full,
+        full.bytes(),
+        true,
+        true,
+        true,
+    )
+    .unwrap();
+    let compact = compile_reasoning_brief_v1(
+        &input,
+        ReasoningBriefPresentationRequestV1::PreferCompact {
+            acknowledgment: Some(&acknowledgment),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(
+        compact.presentation(),
+        ReasoningBriefPresentationV1::CompactReference
+    );
+    assert!(compact.bytes().len() < full.bytes().len());
+    assert_eq!(compact.full_exact_bytes(), full.bytes());
+    assert!(compact.metrics().delivery_confirmed_bytes_omitted > 0);
+    assert!(compact.metrics().confirmed_tokens_avoided > 0);
+
+    let mut after_compaction = input.clone();
+    after_compaction.recipient = input.recipient.after_compaction().unwrap();
+    let invalidated = compile_reasoning_brief_v1(
+        &after_compaction,
+        ReasoningBriefPresentationRequestV1::PreferCompact {
+            acknowledgment: Some(&acknowledgment),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        invalidated.presentation(),
+        ReasoningBriefPresentationV1::Full
+    );
+    assert_eq!(invalidated.metrics().confirmed_tokens_avoided, 0);
+}
+
+#[test]
+fn incomplete_reasoning_delivery_cannot_issue_acknowledgment() {
+    let input = reasoning_input();
+    let full =
+        compile_reasoning_brief_v1(&input, ReasoningBriefPresentationRequestV1::Full).unwrap();
+
+    assert_eq!(
+        complete_reasoning_brief_delivery_v1(
+            &input.recipient,
+            &full,
+            &full.bytes()[..full.bytes().len() - 1],
+            true,
+            true,
+            true,
+        )
+        .unwrap_err()
+        .code(),
+        "reasoning_delivery_incomplete"
     );
 }
