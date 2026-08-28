@@ -47,6 +47,14 @@ not yet a user-visible capability: the public stdio transport has no trusted
 recipient issuer, so it continues to send full results and records zero
 delivery-confirmed savings.
 
+The built-in Git boundary now refuses reuse when local configuration imports
+external files, and status/diff queries with nested worktree or submodule
+control state execute without reuse. Configuration capable of launching a
+filter, external diff/text-conversion command, or alternate-reference command
+is rejected before the Git subprocess starts. This closes stale-result and
+nominally-read-only command-launch gaps; broader Git configuration support must
+arrive only with explicit dependency and executable authority.
+
 1. Replace every caller-constructible routing observation with a store-issued,
    one-use proof whose lifecycle generation, dependency binding, and freshness
    are checked at consumption.
