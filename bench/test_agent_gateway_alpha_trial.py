@@ -365,6 +365,15 @@ class AgentGatewayAlphaTrialTest(unittest.TestCase):
         self.assertEqual(refused.exception.code, "output_exists")
         self.assertEqual(output.read_bytes(), before)
 
+    def test_output_accepts_an_absolute_alias_to_an_existing_parent(self) -> None:
+        alias_parent = self.root / "output-parent-alias"
+        real_parent = self.root / "output-parent"
+        real_parent.mkdir()
+        alias_parent.symlink_to(real_parent, target_is_directory=True)
+        output = alias_parent / "evidence.json"
+        harness.write_json_exclusive(output, {"written": True})
+        self.assertEqual((real_parent / "evidence.json").read_bytes(), b'{"written":true}\n')
+
     def test_five_user_aggregate_closes_thresholds_but_claims_no_crypto_identity(self) -> None:
         reports = [self.verified(index) for index in range(1, 6)]
         hashes = [self.digest(f"verified:{index}") for index in range(1, 6)]

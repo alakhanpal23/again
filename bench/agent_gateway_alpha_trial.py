@@ -247,15 +247,20 @@ def read_json_file(path: pathlib.Path) -> tuple[dict[str, Any], str]:
 def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
     if not path.is_absolute():
         raise TrialRefusal("output_not_absolute", "output path must be absolute")
-    parent = _canonical_existing_path(path.parent, "output_parent")
-    if parent != path.parent:
-        raise TrialRefusal("output_parent_not_canonical", "output parent must be canonical")
+    try:
+        parent = path.parent.resolve(strict=True)
+        parent_metadata = parent.stat()
+    except OSError as error:
+        raise TrialRefusal("output_parent_unavailable", "output parent is unavailable") from error
+    if not stat.S_ISDIR(parent_metadata.st_mode):
+        raise TrialRefusal("output_parent_unavailable", "output parent must be a directory")
+    output_path = parent / path.name
     rendered = canonical_json_bytes(value)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(path, flags, 0o600)
+        descriptor = os.open(output_path, flags, 0o600)
     except FileExistsError as error:
         raise TrialRefusal("output_exists", "refusing to overwrite existing output") from error
     except OSError as error:
@@ -267,7 +272,7 @@ def write_json_exclusive(path: pathlib.Path, value: Any) -> None:
             os.fsync(output.fileno())
     except BaseException:
         try:
-            path.unlink()
+            output_path.unlink()
         except OSError:
             pass
         raise
