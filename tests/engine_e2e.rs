@@ -122,6 +122,118 @@ fn run_again(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     run_process(root, &again_binary(), &args, stdin)
 }
 
+#[cfg(not(any(
+    feature = "hook",
+    feature = "daemon",
+    feature = "linux-pytest",
+    feature = "team-alpha"
+)))]
+#[test]
+fn default_help_contains_only_the_shipping_product() {
+    let temp = TempDir::new().unwrap();
+    let output = run_again(temp.path(), &["--help"], None);
+    assert!(output.status.success(), "help failed: {:?}", output.stderr);
+    let help = String::from_utf8(output.stdout).unwrap();
+    for command in [
+        "setup",
+        "run",
+        "reference",
+        "mcp",
+        "explain",
+        "show",
+        "stats",
+        "doctor",
+    ] {
+        assert!(
+            help.contains(&format!("  {command}")),
+            "missing {command}: {help}"
+        );
+    }
+    for command in ["hook", "exec", "daemon", "connect", "team", "linux-pytest"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.starts_with(&format!("  {command} "))),
+            "unexpected {command}: {help}"
+        );
+    }
+
+    let mcp = run_again(temp.path(), &["mcp", "--help"], None);
+    assert!(mcp.status.success(), "mcp help failed: {:?}", mcp.stderr);
+    let mcp_help = String::from_utf8(mcp.stdout).unwrap();
+    assert!(mcp_help.contains("  serve"));
+    assert!(mcp_help.contains("  setup"));
+    assert!(!mcp_help.contains("experimental"));
+    assert!(!mcp_help.contains("daemon"));
+    assert!(!mcp_help.contains("connect"));
+}
+
+#[test]
+fn user_facing_help_and_dry_run_output_are_actionable() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join(".git")).unwrap();
+
+    for (args, expected) in [
+        (&["show", "--help"][..], "Stored result id to retrieve"),
+        (
+            &["stats", "--help"][..],
+            "machine-readable JSON with local-engine and gateway counters",
+        ),
+        (
+            &["doctor", "--help"][..],
+            "complete diagnostic report as machine-readable JSON",
+        ),
+    ] {
+        let output = run_again(temp.path(), args, None);
+        assert!(
+            output.status.success(),
+            "args={args:?}: {:?}",
+            output.stderr
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "args={args:?}: {:?}",
+            output.stdout
+        );
+    }
+
+    let workspace = temp.path().canonicalize().unwrap();
+    let setup = run_again(
+        temp.path(),
+        &[
+            "mcp",
+            "setup",
+            "--client",
+            "codex",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        setup.status.success(),
+        "mcp setup failed: {:?}",
+        setup.stderr
+    );
+    let setup_stdout = String::from_utf8(setup.stdout).unwrap();
+    assert!(setup_stdout.contains("# dry run; no configuration was changed"));
+    assert!(!setup_stdout.contains("experimental"));
+
+    let stats = run_again(temp.path(), &["stats"], None);
+    assert!(stats.status.success(), "stats failed: {:?}", stats.stderr);
+    let stats_stdout = String::from_utf8(stats.stdout).unwrap();
+    assert!(stats_stdout.contains("gateway requests: 0"));
+    assert!(stats_stdout.contains("gateway provider calls avoided: 0"));
+
+    let doctor = run_again(temp.path(), &["doctor"], None);
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {:?}",
+        doctor.stderr
+    );
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("state writable: true"));
+}
+
 #[cfg(any(
     not(feature = "hook"),
     not(feature = "daemon"),

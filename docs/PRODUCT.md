@@ -4,11 +4,11 @@
 
 > Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
-This sentence is both the product pitch and the reuse boundary. The stable explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The experimental MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
+This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The experimental gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative stable path.
+The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative local path.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
@@ -29,7 +29,7 @@ again reference -- rg --no-ignore --sort=path needle src
 
 Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
 
-The experimental MCP onboarding path is explicit and workspace-bound:
+The MCP onboarding path is explicit and workspace-bound:
 
 ```bash
 again mcp setup --client codex --workspace /canonical/repository

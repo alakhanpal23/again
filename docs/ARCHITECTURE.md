@@ -43,7 +43,7 @@ apply across the local, Linux trace-backed, and team paths:
 The status of each row is normative only through [STATUS.md](STATUS.md). The
 phase ordering and exit gates are in [ROADMAP.md](ROADMAP.md).
 
-## Experimental gateway authority chain
+## Gateway authority chain
 
 ```text
 MCP JSON-RPC frame

@@ -1,6 +1,6 @@
 # Again
 
-Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The stable local engine currently applies that rule to a deliberately narrow set of explicit read-only commands; an experimental MCP gateway applies it to bounded repository and Git intelligence.
+Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The default product applies that rule to a deliberately narrow set of explicit read-only commands and to bounded repository and Git intelligence over MCP.
 
 ```bash
 # Redirect all three standard streams so this terminal demonstration is non-TTY.
@@ -14,7 +14,7 @@ cmp /tmp/again-first.err /tmp/again-second.err
 
 The second eligible invocation can be a cache hit and still returns the same complete streams. An agent that already has those complete bytes in its active context may instead explicitly request a compact, content-addressed proof with `again reference -- <same argv...>`; that command never executes on a miss. If any standard stream is a TTY, as in a normal interactive terminal invocation, `again run` instead executes the audited command once uncached with inherited streams. The current repository is an early conservative implementation; arbitrary commands are not safe to cache.
 
-## Experimental agent gateway
+## Repository MCP gateway
 
 `again mcp serve` exposes 13 bounded read-only tools over MCP stdio: `repo.read`, `repo.search`, `repo.list`, `repo.tree`, `repo.stat`, `repo.glob`, `repo.references`, `repo.manifest`, plus `git.status`, `git.diff`, `git.log`, `git.show`, and `git.blame`. Exact repository, task, provider, schema, environment, authorization-scope, dependency, and executable bindings control reuse. Concurrent identical calls can join one in-flight execution; later exact calls can reuse its verified result. Relevant repository changes invalidate it. Unknown state and every mutation, credential operation, communication, deployment, payment, or unknown tool bypasses storage and replay.
 
@@ -50,14 +50,14 @@ Local v0 does not classify credentials or secret-tainted output. Admitted path o
 
 ## First user
 
-The beachhead is an individual Codex or Claude user working in a medium or large local repository where agents repeatedly read and search the same state. The experimental gateway removes duplicate provider calls without asking every agent to remember prior commands; the stable explicit path remains `again run --`, with `again reference --` available only when the complete bytes remain visible. Test/build reuse and transparent interception are later profiles and do not ship until their semantics are observable and their isolation/differential gates pass.
+The beachhead is an individual Codex or Claude user working in a medium or large local repository where agents repeatedly read and search the same state. The gateway removes duplicate provider calls without asking every agent to remember prior commands; the explicit local path remains `again run --`, with `again reference --` available only when the complete bytes remain visible. Test/build reuse and transparent interception are later profiles and do not ship until their semantics are observable and their isolation/differential gates pass.
 
 ## Install during development
 
 ```bash
 cargo install --path .
 again setup --codex
-# Optional experimental MCP gateway dry run for the current canonical repository:
+# Optional MCP gateway setup plan for the current canonical repository:
 again mcp setup --client codex --workspace "$(pwd -P)"
 # Start a new Codex session, then Codex can use:
 again run -- cat path/to/file
@@ -69,7 +69,7 @@ again reference -- cat path/to/file
 
 No Again account, OAuth flow, API key, daemon, Docker, root permission, task graph, hook installation, or telemetry is required for local mode. On Unix, disposable state defaults to `${TMPDIR}/again-<euid>/workspaces/<BLAKE3(canonical-workspace-path)>`, with app-owned directory levels at mode `0700`; the first run never mutates the workspace. `AGAIN_HOME` selects one exact persistent root and must be absolute and outside the active workspace. Its final component cannot be a symlink, and an existing root must already be an owned real directory with mode `0700`. Every canonical ancestor must be a real directory owned by the current uid or root; a group/world-writable ancestor must have the sticky bit. Fixed state files, directories, blobs, and the state-root `.gitignore` must satisfy the documented ownership, type, link-count, symlink, and private-mode checks; unsafe state causes an error. Resolution and creation remain pathname-based and can still be raced by the same user or root. This repository's checked-in `/.again` ignore is root-scoped legacy housekeeping; it neither places current state in the workspace nor ignores nested user directories.
 
-An opt-in encrypted team-alpha path now exists for a manually provisioned private profile:
+A binary built with `--features team-alpha` exposes an opt-in encrypted path for a manually provisioned private profile:
 
 ```bash
 again team run --profile /absolute/private/profile.json -- wc -c README.md
@@ -91,30 +91,31 @@ the fixed system signature verifier, but never the requested command.
 
 ## Commands
 
+The default binary exposes this product surface:
+
 ```text
 again run -- <argv...>    Run through the conservative local engine
 again reference -- <argv...>
                           Verify an existing hit and emit a compact JSON reference; never execute on miss
-again team run --profile <absolute-profile> -- <bare argv...>
-                          Use the manually provisioned encrypted team alpha
-again team inspect --profile <absolute-profile> --json -- <bare argv...>
-                          Print its offline, unsigned trust bootstrap bindings
 again mcp serve --workspace <canonical-repository>
-                          Serve experimental bounded repository tools over MCP stdio
+                          Serve bounded repository tools over MCP stdio
 again mcp setup --client <codex|claude> --workspace <canonical-repository>
                           Print an ownership-checked, dry-run agent configuration
 again setup --codex       Install the instruction-only personal Codex skill
 again setup --codex --project
                           Install the skill in the current repository
-again hook                Production no-op; unsafe parser requires a test flag
-again exec --call <id>    Experimental opaque-call plumbing for hook tests
 again explain [id]        Show a stored result or the latest recorded event
 again show <result-id>    Retrieve exact stored stdout/stderr
 again stats               Show local execution and replay counters
 again doctor              Verify state, skill scopes, and safety capabilities
 ```
 
-`again hook --experimental-unsafe-rewrite` exists only for controlled differential tests. It can change hidden Codex invocation semantics and must not be installed or used as a production integration.
+Empty-by-default Cargo features retain non-product and future surfaces without exposing them in ordinary builds:
+
+- `hook` adds hidden `again hook` and `again exec` test plumbing. `again hook --experimental-unsafe-rewrite` exists only for controlled differential tests; it can change hidden Codex invocation semantics and must not be installed or used as a production integration.
+- `daemon` adds hidden `again mcp daemon` and `again mcp connect` same-user local service commands.
+- `linux-pytest` adds four hidden, command-free Linux diagnostics. They grant no execution or reuse authority.
+- `team-alpha` adds `again team run` and `again team inspect` for manually provisioned private profiles; it is not a public team service.
 
 `again explain <id>` reads a stored, non-quarantined result; without an id it reports only the latest event that was actually recorded. It does not reconstruct or invent an explanation for a refusal or failure that occurred before event persistence.
 

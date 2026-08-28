@@ -274,6 +274,7 @@ struct HookArgs {
 #[cfg(feature = "hook")]
 #[derive(Debug, Args)]
 struct ExecArgs {
+    /// Opaque pending-call identifier issued by the hook adapter.
     #[arg(long)]
     call: String,
 }
@@ -282,23 +283,27 @@ struct ExecArgs {
 struct ExplainArgs {
     /// Stored result id. Omit it to explain the latest local event.
     id: Option<String>,
+    /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ShowArgs {
+    /// Stored result id to retrieve.
     id: String,
 }
 
 #[derive(Debug, Args)]
 struct StatsArgs {
+    /// Emit machine-readable JSON with local-engine and gateway counters.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
+    /// Emit the complete diagnostic report as machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
@@ -1012,7 +1017,7 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
     } else {
         println!("{plan}");
         if args.install_owned_config.is_none() {
-            println!("# experimental dry run; no configuration was changed");
+            println!("# dry run; no configuration was changed");
         }
     }
     if args.install_owned_config.is_some() {
@@ -2323,6 +2328,22 @@ fn stats(json: bool) -> Result<i32> {
             "estimated net execution time saved: {} ms",
             stats.estimated_execution_ms_saved
         );
+        println!("gateway requests: {}", stats.requested);
+        println!("gateway provider executions: {}", stats.executed);
+        println!("gateway exact hits: {}", stats.exact_hits);
+        println!("gateway in-flight joins: {}", stats.inflight_joins);
+        println!(
+            "gateway provider calls avoided: {}",
+            stats.provider_calls_avoided
+        );
+        println!(
+            "gateway false-hit quarantines: {}",
+            stats.false_hit_quarantines
+        );
+        println!(
+            "estimated gateway execution time saved: {} ms",
+            stats.estimated_execution_time_saved_ms
+        );
     }
     Ok(0)
 }
@@ -2368,6 +2389,7 @@ fn doctor(json: bool) -> Result<i32> {
         println!("Again {}", report.version);
         println!("executable: {}", report.executable);
         println!("state: {}", report.state_dir);
+        println!("state writable: {}", report.state_writable);
         println!("policy: {}", report.policy_version);
         println!(
             "audited Apple tool profile: {}",
