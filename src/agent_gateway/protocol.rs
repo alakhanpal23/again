@@ -29,6 +29,9 @@ pub const MAX_GATEWAY_TOOL_CALL_NODES: usize = MAX_CANONICAL_JSON_NODES + 128;
 pub const DELIVERY_CHALLENGE_SCHEMA_VERSION: u16 = 1;
 pub const DELIVERY_ACKNOWLEDGEMENT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_DELIVERY_IDENTIFIER_BYTES_V1: usize = 128;
+pub const TOOL_POLICY_SCHEMA_VERSION_V1: u16 = 1;
+pub const MAX_TOOL_POLICY_IDENTIFIER_BYTES_V1: usize = 128;
+pub const MAX_TOOL_POLICY_DEPENDENCIES_V1: usize = 64;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.request.v1\0";
 const ADAPTER_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.adapter.v1\0";
@@ -659,6 +662,264 @@ pub enum GatewayEffectClassV1 {
     ExternalWrite,
     Privileged,
     Unknown,
+}
+
+/// Conservative capability classes understood by the universal MCP control
+/// plane. These values describe policy; they do not themselves grant reuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolCapabilityClassV1 {
+    ExactStateBoundRead,
+    DeterministicCommand,
+    FreshnessBoundRead,
+    NonReusableRead,
+    Mutation,
+    CredentialOperation,
+    Communication,
+    Deployment,
+    Payment,
+    Unknown,
+}
+
+impl ToolCapabilityClassV1 {
+    pub const fn may_consider_reuse(self) -> bool {
+        matches!(self, Self::ExactStateBoundRead | Self::DeterministicCommand)
+    }
+
+    pub const fn must_bypass_storage(self) -> bool {
+        matches!(
+            self,
+            Self::Mutation
+                | Self::CredentialOperation
+                | Self::Communication
+                | Self::Deployment
+                | Self::Payment
+                | Self::Unknown
+        )
+    }
+}
+
+/// State inputs which a reusable tool observation claims to cover. A binding
+/// is content addressed; names identify scope but never serve as authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDependencyKindV1 {
+    RepositoryPath,
+    RepositoryTree,
+    GitState,
+    Executable,
+    Toolchain,
+    Environment,
+    Configuration,
+    Lockfile,
+    ExternalResource,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ToolDependencyBindingV1 {
+    kind: ToolDependencyKindV1,
+    name: String,
+    digest: DigestReferenceV1,
+}
+
+impl ToolDependencyBindingV1 {
+    pub fn new(
+        kind: ToolDependencyKindV1,
+        name: impl Into<String>,
+        digest: DigestReferenceV1,
+    ) -> Result<Self, ToolPolicyRefusalV1> {
+        let binding = Self {
+            kind,
+            name: name.into(),
+            digest,
+        };
+        validate_tool_policy_identifier_v1(&binding.name)?;
+        binding
+            .digest
+            .validate_bounded()
+            .map_err(|_| ToolPolicyRefusalV1::InvalidDependency)?;
+        Ok(binding)
+    }
+
+    pub const fn kind(&self) -> ToolDependencyKindV1 {
+        self.kind
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn digest(&self) -> &DigestReferenceV1 {
+        &self.digest
+    }
+}
+
+/// A dependency declaration is either explicitly empty or a non-empty,
+/// duplicate-free set. An absent/incomplete declaration has no representation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolDependencySetV1 {
+    ExplicitlyNone,
+    Bound(Vec<ToolDependencyBindingV1>),
+}
+
+impl ToolDependencySetV1 {
+    pub fn bound(dependencies: Vec<ToolDependencyBindingV1>) -> Result<Self, ToolPolicyRefusalV1> {
+        if dependencies.is_empty() || dependencies.len() > MAX_TOOL_POLICY_DEPENDENCIES_V1 {
+            return Err(ToolPolicyRefusalV1::InvalidDependency);
+        }
+        let mut identities = BTreeSet::new();
+        for dependency in &dependencies {
+            validate_tool_policy_identifier_v1(dependency.name())?;
+            dependency
+                .digest()
+                .validate_bounded()
+                .map_err(|_| ToolPolicyRefusalV1::InvalidDependency)?;
+            if !identities.insert((dependency.kind(), dependency.name().to_owned())) {
+                return Err(ToolPolicyRefusalV1::DuplicateDependency);
+            }
+        }
+        Ok(Self::Bound(dependencies))
+    }
+
+    pub fn dependencies(&self) -> &[ToolDependencyBindingV1] {
+        match self {
+            Self::ExplicitlyNone => &[],
+            Self::Bound(dependencies) => dependencies,
+        }
+    }
+}
+
+/// Identification of a deterministic external freshness validator. Merely
+/// declaring a validator does not prove that it ran or authorize a cache hit.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExternalFreshnessValidatorV1 {
+    id: String,
+    version: String,
+    implementation_digest: DigestReferenceV1,
+}
+
+impl ExternalFreshnessValidatorV1 {
+    pub fn new(
+        id: impl Into<String>,
+        version: impl Into<String>,
+        implementation_digest: DigestReferenceV1,
+    ) -> Result<Self, ToolPolicyRefusalV1> {
+        let validator = Self {
+            id: id.into(),
+            version: version.into(),
+            implementation_digest,
+        };
+        validate_tool_policy_identifier_v1(&validator.id)?;
+        validate_tool_policy_identifier_v1(&validator.version)?;
+        validator
+            .implementation_digest
+            .validate_bounded()
+            .map_err(|_| ToolPolicyRefusalV1::InvalidFreshnessValidator)?;
+        Ok(validator)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPolicyDispositionV1 {
+    Allow,
+    Deny,
+}
+
+/// Validated local policy for one provider tool. It is deliberately separate
+/// from provider-supplied MCP annotations, which remain untrusted hints.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct UniversalToolPolicyV1 {
+    schema_version: u16,
+    policy_id: String,
+    policy_version: String,
+    capability: ToolCapabilityClassV1,
+    dependencies: ToolDependencySetV1,
+    freshness_validator: Option<ExternalFreshnessValidatorV1>,
+    disposition: ToolPolicyDispositionV1,
+}
+
+impl UniversalToolPolicyV1 {
+    pub fn new(
+        schema_version: u16,
+        policy_id: impl Into<String>,
+        policy_version: impl Into<String>,
+        capability: ToolCapabilityClassV1,
+        dependencies: ToolDependencySetV1,
+        freshness_validator: Option<ExternalFreshnessValidatorV1>,
+        disposition: ToolPolicyDispositionV1,
+    ) -> Result<Self, ToolPolicyRefusalV1> {
+        if schema_version != TOOL_POLICY_SCHEMA_VERSION_V1 {
+            return Err(ToolPolicyRefusalV1::UnsupportedSchema);
+        }
+        let policy = Self {
+            schema_version,
+            policy_id: policy_id.into(),
+            policy_version: policy_version.into(),
+            capability,
+            dependencies,
+            freshness_validator,
+            disposition,
+        };
+        validate_tool_policy_identifier_v1(&policy.policy_id)?;
+        validate_tool_policy_identifier_v1(&policy.policy_version)?;
+        if policy.capability == ToolCapabilityClassV1::ExactStateBoundRead
+            && policy.dependencies.dependencies().is_empty()
+        {
+            return Err(ToolPolicyRefusalV1::IncompleteDependencies);
+        }
+        if policy.freshness_validator.is_some()
+            && policy.capability != ToolCapabilityClassV1::FreshnessBoundRead
+        {
+            return Err(ToolPolicyRefusalV1::UnexpectedFreshnessValidator);
+        }
+        Ok(policy)
+    }
+
+    pub const fn capability(&self) -> ToolCapabilityClassV1 {
+        self.capability
+    }
+
+    pub const fn disposition(&self) -> ToolPolicyDispositionV1 {
+        self.disposition
+    }
+
+    pub fn dependencies(&self) -> &ToolDependencySetV1 {
+        &self.dependencies
+    }
+
+    pub fn freshness_validator(&self) -> Option<&ExternalFreshnessValidatorV1> {
+        self.freshness_validator.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
+pub enum ToolPolicyRefusalV1 {
+    #[error("unsupported_schema")]
+    UnsupportedSchema,
+    #[error("invalid_identifier")]
+    InvalidIdentifier,
+    #[error("invalid_dependency")]
+    InvalidDependency,
+    #[error("duplicate_dependency")]
+    DuplicateDependency,
+    #[error("incomplete_dependencies")]
+    IncompleteDependencies,
+    #[error("invalid_freshness_validator")]
+    InvalidFreshnessValidator,
+    #[error("unexpected_freshness_validator")]
+    UnexpectedFreshnessValidator,
+}
+
+fn validate_tool_policy_identifier_v1(value: &str) -> Result<(), ToolPolicyRefusalV1> {
+    if value.is_empty()
+        || value.len() > MAX_TOOL_POLICY_IDENTIFIER_BYTES_V1
+        || !value.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(ToolPolicyRefusalV1::InvalidIdentifier);
+    }
+    Ok(())
 }
 
 impl GatewayEffectClassV1 {

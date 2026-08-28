@@ -17,13 +17,17 @@ pub use context::{
 };
 pub use protocol::{
     AgentCallIdentityV1, CanonicalArguments, CanonicalJsonError, DigestReferenceV1, EffectClass,
-    FreshnessRequirementV1, GatewayAdapterToolCallV1, GatewayEffectClassV1, GatewayProtocolError,
-    GatewayProtocolRefusalV1, GatewayToolCallInputV1, GatewayToolCallV1, ModelIdentityV1,
-    PermissionClass, PresentationMode, ProviderIdentityV1, RepositoryEnvironmentStateV1,
-    RequestDigestV1, StateDigestReferenceV1, TaskIdentityV1, ToolIdentityV1, WorkspaceIdentityV1,
+    ExternalFreshnessValidatorV1, FreshnessRequirementV1, GatewayAdapterToolCallV1,
+    GatewayEffectClassV1, GatewayProtocolError, GatewayProtocolRefusalV1, GatewayToolCallInputV1,
+    GatewayToolCallV1, ModelIdentityV1, PermissionClass, PresentationMode, ProviderIdentityV1,
+    RepositoryEnvironmentStateV1, RequestDigestV1, StateDigestReferenceV1, TaskIdentityV1,
+    ToolCapabilityClassV1, ToolDependencyBindingV1, ToolDependencyKindV1, ToolDependencySetV1,
+    ToolIdentityV1, ToolPolicyDispositionV1, ToolPolicyRefusalV1, UniversalToolPolicyV1,
+    WorkspaceIdentityV1,
 };
 pub use router::{
     CandidateEvidenceRefusalV1, CandidateFreshnessV1, GatewayCandidateKindV1,
     GatewayCandidateRequestV1, GatewayDecision, GatewayRouteDecisionV1, GatewayRouteRefusalV1,
-    ReuseCandidateV1, RoutingCandidatesV1, route, route_gateway_candidate_v1,
+    ReuseCandidateV1, RoutingCandidatesV1, UniversalGatewayDecisionV1, route,
+    route_gateway_candidate_v1, route_with_tool_policy_v1,
 };

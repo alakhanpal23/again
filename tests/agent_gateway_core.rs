@@ -37,15 +37,18 @@ use agent_gateway::protocol::{
 };
 use agent_gateway::{
     AgentCallIdentityV1, AgentContextIdentityV1, CandidateFreshnessV1, CanonicalArguments,
-    CanonicalJsonError, DigestReferenceV1, EffectClass, FreshnessRequirementV1,
-    GatewayAdapterToolCallV1, GatewayCandidateKindV1, GatewayCandidateRequestV1, GatewayDecision,
-    GatewayEffectClassV1, GatewayProtocolError, GatewayProtocolRefusalV1, GatewayResultIdentityV1,
-    GatewayRouteDecisionV1, GatewayRouteRefusalV1, GatewayToolCallInputV1, GatewayToolCallV1,
-    ModelIdentityV1, PermissionClass, PresentationContextV1, PresentationDecisionV1,
-    PresentationMode, PresentationRefusalV1, ProviderIdentityV1, RepositoryEnvironmentStateV1,
-    ReuseCandidateV1, RoutingCandidatesV1, StateDigestReferenceV1, TaskIdentityV1, ToolIdentityV1,
-    WorkspaceIdentityV1, decide_presentation_v1, route, route_gateway_candidate_v1,
-    select_presentation,
+    CanonicalJsonError, DigestReferenceV1, EffectClass, ExternalFreshnessValidatorV1,
+    FreshnessRequirementV1, GatewayAdapterToolCallV1, GatewayCandidateKindV1,
+    GatewayCandidateRequestV1, GatewayDecision, GatewayEffectClassV1, GatewayProtocolError,
+    GatewayProtocolRefusalV1, GatewayResultIdentityV1, GatewayRouteDecisionV1,
+    GatewayRouteRefusalV1, GatewayToolCallInputV1, GatewayToolCallV1, ModelIdentityV1,
+    PermissionClass, PresentationContextV1, PresentationDecisionV1, PresentationMode,
+    PresentationRefusalV1, ProviderIdentityV1, RepositoryEnvironmentStateV1, ReuseCandidateV1,
+    RoutingCandidatesV1, StateDigestReferenceV1, TaskIdentityV1, ToolCapabilityClassV1,
+    ToolDependencyBindingV1, ToolDependencyKindV1, ToolDependencySetV1, ToolIdentityV1,
+    ToolPolicyDispositionV1, ToolPolicyRefusalV1, UniversalGatewayDecisionV1,
+    UniversalToolPolicyV1, WorkspaceIdentityV1, decide_presentation_v1, route,
+    route_gateway_candidate_v1, route_with_tool_policy_v1, select_presentation,
 };
 
 fn call(effect: GatewayEffectClassV1) -> GatewayAdapterToolCallV1 {
@@ -743,6 +746,156 @@ fn rich_router_executes_unknown_state_and_never_replays_mutations() {
             GatewayDecision::ExecuteNonReplayable
         );
     }
+}
+
+fn policy_v1(
+    capability: ToolCapabilityClassV1,
+    dependencies: ToolDependencySetV1,
+    freshness_validator: Option<ExternalFreshnessValidatorV1>,
+    disposition: ToolPolicyDispositionV1,
+) -> Result<UniversalToolPolicyV1, ToolPolicyRefusalV1> {
+    UniversalToolPolicyV1::new(
+        1,
+        "local-policy",
+        "1",
+        capability,
+        dependencies,
+        freshness_validator,
+        disposition,
+    )
+}
+
+fn repository_dependency_v1() -> ToolDependencyBindingV1 {
+    ToolDependencyBindingV1::new(
+        ToolDependencyKindV1::RepositoryTree,
+        "workspace-root",
+        digest_ref("repository-1"),
+    )
+    .unwrap()
+}
+
+#[test]
+fn universal_policy_is_bounded_duplicate_free_and_explicit() {
+    assert_eq!(
+        policy_v1(
+            ToolCapabilityClassV1::ExactStateBoundRead,
+            ToolDependencySetV1::ExplicitlyNone,
+            None,
+            ToolPolicyDispositionV1::Allow,
+        )
+        .unwrap_err(),
+        ToolPolicyRefusalV1::IncompleteDependencies
+    );
+    let dependency = repository_dependency_v1();
+    assert_eq!(
+        ToolDependencySetV1::bound(vec![dependency.clone(), dependency]).unwrap_err(),
+        ToolPolicyRefusalV1::DuplicateDependency
+    );
+    assert_eq!(
+        UniversalToolPolicyV1::new(
+            2,
+            "policy",
+            "1",
+            ToolCapabilityClassV1::Unknown,
+            ToolDependencySetV1::ExplicitlyNone,
+            None,
+            ToolPolicyDispositionV1::Allow,
+        )
+        .unwrap_err(),
+        ToolPolicyRefusalV1::UnsupportedSchema
+    );
+}
+
+#[test]
+fn universal_policy_never_turns_metadata_into_reuse_authority() {
+    let call = rich_call();
+    let exact = policy_v1(
+        ToolCapabilityClassV1::ExactStateBoundRead,
+        ToolDependencySetV1::bound(vec![repository_dependency_v1()]).unwrap(),
+        None,
+        ToolPolicyDispositionV1::Allow,
+    )
+    .unwrap();
+    assert_eq!(
+        route_with_tool_policy_v1(&call, &RoutingCandidatesV1::default(), &exact),
+        UniversalGatewayDecisionV1::ExecuteAndObserve
+    );
+
+    let validator =
+        ExternalFreshnessValidatorV1::new("etag", "1", digest_ref("validator-implementation"))
+            .unwrap();
+    let freshness = policy_v1(
+        ToolCapabilityClassV1::FreshnessBoundRead,
+        ToolDependencySetV1::bound(vec![
+            ToolDependencyBindingV1::new(
+                ToolDependencyKindV1::ExternalResource,
+                "upstream-resource",
+                digest_ref("resource-identity"),
+            )
+            .unwrap(),
+        ])
+        .unwrap(),
+        Some(validator),
+        ToolPolicyDispositionV1::Allow,
+    )
+    .unwrap();
+    assert_eq!(
+        route_with_tool_policy_v1(&call, &RoutingCandidatesV1::default(), &freshness),
+        UniversalGatewayDecisionV1::ExecuteAndObserve
+    );
+}
+
+#[test]
+fn universal_policy_bypasses_storage_for_every_sensitive_or_unknown_class() {
+    for capability in [
+        ToolCapabilityClassV1::Mutation,
+        ToolCapabilityClassV1::CredentialOperation,
+        ToolCapabilityClassV1::Communication,
+        ToolCapabilityClassV1::Deployment,
+        ToolCapabilityClassV1::Payment,
+        ToolCapabilityClassV1::Unknown,
+    ] {
+        let policy = policy_v1(
+            capability,
+            ToolDependencySetV1::ExplicitlyNone,
+            None,
+            ToolPolicyDispositionV1::Allow,
+        )
+        .unwrap();
+        assert_eq!(
+            route_with_tool_policy_v1(&rich_call(), &RoutingCandidatesV1::default(), &policy),
+            UniversalGatewayDecisionV1::PassthroughWithoutStorage
+        );
+    }
+
+    let denied = policy_v1(
+        ToolCapabilityClassV1::Unknown,
+        ToolDependencySetV1::ExplicitlyNone,
+        None,
+        ToolPolicyDispositionV1::Deny,
+    )
+    .unwrap();
+    assert_eq!(
+        route_with_tool_policy_v1(&rich_call(), &RoutingCandidatesV1::default(), &denied),
+        UniversalGatewayDecisionV1::RefuseByPolicy
+    );
+
+    let mut approval = rich_input();
+    approval.permission_class = PermissionClass::RequiresApproval;
+    assert_eq!(
+        route_with_tool_policy_v1(
+            &GatewayToolCallV1::from_input(approval).unwrap(),
+            &RoutingCandidatesV1::default(),
+            &policy_v1(
+                ToolCapabilityClassV1::Unknown,
+                ToolDependencySetV1::ExplicitlyNone,
+                None,
+                ToolPolicyDispositionV1::Allow,
+            )
+            .unwrap(),
+        ),
+        UniversalGatewayDecisionV1::RefuseByPolicy
+    );
 }
 
 #[test]

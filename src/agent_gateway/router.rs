@@ -5,6 +5,7 @@ use std::fmt;
 use super::protocol::{
     DigestReferenceV1, EffectClass, FreshnessRequirementV1, GatewayAdapterToolCallV1,
     GatewayToolCallV1, PermissionClass, RepositoryEnvironmentStateV1, RequestDigestV1,
+    ToolCapabilityClassV1, ToolPolicyDispositionV1, UniversalToolPolicyV1,
 };
 use crate::store::{StoreExactResultProofV1, StoreInflightJoinProofV1};
 
@@ -20,6 +21,18 @@ pub enum GatewayDecision {
     ExecuteNonReplayable,
     RequireApproval,
     Refuse,
+}
+
+/// Stable product-level outcomes for a provider-neutral tool policy. These
+/// outcomes add constraints to [`GatewayDecision`]; they never mint authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalGatewayDecisionV1 {
+    ReuseExact,
+    ReuseDeterministicCoverage,
+    JoinInflight,
+    ExecuteAndObserve,
+    PassthroughWithoutStorage,
+    RefuseByPolicy,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,6 +376,59 @@ pub fn route(call: &GatewayToolCallV1, candidates: &RoutingCandidatesV1) -> Gate
         GatewayDecision::ValidateSemanticCandidate
     } else {
         GatewayDecision::Execute
+    }
+}
+
+/// Apply local provider-neutral policy while delegating all reuse decisions to
+/// the existing proof-gated router. Provider annotations and policy metadata
+/// alone can therefore never produce a hit.
+pub fn route_with_tool_policy_v1(
+    call: &GatewayToolCallV1,
+    candidates: &RoutingCandidatesV1,
+    policy: &UniversalToolPolicyV1,
+) -> UniversalGatewayDecisionV1 {
+    let routed = route(call, candidates);
+    if policy.disposition() == ToolPolicyDispositionV1::Deny
+        || matches!(
+            routed,
+            GatewayDecision::RequireApproval | GatewayDecision::Refuse
+        )
+    {
+        return UniversalGatewayDecisionV1::RefuseByPolicy;
+    }
+
+    if policy.capability().must_bypass_storage() {
+        return UniversalGatewayDecisionV1::PassthroughWithoutStorage;
+    }
+
+    match policy.capability() {
+        ToolCapabilityClassV1::ExactStateBoundRead
+        | ToolCapabilityClassV1::DeterministicCommand => match routed {
+            GatewayDecision::ServeExact => UniversalGatewayDecisionV1::ReuseExact,
+            GatewayDecision::ServeDeterministicCoverage => {
+                UniversalGatewayDecisionV1::ReuseDeterministicCoverage
+            }
+            GatewayDecision::JoinInflight => UniversalGatewayDecisionV1::JoinInflight,
+            GatewayDecision::Execute
+            | GatewayDecision::ValidateSemanticCandidate
+            | GatewayDecision::ExecuteNonReplayable => {
+                UniversalGatewayDecisionV1::ExecuteAndObserve
+            }
+            GatewayDecision::RequireApproval | GatewayDecision::Refuse => {
+                UniversalGatewayDecisionV1::RefuseByPolicy
+            }
+        },
+        // A declared freshness validator is not evidence that validation ran.
+        // Until a proof type exists, freshness-bound reads execute every time.
+        ToolCapabilityClassV1::FreshnessBoundRead | ToolCapabilityClassV1::NonReusableRead => {
+            UniversalGatewayDecisionV1::ExecuteAndObserve
+        }
+        ToolCapabilityClassV1::Mutation
+        | ToolCapabilityClassV1::CredentialOperation
+        | ToolCapabilityClassV1::Communication
+        | ToolCapabilityClassV1::Deployment
+        | ToolCapabilityClassV1::Payment
+        | ToolCapabilityClassV1::Unknown => UniversalGatewayDecisionV1::PassthroughWithoutStorage,
     }
 }
 
