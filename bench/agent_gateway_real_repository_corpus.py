@@ -846,7 +846,7 @@ def native_read(workspace: pathlib.Path, relative: str) -> NativeObservation:
         "ok",
         {
             "content": [{"type": "text", "text": text}],
-            "structuredContent": {"path": relative, "bytes": len(raw)},
+            "structuredContent": {"schemaVersion": 1, "path": relative, "bytes": len(raw)},
         },
     )
 
@@ -943,6 +943,7 @@ def native_search(
         {
             "content": [{"type": "text", "text": rendered}],
             "structuredContent": {
+                "schemaVersion": 1,
                 "pattern": pattern,
                 "path": relative,
                 "matches": matches,
