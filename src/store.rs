@@ -17,7 +17,7 @@ use crate::agent_gateway::protocol::{
 use crate::fingerprint::{FileDigestCache, FileIdentity};
 use crate::mcp_gateway::ConfirmedDeliveryV1;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -1041,6 +1041,89 @@ impl Store {
                 SET estimated_tokens_avoided = 0
                 WHERE presentation = 'compact';
                 PRAGMA user_version = 9;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 10 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                -- Schema v8 receipts are retained as immutable legacy audit
+                -- records.  V10 authority is deliberately represented by new
+                -- tables: adding meaning to a v8 row would turn old data into
+                -- authority it never possessed.
+                CREATE TABLE gateway_delivery_receipts_v2 (
+                    receipt_id TEXT PRIMARY KEY CHECK(length(receipt_id) BETWEEN 1 AND 128),
+                    challenge_id TEXT NOT NULL UNIQUE CHECK(length(challenge_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    connection_digest TEXT NOT NULL CHECK(length(connection_digest) = 64),
+                    connection_generation TEXT NOT NULL CHECK(length(connection_generation) = 64),
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
+                    agent_id TEXT NOT NULL CHECK(length(agent_id) BETWEEN 1 AND 128),
+                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
+                    response_request_id_digest TEXT NOT NULL CHECK(length(response_request_id_digest) = 64),
+                    call_digest TEXT NOT NULL CHECK(length(call_digest) = 64),
+                    gateway_result_id TEXT NOT NULL CHECK(length(gateway_result_id) = 64),
+                    result_digest TEXT NOT NULL CHECK(length(result_digest) = 64),
+                    exact_status INTEGER NOT NULL,
+                    stdout_digest TEXT NOT NULL CHECK(length(stdout_digest) = 64),
+                    stdout_bytes INTEGER NOT NULL CHECK(stdout_bytes >= 0),
+                    stderr_digest TEXT NOT NULL CHECK(length(stderr_digest) = 64),
+                    stderr_bytes INTEGER NOT NULL CHECK(stderr_bytes >= 0),
+                    response_envelope_digest TEXT NOT NULL CHECK(length(response_envelope_digest) = 64),
+                    presentation TEXT NOT NULL CHECK(presentation IN ('full', 'compact')),
+                    source_receipt_id TEXT,
+                    acknowledged_ms INTEGER NOT NULL,
+                    FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE,
+                    FOREIGN KEY (source_receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE RESTRICT
+                ) WITHOUT ROWID;
+                CREATE INDEX gateway_delivery_receipts_v2_context_idx
+                    ON gateway_delivery_receipts_v2(
+                        authorization_scope_digest, connection_digest,
+                        connection_generation, session_id, turn_id, agent_id,
+                        compaction_generation, gateway_result_id, presentation
+                    );
+
+                CREATE TABLE gateway_retrieval_grants_v2 (
+                    grant_id TEXT PRIMARY KEY CHECK(length(grant_id) BETWEEN 1 AND 128),
+                    token_digest TEXT NOT NULL UNIQUE CHECK(length(token_digest) = 64),
+                    source_receipt_id TEXT NOT NULL,
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    connection_digest TEXT NOT NULL CHECK(length(connection_digest) = 64),
+                    connection_generation TEXT NOT NULL CHECK(length(connection_generation) = 64),
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
+                    agent_id TEXT NOT NULL CHECK(length(agent_id) BETWEEN 1 AND 128),
+                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
+                    gateway_result_id TEXT NOT NULL CHECK(length(gateway_result_id) = 64),
+                    issued_ms INTEGER NOT NULL,
+                    expires_ms INTEGER NOT NULL CHECK(expires_ms > issued_ms),
+                    consumed_ms INTEGER,
+                    retired_ms INTEGER,
+                    retire_reason TEXT,
+                    FOREIGN KEY (source_receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE CASCADE,
+                    FOREIGN KEY (gateway_result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE,
+                    CHECK(consumed_ms IS NULL OR consumed_ms >= issued_ms),
+                    CHECK(retired_ms IS NULL OR retired_ms >= issued_ms)
+                ) WITHOUT ROWID;
+                CREATE INDEX gateway_retrieval_grants_v2_context_idx
+                    ON gateway_retrieval_grants_v2(
+                        authorization_scope_digest, connection_digest,
+                        connection_generation, session_id, turn_id, agent_id,
+                        compaction_generation, gateway_result_id, expires_ms
+                    );
+
+                CREATE TABLE gateway_delivery_savings_v2 (
+                    receipt_id TEXT PRIMARY KEY,
+                    response_envelope_digest TEXT NOT NULL CHECK(length(response_envelope_digest) = 64),
+                    bytes_omitted INTEGER NOT NULL CHECK(bytes_omitted > 0),
+                    estimated_tokens_avoided INTEGER NOT NULL CHECK(estimated_tokens_avoided >= 0),
+                    recorded_ms INTEGER NOT NULL,
+                    FOREIGN KEY (receipt_id) REFERENCES gateway_delivery_receipts_v2(receipt_id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                PRAGMA user_version = 10;
                 COMMIT;
                 "#,
             )?;
@@ -3360,6 +3443,11 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "compaction_epoch"
             | "compaction_generation"
             | "estimated_tokens_avoided"
+            | "bytes_omitted"
+            | "issued_ms"
+            | "recorded_ms"
+            | "consumed_ms"
+            | "retired_ms"
             | "delivered_ms"
             | "acknowledged_ms"
     ) || (table == "gateway_events" && column == "id");
@@ -3380,6 +3468,11 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | (
                 "gateway_events",
                 "id" | "call_id" | "lease_id" | "gateway_result_id" | "reason"
+            )
+            | ("gateway_delivery_receipts_v2", "source_receipt_id")
+            | (
+                "gateway_retrieval_grants_v2",
+                "consumed_ms" | "retired_ms" | "retire_reason"
             )
     );
     (if integer { "INTEGER" } else { "TEXT" }, !nullable)
@@ -3509,6 +3602,64 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             ],
         ),
         (
+            "gateway_delivery_receipts_v2",
+            &[
+                "receipt_id",
+                "challenge_id",
+                "authorization_scope_digest",
+                "connection_digest",
+                "connection_generation",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "response_request_id_digest",
+                "call_digest",
+                "gateway_result_id",
+                "result_digest",
+                "exact_status",
+                "stdout_digest",
+                "stdout_bytes",
+                "stderr_digest",
+                "stderr_bytes",
+                "response_envelope_digest",
+                "presentation",
+                "source_receipt_id",
+                "acknowledged_ms",
+            ],
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            &[
+                "grant_id",
+                "token_digest",
+                "source_receipt_id",
+                "authorization_scope_digest",
+                "connection_digest",
+                "connection_generation",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "gateway_result_id",
+                "issued_ms",
+                "expires_ms",
+                "consumed_ms",
+                "retired_ms",
+                "retire_reason",
+            ],
+        ),
+        (
+            "gateway_delivery_savings_v2",
+            &[
+                "receipt_id",
+                "response_envelope_digest",
+                "bytes_omitted",
+                "estimated_tokens_avoided",
+                "recorded_ms",
+            ],
+        ),
+        (
             "gateway_events",
             &[
                 "id",
@@ -3606,6 +3757,40 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "agent_id",
                 "compaction_generation",
                 "gateway_result_id",
+            ],
+            false,
+            false,
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "gateway_delivery_receipts_v2_context_idx",
+            &[
+                "authorization_scope_digest",
+                "connection_digest",
+                "connection_generation",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "gateway_result_id",
+                "presentation",
+            ],
+            false,
+            false,
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "gateway_retrieval_grants_v2_context_idx",
+            &[
+                "authorization_scope_digest",
+                "connection_digest",
+                "connection_generation",
+                "session_id",
+                "turn_id",
+                "agent_id",
+                "compaction_generation",
+                "gateway_result_id",
+                "expires_ms",
             ],
             false,
             false,
@@ -3738,6 +3923,31 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ),
         ("gateway_delivery_receipts", "CHECK(stderr_bytes >= 0)"),
         (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(response_request_id_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(response_envelope_digest) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(length(connection_generation) = 64)",
+        ),
+        (
+            "gateway_delivery_receipts_v2",
+            "CHECK(presentation IN ('full', 'compact'))",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(length(token_digest) = 64)",
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            "CHECK(expires_ms > issued_ms)",
+        ),
+        ("gateway_delivery_savings_v2", "CHECK(bytes_omitted > 0)"),
+        (
             "gateway_delivery_receipts",
             "FOREIGN KEY (gateway_result_id) REFERENCES gateway_results",
         ),
@@ -3761,6 +3971,49 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let expected_foreign_keys: &[ExpectedTableForeignKeysV1] = &[
+        (
+            "gateway_delivery_receipts_v2",
+            &[
+                (
+                    "gateway_delivery_receipts_v2",
+                    "source_receipt_id",
+                    "receipt_id",
+                    "RESTRICT",
+                ),
+                (
+                    "gateway_results",
+                    "gateway_result_id",
+                    "gateway_result_id",
+                    "CASCADE",
+                ),
+            ],
+        ),
+        (
+            "gateway_retrieval_grants_v2",
+            &[
+                (
+                    "gateway_results",
+                    "gateway_result_id",
+                    "gateway_result_id",
+                    "CASCADE",
+                ),
+                (
+                    "gateway_delivery_receipts_v2",
+                    "source_receipt_id",
+                    "receipt_id",
+                    "CASCADE",
+                ),
+            ],
+        ),
+        (
+            "gateway_delivery_savings_v2",
+            &[(
+                "gateway_delivery_receipts_v2",
+                "receipt_id",
+                "receipt_id",
+                "CASCADE",
+            )],
+        ),
         (
             "gateway_request_dependencies",
             &[("gateway_requests", "call_id", "call_id", "CASCADE")],
@@ -4878,6 +5131,39 @@ mod tests {
         let stats = reopened.gateway_stats().unwrap();
         assert_eq!(stats.compact_deliveries, 0);
         assert_eq!(stats.estimated_tokens_avoided, 0);
+    }
+
+    #[test]
+    fn version_nine_migrates_additively_without_reinterpreting_legacy_receipts() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store.conn.pragma_update(None, "user_version", 9).unwrap();
+        }
+
+        let reopened = Store::open(temp.path()).unwrap();
+        let version: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 10);
+        for table in [
+            "gateway_delivery_receipts",
+            "gateway_delivery_receipts_v2",
+            "gateway_retrieval_grants_v2",
+            "gateway_delivery_savings_v2",
+        ] {
+            let exists: bool = reopened
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "missing additive migration table {table}");
+        }
     }
 
     #[test]
