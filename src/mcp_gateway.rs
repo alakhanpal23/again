@@ -2514,10 +2514,21 @@ impl McpGateway {
         }
         let acknowledgment = completion.completion.complete();
         if let Ok(acknowledgment) = acknowledgment {
-            self.reasoning_delivery_ledger
+            let mut ledger = self
+                .reasoning_delivery_ledger
                 .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .remember(completion.key, acknowledgment);
+                .unwrap_or_else(|poison| poison.into_inner());
+            // Completion may perform canonicalization between the first
+            // lifecycle check and insertion. Recheck while holding the same
+            // ledger lock used by invalidation so a disconnect, cancellation,
+            // or compaction cannot race a retired acknowledgment back into the
+            // live set.
+            if completion.lifecycle_generation.load(Ordering::Acquire)
+                != completion.recipient.lifecycle_generation
+            {
+                return;
+            }
+            ledger.remember(completion.key, acknowledgment);
             #[cfg(test)]
             self.reasoning_confirmation_count
                 .fetch_add(1, Ordering::AcqRel);
