@@ -62,8 +62,9 @@ promoted after one-use proof consumption, result loading, and repository
 revalidation. Additive schema-v10 receipt/grant storage exists, but item 2
 remains open because production stdio has no transport-authenticated recipient
 issuer. No compact delivery, bytes, tokens, or time savings are claimed. The
-phase-two response-bound candidate was rejected because it failed all-target
-compilation and did not add genuine production recipient authentication.
+phase-two response-bound commit failed its isolated all-target build. A later
+retrieval commit made the combined branch green, but authenticated recipient
+issuance remained test-only, so the production authority gate was still open.
 
 The retained schema-v10 release-binary harness closes the deterministic portion
 of item 5 with 8/8 scenarios, four real MCP processes, 12 provider executions,

@@ -69,10 +69,11 @@ reinterpreting legacy rows. This is structural groundwork, not a production
 delivery channel. Normal stdio sessions have unknown recipient identity, and
 the authenticated recipient issuer and route remain test-only. Receipts
 therefore cannot authorize retrieval or compact output, and compact
-bytes/tokens/time remain zero and unclaimed. The rejected phase-two candidate
-did not compile across all targets and still had no production-authenticated
-recipient. Its response-bound types remain off main; production continues to
-send the complete bounded MCP result.
+bytes/tokens/time remain zero and unclaimed. The phase-two commit failed the
+all-target build in isolation; its later retrieval commit made the candidate
+branch green but still supplied authenticated recipients only under `cfg(test)`.
+Those response-bound types remain off main; production continues to send the
+complete bounded MCP result.
 
 ## Target Linux authority chain
 
