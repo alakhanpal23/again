@@ -104,3 +104,16 @@ or model-generated relevance score cannot alone establish task savings or reuse
 authority. Unknown dependencies execute normally, and a task-level improvement
 cannot compensate for an incorrect hit, stale fact, or weaker validation
 outcome.
+
+## D-024 — Every reusable action gets a profile, not a generic cache
+
+A repeated tool or command is a candidate for optimization, not evidence that
+its old result remains valid. Repository reads, language queries, tests,
+linters, builds, and artifacts may share the universal coordination, storage,
+delivery, and accounting control plane, but each family requires its own
+canonical request, complete dependency observer, effect boundary, executable
+and toolchain identity, immutable result, and fresh validator. Unknown or
+incomplete profiles execute normally. Workspace mutations invalidate dependent
+knowledge and are not replayed; credentials, communication, deployment,
+payment, and other external side effects bypass result reuse. This prevents
+coverage growth from turning Again into an unsafe generic command cache.

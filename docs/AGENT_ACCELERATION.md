@@ -38,6 +38,8 @@ A coding task should eventually flow through one verified loop:
 
 The agent remains free to inspect more context or run more validation. Again is
 a control plane for verified shortcuts, not a replacement for agent reasoning.
+The complete action-by-action coverage inventory is maintained in
+[the coding-agent reuse surface](REUSE_SURFACE.md).
 
 ## Four product accelerators
 

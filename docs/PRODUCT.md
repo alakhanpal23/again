@@ -16,7 +16,9 @@ The product is optimized for lower time and lower total cost per successful
 coding task, not for cache-hit percentage. The complete end-state user loop,
 current implementation map, scorecard, and delivery order are frozen in
 [the agent acceleration product](AGENT_ACCELERATION.md). That direction does
-not upgrade an experimental subsystem or broaden any shipping claim below.
+not upgrade an experimental subsystem or broaden any shipping claim below. The
+profile-by-profile inventory of reads, code intelligence, validation, builds,
+artifacts, mutations, and external actions is [the reuse surface](REUSE_SURFACE.md).
 
 ## Initial customer and job
 

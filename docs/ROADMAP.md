@@ -34,6 +34,8 @@ The unifying user outcome is: “Again helps coding agents start with verified
 repository understanding, avoid repeating work, run only the validation that
 changed, and share exact execution knowledge across agents.” The normative
 current-to-end-state map is [AGENT_ACCELERATION.md](AGENT_ACCELERATION.md).
+The exhaustive action-family inventory and profile order are maintained in
+[REUSE_SURFACE.md](REUSE_SURFACE.md).
 
 ## Agent acceleration program
 
