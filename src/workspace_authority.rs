@@ -5,7 +5,7 @@
 //! dependencies. Filesystem notifications may tell a caller when to re-run an
 //! observation, but they are never accepted as evidence by this module.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, Metadata};
@@ -312,7 +312,7 @@ impl RepositoryObservationPlanV1 {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RepositoryObservationKindV1 {
     ContentPath,
     RecursiveTree,
@@ -479,6 +479,200 @@ pub(crate) struct WorkspaceExecutionEpochV1 {
     root_identity: FilesystemIdentityV1,
 }
 
+/// A private, live capability containing sealed repository observations for one
+/// retained workspace epoch.
+///
+/// The manifest is deliberately neither cloneable nor serializable. Its cache
+/// entries are useful only while the borrowed [`WorkspaceExecutionEpochV1`]
+/// remains live, and every reuse is fenced by fresh descriptor-relative witness
+/// validation. A digest or observation copied out of this value cannot
+/// reconstruct it or grant a cache hit.
+// Phase 1 deliberately lands this authority primitive before its MCP consumer.
+// Keep the private integration surface reviewable without pretending it is live.
+#[allow(dead_code)]
+pub(crate) struct ObservedManifestV1<'epoch> {
+    execution_epoch: &'epoch WorkspaceExecutionEpochV1,
+    limits: WorkspaceAuthorityLimitsV1,
+    observations: BTreeMap<ManifestObservationKeyV1, SealedManifestObservationV1>,
+    nodes: ManifestNodeCacheV1,
+    poison: Option<IncompleteToolStateV1>,
+    accounting: ObservedManifestAccountingV1,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+struct ManifestObservationKeyV1 {
+    kind: RepositoryObservationKindV1,
+    path: PathBuf,
+}
+
+#[allow(dead_code)]
+impl ManifestObservationKeyV1 {
+    fn new(kind: RepositoryObservationKindV1, path: &Path) -> Self {
+        Self {
+            kind,
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+#[allow(dead_code)]
+struct SealedManifestObservationV1 {
+    observation: RepositoryObservationV1,
+    witnesses: Vec<ManifestWitnessV1>,
+}
+
+#[allow(dead_code)]
+#[derive(Default)]
+struct ManifestNodeCacheV1 {
+    nodes: BTreeMap<PathBuf, ManifestObservedNodeV1>,
+    paths: BTreeSet<PathBuf>,
+    path_bytes: u64,
+    max_depth: usize,
+    physical_content_hashes: u64,
+    physical_directory_listings: u64,
+    node_reuse_hits: u64,
+}
+
+#[derive(Clone)]
+enum ManifestObservedNodeV1 {
+    Missing,
+    Regular(ObservedFileV1),
+    Directory {
+        identity: FilesystemIdentityV1,
+        names: Vec<OsString>,
+    },
+}
+
+#[allow(dead_code)]
+impl ManifestNodeCacheV1 {
+    fn get(&self, relative_path: &Path) -> Option<ManifestObservedNodeV1> {
+        self.nodes.get(relative_path).cloned()
+    }
+
+    fn insert(
+        &mut self,
+        relative_path: &Path,
+        node: ManifestObservedNodeV1,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<()> {
+        if self.nodes.contains_key(relative_path) {
+            return Ok(());
+        }
+        self.account_path(relative_path, limits)?;
+        if let ManifestObservedNodeV1::Directory { names, .. } = &node {
+            for name in names {
+                self.account_path(&relative_path.join(name), limits)?;
+            }
+        }
+        self.nodes.insert(relative_path.to_path_buf(), node);
+        Ok(())
+    }
+
+    fn account_path(
+        &mut self,
+        relative_path: &Path,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<()> {
+        if self.paths.contains(relative_path) {
+            return Ok(());
+        }
+        let path_bytes = relative_path.as_os_str().as_bytes().len() as u64;
+        let next_path_bytes = self.path_bytes.checked_add(path_bytes).ok_or_else(|| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative_path),
+                "sum observed manifest path bytes",
+            )
+        })?;
+        let depth = relative_path.components().count();
+        if self.paths.len() >= limits.max_tree_entries as usize
+            || path_bytes > limits.max_path_bytes as u64
+            || next_path_bytes > limits.max_total_path_bytes as u64
+        {
+            return Err(incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(relative_path),
+                "bound observed manifest paths",
+            ));
+        }
+        self.paths.insert(relative_path.to_path_buf());
+        self.path_bytes = next_path_bytes;
+        self.max_depth = self.max_depth.max(depth);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ObservedManifestAccountingV1 {
+    cached_observations: u64,
+    observed_entries: u64,
+    observed_bytes: u64,
+    observed_paths: u64,
+    observed_path_bytes: u64,
+    max_observed_depth: usize,
+    physical_content_hashes: u64,
+    physical_directory_listings: u64,
+    node_reuse_hits: u64,
+    reuse_hits: u64,
+}
+
+#[allow(dead_code)]
+impl ObservedManifestAccountingV1 {
+    pub(crate) const fn cached_observations(self) -> u64 {
+        self.cached_observations
+    }
+
+    pub(crate) const fn observed_entries(self) -> u64 {
+        self.observed_entries
+    }
+
+    pub(crate) const fn observed_bytes(self) -> u64 {
+        self.observed_bytes
+    }
+
+    pub(crate) const fn observed_paths(self) -> u64 {
+        self.observed_paths
+    }
+
+    pub(crate) const fn observed_path_bytes(self) -> u64 {
+        self.observed_path_bytes
+    }
+
+    pub(crate) const fn max_observed_depth(self) -> usize {
+        self.max_observed_depth
+    }
+
+    #[cfg(test)]
+    const fn physical_content_hashes(self) -> u64 {
+        self.physical_content_hashes
+    }
+
+    #[cfg(test)]
+    const fn physical_directory_listings(self) -> u64 {
+        self.physical_directory_listings
+    }
+
+    #[cfg(test)]
+    const fn node_reuse_hits(self) -> u64 {
+        self.node_reuse_hits
+    }
+
+    #[cfg(test)]
+    const fn reuse_hits(self) -> u64 {
+        self.reuse_hits
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum ObservedManifestCoverageV1 {
+    Partial,
+    Complete,
+    Poisoned,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RepositoryNodeKindV1 {
     Missing,
@@ -582,6 +776,81 @@ impl FilesystemIdentityV1 {
         encoder.u32(self.mode);
         encoder.u32(self.uid);
         encoder.u32(self.gid);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestWitnessV1 {
+    relative_path: PathBuf,
+    state: ManifestWitnessStateV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ManifestWitnessStateV1 {
+    Missing,
+    Regular(FilesystemIdentityV1),
+    DirectoryIdentity(FilesystemIdentityV1),
+    Directory {
+        identity: FilesystemIdentityV1,
+        names: Vec<OsString>,
+    },
+}
+
+struct ManifestWitnessSinkV1<'a> {
+    witnesses: Option<&'a mut Vec<ManifestWitnessV1>>,
+    nodes: Option<&'a mut ManifestNodeCacheV1>,
+}
+
+impl ManifestWitnessSinkV1<'_> {
+    fn disabled() -> Self {
+        Self {
+            witnesses: None,
+            nodes: None,
+        }
+    }
+
+    fn regular(&mut self, relative_path: &Path, identity: FilesystemIdentityV1) {
+        if let Some(witnesses) = self.witnesses.as_deref_mut() {
+            witnesses.push(ManifestWitnessV1 {
+                relative_path: relative_path.to_path_buf(),
+                state: ManifestWitnessStateV1::Regular(identity),
+            });
+        }
+    }
+
+    fn directory(
+        &mut self,
+        relative_path: &Path,
+        identity: FilesystemIdentityV1,
+        names: &[OsString],
+    ) {
+        if let Some(witnesses) = self.witnesses.as_deref_mut() {
+            witnesses.push(ManifestWitnessV1 {
+                relative_path: relative_path.to_path_buf(),
+                state: ManifestWitnessStateV1::Directory {
+                    identity,
+                    names: names.to_vec(),
+                },
+            });
+        }
+    }
+
+    fn directory_identity(&mut self, relative_path: &Path, identity: FilesystemIdentityV1) {
+        if let Some(witnesses) = self.witnesses.as_deref_mut() {
+            witnesses.push(ManifestWitnessV1 {
+                relative_path: relative_path.to_path_buf(),
+                state: ManifestWitnessStateV1::DirectoryIdentity(identity),
+            });
+        }
+    }
+
+    fn missing(&mut self, relative_path: &Path) {
+        if let Some(witnesses) = self.witnesses.as_deref_mut() {
+            witnesses.push(ManifestWitnessV1 {
+                relative_path: relative_path.to_path_buf(),
+                state: ManifestWitnessStateV1::Missing,
+            });
+        }
     }
 }
 
@@ -837,6 +1106,23 @@ impl WorkspaceExecutionEpochV1 {
         limits: &WorkspaceAuthorityLimitsV1,
     ) -> AuthorityResult<RepositoryEpochV1> {
         observe_repository_epoch_inner(self, plan, limits, || {})
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn begin_observed_manifest(
+        &self,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<ObservedManifestV1<'_>> {
+        validate_limits(limits)?;
+        self.verify_current_path()?;
+        Ok(ObservedManifestV1 {
+            execution_epoch: self,
+            limits: limits.clone(),
+            observations: BTreeMap::new(),
+            nodes: ManifestNodeCacheV1::default(),
+            poison: None,
+            accounting: ObservedManifestAccountingV1::default(),
+        })
     }
 
     pub(crate) fn read_repository_file(
@@ -1118,6 +1404,268 @@ impl WorkspaceExecutionEpochV1 {
         validate_limits(limits)?;
         let _ = observe_git_state_inner(&self.canonical_workspace, limits, false)?;
         self.verify_current_path()
+    }
+}
+
+#[allow(dead_code)]
+impl ObservedManifestV1<'_> {
+    pub(crate) fn observe_repository(
+        &mut self,
+        plan: &RepositoryObservationPlanV1,
+    ) -> AuthorityResult<RepositoryEpochV1> {
+        self.observe_repository_with_hook(plan, || {})
+    }
+
+    fn observe_repository_with_hook<F>(
+        &mut self,
+        plan: &RepositoryObservationPlanV1,
+        between_observation_and_fence: F,
+    ) -> AuthorityResult<RepositoryEpochV1>
+    where
+        F: FnOnce(),
+    {
+        if let Some(error) = &self.poison {
+            return Err(error.clone());
+        }
+        let result = self.observe_repository_inner(plan, between_observation_and_fence);
+        if let Err(error) = &result {
+            self.poison = Some(error.clone());
+        }
+        result
+    }
+
+    fn observe_repository_inner<F>(
+        &mut self,
+        plan: &RepositoryObservationPlanV1,
+        between_observation_and_fence: F,
+    ) -> AuthorityResult<RepositoryEpochV1>
+    where
+        F: FnOnce(),
+    {
+        let plan = normalize_plan(plan, &self.limits)?;
+        self.execution_epoch.verify_current_path()?;
+        let canonical_workspace = self.execution_epoch.canonical_workspace.clone();
+        let root_before = FilesystemIdentityV1::from_metadata(
+            &self
+                .execution_epoch
+                .root_handle
+                .metadata()
+                .map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::Repository,
+                        &canonical_workspace,
+                        "inspect observed manifest workspace",
+                        error,
+                    )
+                })?,
+        );
+        if !self
+            .execution_epoch
+            .root_identity
+            .same_authority(root_before)
+        {
+            return Err(concurrent(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "authenticate observed manifest workspace",
+            ));
+        }
+
+        let git_before = observe_git_state(&canonical_workspace, &self.limits)?;
+        let keys = manifest_observation_keys_v1(&plan);
+        let mut observations = Vec::new();
+        observations.try_reserve_exact(keys.len()).map_err(|_| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                None,
+                "allocate observed manifest result",
+            )
+        })?;
+
+        for key in &keys {
+            if let Some(cached) = self.observations.get(key) {
+                validate_manifest_witnesses_v1(self.execution_epoch, &cached.witnesses)?;
+                self.accounting.reuse_hits =
+                    self.accounting.reuse_hits.checked_add(1).ok_or_else(|| {
+                        incomplete_limit(
+                            StateDimensionV1::RepositoryContent,
+                            Some(&key.path),
+                            "count observed manifest reuse",
+                        )
+                    })?;
+                observations.push(cached.observation.clone());
+                continue;
+            }
+
+            let sealed = observe_manifest_entry_v1(
+                self.execution_epoch,
+                key,
+                &self.limits,
+                &mut self.nodes,
+            )?;
+            let next_cached = self
+                .accounting
+                .cached_observations
+                .checked_add(1)
+                .ok_or_else(|| {
+                    incomplete_limit(
+                        StateDimensionV1::RepositoryContent,
+                        Some(&key.path),
+                        "count observed manifest entries",
+                    )
+                })?;
+            let next_entries = self
+                .accounting
+                .observed_entries
+                .checked_add(sealed.observation.entries)
+                .ok_or_else(|| {
+                    incomplete_limit(
+                        StateDimensionV1::RepositoryContent,
+                        Some(&key.path),
+                        "sum observed manifest entries",
+                    )
+                })?;
+            let next_bytes = self
+                .accounting
+                .observed_bytes
+                .checked_add(sealed.observation.bytes)
+                .ok_or_else(|| {
+                    incomplete_limit(
+                        StateDimensionV1::RepositoryContent,
+                        Some(&key.path),
+                        "sum observed manifest bytes",
+                    )
+                })?;
+            if next_cached > self.limits.max_plan_entries as u64
+                || next_entries > self.limits.max_tree_entries
+                || next_bytes > self.limits.max_total_bytes
+            {
+                return Err(incomplete_limit(
+                    StateDimensionV1::RepositoryContent,
+                    Some(&key.path),
+                    "bound observed manifest accounting",
+                ));
+            }
+            self.accounting.cached_observations = next_cached;
+            self.accounting.observed_entries = next_entries;
+            self.accounting.observed_bytes = next_bytes;
+            observations.push(sealed.observation.clone());
+            self.observations.insert(key.clone(), sealed);
+        }
+
+        between_observation_and_fence();
+        for key in &keys {
+            let sealed = self.observations.get(key).ok_or_else(|| {
+                incomplete_plan(
+                    StateDimensionV1::RepositoryContent,
+                    Some(&key.path),
+                    "require sealed manifest observation",
+                )
+            })?;
+            validate_manifest_witnesses_v1(self.execution_epoch, &sealed.witnesses)?;
+        }
+        self.execution_epoch.verify_current_path()?;
+        let git_after = observe_git_state(&canonical_workspace, &self.limits)?;
+        if git_before != git_after {
+            return Err(IncompleteToolStateV1::single(
+                IncompleteReasonCodeV1::GitStateChanged,
+                StateDimensionV1::RepositoryGit,
+                Some(canonical_workspace.join(".git")),
+                "compare observed manifest Git samples",
+            ));
+        }
+        let root_after = FilesystemIdentityV1::from_metadata(
+            &self
+                .execution_epoch
+                .root_handle
+                .metadata()
+                .map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::Repository,
+                        &canonical_workspace,
+                        "reinspect observed manifest workspace",
+                        error,
+                    )
+                })?,
+        );
+        if !root_before.same_authority(root_after) {
+            return Err(concurrent(
+                StateDimensionV1::Repository,
+                &canonical_workspace,
+                "verify observed manifest workspace",
+            ));
+        }
+
+        observations.sort_by(|left, right| {
+            observation_kind_tag(left.kind)
+                .cmp(&observation_kind_tag(right.kind))
+                .then_with(|| {
+                    left.path
+                        .as_os_str()
+                        .as_bytes()
+                        .cmp(right.path.as_os_str().as_bytes())
+                })
+        });
+        let mut repository_epoch = RepositoryEpochV1 {
+            schema_version: WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1,
+            canonical_workspace,
+            workspace_identity: root_before,
+            git: git_before,
+            plan,
+            observations,
+            digest: StateDigestV1([0; 32]),
+        };
+        repository_epoch.digest = digest_encoded(
+            b"again.repository-epoch.v1",
+            &encode_repository_epoch(&repository_epoch),
+        );
+        Ok(repository_epoch)
+    }
+
+    pub(crate) fn accounting(&self) -> ObservedManifestAccountingV1 {
+        ObservedManifestAccountingV1 {
+            observed_paths: self.nodes.paths.len() as u64,
+            observed_path_bytes: self.nodes.path_bytes,
+            max_observed_depth: self.nodes.max_depth,
+            physical_content_hashes: self.nodes.physical_content_hashes,
+            physical_directory_listings: self.nodes.physical_directory_listings,
+            node_reuse_hits: self.nodes.node_reuse_hits,
+            ..self.accounting
+        }
+    }
+
+    pub(crate) fn coverage_for(
+        &self,
+        plan: &RepositoryObservationPlanV1,
+    ) -> AuthorityResult<ObservedManifestCoverageV1> {
+        if self.poison.is_some() {
+            return Ok(ObservedManifestCoverageV1::Poisoned);
+        }
+        let plan = normalize_plan(plan, &self.limits)?;
+        let complete = manifest_observation_keys_v1(&plan)
+            .iter()
+            .all(|key| self.observations.contains_key(key));
+        Ok(if complete {
+            ObservedManifestCoverageV1::Complete
+        } else {
+            ObservedManifestCoverageV1::Partial
+        })
+    }
+
+    #[cfg(test)]
+    fn identity_digest_for_test(&self) -> StateDigestV1 {
+        let mut encoder = CanonicalEncoder::new(b"again.observed-manifest.v1");
+        encoder.path(&self.execution_epoch.canonical_workspace);
+        self.execution_epoch
+            .root_identity
+            .encode_authority(&mut encoder);
+        encoder.u64(self.observations.len() as u64);
+        for (key, value) in &self.observations {
+            encoder.u8(observation_kind_tag(key.kind));
+            encoder.path(&key.path);
+            encoder.digest(value.observation.digest);
+        }
+        encoder.finish()
     }
 }
 
@@ -1983,11 +2531,269 @@ fn normalize_path_set(
     Ok(normalized)
 }
 
+#[allow(dead_code)]
+fn manifest_observation_keys_v1(
+    plan: &RepositoryObservationPlanV1,
+) -> Vec<ManifestObservationKeyV1> {
+    let mut keys = Vec::with_capacity(
+        plan.content_paths
+            .len()
+            .saturating_add(plan.recursive_trees.len())
+            .saturating_add(plan.source_trees.len())
+            .saturating_add(plan.directory_listings.len())
+            .saturating_add(plan.negative_dependencies.len()),
+    );
+    for (kind, paths) in [
+        (
+            RepositoryObservationKindV1::ContentPath,
+            &plan.content_paths,
+        ),
+        (
+            RepositoryObservationKindV1::RecursiveTree,
+            &plan.recursive_trees,
+        ),
+        (RepositoryObservationKindV1::SourceTree, &plan.source_trees),
+        (
+            RepositoryObservationKindV1::DirectoryListing,
+            &plan.directory_listings,
+        ),
+        (
+            RepositoryObservationKindV1::NegativeDependency,
+            &plan.negative_dependencies,
+        ),
+    ] {
+        keys.extend(
+            paths
+                .iter()
+                .map(|path| ManifestObservationKeyV1::new(kind, path)),
+        );
+    }
+    keys.sort();
+    keys
+}
+
+#[allow(dead_code)]
+fn observation_plan_for_manifest_key_v1(
+    key: &ManifestObservationKeyV1,
+) -> RepositoryObservationPlanV1 {
+    let path = key.path.clone();
+    match key.kind {
+        RepositoryObservationKindV1::ContentPath => {
+            RepositoryObservationPlanV1::new(vec![path], Vec::new(), Vec::new(), Vec::new())
+        }
+        RepositoryObservationKindV1::RecursiveTree => {
+            RepositoryObservationPlanV1::new(Vec::new(), vec![path], Vec::new(), Vec::new())
+        }
+        RepositoryObservationKindV1::SourceTree => {
+            RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .with_source_trees(vec![path])
+        }
+        RepositoryObservationKindV1::DirectoryListing => {
+            RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), vec![path], Vec::new())
+        }
+        RepositoryObservationKindV1::NegativeDependency => {
+            RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), Vec::new(), vec![path])
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn observe_manifest_entry_v1(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    key: &ManifestObservationKeyV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+    nodes: &mut ManifestNodeCacheV1,
+) -> AuthorityResult<SealedManifestObservationV1> {
+    let plan = observation_plan_for_manifest_key_v1(key);
+    let mut witnesses = Vec::new();
+    let mut sink = ManifestWitnessSinkV1 {
+        witnesses: Some(&mut witnesses),
+        nodes: Some(nodes),
+    };
+    let mut observations = observe_plan_once_with_witnesses(
+        &execution_epoch.canonical_workspace,
+        &execution_epoch.root_handle,
+        &plan,
+        limits,
+        &mut sink,
+    )?;
+    if observations.len() != 1 {
+        return Err(incomplete_plan(
+            StateDimensionV1::RepositoryContent,
+            Some(&key.path),
+            "seal one manifest observation",
+        ));
+    }
+    witnesses.sort_by(|left, right| {
+        left.relative_path
+            .as_os_str()
+            .as_bytes()
+            .cmp(right.relative_path.as_os_str().as_bytes())
+    });
+    let mut deduplicated: Vec<ManifestWitnessV1> = Vec::new();
+    deduplicated
+        .try_reserve_exact(witnesses.len())
+        .map_err(|_| {
+            incomplete_limit(
+                StateDimensionV1::RepositoryContent,
+                Some(&key.path),
+                "allocate manifest witnesses",
+            )
+        })?;
+    for witness in witnesses {
+        if let Some(previous) = deduplicated.last() {
+            if previous.relative_path == witness.relative_path {
+                if previous.state != witness.state {
+                    return Err(concurrent(
+                        StateDimensionV1::RepositoryContent,
+                        &witness.relative_path,
+                        "deduplicate manifest witnesses",
+                    ));
+                }
+                continue;
+            }
+        }
+        deduplicated.push(witness);
+    }
+    let observation = observations.pop().ok_or_else(|| {
+        incomplete_plan(
+            StateDimensionV1::RepositoryContent,
+            Some(&key.path),
+            "take sealed manifest observation",
+        )
+    })?;
+    Ok(SealedManifestObservationV1 {
+        observation,
+        witnesses: deduplicated,
+    })
+}
+
+#[allow(dead_code)]
+fn validate_manifest_witnesses_v1(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    witnesses: &[ManifestWitnessV1],
+) -> AuthorityResult<()> {
+    for witness in witnesses {
+        let display = execution_epoch
+            .canonical_workspace
+            .join(&witness.relative_path);
+        match &witness.state {
+            ManifestWitnessStateV1::Missing => {
+                if secure_node_kind_relative(
+                    &execution_epoch.root_handle,
+                    &witness.relative_path,
+                    StateDimensionV1::RepositoryContent,
+                    &display,
+                    "revalidate missing manifest node",
+                )?
+                .is_some()
+                {
+                    return Err(concurrent(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "revalidate missing manifest node",
+                    ));
+                }
+            }
+            ManifestWitnessStateV1::Regular(expected) => {
+                let handle = secure_open_relative(
+                    &execution_epoch.root_handle,
+                    &witness.relative_path,
+                    ExpectedNodeV1::Regular,
+                    StateDimensionV1::RepositoryContent,
+                    &display,
+                    "revalidate manifest regular file",
+                )?;
+                let observed =
+                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                        incomplete_io(
+                            StateDimensionV1::RepositoryContent,
+                            &display,
+                            "inspect revalidated manifest regular file",
+                            error,
+                        )
+                    })?);
+                if observed != *expected {
+                    return Err(concurrent(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "revalidate manifest regular file",
+                    ));
+                }
+            }
+            ManifestWitnessStateV1::DirectoryIdentity(expected) => {
+                let handle = secure_open_relative(
+                    &execution_epoch.root_handle,
+                    &witness.relative_path,
+                    ExpectedNodeV1::Directory,
+                    StateDimensionV1::RepositoryContent,
+                    &display,
+                    "revalidate manifest directory identity",
+                )?;
+                let observed =
+                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                        incomplete_io(
+                            StateDimensionV1::RepositoryContent,
+                            &display,
+                            "inspect revalidated manifest directory identity",
+                            error,
+                        )
+                    })?);
+                if observed != *expected {
+                    return Err(concurrent(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "revalidate manifest directory identity",
+                    ));
+                }
+            }
+            ManifestWitnessStateV1::Directory { identity, names: _ } => {
+                let handle = secure_open_relative(
+                    &execution_epoch.root_handle,
+                    &witness.relative_path,
+                    ExpectedNodeV1::Directory,
+                    StateDimensionV1::RepositoryContent,
+                    &display,
+                    "revalidate manifest directory",
+                )?;
+                let observed =
+                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                        incomplete_io(
+                            StateDimensionV1::RepositoryContent,
+                            &display,
+                            "inspect revalidated manifest directory",
+                            error,
+                        )
+                    })?);
+                if observed != *identity {
+                    return Err(concurrent(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "revalidate manifest directory listing",
+                    ));
+                }
+            }
+        }
+    }
+    execution_epoch.verify_current_path()
+}
+
 fn observe_plan_once(
     root: &Path,
     root_handle: &File,
     plan: &RepositoryObservationPlanV1,
     limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<Vec<RepositoryObservationV1>> {
+    let mut witness_sink = ManifestWitnessSinkV1::disabled();
+    observe_plan_once_with_witnesses(root, root_handle, plan, limits, &mut witness_sink)
+}
+
+fn observe_plan_once_with_witnesses(
+    root: &Path,
+    root_handle: &File,
+    plan: &RepositoryObservationPlanV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<Vec<RepositoryObservationV1>> {
     let mut ledger = ObservationLedger::default();
     let mut observations = Vec::new();
@@ -1998,6 +2804,7 @@ fn observe_plan_once(
             relative,
             limits,
             &mut ledger,
+            witness_sink,
         )?);
     }
     for relative in &plan.recursive_trees {
@@ -2008,6 +2815,7 @@ fn observe_plan_once(
             limits,
             &mut ledger,
             false,
+            witness_sink,
         )?);
     }
     for relative in &plan.source_trees {
@@ -2018,6 +2826,7 @@ fn observe_plan_once(
             limits,
             &mut ledger,
             true,
+            witness_sink,
         )?);
     }
     for relative in &plan.directory_listings {
@@ -2027,6 +2836,7 @@ fn observe_plan_once(
             relative,
             limits,
             &mut ledger,
+            witness_sink,
         )?);
     }
     for relative in &plan.negative_dependencies {
@@ -2036,6 +2846,7 @@ fn observe_plan_once(
             relative,
             limits,
             &mut ledger,
+            witness_sink,
         )?);
     }
     observations.sort_by(|left, right| {
@@ -2051,12 +2862,176 @@ fn observe_plan_once(
     Ok(observations)
 }
 
+fn observe_regular_file_for_manifest(
+    root_handle: &File,
+    relative: &Path,
+    display_path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    ledger: &mut ObservationLedger,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
+) -> AuthorityResult<ObservedFileV1> {
+    let cached = witness_sink
+        .nodes
+        .as_deref()
+        .and_then(|nodes| nodes.get(relative));
+    if let Some(cached) = cached {
+        let ManifestObservedNodeV1::Regular(observed) = cached else {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reuse observed manifest regular file",
+            ));
+        };
+        let handle = secure_open_relative(
+            root_handle,
+            relative,
+            ExpectedNodeV1::Regular,
+            StateDimensionV1::RepositoryContent,
+            display_path,
+            "reopen observed manifest regular file",
+        )?;
+        let current = FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reinspect observed manifest regular file",
+                error,
+            )
+        })?);
+        if current != observed.identity {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reuse observed manifest regular file",
+            ));
+        }
+        ledger.add_bytes(
+            observed.bytes,
+            limits,
+            StateDimensionV1::RepositoryContent,
+            display_path,
+        )?;
+        if let Some(nodes) = witness_sink.nodes.as_deref_mut() {
+            nodes.node_reuse_hits = nodes.node_reuse_hits.checked_add(1).ok_or_else(|| {
+                incomplete_limit(
+                    StateDimensionV1::RepositoryContent,
+                    Some(display_path),
+                    "count observed manifest node reuse",
+                )
+            })?;
+        }
+        witness_sink.regular(relative, observed.identity);
+        return Ok(observed);
+    }
+
+    let observed =
+        observe_regular_file_relative(root_handle, relative, display_path, limits, ledger)?;
+    if let Some(nodes) = witness_sink.nodes.as_deref_mut() {
+        nodes.insert(relative, ManifestObservedNodeV1::Regular(observed), limits)?;
+        nodes.physical_content_hashes =
+            nodes
+                .physical_content_hashes
+                .checked_add(1)
+                .ok_or_else(|| {
+                    incomplete_limit(
+                        StateDimensionV1::RepositoryContent,
+                        Some(display_path),
+                        "count observed manifest content hashes",
+                    )
+                })?;
+    }
+    witness_sink.regular(relative, observed.identity);
+    Ok(observed)
+}
+
+fn observe_directory_for_manifest(
+    root_handle: &File,
+    relative: &Path,
+    display_path: &Path,
+    limits: &WorkspaceAuthorityLimitsV1,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
+) -> AuthorityResult<(FilesystemIdentityV1, Vec<OsString>)> {
+    let cached = witness_sink
+        .nodes
+        .as_deref()
+        .and_then(|nodes| nodes.get(relative));
+    if let Some(cached) = cached {
+        let ManifestObservedNodeV1::Directory { identity, names } = cached else {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reuse observed manifest directory",
+            ));
+        };
+        let handle = secure_open_relative(
+            root_handle,
+            relative,
+            ExpectedNodeV1::Directory,
+            StateDimensionV1::RepositoryContent,
+            display_path,
+            "reopen observed manifest directory",
+        )?;
+        let current = FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reinspect observed manifest directory",
+                error,
+            )
+        })?);
+        if current != identity {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                display_path,
+                "reuse observed manifest directory",
+            ));
+        }
+        if let Some(nodes) = witness_sink.nodes.as_deref_mut() {
+            nodes.node_reuse_hits = nodes.node_reuse_hits.checked_add(1).ok_or_else(|| {
+                incomplete_limit(
+                    StateDimensionV1::RepositoryContent,
+                    Some(display_path),
+                    "count observed manifest node reuse",
+                )
+            })?;
+        }
+        witness_sink.directory(relative, identity, &names);
+        return Ok((identity, names));
+    }
+
+    let (identity, names) =
+        stable_directory_listing_relative(root_handle, relative, display_path, limits)?;
+    if let Some(nodes) = witness_sink.nodes.as_deref_mut() {
+        nodes.insert(
+            relative,
+            ManifestObservedNodeV1::Directory {
+                identity,
+                names: names.clone(),
+            },
+            limits,
+        )?;
+        nodes.physical_directory_listings = nodes
+            .physical_directory_listings
+            .checked_add(1)
+            .ok_or_else(|| {
+                incomplete_limit(
+                    StateDimensionV1::RepositoryContent,
+                    Some(display_path),
+                    "count observed manifest directory listings",
+                )
+            })?;
+    }
+    witness_sink.directory(relative, identity, &names);
+    Ok((identity, names))
+}
+
 fn observe_content_path(
     root: &Path,
     root_handle: &File,
     relative: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ObservationLedger,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<RepositoryObservationV1> {
     let path = root.join(relative);
     if secure_node_kind_relative(
@@ -2069,7 +3044,14 @@ fn observe_content_path(
     {
         return Err(special(&path, "observe selected content"));
     }
-    let file = observe_regular_file_relative(root_handle, relative, &path, limits, ledger)?;
+    let file = observe_regular_file_for_manifest(
+        root_handle,
+        relative,
+        &path,
+        limits,
+        ledger,
+        witness_sink,
+    )?;
     let mut encoder = CanonicalEncoder::new(b"again.repository-content-path.v1");
     encoder.path(relative);
     file.encode(&mut encoder);
@@ -2090,6 +3072,7 @@ fn observe_recursive_tree(
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ObservationLedger,
     source_tree: bool,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<RepositoryObservationV1> {
     let tree_root = root.join(relative);
     if secure_node_kind_relative(
@@ -2114,7 +3097,14 @@ fn observe_recursive_tree(
         limits,
         exclude_git_control_directory: source_tree && relative.as_os_str().is_empty(),
     };
-    encode_tree(&context, Path::new(""), 0, ledger, &mut encoder)?;
+    encode_tree(
+        &context,
+        Path::new(""),
+        0,
+        ledger,
+        &mut encoder,
+        witness_sink,
+    )?;
     Ok(RepositoryObservationV1 {
         kind: if source_tree {
             RepositoryObservationKindV1::SourceTree
@@ -2143,6 +3133,7 @@ fn encode_tree(
     depth: usize,
     ledger: &mut ObservationLedger,
     encoder: &mut CanonicalEncoder,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<()> {
     let repository_relative = context.tree_base.join(tree_relative);
     let path = context.repository_root.join(&repository_relative);
@@ -2154,11 +3145,12 @@ fn encode_tree(
         ));
     }
     ledger.add_entry(context.limits, &path)?;
-    let (identity, names) = stable_directory_listing_relative(
+    let (identity, names) = observe_directory_for_manifest(
         context.root_handle,
         &repository_relative,
         &path,
         context.limits,
+        witness_sink,
     )?;
     encoder.u8(1);
     encoder.path(tree_relative);
@@ -2196,15 +3188,23 @@ fn encode_tree(
             )
         })?;
         if kind == SecureNodeKindV1::Directory {
-            encode_tree(context, &child_relative, depth + 1, ledger, encoder)?;
+            encode_tree(
+                context,
+                &child_relative,
+                depth + 1,
+                ledger,
+                encoder,
+                witness_sink,
+            )?;
         } else {
             ledger.add_entry(context.limits, &child)?;
-            let observed = observe_regular_file_relative(
+            let observed = observe_regular_file_for_manifest(
                 context.root_handle,
                 &child_repository_relative,
                 &child,
                 context.limits,
                 ledger,
+                witness_sink,
             )?;
             encoder.u8(2);
             encoder.path(&child_relative);
@@ -2220,11 +3220,12 @@ fn observe_directory_listing(
     relative: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ObservationLedger,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<RepositoryObservationV1> {
     let path = root.join(relative);
     let entries_before = ledger.entries;
     let (identity, names) =
-        stable_directory_listing_relative(root_handle, relative, &path, limits)?;
+        observe_directory_for_manifest(root_handle, relative, &path, limits, witness_sink)?;
     ledger.add_entry(limits, &path)?;
     let mut encoder = CanonicalEncoder::new(b"again.repository-directory-listing.v1");
     encoder.path(relative);
@@ -2294,6 +3295,11 @@ fn observe_directory_listing(
                 "observe directory entry",
             ));
         }
+        if kind == SecureNodeKindV1::Directory {
+            witness_sink.directory_identity(&child_relative, identity_before);
+        } else {
+            witness_sink.regular(&child_relative, identity_before);
+        }
         encoder.os_str(&name);
         encoder.u8(if kind == SecureNodeKindV1::Directory {
             1
@@ -2318,12 +3324,13 @@ fn observe_negative_dependency(
     relative: &Path,
     limits: &WorkspaceAuthorityLimitsV1,
     ledger: &mut ObservationLedger,
+    witness_sink: &mut ManifestWitnessSinkV1<'_>,
 ) -> AuthorityResult<RepositoryObservationV1> {
     let path = root.join(relative);
     let parent = path.parent().unwrap_or(root);
     let relative_parent = relative.parent().unwrap_or_else(|| Path::new(""));
     let (parent_identity_before, names_before) =
-        stable_directory_listing_relative(root_handle, relative_parent, parent, limits)?;
+        observe_directory_for_manifest(root_handle, relative_parent, parent, limits, witness_sink)?;
     let first_kind = secure_node_kind_relative(
         root_handle,
         relative,
@@ -2380,6 +3387,11 @@ fn observe_negative_dependency(
                 "observe negative dependency",
             ));
         }
+        if kind == SecureNodeKindV1::Directory {
+            witness_sink.directory_identity(relative, identity);
+        } else {
+            witness_sink.regular(relative, identity);
+        }
         encoder.bool(true);
         encoder.u8(if kind == SecureNodeKindV1::Directory {
             1
@@ -2390,10 +3402,14 @@ fn observe_negative_dependency(
         true
     } else {
         encoder.bool(false);
+        if let Some(nodes) = witness_sink.nodes.as_deref_mut() {
+            nodes.insert(relative, ManifestObservedNodeV1::Missing, limits)?;
+        }
+        witness_sink.missing(relative);
         false
     };
     let (parent_identity_after, names_after) =
-        stable_directory_listing_relative(root_handle, relative_parent, parent, limits)?;
+        observe_directory_for_manifest(root_handle, relative_parent, parent, limits, witness_sink)?;
     let second_kind = secure_node_kind_relative(
         root_handle,
         relative,
@@ -5022,7 +6038,7 @@ fn digest_encoded(domain: &'static [u8], bytes: &[u8]) -> StateDigestV1 {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod retained_epoch_tests {
-    use std::fs;
+    use std::fs::{self, FileTimes, OpenOptions};
 
     use tempfile::TempDir;
 
@@ -5131,6 +6147,499 @@ mod retained_epoch_tests {
                 .primary_code(),
             IncompleteReasonCodeV1::InputLimitExceeded
         );
+    }
+
+    #[test]
+    fn observed_manifest_reuses_same_and_overlapping_plan_entries() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::create_dir_all(repository.join("src/nested")).unwrap();
+        fs::write(repository.join("src/one.rs"), b"one").unwrap();
+        fs::write(repository.join("src/two.rs"), b"two").unwrap();
+        fs::write(repository.join("src/nested/three.rs"), b"three").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let first_plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("src/one.rs")],
+            vec![PathBuf::from("src")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let second_plan = RepositoryObservationPlanV1::new(
+            Vec::new(),
+            vec![PathBuf::from("src/nested")],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let first = manifest.observe_repository(&first_plan).unwrap();
+        let after_first = manifest.accounting();
+        let repeated = manifest.observe_repository(&first_plan).unwrap();
+        let after_repeat = manifest.accounting();
+        let overlap = manifest.observe_repository(&second_plan).unwrap();
+        let after_overlap = manifest.accounting();
+
+        assert_eq!(first, repeated);
+        assert_eq!(after_first.physical_content_hashes(), 3);
+        assert_eq!(after_repeat.physical_content_hashes(), 3);
+        assert_eq!(after_overlap.physical_content_hashes(), 3);
+        assert_eq!(after_repeat.reuse_hits(), 2);
+        assert_eq!(after_overlap.reuse_hits(), 2);
+        assert_eq!(after_overlap.node_reuse_hits(), 3);
+        assert_eq!(after_overlap.cached_observations(), 3);
+        assert_eq!(after_overlap.observed_entries(), 8);
+        assert_eq!(after_overlap.observed_bytes(), 19);
+        assert_eq!(after_overlap.observed_paths(), 5);
+        assert_eq!(after_overlap.max_observed_depth(), 3);
+        assert!(after_overlap.observed_path_bytes() <= limits.max_total_path_bytes as u64);
+        assert_eq!(after_overlap.physical_directory_listings(), 2);
+        assert_eq!(overlap.observations()[0].entries(), 2);
+    }
+
+    #[test]
+    fn observed_manifest_shares_listing_with_negative_dependency() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("present"), b"present").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            Vec::new(),
+            Vec::new(),
+            vec![PathBuf::new()],
+            vec![PathBuf::from("missing")],
+        );
+
+        let first = manifest.observe_repository(&plan).unwrap();
+        let after_first = manifest.accounting();
+        let repeated = manifest.observe_repository(&plan).unwrap();
+        let after_repeat = manifest.accounting();
+
+        assert_eq!(first, repeated);
+        assert_eq!(after_first.physical_directory_listings(), 1);
+        assert!(after_first.node_reuse_hits() >= 2);
+        assert_eq!(after_repeat.physical_directory_listings(), 1);
+        assert_eq!(after_repeat.reuse_hits(), 2);
+    }
+
+    #[test]
+    fn observed_manifest_reuses_source_tree_observation() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(repository.join("src/lib.rs"), b"pub fn value() {}\n").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+            .with_source_trees(vec![PathBuf::new()]);
+
+        let first = manifest.observe_repository(&plan).unwrap();
+        let after_first = manifest.accounting();
+        let second = manifest.observe_repository(&plan).unwrap();
+        let after_second = manifest.accounting();
+
+        assert_eq!(first, second);
+        assert_eq!(
+            first.observations()[0].kind(),
+            RepositoryObservationKindV1::SourceTree
+        );
+        assert_eq!(
+            after_second.physical_content_hashes(),
+            after_first.physical_content_hashes()
+        );
+        assert_eq!(
+            after_second.physical_directory_listings(),
+            after_first.physical_directory_listings()
+        );
+        assert_eq!(after_second.reuse_hits(), after_first.reuse_hits() + 1);
+    }
+
+    #[test]
+    fn observed_manifest_partial_coverage_cannot_satisfy_broader_plan() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("one"), b"one").unwrap();
+        fs::write(repository.join("two"), b"two").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let narrow = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("one")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let broad = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("one"), PathBuf::from("two")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        manifest.observe_repository(&narrow).unwrap();
+        assert_eq!(
+            manifest.coverage_for(&broad).unwrap(),
+            ObservedManifestCoverageV1::Partial
+        );
+        let before = manifest.accounting();
+        manifest.observe_repository(&broad).unwrap();
+        let after = manifest.accounting();
+        assert_eq!(
+            after.physical_content_hashes(),
+            before.physical_content_hashes() + 1
+        );
+        assert_eq!(after.reuse_hits(), before.reuse_hits() + 1);
+        assert_eq!(
+            manifest.coverage_for(&broad).unwrap(),
+            ObservedManifestCoverageV1::Complete
+        );
+    }
+
+    #[test]
+    fn observed_manifest_relevant_mutation_poisons_future_reuse() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("input"), b"before").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        manifest.observe_repository(&plan).unwrap();
+
+        fs::write(repository.join("input"), b"after!").unwrap();
+        let error = manifest.observe_repository(&plan).unwrap_err();
+        assert_eq!(
+            error.primary_code(),
+            IncompleteReasonCodeV1::ConcurrentMutation
+        );
+        assert_eq!(
+            manifest.coverage_for(&plan).unwrap(),
+            ObservedManifestCoverageV1::Poisoned
+        );
+        assert_eq!(
+            manifest.observe_repository(&plan).unwrap_err(),
+            error,
+            "poisoned manifests must never resume from remaining entries"
+        );
+    }
+
+    #[test]
+    fn observed_manifest_tree_detects_directory_membership_mutation() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(repository.join("src/one"), b"one").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            Vec::new(),
+            vec![PathBuf::from("src")],
+            Vec::new(),
+            Vec::new(),
+        );
+        manifest.observe_repository(&plan).unwrap();
+
+        fs::write(repository.join("src/two"), b"two").unwrap();
+        assert_eq!(
+            manifest
+                .observe_repository(&plan)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::ConcurrentMutation
+        );
+    }
+
+    #[test]
+    fn observed_manifest_detects_restored_mtime_replacement() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        let path = repository.join("input");
+        fs::write(&path, b"before").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        manifest.observe_repository(&plan).unwrap();
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"after!").unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(
+            manifest
+                .observe_repository(&plan)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::ConcurrentMutation
+        );
+    }
+
+    #[test]
+    fn observed_manifest_detects_negative_dependency_becoming_present() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![PathBuf::from("missing")],
+        );
+        manifest.observe_repository(&plan).unwrap();
+
+        fs::write(repository.join("missing"), b"present").unwrap();
+        assert_eq!(
+            manifest
+                .observe_repository(&plan)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::ConcurrentMutation
+        );
+    }
+
+    #[test]
+    fn observed_manifest_preserves_proven_irrelevant_changes() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("relevant"), b"same").unwrap();
+        fs::write(repository.join("irrelevant"), b"before").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("relevant")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let first = manifest.observe_repository(&plan).unwrap();
+        let hashes = manifest.accounting().physical_content_hashes();
+
+        fs::write(repository.join("irrelevant"), b"after!").unwrap();
+        let second = manifest.observe_repository(&plan).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(manifest.accounting().physical_content_hashes(), hashes);
+    }
+
+    #[test]
+    fn observed_manifest_failure_and_epoch_replacement_are_terminal() {
+        let temporary = TempDir::new().unwrap();
+        let base = fs::canonicalize(temporary.path()).unwrap();
+        let repository = base.join("repository");
+        let moved = base.join("moved");
+        fs::create_dir(&repository).unwrap();
+        fs::write(repository.join("input"), b"input").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let error = manifest
+            .observe_repository_with_hook(&plan, || {
+                fs::rename(&repository, &moved).unwrap();
+                fs::create_dir(&repository).unwrap();
+                fs::write(repository.join("input"), b"replacement").unwrap();
+            })
+            .unwrap_err();
+        assert_eq!(
+            error.primary_code(),
+            IncompleteReasonCodeV1::RepositoryReplaced
+        );
+        assert_eq!(
+            manifest.observe_repository(&plan).unwrap_err(),
+            error,
+            "a manifest tied to the replaced epoch must remain terminal"
+        );
+    }
+
+    #[test]
+    fn observed_manifest_incomplete_observation_never_becomes_reusable() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("present"), b"present").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("present"), PathBuf::from("missing")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let error = manifest.observe_repository(&plan).unwrap_err();
+        fs::write(repository.join("missing"), b"now present").unwrap();
+
+        assert_eq!(
+            manifest.coverage_for(&plan).unwrap(),
+            ObservedManifestCoverageV1::Poisoned
+        );
+        assert_eq!(manifest.observe_repository(&plan).unwrap_err(), error);
+        assert_eq!(manifest.accounting().reuse_hits(), 0);
+    }
+
+    #[test]
+    fn observed_manifest_accounting_is_bounded_across_plans() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("one"), b"aa").unwrap();
+        fs::write(repository.join("two"), b"bb").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1 {
+            max_file_bytes: 3,
+            max_total_bytes: 3,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let one = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("one")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let two = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("two")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        manifest.observe_repository(&one).unwrap();
+        assert_eq!(
+            manifest
+                .observe_repository(&two)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+        assert_eq!(
+            manifest.coverage_for(&two).unwrap(),
+            ObservedManifestCoverageV1::Poisoned
+        );
+
+        let path_limit = repository.as_os_str().as_bytes().len() + 8;
+        let path_one = "a".repeat(path_limit / 2 + 1);
+        let path_two = "b".repeat(path_limit / 2 + 1);
+        fs::write(repository.join(&path_one), b"aa").unwrap();
+        fs::write(repository.join(&path_two), b"bb").unwrap();
+        let path_limits = WorkspaceAuthorityLimitsV1 {
+            max_path_bytes: path_limit,
+            max_total_path_bytes: path_limit,
+            max_file_bytes: 10,
+            max_total_bytes: 100,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let path_epoch = WorkspaceExecutionEpochV1::begin(&repository, &path_limits).unwrap();
+        let mut path_manifest = path_epoch.begin_observed_manifest(&path_limits).unwrap();
+        let long_one = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from(&path_one)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let long_two = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from(&path_two)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        path_manifest.observe_repository(&long_one).unwrap();
+        assert_eq!(path_manifest.accounting().observed_paths(), 1);
+        assert_eq!(
+            path_manifest.accounting().observed_path_bytes(),
+            path_one.len() as u64
+        );
+        assert_eq!(
+            path_manifest
+                .observe_repository(&long_two)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+    }
+
+    #[test]
+    fn observed_manifest_identity_is_deterministic_but_not_authority() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(repository.join("src/input"), b"input").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch_one = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let epoch_two = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            Vec::new(),
+            vec![PathBuf::from("src")],
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut first = epoch_one.begin_observed_manifest(&limits).unwrap();
+        let mut second = epoch_two.begin_observed_manifest(&limits).unwrap();
+        first.observe_repository(&plan).unwrap();
+        second.observe_repository(&plan).unwrap();
+
+        assert_eq!(
+            first.identity_digest_for_test(),
+            second.identity_digest_for_test()
+        );
+        assert_eq!(
+            first.accounting().physical_content_hashes(),
+            second.accounting().physical_content_hashes()
+        );
+    }
+
+    #[test]
+    fn observed_manifest_preserves_existing_canonical_repository_epoch() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::create_dir(repository.join("src")).unwrap();
+        fs::write(
+            repository.join("src/input.rs"),
+            b"pub const INPUT: u8 = 1;\n",
+        )
+        .unwrap();
+        fs::write(repository.join("README.md"), b"readme\n").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1::default();
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("README.md")],
+            Vec::new(),
+            vec![PathBuf::from("src")],
+            vec![PathBuf::from("missing")],
+        )
+        .with_source_trees(vec![PathBuf::new()]);
+
+        let expected = epoch.observe_repository(&plan, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let observed = manifest.observe_repository(&plan).unwrap();
+
+        assert_eq!(observed, expected);
+        assert_eq!(observed.digest(), expected.digest());
     }
 }
 
