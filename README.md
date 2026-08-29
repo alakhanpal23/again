@@ -2,22 +2,20 @@
 
 Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
-## Product
+## Current product
 
-**Current (Default Product):**
+- `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
+- `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
+- `again mcp serve --workspace <path>` — expose 13 bounded, read-only repository and Git tools over MCP stdio.
+- `again mcp setup --client codex|claude --workspace <path>` — print an ownership-checked setup plan; it does not write configuration unless `--install-owned-config` is explicit.
+- `again setup --codex` — install the instruction-only personal Codex skill.
+- `again explain [id]` / `again show <id>` — inspect the latest decision or retrieve exact stored output.
 
-- `again run -- <argv...>` — Run commands through a conservative local engine; cache hits return stored stdout/stderr/status without rerun
-- `again reference -- <argv...>` — Verify existing hits and emit compact content-addressed JSON; never executes on miss
-- `again mcp serve --workspace <path>` — Exposes 13 bounded read-only repository/Git tools over MCP stdio
-- `again mcp setup --client codex|claude --workspace <path>` — Print ownership-checked, dry-run configuration
-- `again setup --codex` — Install instruction-only personal Codex skill
-- `again explain [id]` / `again show <id>` — Retrieve stored results or latest persisted event
-
-**Product Direction:**
+## Product direction
 
 Again gives coding agents persistent, verified repository understanding and execution memory so they can move from task to correct code with less rediscovery, fewer tool calls, and less repeated validation.
 
-**Target outcome:** Helping coding agents start with verified repository understanding, avoid repeating work, run only the validation that changed, and share exact execution knowledge across agents.
+The target outcome is to help coding agents start with verified repository understanding, avoid repeating work, run only validation affected by a change, and share exact execution knowledge across agents.
 
 ## Technical Foundation
 
@@ -40,7 +38,7 @@ Again gives coding agents persistent, verified repository understanding and exec
 ## Quickstart
 
 ```bash
-cargo install --path .
+cargo install --locked --path .
 again setup --codex
 again mcp setup --client codex --workspace "$(pwd -P)"
 again run -- cat path/to/file
@@ -52,11 +50,11 @@ Apache-2.0.
 
 ## Roadmap
 
-[agent acceleration](docs/AGENT_ACCELERATION.md) — complete user loop and product scorecard  
-[product contract](docs/PRODUCT.md) — shipping promise and current boundary  
-[straight-to-code](docs/STRAIGHT_TO_CODE.md) — edit-brief fast path and editable task evaluation  
-[reuse surface](docs/REUSE_SURFACE.md) — action-family and validation-profile inventory  
-[architecture](docs/ARCHITECTURE.md) — authority transitions and current/target component boundaries  
-[status](docs/STATUS.md) — what is implemented  
-[evidence](docs/EVIDENCE.md) — what has been measured  
-[development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md) — terminal ownership and merge discipline
+- [Agent acceleration](docs/AGENT_ACCELERATION.md) — complete user loop and product scorecard
+- [Product contract](docs/PRODUCT.md) — shipping promise and current boundary
+- [Straight-to-code](docs/STRAIGHT_TO_CODE.md) — edit-brief fast path and editable task evaluation
+- [Reuse surface](docs/REUSE_SURFACE.md) — action-family and validation-profile inventory
+- [Architecture](docs/ARCHITECTURE.md) — authority transitions and current/target component boundaries
+- [Status](docs/STATUS.md) — what is implemented
+- [Evidence](docs/EVIDENCE.md) — what has been measured
+- [Development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md) — terminal ownership and merge discipline

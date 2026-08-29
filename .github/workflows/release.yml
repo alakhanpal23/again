@@ -46,6 +46,8 @@ jobs:
           cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
           cargo +1.88.0 test --locked --all-features
           cargo +1.88.0 test --locked --test generated_differential generated_differential_100k -- --ignored --exact --nocapture
+          cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+          cargo +1.88.0 audit
           sh -n scripts/install.sh scripts/uninstall.sh scripts/verify_release.sh \
             scripts/verify_published_release.sh \
             scripts/test_packaging.sh scripts/test_release_verification.sh \

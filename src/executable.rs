@@ -6,7 +6,13 @@
 use std::fmt;
 #[cfg(target_os = "macos")]
 use std::io::Read;
+#[cfg(target_os = "macos")]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
+use std::process::{Command, ExitStatus, Stdio};
+#[cfg(target_os = "macos")]
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +20,12 @@ use serde::{Deserialize, Serialize};
 const MACOS_SYSTEM_PROFILE_PATH: &str = "/System/Library/CoreServices/SystemVersion.plist";
 #[cfg(target_os = "macos")]
 const MAX_AUDITED_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(target_os = "macos")]
+const MAX_CODESIGN_IDENTITY_OUTPUT_BYTES: usize = 64 * 1024;
+#[cfg(target_os = "macos")]
+const CODESIGN_IDENTITY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const CODESIGN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A command whose executable has a v0 audit profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -355,10 +367,13 @@ fn verify_macos(
         return Err(VerifyError::CodexBundlePathMismatch);
     }
     let system_profile = verify_macos_system_profile()?;
-    verify_codex_rg_signature_identity(canonical_path)?;
     let digest = hash_file_bounded(canonical_path)?;
     let rg_profile = audited_codex_rg_profile(canonical_path, &digest)
         .ok_or(VerifyError::ContentDigestMismatch)?;
+    verify_codex_rg_signature_identity(canonical_path)?;
+    if hash_file_bounded(canonical_path)? != digest {
+        return Err(VerifyError::ContentDigestMismatch);
+    }
     Ok(ExecutableIdentity {
         tool,
         canonical_path: canonical_path.to_path_buf(),
@@ -487,26 +502,22 @@ fn codex_rg_path_matches_layout(path: &Path, layout: CodexRgLayout) -> bool {
 
 #[cfg(target_os = "macos")]
 fn verify_codex_rg_signature_identity(path: &Path) -> Result<(), VerifyError> {
-    use std::process::Command;
-
     // Some official npm-distributed Codex bundles retain identifier/team
     // metadata while macOS reports that the extracted nested signature is not
     // strictly verifiable. Runtime integrity and semantics are therefore bound
     // by the exact BLAKE3 allowlist below; these fields are an additional
     // publisher-identity check, not the content trust boundary.
-    let details = Command::new("/usr/bin/codesign")
-        .args(["-dvv"])
-        .arg(path)
-        .output()
-        .map_err(|_| VerifyError::InspectionFailed)?;
-    if !details.status.success() {
+    let mut command = Command::new("/usr/bin/codesign");
+    command.env_clear().args(["-dvv"]).arg(path);
+    let (status, details) = run_bounded_inspection(
+        &mut command,
+        CODESIGN_IDENTITY_TIMEOUT,
+        MAX_CODESIGN_IDENTITY_OUTPUT_BYTES,
+    )?;
+    if !status.success() {
         return Err(VerifyError::SignatureInvalid);
     }
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&details.stdout),
-        String::from_utf8_lossy(&details.stderr)
-    );
+    let text = String::from_utf8_lossy(&details);
     let identifier = text
         .lines()
         .find_map(|line| line.strip_prefix("Identifier="));
@@ -518,6 +529,136 @@ fn verify_codex_rg_signature_identity(path: &Path) -> Result<(), VerifyError> {
     } else {
         Err(VerifyError::SignatureIdentityMismatch)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn run_bounded_inspection(
+    command: &mut Command,
+    timeout: Duration,
+    output_limit: usize,
+) -> Result<(ExitStatus, Vec<u8>), VerifyError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|_| VerifyError::InspectionFailed)?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(VerifyError::InspectionFailed);
+    };
+    let Some(stderr) = child.stderr.take() else {
+        drop(stdout);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(VerifyError::InspectionFailed);
+    };
+    let mut stdout = stdout;
+    let mut stderr = stderr;
+    let result = (|| {
+        set_nonblocking(stdout.as_raw_fd())?;
+        set_nonblocking(stderr.as_raw_fd())?;
+        let mut output = Vec::new();
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let mut status = None;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let mut progressed = false;
+            if stdout_open {
+                let state = drain_inspection_output(&mut stdout, &mut output, output_limit)?;
+                stdout_open = !state.eof;
+                progressed |= state.progressed;
+            }
+            if stderr_open {
+                let state = drain_inspection_output(&mut stderr, &mut output, output_limit)?;
+                stderr_open = !state.eof;
+                progressed |= state.progressed;
+            }
+            if status.is_none() {
+                status = child
+                    .try_wait()
+                    .map_err(|_| VerifyError::InspectionFailed)?;
+            }
+            if let Some(status) = status {
+                if !stdout_open && !stderr_open {
+                    return Ok((status, output));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(VerifyError::InspectionFailed);
+            }
+            if !progressed {
+                std::thread::sleep(CODESIGN_POLL_INTERVAL);
+            }
+        }
+    })();
+    if result.is_err() {
+        terminate_inspection(&mut child);
+    }
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn set_nonblocking(file_descriptor: libc::c_int) -> Result<(), VerifyError> {
+    // SAFETY: fcntl is called with a live pipe descriptor and integer-only
+    // F_GETFL/F_SETFL operations. The descriptor remains owned by ChildStdout
+    // or ChildStderr for the duration of the inspection.
+    let flags = unsafe { libc::fcntl(file_descriptor, libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file_descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(VerifyError::InspectionFailed);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+struct InspectionDrainState {
+    eof: bool,
+    progressed: bool,
+}
+
+#[cfg(target_os = "macos")]
+fn drain_inspection_output(
+    reader: &mut impl Read,
+    output: &mut Vec<u8>,
+    limit: usize,
+) -> Result<InspectionDrainState, VerifyError> {
+    let mut progressed = false;
+    let mut buffer = [0_u8; 4096];
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => {
+                return Ok(InspectionDrainState {
+                    eof: true,
+                    progressed,
+                });
+            }
+            Ok(read) => {
+                progressed = true;
+                let retained = limit.saturating_sub(output.len()).min(read);
+                output.extend_from_slice(&buffer[..retained]);
+                if retained != read {
+                    return Err(VerifyError::InspectionFailed);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                return Ok(InspectionDrainState {
+                    eof: false,
+                    progressed,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Err(VerifyError::InspectionFailed),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_inspection(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(test)]
@@ -630,6 +771,31 @@ mod tests {
             (None, Ok(_)) => panic!("unreviewed Codex rg bytes must fail closed"),
             (None, Err(error)) => panic!("unexpected Codex rg verification result: {error}"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn codesign_identity_inspection_is_bounded_and_timed() {
+        let mut success = Command::new("/bin/echo");
+        success.arg("identity");
+        let (status, output) =
+            run_bounded_inspection(&mut success, Duration::from_secs(1), 64).unwrap();
+        assert!(status.success());
+        assert_eq!(output, b"identity\n");
+
+        let mut excessive = Command::new("/bin/dd");
+        excessive.args(["if=/dev/zero", "bs=1024", "count=2"]);
+        assert_eq!(
+            run_bounded_inspection(&mut excessive, Duration::from_secs(1), 64),
+            Err(VerifyError::InspectionFailed)
+        );
+
+        let mut stalled = Command::new("/bin/sleep");
+        stalled.arg("1");
+        assert_eq!(
+            run_bounded_inspection(&mut stalled, Duration::from_millis(10), 64),
+            Err(VerifyError::InspectionFailed)
+        );
     }
 
     #[cfg(target_os = "macos")]

@@ -497,7 +497,6 @@ pub(crate) struct ObservedManifestV1<'epoch> {
     nodes: ManifestNodeCacheV1,
     poison: Option<IncompleteToolStateV1>,
     accounting: ObservedManifestAccountingV1,
-    dependency_invalidation_index: DependencyInvalidationIndexV1,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -521,41 +520,6 @@ impl ManifestObservationKeyV1 {
 struct SealedManifestObservationV1 {
     observation: RepositoryObservationV1,
     witnesses: Vec<ManifestWitnessV1>,
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct DependentObservationV1 {
-    observation_key: ManifestObservationKeyV1,
-    path: PathBuf,
-}
-
-#[allow(dead_code)]
-#[derive(Default)]
-struct DependencyInvalidationIndexV1 {
-    path_to_dependents: BTreeMap<PathBuf, Vec<DependentObservationV1>>,
-}
-
-impl DependencyInvalidationIndexV1 {
-    fn add_dependent(&mut self, observation_key: ManifestObservationKeyV1, path: PathBuf) {
-        self.path_to_dependents
-            .entry(path)
-            .or_default()
-            .push(DependentObservationV1 {
-                observation_key: observation_key.clone(),
-                path: observation_key.path.clone(),
-            });
-    }
-
-    fn get_dependents(&self, path: &Path) -> Option<&Vec<DependentObservationV1>> {
-        self.path_to_dependents.get(path)
-    }
-
-    fn remove_dependent(&mut self, observation_key: &ManifestObservationKeyV1) {
-        for dependents in self.path_to_dependents.values_mut() {
-            dependents.retain(|dep| &dep.observation_key != observation_key);
-        }
-    }
 }
 
 #[allow(dead_code)]
@@ -1158,7 +1122,6 @@ impl WorkspaceExecutionEpochV1 {
             nodes: ManifestNodeCacheV1::default(),
             poison: None,
             accounting: ObservedManifestAccountingV1::default(),
-            dependency_invalidation_index: DependencyInvalidationIndexV1::default(),
         })
     }
 
@@ -1588,7 +1551,6 @@ impl ObservedManifestV1<'_> {
             self.accounting.observed_bytes = next_bytes;
             observations.push(sealed.observation.clone());
             self.observations.insert(key.clone(), sealed);
-            self.dependency_invalidation_index.add_dependent(key.clone(), key.path.clone());
         }
 
         between_observation_and_fence();
