@@ -133,10 +133,12 @@ grep -Fqx '  workflow_dispatch:' "$workflow" ||
   fail 'qualification workflow is no longer manual dispatch only'
 grep -Fqx '  contents: read' "$workflow" ||
   fail 'qualification workflow no longer has contents-read authority'
-grep -Fqx '    runs-on: [self-hosted, linux, x64, again-linux-pytest-v1]' "$workflow" ||
-  fail 'qualification workflow runner labels changed'
-grep -Fqx '        run: scripts/preflight_linux_supervisor_runner.sh' "$workflow" ||
+grep -Fqx '    runs-on: ubuntu-24.04' "$workflow" ||
+  fail 'qualification workflow is not pinned to the disposable x86_64 hosted image'
+grep -Fqx '        run: sudo --preserve-env=PATH scripts/preflight_linux_supervisor_runner.sh' "$workflow" ||
   fail 'qualification workflow does not invoke the production preflight'
+grep -Fqx '        run: sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh' "$workflow" ||
+  fail 'qualification workflow does not scope elevated execution to the fixed diagnostic'
 grep -Fqx '        run: cargo +1.88.0 build --locked --features linux-pytest --bin again' "$workflow" ||
   fail 'qualification workflow does not build the hidden diagnostic surface'
 if grep -Eq 'CapEff:|CONFIG_SECCOMP_FILTER|CONFIG_CHECKPOINT_RESTORE|uname -[sm]' "$workflow"; then
