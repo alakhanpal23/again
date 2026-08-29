@@ -133,7 +133,7 @@ grep -Fqx '  workflow_dispatch:' "$workflow" ||
   fail 'qualification workflow is no longer manual dispatch only'
 grep -Fqx '  contents: read' "$workflow" ||
   fail 'qualification workflow no longer has contents-read authority'
-grep -Fqx '    runs-on: ubuntu-24.04' "$workflow" ||
+grep -Fqx '    runs-on: ubuntu-22.04' "$workflow" ||
   fail 'qualification workflow is not pinned to the disposable x86_64 hosted image'
 grep -Fqx '        run: sudo --preserve-env=PATH scripts/preflight_linux_supervisor_runner.sh' "$workflow" ||
   fail 'qualification workflow does not invoke the production preflight'

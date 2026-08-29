@@ -9,7 +9,7 @@ grant Python, EffectIR, execution-profile, execution, or reuse authority.
 
 ## Required runner contract
 
-The manual workflow is pinned to GitHub's disposable `ubuntu-24.04` x86_64
+The manual workflow is pinned to GitHub's disposable `ubuntu-22.04` x86_64
 VM. Its running kernel must expose
 `CONFIG_SECCOMP_FILTER=y` and `CONFIG_CHECKPOINT_RESTORE=y` through
 `/proc/config.gz` or `/boot/config-$(uname -r)`. The job process must have
