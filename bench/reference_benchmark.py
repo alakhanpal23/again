@@ -32,8 +32,34 @@ from direct_benchmark import (
 
 
 SCHEMA = "again.reference-benchmark.v1"
-HARNESS_VERSION = "1.0.0"
+HARNESS_VERSION = "1.1.0"
 PROCESS_FILE_LIMIT_BYTES = 16 * 1024 * 1024
+STATS_FIELDS = (
+    "executions",
+    "full_replays",
+    "compact_replays",
+    "bypasses",
+    "quarantines",
+    "duplicate_bytes_omitted",
+    "estimated_execution_ms_saved",
+    "requested",
+    "executed",
+    "exact_hits",
+    "coverage_hits",
+    "inflight_joins",
+    "compact_deliveries",
+    "estimated_tokens_avoided",
+    "stale_or_divergent_quarantines",
+    "facts_reused",
+    "investigations_avoided",
+    "provider_calls_avoided",
+    "invalidated_facts",
+    "context_bytes_delivered",
+    "delivery_confirmed_bytes_omitted",
+    "confirmed_tokens_avoided",
+    "false_hit_quarantines",
+    "estimated_execution_time_saved_ms",
+)
 
 
 def sanitized_environment(state: pathlib.Path) -> tuple[dict[str, str], list[str]]:
@@ -99,6 +125,24 @@ def validate_reference(
         digest = stream.get("blake3")
         if not isinstance(digest, str) or len(digest) != 64:
             raise RuntimeError("reference is missing a strict BLAKE3 digest")
+
+
+def validate_stats(value: dict[str, Any], expected: dict[str, int], label: str) -> None:
+    if set(value) != set(STATS_FIELDS):
+        missing = sorted(set(STATS_FIELDS) - set(value))
+        unknown = sorted(set(value) - set(STATS_FIELDS))
+        raise RuntimeError(
+            f"{label} stats schema changed: missing={missing!r} unknown={unknown!r}"
+        )
+    for field in STATS_FIELDS:
+        observed = value[field]
+        if isinstance(observed, bool) or not isinstance(observed, int) or observed < 0:
+            raise RuntimeError(f"{label} stats {field} is not a non-negative integer")
+        wanted = expected.get(field, 0)
+        if observed != wanted:
+            raise RuntimeError(
+                f"{label} stats {field}={observed!r}; expected {wanted}"
+            )
 
 
 def main() -> int:
@@ -182,18 +226,7 @@ def main() -> int:
             run_bounded([str(binary), "stats", "--json"], **options),
             "cold reference stats",
         )
-        if cold_miss_stats != {
-            "executions": 0,
-            "full_replays": 0,
-            "compact_replays": 0,
-            "bypasses": 1,
-            "quarantines": 0,
-            "duplicate_bytes_omitted": 0,
-            "estimated_execution_ms_saved": 0,
-        }:
-            raise RuntimeError(
-                f"cold reference miss changed execution counters: {cold_miss_stats!r}"
-            )
+        validate_stats(cold_miss_stats, {"bypasses": 1}, "cold reference miss")
         if payload_path.read_bytes() != payload:
             raise RuntimeError("cold reference miss mutated the requested input")
 
@@ -248,20 +281,6 @@ def main() -> int:
         ):
             raise RuntimeError(f"unexpected invalidated miss event: {miss_event!r}")
 
-        stats = parse_json_output(
-            run_bounded([str(binary), "stats", "--json"], **options), "stats"
-        )
-        expected = {
-            "executions": 1,
-            "full_replays": arguments.iterations,
-            "compact_replays": arguments.iterations,
-            "bypasses": 2,
-            "quarantines": 0,
-        }
-        for key, value in expected.items():
-            if stats.get(key) != value:
-                raise RuntimeError(f"stats {key}={stats.get(key)!r}; expected {value}")
-
         full_output_bytes = sum(len(item.stdout) + len(item.stderr) for item in full_hits)
         reference_output_bytes = sum(
             len(item.stdout) + len(item.stderr) for item in references
@@ -270,10 +289,24 @@ def main() -> int:
             max(0, payload_size - len(item.stdout) - len(item.stderr))
             for item in references
         )
-        if stats.get("duplicate_bytes_omitted") != expected_omitted:
-            raise RuntimeError(
-                "stats duplicate_bytes_omitted does not match observed output reduction"
-            )
+        stats = parse_json_output(
+            run_bounded([str(binary), "stats", "--json"], **options), "stats"
+        )
+        validate_stats(
+            stats,
+            {
+                "executions": 1,
+                "full_replays": arguments.iterations,
+                "compact_replays": arguments.iterations,
+                "bypasses": 2,
+                "duplicate_bytes_omitted": expected_omitted,
+                # The estimator is positive-only and may legitimately remain
+                # zero for a tiny or unusually loaded fixture, so it is checked
+                # structurally above instead of assigned a required value.
+                "estimated_execution_ms_saved": stats["estimated_execution_ms_saved"],
+            },
+            "final",
+        )
         byte_reduction = 1 - reference_output_bytes / full_output_bytes
         full_distribution = distribution([item.elapsed_ms for item in full_hits])
         reference_distribution = distribution([item.elapsed_ms for item in references])
