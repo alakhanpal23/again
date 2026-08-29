@@ -111,7 +111,7 @@ The new product is built on the working Again engine rather than replacing it.
 | Existing subsystem | Current value | Role in the new product |
 |---|---|---|
 | Canonical tool-call gateway | Normalizes bounded MCP calls and provider identity | Common entrance for task-start, code intelligence, validation, and future providers |
-| Thirteen repository/Git tools | Exact bounded repository and Git observations | Immediate agent orientation and source evidence for edit briefs |
+| Fourteen local-alpha MCP tools | One deterministic task-start brief plus 13 exact repository/Git observations | Immediate agent orientation, source evidence, and reusable task context |
 | Workspace execution epochs | Descriptor-retained repository authority | One current view shared by task-start and eligible tools |
 | Scoped observation plans | Fingerprint only declared paths, trees, listings, identities, and Git state | Fine-grained invalidation instead of whole-repository cache eviction |
 | Exact executable/profile checks | Bind reviewed executable and host semantics | Foundation for toolchain-specific validation profiles |

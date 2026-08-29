@@ -24,6 +24,14 @@ it grants no Python, EffectIR, profile, execution, or reuse authority.
 
 ## Local vertical slice
 
+Candidate note: the current local-alpha successor adds one deterministic,
+full-only `again.task_start` route to the 13 repository/Git tools. Its edit
+brief exposes non-empty workspace, session, state, dependency, task, and
+authorization bindings; invokes no model; labels its maturity `local_alpha`;
+and grants no edit, test, tool, execution, retrieval, compact-delivery, or model
+authority. The older 13-tool checkpoint statements below remain historical
+evidence rather than the candidate's current tool count.
+
 | Capability | Status | Evidence / limitation |
 |---|---|---|
 | Durable task-intent coordination | implemented locally; live-agent qualification open | `task.start` stores exact agent-supplied prompt bytes as unverified local intent, converges different external task IDs for the same prompt within one repository/workspace/authorization scope, and refuses reuse of a task ID with conflicting prompt bytes. It automatically elects one bounded task leader, exposes owner-authenticated heartbeat/finish/cancel operations, retires leadership on recipient disconnect or cancellation, and preserves canonical identity across daemon restarts. Canonical tasks and aliases have separate hard limits; schema-open validation checks prompt bindings, canonical aliases, foreign keys, and capacity. Similar prompts deliberately remain distinct because semantic similarity grants no convergence authority. Durable stats expose task, alias, and exact-prompt convergence counts. |

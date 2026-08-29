@@ -4,7 +4,7 @@
 
 > Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
-This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
+This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls one deterministic task-start tool plus 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, model output, or semantic similarity is never sufficient.
 
 ## Product outcome
 
@@ -54,7 +54,16 @@ again mcp setup --client claude --workspace /canonical/repository
 
 Both commands are dry runs unless `--install-owned-config ABSOLUTE_PATH` is supplied. The generated server argv contains the exact canonical repository path. Installation can create only a wholly Again-owned absent config plus its ownership record, or verify the exact owned pair; an unowned or conflicting file is never overwritten. The gateway uses bounded concurrent stdio, serializes complete responses, propagates cancellation to the matching physical attempt, and fails closed on malformed or oversized JSON-RPC.
 
-Current gateway limits are part of the product truth: there is no CLI configuration path for arbitrary upstream MCP servers, authenticated result-ID retrieval, automatic compact cross-agent delivery, semantic reuse, task-quality qualification, or production Linux command backend. Unknown or incomplete state executes normally when doing so preserves the closed provider semantics; configuration that could make a nominally read-only Git query execute a filter or external diff command is instead refused before Git starts. External Git includes/ignore/attribute files and nested worktree/submodule state never authorize reuse. Mutating, freshness-bound, network, credential, communication, deployment, payment, and unknown tools are not reused; sensitive or unknown classes bypass storage entirely.
+Current gateway limits are part of the product truth: task-start is a
+`local_alpha` full-only interface with complete workspace, session, state,
+dependency, and authorization identity, but it grants no edit, test, tool,
+execution, compact-delivery, retrieval, or model authority. There is no CLI
+configuration path for arbitrary upstream MCP servers, authenticated result-ID
+retrieval, automatic compact cross-agent delivery, semantic reuse, optional LLM
+provider, task-quality qualification, or production Linux command backend.
+Unknown or incomplete state executes normally when doing so preserves the
+closed provider semantics; model suggestions will remain non-authoritative when
+the optional advisory phase ships.
 
 The current retained product checkpoint is [`2026-08-27-agent-gateway-product-e2e-release-v3.json`](../bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json), bound to source `850e7c4398adc25ef1210ee4260e27b29aaeb753`, release-binary SHA-256 `e52e7540c3754038db3fbc87bc0039df1b6e983b124497d4f3559708c5a536f0`, and report-file SHA-256 `9b818771f830395d2b123e83437b290ea470b284bcef0f52ce1576edbd82ce08`. All eight exact scenarios passed through four actual Again MCP processes with 12 provider executions and zero false hits. Their exact event windows contain two exact reuse hits and one joined in-flight call, for three avoided provider executions. The canceled follower remains only a cancellation candidate.
 

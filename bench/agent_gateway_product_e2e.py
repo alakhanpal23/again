@@ -54,10 +54,7 @@ PROCESS_STOP_SECONDS = 2.0
 EVENT_OBSERVATION_TIMEOUT_SECONDS = 15.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 EXPECTED_ADVERTISED_TOOLS = (
-    "context.cancel",
-    "context.delta",
-    "context.publish",
-    "context.retrieve",
+    "again.task_start",
     "git.blame",
     "git.diff",
     "git.log",
@@ -77,7 +74,7 @@ EXPECTED_ADVERTISED_TOOLS = (
     "task.start",
     "task.transition",
 )
-E2E_EXERCISED_TOOLS = frozenset(("repo.read", "repo.search"))
+E2E_EXERCISED_TOOLS = frozenset(("again.task_start", "repo.read", "repo.search"))
 
 
 class HarnessRefusal(RuntimeError):

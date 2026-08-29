@@ -221,7 +221,7 @@ impl ToolDiscovery for TaskStartProviderV1 {
         );
         tool.title = Some("Start a repository-bound coding task".to_owned());
         tool.description = Some(
-            "Return one bounded deterministic edit brief from the current verified workspace epoch"
+            "Call once when beginning or resuming a coding task, before broad repository reads. Returns one bounded deterministic edit brief from the current verified workspace epoch. Use source-backed facts directly, inspect explicit unknowns, and treat suggestions as advisory; the brief never authorizes an edit or skipped validation."
                 .to_owned(),
         );
         tool.annotations = Some(json!({
@@ -632,6 +632,10 @@ pub(super) fn attach_full_context_v1(value: &mut Value, context: DirectTaskStart
     else {
         return;
     };
+    again.insert(
+        "maturity".to_owned(),
+        Value::String("local_alpha".to_owned()),
+    );
     again.insert(
         "reasoningContext".to_owned(),
         json!({
@@ -1095,6 +1099,7 @@ mod tests {
     fn fixture_v1() -> TempDir {
         let workspace = TempDir::new().unwrap();
         fs::create_dir_all(workspace.path().join("src/nested")).unwrap();
+        fs::create_dir_all(workspace.path().join("docs")).unwrap();
         fs::write(
             workspace.path().join("src/lib.rs"),
             "pub fn target() -> usize { 7 }\n",
@@ -1108,6 +1113,11 @@ mod tests {
         fs::write(
             workspace.path().join("Cargo.toml"),
             "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::write(
+            workspace.path().join("docs/notes.md"),
+            "outside the declared source dependency\n",
         )
         .unwrap();
         workspace
@@ -1366,6 +1376,10 @@ mod tests {
                 .find(|response| response["id"] == id)
                 .expect("task-start response");
             let context = &response["result"]["_meta"]["again"]["reasoningContext"];
+            let again = &response["result"]["_meta"]["again"];
+            assert_eq!(again["experimental"], true);
+            assert_eq!(again["maturity"], "local_alpha");
+            assert_eq!(again["fullRetrievalAvailable"], false);
             assert_eq!(context["presentation"], "full");
             assert_eq!(context["brief"]["format"], "again.edit-brief");
             assert_eq!(context["brief"]["compiler"], "deterministic_local");
@@ -1376,6 +1390,24 @@ mod tests {
             assert_eq!(context["brief"]["authority"]["execution_reuse"], false);
             assert_eq!(context["brief"]["authority"]["llm_ran"], false);
             assert_eq!(context["metrics"]["external_model_calls"], 0);
+            let identity = context["brief"]["identity"].as_object().unwrap();
+            for field in [
+                "workspace_id",
+                "session_id",
+                "authorization_scope_digest",
+                "state_digest",
+                "dependency_digest",
+                "connection_generation",
+                "task_id",
+            ] {
+                assert!(
+                    identity
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| !value.is_empty()),
+                    "missing task-start identity field: {field}"
+                );
+            }
             assert!(context["metrics"]["delivered_bytes"].as_u64().unwrap() <= 16_384);
             assert!(
                 context["brief"]["truncation"]["included_items"]
@@ -1390,8 +1422,53 @@ mod tests {
                     <= 32
             );
         }
+        let first = responses
+            .iter()
+            .find(|response| response["id"] == 2)
+            .unwrap();
+        let warm = responses
+            .iter()
+            .find(|response| response["id"] == 3)
+            .unwrap();
+        assert_eq!(
+            first["result"]["_meta"]["again"]["resultId"],
+            warm["result"]["_meta"]["again"]["resultId"]
+        );
+        assert_ne!(
+            first["result"]["_meta"]["again"]["reasoningContext"]["brief"]["identity"]["session_id"],
+            warm["result"]["_meta"]["again"]["reasoningContext"]["brief"]["identity"]["session_id"]
+        );
         let stats = server.stats().unwrap();
         assert!(stats.exact_hits.saturating_add(stats.inflight_joins) >= 1);
+    }
+
+    #[test]
+    fn task_start_irrelevant_content_preserves_exact_reuse() {
+        let workspace = fixture_v1();
+        let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let arguments = json!({
+            "task": "edit target",
+            "changedPaths": ["src/lib.rs"]
+        });
+        let first = stdio_task_start_v1(&server, "irrelevant-scope", arguments.clone());
+        fs::write(
+            workspace.path().join("docs/notes.md"),
+            "changed but still outside the declared source dependency\n",
+        )
+        .unwrap();
+        let warm = stdio_task_start_v1(&server, "irrelevant-scope", arguments);
+        assert_eq!(
+            first["result"]["_meta"]["again"]["resultId"],
+            warm["result"]["_meta"]["again"]["resultId"]
+        );
+        assert_eq!(
+            warm["result"]["_meta"]["again"]["reasoningContext"]["metrics"]["provider_calls_avoided"],
+            1
+        );
+        assert_eq!(
+            warm["result"]["_meta"]["again"]["reasoningContext"]["brief"]["truncation"]["complete_within_budget"],
+            true
+        );
     }
 
     #[test]
