@@ -137,6 +137,8 @@ grep -Fqx '    runs-on: [self-hosted, linux, x64, again-linux-pytest-v1]' "$work
   fail 'qualification workflow runner labels changed'
 grep -Fqx '        run: scripts/preflight_linux_supervisor_runner.sh' "$workflow" ||
   fail 'qualification workflow does not invoke the production preflight'
+grep -Fqx '        run: cargo +1.88.0 build --locked --features linux-pytest --bin again' "$workflow" ||
+  fail 'qualification workflow does not build the hidden diagnostic surface'
 if grep -Eq 'CapEff:|CONFIG_SECCOMP_FILTER|CONFIG_CHECKPOINT_RESTORE|uname -[sm]' "$workflow"; then
   fail 'qualification workflow still duplicates the extracted host contract'
 fi

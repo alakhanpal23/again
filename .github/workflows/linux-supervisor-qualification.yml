@@ -29,7 +29,7 @@ jobs:
       - name: Strict Linux source validation
         run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
       - name: Build the fixed diagnostic
-        run: cargo +1.88.0 build --locked --bin again
+        run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Require 100 samples and both kernel fork-delivery orders
         run: scripts/qualify_linux_supervisor.sh
       - name: Upload exact qualification evidence
