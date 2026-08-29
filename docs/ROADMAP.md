@@ -36,6 +36,8 @@ changed, and share exact execution knowledge across agents.” The normative
 current-to-end-state map is [AGENT_ACCELERATION.md](AGENT_ACCELERATION.md).
 The exhaustive action-family inventory and profile order are maintained in
 [REUSE_SURFACE.md](REUSE_SURFACE.md).
+The task-start latency path and editable real-agent gate are frozen in
+[STRAIGHT_TO_CODE.md](STRAIGHT_TO_CODE.md).
 
 ## Agent acceleration program
 
@@ -48,7 +50,9 @@ organized into one user loop rather than independent caches:
    allow an old manifest to authorize a new hit.
 2. **Verified task-start brief:** admit typed repository/task facts only from
    verified observations, retain explicit invalidations, and return the
-   smallest relevant full brief before an agent begins broad exploration.
+   smallest relevant full brief before an agent begins broad exploration. The
+   synchronous path performs no model call, network access, build, or test and
+   emits an edit brief rather than a generic planning document.
 3. **Authenticated context delta:** bind recipients and complete delivery,
    retire authority on lifecycle or compaction changes, and issue compact or
    delta presentations only after those proofs. Until then, full delivery is

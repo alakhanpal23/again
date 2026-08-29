@@ -117,3 +117,15 @@ incomplete profiles execute normally. Workspace mutations invalidate dependent
 knowledge and are not replayed; credentials, communication, deployment,
 payment, and other external side effects bypass result reuse. This prevents
 coverage growth from turning Again into an unsafe generic command cache.
+
+## D-025 — Optimize the first correct edit, not the planning transcript
+
+The default task-start product emits one bounded verified edit brief and does
+not require a generic prose plan. Its synchronous path is local and performs no
+model call, network access, build, or test. Optional indexing and semantic
+ranking cannot block the brief or promote a candidate to current truth. If the
+complete orientation is unavailable, Again returns the verified subset with
+explicit unknowns and lets the agent inspect or edit normally. Product
+evaluation measures time to the first edit retained in the accepted patch and
+the final validated outcome together; an earlier incorrect edit, fewer tool
+calls, or a smaller transcript cannot close the gate by itself.

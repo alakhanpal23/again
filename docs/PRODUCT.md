@@ -19,6 +19,8 @@ current implementation map, scorecard, and delivery order are frozen in
 not upgrade an experimental subsystem or broaden any shipping claim below. The
 profile-by-profile inventory of reads, code intelligence, validation, builds,
 artifacts, mutations, and external actions is [the reuse surface](REUSE_SURFACE.md).
+The latency-critical task experience and its proof gate are defined by the
+[straight-to-code fast path](STRAIGHT_TO_CODE.md).
 
 ## Initial customer and job
 

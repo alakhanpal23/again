@@ -41,6 +41,11 @@ a control plane for verified shortcuts, not a replacement for agent reasoning.
 The complete action-by-action coverage inventory is maintained in
 [the coding-agent reuse surface](REUSE_SURFACE.md).
 
+The default interaction is a [straight-to-code fast path](STRAIGHT_TO_CODE.md):
+one small verified edit brief replaces broad repository orientation and a
+compulsory prose plan. The product measures time to the first correct edit and
+the final validated outcome together.
+
 ## Four product accelerators
 
 ### 1. Verified orientation

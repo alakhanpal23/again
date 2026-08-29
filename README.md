@@ -131,6 +131,7 @@ Empty-by-default Cargo features retain non-product and future surfaces without e
 See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md),
 [agent acceleration](docs/AGENT_ACCELERATION.md),
 [coding-agent reuse coverage](docs/REUSE_SURFACE.md),
+[straight-to-code fast path](docs/STRAIGHT_TO_CODE.md),
 [architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md),
 [roadmap](docs/ROADMAP.md), [development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md),
 and [security model](SECURITY.md).
