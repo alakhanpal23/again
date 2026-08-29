@@ -30,6 +30,42 @@ foundations exist, but no Linux pytest command can execute through the profile
 and no Linux reuse authority exists. Stage 4 has a manually provisioned
 client/service foundation, not a deployed product.
 
+The unifying user outcome is: “Again helps coding agents start with verified
+repository understanding, avoid repeating work, run only the validation that
+changed, and share exact execution knowledge across agents.” The normative
+current-to-end-state map is [AGENT_ACCELERATION.md](AGENT_ACCELERATION.md).
+
+## Agent acceleration program
+
+The existing gates remain the authority sequence. Product work across them is
+organized into one user loop rather than independent caches:
+
+1. **Fast current repository view:** reduce the remaining authoritative
+   traversal with reusable parent descriptors and a sealed fresh manifest.
+   Sharing a view may remove duplicate observation within an epoch; it may not
+   allow an old manifest to authorize a new hit.
+2. **Verified task-start brief:** admit typed repository/task facts only from
+   verified observations, retain explicit invalidations, and return the
+   smallest relevant full brief before an agent begins broad exploration.
+3. **Authenticated context delta:** bind recipients and complete delivery,
+   retire authority on lifecycle or compaction changes, and issue compact or
+   delta presentations only after those proofs. Until then, full delivery is
+   mandatory and token savings remain zero.
+4. **Changed-only validation:** finish execute-only pytest, construct observed
+   dependency closures, and expose a validation plan. Skipping a test requires
+   the later candidate, shadow, promotion, and fresh-hit gates; selection by
+   filename, history, model judgment, or similarity is never enough.
+5. **Shared execution knowledge:** carry exact results, facts, invalidations,
+   and validation evidence into later agent sessions and eventually across
+   equivalent machines through the encrypted team boundary.
+
+Each slice must be evaluated at the completed-task level. Paired runs freeze the
+agent/model, repository snapshot, task, limits, and outcome rubric, then record
+time to first useful edit, task wall time, tool/provider calls, context bytes,
+provider-reported tokens, validation compute, total metered cost, and every
+incorrect-hit or stale-fact event. Cache-hit rate alone cannot close a product
+gate. Provider token or dollar savings cannot be inferred from byte counts.
+
 ## Agent gateway fast track
 
 The experimental local vertical slice now includes a real bounded MCP stdio

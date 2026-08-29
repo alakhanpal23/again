@@ -6,6 +6,18 @@
 
 This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
 
+## Product outcome
+
+> Again helps coding agents start with verified repository understanding, avoid
+> repeating work, run only the validation that changed, and share exact
+> execution knowledge across agents.
+
+The product is optimized for lower time and lower total cost per successful
+coding task, not for cache-hit percentage. The complete end-state user loop,
+current implementation map, scorecard, and delivery order are frozen in
+[the agent acceleration product](AGENT_ACCELERATION.md). That direction does
+not upgrade an experimental subsystem or broaden any shipping claim below.
+
 ## Initial customer and job
 
 The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative local path.
@@ -101,6 +113,7 @@ The repository still contains a context-keyed delivery ledger and `PreCompact`/`
 
 ## North-star and guardrails
 
-North-star: measured end-to-end agent wait time eliminated on eligible repeated work.
+North-star: measured end-to-end time and total cost eliminated per successful
+coding task while preserving its fixed outcome rubric.
 
 Guardrails: known incorrect reuse count, shadow divergence count, miss overhead, explicit-CLI/cache-read-plus-probe latency, exact executable/OS/context-profile mismatches, exact full-stream equality, production-hook no-op violations, secret-tainted entry count, crash consistency, and user-visible refusal/no-store explanations.

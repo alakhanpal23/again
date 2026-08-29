@@ -91,3 +91,16 @@ Release artifacts may install and expose diagnostics on Linux or an unknown macO
 ## D-022 — Team bundles stream only after an object-identity fence
 
 The two-request team lookup keeps the 16 MiB ciphertext limit but may not materialize ciphertext-sized JavaScript buffers in the Worker. A successful upload binds the R2-returned version, ETag, R2-verified SHA-256, size, storage key, and random blob incarnation into D1. Lookup obtains conditional R2 body streams, checks that metadata, and then runs one final D1 query binding the same repository generation, manifest, trust head, blob incarnations, and R2 identities. Only after that fence may the response stream begin. This follows the 128 MiB-per-isolate Workers limit, which is shared across concurrent requests, while retaining client-side BLAKE3, AEAD, signed-manifest, local privacy, and post-decryption trust verification as the plaintext-release authority. Lowering the output limit merely to accommodate buffering would narrow the product without fixing the architecture.
+
+## D-023 — The product unit is a successful coding task
+
+Again optimizes time and total cost per successful coding task, not cache-hit
+percentage. Repository orientation, tool execution, context delivery,
+validation, and cross-agent knowledge are one acceleration loop. Evaluation
+freezes the agent/model, repository snapshot, task, limits, and outcome rubric,
+then measures task wall time, provider calls, provider-reported tokens,
+validation compute, and total metered cost. A byte count, hit, skipped process,
+or model-generated relevance score cannot alone establish task savings or reuse
+authority. Unknown dependencies execute normally, and a task-level improvement
+cannot compensate for an incorrect hit, stale fact, or weaker validation
+outcome.

@@ -2,6 +2,15 @@
 
 Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation. The default product applies that rule to a deliberately narrow set of explicit read-only commands and to bounded repository and Git intelligence over MCP.
 
+The product direction is broader: **Again helps coding agents start with
+verified repository understanding, avoid repeating work, run only the
+validation that changed, and share exact execution knowledge across agents.**
+The current gateway is the first shipping layer of that loop; verified
+task-start briefs, changed-only pytest validation, and managed cross-machine
+sharing remain gated work. See the [agent acceleration product](docs/AGENT_ACCELERATION.md)
+for the current-to-end-state map and the measurements required before claiming
+that an agent task is faster or cheaper.
+
 ```bash
 # Redirect all three standard streams so this terminal demonstration is non-TTY.
 again run -- rg --no-ignore --sort=path -n "EffectIR" src \
@@ -119,7 +128,11 @@ Empty-by-default Cargo features retain non-product and future surfaces without e
 
 `again explain <id>` reads a stored, non-quarantined result; without an id it reports only the latest event that was actually recorded. It does not reconstruct or invent an explanation for a refusal or failure that occurred before event persistence.
 
-See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md), [architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md), [roadmap](docs/ROADMAP.md), [development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md), and [security model](SECURITY.md).
+See [current status](docs/STATUS.md), [the product contract](docs/PRODUCT.md),
+[agent acceleration](docs/AGENT_ACCELERATION.md),
+[architecture](docs/ARCHITECTURE.md), [engineering decisions](docs/DECISIONS.md),
+[roadmap](docs/ROADMAP.md), [development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md),
+and [security model](SECURITY.md).
 
 ## Open source and business
 
