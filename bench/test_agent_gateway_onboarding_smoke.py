@@ -18,14 +18,15 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
         self.root = pathlib.Path(self.temporary.name).resolve()
         self.workspace = self.root / "workspace"
         self.workspace.mkdir(mode=0o700)
+        self.executable = pathlib.Path(sys.executable).resolve(strict=True)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
     def plan(self, client: str, config_path: pathlib.Path) -> dict[str, object]:
         args = ["mcp", "serve", "--workspace", str(self.workspace)]
-        config_document = smoke._expected_config_document(client, args)
-        local_cli = smoke._expected_local_cli(client, args)
+        config_document = smoke._expected_config_document(client, self.executable, args)
+        local_cli = smoke._expected_local_cli(client, self.executable, args)
         ownership_digest = smoke.expected_ownership_digest(
             client=client,
             config_path=config_path,
@@ -36,7 +37,11 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
             "version": 2,
             "client": client,
             "server_name": "again",
-            "stdio": {"transport": "stdio", "command": "again", "args": args},
+            "stdio": {
+                "transport": "stdio",
+                "command": str(self.executable),
+                "args": args,
+            },
             "local_cli_command": local_cli,
             "workspace": str(self.workspace),
             "config_path": str(config_path),
@@ -153,6 +158,7 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
                         client=client,
                         workspace=self.workspace,
                         config_path=path,
+                        executable=self.executable,
                     ),
                     plan,
                 )
@@ -167,6 +173,7 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
                 client="codex",
                 workspace=self.workspace,
                 config_path=path,
+                executable=self.executable,
             )
         self.assertEqual(refused.exception.code, "setup_plan_invalid")
 
@@ -227,9 +234,10 @@ class AgentGatewayOnboardingSmokeTest(unittest.TestCase):
                     client=client,
                     config_path=path,
                     workspace=self.workspace,
+                    executable=self.executable,
                     expected_document=str(plan["config_document"]),
                 )
-                self.assertEqual(command, "again")
+                self.assertEqual(command, str(self.executable))
                 self.assertEqual(args, plan["stdio"]["args"])
 
     def test_exact_search_validation_rejects_echo_only_and_stale_content(self) -> None:

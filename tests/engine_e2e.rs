@@ -10,10 +10,11 @@ use std::process::{Command, Output, Stdio};
 #[cfg(target_os = "macos")]
 use rusqlite::Connection;
 use serde_json::Value;
+#[cfg(any(feature = "hook", feature = "linux-pytest"))]
 use serde_json::json;
 use tempfile::TempDir;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 const AGAIN_SENTINEL: &str = "AGAIN_CODEX_HOOK_V1=1";
 
 #[cfg(target_os = "macos")]
@@ -121,6 +122,173 @@ fn run_again(root: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     run_process(root, &again_binary(), &args, stdin)
 }
 
+#[cfg(not(any(
+    feature = "hook",
+    feature = "daemon",
+    feature = "linux-pytest",
+    feature = "team-alpha"
+)))]
+#[test]
+fn default_help_contains_only_the_shipping_product() {
+    let temp = TempDir::new().unwrap();
+    let output = run_again(temp.path(), &["--help"], None);
+    assert!(output.status.success(), "help failed: {:?}", output.stderr);
+    let help = String::from_utf8(output.stdout).unwrap();
+    for command in [
+        "setup",
+        "run",
+        "reference",
+        "mcp",
+        "explain",
+        "show",
+        "stats",
+        "doctor",
+    ] {
+        assert!(
+            help.contains(&format!("  {command}")),
+            "missing {command}: {help}"
+        );
+    }
+    for command in ["hook", "exec", "daemon", "connect", "team", "linux-pytest"] {
+        assert!(
+            !help
+                .lines()
+                .any(|line| line.starts_with(&format!("  {command} "))),
+            "unexpected {command}: {help}"
+        );
+    }
+
+    let mcp = run_again(temp.path(), &["mcp", "--help"], None);
+    assert!(mcp.status.success(), "mcp help failed: {:?}", mcp.stderr);
+    let mcp_help = String::from_utf8(mcp.stdout).unwrap();
+    assert!(mcp_help.contains("  serve"));
+    assert!(mcp_help.contains("  setup"));
+    assert!(!mcp_help.contains("experimental"));
+    assert!(!mcp_help.contains("daemon"));
+    assert!(!mcp_help.contains("connect"));
+}
+
+#[test]
+fn user_facing_help_and_dry_run_output_are_actionable() {
+    let temp = TempDir::new().unwrap();
+    fs::create_dir(temp.path().join(".git")).unwrap();
+
+    for (args, expected) in [
+        (&["show", "--help"][..], "Stored result id to retrieve"),
+        (
+            &["stats", "--help"][..],
+            "machine-readable JSON with local-engine and gateway counters",
+        ),
+        (
+            &["doctor", "--help"][..],
+            "complete diagnostic report as machine-readable JSON",
+        ),
+    ] {
+        let output = run_again(temp.path(), args, None);
+        assert!(
+            output.status.success(),
+            "args={args:?}: {:?}",
+            output.stderr
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(expected),
+            "args={args:?}: {:?}",
+            output.stdout
+        );
+    }
+
+    let workspace = temp.path().canonicalize().unwrap();
+    let setup = run_again(
+        temp.path(),
+        &[
+            "mcp",
+            "setup",
+            "--client",
+            "codex",
+            "--workspace",
+            workspace.to_str().unwrap(),
+        ],
+        None,
+    );
+    assert!(
+        setup.status.success(),
+        "mcp setup failed: {:?}",
+        setup.stderr
+    );
+    let setup_stdout = String::from_utf8(setup.stdout).unwrap();
+    assert!(setup_stdout.contains("# dry run; no configuration was changed"));
+    assert!(!setup_stdout.contains("experimental"));
+
+    let stats = run_again(temp.path(), &["stats"], None);
+    assert!(stats.status.success(), "stats failed: {:?}", stats.stderr);
+    let stats_stdout = String::from_utf8(stats.stdout).unwrap();
+    assert!(stats_stdout.contains("gateway requests: 0"));
+    assert!(stats_stdout.contains("gateway provider calls avoided: 0"));
+
+    let doctor = run_again(temp.path(), &["doctor"], None);
+    assert!(
+        doctor.status.success(),
+        "doctor failed: {:?}",
+        doctor.stderr
+    );
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("state writable: true"));
+}
+
+#[cfg(any(
+    not(feature = "hook"),
+    not(feature = "daemon"),
+    not(feature = "linux-pytest"),
+    not(feature = "team-alpha")
+))]
+fn assert_unknown_command(root: &Path, args: &[&str]) {
+    let output = run_again(root, args, None);
+    assert_eq!(output.status.code(), Some(2), "args={args:?}");
+    assert!(output.stdout.is_empty(), "args={args:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unrecognized subcommand"),
+        "args={args:?}, stderr={:?}",
+        output.stderr
+    );
+}
+
+#[cfg(not(feature = "hook"))]
+#[test]
+fn default_binary_rejects_hook_commands() {
+    let temp = TempDir::new().unwrap();
+    assert_unknown_command(temp.path(), &["hook"]);
+    assert_unknown_command(temp.path(), &["exec", "--call", "opaque"]);
+}
+
+#[cfg(not(feature = "daemon"))]
+#[test]
+fn default_binary_rejects_daemon_commands() {
+    let temp = TempDir::new().unwrap();
+    assert_unknown_command(temp.path(), &["mcp", "daemon", "status"]);
+    assert_unknown_command(temp.path(), &["mcp", "connect"]);
+}
+
+#[cfg(not(feature = "team-alpha"))]
+#[test]
+fn default_binary_rejects_team_commands() {
+    let temp = TempDir::new().unwrap();
+    assert_unknown_command(temp.path(), &["team", "run"]);
+}
+
+#[cfg(not(feature = "linux-pytest"))]
+#[test]
+fn default_binary_rejects_linux_pytest_diagnostics() {
+    let temp = TempDir::new().unwrap();
+    for command in [
+        "__linux-pytest-namespace-probe-v1",
+        "__linux-pytest-ptrace-transport-probe-v1",
+        "__linux-pytest-supervisor-tree-probe-v1",
+        "__linux-pytest-filesystem-ready-probe-v1",
+    ] {
+        assert_unknown_command(temp.path(), &[command]);
+    }
+}
+
+#[cfg(feature = "linux-pytest")]
 #[test]
 fn rootless_namespace_probe_is_closed_and_non_qualifying() {
     let temp = TempDir::new().unwrap();
@@ -173,6 +341,7 @@ fn rootless_namespace_probe_is_closed_and_non_qualifying() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 fn filesystem_ready_probe_is_closed_redacted_and_non_authoritative() {
     let temp = TempDir::new().unwrap();
@@ -244,6 +413,7 @@ fn filesystem_ready_probe_is_closed_redacted_and_non_authoritative() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 fn ptrace_transport_probe_is_closed_redacted_and_non_authoritative() {
     let temp = TempDir::new().unwrap();
@@ -324,6 +494,7 @@ fn ptrace_transport_probe_is_closed_redacted_and_non_authoritative() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 #[cfg(all(
     target_os = "linux",
@@ -358,6 +529,7 @@ fn supervisor_tree_probe_rejects_loader_injection_before_clone() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 fn supervisor_tree_probe_is_closed_redacted_and_non_authoritative() {
     let temp = TempDir::new().unwrap();
@@ -479,6 +651,7 @@ fn supervisor_tree_probe_is_closed_redacted_and_non_authoritative() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 fn rootless_namespace_probe_rejects_loader_injection_before_clone() {
@@ -504,6 +677,7 @@ fn rootless_namespace_probe_rejects_loader_injection_before_clone() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "linux-pytest")]
 #[test]
 #[cfg(all(
     target_os = "linux",
@@ -541,6 +715,7 @@ fn ptrace_transport_probe_rejects_loader_injection_before_clone() {
     assert!(!state_dir(temp.path()).exists());
 }
 
+#[cfg(feature = "hook")]
 fn run_experimental_hook(root: &Path, stdin: &str) -> Output {
     run_process_with_env(
         root,
@@ -554,6 +729,7 @@ fn run_experimental_hook(root: &Path, stdin: &str) -> Output {
     )
 }
 
+#[cfg(feature = "hook")]
 fn pre_tool_use(session_id: &str, cwd: &Path, command: &str) -> String {
     json!({
         "session_id": session_id,
@@ -570,6 +746,7 @@ fn pre_tool_use(session_id: &str, cwd: &Path, command: &str) -> String {
     .to_string()
 }
 
+#[cfg(feature = "hook")]
 fn compact_event(event: &str, session_id: &str, cwd: &Path) -> String {
     json!({
         "session_id": session_id,
@@ -584,7 +761,7 @@ fn compact_event(event: &str, session_id: &str, cwd: &Path) -> String {
 }
 
 /// Return the shell-free argv encoded by the official hook rewrite.
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn rewritten_argv(output: &Output) -> Option<Vec<String>> {
     assert!(output.status.success(), "hook failed: {:?}", output.stderr);
     if output.stdout.is_empty() {
@@ -600,17 +777,18 @@ fn rewritten_argv(output: &Output) -> Option<Vec<String>> {
     Some(shell_words::split(command).unwrap())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn hook_rewrite(root: &Path, session_id: &str, command: &str) -> Option<Vec<String>> {
     let input = pre_tool_use(session_id, root, command);
     rewritten_argv(&run_experimental_hook(root, &input))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn run_rewritten(root: &Path, argv: &[String]) -> Output {
     run_process(root, Path::new(&argv[0]), &argv[1..], None)
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn automatic_hook_rewrite_is_disabled_by_default() {
     let temp = TempDir::new().unwrap();
@@ -967,7 +1145,7 @@ fn resource_limit_profile_partitions_cache_hits() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn codex_hook_rewrites_executes_replays_full_and_invalidates_on_input_change() {
     if !audited_host_profile_available() {
         return;
@@ -1035,6 +1213,7 @@ fn codex_hook_rewrites_executes_replays_full_and_invalidates_on_input_change() {
     assert!(!String::from_utf8_lossy(&changed.stdout).contains("duplicate bytes omitted"));
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn unsafe_commands_are_left_untouched_by_the_hook() {
     let temp = TempDir::new().unwrap();
@@ -1056,6 +1235,7 @@ fn unsafe_commands_are_left_untouched_by_the_hook() {
     assert!(!temp.path().join("created-by-test.txt").exists());
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn production_hook_is_a_true_noop_even_for_unknown_input() {
     let temp = TempDir::new().unwrap();
@@ -1072,6 +1252,7 @@ fn production_hook_is_a_true_noop_even_for_unknown_input() {
     );
 }
 
+#[cfg(feature = "hook")]
 #[test]
 fn production_compaction_hooks_are_fresh_state_noops_for_both_events() {
     let temp = TempDir::new().unwrap();
@@ -1093,7 +1274,7 @@ fn production_compaction_hooks_are_fresh_state_noops_for_both_events() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn eligible_nonzero_reads_are_executed_again_and_never_cached() {
     if !audited_host_profile_available() {
         return;
@@ -1118,7 +1299,7 @@ fn eligible_nonzero_reads_are_executed_again_and_never_cached() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "hook", target_os = "macos"))]
 fn tampered_result_metadata_is_quarantined_and_never_served() {
     if !audited_host_profile_available() {
         return;
@@ -1196,6 +1377,16 @@ fn personal_codex_skill_setup_is_idempotent_and_reversible() {
     fs::create_dir(&project).unwrap();
     let skill = project.join("home/.agents/skills/again/SKILL.md");
 
+    let absent_remove = run_again(
+        &project,
+        &["setup", "--codex", "--remove", "--dry-run"],
+        None,
+    );
+    assert!(absent_remove.status.success());
+    let absent_stdout = String::from_utf8_lossy(&absent_remove.stdout);
+    assert!(absent_stdout.contains("# dry run: nothing to remove at"));
+    assert!(!absent_stdout.contains("name: again"));
+
     let first = run_again(&project, &["setup", "--codex"], None);
     assert!(first.status.success(), "setup failed: {:?}", first.stderr);
     assert!(String::from_utf8_lossy(&first.stdout).contains("Installed Again's Codex skill"));
@@ -1205,6 +1396,17 @@ fn personal_codex_skill_setup_is_idempotent_and_reversible() {
     let second = run_again(&project, &["setup", "--codex"], None);
     assert!(second.status.success());
     assert!(String::from_utf8_lossy(&second.stdout).contains("already current"));
+
+    let planned_remove = run_again(
+        &project,
+        &["setup", "--codex", "--remove", "--dry-run"],
+        None,
+    );
+    assert!(planned_remove.status.success());
+    let planned_stdout = String::from_utf8_lossy(&planned_remove.stdout);
+    assert!(planned_stdout.contains("# dry run: would remove"));
+    assert!(!planned_stdout.contains("name: again"));
+    assert!(skill.is_file());
 
     let removed = run_again(&project, &["setup", "--codex", "--remove"], None);
     assert!(

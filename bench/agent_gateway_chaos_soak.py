@@ -1099,12 +1099,19 @@ def _tool_frame(request_id: str, pattern: str) -> bytes:
 
 
 def _require_error(
-    response: Mapping[str, Any], expected_id: Any, code: int, message: str
+    response: Mapping[str, Any],
+    expected_id: Any,
+    code: int,
+    message: str,
+    data: Mapping[str, Any] | None = None,
 ) -> None:
+    expected_error: dict[str, Any] = {"code": code, "message": message}
+    if data is not None:
+        expected_error["data"] = dict(data)
     if response != {
         "jsonrpc": "2.0",
         "id": expected_id,
-        "error": {"code": code, "message": message},
+        "error": expected_error,
     }:
         raise HarnessRefusal(
             "transport_error_mismatch", "MCP transport refusal bytes changed"
@@ -1212,28 +1219,41 @@ def _transport_chaos_probe(
                 "malformed",
                 b'{"jsonrpc":"2.0",]\n',
                 -32700,
-                "invalid JSON",
+                "JSON-RPC frame is not valid JSON",
+                {"reason": "malformed_json"},
             ),
             (
                 "duplicate_key",
                 b'{"jsonrpc":"2.0","id":"first","id":"second","method":"ping"}\n',
                 -32700,
-                "invalid JSON",
+                "JSON-RPC frame contains a duplicate object key",
+                {"reason": "duplicate_json_key"},
             ),
-            ("deep_json", deep, -32021, "JSON input limit exceeded"),
+            (
+                "deep_json",
+                deep,
+                -32021,
+                "JSON-RPC frame nesting is too deep",
+                {"reason": "json_depth_limit", "limit": 48, "actual": 49},
+            ),
             (
                 "oversized_frame",
                 b"x" * (1_048_576 + 1) + b"\n",
                 -32021,
-                "JSON input limit exceeded",
+                "JSON-RPC frame is too large",
+                {
+                    "reason": "message_too_large",
+                    "limitBytes": 1_048_576,
+                    "actualBytes": 1_048_577,
+                },
             ),
         ]
         rng.shuffle(malformed_cases)
         malformed_results: dict[str, str] = {}
-        for name, frame, code, message in malformed_cases:
+        for name, frame, code, message, data in malformed_cases:
             primary.write_raw(frame)
             response = primary.read_response()
-            _require_error(response, None, code, message)
+            _require_error(response, None, code, message, data)
             malformed_results[name] = sha256_bytes(canonical_json(response))
 
         duplicate_frame = _tool_frame("duplicate-inflight", "TOKEN_DUPLICATE_ID")

@@ -23,6 +23,7 @@ use crate::executable::{
 use crate::fingerprint::{
     FingerprintInput, FingerprintResult, ScopeEntry, fingerprint_scoped_with_cache,
 };
+#[cfg(feature = "hook")]
 use crate::hook::{CodexHookInput, parse_hook_input, rewrite_output};
 use crate::policy::{AccessPlan, AccessScope, Decision, PolicyContext, classify};
 use crate::setup::{
@@ -52,14 +53,15 @@ enum CommandName {
     Run(RunArgs),
     /// Emit a compact reference to an existing validated local result.
     Reference(ReferenceArgs),
+    #[cfg(feature = "team-alpha")]
     /// Reuse or publish an encrypted result through an explicit team profile.
     Team(TeamArgs),
-    /// Run or configure the experimental repository-aware MCP gateway.
+    /// Run or configure the repository-aware MCP gateway.
     Mcp(McpArgs),
-    /// Handle one Codex tool or compaction lifecycle hook event on stdin.
+    #[cfg(feature = "hook")]
     #[command(hide = true)]
     Hook(HookArgs),
-    /// Execute an opaque call created by the Codex hook.
+    #[cfg(feature = "hook")]
     #[command(hide = true)]
     Exec(ExecArgs),
     /// Explain the latest decision, or inspect a stored result.
@@ -70,15 +72,19 @@ enum CommandName {
     Stats(StatsArgs),
     /// Check the local runtime and Codex integration.
     Doctor(DoctorArgs),
+    #[cfg(feature = "linux-pytest")]
     /// Run the fixed no-command Linux namespace diagnostic.
     #[command(name = "__linux-pytest-namespace-probe-v1", hide = true)]
     LinuxPytestNamespaceProbeV1,
+    #[cfg(feature = "linux-pytest")]
     /// Run the fixed no-command Linux ptrace transport diagnostic.
     #[command(name = "__linux-pytest-ptrace-transport-probe-v1", hide = true)]
     LinuxPytestPtraceTransportProbeV1,
+    #[cfg(feature = "linux-pytest")]
     /// Run the fixed no-command Linux two-task supervisor diagnostic.
     #[command(name = "__linux-pytest-supervisor-tree-probe-v1", hide = true)]
     LinuxPytestSupervisorTreeProbeV1,
+    #[cfg(feature = "linux-pytest")]
     /// Run the fixed no-command Linux filesystem-ready diagnostic.
     #[command(name = "__linux-pytest-filesystem-ready-probe-v1", hide = true)]
     LinuxPytestFilesystemReadyProbeV1,
@@ -92,13 +98,17 @@ struct McpArgs {
 
 #[derive(Debug, Subcommand)]
 enum McpCommand {
-    /// Serve the experimental repository tools over bounded stdio JSON-RPC.
+    /// Serve repository tools over bounded stdio JSON-RPC.
     Serve(McpServeArgs),
     /// Print an opt-in Codex or Claude MCP setup plan.
     Setup(McpSetupArgs),
+    #[cfg(feature = "daemon")]
     /// Run or inspect the opt-in, same-user local gateway daemon.
+    #[command(hide = true)]
     Daemon(McpDaemonArgs),
+    #[cfg(feature = "daemon")]
     /// Proxy stdio to an authenticated local gateway daemon.
+    #[command(hide = true)]
     Connect(McpConnectArgs),
 }
 
@@ -112,12 +122,14 @@ struct McpServeArgs {
     authorization_scope: Option<String>,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Args)]
 struct McpDaemonArgs {
     #[command(subcommand)]
     command: McpDaemonCommand,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Subcommand)]
 enum McpDaemonCommand {
     /// Serve workspace-bound MCP connections until an authenticated stop.
@@ -128,6 +140,7 @@ enum McpDaemonCommand {
     Stop(McpDaemonWorkspaceArgs),
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Args)]
 struct McpDaemonServeArgs {
     /// Repository root; defaults to the repository containing the current directory.
@@ -138,6 +151,7 @@ struct McpDaemonServeArgs {
     authorization_scope: Option<String>,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Args)]
 struct McpDaemonWorkspaceArgs {
     /// Repository root; defaults to the repository containing the current directory.
@@ -145,6 +159,7 @@ struct McpDaemonWorkspaceArgs {
     workspace: Option<PathBuf>,
 }
 
+#[cfg(feature = "daemon")]
 #[derive(Debug, Args)]
 struct McpConnectArgs {
     /// Repository root; defaults to the repository containing the current directory.
@@ -206,12 +221,14 @@ struct ReferenceArgs {
     command: Vec<OsString>,
 }
 
+#[cfg(feature = "team-alpha")]
 #[derive(Debug, Args)]
 struct TeamArgs {
     #[command(subcommand)]
     command: TeamCommand,
 }
 
+#[cfg(feature = "team-alpha")]
 #[derive(Debug, Subcommand)]
 enum TeamCommand {
     /// Run one bare command through the sealed team-cache boundary.
@@ -220,6 +237,7 @@ enum TeamCommand {
     Inspect(TeamInspectArgs),
 }
 
+#[cfg(feature = "team-alpha")]
 #[derive(Debug, Args)]
 struct TeamRunArgs {
     /// Absolute owner-private team profile path.
@@ -230,6 +248,7 @@ struct TeamRunArgs {
     command: Vec<OsString>,
 }
 
+#[cfg(feature = "team-alpha")]
 #[derive(Debug, Args)]
 struct TeamInspectArgs {
     /// Absolute owner-private team profile path.
@@ -243,6 +262,7 @@ struct TeamInspectArgs {
     command: Vec<OsString>,
 }
 
+#[cfg(feature = "hook")]
 #[derive(Debug, Args)]
 struct HookArgs {
     /// Controlled differential-testing escape hatch. This path is known not
@@ -251,8 +271,10 @@ struct HookArgs {
     experimental_unsafe_rewrite: bool,
 }
 
+#[cfg(feature = "hook")]
 #[derive(Debug, Args)]
 struct ExecArgs {
+    /// Opaque pending-call identifier issued by the hook adapter.
     #[arg(long)]
     call: String,
 }
@@ -261,23 +283,27 @@ struct ExecArgs {
 struct ExplainArgs {
     /// Stored result id. Omit it to explain the latest local event.
     id: Option<String>,
+    /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ShowArgs {
+    /// Stored result id to retrieve.
     id: String,
 }
 
 #[derive(Debug, Args)]
 struct StatsArgs {
+    /// Emit machine-readable JSON with local-engine and gateway counters.
     #[arg(long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct DoctorArgs {
+    /// Emit the complete diagnostic report as machine-readable JSON.
     #[arg(long)]
     json: bool,
 }
@@ -385,6 +411,7 @@ struct DoctorReport {
     trace_backed_replay: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct RootlessNamespaceProbeReport {
     schema: &'static str,
@@ -394,6 +421,7 @@ struct RootlessNamespaceProbeReport {
     refusal: Option<FixedProbeRefusal>,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct RootlessNamespaceProbeScope {
     kind: &'static str,
@@ -402,6 +430,7 @@ struct RootlessNamespaceProbeScope {
     execution_authority: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedProbeRefusal {
     code: &'static str,
@@ -411,6 +440,7 @@ struct FixedProbeRefusal {
     cleanup_complete: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedPtraceTransportProbeReport {
     schema: &'static str,
@@ -421,6 +451,7 @@ struct FixedPtraceTransportProbeReport {
     refusal: Option<FixedProbeRefusal>,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedPtraceTransportProbeScope {
     kind: &'static str,
@@ -431,6 +462,7 @@ struct FixedPtraceTransportProbeScope {
     reuse_authority: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedPtraceTransportProbeResult {
     logical_task_id: u32,
@@ -445,6 +477,7 @@ struct FixedPtraceTransportProbeResult {
     protocol_fingerprint: String,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedSupervisorTreeProbeReport {
     schema: &'static str,
@@ -455,6 +488,7 @@ struct FixedSupervisorTreeProbeReport {
     refusal: Option<FixedSupervisorTreeProbeRefusal>,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedSupervisorTreeProbeScope {
     kind: &'static str,
@@ -465,6 +499,7 @@ struct FixedSupervisorTreeProbeScope {
     reuse_authority: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedSupervisorTreeProbeResult {
     fork_delivery_order: &'static str,
@@ -479,6 +514,7 @@ struct FixedSupervisorTreeProbeResult {
     cleanup_complete: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedSupervisorTreeProbeRefusal {
     code: &'static str,
@@ -489,6 +525,7 @@ struct FixedSupervisorTreeProbeRefusal {
     cleanup_errno: Option<i32>,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedFilesystemReadyProbeReport {
     schema: &'static str,
@@ -499,6 +536,7 @@ struct FixedFilesystemReadyProbeReport {
     refusal: Option<FixedProbeRefusal>,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedFilesystemReadyProbeScope {
     kind: &'static str,
@@ -511,6 +549,7 @@ struct FixedFilesystemReadyProbeScope {
     reuse_authority: bool,
 }
 
+#[cfg(feature = "linux-pytest")]
 #[derive(Serialize)]
 struct FixedFilesystemReadyProbeResult {
     successful_attachment_count: u8,
@@ -525,6 +564,7 @@ pub fn run_cli() -> Result<i32> {
         CommandName::Setup(args) => setup(args),
         CommandName::Run(args) => direct_run(args.command),
         CommandName::Reference(args) => direct_reference(args.command),
+        #[cfg(feature = "team-alpha")]
         CommandName::Team(args) => match args.command {
             TeamCommand::Run(args) => crate::team_cli::run(args.profile, args.command),
             TeamCommand::Inspect(args) => {
@@ -534,22 +574,31 @@ pub fn run_cli() -> Result<i32> {
         CommandName::Mcp(args) => match args.command {
             McpCommand::Serve(args) => mcp_serve(args),
             McpCommand::Setup(args) => mcp_setup(args),
+            #[cfg(feature = "daemon")]
             McpCommand::Daemon(args) => mcp_daemon(args),
+            #[cfg(feature = "daemon")]
             McpCommand::Connect(args) => mcp_connect(args),
         },
+        #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
+        #[cfg(feature = "hook")]
         CommandName::Exec(args) => execute_pending_call(&args.call),
         CommandName::Explain(args) => explain(args),
         CommandName::Show(args) => show(&args.id),
         CommandName::Stats(args) => stats(args.json),
         CommandName::Doctor(args) => doctor(args.json),
+        #[cfg(feature = "linux-pytest")]
         CommandName::LinuxPytestNamespaceProbeV1 => linux_pytest_namespace_probe_v1(),
+        #[cfg(feature = "linux-pytest")]
         CommandName::LinuxPytestPtraceTransportProbeV1 => linux_pytest_ptrace_transport_probe_v1(),
+        #[cfg(feature = "linux-pytest")]
         CommandName::LinuxPytestSupervisorTreeProbeV1 => linux_pytest_supervisor_tree_probe_v1(),
+        #[cfg(feature = "linux-pytest")]
         CommandName::LinuxPytestFilesystemReadyProbeV1 => linux_pytest_filesystem_ready_probe_v1(),
     }
 }
 
+#[cfg(feature = "linux-pytest")]
 fn linux_pytest_namespace_probe_v1() -> Result<i32> {
     use crate::linux_pytest::{LINUX_PYTEST_PROFILE_ID, RootlessNamespaceProbeDiagnosticV1};
 
@@ -606,6 +655,7 @@ fn linux_pytest_namespace_probe_v1() -> Result<i32> {
     Ok(exit_code)
 }
 
+#[cfg(feature = "linux-pytest")]
 fn linux_pytest_filesystem_ready_probe_v1() -> Result<i32> {
     use crate::linux_pytest::{
         FixedFilesystemReadyProbeDiagnosticV1, LINUX_PYTEST_PROFILE_ID,
@@ -681,6 +731,7 @@ fn linux_pytest_filesystem_ready_probe_v1() -> Result<i32> {
     Ok(exit_code)
 }
 
+#[cfg(feature = "linux-pytest")]
 fn linux_pytest_ptrace_transport_probe_v1() -> Result<i32> {
     use crate::linux_pytest::{FixedPtraceTransportProbeDiagnosticV1, LINUX_PYTEST_PROFILE_ID};
 
@@ -759,6 +810,7 @@ fn linux_pytest_ptrace_transport_probe_v1() -> Result<i32> {
     Ok(exit_code)
 }
 
+#[cfg(feature = "linux-pytest")]
 fn linux_pytest_supervisor_tree_probe_v1() -> Result<i32> {
     use crate::linux_pytest::{FixedTwoTaskSupervisorProbeDiagnosticV1, LINUX_PYTEST_PROFILE_ID};
 
@@ -889,6 +941,7 @@ fn local_mcp_authorization_scope_v1(
     ))?)
 }
 
+#[cfg(feature = "daemon")]
 #[cfg(unix)]
 fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
     use crate::agent_gateway_service::{GatewayDaemonV1, daemon_status_v1, stop_daemon_v1};
@@ -919,11 +972,13 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
     }
 }
 
+#[cfg(feature = "daemon")]
 #[cfg(not(unix))]
 fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
     Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
 }
 
+#[cfg(feature = "daemon")]
 #[cfg(unix)]
 fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
     let workspace = resolve_mcp_workspace(args.workspace)?;
@@ -932,6 +987,7 @@ fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
     Ok(0)
 }
 
+#[cfg(feature = "daemon")]
 #[cfg(not(unix))]
 fn mcp_connect(_args: McpConnectArgs) -> Result<i32> {
     Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
@@ -961,7 +1017,7 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
     } else {
         println!("{plan}");
         if args.install_owned_config.is_none() {
-            println!("# experimental dry run; no configuration was changed");
+            println!("# dry run; no configuration was changed");
         }
     }
     if args.install_owned_config.is_some() {
@@ -999,8 +1055,20 @@ fn setup(args: SetupArgs) -> Result<i32> {
     };
 
     if args.dry_run {
-        println!("# dry run: {}", change.path.display());
-        print!("{}", change.rendered);
+        if args.remove {
+            println!(
+                "# dry run: {} {}",
+                if change.changed {
+                    "would remove"
+                } else {
+                    "nothing to remove at"
+                },
+                change.path.display()
+            );
+        } else {
+            println!("# dry run: would install {}", change.path.display());
+            print!("{}", change.rendered);
+        }
     } else if args.remove {
         if change.changed {
             println!(
@@ -1039,6 +1107,7 @@ fn setup(args: SetupArgs) -> Result<i32> {
     Ok(0)
 }
 
+#[cfg(feature = "hook")]
 fn handle_hook(experimental_unsafe_rewrite: bool) -> Result<i32> {
     // Production integration is instruction-only. Return before reading or
     // validating stdin so every current or future Codex lifecycle envelope is
@@ -1111,6 +1180,7 @@ fn handle_hook(experimental_unsafe_rewrite: bool) -> Result<i32> {
     Ok(0)
 }
 
+#[cfg(feature = "hook")]
 fn execute_pending_call(call_id: &str) -> Result<i32> {
     let invocation_started = Instant::now();
     let invocation_cwd = fs::canonicalize(std::env::current_dir()?)
@@ -2270,6 +2340,22 @@ fn stats(json: bool) -> Result<i32> {
             "estimated net execution time saved: {} ms",
             stats.estimated_execution_ms_saved
         );
+        println!("gateway requests: {}", stats.requested);
+        println!("gateway provider executions: {}", stats.executed);
+        println!("gateway exact hits: {}", stats.exact_hits);
+        println!("gateway in-flight joins: {}", stats.inflight_joins);
+        println!(
+            "gateway provider calls avoided: {}",
+            stats.provider_calls_avoided
+        );
+        println!(
+            "gateway false-hit quarantines: {}",
+            stats.false_hit_quarantines
+        );
+        println!(
+            "estimated gateway execution time saved: {} ms",
+            stats.estimated_execution_time_saved_ms
+        );
     }
     Ok(0)
 }
@@ -2315,6 +2401,7 @@ fn doctor(json: bool) -> Result<i32> {
         println!("Again {}", report.version);
         println!("executable: {}", report.executable);
         println!("state: {}", report.state_dir);
+        println!("state writable: {}", report.state_writable);
         println!("policy: {}", report.policy_version);
         println!(
             "audited Apple tool profile: {}",
@@ -2441,6 +2528,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "team-alpha")]
     #[test]
     fn team_cli_requires_explicit_profile_and_command_delimiter() {
         let parsed = Cli::try_parse_from([

@@ -519,16 +519,21 @@ def _shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
-def _expected_local_cli(client: str, arguments: Sequence[str]) -> str:
+def _expected_local_cli(
+    client: str, executable: pathlib.Path, arguments: Sequence[str]
+) -> str:
     prefix = (
-        "codex mcp add again -- again"
+        "codex mcp add again --"
         if client == "codex"
-        else "claude mcp add -s user again -- again"
+        else "claude mcp add -s user again --"
     )
-    return prefix + "".join(f" {_shell_quote(argument)}" for argument in arguments)
+    values = [str(executable), *arguments]
+    return prefix + "".join(f" {_shell_quote(argument)}" for argument in values)
 
 
-def _expected_config_document(client: str, arguments: Sequence[str]) -> str:
+def _expected_config_document(
+    client: str, executable: pathlib.Path, arguments: Sequence[str]
+) -> str:
     if client == "codex":
         encoded = ", ".join(
             json.dumps(argument, ensure_ascii=False, separators=(",", ":"))
@@ -537,7 +542,7 @@ def _expected_config_document(client: str, arguments: Sequence[str]) -> str:
         return (
             "# Created and wholly owned by Again gateway setup v2.\n"
             "[mcp_servers.again]\n"
-            "command = \"again\"\n"
+            f"command = {json.dumps(str(executable), ensure_ascii=False, separators=(',', ':'))}\n"
             f"args = [{encoded}]\n"
         )
     return (
@@ -546,7 +551,7 @@ def _expected_config_document(client: str, arguments: Sequence[str]) -> str:
                 "mcpServers": {
                     "again": {
                         "args": list(arguments),
-                        "command": "again",
+                        "command": str(executable),
                         "type": "stdio",
                     }
                 }
@@ -565,13 +570,15 @@ def validate_setup_plan(
     client: str,
     workspace: pathlib.Path,
     config_path: pathlib.Path,
+    executable: pathlib.Path,
 ) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise HarnessRefusal("setup_plan_invalid", "setup plan is not an object")
     stdio = value.get("stdio")
     expected_args = ["mcp", "serve", "--workspace", str(workspace)]
     expected_owner = config_path.with_name(config_path.name + OWNER_SUFFIX)
-    expected_document = _expected_config_document(client, expected_args)
+    executable = executable.resolve(strict=True)
+    expected_document = _expected_config_document(client, executable, expected_args)
     expected_owner_digest = expected_ownership_digest(
         client=client,
         config_path=config_path,
@@ -600,9 +607,10 @@ def validate_setup_plan(
         or not isinstance(stdio, dict)
         or set(stdio) != {"transport", "command", "args"}
         or stdio.get("transport") != "stdio"
-        or stdio.get("command") != "again"
+        or stdio.get("command") != str(executable)
         or stdio.get("args") != expected_args
-        or value.get("local_cli_command") != _expected_local_cli(client, expected_args)
+        or value.get("local_cli_command")
+        != _expected_local_cli(client, executable, expected_args)
         or value.get("workspace") != str(workspace)
         or value.get("config_path") != str(config_path)
         or value.get("ownership_path") != str(expected_owner)
@@ -617,7 +625,11 @@ def validate_setup_plan(
         document = strict_json_loads(value["config_document"].encode("utf-8"))
         expected = {
             "mcpServers": {
-                "again": {"args": expected_args, "command": "again", "type": "stdio"}
+                "again": {
+                    "args": expected_args,
+                    "command": str(executable),
+                    "type": "stdio",
+                }
             }
         }
         if document != expected:
@@ -715,6 +727,7 @@ def installed_stdio_command(
     client: str,
     config_path: pathlib.Path,
     workspace: pathlib.Path,
+    executable: pathlib.Path,
     expected_document: str,
 ) -> tuple[str, list[str]]:
     """Parse the exact installed file and derive the command actually launched."""
@@ -727,12 +740,16 @@ def installed_stdio_command(
         value = strict_json_loads(raw)
         expected = {
             "mcpServers": {
-                "again": {"args": expected_args, "command": "again", "type": "stdio"}
+                "again": {
+                    "args": expected_args,
+                    "command": str(executable),
+                    "type": "stdio",
+                }
             }
         }
         if value != expected:
             raise HarnessRefusal("installed_config_invalid", "installed Claude topology changed")
-        return "again", list(value["mcpServers"]["again"]["args"])
+        return str(executable), list(value["mcpServers"]["again"]["args"])
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as error:
@@ -741,13 +758,13 @@ def installed_stdio_command(
     if len(lines) != 4 or lines[:3] != [
         "# Created and wholly owned by Again gateway setup v2.",
         "[mcp_servers.again]",
-        'command = "again"',
+        f"command = {json.dumps(str(executable), ensure_ascii=False, separators=(',', ':'))}",
     ] or not lines[3].startswith("args = "):
         raise HarnessRefusal("installed_config_invalid", "installed Codex topology changed")
     arguments = strict_json_loads(lines[3][len("args = ") :].encode("utf-8"))
     if arguments != expected_args:
         raise HarnessRefusal("installed_config_invalid", "installed Codex arguments changed")
-    return "again", list(arguments)
+    return str(executable), list(arguments)
 
 
 def remove_exact_owned_pair(config_path: pathlib.Path, plan: Mapping[str, Any]) -> dict[str, Any]:
@@ -787,19 +804,17 @@ class ConfiguredMcpSession:
             client=client,
             config_path=config_path,
             workspace=workspace,
+            executable=binary,
             expected_document=str(plan["config_document"]),
         )
         stdio = plan["stdio"]
-        if command != "again" or arguments != [
+        if command != str(binary) or arguments != [
             "mcp",
             "serve",
             "--workspace",
             str(workspace),
         ] or stdio != {"transport": "stdio", "command": command, "args": arguments}:
             raise HarnessRefusal("configured_command_invalid", "installed command changed")
-        resolved = pathlib.Path(environment["PATH"].split(os.pathsep, 1)[0]) / "again"
-        if resolved.resolve() != binary.resolve():
-            raise HarnessRefusal("configured_binary_mismatch", "installed command does not resolve to pinned binary")
         self.argv = (command, *arguments)
         self.label = label
         self.timeout_seconds = timeout_seconds
@@ -1066,6 +1081,7 @@ def _install_and_verify(
         client=client,
         workspace=workspace,
         config_path=config_path,
+        executable=binary,
     )
     config = inspect_private_regular(config_path, plan["config_document"].encode("utf-8"))
     owner_path = pathlib.Path(plan["ownership_path"])
@@ -1089,6 +1105,7 @@ def _install_and_verify(
         client=client,
         workspace=workspace,
         config_path=config_path,
+        executable=binary,
     )
     if repeated_plan != plan or before != (
         read_private_regular(config_path, MAX_CONFIG_BYTES)[0],
@@ -1317,6 +1334,7 @@ def run_onboarding_smoke(
                 client=client,
                 workspace=workspace,
                 config_path=default_path,
+                executable=pinned.executable_path,
             )
             owner_path = default_path.with_name(default_path.name + OWNER_SUFFIX)
             if default_path.exists() or default_path.is_symlink() or owner_path.exists() or owner_path.is_symlink():

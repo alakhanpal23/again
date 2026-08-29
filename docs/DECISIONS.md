@@ -8,7 +8,7 @@ The production Codex hook returns before reading or parsing stdin and emits no a
 
 ## D-002 — Trust executable identity, not `PATH` names
 
-The macOS `strict-read-v0.5` profile accepts exact Apple system paths only when each tool's BLAKE3 and the exact reviewed `SystemVersion.plist` BLAKE3 match. Codex-bundled ripgrep additionally requires its exact canonical bundle path shape, exact binary BLAKE3, and the same OS profile. Codesign identifier/team output is descriptive provenance metadata rather than strict signature or byte-authentication evidence. Unknown tool or OS updates fail closed until a new profile is reviewed. Explicit `again run -- cat ...` resolves a bare name from the actual tool-shell context and then validates that identity. Dormant hook plumbing requires `argv[0]` to already be an explicit absolute audited path, but that guard does not enable automatic rewriting. Executable identity and semantic profile are bound into the request key and proof.
+The macOS `strict-read-v0.5` profile accepts exact Apple system paths only when each tool's BLAKE3 and one exact reviewed `SystemVersion.plist` BLAKE3 match. The reviewed Apple profiles are `macos-15.6.1-24G90-read-v0` and `macos-26.5-25F71-read-v0`; their tool digests and semantic identities remain separate. Codex ripgrep additionally requires an exact reviewed bundle or standalone-package path shape, exact binary BLAKE3, and the same OS profile. Codesign identifier/team output is descriptive provenance metadata rather than strict signature or byte-authentication evidence. Unknown tool, package-layout, or OS updates fail closed until a new profile is reviewed. Explicit `again run -- cat ...` resolves a bare name from the actual tool-shell context and then validates that identity. Dormant hook plumbing requires `argv[0]` to already be an explicit absolute audited path, but that guard does not enable automatic rewriting. Executable identity and semantic profile are bound into the request key and proof.
 
 ## D-003 — Every ripgrep request fixes ignore and output-order inputs
 
@@ -91,3 +91,41 @@ Release artifacts may install and expose diagnostics on Linux or an unknown macO
 ## D-022 — Team bundles stream only after an object-identity fence
 
 The two-request team lookup keeps the 16 MiB ciphertext limit but may not materialize ciphertext-sized JavaScript buffers in the Worker. A successful upload binds the R2-returned version, ETag, R2-verified SHA-256, size, storage key, and random blob incarnation into D1. Lookup obtains conditional R2 body streams, checks that metadata, and then runs one final D1 query binding the same repository generation, manifest, trust head, blob incarnations, and R2 identities. Only after that fence may the response stream begin. This follows the 128 MiB-per-isolate Workers limit, which is shared across concurrent requests, while retaining client-side BLAKE3, AEAD, signed-manifest, local privacy, and post-decryption trust verification as the plaintext-release authority. Lowering the output limit merely to accommodate buffering would narrow the product without fixing the architecture.
+
+## D-023 — The product unit is a successful coding task
+
+Again optimizes time and total cost per successful coding task, not cache-hit
+percentage. Repository orientation, tool execution, context delivery,
+validation, and cross-agent knowledge are one acceleration loop. Evaluation
+freezes the agent/model, repository snapshot, task, limits, and outcome rubric,
+then measures task wall time, provider calls, provider-reported tokens,
+validation compute, and total metered cost. A byte count, hit, skipped process,
+or model-generated relevance score cannot alone establish task savings or reuse
+authority. Unknown dependencies execute normally, and a task-level improvement
+cannot compensate for an incorrect hit, stale fact, or weaker validation
+outcome.
+
+## D-024 — Every reusable action gets a profile, not a generic cache
+
+A repeated tool or command is a candidate for optimization, not evidence that
+its old result remains valid. Repository reads, language queries, tests,
+linters, builds, and artifacts may share the universal coordination, storage,
+delivery, and accounting control plane, but each family requires its own
+canonical request, complete dependency observer, effect boundary, executable
+and toolchain identity, immutable result, and fresh validator. Unknown or
+incomplete profiles execute normally. Workspace mutations invalidate dependent
+knowledge and are not replayed; credentials, communication, deployment,
+payment, and other external side effects bypass result reuse. This prevents
+coverage growth from turning Again into an unsafe generic command cache.
+
+## D-025 — Optimize the first correct edit, not the planning transcript
+
+The default task-start product emits one bounded verified edit brief and does
+not require a generic prose plan. Its synchronous path is local and performs no
+model call, network access, build, or test. Optional indexing and semantic
+ranking cannot block the brief or promote a candidate to current truth. If the
+complete orientation is unavailable, Again returns the verified subset with
+explicit unknowns and lets the agent inspect or edit normally. Product
+evaluation measures time to the first edit retained in the accepted patch and
+the final validated outcome together; an earlier incorrect edit, fewer tool
+calls, or a smaller transcript cannot close the gate by itself.

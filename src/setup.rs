@@ -6,10 +6,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "hook")]
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
+#[cfg(feature = "hook")]
 const HOOK_SENTINEL: &str = "AGAIN_CODEX_HOOK_V1=1";
+#[cfg(feature = "hook")]
 const SNAPSHOT_SCHEMA: &str = "again.codex-hook-snapshot.v1";
 const SKILL_SNAPSHOT_SCHEMA: &str = "again.codex-skill-snapshot.v1";
 const CODEX_SKILL_NAME: &str = "again";
@@ -48,6 +51,7 @@ pub enum SetupScope {
     Project,
 }
 
+#[cfg(feature = "hook")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HookChange {
     pub path: PathBuf,
@@ -80,6 +84,7 @@ impl CodexSkillScopeStatus {
     }
 }
 
+#[cfg(feature = "hook")]
 /// Installation state across the two Codex hook scopes. Consumers such as
 /// `doctor` can surface an explicit warning when both are active.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,12 +95,14 @@ pub struct CodexHookScopeStatus {
     pub project_installed: bool,
 }
 
+#[cfg(feature = "hook")]
 impl CodexHookScopeStatus {
     pub fn duplicate_again_hooks(&self) -> bool {
         self.global_path != self.project_path && self.global_installed && self.project_installed
     }
 }
 
+#[cfg(feature = "hook")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct HookSnapshot {
     schema: String,
@@ -450,6 +457,7 @@ fn set_skill_file_permissions(_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "hook")]
 pub fn hook_path(scope: SetupScope, project: Option<&Path>) -> Result<PathBuf> {
     match scope {
         SetupScope::Global => {
@@ -467,6 +475,7 @@ pub fn hook_path(scope: SetupScope, project: Option<&Path>) -> Result<PathBuf> {
 }
 
 /// Inspect whether Again is active in each distinct Codex scope.
+#[cfg(feature = "hook")]
 pub fn codex_hook_scope_status(
     global_path: &Path,
     project_path: &Path,
@@ -479,6 +488,7 @@ pub fn codex_hook_scope_status(
     })
 }
 
+#[cfg(feature = "hook")]
 pub fn install_codex_hook(path: &Path, executable: &Path, dry_run: bool) -> Result<HookChange> {
     let original_bytes = if path.exists() {
         Some(fs::read(path).with_context(|| format!("read {}", path.display()))?)
@@ -544,6 +554,7 @@ pub fn install_codex_hook(path: &Path, executable: &Path, dry_run: bool) -> Resu
     })
 }
 
+#[cfg(feature = "hook")]
 pub fn remove_codex_hook(path: &Path, dry_run: bool) -> Result<HookChange> {
     let current_bytes = if path.exists() {
         Some(fs::read(path).with_context(|| format!("read {}", path.display()))?)
@@ -602,6 +613,7 @@ pub fn remove_codex_hook(path: &Path, dry_run: bool) -> Result<HookChange> {
     })
 }
 
+#[cfg(feature = "hook")]
 fn event_contains_again_handler(document: &Value, event: &str) -> bool {
     document
         .pointer(&format!("/hooks/{event}"))
@@ -614,18 +626,21 @@ fn event_contains_again_handler(document: &Value, event: &str) -> bool {
         .any(|command| command.contains(HOOK_SENTINEL))
 }
 
+#[cfg(feature = "hook")]
 fn document_contains_any_again_handler(document: &Value) -> bool {
     ["PreToolUse", "PreCompact", "PostCompact"]
         .iter()
         .any(|event| event_contains_again_handler(document, event))
 }
 
+#[cfg(feature = "hook")]
 fn document_contains_complete_again_hook(document: &Value) -> bool {
     ["PreToolUse", "PreCompact", "PostCompact"]
         .iter()
         .all(|event| event_contains_again_handler(document, event))
 }
 
+#[cfg(feature = "hook")]
 fn is_empty_again_scaffold(document: &Value) -> bool {
     document
         == &json!({
@@ -634,6 +649,7 @@ fn is_empty_again_scaffold(document: &Value) -> bool {
         })
 }
 
+#[cfg(feature = "hook")]
 pub fn is_codex_hook_installed(path: &Path) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
@@ -642,6 +658,7 @@ pub fn is_codex_hook_installed(path: &Path) -> Result<bool> {
     Ok(document_contains_complete_again_hook(&document))
 }
 
+#[cfg(feature = "hook")]
 fn read_document(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(json!({
@@ -658,6 +675,7 @@ fn read_document(path: &Path) -> Result<Value> {
     Ok(value)
 }
 
+#[cfg(feature = "hook")]
 fn hooks_object(document: &mut Value) -> Result<&mut Map<String, Value>> {
     let root = document
         .as_object_mut()
@@ -668,6 +686,7 @@ fn hooks_object(document: &mut Value) -> Result<&mut Map<String, Value>> {
         .ok_or_else(|| anyhow!("hooks field must be an object"))
 }
 
+#[cfg(feature = "hook")]
 fn add_again_handler(document: &mut Value, executable: &Path) -> Result<()> {
     let executable = executable
         .canonicalize()
@@ -693,6 +712,7 @@ fn add_again_handler(document: &mut Value, executable: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "hook")]
 fn add_again_event_handler(
     hooks: &mut Map<String, Value>,
     event: &str,
@@ -716,6 +736,7 @@ fn add_again_event_handler(
     Ok(())
 }
 
+#[cfg(feature = "hook")]
 fn remove_again_handlers(document: &mut Value) -> Result<usize> {
     let hooks = hooks_object(document)?;
     let mut removed = 0;
@@ -749,6 +770,7 @@ fn remove_again_handlers(document: &mut Value) -> Result<usize> {
     Ok(removed)
 }
 
+#[cfg(feature = "hook")]
 fn shell_quote_path(path: &Path) -> Result<String> {
     let value = path
         .to_str()
@@ -762,6 +784,7 @@ fn shell_quote_path(path: &Path) -> Result<String> {
     Ok(format!("'{}'", value.replace('\'', "'\\''")))
 }
 
+#[cfg(feature = "hook")]
 fn backup_existing(path: &Path) -> Result<Option<PathBuf>> {
     if !path.exists() {
         return Ok(None);
@@ -773,15 +796,18 @@ fn backup_existing(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(backup))
 }
 
+#[cfg(feature = "hook")]
 fn snapshot_path(path: &Path) -> PathBuf {
     path.with_extension("json.again-original-v1")
 }
 
+#[cfg(feature = "hook")]
 fn write_snapshot(path: &Path, snapshot: &HookSnapshot) -> Result<()> {
     let bytes = serde_json::to_vec(snapshot)?;
     atomic_write(&snapshot_path(path), &bytes)
 }
 
+#[cfg(feature = "hook")]
 fn read_snapshot(path: &Path) -> Result<Option<HookSnapshot>> {
     let path = snapshot_path(path);
     if !path.exists() {
@@ -797,6 +823,7 @@ fn read_snapshot(path: &Path) -> Result<Option<HookSnapshot>> {
     Ok(Some(snapshot))
 }
 
+#[cfg(feature = "hook")]
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -818,31 +845,30 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "hook", unix))]
 fn set_private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "hook", not(unix)))]
 fn set_private_dir(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "hook", unix))]
 fn set_private_file(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "hook", not(unix)))]
 fn set_private_file(_path: &Path) -> Result<()> {
     Ok(())
 }
-
-#[cfg(test)]
+#[cfg(all(test, feature = "hook"))]
 mod tests {
     use super::*;
     use tempfile::TempDir;

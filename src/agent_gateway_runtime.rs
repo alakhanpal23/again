@@ -54,9 +54,9 @@ use crate::mcp_gateway::{
 use crate::store::{
     GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
     GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayReasoningContextQueryV1,
-    GatewayRouteProofObservationV1, GatewayServedRouteV1, GatewayStats, Store,
-    ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayFullResultV1, GatewayHeartbeat, GatewayOperationDispositionV1,
+    GatewayReasoningContextQueryV1, GatewayRouteProofObservationV1, GatewayServedRouteV1,
+    GatewayStats, Store, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -78,6 +78,7 @@ const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
 const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_millis(250);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
+const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
 const INTERNAL_REASONING_CONTEXT_TOKEN_V1: &str = "__again_internal_reasoning_context_v1";
 
 struct RuntimeReasoningContextV1 {
@@ -270,6 +271,18 @@ pub(crate) struct GatewayControlledProviderV1 {
     store: Arc<Mutex<Store>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
     pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
+    recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
+}
+
+#[derive(Clone)]
+struct RecentGatewayCandidateV1 {
+    binding: ValidatedGatewayReadV1,
+    gateway_result_id: String,
+}
+
+struct LoadedGatewayResultV1 {
+    value: Value,
+    full: GatewayFullResultV1,
 }
 
 struct ActiveRegistrationV1<'a> {
@@ -299,6 +312,7 @@ impl GatewayControlledProviderV1 {
             store,
             active: Mutex::new(BTreeMap::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
+            recent_candidates: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -339,6 +353,48 @@ impl GatewayControlledProviderV1 {
         format!("mcp:{}", &hasher.finalize().to_hex()[..32])
     }
 
+    fn recent_candidate_key(call: &ProviderCall) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"again.gateway.recent-candidate.v1\0");
+        hasher.update(call.translation.canonical_digest());
+        hasher.update(call.authorization_scope.as_str().as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+
+    fn recent_candidate(&self, key: &str) -> Option<RecentGatewayCandidateV1> {
+        self.recent_candidates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    fn remember_candidate(
+        &self,
+        call: &ProviderCall,
+        binding: &ValidatedGatewayReadV1,
+        gateway_result_id: &str,
+    ) {
+        let key = Self::recent_candidate_key(call);
+        let mut recent = self
+            .recent_candidates
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if !recent.contains_key(&key)
+            && recent.len() >= MAX_RECENT_GATEWAY_CANDIDATES_V1
+            && let Some(oldest_key) = recent.keys().next().cloned()
+        {
+            recent.remove(&oldest_key);
+        }
+        recent.insert(
+            key,
+            RecentGatewayCandidateV1 {
+                binding: binding.clone(),
+                gateway_result_id: gateway_result_id.to_owned(),
+            },
+        );
+    }
+
     fn remember_active(
         &self,
         logical_call_id: &str,
@@ -356,24 +412,37 @@ impl GatewayControlledProviderV1 {
         }
     }
 
-    fn load_exact(
+    fn load_stored_exact(
         &self,
-        resolved: &ResolvedRequestV1,
+        binding: &ValidatedGatewayReadV1,
         gateway_result_id: &str,
-        call: &ProviderCall,
-    ) -> Result<Option<Value>> {
+    ) -> Result<Option<LoadedGatewayResultV1>> {
         let store = self
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let Some(result) = store.get_gateway_result(&resolved.binding, gateway_result_id)? else {
+        let Some(full) = store.get_gateway_result(binding, gateway_result_id)? else {
             return Ok(None);
         };
-        let value: Value = serde_json::from_slice(&result.stdout)
-            .context("decode exact gateway provider result")?;
+        let value: Value =
+            serde_json::from_slice(&full.stdout).context("decode exact gateway provider result")?;
+        Ok(Some(LoadedGatewayResultV1 { value, full }))
+    }
+
+    fn attach_loaded_exact(
+        &self,
+        resolved: &ResolvedRequestV1,
+        call: &ProviderCall,
+        loaded: LoadedGatewayResultV1,
+    ) -> Value {
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
         let reasoning = reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
             .ok()
             .flatten();
+        drop(store);
         let reasoning_token = reasoning.and_then(|reasoning| {
             let mut pending = self
                 .pending_reasoning
@@ -386,12 +455,23 @@ impl GatewayControlledProviderV1 {
             pending.insert(token.clone(), reasoning);
             Some(token)
         });
-        Ok(Some(attach_result_reference_v1(
-            value,
-            gateway_result_id,
-            &result.result,
+        attach_result_reference_v1(
+            loaded.value,
+            &loaded.full.gateway_result_id,
+            &loaded.full.result,
             reasoning_token.as_deref(),
-        )))
+        )
+    }
+
+    fn load_exact(
+        &self,
+        resolved: &ResolvedRequestV1,
+        gateway_result_id: &str,
+        call: &ProviderCall,
+    ) -> Result<Option<Value>> {
+        Ok(self
+            .load_stored_exact(&resolved.binding, gateway_result_id)?
+            .map(|loaded| self.attach_loaded_exact(resolved, call, loaded)))
     }
 
     fn execute_as_leader(
@@ -513,7 +593,14 @@ impl GatewayControlledProviderV1 {
                     | Ok(GatewayCompletion::AlreadyCompleted {
                         gateway_result_id, ..
                     }) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
-                        Ok(Some(exact)) => Ok(exact),
+                        Ok(Some(exact)) => {
+                            self.remember_candidate(
+                                &verification_call,
+                                &resolved.binding,
+                                &gateway_result_id,
+                            );
+                            Ok(exact)
+                        }
                         Ok(None) | Err(_) => Ok(value),
                     },
                     Ok(_) | Err(_) => Ok(value),
@@ -569,12 +656,16 @@ impl GatewayControlledProviderV1 {
                     let loaded =
                         self.load_exact(resolved, &gateway_result_id, call)
                             .map_err(|_| {
-                                ProviderError(McpError::typed(
-                                    McpErrorCode::InternalError,
-                                    "verified gateway result became unavailable",
-                                ))
+                                ProviderError::gateway_authored(
+                                    McpError::typed(
+                                        McpErrorCode::InternalError,
+                                        "verified gateway result became unavailable",
+                                    )
+                                    .with_data(json!({ "reason": "verified_result_unavailable" })),
+                                )
                             });
                     if matches!(loaded, Ok(Some(_))) {
+                        self.remember_candidate(call, &resolved.binding, &gateway_result_id);
                         let _ = self
                             .store
                             .lock()
@@ -711,6 +802,18 @@ impl ToolExecution for GatewayControlledProviderV1 {
         if call.effect != EffectClass::ReadOnly {
             return self.execute_direct(&epoch, call, secrets, true);
         }
+        // Preload only a previously verified candidate. Reuse authority still
+        // comes later from a fresh descriptor-bound observation and the exact
+        // current coordinator proof. Loading first lets that observation be
+        // the final filesystem check instead of repeating the whole tree.
+        let preloaded = self
+            .recent_candidate(&Self::recent_candidate_key(&call))
+            .and_then(|candidate| {
+                self.load_stored_exact(&candidate.binding, &candidate.gateway_result_id)
+                    .ok()
+                    .flatten()
+                    .map(|loaded| (candidate, loaded))
+            });
         let Some(resolved) = self.resolve(&epoch, &call) else {
             return self.execute_direct(&epoch, call, secrets, true);
         };
@@ -745,6 +848,23 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     _ => GatewayDecision::Execute,
                 };
                 if decision == GatewayDecision::ServeExact {
+                    if let Some((candidate, loaded)) = preloaded
+                        && candidate.binding.binding_digest() == resolved.binding.binding_digest()
+                        && candidate.gateway_result_id == gateway_result_id
+                    {
+                        let value = self.attach_loaded_exact(&resolved, &call, loaded);
+                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
+                        let _ = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .record_gateway_route_served(
+                                &call_id,
+                                &gateway_result_id,
+                                GatewayServedRouteV1::Exact,
+                            );
+                        return Ok(value);
+                    }
                     let value = self.load_exact(&resolved, &gateway_result_id, &call);
                     let revalidated = self.resolve(&epoch, &call);
                     if revalidated
@@ -753,6 +873,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
                     {
+                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
                         let _ = self
                             .store
                             .lock()
@@ -1507,25 +1628,35 @@ fn now_millis_i64_v1() -> i64 {
 
 fn invalid_arguments_v1(error: impl std::fmt::Display) -> ProviderError {
     let _ = error;
-    ProviderError(McpError::typed(
-        McpErrorCode::InvalidParams,
-        "invalid repository tool arguments",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(
+            McpErrorCode::InvalidParams,
+            "invalid repository tool arguments",
+        )
+        .with_data(json!({
+            "reason": "invalid_repository_arguments",
+            "hint": "Check this tool's inputSchema from tools/list"
+        })),
+    )
 }
 
 fn provider_io_v1(error: impl std::fmt::Display) -> ProviderError {
     let _ = error;
-    ProviderError(McpError::typed(
-        McpErrorCode::InternalError,
-        "repository observation failed",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(McpErrorCode::InternalError, "repository observation failed").with_data(
+            json!({
+                "reason": "repository_observation_failed",
+                "retryable": true
+            }),
+        ),
+    )
 }
 
 fn cancelled_provider_error_v1() -> ProviderError {
-    ProviderError(McpError::typed(
-        McpErrorCode::RequestCancelled,
-        "gateway call cancelled",
-    ))
+    ProviderError::gateway_authored(
+        McpError::typed(McpErrorCode::RequestCancelled, "gateway call cancelled")
+            .with_data(json!({ "reason": "gateway_call_cancelled" })),
+    )
 }
 
 #[cfg(test)]
@@ -1619,8 +1750,12 @@ mod product_tests {
     }
 
     fn context(id: &str) -> GatewayRequestContext {
+        context_with_scope(id, "shared-repository-scope")
+    }
+
+    fn context_with_scope(id: &str, scope: &str) -> GatewayRequestContext {
         GatewayRequestContext::new(
-            AuthorizationScopeId::new("shared-repository-scope").unwrap(),
+            AuthorizationScopeId::new(scope).unwrap(),
             LogicalCallId::new(id).unwrap(),
         )
     }
@@ -1722,6 +1857,67 @@ mod product_tests {
         assert_ne!(first["result"], relevant["result"]);
         assert_eq!(relevant["result"]["content"][0]["text"], "second");
         assert_eq!(gateway.stats().unwrap().executed, 2);
+    }
+
+    #[test]
+    fn warm_preload_is_partitioned_by_authorization_scope() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same").unwrap();
+        let state = TempDir::new().unwrap();
+        let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
+        let repository = Arc::new(RepositoryProviderV1::new(workspace.path()).unwrap());
+        let controlled = Arc::new(GatewayControlledProviderV1::new(
+            repository,
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+        ));
+        let registered: Arc<dyn UpstreamProvider> = controlled.clone();
+        let gateway = McpGateway::new(
+            vec![ProviderRegistration::trusted_annotations(registered)],
+            GatewayLimits::default(),
+        )
+        .unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        assert!(
+            gateway
+                .process_bytes(
+                    initialize,
+                    &context_with_scope("init", "scope-a"),
+                    EphemeralSecrets::default(),
+                )
+                .is_some()
+        );
+        let call = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        for (id, scope) in [
+            ("a-cold", "scope-a"),
+            ("b-cold", "scope-b"),
+            ("a-warm", "scope-a"),
+        ] {
+            assert!(
+                gateway
+                    .process_bytes(
+                        call,
+                        &context_with_scope(id, scope),
+                        EphemeralSecrets::default(),
+                    )
+                    .is_some()
+            );
+        }
+        let stats = store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.executed, 2);
+        assert_eq!(stats.exact_hits, 1);
+        assert_eq!(
+            controlled
+                .recent_candidates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .len(),
+            2
+        );
     }
 
     #[test]

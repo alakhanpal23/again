@@ -33,6 +33,7 @@ apply across the local, Linux trace-backed, and team paths:
 | Plane | Current implementation | Missing authority/product step |
 |---|---|---|
 | Agent tool-call gateway | Experimental bounded MCP stdio server with canonical tool translation, descriptor-retained repository authority, 13 built-in repository/Git tools, SQLite/CAS coordination, post-proof exact reuse/in-flight joining, bounded queues, session cancellation, crash recovery, corruption quarantine, workspace-bound setup, a conservative universal tool policy, Git external-dependency/nested-control refusal and executable-configuration preflight, a bounded crate-internal real-upstream stdio transport, additive schema-v10 receipt/grant storage, verified shared-reasoning read models, a crate-internal write-and-flush-bound reasoning delivery composition, durable envelope-deduplicated metrics verification, release-binary product/onboarding/chaos evidence, a partial real-repository corpus, an outside-trial verifier, and an offline real-agent plan | CLI registration for allowlisted upstream providers, transport-authenticated recipient issuance, recipient-bound full retrieval and exact compact-presentation receipts on the public MCP path, deterministic semantic-candidate validation, a complete four-language real-repository corpus, five-user outside evidence, live Codex/Claude task-quality evaluation, and production qualification |
+| Agent knowledge and context | Internal typed repository/task facts, invalidated facts, source references, bounded deterministic reasoning-brief compilation, and authenticated test-only full/compact delivery composition | Fact admission from live verified observations, public task-start brief, transport-authenticated recipients, lifecycle-safe delta delivery, and real-agent quality/cost evidence |
 | Explicit local reads | Working macOS MVP with strict policy, exact executable/profile checks, SQLite/CAS, double-run admission, complete-stream replay, explicit references, and reversible Codex skill | audited multi-host profile registry, signed distribution, and outside-alpha evidence |
 | Linux snapshots | Descriptor-stable enumeration, charged materialization, canonical workspace/runtime-tree publication, reopened-child binding, a descriptor-bound `.venv/bin/python` checkpoint, and a bounded two-publication structural runtime inventory exist internally | model complete loader search/cache/preload/hwcaps semantics, content-addressed snapshot identity, live connector composition, and `SnapshotProvider` |
 | Linux isolation | Private-root, bounded scratch/procfs, descriptor scrub, credential normalization, capability elimination, authenticated child-only continuation, Landlock, terminal seccomp, and fixed ptrace diagnostics exist as hidden leaves; a command-free connector now consumes the real runtime checkpoint, attaches and reauthenticates both published roots, transfers the exact stopped child and its cleanup guard through `PTRACE_SEIZE`/`PTRACE_INTERRUPT` to an opaque supervisor owner, and preserves terminate/reap-before-drain cancellation | install and read back the workload filter on that same held child, add a fixed one-use command release, supervise the complete task tree, and deliver foreground results in a provisioned launch |
@@ -43,7 +44,31 @@ apply across the local, Linux trace-backed, and team paths:
 The status of each row is normative only through [STATUS.md](STATUS.md). The
 phase ordering and exit gates are in [ROADMAP.md](ROADMAP.md).
 
-## Experimental gateway authority chain
+## Target agent acceleration loop
+
+```text
+task + authenticated recipient
+  -> current repository snapshot and change set
+  -> retrieve candidate results, facts, and prior investigations
+  -> deterministic dependency validation and invalidation
+  -> bounded verified orientation brief
+  -> agent reads and edits normally
+  -> observe the changed dependency closure
+  -> validation plan
+       |- affected or uncertain work -> execute
+       `- exact promoted proof       -> reuse
+  -> store immutable results, facts, invalidations, and provenance
+  -> recipient-bound full or proven-delta delivery
+```
+
+This loop is the architecture behind the product outcome in
+[AGENT_ACCELERATION.md](AGENT_ACCELERATION.md). Each arrow is an authority
+transition. A semantic index or model may rank candidate context, tests, or
+prior investigations, but the deterministic validation step decides whether
+they are current. The loop must fall back to ordinary agent/tool execution when
+identity, dependency, recipient, delivery, or cleanup state is unknown.
+
+## Gateway authority chain
 
 ```text
 MCP JSON-RPC frame
@@ -196,7 +221,7 @@ Automatic `PreToolUse` rewriting is disabled; the normal hook returns before rea
 - **Policy:** deterministic, versioned, deny-by-default parser with stable reason codes.
 - **Codex skill:** instruction-only onboarding for explicit `again run` and caller-asserted `again reference`; it does not modify hooks or execute commands itself.
 - **Experimental adapter:** dormant parser/handoff plumbing for the audited Codex `PreToolUse`, `PreCompact`, and `PostCompact` JSON shapes with unknown-field rejection. Production returns before stdin read/parse and emits nothing; only the explicit unsafe test flag reaches this adapter.
-- **Executable verifier:** rejects PATH/basename spoofing. `strict-read-v0.5` accepts only each exact reviewed Apple system path and binary BLAKE3 under the exact `macos-15.6.1-24G90-read-v0` `SystemVersion.plist` BLAKE3. Ripgrep additionally requires the exact canonical Codex bundle path shape, exact binary BLAKE3, and `codex-rg-15.2.0-e89fff89ac-arm64-read-v0` profile. Codesign identifier/team fields are descriptive metadata only, not strict signature validity or the byte-authentication boundary. Unknown updates fail closed. Installation on Linux or unknown macOS does not enable reuse; doctor reports unsupported until a backend/profile is audited.
+- **Executable verifier:** rejects PATH/basename spoofing. `strict-read-v0.5` accepts only each exact reviewed Apple system path and binary BLAKE3 under an exact reviewed `SystemVersion.plist` BLAKE3. The supported Apple identities are `macos-15.6.1-24G90-read-v0` and `macos-26.5-25F71-read-v0`, with separate tool-digest tables. Ripgrep additionally requires an exact reviewed Codex bundle or standalone-package path shape and binary BLAKE3; the installed standalone Codex `0.150.1` profile is distinct from the original bundled-ripgrep profile. Codesign identifier/team fields are descriptive metadata only, not strict signature validity or the byte-authentication boundary. Unknown updates fail closed. Installation on Linux or unknown macOS does not enable reuse; doctor reports unsupported until a backend/profile is audited.
 - **Fingerprinter:** samples canonical argv, admitted content/listing paths, executable, platform/profile, policy version, and plaintext-free domain-separated environment digests. It refuses any present loader/instrumentation/locale/terminal/timezone override in the `DYLD_*`, `LD_*`, `Malloc*`, `MALLOC_*`, sanitizer-option, `GCONV_PATH`, `LOCPATH`, `NLSPATH`, `PATH_LOCALE`, `TERMCAP`, `TERMINFO`/`TERMINFO_DIRS`, or `TZDIR` set because their referenced bytes are outside the scoped observation. A separate runtime-context digest binds real/effective uid/gid, the supplementary-group vector, macOS soft/hard `CPU`, `FSIZE`, `DATA`, `STACK`, `CORE`, `RSS`, `MEMLOCK`, `NPROC`, `NOFILE`, and `AS` limits, plus the signal mask and disposition/flag class through signal 31. Both the cache key and stored proof bind this digest. Filesystem observations remain path-based rather than immutable, and the environment digests are not a secret-classification or high-entropy confidentiality boundary.
 - **Executor:** runs explicit argv from the actual local context, streams a cold execution live, and captures bounded exact bytes/status. Dormant hook plumbing can hand off an opaque stored call id. V0 admits only exit-zero results with empty stderr, complete stdout/stderr captures no larger than 16 MiB each, stable post-observations, and exact shadow agreement. It does not yet classify secret-bearing arguments or output.
 - **Index:** private SQLite WAL metadata with immediate transactions for concurrent compare/insert and foreign keys. Every hit semantically revalidates the result row and stored validation record against recomputed inputs; the row still lacks a cryptographic binding against a malicious same-user writer.

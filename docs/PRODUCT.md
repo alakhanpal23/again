@@ -4,11 +4,27 @@
 
 > Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
-This sentence is both the product pitch and the reuse boundary. The stable explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The experimental MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
+This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
+
+## Product outcome
+
+> Again helps coding agents start with verified repository understanding, avoid
+> repeating work, run only the validation that changed, and share exact
+> execution knowledge across agents.
+
+The product is optimized for lower time and lower total cost per successful
+coding task, not for cache-hit percentage. The complete end-state user loop,
+current implementation map, scorecard, and delivery order are frozen in
+[the agent acceleration product](AGENT_ACCELERATION.md). That direction does
+not upgrade an experimental subsystem or broaden any shipping claim below. The
+profile-by-profile inventory of reads, code intelligence, validation, builds,
+artifacts, mutations, and external actions is [the reuse surface](REUSE_SURFACE.md).
+The latency-critical task experience and its proof gate are defined by the
+[straight-to-code fast path](STRAIGHT_TO_CODE.md).
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The experimental gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative stable path.
+The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative local path.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
@@ -29,7 +45,7 @@ again reference -- rg --no-ignore --sort=path needle src
 
 Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
 
-The experimental MCP onboarding path is explicit and workspace-bound:
+The MCP onboarding path is explicit and workspace-bound:
 
 ```bash
 again mcp setup --client codex --workspace /canonical/repository
@@ -62,7 +78,7 @@ bootstrap artifact, not a signed trust bundle or public onboarding flow.
 
 ## v0 admission boundary
 
-The macOS-compatible `strict-read-v0.5` slice admits only strictly parsed read-only `again run` invocations from a small allowlist and verifies executable identity. It may resolve a bare audited name such as `cat`, but admission requires the exact reviewed Apple-tool BLAKE3 and exact reviewed `SystemVersion.plist` BLAKE3. Codex-bundled `rg` requires its exact reviewed BLAKE3 and canonical bundle path shape under that OS profile. Codesign identifier/team fields are descriptive metadata, not strict signature or byte-integrity evidence. Unknown binary or OS updates fail closed. Linux and unknown macOS packages may install, but reuse remains disabled until an audited backend/profile exists; doctor reports audited or unsupported status. Dormant hook plumbing additionally requires `argv[0]` to be an explicit absolute audited executable, but no automatic hook invocation is currently admitted.
+The macOS-compatible `strict-read-v0.5` slice admits only strictly parsed read-only `again run` invocations from a small allowlist and verifies executable identity. It may resolve a bare audited name such as `cat`, but admission requires the exact reviewed Apple-tool BLAKE3 and exact reviewed `SystemVersion.plist` BLAKE3 for either `macos-15.6.1-24G90-read-v0` or `macos-26.5-25F71-read-v0`. Codex `rg` requires an exact reviewed BLAKE3 and package path shape under that OS profile; the reviewed layouts are the original bundle and standalone Codex `0.150.1`. Codesign identifier/team fields are descriptive metadata, not strict signature or byte-integrity evidence. Unknown binary, layout, or OS updates fail closed. Linux and unknown macOS packages may install, but reuse remains disabled until an audited backend/profile exists; doctor reports audited or unsupported status. Dormant hook plumbing additionally requires `argv[0]` to be an explicit absolute audited executable, but no automatic hook invocation is currently admitted.
 
 Again fingerprints the declared content/listing scope plus canonical workspace/cwd identity, executable bytes, plaintext-free domain-separated environment digests, platform, policy, and request before reuse. Cache keys and proofs also bind real/effective uid and gid, supplementary groups, supported macOS resource limits, and signal mask/dispositions/flags. V0 refuses any present `DYLD_*`, `LD_*`, `Malloc*`, `MALLOC_*`, sanitizer-options, `GCONV_PATH`, `LOCPATH`, `NLSPATH`, `PATH_LOCALE`, `TERMCAP`, `TERMINFO`/`TERMINFO_DIRS`, or `TZDIR` variable because its referenced external bytes are unmodeled. The observation is sampled and path-based, not an immutable snapshot; concurrent mutation, plan-to-use races, and transient global-resource changes remain. Environment digests do not classify secrets or protect low-entropy values from an attacker who can guess the complete fingerprint input.
 
@@ -101,6 +117,7 @@ The repository still contains a context-keyed delivery ledger and `PreCompact`/`
 
 ## North-star and guardrails
 
-North-star: measured end-to-end agent wait time eliminated on eligible repeated work.
+North-star: measured end-to-end time and total cost eliminated per successful
+coding task while preserving its fixed outcome rubric.
 
 Guardrails: known incorrect reuse count, shadow divergence count, miss overhead, explicit-CLI/cache-read-plus-probe latency, exact executable/OS/context-profile mismatches, exact full-stream equality, production-hook no-op violations, secret-tainted entry count, crash consistency, and user-visible refusal/no-store explanations.
