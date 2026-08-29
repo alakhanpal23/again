@@ -993,7 +993,7 @@ fn compact_reasoning_reference_v1(digest: [u8; 32], full_bytes: u64) -> String {
     )
 }
 
-fn contains_sensitive_reasoning_content_v1(bytes: &[u8]) -> bool {
+pub(super) fn contains_sensitive_reasoning_content_v1(bytes: &[u8]) -> bool {
     let lowercase = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     [
         "-----begin private key-----",
@@ -1047,7 +1047,8 @@ impl EditBriefOmittedItemsV1 {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EditBriefMetricsV1 {
     pub included_current_facts: u64,
     pub included_invalidations: u64,

@@ -154,10 +154,7 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     assert_eq!(
         names,
         vec![
-            "context.cancel",
-            "context.delta",
-            "context.publish",
-            "context.retrieve",
+            "again.task_start",
             "git.blame",
             "git.diff",
             "git.log",

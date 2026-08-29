@@ -11,6 +11,8 @@ pub mod context_compiler;
 mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
+#[path = "agent_gateway_runtime/task_start.rs"]
+mod task_start;
 #[path = "agent_gateway_runtime/workspace_observation.rs"]
 mod workspace_observation;
 
@@ -59,11 +61,12 @@ use crate::mcp_gateway::{
     ToolExecution, UpstreamProvider, authorization_scope_digest_v1,
 };
 use crate::store::{
-    GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
-    GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
-    GatewayFullResultV1, GatewayHeartbeat, GatewayOperationDispositionV1,
-    GatewayReasoningContextQueryV1, GatewayRouteProofObservationV1, GatewayServedRouteV1,
-    GatewayStats, Store, ValidatedGatewayReadV1, gateway_policy_digest,
+    DependencyChangeInputV1, DependencyChangeReasonV1, GatewayCallAcquisition,
+    GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1, GatewayDependencyV1,
+    GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1, GatewayFullResultV1,
+    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayReasoningContextQueryV1,
+    GatewayRouteProofObservationV1, GatewayServedRouteV1, GatewayStats, Store,
+    ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -80,6 +83,8 @@ const REPOSITORY_PROVIDER_ID_V1: &str = "repo";
 const REPOSITORY_PROVIDER_IMPLEMENTATION_V1: &str = "again.repository-provider-v1";
 const GIT_PROVIDER_ID_V1: &str = "git";
 const GIT_PROVIDER_IMPLEMENTATION_V1: &str = "again.git-provider-v1";
+const TASK_START_PROVIDER_ID_V1: &str = "again";
+const TASK_START_PROVIDER_IMPLEMENTATION_V1: &str = "again.task-start-provider-v1";
 const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
@@ -202,6 +207,7 @@ enum RepositoryOperationV1 {
     GitLog,
     GitShow,
     GitBlame,
+    TaskStart,
 }
 
 impl RepositoryOperationV1 {
@@ -226,12 +232,17 @@ impl RepositoryOperationV1 {
             "git.log" => Some(Self::GitLog),
             "git.show" => Some(Self::GitShow),
             "git.blame" => Some(Self::GitBlame),
+            "again.task_start" => Some(Self::TaskStart),
             _ => None,
         }
     }
 
     fn provider_boundary(self) -> (&'static str, &'static str) {
         match self {
+            Self::TaskStart => (
+                TASK_START_PROVIDER_ID_V1,
+                TASK_START_PROVIDER_IMPLEMENTATION_V1,
+            ),
             Self::GitStatus | Self::GitDiff | Self::GitLog | Self::GitShow | Self::GitBlame => {
                 (GIT_PROVIDER_ID_V1, GIT_PROVIDER_IMPLEMENTATION_V1)
             }
@@ -255,7 +266,7 @@ impl RepositoryOperationV1 {
 struct ResolvedRequestV1 {
     core_call: GatewayToolCallV1,
     binding: ValidatedGatewayReadV1,
-    observation_plan: RepositoryObservationPlanV1,
+    operation: RepositoryOperationV1,
 }
 
 #[derive(Clone)]
@@ -290,7 +301,7 @@ pub(crate) struct GatewayControlledProviderV1 {
     store: Arc<Mutex<Store>>,
     context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
-    pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
+    pending_reasoning: Mutex<BTreeMap<String, Box<dyn ReasoningContextCandidateV1>>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
 }
 
@@ -390,7 +401,60 @@ impl GatewayControlledProviderV1 {
         }
         let observed = self.observations.observe(&call.arguments, operation).ok()?;
         let resolved = resolve_repository_request_v1(&observed, call, operation).ok()?;
+        if operation == RepositoryOperationV1::TaskStart
+            && self
+                .record_task_start_dependency_changes_v1(call, &resolved.binding)
+                .is_err()
+        {
+            return None;
+        }
         Some((resolved, observed.execution_epoch))
+    }
+
+    fn record_task_start_dependency_changes_v1(
+        &self,
+        call: &ProviderCall,
+        current: &ValidatedGatewayReadV1,
+    ) -> Result<()> {
+        let Some(previous) = self.recent_candidate(&Self::recent_candidate_key(call)) else {
+            return Ok(());
+        };
+        if previous.binding.binding_digest() == current.binding_digest() {
+            return Ok(());
+        }
+        let prior = previous
+            .binding
+            .dependencies()
+            .iter()
+            .map(|dependency| (&dependency.key_digest, &dependency.value_digest))
+            .collect::<BTreeMap<_, _>>();
+        let scope_digest = authorization_scope_digest_v1(&call.authorization_scope);
+        let observation_epoch_digest = current.state_digest();
+        let reason = DependencyChangeReasonV1::new("repository_content")?;
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for dependency in current.dependencies() {
+            let Some(prior_value) = prior.get(&dependency.key_digest) else {
+                continue;
+            };
+            if *prior_value == &dependency.value_digest {
+                continue;
+            }
+            store.record_dependency_change_v1(
+                &DependencyChangeInputV1 {
+                    scope_digest: scope_digest.clone(),
+                    observation_epoch_digest: observation_epoch_digest.to_owned(),
+                    dependency_key_digest: dependency.key_digest.clone(),
+                    prior_dependency_value_digest: (*prior_value).clone(),
+                    current_dependency_value_digest: dependency.value_digest.clone(),
+                    reason: reason.clone(),
+                },
+                task_start::MAX_DEPENDENCY_REPORT_RESULTS_V1,
+            )?;
+        }
+        Ok(())
     }
 
     fn fresh_direct_epoch(&self) -> Result<WorkspaceExecutionEpochV1, ProviderError> {
@@ -506,15 +570,48 @@ impl GatewayControlledProviderV1 {
         &self,
         resolved: &ResolvedRequestV1,
         call: &ProviderCall,
-        loaded: LoadedGatewayResultV1,
+        mut loaded: LoadedGatewayResultV1,
+        provider_call_avoided: bool,
     ) -> Value {
         let store = self
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let reasoning = reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
-            .ok()
-            .flatten();
+        let mut task_start_context = None;
+        let reasoning: Option<Box<dyn ReasoningContextCandidateV1>> =
+            if resolved.operation == RepositoryOperationV1::TaskStart {
+                match task_start::take_context_for_result_v1(
+                    &store,
+                    &self.workspace,
+                    resolved,
+                    call,
+                    &mut loaded,
+                    provider_call_avoided,
+                ) {
+                    Ok(Some(reasoning)) => {
+                        match task_start::compile_full_context_for_call_v1(reasoning, call) {
+                            Ok(context) => task_start_context = Some(context),
+                            Err(failure) => {
+                                task_start::attach_failure_v1(&mut loaded.value, failure);
+                            }
+                        }
+                        None
+                    }
+                    Ok(None) => None,
+                    Err(failure) => {
+                        task_start::attach_failure_v1(&mut loaded.value, failure);
+                        None
+                    }
+                }
+            } else {
+                reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
+                    .ok()
+                    .flatten()
+                    .map(|input| {
+                        Box::new(RuntimeReasoningContextV1 { input })
+                            as Box<dyn ReasoningContextCandidateV1>
+                    })
+            };
         drop(store);
         if let Some(coordinator) = self.context_coordinator.as_ref() {
             let _ = coordinator.admit_verified_result(
@@ -536,12 +633,16 @@ impl GatewayControlledProviderV1 {
             pending.insert(token.clone(), reasoning);
             Some(token)
         });
-        attach_result_reference_v1(
+        let mut value = attach_result_reference_v1(
             loaded.value,
             &loaded.full.gateway_result_id,
             &loaded.full.result,
             reasoning_token.as_deref(),
-        )
+        );
+        if let Some(context) = task_start_context {
+            task_start::attach_full_context_v1(&mut value, context);
+        }
+        value
     }
 
     fn load_exact(
@@ -549,10 +650,11 @@ impl GatewayControlledProviderV1 {
         resolved: &ResolvedRequestV1,
         gateway_result_id: &str,
         call: &ProviderCall,
+        provider_call_avoided: bool,
     ) -> Result<Option<Value>> {
         Ok(self
             .load_stored_exact(&resolved.binding, gateway_result_id)?
-            .map(|loaded| self.attach_loaded_exact(resolved, call, loaded)))
+            .map(|loaded| self.attach_loaded_exact(resolved, call, loaded, provider_call_avoided)))
     }
 
     fn execute_as_leader(
@@ -615,6 +717,9 @@ impl GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
+                    if resolved.operation == RepositoryOperationV1::TaskStart {
+                        return Err(task_start::unavailable_v1("heartbeat_failed"));
+                    }
                     return Ok(value);
                 }
                 let revalidated = self.resolve(&verification_call);
@@ -628,6 +733,9 @@ impl GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
+                    if resolved.operation == RepositoryOperationV1::TaskStart {
+                        return Err(task_start::unavailable_v1("revalidation_failed"));
+                    }
                     return Ok(value);
                 }
                 if cancelled.load(Ordering::Acquire) {
@@ -669,18 +777,17 @@ impl GatewayControlledProviderV1 {
                     Ok::<_, anyhow::Error>((outcome, stored))
                 })();
                 match completion {
-                    Ok((
-                        GatewayCompletion::Completed {
-                            gateway_result_id, ..
-                        },
-                        stored,
-                    ))
-                    | Ok((
-                        GatewayCompletion::AlreadyCompleted {
-                            gateway_result_id, ..
-                        },
-                        stored,
-                    )) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
+                    Ok(GatewayCompletion::Completed {
+                        gateway_result_id, ..
+                    })
+                    | Ok(GatewayCompletion::AlreadyCompleted {
+                        gateway_result_id, ..
+                    }) => match self.load_exact(
+                        resolved,
+                        &gateway_result_id,
+                        &verification_call,
+                        false,
+                    ) {
                         Ok(Some(exact)) => {
                             // Dependency-proof registration controls only
                             // future reuse authority. The just-executed,
@@ -696,35 +803,16 @@ impl GatewayControlledProviderV1 {
                             }
                             Ok(exact)
                         }
-                        Ok(None) | Err(_) => {
-                            // Completion already proved and committed this
-                            // exact stored result. If a contended immediate
-                            // reload is unavailable, preserve the durable
-                            // reference on the validated provider value instead
-                            // of returning one unreferenced duplicate response.
-                            if let Some(coordinator) = self.context_coordinator.as_ref() {
-                                let _ = coordinator.admit_verified_result(
-                                    &verification_call,
-                                    &resolved.binding,
-                                    &gateway_result_id,
-                                    stored.duration_ms,
-                                );
-                            }
-                            if self.register_result_dependency(resolved, &gateway_result_id) {
-                                self.remember_candidate(
-                                    &verification_call,
-                                    &resolved.binding,
-                                    &gateway_result_id,
-                                );
-                            }
-                            Ok(attach_result_reference_v1(
-                                value,
-                                &gateway_result_id,
-                                &stored,
-                                None,
-                            ))
+                        Ok(None) | Err(_)
+                            if resolved.operation == RepositoryOperationV1::TaskStart =>
+                        {
+                            Err(task_start::unavailable_v1("stored_result_unavailable"))
                         }
+                        Ok(None) | Err(_) => Ok(value),
                     },
+                    Ok(_) | Err(_) if resolved.operation == RepositoryOperationV1::TaskStart => {
+                        Err(task_start::unavailable_v1("completion_failed"))
+                    }
                     Ok(_) | Err(_) => Ok(value),
                 }
             }
@@ -774,20 +862,18 @@ impl GatewayControlledProviderV1 {
                     {
                         break Ok(None);
                     }
-                    let dependency_registered =
-                        self.register_result_dependency(resolved, &gateway_result_id);
-                    let loaded =
-                        self.load_exact(resolved, &gateway_result_id, call)
-                            .map_err(|_| {
-                                ProviderError::gateway_authored(
-                                    McpError::typed(
-                                        McpErrorCode::InternalError,
-                                        "verified gateway result became unavailable",
-                                    )
-                                    .with_data(json!({ "reason": "verified_result_unavailable" })),
+                    let loaded = self
+                        .load_exact(resolved, &gateway_result_id, call, true)
+                        .map_err(|_| {
+                            ProviderError::gateway_authored(
+                                McpError::typed(
+                                    McpErrorCode::InternalError,
+                                    "verified gateway result became unavailable",
                                 )
-                            });
-                    if matches!(loaded, Ok(Some(_))) && dependency_registered {
+                                .with_data(json!({ "reason": "verified_result_unavailable" })),
+                            )
+                        });
+                    if matches!(loaded, Ok(Some(_))) {
                         self.remember_candidate(call, &resolved.binding, &gateway_result_id);
                         let _ = self
                             .store
@@ -861,10 +947,7 @@ impl StructuredResultCapture for GatewayControlledProviderV1 {
                     gateway_result_id,
                     result_digest,
                     streams,
-                    reasoning.map(|input| {
-                        Box::new(RuntimeReasoningContextV1 { input })
-                            as Box<dyn ReasoningContextCandidateV1>
-                    }),
+                    reasoning,
                 ))
             }
             None => Ok(CapturedToolResult::exact(exact)),
@@ -918,6 +1001,10 @@ impl ToolExecution for GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
+        let is_task_start = call.namespaced_tool_name == "again.task_start";
+        if is_task_start {
+            task_start::validate_arguments_v1(&call.arguments)?;
+        }
         if call.effect != EffectClass::ReadOnly {
             let epoch = self.fresh_direct_epoch()?;
             return self.execute_direct(&epoch, call, secrets, true);
@@ -935,6 +1022,9 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .map(|loaded| (candidate, loaded))
             });
         let Some((resolved, epoch)) = self.resolve(&call) else {
+            if is_task_start {
+                return Err(task_start::unavailable_v1("workspace_validation_failed"));
+            }
             let epoch = self.fresh_direct_epoch()?;
             return self.execute_direct(&epoch, call, secrets, true);
         };
@@ -945,6 +1035,9 @@ impl ToolExecution for GatewayControlledProviderV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .acquire_gateway_call(&resolved.binding, &owner);
         let Ok(acquisition) = acquisition else {
+            if is_task_start {
+                return Err(task_start::unavailable_v1("coordination_failed"));
+            }
             return self.execute_direct(&epoch, call, secrets, true);
         };
         match acquisition {
@@ -973,22 +1066,20 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         && candidate.binding.binding_digest() == resolved.binding.binding_digest()
                         && candidate.gateway_result_id == gateway_result_id
                     {
-                        let value = self.attach_loaded_exact(&resolved, &call, loaded);
-                        if self.register_result_dependency(&resolved, &gateway_result_id) {
-                            self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
-                            let _ = self
-                                .store
-                                .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .record_gateway_route_served(
-                                    &call_id,
-                                    &gateway_result_id,
-                                    GatewayServedRouteV1::Exact,
-                                );
-                        }
+                        let value = self.attach_loaded_exact(&resolved, &call, loaded, true);
+                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
+                        let _ = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .record_gateway_route_served(
+                                &call_id,
+                                &gateway_result_id,
+                                GatewayServedRouteV1::Exact,
+                            );
                         return Ok(value);
                     }
-                    let value = self.load_exact(&resolved, &gateway_result_id, &call);
+                    let value = self.load_exact(&resolved, &gateway_result_id, &call, true);
                     let revalidated = self.resolve(&call);
                     if revalidated
                         .as_ref()
@@ -1011,7 +1102,11 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         return Ok(value);
                     }
                 }
-                self.execute_direct(&epoch, call, secrets, false)
+                if is_task_start {
+                    Err(task_start::unavailable_v1("exact_validation_failed"))
+                } else {
+                    self.execute_direct(&epoch, call, secrets, false)
+                }
             }
             GatewayCallAcquisition::Follower {
                 call_id, lease_id, ..
@@ -1079,7 +1174,11 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .cancel_gateway_follower(&call_id);
-                self.execute_direct(&epoch, call, secrets, false)
+                if is_task_start {
+                    Err(task_start::unavailable_v1("coordination_join_failed"))
+                } else {
+                    self.execute_direct(&epoch, call, secrets, false)
+                }
             }
             GatewayCallAcquisition::Leader {
                 lease_id,
@@ -1097,9 +1196,15 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
+                    if is_task_start {
+                        return Err(task_start::unavailable_v1("execution_start_failed"));
+                    }
                     return self.execute_direct(&epoch, call, secrets, false);
                 }
                 self.execute_as_leader(&epoch, call, secrets, &resolved, lease_id, owner)
+            }
+            GatewayCallAcquisition::Refused { .. } if is_task_start => {
+                Err(task_start::unavailable_v1("coordination_refused"))
             }
             GatewayCallAcquisition::Refused { .. } => {
                 self.execute_direct(&epoch, call, secrets, true)
@@ -1377,6 +1482,14 @@ impl ExperimentalMcpGatewayV1 {
                 Arc::clone(&store),
                 Arc::clone(&observations),
             ));
+        let task_start = Arc::new(task_start::TaskStartProviderV1::new(&workspace)?);
+        let task_start_controlled: Arc<dyn UpstreamProvider> =
+            Arc::new(GatewayControlledProviderV1::new(
+                task_start,
+                workspace.clone(),
+                Arc::clone(&store),
+                Arc::clone(&observations),
+            ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
         let git_controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
             git,
@@ -1387,6 +1500,7 @@ impl ExperimentalMcpGatewayV1 {
         let gateway = McpGateway::new(
             vec![
                 ProviderRegistration::trusted_annotations(repository_controlled),
+                ProviderRegistration::trusted_annotations(task_start_controlled),
                 ProviderRegistration::trusted_annotations(git_controlled),
                 ProviderRegistration::trusted_annotations(task_context),
                 ProviderRegistration::trusted_annotations(shared_context),
@@ -1671,7 +1785,7 @@ fn resolve_repository_request_v1(
     Ok(ResolvedRequestV1 {
         core_call,
         binding,
-        observation_plan,
+        operation,
     })
 }
 
