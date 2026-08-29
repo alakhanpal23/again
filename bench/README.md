@@ -162,34 +162,33 @@ of current Worker-isolate heap usage, 100,000-case stateful D1/R2 path, and cros
 post-decrypt trust race remain missing. See the exact [rollout contract and
 evidence](../docs/TEAM_LOOKUP_BUNDLE_V1.md).
 
-## Paired editable-agent benchmark
+## Hot-reuse baseline-vs-candidate benchmark gate
 
-[`agent_gateway_editable_pair.py`](agent_gateway_editable_pair.py) is the
-fail-closed editable companion to the existing read-only real-agent harness. It
-creates independent identical Git fixtures, permits exactly one known source
-repair, rejects test/collateral edits, runs a fixed acceptance suite, alternates
-baseline/Again order, and retains monotonic first-edit, accepted-edit,
-validation, final-outcome, and total timing markers. Live mode requires explicit
-network authorization, a credential environment-name binding, pinned model and
-settings IDs, absolute command arrays with standalone placeholders, and an
-exact Again binary. An Again treatment passes only when durable workspace
-gateway/context counters move; a command label or socket alone is not evidence.
-
-Qualify the harness and oracle offline before any paid run:
+[`hot_reuse_benchmark_gate.py`](hot_reuse_benchmark_gate.py) is a reproducible
+baseline-vs-candidate regression gate. It records SHA-256 of the baseline and
+candidate binaries, never inferring them from filenames, and runs the identical
+synthetic repository scenarios against each. It compares exact result IDs,
+response hashes, classification events, false-hit counts, and timing, then
+writes a single JSON report with six separated sections: exactness,
+performance, unsupported instrumentation, regression, improvement, and refusal.
 
 ```bash
-python3 -B bench/agent_gateway_editable_pair.py \
-  --mode qualify \
-  --runs 10 \
-  --json-out bench/results/YYYY-MM-DD-agent-gateway-editable-qualification.json
+cargo build --release
+python3 -B bench/hot_reuse_benchmark_gate.py \
+  --baseline-binary target/release/again \
+  --candidate-binary target/release/again \
+  --source-sha 78baa5e46f87b7e74c6d30f3e6bebe2af07fe434 \
+  --output bench/results/2026-08-28-hot-reuse-gate-baseline-vs-candidate.json
 ```
 
-The retained
-[`2026-08-29 qualification`](results/2026-08-29-agent-gateway-editable-pair-qualification-v1.json)
-passed 10/10 baseline and 10/10 treatment-shaped observations. It measures a
-deterministic reference editor and the harness only: it is not real-agent task
-quality, model usage, or Again acceleration evidence. Live Codex/Claude runs
-remain a separate explicit external gate.
+Use `--baseline-sha` and `--candidate-sha` to pin expected binary digests. The
+harness is offline-only: it uses no network, no paid model, and no clone. It
+records observed-manifest integration timing only as a typed non-pass fallback
+when the binary does not expose the instrumentation. Adversarial checks in
+[`test_hot_reuse_benchmark_gate.py`](test_hot_reuse_benchmark_gate.py) cover
+malformed reports, mismatched binary SHA-256, missing/duplicated samples, false
+hits, mutation mistakes, and unsupported counter types. The gate exits 2 unless
+the exactness, performance, and refusal sections all pass.
 
 ## Retained diagnostic artifacts
 
