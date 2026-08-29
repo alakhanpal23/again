@@ -1,593 +1,604 @@
-# Delivery roadmap and product gates
+# Again product and delivery roadmap
 
-This roadmap starts from the implementation described in [STATUS.md](STATUS.md).
-Dates are planning labels, never evidence. A phase advances only when its exit
-gate has a reproducible result and, where required, an immutable CI or retained
-runtime artifact.
+This is the single roadmap for Again. It combines the product architecture,
+reuse strategy, straight-to-code experience, delivery sequence, and release
+gates. [STATUS.md](STATUS.md) remains the source of implementation truth and
+[EVIDENCE.md](EVIDENCE.md) remains the source of measured claims. A roadmap
+item is intent until those documents contain its passing evidence.
+
+Historical Gate 0–6 names are retained below so release procedures, Linux
+evidence, and older technical documents keep their original meaning.
 
 ## Product objective
 
-Again should eliminate repeated agent wait time and context without serving a
-result whose inputs, execution profile, or effects are not proven equivalent.
-The product definition is: “Again is a repository-aware execution memory and
-tool-call control plane for coding agents. It skips only work proven redundant,
-executes uncertain work, and returns the smallest useful verified observation.”
-The product advances through four user-visible stages:
+> Again gives coding agents persistent, verified repository understanding and
+> execution memory so they can move from task to correct code with less
+> rediscovery, fewer tool calls, less context, and less repeated validation.
 
-1. **Repository-aware agent gateway:** deduplicate exact repository tool calls
-   across agent sessions and return bounded verified observations.
-2. **Explicit local exact reads:** accelerate a deliberately narrow set of
-   audited read-only commands while preserving complete streams.
-3. **Trace-backed local pytest:** execute one frozen pytest invocation shape in
-   an isolated Linux profile, then admit reuse only after complete observation
-   and independent shadow agreement.
-4. **Managed team reuse:** share encrypted, signed results only across equivalent
-   repository and execution profiles with local verification.
+Again optimizes time and total cost per successful coding task. It is not a
+generic command cache, a replacement coding agent, or an authority granted to
+an LLM. Every repeated action is a reuse candidate; only a current
+deterministic proof may turn it into a shortcut.
 
-The current product has an experimental stage-1 gateway and the narrower
-stage-2 explicit CLI. Stage-3 snapshot, isolation, seccomp, ptrace, and wire
-foundations exist, but no Linux pytest command can execute through the profile
-and no Linux reuse authority exists. Stage 4 has a manually provisioned
-client/service foundation, not a deployed product.
+The target user outcome is:
 
-The unifying user outcome is: “Again helps coding agents start with verified
-repository understanding, avoid repeating work, run only the validation that
-changed, and share exact execution knowledge across agents.” The normative
-current-to-end-state map is [AGENT_ACCELERATION.md](AGENT_ACCELERATION.md).
-The exhaustive action-family inventory and profile order are maintained in
-[REUSE_SURFACE.md](REUSE_SURFACE.md).
-The task-start latency path and editable real-agent gate are frozen in
-[STRAIGHT_TO_CODE.md](STRAIGHT_TO_CODE.md).
+> Again helps coding agents start with verified repository understanding, avoid
+> repeating work, run only the validation that changed, and share exact
+> execution knowledge across agents.
 
-## Agent acceleration program
-
-The existing gates remain the authority sequence. Product work across them is
-organized into one user loop rather than independent caches:
-
-1. **Fast current repository view:** reduce the remaining authoritative
-   traversal with reusable parent descriptors and a sealed fresh manifest.
-   Sharing a view may remove duplicate observation within an epoch; it may not
-   allow an old manifest to authorize a new hit.
-2. **Verified task-start brief:** admit typed repository/task facts only from
-   verified observations, retain explicit invalidations, and return the
-   smallest relevant full brief before an agent begins broad exploration. The
-   synchronous path performs no model call, network access, build, or test and
-   emits an edit brief rather than a generic planning document.
-3. **Authenticated context delta:** bind recipients and complete delivery,
-   retire authority on lifecycle or compaction changes, and issue compact or
-   delta presentations only after those proofs. Until then, full delivery is
-   mandatory and token savings remain zero.
-4. **Changed-only validation:** finish execute-only pytest, construct observed
-   dependency closures, and expose a validation plan. Skipping a test requires
-   the later candidate, shadow, promotion, and fresh-hit gates; selection by
-   filename, history, model judgment, or similarity is never enough.
-5. **Shared execution knowledge:** carry exact results, facts, invalidations,
-   and validation evidence into later agent sessions and eventually across
-   equivalent machines through the encrypted team boundary.
-
-Each slice must be evaluated at the completed-task level. Paired runs freeze the
-agent/model, repository snapshot, task, limits, and outcome rubric, then record
-time to first useful edit, task wall time, tool/provider calls, context bytes,
-provider-reported tokens, validation compute, total metered cost, and every
-incorrect-hit or stale-fact event. Cache-hit rate alone cannot close a product
-gate. Provider token or dollar savings cannot be inferred from byte counts.
-
-## Agent gateway fast track
-
-The experimental local vertical slice now includes a real bounded MCP stdio
-server, 13 built-in repository/Git intelligence tools, descriptor-retained repository authority,
-exact dependency-bound reuse, SQLite/CAS coordination, in-flight joining,
-cancellation, and explicit workspace-bound Codex/Claude setup. It remains
-pre-alpha until these gates close:
-
-The internal delivery composition now proves that one authenticated recipient
-receives the canonical full reasoning brief before a compact reference can be
-issued, and that write failure, reconnect, cancellation, compaction, or
-lifecycle change clears that authority. Durable accounting revalidates the
-exact result and response envelope and deduplicates retried receipts. This is
-not yet a user-visible capability: the public stdio transport has no trusted
-recipient issuer, so it continues to send full results and records zero
-delivery-confirmed savings.
-
-The built-in Git boundary now refuses reuse when local configuration imports
-external files, and status/diff queries with nested worktree or submodule
-control state execute without reuse. Configuration capable of launching a
-filter, external diff/text-conversion command, or alternate-reference command
-is rejected before the Git subprocess starts. This closes stale-result and
-nominally-read-only command-launch gaps; broader Git configuration support must
-arrive only with explicit dependency and executable authority.
-
-1. Replace every caller-constructible routing observation with a store-issued,
-   one-use proof whose lifecycle generation, dependency binding, and freshness
-   are checked at consumption.
-2. Add authenticated delivery receipts before counting bytes or execution time
-   as saved. A content address must never act as a bearer authorization token.
-3. Add full-result retrieval only through an authorization-scope and
-   recipient-bound grant; then add compact references only after that exact
-   recipient has received the full result in the current uncompacted context.
-4. Keep semantic/AI routing suggestion-only until deterministic validation
-   binds the complete state and a trusted validity interval.
-5. Run the production binary with real Codex and Claude sessions on retained,
-   network-controlled repository fixtures. Measure provider calls avoided,
-   latency, bytes and estimated tokens omitted, false-hit count, task outcome,
-   cancellation, restart recovery, and store corruption.
-6. Expose reviewed configuration for the implemented bounded upstream MCP
-   transport only after provider identity, executable drift, cancellation,
-   credentials, and local policy are bound end to end. Side effects,
-   credentials, communication, deployments, payments, and unknown tools must
-   continue to bypass storage and reuse.
-
-Current checkpoint: item 1 is closed for the built-in tools, and acquisition
-events are only candidates; exact-hit and in-flight-join statistics are
-promoted after one-use proof consumption, result loading, and repository
-revalidation. Additive schema-v10 receipt/grant storage exists, but item 2
-remains open because production stdio has no transport-authenticated recipient
-issuer. No compact delivery, bytes, tokens, or time savings are claimed. The
-phase-two response-bound commit failed its isolated all-target build. A later
-retrieval commit made the combined branch green, but authenticated recipient
-issuance remained test-only, so the production authority gate was still open.
-
-The retained schema-v10 release-binary harness closes the deterministic portion
-of item 5 with 8/8 scenarios, four real MCP processes, 12 provider executions,
-three avoided executions (two exact hits and one joined call), and zero false
-hits at source `850e7c4398adc25ef1210ee4260e27b29aaeb753`. The same binary passed the
-isolated onboarding and quick chaos harnesses. Three explicit clean real
-repositories passed, while the overall corpus correctly remains `non_pass`
-until an eligible local Go repository is supplied. The ten-scenario alpha-trial
-recorder exists, but zero outside users and zero of the required 50 attempts
-have been recorded. The real-agent harness passed only its offline dry run
-against Codex 0.150.1 and Claude 2.1.220; all 16 networked/paid paired runs
-remain manual and unexecuted.
-
-## Critical path
+## Target user experience
 
 ```text
-                         restore immutable evidence
-                             /              \
-                            v                v
-          distribute/validate local alpha   kernel two-task proof
-                            |                -> execute-only pytest
-                            |                -> complete candidates
-                            |                -> shadow/promote/reuse
-                            \                /
-                             v              v
-                         managed team alpha
+task arrives
+  -> Again opens one current repository epoch
+  -> Again returns one bounded verified edit brief
+  -> the agent inspects only unresolved details
+  -> the agent makes the first correct edit
+  -> Again invalidates affected knowledge
+  -> uncertain or affected validation executes
+  -> proven unaffected validation may reuse a promoted result
+  -> findings, results, and artifacts become verified execution memory
+  -> the next agent starts ahead
 ```
 
-After Gate 0, Gate 1 distribution and Gate 2 Linux-supervisor work are
-independent branches. They may alternate implementation rounds, but only one
-terminal owns repository edits at a time unless an explicitly isolated Git
-worktree is assigned. Gate 6 requires both branches: Gate 1 and Gate 5. See
-[DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md).
+The task-start response is an edit brief, not a compulsory prose plan. It
+contains current entry points, exact source locators, verified constraints,
+invalidations, known failed approaches, explicit unknowns, and a proposed
+validation set. It does not dump a full repository tree, repeat already
+delivered output, or present model speculation as fact.
 
-## Gate 0 — restore evidence authority
-
-**Goal:** make the current source checkpoint eligible for engineering and
-release claims.
-
-Work:
-
-- resolve the GitHub Actions account billing/spending-limit block;
-- rerun macOS, Ubuntu, stock-rootless negative-lane, service, and applicable
-  integration workflows on the exact commit being evaluated;
-- retain raw artifacts and link the immutable runs from [STATUS.md](STATUS.md)
-  and [EVIDENCE.md](EVIDENCE.md); and
-- distinguish source failures, environment refusals, and zero-step CI
-  infrastructure failures.
-
-Exit gate:
-
-- formatting, pinned Rust 1.88 strict all-target/all-feature Clippy, locked
-  all-feature test suites, service tests, packaging tests, and the 100,000-case
-  differential gate pass on their documented platforms; and
-- every positive runtime claim names its exact source, platform, command, and
-  retained artifact.
-
-No later phase may treat a local pass or a zero-step CI failure as immutable
-release evidence.
-
-## Gate 1 — distributable local alpha
-
-**Goal:** put the stage-1 product in outside users' hands before broadening its
-semantic surface.
-
-**Entry gate:** Gate 0.
-
-Work:
-
-1. Replace duplicated single-host constants with one versioned audited-profile
-   registry shared by local executable verification and team runtime
-   attestation.
-2. Populate only profiles backed by exact host, OS, executable, and runtime
-   evidence. Unknown profiles continue to fail closed.
-3. Make `again doctor` report the selected profile, unsupported dimensions,
-   skill scope, and safe next action without implying reuse authority.
-4. Exercise real Codex sessions from workspace roots and subdirectories, with
-   TTY/non-TTY streams, interruption, long-running calls, personal/project skill
-   scopes, and automatic hooks remaining no-op.
-5. Run the direct benchmark on real non-sparse Rust, Python, Go, and TypeScript
-   repositories. Preserve exact streams and mutation invalidation.
-6. Add reviewed keyless artifact signing/attestation and independently tested
-   verification instructions around the existing native release workflow,
-   checksums, source SBOM, installer, rollback, and uninstaller.
-7. Publish a prerelease and provide a reviewed Homebrew or equivalent installation
-   path that still refuses unsupported runtime profiles.
-
-Current checkpoint: the real-repository validation harness for item 5 is
-implemented, bounded, offline-only, and exercised by portable CI tests. It
-requires explicit absolute paths to already-local Rust, Python, Go, and
-TypeScript Git worktrees, pins the exact Again binary, copies only selected
-tracked regular files, compares native/cold/warm streams and status exactly,
-and proves mutation invalidation. A retained schema-v10 run passed Rust, Python,
-and TypeScript with zero false hits but remains `non_pass` because the bounded
-offline search found no eligible Go repository. The alpha-trial harness freezes
-the required ten scenarios and exact five-user/50-attempt gate, while correctly
-refusing local simulation as outside-user evidence. No outside attempt or
-publisher-authenticated prerelease exists, so Gate 1 remains open.
-
-Product outcome:
-
-- an outside developer can install Again, run `again setup --codex`, inspect
-  support with `again doctor`, use explicit `again run`/`again reference`, and
-  remove the integration without hooks, accounts, daemons, or repository
-  mutation.
-
-Exit gate:
-
-- five outside developers each attempt the same versioned 10-command corpus;
-- at least 35 of the 50 attempts are policy-admitted and complete successfully
-  without configuration after documented onboarding, with byte-identical cold
-  and warm streams; safe refusals are reported separately and do not count as
-  admitted successes;
-- eligible repeats achieve at least 3x median warm speedup with byte-identical
-  streams and zero known incorrect hits;
-- unsupported hosts and tools fail closed with actionable explanations; and
-- release artifacts have verified publisher authentication, not checksums alone.
-
-Kill or narrow the stage-1 profile if any known stale result is served, a
-production hook rewrites a command, a hit changes either stream, or the median
-eligible warm speedup falls below 2x.
-
-## Gate 2 — kernel-backed supervisor tree proof
-
-**Goal:** connect the pure production tracer planner to the Linux kernel without
-granting workload, Python, EffectIR, profile, execution, or reuse authority.
-
-**Entry gate:** Gate 0. Gate 1 is an independent branch.
-
-**Status:** closed for the fixed, command-free transport proof at source
-`3d1fb201507a43b830d5ce341b2253957634016d`; this is not profile, execution, or
-reuse qualification.
-
-The first executable artifact is a hidden, fixed, no-command two-task probe. A
-parent performs exact 88-byte `clone3(SIGCHLD)` and parent and child raw-exit.
-The connector must:
-
-- own the only private issuer for `TracerSupervisorStateV1`;
-- prove exact ptrace options and exact installed-filter bytes before beginning;
-- drive every planner intent through real `waitpid(-1, __WALL)`,
-  `PTRACE_GETEVENTMSG`, `PTRACE_GET_SYSCALL_INFO`, bounded stopped-memory reads,
-  and ordered `PTRACE_CONT`/`PTRACE_SYSCALL` operations;
-- confirm a resume only after the exact ptrace operation returns success;
-- before reading or resuming from `clone3` arguments, prove that every task
-  sharing the address space is stopped or absent, no untraced sibling can
-  mutate it, and the range is not externally mutable/shared; otherwise do not
-  resume, kill and drain the tree, and fail closed;
-- consume a completion boundary that requires no outstanding exchange, no
-  pending birth/stop/resume, terminal reap for every task, connector-owned final
-  `ECHILD`, preserved signal state, drained `SIGCHLD`, and completed cleanup; and
-- emit only a fixed redacted diagnostic with every authority flag false.
-
-Current checkpoint: that hidden connector and redacted CLI diagnostic are now
-implemented, including exact option/filter readback, stopped private-range
-capture, event/stop identity correlation before pidfd authority, full-tree
-drain, final `ECHILD`, and consuming completion. A wait-returned stopped tracee
-is retained for cleanup before event-message correlation, including on a
-mismatch. Bounded proc/environment reads, bounded wait backoff, and typed
-seccomp/process-memory refusals are also implemented. The connector now routes
-run/cleanup waits, every ptrace exchange, stopped-memory reads, both resume
-modes, PID/pidfd termination, and signal-state verification through private
-test-only fault seams. Linux tests require each forward failure to preserve its
-typed first error while the complete tree reaches final `ECHILD`; cleanup-path
-faults retain the first cleanup errno and refuse completion. The completed
-diagnostic redacts the observed parent-event-first or child-stop-first order.
-Provisioned
-[`run 32965300493`](https://github.com/alakhanpal23/again/actions/runs/32965300493)
-passed 100/100 at the exact source checkpoint above on Linux x86_64 kernel
-`6.8.0-134-generic`, with 99 parent-event-first and 1 child-stop-first sample.
-The offline verifier accepted artifact `9605461989` with 302 members, archive
-SHA-256
-`43f3be33e9d92e28198ccab64deab1db6533c6a66c0ed7d1523f6fde4f371dfa`,
-and member-manifest SHA-256
-`4cb7287d6940b43a9720b10b82f90518b32abd319b3c9343df69c42ab20cf3ae`.
-The ephemeral runner was evidence infrastructure only and need not remain
-registered after the run.
-
-The retained artifact must be verified offline before it is cited. The verifier
-accepts the downloaded ZIP, the independently recorded source SHA, and the
-independently recorded runner kernel release; it refuses ZIP prefixes, trailers,
-comments, extra fields, gaps, special entries, type-loose JSON, raw/validated
-drift, report drift, and any authority claim. Its canonical audit includes the
-archive SHA-256, member-manifest SHA-256, source SHA, kernel release, exact member
-and sample counts, and both observed delivery orders:
-
-```sh
-python3 -B scripts/verify_linux_supervisor_evidence.py ARTIFACT.zip \
-  --expected-source-sha SOURCE_SHA \
-  --expected-kernel-release KERNEL_RELEASE
-```
-
-Before wiring a candidate record, narrow the authority path so structurally
-valid synthetic values cannot bind a reusable execution record. Completion
-evidence must be linear, connector-issued, and consumed exactly once.
-
-Exit gate:
-
-- parent-event-first and child-stop-first kernel schedules both satisfy the same
-  invariant summary;
-- exact stopped-memory address, TID, stop generation, and 88-byte count are
-  enforced; partial, long, unavailable, substituted, or dirty-tail reads never
-  resume the task;
-- every injected wait/ptrace/read/resume failure kills and reaps the complete
-  tree, preserves signal state, drains `SIGCHLD`, leaks no tracked descriptor,
-  and preserves the first typed error;
-- 100/100 fixed samples pass on a pinned provisioned Linux runner whose tracer
-  is outside seccomp, has `CAP_SYS_ADMIN` in the governing user namespace, and
-  runs a kernel with `CONFIG_SECCOMP_FILTER` and `CONFIG_CHECKPOINT_RESTORE`, as
-  required for `PTRACE_SECCOMP_GET_FILTER`;
-- the preserved fixed single-task ptrace diagnostic and stock-Ubuntu negative
-  namespace lane remain unchanged; and
-- public Linux dispatch remains disabled.
-
-## Gate 3 — first execute-only pytest product slice
-
-**Goal:** safely execute one real pytest selector through the documented Linux
-profile while making reuse impossible.
-
-**Entry gate:** Gate 2.
-
-The only invocation shape remains:
+## System architecture
 
 ```text
-again run -- .venv/bin/python -I -m pytest <selector> [<selector> ...]
+Codex / Claude / OpenCode / IDE / CI
+                  |
+          MCP and explicit CLI
+                  |
+   +--------------v----------------+
+   | Agent acceleration gateway     |
+   | task start | tool router       |
+   | context delivery | validation  |
+   | explanations | metrics         |
+   +----------+------------+--------+
+              |            |
+       suggestions          | authority
+              |            |
+   +----------v----+  +----v--------------------+
+   | Optional LLM  |  | Deterministic authority |
+   | task intent   |  | repository epoch        |
+   | relevance     |  | dependency/effect proof |
+   | compression   |  | executable/toolchain    |
+   +----------+----+  | policy/freshness/scope  |
+              |       +------------+------------+
+              +--------------------+
+                                   |
+                     +-------------v-------------+
+                     | Verified execution memory |
+                     | results | facts           |
+                     | invalidations | failures  |
+                     | candidates | promotions   |
+                     | artifacts | receipts      |
+                     | SQLite metadata + CAS     |
+                     +-------------+-------------+
+                                   |
+                     +-------------v-------------+
+                     | Execution providers       |
+                     | repository/Git            |
+                     | audited local reads       |
+                     | isolated validation       |
+                     | encrypted team service    |
+                     +---------------------------+
 ```
 
-Current checkpoint: a crate-private pure parser accepts only the exact inner
-argv `.venv/bin/python -I -m pytest tests/test_smoke.py::test_smoke` and returns
-a non-authoritative lexical wrapper around the existing Stage-0 selector. A
-fixed two-file fixture and bounded Python oracle freeze the intended evidence
-shape and refuse fixture drift, malformed JSON, stream mismatch, nonzero wait
-status, incomplete cleanup/reap, nonzero candidate/shadow/promotion/replay
-counts, or any authority claim. The oracle deliberately does not execute
-pytest, dereference its qualified-tuple reference, or independently bind the
-caller-reported binary/source hashes and cleanup booleans; even its consistent
-outcome grants no pass, qualification, execution, or reuse authority. No CLI
-or tracer path consumes this scaffold yet. A dedicated
-connector transition can now consume the lexical proof while compiling the
-four-view workspace tree, verify the fixed selector's regular-file type,
-length, single-link manifest topology, and content digest before publication
-escrow or rename, and return one opaque linear workspace-tree binding.
+The optional LLM interprets a task, ranks candidates, compresses verified
+context, and suggests validation. It cannot declare a fact current, issue a
+cache hit, skip a test, authorize artifact materialization, or upgrade remote
+state. The deterministic authority layer owns those decisions.
 
-That binding can now be consumed with a second, independently published runtime
-tree. The resulting structural inventory binds both publication roots, pins and
-revalidates every selected object, distinguishes the root executable,
-interpreter, and dependency-DSO ELF roles, and rejects `ET_EXEC` outside the
-root. Its fixed six-directory lookup resolves the frozen `PT_INTERP` and ordered
-`DT_NEEDED` graph under explicit node, depth, byte, lookup, descriptor, and
-memory bounds. This is deliberately not a loader proof: loader cache, preload,
-environment, `RPATH`/`RUNPATH`, glibc-hwcaps, virtual-environment, and pytest
-semantics remain unmodeled. The native dual-publication test passed on hosted
-Ubuntu at source commit `eec5d95edd2b01a94c3ac8bd76c2c5dc0f26f502` in
-[CI run 33028269206](https://github.com/alakhanpal23/again/actions/runs/33028269206),
-including complete fixed-directory lookup and refusal after a published runtime
-mutation. The earlier local x86_64 QEMU timeout remains non-evidence, and this
-structural result does not qualify the loader or authorize execution.
+## What the previous Again contributes
 
-The runtime, stdio, and isolation owners now meet at one command-free connector
-checkpoint. It requires and retains the two-publication structural inventory
-before creating the concrete isolation-ready child, authenticates and splits
-all pipe ownership, and retains bounded parent capture. After both roots are
-attached and reauthenticated in the child's private mount namespace, a linear
-handoff performs `PTRACE_SEIZE`, interrupts that exact single-task child,
-requires the exact ptrace-event stop, and rechecks its task count, tracer,
-`NoNewPrivs`, and pre-filter seccomp state before transferring the existing
-cleanup guard to an opaque supervisor owner. Cancellation terminates and reaps
-before EOF draining; uncertain reap closes without capture, and setup failures
-retain their first error separately from cleanup completeness. A provisioned
-x86_64 Linux run completed 100/100 attach, handoff, cancel, and terminal-reap
-samples. This is a command-free ownership checkpoint, not execution evidence:
-the connector exposes no resume, filter-install, release frame, command, PID,
-descriptor, execution, candidate, replay, or reuse authority.
+The new product is built on the working Again engine rather than replacing it.
 
-A separate live workload-seccomp diagnostic is also integrated. It installs and
-reads back the exact 223-instruction cBPF program in one disposable single-task
-child, retires the child identity on every terminal/ownership-loss path, and
-returns only after kill, reap, final `ECHILD`, pending-signal continuity, and
-signal restoration. Its result is intentionally a completed-probe record, not
-a live installed-filter witness: the diagnostic child is already gone and can
-never accept a command. The real isolation child can now enter a distinct
-supervisor-held state, but supervisor cookie handling, same-child filter
-installation/readback, fixed command release, complete post-release task-tree
-supervision, and qualification against pinned Python remain future composition
-work. No component grants execution, profile, candidate, replay, hit, or reuse
-authority.
-
-A separate bounded reference snapshot oracle records the fixed workspace
-fixture and exact argv while marking source, binary, and qualified-tuple
-provenance as caller-supplied and unverified. An offline verifier accepts only
-the exact five-member future evidence archive and checks canonical ZIP layout,
-schemas, hashes, streams, wait status, workspace stability, cleanup/reap
-claims, execute-only counters, and false authority fields. A deterministic
-offline packager reads exactly those five bounded inputs without following
-links, writes and verifies a private `0600` staging archive, then publishes it
-under the requested name with an atomic no-replace link. Publication and
-cleanup ambiguity remain typed, and rejected bytes are never deliberately
-published under the final name. These tools and their adversarial suites are
-connected to hosted CI. They validate evidence shape and internal consistency
-only: none executes pytest, verifies the producer's runtime observations,
-qualifies a tuple, or grants product authority. There is no production
-evidence producer yet, and the packager does not protect against a malicious
-same-UID process that can race its output directory.
-
-The first acceptance fixture should use exactly one selector, such as
-`tests/test_smoke.py::test_smoke`. It must compose:
-
-- two-phase lexical and snapshot-backed admission;
-- descriptor-bound, manifest-reconciled, whole-inventory-revalidated
-  workspace/runtime publications;
-- rootless namespace PID 1, private root, scratch mounts, procfs, FD scrub,
-  capability elimination, Landlock, and production workload seccomp;
-- the kernel-backed supervisor and complete descendant cleanup;
-- profile-owned stdin/stdout/stderr; and
-- exact foreground stream and raw wait-status delivery.
-
-Product outcome:
-
-- admitted pytest runs execute in a disposable branch with no host network and
-  no writable host-workspace view; malformed invocations refuse before Python
-  starts; completed runs are always `Executed only` and cannot be shadowed,
-  promoted, or replayed.
-
-Exit gate:
-
-- exact stdout, stderr, and wait status are delivered;
-- the host workspace manifest is unchanged;
-- network, descriptor, mount, namespace, task, and branch cleanup canaries pass;
-- every descendant reaches terminal reap and final `ECHILD`;
-- unsupported signals, restarts, syscalls, mappings, or nondeterministic inputs
-  produce an explicit execute-only reason rather than a candidate; and
-- the feature remains limited to exact qualified Linux tuples.
-
-## Gate 4 — complete candidate construction
-
-**Goal:** turn a foreground execution into an immutable candidate without yet
-serving a cache hit.
-
-**Entry gate:** Gate 3.
-
-Work:
-
-- implement the semantic syscall adapter and complete EffectIR v2 recorder;
-- record executable/interpreter/library closure, descriptor-selected paths,
-  file and directory observations, absent paths, symlinks, metadata, environment
-  digests, stdin, ordered effects, task lifecycle, streams, and raw wait status;
-- bind the canonical snapshot manifest and digest to the prepared invocation;
-- broker or explicitly reject time, randomness, logical PID, sleep, asynchronous
-  signal, scheduling, and externally mutable shared-memory surfaces;
-- make every unsupported or incomplete trace permanently execute-only; and
-- store candidates immutably without mutating them into promoted records.
-
-Exit gate:
-
-- the completeness bitmap is closed for every admitted candidate;
-- no candidate can be created without connector completion evidence;
-- canonical wire objects round-trip and differential tests cover malformed,
-  reordered, substituted, over-limit, and unknown-version inputs; and
-- crash or interruption exposes no partial committed effect or candidate.
-
-## Gate 5 — shadow, promotion, and local pytest reuse
-
-**Goal:** serve the first trace-backed pytest hit.
-
-**Entry gate:** Gate 4.
-
-Work:
-
-1. Run the foreground and shadow in separate independently isolated invocations
-   from the same immutable inputs.
-2. Compare exact stdout, stderr, raw wait status, semantic EffectIR comparison
-   view, completeness, runtime/profile identity, and final filesystem root.
-3. On divergence, atomically quarantine only the exact v1 request-scoped class:
-   profile digest, workspace identity, shape key, and request key. Effect shape
-   remains analytics and grants no generalized quarantine authority.
-4. Create a separate promotion row referencing two distinct immutable candidates;
-   never mutate a candidate disposition.
-5. Revalidate current inputs and all replay preconditions before serving a hit.
-6. Start with 100% shadow validation and reduce it only after retained evidence
-   demonstrates dependency completeness.
-
-Product outcome:
-
-- a later identical qualified pytest invocation with no replay-required
-  workspace effects and an unchanged final workspace may return the promoted
-  result without rerunning pytest while preserving complete streams and status.
-  Filesystem-writing runs remain execute-only until transactional replay
-  preconditions and effect commit pass a later gate.
-
-Exit gate:
-
-- zero unexplained divergences in 100,000 eligible shadow comparisons;
-- zero known incorrect reuses and zero partial-effect commits;
-- miss overhead below 15% for commands over one second;
-- warm hit p95 below 100 ms and at least 3x speedup on eligible fixtures whose
-  original duration is at least 500 ms; and
-- every refusal, execute-only disposition, candidate, promotion, quarantine, and
-  replay has a stable explanation and retained evidence.
-
-## Gate 6 — managed team alpha
-
-**Goal:** convert the existing manually provisioned encrypted team foundation
-into a deployable, operable product without allowing remote state to upgrade an
-unsafe local execution profile.
-
-**Entry gates:** Gate 1 and Gate 5.
-
-Work:
-
-- deploy the Worker/D1/R2 service behind production TLS and pre-auth abuse
-  controls;
-- build account, tenant, repository, generation, profile, key, trust, rotation,
-  revocation, retention, deletion, quota, and recovery workflows;
-- prove production bucket and tenant isolation and obtain external security
-  review;
-- complete the cross-layer post-decrypt revocation race and stateful 100,000-case
-  D1/R2 protocol corpus;
-- keep `legacy_v2` as the default until `bundle_v1` passes the maximum-payload,
-  pending-reader cancellation, heap, and full local/live matrix gates;
-- prove cross-machine equality for equivalent execution profiles; and
-- deliver CI integration using signed, immutable client artifacts rather than
-  building secret-bearing code from an untrusted checkout.
-
-Exit gate:
-
-- 100% rejection of unsigned, revoked, stale-generation, cross-tenant,
-  cross-repository, policy-mismatched, and profile-mismatched fixtures;
-- cross-machine equality for at least 100 hermetic workloads;
-- at least 30% median end-to-end wall-time reduction on consenting team sessions;
-- at least 20% useful cross-user hit rate for the chosen customer profile; and
-- three design partners are willing to pay for verified shared reuse or compute
-  savings.
-
-If useful cross-user hits remain below 10%, retain the remote evidence and local
-optimization value but reconsider the shared-cache business thesis.
-
-## Explicitly deferred
-
-The following do not enter the critical path until their prerequisite gate is
-green:
-
-- arbitrary commands, arbitrary Python, pytest flags, interactive workloads,
-  macOS trace-backed execution, or cross-platform semantic generalization;
-- automatic Codex hook rewriting or automatic compact references without an
-  effective per-call context and delivery receipt;
-- remote execution before local trace/replay correctness;
-- `bundle_v1` rollout before its existing failed gates pass;
-- eBPF as a sole enforcement or completeness boundary;
-- reuse of filesystem-writing pytest runs before transactional preconditions and
-  effect commit are proven; and
-- broad observability or surveillance telemetry. Metrics remain opt-in,
-  content-free, and tied to explicit product gates.
-
-## Compounding assets
-
-| Stage | Product asset | Compounding evidence asset |
+| Existing subsystem | Current value | Role in the new product |
 |---|---|---|
-| Explicit local reads | simple exact wrapper and reversible onboarding | admitted/refused shapes, invalidation corpus, real repeat patterns |
-| Kernel supervisor proof | real descendant transport and cleanup | kernel/profile compatibility and fault corpus |
-| Execute-only pytest | safe useful Linux execution | traced unsupported surfaces and workload compatibility |
-| Candidate + shadow | complete semantic records | minimized divergences and dependency closure |
-| Local reuse | saved pytest execution | validation history and calibrated replay preconditions |
-| Managed team reuse | shared verified savings | cross-machine equivalence, provenance, and organization-specific effect graphs |
+| Canonical tool-call gateway | Normalizes bounded MCP calls and provider identity | Common entrance for task-start, code intelligence, validation, and future providers |
+| Thirteen repository/Git tools | Exact bounded repository and Git observations | Immediate agent orientation and source evidence for edit briefs |
+| Workspace execution epochs | Descriptor-retained repository authority | One current view shared by task-start and eligible tools |
+| Scoped observation plans | Fingerprint only declared paths, trees, listings, identities, and Git state | Fine-grained invalidation instead of whole-repository cache eviction |
+| Exact executable/profile checks | Bind reviewed executable and host semantics | Foundation for toolchain-specific validation profiles |
+| SQLite coordination and CAS | Durable metadata, leases, events, and immutable streams | Shared execution memory for results, facts, validation, and artifacts |
+| In-flight joining | Identical concurrent calls converge on one execution | Prevent duplicate work across simultaneous agents |
+| Crash recovery and quarantine | Reclaims dead leases and refuses corrupt/divergent state | Required reliability boundary for all new reuse planes |
+| Double-execution admission | Detects common nondeterminism before storing local reads | Early validation pattern; later test profiles use stronger shadow promotion |
+| Digest memoization | Avoids rehashing unchanged filesystem objects | Core primitive for the shared manifest and incremental indexes |
+| Exact `run`/`reference`/`show` | Reuse or retrieve narrow audited local command results | Explicit local compatibility path and exact-result delivery primitive |
+| Universal tool policy | Separates exact reads, deterministic commands, freshness reads, mutations, credentials, communication, deployment, and payment | Prevents broader coverage from becoming unsafe generic caching |
+| Typed reasoning context | Facts, invalidations, unknowns, observations, failures, suggestions, and delivery metrics | Data model for the task-start edit brief and cross-agent knowledge |
+| Linux EffectIR foundations | Snapshot, isolation, trace, candidate, shadow, promotion, and replay contracts | Dependency authority for changed-only testing and later build reuse |
+| Encrypted team foundation | Signed provenance, encrypted manifests, trust and revocation | Later cross-machine execution-memory distribution |
 
-The moat is conservative reuse authority backed by evidence. A blob store,
-leaderboard score, or opaque classifier is not sufficient.
+No new subsystem should rebuild storage, request canonicalization, coordination,
+invalidation, delivery accounting, or corruption handling if the existing engine
+can be safely generalized.
+
+## Unified reuse architecture
+
+Again uses multiple reuse planes on one control plane.
+
+### Observation reuse
+
+Repository reads, search, tree, stat, glob, manifests, and bounded Git
+intelligence reuse exact results after fresh dependency validation. This is the
+shipping beachhead.
+
+### Knowledge reuse
+
+Verified facts, completed investigations, failed approaches, explicit unknowns,
+and invalidations are derived from exact observations. A fact carries source
+references and repository, workspace, state, dependency, and authorization
+bindings. A model-produced statement is a suggestion until admitted through
+that deterministic path.
+
+### Execution reuse
+
+Tests, type checks, linters, and builds use profile-specific observers. The
+first version of every profile is execute-only. Reuse requires a complete
+immutable candidate, an independent shadow, a separate promotion record, and
+fresh validation of the promoted dependency closure.
+
+### Artifact reuse
+
+Qualified build outputs become immutable content-addressed artifacts. Artifact
+identity alone never authorizes materialization; the producing profile,
+toolchain, configuration, environment, complete inputs, and destination/effect
+contract must still match.
+
+### Delivery reuse
+
+An exact result or brief is delivered in full until the exact recipient,
+session, turn, connection, compaction generation, and lifecycle authenticate
+complete delivery. Only then may Again send a compact reference or delta.
+
+### Team reuse
+
+Encrypted remote storage distributes already qualified observations, results,
+and artifacts across equivalent profiles. Remote signatures and ciphertext can
+never compensate for missing local validation authority.
+
+## Cache hierarchy
+
+```text
+L0  active in-flight work
+    identical concurrent calls join one physical execution
+
+L1  process-hot verified view
+    current repository epoch, descriptor handles, prepared statements,
+    current manifest nodes, and bounded indexes
+
+L2  local durable execution memory
+    SQLite metadata, immutable CAS streams/artifacts, facts, invalidations,
+    candidates, promotions, receipts, and metrics
+
+L3  optional local shared service
+    multiple agent sessions share one same-user coordinator without weakening
+    workspace or recipient identity
+
+L4  encrypted team service
+    cross-machine distribution with signatures, trust, revocation, privacy,
+    profile equivalence, quotas, and local verification
+```
+
+Every layer may improve lookup latency. None may mint authority that the layer
+below does not possess.
+
+## Universal request lifecycle
+
+```text
+agent action
+  -> canonical request and capability class
+  -> profile-specific dependency/effect plan
+  -> current repository/runtime observation
+  -> exact candidate lookup
+       |- active equivalent call -> join
+       |- fresh promoted result  -> serve
+       `- absent or uncertain    -> execute normally
+  -> immutable result or execute-only record
+  -> optional independent shadow
+  -> separate promotion
+  -> provenance and invalidation edges
+  -> recipient-safe presentation
+  -> task-level cost and quality accounting
+```
+
+Unknown reusable state falls back to normal execution where that execution is
+safe. Dangerous executable configuration may require refusal. Mutations,
+credentials, communication, deployment, payment, and unknown external effects
+bypass result reuse.
+
+## Reuse identity
+
+A profile binds the relevant subset of:
+
+- repository, workspace, and task identity;
+- canonical provider/tool/request/arguments;
+- repository paths, trees, Git state, and filesystem-object epochs;
+- executable, interpreter, compiler, toolchain, and provider bytes;
+- environment, runtime context, platform, and isolation profile;
+- configuration, plugins, manifests, lockfiles, and generated inputs;
+- observed dependency and effect closure;
+- authorization and privacy scope;
+- policy, schema, and profile versions;
+- exact stdout, stderr, wait status, diagnostics, or artifact manifests.
+
+A command string, basename, content digest, provider annotation, embedding
+match, or LLM judgment is never sufficient by itself.
+
+## Shared repository manifest and invalidation
+
+The largest common cost is the fresh authoritative filesystem view. The target
+implementation extends the existing workspace epoch, observation plans, and
+digest memoization:
+
+1. Open and retain bounded directory descriptors from one workspace epoch.
+2. Build a sealed observed manifest containing only nodes required by current
+   operations, not an unconditional whole-repository snapshot.
+3. Reuse parent directory descriptors and verified unchanged-node digests
+   across repository tools in the same epoch.
+4. Record result-to-node and fact-to-result dependency edges.
+5. On mutation, create a new epoch and revalidate changed nodes plus required
+   ancestors.
+6. Retire only results, facts, indexes, validations, and artifacts reachable
+   from changed or uncertain dependencies.
+7. Require a final fresh fence before serving a hit; an old sealed manifest
+   cannot authorize a new epoch.
+
+This accelerates both the previous exact-tool cache and the new task-start
+brief. It requires no external account or hosted service.
+
+## Optional LLM acceleration
+
+Again supports three modes:
+
+1. **Deterministic-only:** lexical/path/symbol indexes and verified facts; fully
+   local and offline.
+2. **Fast-model assisted:** a local or inexpensive hosted model interprets the
+   task, ranks candidates, compresses context, and suggests validation.
+3. **Coding-model integrated:** the primary coding model receives the verified
+   brief and concentrates on design, editing, and debugging.
+
+The task-start path must have a deterministic fallback. Optional model work has
+a strict latency, token, privacy, and dollar budget; timeout or refusal returns
+the verified local subset plus explicit unknowns. Model suggestions may be
+memoized by model identity, prompt-template digest, parameters, and exact input
+digest, but remain non-authoritative suggestions after reuse.
+
+The intended economics are:
+
+```text
+deterministic code handles truth and reuse
+  -> cheap model handles ranking and compression
+  -> powerful model spends tokens on coding decisions
+```
+
+## Action-family coverage
+
+| Action family | Target treatment |
+|---|---|
+| File content, metadata, search, tree, glob | Exact snapshot-bound observation reuse |
+| Git status, diff, log, show, blame | Exact Git-state reuse with configuration/executable fences |
+| Symbols, definitions, references, imports | Deterministic derived observations over fixed parser/server bytes |
+| Repository/task facts and investigations | Source-bound knowledge reuse with explicit invalidation |
+| Type checks, diagnostics, lint check mode | Profile-specific exact execution reuse |
+| Pytest, Cargo tests, Go tests, Jest/Vitest | Changed-only execution and promoted-result reuse |
+| Formatting checks | Check-only deterministic profile; write mode is mutation |
+| Dependency/build graph queries | Manifest/lock/toolchain/configuration-bound observation reuse |
+| Builds | Diagnostics first, then qualified immutable artifact reuse |
+| Edits, renames, deletes, generated-source writes | Execute and invalidate; no ordinary replay |
+| Installs and environment changes | Explicit state transition; no generic cache hit |
+| Watchers, servers, REPLs, debuggers | Interactive passthrough |
+| Credentials, communication, deployment, payment | Bypass reusable storage and never replay side effects |
+
+The exhaustive profile inventory remains in [REUSE_SURFACE.md](REUSE_SURFACE.md).
+
+## Product scorecard
+
+The primary unit is a successful coding task. Paired evaluation freezes the
+agent/model, repository snapshot, task, permissions, limits, and acceptance
+rubric.
+
+Primary measures:
+
+- time to the first edit retained in the accepted patch;
+- end-to-end time to a validated task result;
+- pre-edit tool calls, provider executions, unique files, and bytes read;
+- provider-reported input/output tokens;
+- validation processes and compute time;
+- total metered model, provider, and compute cost;
+- accepted task and patch-quality outcome.
+
+Guardrails:
+
+- zero known incorrect hits and stale facts presented as current;
+- no required-validation or patch-quality regression;
+- every skipped execution has a consumable proof and explanation;
+- cold, warm, miss, invalidation, compaction, corruption, cancellation, and
+  recovery cases remain visible;
+- trivial work bypasses Again when verification has negative value;
+- optional model cost and latency are included rather than hidden.
+
+Initial public product targets, not current claims:
+
+- at least 30% median reduction in time to the first correct edit;
+- at least 20% median reduction in end-to-end validated task time;
+- at least 20% median reduction in total metered task cost;
+- at least 30% redundant repository/provider calls avoided on the repeat-heavy
+  beachhead cohort;
+- zero incorrect hits across every qualifying paired run.
+
+A showcase cohort may target 2x or greater acceleration, but it cannot replace
+the diverse-repository product gate.
+
+## Delivery sequence
+
+### Phase 0 — retain the working exact-reuse foundation
+
+Status: implemented local foundation; outside qualification remains open.
+
+Preserve:
+
+- default MCP repository/Git tools and explicit CLI behavior;
+- exact output and request/dependency bindings;
+- in-flight joins, leases, recovery, quarantine, and metrics;
+- fail-closed executable/profile checks;
+- empty-by-default experimental features;
+- existing release, evidence, and security boundaries.
+
+Exit:
+
+- no regression in current product E2E, chaos, four-language, formatting,
+  Clippy, test, packaging, and corruption gates;
+- current benchmark artifacts are reproducible on the candidate binary; and
+- every new layer uses rather than forks the existing execution-memory core.
+
+### Phase 1 — universal hot reuse substrate
+
+Goal: make the existing cache fast and general enough to support the edit brief
+and later validation profiles.
+
+Work:
+
+- add a sealed per-epoch observed manifest;
+- reuse parent directory descriptors and unchanged-node digests;
+- add dependency-to-result/fact invalidation indexes;
+- introduce profile-private adapters around common canonicalization,
+  coordination, CAS, quarantine, and accounting;
+- add a value model that bypasses lookup for trivial negative-value work;
+- benchmark cold/warm 1k, 10k, large-byte, mutation, and concurrent workloads.
+
+Exit:
+
+- exact bytes and zero-false-hit behavior remain unchanged;
+- relevant mutation invalidates and proven-irrelevant mutation preserves hits;
+- one repository epoch can serve multiple eligible operations without duplicate
+  full traversal;
+- benchmarked hot paths materially improve without hiding cold cost; and
+- no persistent manifest becomes authority without a fresh epoch fence.
+
+### Phase 2 — straight-to-code task start
+
+Goal: replace broad agent orientation with one bounded verified edit brief.
+
+Work:
+
+- admit typed facts from exact built-in tool observations;
+- implement bounded file-symbol, definition, and reference indexes;
+- select deterministic task-relevant candidates;
+- create a purpose-specific edit-brief compiler smaller than the internal
+  general reasoning brief;
+- expose one workspace-bound task-start MCP route;
+- attach invalidations, unknowns, failed approaches, source locators,
+  retrieval references, and validation preview;
+- update agent setup so a task begins with one brief, not a forced prose plan.
+
+Exit:
+
+- every presented current fact resolves to live verified sources;
+- invalid or contradictory sources fail closed or appear explicitly invalidated;
+- the route is bounded and has a deterministic model-free fallback;
+- cold and hot task-start latency, bytes, and tool-call displacement are
+  measured; and
+- no semantic ranking result grants current-fact or reuse authority.
+
+### Phase 3 — optional LLM ranking and authenticated context delta
+
+Goal: use models for relevance without paying repeatedly for rediscovery or
+weakening truth.
+
+Work:
+
+- add provider-neutral optional ranking/compression with strict budgets;
+- bind model suggestions to model, template, parameters, and exact input;
+- add transport-authenticated recipient issuance;
+- expose recipient-bound full retrieval grants;
+- record complete-response write/flush receipts;
+- deliver compact references or deltas only within the same active,
+  uncompacted recipient context;
+- retire authority on disconnect, cancellation, restart, compaction, or
+  lifecycle change.
+
+Exit:
+
+- model timeout/failure falls back without blocking the agent;
+- full output remains available and exact;
+- duplicate envelopes do not double-count savings;
+- no bearer result ID grants retrieval;
+- token/cost claims use provider-reported usage from paired runs; and
+- sensitive task/context data remains local unless explicitly configured.
+
+### Phase 4 — editable real-agent product gate
+
+Goal: prove Again reduces planning and coding time, not merely tool latency.
+
+Work:
+
+- extend the existing real-agent harness from read-only tasks to editable tasks
+  in independent identical worktrees;
+- retain monotonic task, first-tool, first-edit, accepted-edit, validation, and
+  final-outcome markers;
+- use fixed acceptance tests and patch-quality rubrics;
+- run Codex and Claude baseline/Again pairs with treatment order balancing;
+- report cold, hot, changed, compaction, model-assisted, and deterministic
+  cohorts separately.
+
+Exit:
+
+- the initial public product targets above pass on diverse real repositories;
+- no task outcome, validation, or patch-quality regression occurs;
+- raw paired events and provider usage are retained; and
+- outside-user evidence closes the applicable local-alpha gate.
+
+### Phase 5 — changed-only pytest
+
+Goal: execute uncertain tests and reuse only promoted unaffected results.
+
+Work:
+
+- complete one real `.venv/bin/python -I -m pytest <selector>` execute-only
+  profile on qualified Linux;
+- bind snapshot, interpreter/runtime closure, configuration/plugins,
+  environment, descendants, reads, effects, streams, wait status, and cleanup;
+- build immutable primary candidates;
+- run independent shadows and store separate promotion rows;
+- derive a validation plan from the observed dependency closure;
+- freshly revalidate every proposed hit.
+
+Exit:
+
+- unsupported/incomplete observations remain execute-only;
+- zero unexplained divergences in the frozen shadow corpus;
+- no candidate exists without connector completion and cleanup evidence;
+- affected tests execute and only proven-unaffected tests reuse; and
+- exact status/stdout/stderr and required effects match the native outcome.
+
+### Phase 6 — polyglot validation and build artifacts
+
+Goal: extend the same private-profile machinery rather than creating ecosystem
+specific caches.
+
+Order:
+
+1. Rust: Cargo check, exact tests, Clippy, and formatter check.
+2. TypeScript/JavaScript: `tsc --noEmit`, Jest/Vitest, ESLint check.
+3. Go: exact `go test`, vet, and build profiles.
+4. Python: Ruff, mypy, and broader qualified test shapes.
+5. Immutable build artifacts produced by the qualified profiles.
+
+Exit for each profile:
+
+- executable/toolchain/configuration/plugin/lock/generated-input and complete
+  observed dependency bindings are closed;
+- execute-only, candidate, shadow, promotion, invalidation, and hit tests pass;
+- native and Again outcomes are exact for the admitted surface;
+- miss overhead and artifact materialization cost are measured; and
+- adding the profile does not expose a generic arbitrary-command launcher.
+
+### Phase 7 — managed cross-agent and team execution memory
+
+Goal: share verified observations, knowledge, validation, and artifacts across
+agents and equivalent machines.
+
+Work:
+
+- productize local multi-session recipient identity and coordination;
+- deploy the encrypted service behind production TLS;
+- add self-service repository/profile/key/trust provisioning;
+- enforce signed producers, revocation, privacy, generation lifecycle, quotas,
+  audit, deletion, monitoring, backup, and recovery;
+- prove cross-machine execution-profile equivalence;
+- retain local verification before every remote hit;
+- validate with design partners before broad availability.
+
+Exit:
+
+- no remote state upgrades missing local authority;
+- cross-machine exactness and revocation races pass;
+- secret-tainted data cannot be shared;
+- production operations and independent security review close; and
+- team task-level time/cost improvement passes the paired product gate.
+
+## Historical gate compatibility
+
+### Gate 0 — restore evidence authority
+
+Historical meaning: make claims follow reproducible local or immutable hosted
+evidence. This remains a permanent rule and is represented by Phase 0 and the
+product scorecard.
+
+### Gate 1 — distributable local alpha
+
+Historical meaning: signed/installable local product plus outside-user exactness
+and speed evidence. It now spans Phase 0 qualification and the outside-user
+portion of Phase 4. The current local four-language pass does not substitute for
+outside evidence.
+
+### Gate 2 — kernel-backed supervisor tree proof
+
+Historical meaning: the fixed command-free Linux supervisor transport proof.
+Its retained evidence remains valid and narrow. It grants no pytest, profile,
+execution, candidate, or reuse authority.
+
+### Gate 3 — first execute-only pytest product slice
+
+Historical meaning: one real pytest selector executes through the qualified
+Linux profile while all candidate/shadow/promotion/reuse fields remain false.
+This is the first half of Phase 5.
+
+### Gate 4 — complete candidate construction
+
+Historical meaning: a completed foreground execution becomes an immutable
+candidate after complete semantic observation and cleanup. This is a Phase 5
+subgate and still grants no hit.
+
+### Gate 5 — shadow, promotion, and local pytest reuse
+
+Historical meaning: independent primary/shadow agreement, separate promotion,
+fresh validation, and exact local pytest reuse. This closes Phase 5.
+
+### Gate 6 — managed team alpha
+
+Historical meaning: deployed, provisioned, encrypted, signed, revocable,
+equivalent-profile team reuse with operational evidence. It is Phase 7 and may
+begin only after the relevant local-product and local-reuse gates pass.
+
+## Release discipline
+
+Every release candidate must:
+
+- pass pinned formatting, strict Clippy, locked tests, packaging, service, and
+  applicable 100,000-case differential gates;
+- retain exact source, binary, environment, benchmark, and report identities;
+- distinguish local observations, immutable hosted evidence, expected platform
+  refusals, and unexecuted plans;
+- preserve failing and superseded evidence instead of overwriting it;
+- keep experimental commands behind empty-by-default features;
+- report cold/miss overhead beside warm savings;
+- make no token, cost, coding-quality, or cross-machine claim without the
+  corresponding direct gate; and
+- refuse release if documentation claims exceed [STATUS.md](STATUS.md) or
+  [EVIDENCE.md](EVIDENCE.md).
+
+## Working documents
+
+- [PRODUCT.md](PRODUCT.md): shipping promise and current boundary.
+- [AGENT_ACCELERATION.md](AGENT_ACCELERATION.md): complete user loop and product
+  scorecard.
+- [STRAIGHT_TO_CODE.md](STRAIGHT_TO_CODE.md): edit-brief fast path and editable
+  task evaluation.
+- [REUSE_SURFACE.md](REUSE_SURFACE.md): action-family and validation-profile
+  inventory.
+- [ARCHITECTURE.md](ARCHITECTURE.md): authority transitions and current/target
+  component boundaries.
+- [STATUS.md](STATUS.md): what is implemented.
+- [EVIDENCE.md](EVIDENCE.md): what has been measured.
+- [DEVELOPMENT_WORKSTREAMS.md](DEVELOPMENT_WORKSTREAMS.md): terminal ownership
+  and merge discipline.
