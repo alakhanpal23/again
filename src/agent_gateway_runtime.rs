@@ -11,6 +11,8 @@ pub mod context_compiler;
 mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
+#[path = "agent_gateway_runtime/workspace_observation.rs"]
+mod workspace_observation;
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -71,6 +73,7 @@ use crate::workspace_authority::{
     TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1,
     issue_no_external_dependencies_v1, observe_environment_v1,
 };
+use workspace_observation::{ObservedWorkspaceRequestV1, WorkspaceObservationManagerV1};
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
 const REPOSITORY_PROVIDER_ID_V1: &str = "repo";
@@ -184,7 +187,7 @@ fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum RepositoryOperationV1 {
     Read,
     Search,
@@ -242,6 +245,10 @@ impl RepositoryOperationV1 {
     fn is_git(self) -> bool {
         self.provider_boundary().0 == GIT_PROVIDER_ID_V1
     }
+
+    const fn cache_tag(self) -> u8 {
+        self as u8
+    }
 }
 
 #[derive(Debug)]
@@ -279,7 +286,7 @@ trait RepositoryEpochProviderV1: UpstreamProvider {
 pub(crate) struct GatewayControlledProviderV1 {
     inner: Arc<dyn RepositoryEpochProviderV1>,
     workspace: PathBuf,
-    observed_workspace: SharedObservedWorkspaceV1,
+    observations: Arc<WorkspaceObservationManagerV1>,
     store: Arc<Mutex<Store>>,
     context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
@@ -342,28 +349,12 @@ impl GatewayControlledProviderV1 {
         inner: Arc<dyn RepositoryEpochProviderV1>,
         workspace: PathBuf,
         store: Arc<Mutex<Store>>,
-    ) -> Result<Self> {
-        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
-        Ok(Self::new_with_observed_workspace(
-            inner,
-            workspace,
-            observed_workspace,
-            store,
-            None,
-        ))
-    }
-
-    fn new_with_observed_workspace(
-        inner: Arc<dyn RepositoryEpochProviderV1>,
-        workspace: PathBuf,
-        observed_workspace: SharedObservedWorkspaceV1,
-        store: Arc<Mutex<Store>>,
-        context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
+        observations: Arc<WorkspaceObservationManagerV1>,
     ) -> Self {
         Self {
             inner,
             workspace,
-            observed_workspace,
+            observations,
             store,
             context_coordinator,
             active: Mutex::new(BTreeMap::new()),
@@ -387,32 +378,24 @@ impl GatewayControlledProviderV1 {
         self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
-    fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
+    fn resolve(
+        &self,
+        call: &ProviderCall,
+    ) -> Option<(ResolvedRequestV1, Arc<WorkspaceExecutionEpochV1>)> {
         let operation = RepositoryOperationV1::from_call(call)?;
         let descriptor = self.inner.descriptor();
         let (provider_id, implementation) = operation.provider_boundary();
         if descriptor.id != provider_id || descriptor.implementation != implementation {
             return None;
         }
-        let mut manifest = self
-            .observed_workspace
-            .manifest
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let resolved = resolve_repository_request_v1(
-            &self.observed_workspace.execution_epoch,
-            &mut manifest,
-            call,
-            operation,
-        )
-        .ok()?;
-        drop(manifest);
-        if let Some(coordinator) = self.context_coordinator.as_ref() {
-            coordinator
-                .observe_dependencies(call, &resolved.binding)
-                .ok()?;
-        }
-        Some(resolved)
+        let observed = self.observations.observe(&call.arguments, operation).ok()?;
+        let resolved = resolve_repository_request_v1(&observed, call, operation).ok()?;
+        Some((resolved, observed.execution_epoch))
+    }
+
+    fn fresh_direct_epoch(&self) -> Result<WorkspaceExecutionEpochV1, ProviderError> {
+        WorkspaceExecutionEpochV1::begin(&self.workspace, &gateway_workspace_limits_v1())
+            .map_err(|_| provider_io_v1(anyhow!("descriptor-retained workspace issuance failed")))
     }
 
     fn owner(call: &ProviderCall) -> String {
@@ -637,7 +620,7 @@ impl GatewayControlledProviderV1 {
                 let revalidated = self.resolve(&verification_call);
                 if revalidated
                     .as_ref()
-                    .map(|request| request.binding.binding_digest())
+                    .map(|(request, _)| request.binding.binding_digest())
                     != Some(resolved.binding.binding_digest())
                 {
                     let _ = self
@@ -786,7 +769,7 @@ impl GatewayControlledProviderV1 {
                     if self
                         .resolve(call)
                         .as_ref()
-                        .map(|request| request.binding.binding_digest())
+                        .map(|(request, _)| request.binding.binding_digest())
                         != Some(resolved.binding.binding_digest())
                     {
                         break Ok(None);
@@ -935,8 +918,8 @@ impl ToolExecution for GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        let epoch = Arc::clone(&self.observed_workspace.execution_epoch);
         if call.effect != EffectClass::ReadOnly {
+            let epoch = self.fresh_direct_epoch()?;
             return self.execute_direct(&epoch, call, secrets, true);
         }
         // Preload only a previously verified candidate. Reuse authority still
@@ -951,7 +934,8 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .flatten()
                     .map(|loaded| (candidate, loaded))
             });
-        let Some(resolved) = self.resolve(&call) else {
+        let Some((resolved, epoch)) = self.resolve(&call) else {
+            let epoch = self.fresh_direct_epoch()?;
             return self.execute_direct(&epoch, call, secrets, true);
         };
         let owner = Self::owner(&call);
@@ -1008,7 +992,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     let revalidated = self.resolve(&call);
                     if revalidated
                         .as_ref()
-                        .map(|request| request.binding.binding_digest())
+                        .map(|(request, _)| request.binding.binding_digest())
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
                     {
@@ -1312,6 +1296,7 @@ impl ToolExecution for GitProviderV1 {
 pub struct ExperimentalMcpGatewayV1 {
     gateway: McpGateway,
     store: Arc<Mutex<Store>>,
+    observations: Arc<WorkspaceObservationManagerV1>,
 }
 
 struct StoreDeliveryConfirmationSinkV1 {
@@ -1380,49 +1365,24 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
-        Self::build_with_shared_store_v1(&workspace, store)
-    }
-
-    /// Construct isolated MCP protocol state over one daemon-owned durable
-    /// store. Each connection still receives its own gateway and lifecycle,
-    /// while cold connection storms avoid concurrently reopening/migrating the
-    /// same SQLite authority.
-    pub(crate) fn build_with_shared_store_v1(
-        workspace: &Path,
-        store: Arc<Mutex<Store>>,
-    ) -> Result<Self> {
-        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
-        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
-        let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
+        let observations = Arc::new(WorkspaceObservationManagerV1::begin(
             &workspace,
-            Arc::clone(&store),
-            observed_workspace.clone(),
-        ));
+            gateway_workspace_limits_v1(),
+        )?);
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let repository_controlled: Arc<dyn UpstreamProvider> =
-            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
+            Arc::new(GatewayControlledProviderV1::new(
                 repository,
                 workspace.clone(),
-                observed_workspace.clone(),
                 Arc::clone(&store),
-                Some(Arc::clone(&context_coordinator)),
+                Arc::clone(&observations),
             ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
-        let git_controlled: Arc<dyn UpstreamProvider> =
-            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
-                git,
-                workspace.clone(),
-                observed_workspace.clone(),
-                Arc::clone(&store),
-                Some(Arc::clone(&context_coordinator)),
-            ));
-        let task_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
-            ContextProviderKindV1::Task,
-            Arc::clone(&context_coordinator),
-        ));
-        let shared_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
-            ContextProviderKindV1::Context,
-            Arc::clone(&context_coordinator),
+        let git_controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
+            git,
+            workspace,
+            Arc::clone(&store),
+            Arc::clone(&observations),
         ));
         let gateway = McpGateway::new(
             vec![
@@ -1435,9 +1395,12 @@ impl ExperimentalMcpGatewayV1 {
         )?
         .with_delivery_confirmation_sink(Arc::new(StoreDeliveryConfirmationSinkV1 {
             store: Arc::clone(&store),
-        }))
-        .with_recipient_lifecycle_sink_v1(context_coordinator);
-        Ok(Self { gateway, store })
+        }));
+        Ok(Self {
+            gateway,
+            store,
+            observations,
+        })
     }
 
     pub fn gateway(&self) -> &McpGateway {
@@ -1493,19 +1456,41 @@ impl ExperimentalMcpGatewayV1 {
     }
 }
 
+impl Drop for ExperimentalMcpGatewayV1 {
+    fn drop(&mut self) {
+        if std::env::var_os("AGAIN_HOT_REUSE_BENCHMARK_V1").as_deref()
+            != Some(std::ffi::OsStr::new("1"))
+        {
+            return;
+        }
+        let metrics = self.observations.metrics();
+        eprintln!(
+            "{}",
+            json!({
+                "schema": "again.hot-reuse-metrics.v1",
+                "sessionsCreated": metrics.sessions_created,
+                "sessionRotations": metrics.session_rotations,
+                "physicalContentHashes": metrics.physical_content_hashes,
+                "physicalDirectoryEnumerations": metrics.physical_directory_listings,
+                "contentHashesAvoided": metrics.content_hashes_avoided,
+                "directoryEnumerationsAvoided": metrics.directory_listings_avoided,
+                "resolverExecutions": metrics.resolver_executions,
+                "resolverCallsAvoided": metrics.resolver_calls_avoided,
+                "boundedLockRefusals": metrics.bounded_lock_refusals,
+            })
+        );
+    }
+}
+
 fn resolve_repository_request_v1(
-    execution_epoch: &WorkspaceExecutionEpochV1,
-    observed_manifest: &mut ObservedManifestV1,
+    observed: &ObservedWorkspaceRequestV1,
     call: &ProviderCall,
     operation: RepositoryOperationV1,
 ) -> Result<ResolvedRequestV1> {
     let limits = gateway_workspace_limits_v1();
+    let execution_epoch = &observed.execution_epoch;
     let workspace = execution_epoch.canonical_workspace();
-    let observation_plan =
-        repository_tools::observation_plan_v1(execution_epoch, &call.arguments, operation)?;
-    let repository = observed_manifest
-        .observe_repository(&observation_plan)
-        .map_err(|_| anyhow!("repository state is incomplete"))?;
+    let repository = &observed.repository_epoch;
     if operation.is_git()
         && !matches!(
             repository.git_state(),
@@ -1969,6 +1954,16 @@ mod product_tests {
         context_with_scope(id, "shared-repository-scope")
     }
 
+    fn observation_manager(workspace: &Path) -> Arc<WorkspaceObservationManagerV1> {
+        Arc::new(
+            WorkspaceObservationManagerV1::begin(
+                &fs::canonicalize(workspace).unwrap(),
+                gateway_workspace_limits_v1(),
+            )
+            .unwrap(),
+        )
+    }
+
     fn context_with_scope(id: &str, scope: &str) -> GatewayRequestContext {
         GatewayRequestContext::new(
             AuthorizationScopeId::new(scope).unwrap(),
@@ -1994,14 +1989,12 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
-            GatewayControlledProviderV1::new(
-                upstream.clone(),
-                fs::canonicalize(workspace.path()).unwrap(),
-                Arc::clone(&store),
-            )
-            .unwrap(),
-        );
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
+            upstream.clone(),
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+            observation_manager(workspace.path()),
+        ));
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],
@@ -2152,14 +2145,12 @@ mod product_tests {
         let state = TempDir::new().unwrap();
         let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
         let repository = Arc::new(RepositoryProviderV1::new(workspace.path()).unwrap());
-        let controlled = Arc::new(
-            GatewayControlledProviderV1::new(
-                repository,
-                fs::canonicalize(workspace.path()).unwrap(),
-                Arc::clone(&store),
-            )
-            .unwrap(),
-        );
+        let controlled = Arc::new(GatewayControlledProviderV1::new(
+            repository,
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+            observation_manager(workspace.path()),
+        ));
         let registered: Arc<dyn UpstreamProvider> = controlled.clone();
         let gateway = McpGateway::new(
             vec![ProviderRegistration::trusted_annotations(registered)],
@@ -2218,14 +2209,12 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
-            GatewayControlledProviderV1::new(
-                upstream.clone(),
-                fs::canonicalize(workspace.path()).unwrap(),
-                Arc::clone(&store),
-            )
-            .unwrap(),
-        );
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
+            upstream.clone(),
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+            observation_manager(workspace.path()),
+        ));
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],

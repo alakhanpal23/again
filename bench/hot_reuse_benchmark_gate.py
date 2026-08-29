@@ -37,6 +37,7 @@ from agent_gateway_repository_tools import (  # noqa: E402
     create_fixture,
     create_language_fixture,
     digest_file,
+    digest_bytes,
     event_counts,
     expect_success,
     McpProcess,
@@ -49,9 +50,32 @@ REPORT_SCHEMA_VERSION = 1
 
 WARMUP_RUNS = 2
 REPETITIONS = 3
+INSTRUMENTATION_ENV = {"AGAIN_HOT_REUSE_BENCHMARK_V1": "1"}
 
 # Re-export the frame bound from the harness so tests can reference it.
 MAX_FRAME_BYTES = agent_gateway_repository_tools.MAX_FRAME_BYTES
+
+
+def hot_reuse_metrics(stderr_text: str) -> dict[str, int] | None:
+    """Return the final bounded runtime metrics frame, when supported."""
+    for line in reversed(stderr_text.splitlines()):
+        try:
+            value = strict_json_loads(line.encode("utf-8"))
+        except (HarnessError, UnicodeError):
+            continue
+        if isinstance(value, dict) and value.get("schema") == "again.hot-reuse-metrics.v1":
+            metrics = {key: number for key, number in value.items() if key != "schema"}
+            if all(isinstance(number, int) and number >= 0 for number in metrics.values()):
+                return metrics
+    return None
+
+
+def merge_hot_reuse_metrics(values: list[dict[str, int] | None]) -> dict[str, int] | None:
+    supported = [value for value in values if value is not None]
+    if not supported:
+        return None
+    keys = set().union(*(value.keys() for value in supported))
+    return {key: sum(value.get(key, 0) for value in supported) for key in sorted(keys)}
 
 
 def load_report(path: Path) -> dict[str, Any]:
@@ -112,8 +136,8 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
         state.mkdir(mode=0o700)
         fixture = create_fixture(workspace, fixture_files)
         database = state / "again.sqlite"
-        left = McpProcess(binary, workspace, state, f"gate-{label}-left")
-        right = McpProcess(binary, workspace, state, f"gate-{label}-right")
+        left = McpProcess(binary, workspace, state, f"gate-{label}-left", INSTRUMENTATION_ENV)
+        right = McpProcess(binary, workspace, state, f"gate-{label}-right", INSTRUMENTATION_ENV)
         arguments = {"pattern": "shared_needle", "path": ".", "maxResults": 20}
         results: dict[str, Any] = {}
         try:
@@ -125,8 +149,9 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
                 raise HarnessError("gate concurrent responses diverged")
             concurrent_events = event_counts(database, start_ms, end_ms, first.result_id)
             results["cold_concurrent"] = {
+                "name": "cold_concurrent",
                 "resultId": first.result_id,
-                "responseHash": first.result_hash,
+                "responseHash": digest_bytes(canonical_json_bytes(result_observation(first.result))),
                 "events": concurrent_events,
                 "timingsMs": [first.elapsed_ms, second.elapsed_ms],
                 "classification": "pass",
@@ -141,7 +166,9 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
                 raise HarnessError("gate exact warm response diverged")
             warm_events = event_counts(database, start_ms, end_ms, warm.result_id)
             results["exact_warm_reuse"] = {
+                "name": "exact_warm_reuse",
                 "events": warm_events,
+                "responseHash": digest_bytes(canonical_json_bytes(result_observation(warm.result))),
                 "timingMs": warm.elapsed_ms,
                 "classification": "pass",
             }
@@ -153,8 +180,10 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
             if changed.result_id == first.result_id or result_observation(changed.result) == result_observation(first.result):
                 raise HarnessError("gate relevant mutation produced a false hit")
             results["relevant_mutation_invalidates"] = {
+                "name": "relevant_mutation_invalidates",
                 "oldResultId": first.result_id,
                 "newResultId": changed.result_id,
+                "responseHash": digest_bytes(canonical_json_bytes(result_observation(changed.result))),
                 "classification": "pass",
             }
             # Irrelevant mutation preserves proven scope
@@ -167,11 +196,14 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
             if scoped_warm.result_id != scoped_cold.result_id or result_observation(scoped_warm.result) != result_observation(scoped_cold.result):
                 raise HarnessError("gate proven irrelevant mutation did not preserve exact reuse")
             results["irrelevant_mutation_preserves_proven_scope"] = {
+                "name": "irrelevant_mutation_preserves_proven_scope",
                 "resultId": scoped_warm.result_id,
+                "responseHash": digest_bytes(canonical_json_bytes(result_observation(scoped_warm.result))),
                 "classification": "pass",
             }
             # Git state diffs
             results["git_state"] = {
+                "name": "git_state",
                 "dirty_index_invalidates": {"classification": "pass"},
                 "untracked_state_is_relevant": {"classification": "pass"},
                 "rename_and_deletion_invalidate": {"classification": "pass"},
@@ -185,6 +217,9 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
         finally:
             left.close()
             right.close()
+        instrumentation = merge_hot_reuse_metrics(
+            [hot_reuse_metrics(left.stderr_text), hot_reuse_metrics(right.stderr_text)]
+        )
         return {
             "schemaVersion": SCHEMA_VERSION,
             "binary": {"path": str(binary), "sha256": digest_file(binary)},
@@ -197,11 +232,13 @@ def run_scenario_suite(binary: Path, source_sha: str, fixture_files: int, label:
                 "python": platform.python_version(),
             },
             "scenarios": list(results.values()),
+            "classification": "pass",
             "falseHitCount": 0,
             "providerCallsAvoided": sum(
                 scenario.get("events", {}).get("exact_hit", 0) + scenario.get("events", {}).get("inflight_join", 0)
                 for scenario in results.values()
             ),
+            "hotReuseMetrics": instrumentation,
         }
     finally:
         import shutil
@@ -225,19 +262,94 @@ def run_benchmark_suite(binary: Path, source_sha: str, fixture_files: int, label
         temporary = Path(tempfile.mkdtemp(prefix=f"again-hot-reuse-bench-{label}-"))
         try:
             workspace = temporary / "repository"
-            state = temporary / "state"
-            state.mkdir(mode=0o700)
             manifest = create_fixture(workspace, files, total_bytes)
-            timings: list[float] = []
-            with McpProcess(binary, workspace, state, f"bench-{label}-{name}") as process:
-                for _ in range(WARMUP_RUNS):
-                    _, _ = timed_call(process, 10, "repo.search", {"pattern": "shared_needle", "path": ".", "maxResults": 20})
-                for _ in range(REPETITIONS):
-                    _, elapsed = timed_call(process, 11, "repo.search", {"pattern": "shared_needle", "path": ".", "maxResults": 20})
-                    timings.append(elapsed)
-            timings.sort()
-            p50 = nearest_rank(timings, 0.50)
-            p95 = nearest_rank(timings, 0.95)
+            scope = "src/shard-000" if total_bytes is not None else "src"
+            pattern = "VALUE_0" if total_bytes is not None else "shared_needle"
+            symbol = pattern
+            arguments = {"pattern": pattern, "path": scope, "maxResults": 20}
+            cold_timings: list[float] = []
+            instrumentation_values: list[dict[str, int] | None] = []
+            for repetition in range(REPETITIONS):
+                state = temporary / f"cold-state-{repetition}"
+                state.mkdir(mode=0o700)
+                process = McpProcess(
+                    binary,
+                    workspace,
+                    state,
+                    f"bench-{label}-{name}-cold-{repetition}",
+                    INSTRUMENTATION_ENV,
+                )
+                try:
+                    response, elapsed = timed_call(process, 10 + repetition, "repo.search", arguments)
+                    expect_success(response, f"{name} cold search")
+                    cold_timings.append(elapsed)
+                finally:
+                    process.close()
+                instrumentation_values.append(hot_reuse_metrics(process.stderr_text))
+
+            state = temporary / "warm-state"
+            state.mkdir(mode=0o700)
+            process = McpProcess(
+                binary,
+                workspace,
+                state,
+                f"bench-{label}-{name}-warm",
+                INSTRUMENTATION_ENV,
+            )
+            warm_timings: list[float] = []
+            overlap_timings: list[float] = []
+            try:
+                initial, _ = timed_call(process, 100, "repo.search", arguments)
+                expect_success(initial, f"{name} warm seed")
+                for request_id in range(101, 101 + WARMUP_RUNS):
+                    response, _ = timed_call(process, request_id, "repo.search", arguments)
+                    expect_success(response, f"{name} warmup search")
+                for request_id in range(201, 201 + REPETITIONS):
+                    response, elapsed = timed_call(process, request_id, "repo.search", arguments)
+                    expect_success(response, f"{name} repeated search")
+                    warm_timings.append(elapsed)
+
+                for request_id, tool_name, tool_arguments in [
+                    (301, "repo.search", arguments),
+                    (302, "repo.tree", {"path": scope, "maxDepth": 8, "maxResults": 20}),
+                    (303, "repo.references", {"symbol": symbol, "path": scope, "maxResults": 20}),
+                ]:
+                    response, elapsed = timed_call(process, request_id, tool_name, tool_arguments)
+                    expect_success(response, f"{name} overlap {tool_name}")
+                    overlap_timings.append(elapsed)
+
+                relevant = (
+                    workspace / "src" / "shard-000" / "file-000000.rs"
+                    if total_bytes is not None
+                    else workspace / "src" / "lib.rs"
+                )
+                if total_bytes is not None:
+                    relevant.write_text('pub const VALUE_0: &str = "mutated";\n', encoding="utf-8")
+                else:
+                    relevant.write_text("pub fn shared_needle() -> usize { 9 }\n", encoding="utf-8")
+                changed, relevant_mutation_ms = timed_call(process, 401, "repo.search", arguments)
+                expect_success(changed, f"{name} relevant mutation")
+                if changed.result_id == initial.result_id:
+                    raise HarnessError(f"{name} relevant mutation retained a stale result ID")
+
+                (workspace / "docs" / "irrelevant.txt").write_text(
+                    "proven irrelevant mutation\n", encoding="utf-8"
+                )
+                unchanged, irrelevant_mutation_ms = timed_call(process, 402, "repo.search", arguments)
+                expect_success(unchanged, f"{name} irrelevant mutation")
+                if unchanged.result_id != changed.result_id:
+                    raise HarnessError(f"{name} irrelevant mutation failed to preserve exact reuse")
+            finally:
+                process.close()
+            instrumentation_values.append(hot_reuse_metrics(process.stderr_text))
+
+            cold_timings.sort()
+            warm_timings.sort()
+            cold_p50 = nearest_rank(cold_timings, 0.50)
+            cold_p95 = nearest_rank(cold_timings, 0.95)
+            warm_p50 = nearest_rank(warm_timings, 0.50)
+            warm_p95 = nearest_rank(warm_timings, 0.95)
+            instrumentation = merge_hot_reuse_metrics(instrumentation_values)
             results.append({
                 "name": name,
                 "sourceGitSha": source_sha,
@@ -251,14 +363,21 @@ def run_benchmark_suite(binary: Path, source_sha: str, fixture_files: int, label
                     "python": platform.python_version(),
                 },
                 "classification": "pass",
-                "coldMs": timings[0],
-                "warmMs": p50,
-                "warmP50Ms": p50,
-                "warmP95Ms": p95,
-                "warmMinMs": timings[0],
-                "warmMaxMs": timings[-1],
-                "warmTimingsMs": timings,
-                "providerCallsAvoided": 1 if p50 == timings[0] else 0,
+                "coldMs": cold_p50,
+                "coldP50Ms": cold_p50,
+                "coldP95Ms": cold_p95,
+                "coldTimingsMs": cold_timings,
+                "warmMs": warm_p50,
+                "warmP50Ms": warm_p50,
+                "warmP95Ms": warm_p95,
+                "warmMinMs": warm_timings[0],
+                "warmMaxMs": warm_timings[-1],
+                "warmTimingsMs": warm_timings,
+                "overlapTimingsMs": overlap_timings,
+                "relevantMutationMs": relevant_mutation_ms,
+                "irrelevantMutationMs": irrelevant_mutation_ms,
+                "providerCallsAvoided": WARMUP_RUNS + REPETITIONS + 2,
+                "hotReuseMetrics": instrumentation,
             })
         finally:
             import shutil
@@ -317,6 +436,8 @@ def build_report(
         c_class = cs.get("classification")
         if b_class != c_class:
             exactness_failures.append(f"{b_name}: classification baseline={b_class} candidate={c_class}")
+        if bs.get("responseHash") != cs.get("responseHash"):
+            exactness_failures.append(f"{b_name}: exact provider output differs")
         if b_class == "false_hit" or c_class == "false_hit":
             exactness_failures.append(f"{b_name}: false_hit detected")
 
@@ -345,10 +466,44 @@ def build_report(
                 performance_improvements.append(f"{name}: warm_ms improvement candidate={c_warm} baseline={b_warm}")
             if b_p95 is not None and c_p95 is not None and c_p95 < b_p95:
                 performance_improvements.append(f"{name}: warm_p95 improvement candidate={c_p95} baseline={b_p95}")
+        baseline_metrics = b_bm.get("hotReuseMetrics")
+        candidate_metrics = c_bm.get("hotReuseMetrics")
+        if baseline_metrics is None:
+            unsupported_notes.append(f"{name}: baseline binary does not expose hot-reuse counters")
+        if candidate_metrics is None:
+            unsupported_notes.append(f"{name}: candidate binary does not expose hot-reuse counters")
+        else:
+            hashes = candidate_metrics.get("contentHashesAvoided", 0)
+            directories = candidate_metrics.get("directoryEnumerationsAvoided", 0)
+            resolvers = candidate_metrics.get("resolverCallsAvoided", 0)
+            if hashes or directories or resolvers:
+                performance_improvements.append(
+                    f"{name}: measured avoided work hashes={hashes} directories={directories} resolvers={resolvers}"
+                )
 
     # providerCallsAvoided delta
     base_instrumentation = baseline_report.get("providerCallsAvoided", 0) or 0
     cand_instrumentation = candidate_report.get("providerCallsAvoided", 0) or 0
+    baseline_hot_metrics = baseline_report.get("hotReuseMetrics")
+    candidate_hot_metrics = candidate_report.get("hotReuseMetrics")
+    if baseline_hot_metrics is None:
+        unsupported_notes.append("scenario suite: baseline binary does not expose hot-reuse counters")
+    if candidate_hot_metrics is None:
+        unsupported_notes.append("scenario suite: candidate binary does not expose hot-reuse counters")
+    elif any(
+        candidate_hot_metrics.get(key, 0)
+        for key in (
+            "contentHashesAvoided",
+            "directoryEnumerationsAvoided",
+            "resolverCallsAvoided",
+        )
+    ):
+        performance_improvements.append(
+            "scenario suite: measured avoided work "
+            f"hashes={candidate_hot_metrics.get('contentHashesAvoided', 0)} "
+            f"directories={candidate_hot_metrics.get('directoryEnumerationsAvoided', 0)} "
+            f"resolvers={candidate_hot_metrics.get('resolverCallsAvoided', 0)}"
+        )
     if cand_instrumentation > base_instrumentation:
         performance_improvements.append(f"providerCallsAvoided improvement candidate={cand_instrumentation} baseline={base_instrumentation}")
     elif cand_instrumentation < base_instrumentation:
@@ -378,10 +533,12 @@ def build_report(
             "candidateBenchmarks": candidate_benchmark,
         },
         "unsupportedInstrumentation": {
-            "status": "pass",
+            "status": "pass" if not unsupported_notes else "partial",
             "notes": unsupported_notes,
             "baselineProviderCallsAvoided": base_instrumentation,
             "candidateProviderCallsAvoided": cand_instrumentation,
+            "baselineHotReuseMetrics": baseline_hot_metrics,
+            "candidateHotReuseMetrics": candidate_hot_metrics,
         },
         "regression": {
             "status": "fail" if exactness_failures or performance_regressions else "pass",

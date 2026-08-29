@@ -247,7 +247,14 @@ class Response:
 
 
 class McpProcess:
-    def __init__(self, binary: Path, workspace: Path, state: Path, name: str):
+    def __init__(
+        self,
+        binary: Path,
+        workspace: Path,
+        state: Path,
+        name: str,
+        extra_environment: dict[str, str] | None = None,
+    ):
         environment = {
             "AGAIN_HOME": str(state),
             "LANG": "C",
@@ -262,6 +269,8 @@ class McpProcess:
             "ALL_PROXY": "http://127.0.0.1:9",
             "NO_PROXY": "",
         }
+        if extra_environment:
+            environment.update(extra_environment)
         self.name = name
         self.process = subprocess.Popen(
             [
@@ -406,6 +415,10 @@ class McpProcess:
                     self.process.wait(timeout=2)
         self._stdout_thread.join(timeout=1)
         self._stderr_thread.join(timeout=1)
+
+    @property
+    def stderr_text(self) -> str:
+        return self._stderr.decode("utf-8", "replace")
 
     def __enter__(self) -> "McpProcess":
         return self
