@@ -9,11 +9,15 @@ use std::fmt;
 use serde::Serialize;
 
 use crate::agent_gateway::context::{
-    CompletedReasoningObservationV1, FailedReasoningApproachV1, InflightReasoningWorkV1,
-    InvalidatedReasoningFactV1, MAX_REASONING_BRIEF_BYTES_V1, MAX_REASONING_ITEMS_V1,
-    MAX_REASONING_SOURCE_REFERENCES_V1, REASONING_BRIEF_SCHEMA_VERSION_V1, ReasoningBriefInputV1,
-    ReasoningChangeV1, ReasoningContextRefusalV1, ReasoningEvidenceMetricsV1, ReasoningFactScopeV1,
-    ReasoningFactV1, ReasoningInvalidationV1, ReasoningRecipientV1, ReasoningRetrievalIdentityV1,
+    CompletedReasoningObservationV1, EDIT_BRIEF_SCHEMA_VERSION_V1, EditBriefInputV1,
+    EditValidationPreviewV1, FailedReasoningApproachV1, InflightReasoningWorkV1,
+    InvalidatedReasoningFactV1, MAX_EDIT_BRIEF_BYTES_V1, MAX_EDIT_BRIEF_DEPTH_V1,
+    MAX_EDIT_BRIEF_ITEMS_V1, MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1,
+    MAX_EDIT_BRIEF_SOURCE_REFERENCES_V1, MAX_EDIT_BRIEF_TEXT_BYTES_V1,
+    MAX_REASONING_BRIEF_BYTES_V1, MAX_REASONING_ITEMS_V1, MAX_REASONING_SOURCE_REFERENCES_V1,
+    REASONING_BRIEF_SCHEMA_VERSION_V1, ReasoningBriefInputV1, ReasoningChangeV1,
+    ReasoningContextRefusalV1, ReasoningEvidenceMetricsV1, ReasoningFactScopeV1, ReasoningFactV1,
+    ReasoningInvalidationV1, ReasoningRecipientV1, ReasoningRetrievalIdentityV1,
     ReasoningRouteDecisionV1, ReasoningScopeV1, ReasoningUnknownV1, SuggestedReasoningToolCallV1,
 };
 
@@ -1007,4 +1011,1120 @@ fn contains_sensitive_reasoning_content_v1(bytes: &[u8]) -> bool {
     ]
     .into_iter()
     .any(|marker| lowercase.contains(marker))
+}
+
+const EDIT_BRIEF_DIGEST_DOMAIN_V1: &[u8] = b"again.edit-brief.v1\0";
+const MAX_EDIT_BRIEF_INPUT_ITEMS_V1: usize = 96;
+const MAX_EDIT_BRIEF_INPUT_SOURCE_REFERENCES_V1: usize = 256;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditBriefOmittedItemsV1 {
+    pub task_current_facts: u64,
+    pub invalidations: u64,
+    pub explicit_unknowns: u64,
+    pub failed_approaches: u64,
+    pub repository_current_facts: u64,
+    pub validation_preview: u64,
+    pub completed_observations: u64,
+    pub inflight_work: u64,
+    pub suggestions: u64,
+    pub retrieval_references: u64,
+}
+
+impl EditBriefOmittedItemsV1 {
+    fn total(&self) -> u64 {
+        self.task_current_facts
+            .saturating_add(self.invalidations)
+            .saturating_add(self.explicit_unknowns)
+            .saturating_add(self.failed_approaches)
+            .saturating_add(self.repository_current_facts)
+            .saturating_add(self.validation_preview)
+            .saturating_add(self.completed_observations)
+            .saturating_add(self.inflight_work)
+            .saturating_add(self.suggestions)
+            .saturating_add(self.retrieval_references)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditBriefMetricsV1 {
+    pub included_current_facts: u64,
+    pub included_invalidations: u64,
+    pub included_unknowns: u64,
+    pub omitted_items: EditBriefOmittedItemsV1,
+    pub delivered_bytes: u64,
+    pub retrieval_references: u64,
+    pub complete_within_budget: bool,
+}
+
+/// One full-delivery-only edit brief. This type deliberately has no compact
+/// request, acknowledgment, or alternate presentation state.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CompiledEditBriefV1 {
+    bytes: Vec<u8>,
+    digest: [u8; 32],
+    full_retrieval: Vec<ReasoningRetrievalIdentityV1>,
+    metrics: EditBriefMetricsV1,
+}
+
+impl fmt::Debug for CompiledEditBriefV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompiledEditBriefV1(<redacted>)")
+    }
+}
+
+impl CompiledEditBriefV1 {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub const fn digest(&self) -> [u8; 32] {
+        self.digest
+    }
+
+    pub fn full_retrieval(&self) -> &[ReasoningRetrievalIdentityV1] {
+        &self.full_retrieval
+    }
+
+    pub const fn metrics(&self) -> &EditBriefMetricsV1 {
+        &self.metrics
+    }
+
+    pub const fn is_full_delivery(&self) -> bool {
+        true
+    }
+
+    pub const fn authorizes_compact_delivery(&self) -> bool {
+        false
+    }
+
+    pub const fn grants_reuse(&self) -> bool {
+        false
+    }
+
+    pub const fn grants_execution(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Default)]
+struct EditBriefSelectionV1 {
+    task_facts: Vec<ReasoningFactV1>,
+    invalidated: Vec<InvalidatedReasoningFactV1>,
+    unknowns: Vec<ReasoningUnknownV1>,
+    failed: Vec<FailedReasoningApproachV1>,
+    repository_facts: Vec<ReasoningFactV1>,
+    validation: Vec<EditValidationPreviewV1>,
+    completed: Vec<CompletedReasoningObservationV1>,
+    inflight: Vec<InflightReasoningWorkV1>,
+    suggestions: Vec<SuggestedReasoningToolCallV1>,
+}
+
+impl EditBriefSelectionV1 {
+    fn item_count(&self) -> usize {
+        self.task_facts.len()
+            + self.invalidated.len()
+            + self.unknowns.len()
+            + self.failed.len()
+            + self.repository_facts.len()
+            + self.validation.len()
+            + self.completed.len()
+            + self.inflight.len()
+            + self.suggestions.len()
+    }
+
+    fn source_count(&self) -> usize {
+        self.task_facts
+            .iter()
+            .chain(&self.repository_facts)
+            .map(|fact| fact.sources().len())
+            .chain(
+                self.invalidated
+                    .iter()
+                    .map(|fact| fact.fact().sources().len()),
+            )
+            .chain(self.failed.iter().map(|approach| approach.sources().len()))
+            .chain(
+                self.completed
+                    .iter()
+                    .map(|observation| observation.sources().len()),
+            )
+            .sum()
+    }
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalEditBriefV1<'a> {
+    format: &'static str,
+    schema_version: u16,
+    compiler: &'static str,
+    identity: CanonicalEditIdentityV1<'a>,
+    task_specific_current_facts: &'a [ReasoningFactV1],
+    invalidated_or_quarantined_facts: &'a [InvalidatedReasoningFactV1],
+    explicit_unknowns: &'a [ReasoningUnknownV1],
+    verified_failed_approaches: &'a [FailedReasoningApproachV1],
+    relevant_repository_current_facts: &'a [ReasoningFactV1],
+    validation_preview: &'a [EditValidationPreviewV1],
+    completed_observation_references: &'a [CompletedReasoningObservationV1],
+    inflight_equivalent_work: &'a [InflightReasoningWorkV1],
+    suggested_next_tool_calls: &'a [SuggestedReasoningToolCallV1],
+    route_explanations: &'a [CanonicalReasoningRouteV1],
+    evidence_metrics: &'a ReasoningEvidenceMetricsV1,
+    full_result_retrieval: &'a [ReasoningRetrievalIdentityV1],
+    truncation: CanonicalEditTruncationV1<'a>,
+    authority: CanonicalEditAuthorityV1,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalEditIdentityV1<'a> {
+    task_id: &'a str,
+    repository_id: &'a str,
+    workspace_id: &'a str,
+    state_digest: &'a str,
+    dependency_digest: &'a str,
+    authorization_scope_digest: &'a str,
+    agent_id: &'a str,
+    session_id: &'a str,
+    turn_id: &'a str,
+    connection_generation: &'a str,
+    compaction_generation: u64,
+    lifecycle_generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalEditTruncationV1<'a> {
+    maximum_bytes: u64,
+    maximum_items: u64,
+    maximum_source_references: u64,
+    maximum_retrieval_references: u64,
+    maximum_text_bytes: u64,
+    maximum_nesting_depth: u64,
+    included_items: u64,
+    included_source_references: u64,
+    included_retrieval_references: u64,
+    omitted: &'a EditBriefOmittedItemsV1,
+    complete_within_budget: bool,
+}
+
+#[derive(Serialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalEditAuthorityV1 {
+    edit_correct: bool,
+    test_reusable: bool,
+    compact_delivery: bool,
+    tool_reuse: bool,
+    execution_reuse: bool,
+    llm_ran: bool,
+}
+
+/// Compile the caller-supplied evidence into one bounded canonical task-start
+/// brief. No store, filesystem, tool, executor, model, or delivery authority is
+/// consulted by this pure function.
+pub fn compile_edit_brief_v1(
+    input: &EditBriefInputV1,
+) -> Result<CompiledEditBriefV1, ReasoningContextRefusalV1> {
+    validate_edit_brief_input_v1(input)?;
+
+    let mut invalidated = input.invalidated_facts.clone();
+    sort_and_deduplicate_v1(&mut invalidated);
+    let explicitly_invalidated_ids: BTreeSet<_> = invalidated
+        .iter()
+        .map(|entry| entry.fact().fact_id().to_owned())
+        .collect();
+    let mut candidates = Vec::new();
+    let mut routes = input.route_decisions.clone();
+
+    for fact in &input.known_facts {
+        if explicitly_invalidated_ids.contains(fact.fact_id()) {
+            continue;
+        }
+        if let Some((reason, changes)) = stale_fact_reason_v1(fact, &input.scope)? {
+            invalidated.push(InvalidatedReasoningFactV1::new(
+                fact.clone(),
+                reason,
+                changes,
+            )?);
+            routes.push(match reason {
+                ReasoningInvalidationV1::AuthorizationChanged => {
+                    ReasoningRouteDecisionV1::ExecuteForAuthorization
+                }
+                _ => ReasoningRouteDecisionV1::ExecuteForStateChange,
+            });
+        } else {
+            candidates.push(fact.clone());
+        }
+    }
+
+    let mut values_by_topic: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for fact in &candidates {
+        values_by_topic
+            .entry(fact.topic().to_owned())
+            .or_default()
+            .insert(fact.value_digest().to_owned());
+    }
+    let contradictory_topics: BTreeSet<_> = values_by_topic
+        .into_iter()
+        .filter_map(|(topic, values)| (values.len() > 1).then_some(topic))
+        .collect();
+
+    let mut task_facts = Vec::new();
+    let mut repository_facts = Vec::new();
+    for fact in candidates {
+        if contradictory_topics.contains(fact.topic()) {
+            invalidated.push(InvalidatedReasoningFactV1::new(
+                fact,
+                ReasoningInvalidationV1::ContradictoryEvidence,
+                Vec::new(),
+            )?);
+            routes.push(ReasoningRouteDecisionV1::QuarantineContradiction);
+        } else {
+            match fact.scope() {
+                ReasoningFactScopeV1::TaskSpecific => task_facts.push(fact),
+                ReasoningFactScopeV1::RepositoryWide => repository_facts.push(fact),
+            }
+        }
+    }
+
+    let mut unknowns = input.explicit_unknowns.clone();
+    let mut failed = input.failed_approaches.clone();
+    let mut validation = input.validation_preview.clone();
+    let mut completed = input.completed_observations.clone();
+    let mut inflight = input.inflight_work.clone();
+    let mut suggestions = input.suggested_next_tool_calls.clone();
+    for values in [&mut task_facts, &mut repository_facts] {
+        sort_and_deduplicate_v1(values);
+    }
+    sort_and_deduplicate_v1(&mut invalidated);
+    sort_and_deduplicate_v1(&mut unknowns);
+    sort_and_deduplicate_v1(&mut failed);
+    sort_and_deduplicate_v1(&mut validation);
+    sort_and_deduplicate_v1(&mut completed);
+    sort_and_deduplicate_v1(&mut inflight);
+    sort_and_deduplicate_v1(&mut suggestions);
+
+    if !unknowns.is_empty() {
+        routes.push(ReasoningRouteDecisionV1::ExecuteForUnknown);
+    }
+    if !inflight.is_empty() {
+        routes.push(ReasoningRouteDecisionV1::InflightJoin);
+    }
+    routes.retain(|route| *route != ReasoningRouteDecisionV1::CompactDeliveryConfirmed);
+    routes.push(ReasoningRouteDecisionV1::FullDeliveryRequired);
+    routes.sort_unstable();
+    routes.dedup();
+    let route_explanations: Vec<_> = routes
+        .into_iter()
+        .map(CanonicalReasoningRouteV1::from)
+        .collect();
+
+    let mut retrieval: Vec<_> = completed
+        .iter()
+        .map(|observation| observation.retrieval().clone())
+        .collect();
+    sort_and_deduplicate_v1(&mut retrieval);
+    let mut omitted = EditBriefOmittedItemsV1::default();
+    if retrieval.len() > MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1 {
+        omitted.retrieval_references =
+            (retrieval.len() - MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1) as u64;
+        retrieval.truncate(MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1);
+    }
+
+    let mut selection = EditBriefSelectionV1::default();
+    let mut included_items = 0usize;
+    let mut included_sources = 0usize;
+    admit_edit_items_v1(
+        &task_facts,
+        &mut selection.task_facts,
+        &mut omitted.task_current_facts,
+        |entry| entry.sources().len(),
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &invalidated,
+        &mut selection.invalidated,
+        &mut omitted.invalidations,
+        |entry| entry.fact().sources().len(),
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &unknowns,
+        &mut selection.unknowns,
+        &mut omitted.explicit_unknowns,
+        |_| 0,
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &failed,
+        &mut selection.failed,
+        &mut omitted.failed_approaches,
+        |entry| entry.sources().len(),
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &repository_facts,
+        &mut selection.repository_facts,
+        &mut omitted.repository_current_facts,
+        |entry| entry.sources().len(),
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &validation,
+        &mut selection.validation,
+        &mut omitted.validation_preview,
+        |_| 0,
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &completed,
+        &mut selection.completed,
+        &mut omitted.completed_observations,
+        |entry| entry.sources().len(),
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &inflight,
+        &mut selection.inflight,
+        &mut omitted.inflight_work,
+        |_| 0,
+        &mut included_items,
+        &mut included_sources,
+    );
+    admit_edit_items_v1(
+        &suggestions,
+        &mut selection.suggestions,
+        &mut omitted.suggestions,
+        |_| 0,
+        &mut included_items,
+        &mut included_sources,
+    );
+
+    let bytes = loop {
+        let complete = omitted.total() == 0;
+        let candidate = serialize_edit_brief_v1(
+            input,
+            &selection,
+            &route_explanations,
+            &retrieval,
+            &omitted,
+            complete,
+        )?;
+        if candidate.len() <= MAX_EDIT_BRIEF_BYTES_V1 {
+            break candidate;
+        }
+        if remove_low_priority_edit_item_v1(&mut selection, &mut omitted) {
+            continue;
+        }
+        if retrieval.pop().is_some() {
+            omitted.retrieval_references = omitted.retrieval_references.saturating_add(1);
+            continue;
+        }
+        if remove_protected_edit_item_v1(&mut selection, &mut omitted) {
+            continue;
+        }
+        return Err(ReasoningContextRefusalV1::ByteBound);
+    };
+
+    if contains_sensitive_reasoning_content_v1(&bytes) {
+        return Err(ReasoningContextRefusalV1::SensitiveContent);
+    }
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|_| ReasoningContextRefusalV1::Canonicalization)?;
+    if json_container_depth_v1(&value) > MAX_EDIT_BRIEF_DEPTH_V1 {
+        return Err(ReasoningContextRefusalV1::Canonicalization);
+    }
+
+    let metrics = EditBriefMetricsV1 {
+        included_current_facts: (selection.task_facts.len() + selection.repository_facts.len())
+            as u64,
+        included_invalidations: selection.invalidated.len() as u64,
+        included_unknowns: selection.unknowns.len() as u64,
+        omitted_items: omitted.clone(),
+        delivered_bytes: bytes.len() as u64,
+        retrieval_references: retrieval.len() as u64,
+        complete_within_budget: omitted.total() == 0,
+    };
+    Ok(CompiledEditBriefV1 {
+        digest: digest_edit_brief_v1(&bytes),
+        bytes,
+        full_retrieval: retrieval,
+        metrics,
+    })
+}
+
+fn admit_edit_items_v1<T: Clone>(
+    input: &[T],
+    output: &mut Vec<T>,
+    omitted: &mut u64,
+    source_count: impl Fn(&T) -> usize,
+    item_total: &mut usize,
+    source_total: &mut usize,
+) {
+    for item in input {
+        let sources = source_count(item);
+        if *item_total < MAX_EDIT_BRIEF_ITEMS_V1
+            && source_total.saturating_add(sources) <= MAX_EDIT_BRIEF_SOURCE_REFERENCES_V1
+        {
+            output.push(item.clone());
+            *item_total += 1;
+            *source_total += sources;
+        } else {
+            *omitted = omitted.saturating_add(1);
+        }
+    }
+}
+
+fn remove_low_priority_edit_item_v1(
+    selection: &mut EditBriefSelectionV1,
+    omitted: &mut EditBriefOmittedItemsV1,
+) -> bool {
+    macro_rules! remove_last {
+        ($field:ident, $count:ident) => {
+            if selection.$field.pop().is_some() {
+                omitted.$count = omitted.$count.saturating_add(1);
+                return true;
+            }
+        };
+    }
+    remove_last!(suggestions, suggestions);
+    remove_last!(inflight, inflight_work);
+    remove_last!(completed, completed_observations);
+    remove_last!(validation, validation_preview);
+    remove_last!(repository_facts, repository_current_facts);
+    remove_last!(failed, failed_approaches);
+    false
+}
+
+fn remove_protected_edit_item_v1(
+    selection: &mut EditBriefSelectionV1,
+    omitted: &mut EditBriefOmittedItemsV1,
+) -> bool {
+    macro_rules! remove_last {
+        ($field:ident, $count:ident) => {
+            if selection.$field.pop().is_some() {
+                omitted.$count = omitted.$count.saturating_add(1);
+                return true;
+            }
+        };
+    }
+    remove_last!(unknowns, explicit_unknowns);
+    remove_last!(invalidated, invalidations);
+    remove_last!(task_facts, task_current_facts);
+    false
+}
+
+fn serialize_edit_brief_v1(
+    input: &EditBriefInputV1,
+    selection: &EditBriefSelectionV1,
+    routes: &[CanonicalReasoningRouteV1],
+    retrieval: &[ReasoningRetrievalIdentityV1],
+    omitted: &EditBriefOmittedItemsV1,
+    complete_within_budget: bool,
+) -> Result<Vec<u8>, ReasoningContextRefusalV1> {
+    serde_json::to_vec(&CanonicalEditBriefV1 {
+        format: "again.edit-brief",
+        schema_version: EDIT_BRIEF_SCHEMA_VERSION_V1,
+        compiler: "deterministic_local",
+        identity: CanonicalEditIdentityV1 {
+            task_id: input.scope.task_id(),
+            repository_id: input.scope.repository_id(),
+            workspace_id: input.scope.workspace_id(),
+            state_digest: input.scope.state_digest(),
+            dependency_digest: input.scope.dependency_digest(),
+            authorization_scope_digest: input.scope.authorization_scope_digest(),
+            agent_id: input.recipient.agent_id(),
+            session_id: input.recipient.session_id(),
+            turn_id: input.recipient.turn_id(),
+            connection_generation: input.recipient.connection_generation(),
+            compaction_generation: input.recipient.compaction_generation(),
+            lifecycle_generation: input.recipient.lifecycle_generation(),
+        },
+        task_specific_current_facts: &selection.task_facts,
+        invalidated_or_quarantined_facts: &selection.invalidated,
+        explicit_unknowns: &selection.unknowns,
+        verified_failed_approaches: &selection.failed,
+        relevant_repository_current_facts: &selection.repository_facts,
+        validation_preview: &selection.validation,
+        completed_observation_references: &selection.completed,
+        inflight_equivalent_work: &selection.inflight,
+        suggested_next_tool_calls: &selection.suggestions,
+        route_explanations: routes,
+        evidence_metrics: &input.evidence_metrics,
+        full_result_retrieval: retrieval,
+        truncation: CanonicalEditTruncationV1 {
+            maximum_bytes: MAX_EDIT_BRIEF_BYTES_V1 as u64,
+            maximum_items: MAX_EDIT_BRIEF_ITEMS_V1 as u64,
+            maximum_source_references: MAX_EDIT_BRIEF_SOURCE_REFERENCES_V1 as u64,
+            maximum_retrieval_references: MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1 as u64,
+            maximum_text_bytes: MAX_EDIT_BRIEF_TEXT_BYTES_V1 as u64,
+            maximum_nesting_depth: MAX_EDIT_BRIEF_DEPTH_V1 as u64,
+            included_items: selection.item_count() as u64,
+            included_source_references: selection.source_count() as u64,
+            included_retrieval_references: retrieval.len() as u64,
+            omitted,
+            complete_within_budget,
+        },
+        authority: CanonicalEditAuthorityV1 {
+            edit_correct: false,
+            test_reusable: false,
+            compact_delivery: false,
+            tool_reuse: false,
+            execution_reuse: false,
+            llm_ran: false,
+        },
+    })
+    .map_err(|_| ReasoningContextRefusalV1::Canonicalization)
+}
+
+fn validate_edit_brief_input_v1(input: &EditBriefInputV1) -> Result<(), ReasoningContextRefusalV1> {
+    if !input.recipient.is_active() {
+        return Err(ReasoningContextRefusalV1::DeliveryIncomplete);
+    }
+    let item_count = [
+        input.known_facts.len(),
+        input.invalidated_facts.len(),
+        input.explicit_unknowns.len(),
+        input.failed_approaches.len(),
+        input.validation_preview.len(),
+        input.completed_observations.len(),
+        input.inflight_work.len(),
+        input.suggested_next_tool_calls.len(),
+        input.route_decisions.len(),
+    ]
+    .into_iter()
+    .try_fold(0usize, |total, count| total.checked_add(count))
+    .ok_or(ReasoningContextRefusalV1::ItemBound)?;
+    if item_count > MAX_EDIT_BRIEF_INPUT_ITEMS_V1 {
+        return Err(ReasoningContextRefusalV1::ItemBound);
+    }
+    let source_count = input
+        .known_facts
+        .iter()
+        .map(|fact| fact.sources().len())
+        .chain(
+            input
+                .invalidated_facts
+                .iter()
+                .map(|entry| entry.fact().sources().len()),
+        )
+        .chain(
+            input
+                .failed_approaches
+                .iter()
+                .map(|entry| entry.sources().len()),
+        )
+        .chain(
+            input
+                .completed_observations
+                .iter()
+                .map(|entry| entry.sources().len()),
+        )
+        .try_fold(0usize, |total, count| total.checked_add(count))
+        .ok_or(ReasoningContextRefusalV1::SourceReferenceBound)?;
+    if source_count > MAX_EDIT_BRIEF_INPUT_SOURCE_REFERENCES_V1 {
+        return Err(ReasoningContextRefusalV1::SourceReferenceBound);
+    }
+
+    let value =
+        serde_json::to_value(input).map_err(|_| ReasoningContextRefusalV1::Canonicalization)?;
+    validate_edit_json_value_v1(&value)?;
+    let bytes =
+        serde_json::to_vec(&value).map_err(|_| ReasoningContextRefusalV1::Canonicalization)?;
+    if contains_sensitive_reasoning_content_v1(&bytes) {
+        return Err(ReasoningContextRefusalV1::SensitiveContent);
+    }
+    Ok(())
+}
+
+fn validate_edit_json_value_v1(value: &serde_json::Value) -> Result<(), ReasoningContextRefusalV1> {
+    match value {
+        serde_json::Value::String(text) if text.len() > MAX_EDIT_BRIEF_TEXT_BYTES_V1 => {
+            Err(ReasoningContextRefusalV1::InvalidText)
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                validate_edit_json_value_v1(value)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(values) => {
+            for value in values.values() {
+                validate_edit_json_value_v1(value)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn json_container_depth_v1(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Array(values) => {
+            1 + values
+                .iter()
+                .map(json_container_depth_v1)
+                .max()
+                .unwrap_or(0)
+        }
+        serde_json::Value::Object(values) => {
+            1 + values
+                .values()
+                .map(json_container_depth_v1)
+                .max()
+                .unwrap_or(0)
+        }
+        _ => 0,
+    }
+}
+
+fn digest_edit_brief_v1(bytes: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EDIT_BRIEF_DIGEST_DOMAIN_V1);
+    hasher.update(&(bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    *hasher.finalize().as_bytes()
+}
+
+#[cfg(test)]
+mod edit_brief_tests {
+    use super::*;
+    use crate::agent_gateway::context::{EditValidationDispositionV1, ReasoningSourceReferenceV1};
+
+    fn digest(character: char) -> String {
+        std::iter::repeat_n(character, 64).collect()
+    }
+
+    fn scope() -> ReasoningScopeV1 {
+        ReasoningScopeV1::new(
+            "task-1",
+            "repository-1",
+            "workspace-1",
+            &digest('1'),
+            &digest('2'),
+            &digest('3'),
+        )
+        .unwrap()
+    }
+
+    fn recipient() -> ReasoningRecipientV1 {
+        ReasoningRecipientV1::new("agent-1", "session-1", "turn-1", &digest('4'), 0, 1).unwrap()
+    }
+
+    fn source(id: &str) -> ReasoningSourceReferenceV1 {
+        ReasoningSourceReferenceV1::new(
+            id,
+            &digest('5'),
+            "repository-1",
+            "workspace-1",
+            &digest('1'),
+            &digest('2'),
+            &digest('3'),
+            "src/lib.rs:1",
+        )
+        .unwrap()
+    }
+
+    fn task_fact(id: &str, topic: &str, statement: &str, value: char) -> ReasoningFactV1 {
+        ReasoningFactV1::new(
+            id,
+            topic,
+            statement,
+            &digest(value),
+            ReasoningFactScopeV1::TaskSpecific,
+            Some("task-1"),
+            vec![source(&format!("result-{id}"))],
+        )
+        .unwrap()
+    }
+
+    fn repository_fact(id: &str, topic: &str, statement: &str, value: char) -> ReasoningFactV1 {
+        ReasoningFactV1::new(
+            id,
+            topic,
+            statement,
+            &digest(value),
+            ReasoningFactScopeV1::RepositoryWide,
+            None,
+            vec![source(&format!("result-{id}"))],
+        )
+        .unwrap()
+    }
+
+    fn input_with_facts(facts: Vec<ReasoningFactV1>) -> EditBriefInputV1 {
+        EditBriefInputV1::new(
+            scope(),
+            recipient(),
+            facts,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            ReasoningEvidenceMetricsV1::default(),
+        )
+    }
+
+    fn json(compiled: &CompiledEditBriefV1) -> serde_json::Value {
+        serde_json::from_slice(compiled.bytes()).unwrap()
+    }
+
+    #[test]
+    fn edit_brief_is_deterministic_under_shuffled_input() {
+        let alpha = task_fact("fact-a", "alpha", "task alpha", '6');
+        let beta = repository_fact("fact-b", "beta", "repository beta", '7');
+        let mut first = input_with_facts(vec![beta.clone(), alpha.clone()]);
+        first.explicit_unknowns = vec![
+            ReasoningUnknownV1::new("unknown-b", "second unknown").unwrap(),
+            ReasoningUnknownV1::new("unknown-a", "first unknown").unwrap(),
+        ];
+        let mut second = input_with_facts(vec![alpha, beta]);
+        second.explicit_unknowns = first.explicit_unknowns.iter().cloned().rev().collect();
+
+        let first = compile_edit_brief_v1(&first).unwrap();
+        let second = compile_edit_brief_v1(&second).unwrap();
+        assert_eq!(first.bytes(), second.bytes());
+        assert_eq!(first.digest(), second.digest());
+    }
+
+    #[test]
+    fn task_facts_precede_repository_facts() {
+        let input = input_with_facts(vec![
+            repository_fact("repo-fact", "repo-topic", "repository statement", '6'),
+            task_fact("task-fact", "task-topic", "task statement", '7'),
+        ]);
+        let bytes = compile_edit_brief_v1(&input).unwrap().bytes;
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.find("task statement").unwrap() < text.find("repository statement").unwrap());
+    }
+
+    #[test]
+    fn contradictions_are_quarantined_and_explicit_invalidations_win() {
+        let contradicted = task_fact("fact-a", "same-topic", "first value", '6');
+        let competing = task_fact("fact-b", "same-topic", "second value", '7');
+        let explicitly_invalidated = InvalidatedReasoningFactV1::new(
+            contradicted.clone(),
+            ReasoningInvalidationV1::Quarantined,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut input = input_with_facts(vec![contradicted, competing]);
+        input.invalidated_facts = vec![explicitly_invalidated];
+
+        let compiled = compile_edit_brief_v1(&input).unwrap();
+        let value = json(&compiled);
+        assert_eq!(
+            value["task_specific_current_facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            value["invalidated_or_quarantined_facts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let input = input_with_facts(vec![
+            task_fact("fact-c", "other-topic", "third value", '8'),
+            task_fact("fact-d", "other-topic", "fourth value", '9'),
+        ]);
+        let value = json(&compile_edit_brief_v1(&input).unwrap());
+        assert!(
+            value["task_specific_current_facts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            value["invalidated_or_quarantined_facts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["reason"] == "contradictory_evidence")
+        );
+    }
+
+    #[test]
+    fn unknowns_failed_approaches_and_full_retrieval_are_preserved() {
+        let retrieval =
+            ReasoningRetrievalIdentityV1::new("full-result", &digest('6'), 2048).unwrap();
+        let completed = CompletedReasoningObservationV1::new(
+            "observation-1",
+            "repository inspection",
+            12,
+            retrieval.clone(),
+            vec![source("inspection-result")],
+        )
+        .unwrap();
+        let mut input = EditBriefInputV1::empty(scope(), recipient());
+        input.explicit_unknowns =
+            vec![ReasoningUnknownV1::new("test-result", "tests have not executed").unwrap()];
+        input.failed_approaches = vec![
+            FailedReasoningApproachV1::new(
+                "failed-1",
+                "reuse an old patch",
+                "state digest differs",
+                vec![source("failed-result")],
+            )
+            .unwrap(),
+        ];
+        input.completed_observations = vec![completed];
+
+        let compiled = compile_edit_brief_v1(&input).unwrap();
+        let value = json(&compiled);
+        assert_eq!(value["explicit_unknowns"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            value["verified_failed_approaches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(compiled.full_retrieval() == [retrieval]);
+    }
+
+    #[test]
+    fn validation_preview_and_compiled_brief_never_grant_authority() {
+        let preview = EditValidationPreviewV1::new(
+            "targeted-tests",
+            EditValidationDispositionV1::CandidateUnproven,
+        )
+        .unwrap();
+        assert!(!preview.grants_reuse());
+        assert!(!preview.grants_execution_reuse());
+        let mut input = EditBriefInputV1::empty(scope(), recipient());
+        input.validation_preview = vec![
+            preview,
+            EditValidationPreviewV1::new(
+                "full-suite",
+                EditValidationDispositionV1::ExecuteRequired,
+            )
+            .unwrap(),
+            EditValidationPreviewV1::new("mutation-check", EditValidationDispositionV1::Unknown)
+                .unwrap(),
+        ];
+        input.route_decisions = vec![ReasoningRouteDecisionV1::CompactDeliveryConfirmed];
+
+        let compiled = compile_edit_brief_v1(&input).unwrap();
+        assert!(compiled.is_full_delivery());
+        assert!(!compiled.authorizes_compact_delivery());
+        assert!(!compiled.grants_reuse());
+        assert!(!compiled.grants_execution());
+        let value = json(&compiled);
+        let dispositions: BTreeSet<_> = value["validation_preview"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["disposition"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            dispositions,
+            BTreeSet::from(["candidate_unproven", "execute_required", "unknown"])
+        );
+        assert!(!String::from_utf8_lossy(compiled.bytes()).contains("compact_delivery_confirmed"));
+        assert_authority_fields_are_false(&value);
+    }
+
+    fn assert_authority_fields_are_false(value: &serde_json::Value) {
+        match value {
+            serde_json::Value::Object(entries) => {
+                for (key, value) in entries {
+                    if key.contains("reuse")
+                        || matches!(
+                            key.as_str(),
+                            "edit_correct" | "compact_delivery" | "llm_ran"
+                        )
+                    {
+                        assert_eq!(value, false, "authority field {key} became true");
+                    }
+                    assert_authority_fields_are_false(value);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    assert_authority_fields_are_false(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn item_source_retrieval_byte_and_depth_bounds_are_explicit() {
+        let many_sources: Vec<_> = (0..8)
+            .map(|index| source(&format!("source-{index}")))
+            .collect();
+        let facts: Vec<_> = (0..6)
+            .map(|index| {
+                ReasoningFactV1::new(
+                    &format!("fact-{index}"),
+                    &format!("topic-{index}"),
+                    &format!("statement-{index}"),
+                    &digest(char::from(b'a' + index as u8)),
+                    ReasoningFactScopeV1::TaskSpecific,
+                    Some("task-1"),
+                    many_sources.clone(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let compiled = compile_edit_brief_v1(&input_with_facts(facts)).unwrap();
+        let value = json(&compiled);
+        assert!(compiled.bytes().len() <= MAX_EDIT_BRIEF_BYTES_V1);
+        assert!(
+            value["truncation"]["included_items"].as_u64().unwrap()
+                <= MAX_EDIT_BRIEF_ITEMS_V1 as u64
+        );
+        assert!(
+            value["truncation"]["included_source_references"]
+                .as_u64()
+                .unwrap()
+                <= MAX_EDIT_BRIEF_SOURCE_REFERENCES_V1 as u64
+        );
+        assert!(json_container_depth_v1(&value) <= MAX_EDIT_BRIEF_DEPTH_V1);
+        assert!(compiled.metrics().omitted_items.task_current_facts > 0);
+
+        let mut input = EditBriefInputV1::empty(scope(), recipient());
+        input.completed_observations = (0..20)
+            .map(|index| {
+                CompletedReasoningObservationV1::new(
+                    &format!("observation-{index:02}"),
+                    "bounded observation",
+                    1,
+                    ReasoningRetrievalIdentityV1::new(
+                        &format!("retrieval-{index:02}"),
+                        &digest(char::from(b'a' + (index % 6) as u8)),
+                        1,
+                    )
+                    .unwrap(),
+                    vec![source(&format!("observation-source-{index:02}"))],
+                )
+                .unwrap()
+            })
+            .collect();
+        let compiled = compile_edit_brief_v1(&input).unwrap();
+        assert_eq!(
+            compiled.full_retrieval().len(),
+            MAX_EDIT_BRIEF_RETRIEVAL_REFERENCES_V1
+        );
+        assert_eq!(compiled.metrics().omitted_items.retrieval_references, 4);
+    }
+
+    #[test]
+    fn truncation_markers_and_counts_are_deterministic() {
+        let unknowns: Vec<_> = (0..30)
+            .map(|index| {
+                ReasoningUnknownV1::new(
+                    &format!("unknown-{index:02}"),
+                    &format!("unresolved-{index:02}"),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut first = EditBriefInputV1::empty(scope(), recipient());
+        first.explicit_unknowns = unknowns.clone();
+        let mut second = EditBriefInputV1::empty(scope(), recipient());
+        second.explicit_unknowns = unknowns.into_iter().rev().collect();
+
+        let first = compile_edit_brief_v1(&first).unwrap();
+        let second = compile_edit_brief_v1(&second).unwrap();
+        assert_eq!(first.bytes(), second.bytes());
+        assert_eq!(first.metrics().included_unknowns, 24);
+        assert_eq!(first.metrics().omitted_items.explicit_unknowns, 6);
+        assert!(!first.metrics().complete_within_budget);
+        assert_eq!(json(&first)["truncation"]["complete_within_budget"], false);
+    }
+
+    #[test]
+    fn sensitive_and_overlong_content_is_refused_even_if_it_would_be_omitted() {
+        let mut input = EditBriefInputV1::empty(scope(), recipient());
+        input.explicit_unknowns = (0..25)
+            .map(|index| {
+                let explanation = if index == 24 {
+                    "password leaked"
+                } else {
+                    "ordinary unknown"
+                };
+                ReasoningUnknownV1::new(&format!("unknown-{index}"), explanation).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            compile_edit_brief_v1(&input),
+            Err(ReasoningContextRefusalV1::SensitiveContent)
+        );
+
+        let overlong = "x".repeat(MAX_EDIT_BRIEF_TEXT_BYTES_V1 + 1);
+        input.explicit_unknowns = vec![ReasoningUnknownV1::new("long", &overlong).unwrap()];
+        assert_eq!(
+            compile_edit_brief_v1(&input),
+            Err(ReasoningContextRefusalV1::InvalidText)
+        );
+    }
+
+    #[test]
+    fn malformed_scope_and_source_are_refused_by_the_shared_model() {
+        assert_eq!(
+            ReasoningScopeV1::new(
+                "",
+                "repository",
+                "workspace",
+                &digest('1'),
+                &digest('2'),
+                &digest('3')
+            ),
+            Err(ReasoningContextRefusalV1::InvalidIdentifier)
+        );
+        assert_eq!(
+            ReasoningSourceReferenceV1::new(
+                "result",
+                "bad-digest",
+                "repository",
+                "workspace",
+                &digest('1'),
+                &digest('2'),
+                &digest('3'),
+                "src/lib.rs:1",
+            ),
+            Err(ReasoningContextRefusalV1::InvalidDigest)
+        );
+    }
+
+    #[test]
+    fn minimal_brief_has_exact_canonical_digest_and_no_authority() {
+        let compiled =
+            compile_edit_brief_v1(&EditBriefInputV1::empty(scope(), recipient())).unwrap();
+        assert!(compiled.metrics().complete_within_budget);
+        assert_eq!(compiled.metrics().included_current_facts, 0);
+        assert_eq!(compiled.metrics().included_invalidations, 0);
+        assert_eq!(compiled.metrics().included_unknowns, 0);
+        assert!(compiled.full_retrieval().is_empty());
+        assert_eq!(
+            compiled
+                .digest()
+                .iter()
+                .fold(String::with_capacity(64), |mut encoded, byte| {
+                    use std::fmt::Write as _;
+                    write!(&mut encoded, "{byte:02x}").unwrap();
+                    encoded
+                }),
+            "445b1b077c20201a1b26b8835607206753c230e9e5731c06bb5ddfe316ada4b1"
+        );
+        assert_authority_fields_are_false(&json(&compiled));
+    }
 }
