@@ -129,7 +129,14 @@ const CACHE_MAGIC: &[u8; 16] = b"dyld_v1  arm64e\0";
 const AUDITED_SHARED_CACHE_RANGE_SIZE: u64 = 5_040_898_048;
 
 pub(crate) fn host_supports_team_runtime_v1() -> bool {
-    host_audited_apple_profile() == Ok(AUDITED_SYSTEM_PROFILE)
+    #[cfg(target_os = "macos")]
+    {
+        host_audited_apple_profile() == Ok(AUDITED_SYSTEM_PROFILE)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
