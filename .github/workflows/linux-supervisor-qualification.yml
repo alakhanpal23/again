@@ -15,8 +15,8 @@ concurrency:
 
 jobs:
   qualify:
-    name: Pinned provisioned Linux supervisor 100-sample qualification
-    runs-on: [self-hosted, linux, x64, again-linux-pytest-v1]
+    name: Disposable hosted Linux supervisor 100-sample qualification
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,13 +25,16 @@ jobs:
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
       - name: Require the provisioned kernel contract
-        run: scripts/preflight_linux_supervisor_runner.sh
+        run: sudo --preserve-env=PATH scripts/preflight_linux_supervisor_runner.sh
       - name: Strict Linux source validation
         run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
       - name: Build the fixed diagnostic
         run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Require 100 samples and both kernel fork-delivery orders
-        run: scripts/qualify_linux_supervisor.sh
+        run: sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh
+      - name: Return evidence ownership to the unprivileged job user
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" linux-supervisor-qualification 2>/dev/null || true
       - name: Upload exact qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

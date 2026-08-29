@@ -2,17 +2,17 @@
 //!
 //! A portable request must not obtain `platform_digest` or `image_digest` from
 //! a caller.  This module is the only production authority for those values.
-//! It admits one reviewed host: native arm64 macOS 15.6.1 (24G90), with SIP and
+//! It admits one reviewed host: native arm64 macOS 26.5 (25F71), with SIP and
 //! authenticated-root enforcement fully enabled, the exact audited command
-//! bytes, Apple's exact dyld, and the exact active arm64e shared-cache pair.
+//! bytes, Apple's exact dyld, and the exact active arm64e shared-cache set.
 //!
 //! The dynamic closure is authenticated rather than guessed.  The selected
 //! Mach-O slice may load only `/usr/lib/dyld` and
 //! `/usr/lib/libSystem.B.dylib`; loader-sensitive environment variables are
 //! excluded by the team request profile.  The in-process dyld UUID must equal
-//! the reviewed main cache, the main header must name exactly its reviewed
-//! `.01` subcache, and `codesign --strict` must validate both files against
-//! their exact reviewed CodeDirectory hashes.  Any OS/runtime change is local
+//! the reviewed main cache, the main header must name every reviewed
+//! subcache, and `codesign --strict` must validate each file against
+//! its exact reviewed CodeDirectory hash.  Any OS/runtime change is local
 //! only until a new profile is audited.
 //!
 //! The explicit slow audit can persist those code-signing facts in a
@@ -72,61 +72,188 @@ use crate::executable::{
 use crate::team::Digest;
 use crate::team_request_key::TeamRequestKeyV1;
 
-const ATTESTATION_SCHEMA_VERSION: u16 = 1;
+const ATTESTATION_SCHEMA_VERSION: u16 = 2;
 const PLATFORM_DOMAIN: &[u8] = b"again.team-runtime-platform.v1";
 const IMAGE_DOMAIN: &[u8] = b"again.team-runtime-image.v1";
 const CHECKPOINT_DIGEST_DOMAIN: &[u8] = b"again.team-runtime-audit-checkpoint.v1";
 const CHECKPOINT_NAMESPACE: &str = "again.team-runtime-audit-checkpoint.v1";
-const CHECKPOINT_SCHEMA_VERSION: u16 = 1;
-const CHECKPOINT_VERIFIER_PROFILE: &str = "again-macos-15.6.1-24G90-arm64e-runtime-verifier-v1";
+const CHECKPOINT_SCHEMA_VERSION: u16 = 2;
+const CHECKPOINT_VERIFIER_PROFILE: &str = "again-macos-26.5-25F71-arm64e-runtime-verifier-v1";
 const CHECKPOINT_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_CHECKPOINT_BYTES: u64 = 64 * 1024;
 
-const AUDITED_SYSTEM_PROFILE: &str = "macos-15.6.1-24G90-read-v0";
-const AUDITED_RG_PROFILE: &str = "codex-rg-15.2.0-e89fff89ac-arm64-read-v0";
+const AUDITED_SYSTEM_PROFILE: &str = "macos-26.5-25F71-read-v0";
+const AUDITED_RG_PROFILE: &str = "codex-rg-15.2.0-e89fff89ac-arm64-standalone-0.150.1-read-v0";
 const AUDITED_TARGET_ARCH: &str = "aarch64";
 const AUDITED_HW_MACHINE: &str = "arm64";
 const AUDITED_HW_CPU_TYPE: u32 = 16_777_228;
 const AUDITED_HW_CPU_SUBTYPE: u32 = 2;
-const AUDITED_KERNEL_RELEASE: &str = "24.6.0";
-const AUDITED_KERNEL_BUILD: &str = "24G90";
-const AUDITED_KERNEL_VERSION: &str = "Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000";
-const AUDITED_PRODUCT_VERSION: &str = "15.6.1";
+const AUDITED_KERNEL_RELEASE: &str = "25.5.0";
+const AUDITED_KERNEL_BUILD: &str = "25F71";
+const AUDITED_KERNEL_VERSION: &str = "Darwin Kernel Version 25.5.0: Mon Apr 27 20:41:12 PDT 2026; root:xnu-12377.121.6~2/RELEASE_ARM64_T6050";
+const AUDITED_PRODUCT_VERSION: &str = "26.5";
 const AUDITED_RELEASE_TYPE: &str = "User";
 const AUDITED_SHARED_REGION_VERSION: u32 = 3;
 const AUDITED_CSR_CONFIG: u32 = 0;
 
 const CODESIGN_PATH: &str = "/usr/bin/codesign";
-const CODESIGN_SIZE: u64 = 378_144;
-const CODESIGN_BLAKE3: &str = "0eadb4f5cb0ecea5124a7608057fda8ab88b77c7a2a72dbb419486163b080d62";
+const CODESIGN_SIZE: u64 = 459_824;
+const CODESIGN_BLAKE3: &str = "a2b92c8bf4a4959223df776e87b56b51e5ff897ba6894df0dd0908e974602fd7";
 const DYLD_PATH: &str = "/usr/lib/dyld";
-const DYLD_SIZE: u64 = 2_289_328;
-const DYLD_BLAKE3: &str = "807bd6c6538d3930511813b2046db83f91d3617888bd74d6275f35ee3cae1160";
+const DYLD_SIZE: u64 = 2_374_000;
+const DYLD_BLAKE3: &str = "747640e895367919c61a258eecb08adaaba9c509f8b06032f62b14137215c0d2";
 const DYLD_IDENTIFIER: &str = "com.apple.darwin.ignition";
 const DYLD_CODE_DIRECTORY_SHA256: &str =
-    "b4959acb9d4e635d5b79daa74b5d27f639896af63b4664052a4d6c16c1b3cf3a";
+    "eff52b30951e88997b80ab2f24b127ded87ae8225261582a2925e3baf9a07b4d";
 
 const CACHE_DIRECTORY: &str = "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld";
 const CACHE_MAIN_PATH: &str =
     "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e";
-const CACHE_SUB_PATH: &str =
-    "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld/dyld_shared_cache_arm64e.01";
-const CACHE_MAIN_SIZE: u64 = 2_712_764_416;
-const CACHE_SUB_SIZE: u64 = 2_203_500_544;
+const CACHE_MAIN_SIZE: u64 = 573_440;
 const CACHE_IDENTIFIER: &str = "com.apple.dyld.cache.arm64e.development";
 const CACHE_MAIN_CODE_DIRECTORY_SHA256: &str =
-    "2b9cccd5c5728972bc2a3b7f251114e6f1ff9b5eba56db1db3498ed4fe8dfc8a";
-const CACHE_SUB_CODE_DIRECTORY_SHA256: &str =
-    "8c7ba7e588b0edd43f7334e2de11688cd473219276fec41c1b6660fffd902be4";
+    "096faddef782ee51ed719ff1ef386f5370d68d8e7ade21d58b8231a184ee4429";
 const CACHE_MAIN_UUID: [u8; 16] = [
-    0x4c, 0x12, 0x23, 0xe5, 0xca, 0xce, 0x39, 0x82, 0xa0, 0x03, 0x61, 0x10, 0xa7, 0xa8, 0xa2, 0x5c,
+    0x46, 0xe0, 0x09, 0x7f, 0xf3, 0x85, 0x36, 0xc8, 0x84, 0xa9, 0xa4, 0x0d, 0x31, 0x5a, 0x32, 0xd1,
 ];
-const CACHE_SUB_UUID: [u8; 16] = [
-    0x2b, 0x39, 0x06, 0x46, 0xb4, 0xb5, 0x30, 0x2b, 0x84, 0x1a, 0xef, 0xaa, 0x52, 0x83, 0x64, 0x0d,
-];
-const CACHE_SUB_VM_OFFSET: u64 = 0x0000_0000_a560_c000;
 const CACHE_MAGIC: &[u8; 16] = b"dyld_v1  arm64e\0";
-const AUDITED_SHARED_CACHE_RANGE_SIZE: u64 = 5_040_898_048;
+const AUDITED_SHARED_CACHE_RANGE_SIZE: u64 = 5_990_596_608;
+
+#[derive(Clone, Copy)]
+struct AuditedSubcache {
+    suffix: &'static str,
+    size: u64,
+    uuid: [u8; 16],
+    vm_offset: u64,
+    code_directory_sha256: &'static str,
+}
+
+const AUDITED_SUBCACHES: &[AuditedSubcache] = &[
+    AuditedSubcache {
+        suffix: ".01",
+        size: 1_706_196_992,
+        uuid: [
+            0x24, 0x01, 0xa0, 0x23, 0x10, 0xba, 0x34, 0x95, 0xad, 0x2f, 0x03, 0xcb, 0x53, 0x72,
+            0x68, 0x1b,
+        ],
+        vm_offset: 0x0008_8000,
+        code_directory_sha256: "57f21f98b452d06b18ca60f329b3f5c2d02520280ca814c044e4fa0ccce89a93",
+    },
+    AuditedSubcache {
+        suffix: ".02.dylddata",
+        size: 234_373_120,
+        uuid: [
+            0xf7, 0xa6, 0xb9, 0xb6, 0x0f, 0xe6, 0x3c, 0x31, 0xb5, 0x11, 0x00, 0x3e, 0x1a, 0x0a,
+            0x05, 0xc9,
+        ],
+        vm_offset: 0x6588_0000,
+        code_directory_sha256: "4f57b9afacbf26c21b0956859d8756ff1a1b47090878067a79151fbb529e5708",
+    },
+    AuditedSubcache {
+        suffix: ".03.dyldreadonly",
+        size: 126_894_080,
+        uuid: [
+            0xce, 0x4a, 0xff, 0xcb, 0x4d, 0x8a, 0x33, 0xe4, 0x8f, 0xb3, 0xac, 0xa0, 0xf2, 0x93,
+            0x49, 0xb0,
+        ],
+        vm_offset: 0x7779_4000,
+        code_directory_sha256: "e91c640b5fa7148dcbaadb6b116ede2b706c6de896c0f6318901cd8c048e162b",
+    },
+    AuditedSubcache {
+        suffix: ".04.dyldlinkedit",
+        size: 601_980_928,
+        uuid: [
+            0xb5, 0x6a, 0x11, 0x17, 0xf6, 0x79, 0x3e, 0xbe, 0xb9, 0xe0, 0x3b, 0xeb, 0x1a, 0xd9,
+            0xca, 0x0a,
+        ],
+        vm_offset: 0x7f05_8000,
+        code_directory_sha256: "a93ef1bf2d07de188e0ae0300d2f3e31e94e5e49933d3f1bf9c733abe84fd500",
+    },
+    AuditedSubcache {
+        suffix: ".05",
+        size: 1_824_473_088,
+        uuid: [
+            0x43, 0xd4, 0x54, 0xfc, 0xf1, 0xfe, 0x32, 0xf0, 0x89, 0x1d, 0xb5, 0xc7, 0x68, 0x0e,
+            0x83, 0xa6,
+        ],
+        vm_offset: 0xa2d5_0000,
+        code_directory_sha256: "8c0598db2c9b50a6df8bbd4dd5b4bf21027bb4f2b3b4849a2dc0220350edbb39",
+    },
+    AuditedSubcache {
+        suffix: ".06.dylddata",
+        size: 237_486_080,
+        uuid: [
+            0xbd, 0x88, 0x39, 0x3f, 0xf0, 0x65, 0x3b, 0x09, 0x90, 0x87, 0xf8, 0x74, 0x80, 0x3c,
+            0xb9, 0x4e,
+        ],
+        vm_offset: 0x10f5_dc000,
+        code_directory_sha256: "bcb9787b3e6eb00265069d1c1823208e4285b33890eb199295cbb2213333056a",
+    },
+    AuditedSubcache {
+        suffix: ".07.dyldreadonly",
+        size: 7_290_880,
+        uuid: [
+            0x31, 0x22, 0x9b, 0xbc, 0x86, 0x92, 0x3d, 0x76, 0x8a, 0xdf, 0x58, 0x42, 0x7b, 0x42,
+            0x63, 0x1b,
+        ],
+        vm_offset: 0x1217_e4000,
+        code_directory_sha256: "71d40821d4f36b8f21b976b8e45beed527250fc8853e2bedd87663946cb0433d",
+    },
+    AuditedSubcache {
+        suffix: ".08.dyldlinkedit",
+        size: 613_711_872,
+        uuid: [
+            0x34, 0xbd, 0xb6, 0xb4, 0x8c, 0x63, 0x3d, 0x4e, 0x95, 0x5b, 0x34, 0x67, 0xe7, 0x31,
+            0xa5, 0xa2,
+        ],
+        vm_offset: 0x121e_d4000,
+        code_directory_sha256: "30e2e431d9b45d6c5e1384463d31d844300a77b1c07bda5058976f85e6971b6d",
+    },
+    AuditedSubcache {
+        suffix: ".09",
+        size: 172_654_592,
+        uuid: [
+            0x6e, 0xd6, 0xc8, 0x13, 0xa6, 0xd7, 0x38, 0x9f, 0xba, 0x77, 0x90, 0x81, 0x04, 0x51,
+            0xbf, 0xe7,
+        ],
+        vm_offset: 0x1466_f4000,
+        code_directory_sha256: "0ea96a7c0d16631584d98513f17ff1e49a6d88953ad1d967c05e0e735450ca00",
+    },
+    AuditedSubcache {
+        suffix: ".10.dylddata",
+        size: 22_331_392,
+        uuid: [
+            0xbd, 0x38, 0x41, 0x52, 0x12, 0x65, 0x37, 0xd2, 0x87, 0xfb, 0x3b, 0xd3, 0xed, 0x8e,
+            0x31, 0x2e,
+        ],
+        vm_offset: 0x150b_48000,
+        code_directory_sha256: "07946825b64040fc12b01bbbe46bd9348c9c7bca8fee87e78b54d067f3d72c2b",
+    },
+    AuditedSubcache {
+        suffix: ".11",
+        size: 32_768,
+        uuid: [
+            0xc0, 0xc0, 0xbb, 0xcf, 0x07, 0xb7, 0x3e, 0x82, 0x8a, 0x86, 0x63, 0xaa, 0x0e, 0xab,
+            0xbd, 0xb3,
+        ],
+        vm_offset: 0x1560_88000,
+        code_directory_sha256: "2e6c946f43fcb89d7dd04cc547fd508d018fdb17f13bfb90cfb80b20d0bb6735",
+    },
+    AuditedSubcache {
+        suffix: ".12.dyldlinkedit",
+        size: 252_706_816,
+        uuid: [
+            0x83, 0x64, 0x75, 0x0b, 0xcb, 0xef, 0x30, 0xc8, 0xa5, 0x08, 0x26, 0x9d, 0x86, 0x20,
+            0x64, 0x5a,
+        ],
+        vm_offset: 0x1560_8c000,
+        code_directory_sha256: "a854870e8da1de8f45c34f1da542eeb2598e7787af6c8846827b6b9283349bf2",
+    },
+];
+
+fn cache_subcache_path(suffix: &str) -> PathBuf {
+    PathBuf::from(format!("{CACHE_MAIN_PATH}{suffix}"))
+}
 
 pub(crate) fn host_supports_team_runtime_v1() -> bool {
     #[cfg(target_os = "macos")]
@@ -142,6 +269,7 @@ pub(crate) fn host_supports_team_runtime_v1() -> bool {
 const MAX_EXECUTABLE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_STATIC_ARTIFACT_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_CACHE_HEADER_BYTES: usize = 1024 * 1024;
+const MAX_CACHE_SUBCACHES: usize = 32;
 const MAX_SYSCTL_BYTES: usize = 4096;
 const MAX_CODESIGN_OUTPUT_BYTES: usize = 64 * 1024;
 const CODESIGN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -553,7 +681,7 @@ struct RuntimeEvidence {
     dyld_digest: Digest,
     dyld_signature: SignatureEvidence,
     main_cache: CacheEvidence,
-    sub_cache: CacheEvidence,
+    subcaches: Vec<CacheEvidence>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -673,12 +801,19 @@ fn inspect_static_runtime() -> Result<RuntimeEvidence, RuntimeAttestationError> 
         "dyld_cache_main",
         CACHE_MAIN_CODE_DIRECTORY_SHA256,
     )?;
-    let sub_cache = inspect_cache(
-        Path::new(CACHE_SUB_PATH),
-        CACHE_SUB_SIZE,
-        "dyld_cache_sub",
-        CACHE_SUB_CODE_DIRECTORY_SHA256,
-    )?;
+    let mut subcaches = Vec::with_capacity(AUDITED_SUBCACHES.len());
+    for (index, expected) in AUDITED_SUBCACHES.iter().enumerate() {
+        let path = cache_subcache_path(expected.suffix);
+        subcaches.push(inspect_cache(
+            &path,
+            expected.size,
+            "dyld_cache_sub",
+            expected.code_directory_sha256,
+        )?);
+        if subcaches[index].uuid != expected.uuid || !subcaches[index].subcaches.is_empty() {
+            return Err(RuntimeAttestationError::CacheHeaderInvalid);
+        }
+    }
 
     Ok(RuntimeEvidence {
         system_profile,
@@ -701,12 +836,12 @@ fn inspect_static_runtime() -> Result<RuntimeEvidence, RuntimeAttestationError> 
         dyld_digest,
         dyld_signature,
         main_cache,
-        sub_cache,
+        subcaches,
     })
 }
 
-/// Reconstruct current evidence without invoking `codesign` over the 4.9 GB
-/// shared-cache pair. The checkpoint contributes only facts established by
+/// Reconstruct current evidence without invoking `codesign` over the multi-gigabyte
+/// shared-cache set. The checkpoint contributes only facts established by
 /// the recent slow audit. Every mutable/selected identity is re-read here.
 /// This shortcut is sound only for the stated threat boundary: CSR 0 and the
 /// authenticated root make the exact OS cache/dyld paths immutable to an
@@ -747,12 +882,15 @@ fn inspect_fast_runtime(
         "dyld_cache_main",
         audited.main_cache.signature.clone(),
     )?;
-    let sub_cache = inspect_cache_header_only(
-        Path::new(CACHE_SUB_PATH),
-        CACHE_SUB_SIZE,
-        "dyld_cache_sub",
-        audited.sub_cache.signature.clone(),
-    )?;
+    let mut subcaches = Vec::with_capacity(AUDITED_SUBCACHES.len());
+    for (expected, audited_cache) in AUDITED_SUBCACHES.iter().zip(&audited.subcaches) {
+        subcaches.push(inspect_cache_header_only(
+            &cache_subcache_path(expected.suffix),
+            expected.size,
+            "dyld_cache_sub",
+            audited_cache.signature.clone(),
+        )?);
+    }
 
     let runtime = RuntimeEvidence {
         system_profile: AUDITED_SYSTEM_PROFILE.to_owned(),
@@ -775,7 +913,7 @@ fn inspect_fast_runtime(
         dyld_digest,
         dyld_signature: audited.dyld_signature.clone(),
         main_cache,
-        sub_cache,
+        subcaches,
     };
     validate_runtime_evidence(&runtime)?;
     Ok(runtime)
@@ -986,13 +1124,18 @@ fn validate_runtime_evidence(runtime: &RuntimeEvidence) -> Result<(), RuntimeAtt
         CACHE_MAIN_CODE_DIRECTORY_SHA256,
         true,
     )?;
-    validate_cache_evidence(
-        &runtime.sub_cache,
-        CACHE_SUB_SIZE,
-        CACHE_SUB_UUID,
-        CACHE_SUB_CODE_DIRECTORY_SHA256,
-        false,
-    )?;
+    if runtime.subcaches.len() != AUDITED_SUBCACHES.len() {
+        return Err(RuntimeAttestationError::CacheHeaderInvalid);
+    }
+    for (cache, expected) in runtime.subcaches.iter().zip(AUDITED_SUBCACHES) {
+        validate_cache_evidence(
+            cache,
+            expected.size,
+            expected.uuid,
+            expected.code_directory_sha256,
+            false,
+        )?;
+    }
     Ok(())
 }
 
@@ -1021,10 +1164,16 @@ fn validate_cache_evidence(
         SignatureKind::AdHoc,
     )?;
     if is_main {
-        if cache.subcaches.len() != 1
-            || cache.subcaches[0].uuid != CACHE_SUB_UUID
-            || cache.subcaches[0].vm_offset != CACHE_SUB_VM_OFFSET
-            || cache.subcaches[0].suffix != ".01"
+        if cache.subcaches.len() != AUDITED_SUBCACHES.len()
+            || cache
+                .subcaches
+                .iter()
+                .zip(AUDITED_SUBCACHES)
+                .any(|(actual, expected)| {
+                    actual.uuid != expected.uuid
+                        || actual.vm_offset != expected.vm_offset
+                        || actual.suffix != expected.suffix
+                })
         {
             return Err(RuntimeAttestationError::CacheHeaderInvalid);
         }
@@ -1111,7 +1260,10 @@ fn image_digest(
         observation.runtime.active_cache_path.as_bytes(),
     );
     put_cache(&mut hasher, &observation.runtime.main_cache);
-    put_cache(&mut hasher, &observation.runtime.sub_cache);
+    hasher.update(&(observation.runtime.subcaches.len() as u64).to_le_bytes());
+    for cache in &observation.runtime.subcaches {
+        put_cache(&mut hasher, cache);
+    }
     digest_hash(hasher.finalize())
 }
 
@@ -1790,7 +1942,7 @@ fn read_cache_header(
     let uuid = read_array_16(&prefix, 88)?;
     let subcache_offset = read_le_u32(&prefix, 392)? as usize;
     let subcache_count = read_le_u32(&prefix, 396)? as usize;
-    if subcache_count > 8 {
+    if subcache_count > MAX_CACHE_SUBCACHES {
         return Err(RuntimeAttestationError::CacheHeaderInvalid);
     }
     if subcache_count == 0 {
@@ -2308,27 +2460,33 @@ mod tests {
             main_cache: CacheEvidence {
                 size: CACHE_MAIN_SIZE,
                 uuid: CACHE_MAIN_UUID,
-                subcaches: vec![SubcacheEvidence {
-                    uuid: CACHE_SUB_UUID,
-                    vm_offset: CACHE_SUB_VM_OFFSET,
-                    suffix: ".01".to_owned(),
-                }],
+                subcaches: AUDITED_SUBCACHES
+                    .iter()
+                    .map(|expected| SubcacheEvidence {
+                        uuid: expected.uuid,
+                        vm_offset: expected.vm_offset,
+                        suffix: expected.suffix.to_owned(),
+                    })
+                    .collect(),
                 signature: fixture_signature(
                     CACHE_IDENTIFIER,
                     CACHE_MAIN_CODE_DIRECTORY_SHA256,
                     SignatureKind::AdHoc,
                 ),
             },
-            sub_cache: CacheEvidence {
-                size: CACHE_SUB_SIZE,
-                uuid: CACHE_SUB_UUID,
-                subcaches: Vec::new(),
-                signature: fixture_signature(
-                    CACHE_IDENTIFIER,
-                    CACHE_SUB_CODE_DIRECTORY_SHA256,
-                    SignatureKind::AdHoc,
-                ),
-            },
+            subcaches: AUDITED_SUBCACHES
+                .iter()
+                .map(|expected| CacheEvidence {
+                    size: expected.size,
+                    uuid: expected.uuid,
+                    subcaches: Vec::new(),
+                    signature: fixture_signature(
+                        CACHE_IDENTIFIER,
+                        expected.code_directory_sha256,
+                        SignatureKind::AdHoc,
+                    ),
+                })
+                .collect(),
         }
     }
 
@@ -2374,11 +2532,11 @@ mod tests {
         let attestation = seal_observation(fixture_observation()).unwrap();
         assert_eq!(
             attestation.platform_digest().to_hex(),
-            "3f406c802cb5c02fff164fbceab30cf71508bb8353c6da2e6525667ad79925ea"
+            "d3c70e8fbac1ee2a495520ff6162c5b1837c2e818c634522e7ec1a8de9ce971c"
         );
         assert_eq!(
             attestation.image_digest().to_hex(),
-            "1e48a4b0f69a19cb62645d2f3bb9c9600661e4237a42a7090be8191a025f0ab4"
+            "d932f8990c9e4a94d93911f40c6143099b9e57a873f97473a0a2af5d7cd3849c"
         );
     }
 
@@ -2460,6 +2618,29 @@ mod tests {
             .code_directory_sha256 = "00".repeat(32);
         assert_eq!(
             seal_observation(code_directory).unwrap_err(),
+            RuntimeAttestationError::CodeSignIdentityMismatch
+        );
+
+        let mut missing_subcache = fixture_observation();
+        missing_subcache.runtime.subcaches.pop();
+        assert_eq!(
+            seal_observation(missing_subcache).unwrap_err(),
+            RuntimeAttestationError::CacheHeaderInvalid
+        );
+
+        let mut changed_subcache = fixture_observation();
+        changed_subcache.runtime.subcaches[5].uuid[0] ^= 1;
+        assert_eq!(
+            seal_observation(changed_subcache).unwrap_err(),
+            RuntimeAttestationError::CacheHeaderInvalid
+        );
+
+        let mut changed_subcache_signature = fixture_observation();
+        changed_subcache_signature.runtime.subcaches[11]
+            .signature
+            .code_directory_sha256 = "00".repeat(32);
+        assert_eq!(
+            seal_observation(changed_subcache_signature).unwrap_err(),
             RuntimeAttestationError::CodeSignIdentityMismatch
         );
     }
@@ -2878,9 +3059,11 @@ mod tests {
             Path::new(CACHE_MAIN_PATH).parent(),
             Some(Path::new(CACHE_DIRECTORY))
         );
-        assert_eq!(
-            Path::new(CACHE_SUB_PATH).parent(),
-            Some(Path::new(CACHE_DIRECTORY))
-        );
+        for expected in AUDITED_SUBCACHES {
+            assert_eq!(
+                cache_subcache_path(expected.suffix).parent(),
+                Some(Path::new(CACHE_DIRECTORY))
+            );
+        }
     }
 }

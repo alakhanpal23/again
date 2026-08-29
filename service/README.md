@@ -48,12 +48,14 @@ The test setup applies every migration in `migrations/` to isolated D1 state and
 
 Retained evidence is intentionally split by scope. The [18-state matrix source](test/service.spec.ts) exercises the actual Worker with isolated D1/R2. The Rust [100,000-case parity gate](../src/team_pull/team_lookup_bundle_differential.rs) is synthetic protocol/parser/mapper coverage, not 100,000 stateful D1/R2 operations. The [manual two-client lifecycle result](../bench/results/2026-08-23-team-live-e2e-bundle-v1.json) uses production rustls through a public-CA Quick Tunnel into local Wrangler D1/R2, but it is not a deployment or full live performance matrix. See the [bundle rollout status](../docs/TEAM_LOOKUP_BUNDLE_V1.md).
 
-## Deployment prerequisites and placeholders
+## Deployment prerequisites
 
-`wrangler.jsonc` is a template, not deploy-ready production configuration:
+`wrangler.jsonc` uses Wrangler draft bindings instead of fake resource IDs.
+Before the first production deployment:
 
-- Replace D1 `database_id: "00000000-0000-0000-0000-000000000000"` with the created database ID.
-- Confirm the D1 database name and R2 bucket name are unique and correct for the target account/environment.
+- Authenticate the intended Cloudflare account and accept its terms as the account owner.
+- Confirm the D1 database and R2 bucket names are unique and correct for the target account/environment.
+- Materialize both draft bindings with Wrangler's `--update-config`; review the resulting account-specific IDs and keep that environment configuration out of reusable templates.
 - Decide whether to use a `workers.dev` hostname or add an explicit route/custom domain. No production route is currently declared.
 - Keep both cron triggers. `*/15 * * * *` performs tenant-fair metadata retention, blob-GC admission, active-object orphan and completed-generation graveyard sweeps, repository deletion, expired-write-lease cleanup, and rate-window cleanup. `7 * * * *` performs byte-reading blob reconciliation separately so worst-case hashing never runs in the sub-hour cron.
 - Review observability and log-retention settings. The template enables observability with full head sampling.
@@ -74,14 +76,13 @@ A typical operator sequence is:
 ```sh
 cd service
 npm ci
-npx wrangler d1 create again-cache
-npx wrangler r2 bucket create again-cache-blobs
-# Put the returned D1 ID and chosen resource names in an environment-specific config.
-npx wrangler d1 migrations apply again-cache --remote
+npx wrangler d1 create again-cache --binding DB --update-config
+npx wrangler r2 bucket create again-cache-blobs --binding BLOBS --update-config
+npx wrangler d1 migrations apply DB --remote
 npm run cf-typegen
 npm run typecheck
 npm test
-# Only after security/configuration review: npm run deploy
+# Only after security/configuration review: npm run deploy -- --no-x-auto-create
 ```
 
 For a new installation, apply every migration before provisioning any tenant, token, or repository. Migration `0003_retention_lifecycle.sql` intentionally aborts if a pre-`0003` database already contains repositories; it does not attempt an unbounded generation backfill. A database that has already applied `0001` through `0003` may apply `0004_repository_generation_protocol.sql`: its preflight guard requires every stored trust head and encrypted-manifest-v2 body to contain the exact live repository generation, then installs atomic generation triggers. `0005_commit_freshness.sql` adds commit-time freshness fences. `0006_blob_incarnations.sql` upgrades existing blob rows to the explicit all-zero legacy incarnation, makes every replacement use a random immutable incarnation, disables new manifest-v1 rows, and adds bounded lifecycle/audit/trust reserves. `0007_r2_object_identities.sql` adds the immutable version/ETag/SHA-256 identity tuple required by the streaming bundle fence. Pre-v7 ready rows retain an all-null legacy tuple so they can be reconciled or deleted, but they are not bundle-eligible; every new transition to ready must carry the complete tuple. The migration tests exercise populated upgrades and incompatible-state refusal; no migration rewrites or re-signs cryptographic records. Back up and rehearse any upgrade on a copy first.
