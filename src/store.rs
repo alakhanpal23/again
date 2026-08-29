@@ -55,6 +55,9 @@ const GATEWAY_LEASE_TTL_MS: i64 = 30_000;
 const GATEWAY_FRESHNESS_MAX_MS: i64 = 5 * 60_000;
 const GATEWAY_MAX_DEPENDENCIES: usize = 64;
 const GATEWAY_MAX_OWNER_BYTES: usize = 128;
+const DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY: usize = 8;
+const DEPENDENCY_CHANGE_MAX_AFFECTED_RESULTS: usize = 256;
+const DEPENDENCY_CHANGE_MAX_REASON_CODE_BYTES: usize = 64;
 const RETRIEVAL_GRANT_TTL_MS_V2: i64 = 30_000;
 const CONTEXT_LEASE_TTL_MAX_MS_V1: i64 = 5 * 60_000;
 const CONTEXT_VERIFIED_FACT_TOPIC_V1: &str = "gateway-exact-observation";
@@ -288,6 +291,104 @@ pub enum GatewayOperationDispositionV1 {
 pub struct GatewayDependencyV1 {
     pub key_digest: String,
     pub value_digest: String,
+}
+
+/// A bounded, storage-safe reason code for immutable dependency-change
+/// evidence. Reason codes are descriptive only: they confer no invalidation,
+/// replay, fact, candidate, artifact, or delivery authority.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct DependencyChangeReasonV1(String);
+
+impl DependencyChangeReasonV1 {
+    pub fn new(reason_code: impl Into<String>) -> Result<Self> {
+        let reason_code = reason_code.into();
+        if reason_code.is_empty()
+            || reason_code.len() > DEPENDENCY_CHANGE_MAX_REASON_CODE_BYTES
+            || !reason_code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            bail!(
+                "dependency change reason code must contain 1 to {DEPENDENCY_CHANGE_MAX_REASON_CODE_BYTES} lowercase ASCII letters, digits, or underscores"
+            );
+        }
+        Ok(Self(reason_code))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// One validated observation to append to the dependency-change evidence
+/// stream. Digests deliberately prevent plaintext repository paths from being
+/// persisted in this index.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyChangeInputV1 {
+    pub scope_digest: String,
+    pub observation_epoch_digest: String,
+    pub dependency_key_digest: String,
+    pub prior_dependency_value_digest: String,
+    pub current_dependency_value_digest: String,
+    pub reason: DependencyChangeReasonV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyChangeEvidenceV1 {
+    pub record_id: String,
+    pub scope_digest: String,
+    pub observation_epoch_digest: String,
+    pub dependency_key_digest: String,
+    pub prior_dependency_value_digest: String,
+    pub current_dependency_value_digest: String,
+    pub reason: DependencyChangeReasonV1,
+    pub created_ms: i64,
+}
+
+/// Stable source material that future fact, validation-candidate, and artifact
+/// tables can bind without treating the source as authority by itself.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyChangeSourceV1 {
+    pub record_id: String,
+    pub scope_digest: String,
+    pub observation_epoch_digest: String,
+    pub dependency_key_digest: String,
+}
+
+impl DependencyChangeEvidenceV1 {
+    pub fn source(&self) -> DependencyChangeSourceV1 {
+        DependencyChangeSourceV1 {
+            record_id: self.record_id.clone(),
+            scope_digest: self.scope_digest.clone(),
+            observation_epoch_digest: self.observation_epoch_digest.clone(),
+            dependency_key_digest: self.dependency_key_digest.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DependencyChangeStateV1 {
+    Changed,
+    Unchanged,
+    Unknown,
+    Contradictory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyChangeReportV1 {
+    pub state: DependencyChangeStateV1,
+    pub evidence: Vec<DependencyChangeEvidenceV1>,
+    pub affected_gateway_result_ids: Vec<String>,
+    pub affected_results_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DependencyChangeRecordResultV1 {
+    pub inserted: bool,
+    pub evidence: DependencyChangeEvidenceV1,
+    pub report: DependencyChangeReportV1,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1481,405 +1582,64 @@ impl Store {
                 "#,
             )?;
         }
-        if version < 11 {
+        // This independent evidence relation is a compatible additive schema
+        // extension: schema-v10 binaries ignore unknown tables and never
+        // delete from them, while current binaries require and verify it.
+        // Retaining user_version 10 avoids making a safely readable database
+        // look newer to those binaries. Catalog presence, followed by strict
+        // schema verification, deterministically distinguishes the extension.
+        let dependency_change_schema_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'dependency_change_evidence')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !dependency_change_schema_exists {
             self.conn.execute_batch(
                 r#"
                 BEGIN IMMEDIATE;
-                CREATE TABLE context_ledger_recipients_v1 (
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    agent_id TEXT NOT NULL CHECK(length(agent_id) BETWEEN 1 AND 128),
-                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
-                    turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
-                    connection_generation TEXT NOT NULL CHECK(length(connection_generation) = 64),
-                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
-                    lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation > 0),
-                    active INTEGER NOT NULL CHECK(active IN (0, 1)),
-                    updated_ms INTEGER NOT NULL,
-                    PRIMARY KEY (
-                        repository_id, workspace_id, task_id, authorization_scope_digest,
-                        agent_id, session_id
-                    )
-                ) WITHOUT ROWID;
-
-                CREATE TABLE context_ledger_events_v1 (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    envelope_digest TEXT NOT NULL UNIQUE CHECK(length(envelope_digest) = 64),
-                    canonical_digest TEXT NOT NULL CHECK(length(canonical_digest) = 64),
-                    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    agent_id TEXT NOT NULL CHECK(length(agent_id) BETWEEN 1 AND 128),
-                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
-                    turn_id TEXT NOT NULL CHECK(length(turn_id) BETWEEN 1 AND 128),
-                    connection_generation TEXT NOT NULL CHECK(length(connection_generation) = 64),
-                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
-                    lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation > 0),
-                    kind TEXT NOT NULL CHECK(kind IN (
-                        'verified_fact_admission', 'unverified_suggestion',
-                        'completed_observation', 'inflight_work', 'failed_approach',
-                        'explicit_unknown', 'result_reference', 'invalidation', 'retirement'
-                    )),
-                    subject_id TEXT NOT NULL CHECK(length(subject_id) BETWEEN 1 AND 128),
-                    subject_version INTEGER NOT NULL CHECK(subject_version > 0),
-                    summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 1024),
-                    value_digest TEXT CHECK(value_digest IS NULL OR length(value_digest) = 64),
-                    result_id TEXT,
-                    result_digest TEXT CHECK(result_digest IS NULL OR length(result_digest) = 64),
-                    total_bytes INTEGER CHECK(total_bytes IS NULL OR total_bytes >= 0),
-                    duration_ms INTEGER CHECK(duration_ms IS NULL OR duration_ms >= 0),
-                    created_ms INTEGER NOT NULL
-                );
-                CREATE INDEX context_ledger_events_task_idx
-                    ON context_ledger_events_v1(repository_id, workspace_id, task_id, sequence);
-                CREATE INDEX context_ledger_events_result_idx
-                    ON context_ledger_events_v1(result_id, sequence);
-
-                CREATE TABLE context_ledger_event_sources_v1 (
-                    event_sequence INTEGER NOT NULL,
-                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 8),
-                    result_id TEXT NOT NULL CHECK(length(result_id) BETWEEN 1 AND 128),
-                    result_digest TEXT NOT NULL CHECK(length(result_digest) = 64),
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    state_digest TEXT NOT NULL CHECK(length(state_digest) = 64),
-                    dependency_digest TEXT NOT NULL CHECK(length(dependency_digest) = 64),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    locator TEXT NOT NULL CHECK(length(locator) BETWEEN 1 AND 512),
-                    binding_digest TEXT NOT NULL CHECK(length(binding_digest) = 64),
-                    PRIMARY KEY(event_sequence, ordinal),
-                    UNIQUE(event_sequence, result_id, locator),
-                    FOREIGN KEY(event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE CASCADE,
-                    FOREIGN KEY(result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE RESTRICT
-                ) WITHOUT ROWID;
-                CREATE INDEX context_ledger_sources_result_idx
-                    ON context_ledger_event_sources_v1(result_id, event_sequence);
-
-                CREATE TABLE context_ledger_event_dependencies_v1 (
-                    event_sequence INTEGER NOT NULL,
-                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 64),
+                -- Immutable observations are evidence only. They intentionally
+                -- do not reference or mutate gateway results, leases, receipts,
+                -- grants, facts, candidates, or artifacts.
+                CREATE TABLE dependency_change_evidence (
+                    record_id TEXT PRIMARY KEY CHECK(length(record_id) = 64),
+                    scope_digest TEXT NOT NULL CHECK(length(scope_digest) = 64),
+                    observation_epoch_digest TEXT NOT NULL CHECK(length(observation_epoch_digest) = 64),
                     dependency_key_digest TEXT NOT NULL CHECK(length(dependency_key_digest) = 64),
-                    dependency_value_digest TEXT NOT NULL CHECK(length(dependency_value_digest) = 64),
-                    PRIMARY KEY(event_sequence, ordinal),
-                    UNIQUE(event_sequence, dependency_key_digest),
-                    FOREIGN KEY(event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE CASCADE
-                ) WITHOUT ROWID;
-                CREATE INDEX context_ledger_dependency_reverse_idx
-                    ON context_ledger_event_dependencies_v1(
-                        dependency_key_digest, dependency_value_digest, event_sequence
-                    );
-
-                CREATE TABLE context_ledger_fact_versions_v1 (
-                    repository_id TEXT NOT NULL,
-                    workspace_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    fact_id TEXT NOT NULL CHECK(length(fact_id) BETWEEN 1 AND 128),
-                    fact_version INTEGER NOT NULL CHECK(fact_version > 0),
-                    admission_event_sequence INTEGER NOT NULL UNIQUE,
-                    topic TEXT NOT NULL CHECK(length(topic) BETWEEN 1 AND 128),
-                    statement TEXT NOT NULL CHECK(length(statement) BETWEEN 1 AND 1024),
-                    value_digest TEXT NOT NULL CHECK(length(value_digest) = 64),
-                    fact_scope TEXT NOT NULL CHECK(fact_scope IN ('repository_wide', 'task_specific')),
-                    fact_task_id TEXT,
-                    retired_event_sequence INTEGER,
-                    retirement_reason TEXT,
-                    PRIMARY KEY(repository_id, workspace_id, task_id, fact_id, fact_version),
-                    FOREIGN KEY(admission_event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE RESTRICT,
-                    FOREIGN KEY(retired_event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE RESTRICT,
-                    CHECK((retired_event_sequence IS NULL) = (retirement_reason IS NULL)),
-                    CHECK(
-                        (fact_scope = 'repository_wide' AND fact_task_id IS NULL) OR
-                        (fact_scope = 'task_specific' AND fact_task_id = task_id)
+                    prior_dependency_value_digest TEXT NOT NULL CHECK(length(prior_dependency_value_digest) = 64),
+                    current_dependency_value_digest TEXT NOT NULL CHECK(length(current_dependency_value_digest) = 64),
+                    reason_code TEXT NOT NULL CHECK(
+                        length(reason_code) BETWEEN 1 AND 64
+                        AND reason_code NOT GLOB '*[^a-z0-9_]*'
+                    ),
+                    created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+                    UNIQUE (
+                        scope_digest, observation_epoch_digest, dependency_key_digest,
+                        prior_dependency_value_digest, current_dependency_value_digest, reason_code
                     )
                 ) WITHOUT ROWID;
-                CREATE INDEX context_ledger_facts_current_idx
-                    ON context_ledger_fact_versions_v1(repository_id, workspace_id, task_id, fact_id)
-                    WHERE retired_event_sequence IS NULL;
-
-                CREATE TABLE context_ledger_result_references_v1 (
-                    repository_id TEXT NOT NULL,
-                    workspace_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    result_id TEXT NOT NULL CHECK(length(result_id) BETWEEN 1 AND 128),
-                    reference_version INTEGER NOT NULL CHECK(reference_version > 0),
-                    admission_event_sequence INTEGER NOT NULL UNIQUE,
-                    result_digest TEXT NOT NULL CHECK(length(result_digest) = 64),
-                    total_bytes INTEGER NOT NULL CHECK(total_bytes >= 0),
-                    retired_event_sequence INTEGER,
-                    retirement_reason TEXT,
-                    PRIMARY KEY(repository_id, workspace_id, task_id, result_id, reference_version),
-                    FOREIGN KEY(admission_event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE RESTRICT,
-                    FOREIGN KEY(retired_event_sequence) REFERENCES context_ledger_events_v1(sequence) ON DELETE RESTRICT,
-                    CHECK((retired_event_sequence IS NULL) = (retirement_reason IS NULL))
-                ) WITHOUT ROWID;
-                CREATE INDEX context_ledger_results_current_idx
-                    ON context_ledger_result_references_v1(repository_id, workspace_id, task_id, result_id)
-                    WHERE retired_event_sequence IS NULL;
-
-                CREATE TABLE context_ledger_leases_v1 (
-                    lease_id TEXT PRIMARY KEY CHECK(length(lease_id) BETWEEN 1 AND 128),
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    work_key_digest TEXT NOT NULL CHECK(length(work_key_digest) = 64),
-                    generation INTEGER NOT NULL CHECK(generation > 0),
-                    leader_agent_id TEXT NOT NULL CHECK(length(leader_agent_id) BETWEEN 1 AND 128),
-                    leader_session_id TEXT NOT NULL CHECK(length(leader_session_id) BETWEEN 1 AND 128),
-                    leader_lifecycle_generation INTEGER NOT NULL CHECK(leader_lifecycle_generation > 0),
-                    summary TEXT NOT NULL CHECK(length(summary) BETWEEN 1 AND 1024),
-                    status TEXT NOT NULL CHECK(status IN ('active', 'completed', 'failed', 'cancelled', 'expired')),
-                    acquired_ms INTEGER NOT NULL,
-                    heartbeat_ms INTEGER NOT NULL,
-                    deadline_ms INTEGER NOT NULL,
-                    expires_ms INTEGER NOT NULL,
-                    completed_ms INTEGER,
-                    UNIQUE(repository_id, workspace_id, task_id, authorization_scope_digest, work_key_digest, generation),
-                    CHECK(expires_ms <= deadline_ms),
-                    CHECK((status = 'active') = (completed_ms IS NULL))
-                );
-                CREATE UNIQUE INDEX context_ledger_leases_active_idx
-                    ON context_ledger_leases_v1(
-                        repository_id, workspace_id, task_id,
-                        authorization_scope_digest, work_key_digest
-                    ) WHERE status = 'active';
-                CREATE INDEX context_ledger_leases_expiry_idx
-                    ON context_ledger_leases_v1(status, expires_ms);
-
-                CREATE TABLE context_ledger_delivery_receipts_v1 (
-                    receipt_digest TEXT PRIMARY KEY CHECK(length(receipt_digest) = 64),
-                    response_envelope_digest TEXT NOT NULL UNIQUE CHECK(length(response_envelope_digest) = 64),
-                    repository_id TEXT NOT NULL,
-                    workspace_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    agent_id TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    turn_id TEXT NOT NULL,
-                    connection_generation TEXT NOT NULL CHECK(length(connection_generation) = 64),
-                    compaction_generation INTEGER NOT NULL CHECK(compaction_generation >= 0),
-                    lifecycle_generation INTEGER NOT NULL CHECK(lifecycle_generation > 0),
-                    through_sequence INTEGER NOT NULL CHECK(through_sequence >= 0),
-                    delivered_bytes INTEGER NOT NULL CHECK(delivered_bytes >= 0),
-                    acknowledged_ms INTEGER NOT NULL
-                ) WITHOUT ROWID;
-                CREATE INDEX context_ledger_receipts_task_idx
-                    ON context_ledger_delivery_receipts_v1(
-                        repository_id, workspace_id, task_id, through_sequence
+                CREATE INDEX dependency_change_evidence_lookup_idx
+                    ON dependency_change_evidence(
+                        scope_digest, observation_epoch_digest, dependency_key_digest, record_id
                     );
-
-                CREATE TABLE context_ledger_delivery_savings_v1 (
-                    receipt_digest TEXT PRIMARY KEY,
-                    response_envelope_digest TEXT NOT NULL UNIQUE CHECK(length(response_envelope_digest) = 64),
-                    bytes_omitted INTEGER NOT NULL CHECK(bytes_omitted > 0),
-                    recorded_ms INTEGER NOT NULL,
-                    FOREIGN KEY(receipt_digest) REFERENCES context_ledger_delivery_receipts_v1(receipt_digest) ON DELETE CASCADE
-                ) WITHOUT ROWID;
-                PRAGMA user_version = 11;
+                CREATE INDEX dependency_change_evidence_reverse_idx
+                    ON dependency_change_evidence(
+                        dependency_key_digest, prior_dependency_value_digest,
+                        scope_digest, observation_epoch_digest
+                    );
+                CREATE TRIGGER dependency_change_evidence_no_update
+                    BEFORE UPDATE ON dependency_change_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'dependency change evidence is immutable');
+                    END;
+                CREATE TRIGGER dependency_change_evidence_no_delete
+                    BEFORE DELETE ON dependency_change_evidence
+                    BEGIN
+                        SELECT RAISE(ABORT, 'dependency change evidence is immutable');
+                    END;
+                PRAGMA user_version = 10;
                 COMMIT;
                 "#,
             )?;
-        }
-        if version < 12 {
-            self.conn.execute_batch(
-                r#"
-                BEGIN IMMEDIATE;
-                CREATE TABLE context_tasks_v1 (
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
-                    prompt_digest TEXT NOT NULL CHECK(length(prompt_digest) = 64),
-                    prompt_text TEXT NOT NULL CHECK(length(CAST(prompt_text AS BLOB)) BETWEEN 1 AND 8192),
-                    created_ms INTEGER NOT NULL,
-                    updated_ms INTEGER NOT NULL,
-                    PRIMARY KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
-                ) WITHOUT ROWID;
-                CREATE UNIQUE INDEX context_tasks_prompt_idx
-                    ON context_tasks_v1(
-                        repository_id, workspace_id, authorization_scope_digest, prompt_digest
-                    );
-
-                CREATE TABLE context_task_aliases_v1 (
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    requested_task_id TEXT NOT NULL CHECK(length(requested_task_id) BETWEEN 1 AND 128),
-                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
-                    created_ms INTEGER NOT NULL,
-                    PRIMARY KEY(repository_id, workspace_id, authorization_scope_digest, requested_task_id),
-                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
-                        REFERENCES context_tasks_v1(
-                            repository_id, workspace_id, authorization_scope_digest, canonical_task_id
-                        ) ON DELETE RESTRICT
-                ) WITHOUT ROWID;
-                CREATE INDEX context_task_aliases_canonical_idx
-                    ON context_task_aliases_v1(
-                        repository_id, workspace_id, authorization_scope_digest, canonical_task_id
-                    );
-                PRAGMA user_version = 12;
-                COMMIT;
-                "#,
-            )?;
-        }
-        if version < 13 {
-            let transaction =
-                Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-            transaction.execute_batch(
-                r#"
-                DROP INDEX context_tasks_prompt_idx;
-                ALTER TABLE context_tasks_v1 ADD COLUMN definition_digest TEXT
-                    CHECK(definition_digest IS NULL OR length(definition_digest) = 64);
-                ALTER TABLE context_tasks_v1 ADD COLUMN acceptance_criteria_json TEXT NOT NULL
-                    DEFAULT '[]' CHECK(json_valid(acceptance_criteria_json));
-                ALTER TABLE context_tasks_v1 ADD COLUMN revision INTEGER NOT NULL
-                    DEFAULT 1 CHECK(revision > 0);
-                ALTER TABLE context_tasks_v1 ADD COLUMN state TEXT NOT NULL
-                    DEFAULT 'active' CHECK(state IN (
-                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
-                    ));
-                ALTER TABLE context_tasks_v1 ADD COLUMN state_generation INTEGER NOT NULL
-                    DEFAULT 1 CHECK(state_generation > 0);
-                CREATE UNIQUE INDEX context_tasks_definition_idx
-                    ON context_tasks_v1(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        definition_digest
-                    );
-                CREATE INDEX context_tasks_state_idx
-                    ON context_tasks_v1(repository_id, workspace_id, state, created_ms);
-
-                CREATE TABLE context_task_relations_v1 (
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    source_task_id TEXT NOT NULL CHECK(length(source_task_id) BETWEEN 1 AND 128),
-                    relation_kind TEXT NOT NULL CHECK(relation_kind IN ('parent', 'dependency', 'supersedes')),
-                    target_task_id TEXT NOT NULL CHECK(length(target_task_id) BETWEEN 1 AND 128),
-                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 64),
-                    created_ms INTEGER NOT NULL,
-                    PRIMARY KEY(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        source_task_id, relation_kind, target_task_id
-                    ),
-                    UNIQUE(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        source_task_id, relation_kind, ordinal
-                    ),
-                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, source_task_id)
-                        REFERENCES context_tasks_v1(
-                            repository_id, workspace_id, authorization_scope_digest,
-                            canonical_task_id
-                        ) ON DELETE CASCADE,
-                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, target_task_id)
-                        REFERENCES context_tasks_v1(
-                            repository_id, workspace_id, authorization_scope_digest,
-                            canonical_task_id
-                        ) ON DELETE RESTRICT,
-                    CHECK(source_task_id != target_task_id)
-                ) WITHOUT ROWID;
-                CREATE INDEX context_task_relations_target_idx
-                    ON context_task_relations_v1(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        target_task_id, relation_kind
-                    );
-
-                CREATE TABLE context_task_transitions_v1 (
-                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
-                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
-                    from_state TEXT CHECK(from_state IS NULL OR from_state IN (
-                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
-                    )),
-                    to_state TEXT NOT NULL CHECK(to_state IN (
-                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
-                    )),
-                    state_generation INTEGER NOT NULL CHECK(state_generation > 0),
-                    lease_id TEXT,
-                    agent_id TEXT,
-                    session_id TEXT,
-                    lifecycle_generation INTEGER,
-                    reason TEXT NOT NULL CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 512),
-                    created_ms INTEGER NOT NULL,
-                    UNIQUE(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        canonical_task_id, state_generation
-                    ),
-                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
-                        REFERENCES context_tasks_v1(
-                            repository_id, workspace_id, authorization_scope_digest,
-                            canonical_task_id
-                        ) ON DELETE CASCADE,
-                    CHECK((agent_id IS NULL) = (session_id IS NULL)),
-                    CHECK((agent_id IS NULL) = (lifecycle_generation IS NULL)),
-                    CHECK(lifecycle_generation IS NULL OR lifecycle_generation > 0)
-                );
-                CREATE INDEX context_task_transitions_task_idx
-                    ON context_task_transitions_v1(
-                        repository_id, workspace_id, authorization_scope_digest,
-                        canonical_task_id, sequence
-                    );
-
-                CREATE TABLE context_workspace_quota_v1 (
-                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
-                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
-                    task_context_bytes INTEGER NOT NULL CHECK(task_context_bytes >= 0),
-                    workspace_state_bytes INTEGER NOT NULL CHECK(workspace_state_bytes >= 0),
-                    maintenance_mode INTEGER NOT NULL CHECK(maintenance_mode IN (0, 1)),
-                    counter_checksum TEXT NOT NULL CHECK(length(counter_checksum) = 64),
-                    reconciled_ms INTEGER NOT NULL,
-                    PRIMARY KEY(repository_id, workspace_id)
-                ) WITHOUT ROWID;
-                "#,
-            )?;
-            let legacy_tasks = {
-                let mut statement = transaction.prepare(
-                    "SELECT repository_id, workspace_id, authorization_scope_digest,
-                            canonical_task_id, prompt_text, created_ms
-                     FROM context_tasks_v1
-                     ORDER BY repository_id, workspace_id,
-                              authorization_scope_digest, canonical_task_id",
-                )?;
-                statement
-                    .query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, i64>(5)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for (repository, workspace, authorization, task_id, prompt, created_ms) in legacy_tasks
-            {
-                let digest = task_definition_digest_v1(&prompt, &[], None, &[], None);
-                transaction.execute(
-                    "UPDATE context_tasks_v1 SET definition_digest = ?5
-                     WHERE repository_id = ?1 AND workspace_id = ?2
-                       AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
-                    params![repository, workspace, authorization, task_id, digest],
-                )?;
-                transaction.execute(
-                    "INSERT INTO context_task_transitions_v1 (
-                        repository_id, workspace_id, authorization_scope_digest,
-                        canonical_task_id, from_state, to_state, state_generation,
-                        reason, created_ms
-                     ) VALUES (?1, ?2, ?3, ?4, NULL, 'active', 1,
-                               'schema_v12_migration', ?5)",
-                    params![repository, workspace, authorization, task_id, created_ms],
-                )?;
-            }
-            reconcile_all_task_quotas_v1_tx(&transaction, now_ms())?;
-            transaction.pragma_update(None, "user_version", 13)?;
-            transaction.commit()?;
         }
         Ok(())
     }
@@ -5617,6 +5377,113 @@ impl Store {
         }))
     }
 
+    /// Append one validated dependency observation and return its current
+    /// evidence classification plus an exact, bounded reverse lookup through
+    /// `result_dependencies`. This method never changes result visibility or
+    /// status and never grants reuse or delivery authority.
+    pub fn record_dependency_change_v1(
+        &self,
+        input: &DependencyChangeInputV1,
+        max_affected_results: usize,
+    ) -> Result<DependencyChangeRecordResultV1> {
+        validate_dependency_change_input_v1(input)?;
+        validate_dependency_change_result_limit_v1(max_affected_results)?;
+        let record_id = dependency_change_record_id_v1(input);
+        let created_ms = now_ms().max(0);
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing = load_dependency_change_evidence_by_id_v1(&transaction, &record_id)?;
+        let (inserted, evidence) = if let Some(existing) = existing {
+            if !dependency_change_matches_input_v1(&existing, input) {
+                bail!("dependency change record identity collision or corrupt immutable evidence");
+            }
+            (false, existing)
+        } else {
+            let existing_count: usize = transaction.query_row(
+                "SELECT COUNT(*) FROM dependency_change_evidence WHERE scope_digest = ?1 AND observation_epoch_digest = ?2 AND dependency_key_digest = ?3",
+                params![
+                    input.scope_digest,
+                    input.observation_epoch_digest,
+                    input.dependency_key_digest
+                ],
+                |row| row.get(0),
+            )?;
+            if existing_count >= DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY {
+                bail!("dependency change evidence bound exceeded for exact scope, epoch, and key");
+            }
+            transaction.execute(
+                "INSERT INTO dependency_change_evidence (record_id, scope_digest, observation_epoch_digest, dependency_key_digest, prior_dependency_value_digest, current_dependency_value_digest, reason_code, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    record_id,
+                    input.scope_digest,
+                    input.observation_epoch_digest,
+                    input.dependency_key_digest,
+                    input.prior_dependency_value_digest,
+                    input.current_dependency_value_digest,
+                    input.reason.as_str(),
+                    created_ms
+                ],
+            )?;
+            (
+                true,
+                DependencyChangeEvidenceV1 {
+                    record_id,
+                    scope_digest: input.scope_digest.clone(),
+                    observation_epoch_digest: input.observation_epoch_digest.clone(),
+                    dependency_key_digest: input.dependency_key_digest.clone(),
+                    prior_dependency_value_digest: input.prior_dependency_value_digest.clone(),
+                    current_dependency_value_digest: input.current_dependency_value_digest.clone(),
+                    reason: input.reason.clone(),
+                    created_ms,
+                },
+            )
+        };
+        let report = dependency_change_report_v1_tx(
+            &transaction,
+            &input.scope_digest,
+            &input.observation_epoch_digest,
+            &input.dependency_key_digest,
+            max_affected_results,
+        )?;
+        transaction.commit()?;
+        Ok(DependencyChangeRecordResultV1 {
+            inserted,
+            evidence,
+            report,
+        })
+    }
+
+    /// Read immutable invalidation evidence without deleting, quarantining, or
+    /// otherwise changing any result. An absent exact scope/epoch/key is
+    /// reported as `Unknown`, not guessed from similar evidence.
+    pub fn dependency_change_report_v1(
+        &self,
+        scope_digest: &str,
+        observation_epoch_digest: &str,
+        dependency_key_digest: &str,
+        max_affected_results: usize,
+    ) -> Result<DependencyChangeReportV1> {
+        validate_digest(scope_digest, "dependency change scope digest")?;
+        validate_digest(
+            observation_epoch_digest,
+            "dependency change observation epoch digest",
+        )?;
+        validate_digest(
+            dependency_key_digest,
+            "dependency change dependency key digest",
+        )?;
+        validate_dependency_change_result_limit_v1(max_affected_results)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let report = dependency_change_report_v1_tx(
+            &transaction,
+            scope_digest,
+            observation_epoch_digest,
+            dependency_key_digest,
+            max_affected_results,
+        )?;
+        transaction.commit()?;
+        Ok(report)
+    }
+
     /// Record a provider execution that bypassed coordinator authority. This
     /// counter is emitted immediately before the provider invocation and does
     /// not imply that the call succeeded or produced reusable evidence.
@@ -6609,6 +6476,228 @@ fn validate_digest(value: &str, label: &str) -> Result<()> {
         bail!("{label} must be exactly 64 lowercase hexadecimal characters");
     }
     Ok(())
+}
+
+fn validate_dependency_change_input_v1(input: &DependencyChangeInputV1) -> Result<()> {
+    for (value, label) in [
+        (&input.scope_digest, "dependency change scope digest"),
+        (
+            &input.observation_epoch_digest,
+            "dependency change observation epoch digest",
+        ),
+        (
+            &input.dependency_key_digest,
+            "dependency change dependency key digest",
+        ),
+        (
+            &input.prior_dependency_value_digest,
+            "dependency change prior value digest",
+        ),
+        (
+            &input.current_dependency_value_digest,
+            "dependency change current value digest",
+        ),
+    ] {
+        validate_digest(value, label)?;
+    }
+    DependencyChangeReasonV1::new(input.reason.as_str())?;
+    Ok(())
+}
+
+fn validate_dependency_change_result_limit_v1(limit: usize) -> Result<()> {
+    if limit == 0 || limit > DEPENDENCY_CHANGE_MAX_AFFECTED_RESULTS {
+        bail!(
+            "dependency change affected-result limit must be between 1 and {DEPENDENCY_CHANGE_MAX_AFFECTED_RESULTS}"
+        );
+    }
+    Ok(())
+}
+
+fn dependency_change_record_id_v1(input: &DependencyChangeInputV1) -> String {
+    let mut hasher = blake3::Hasher::new_derive_key("again.dependency-change-evidence.v1");
+    for value in [
+        input.scope_digest.as_str(),
+        input.observation_epoch_digest.as_str(),
+        input.dependency_key_digest.as_str(),
+        input.prior_dependency_value_digest.as_str(),
+        input.current_dependency_value_digest.as_str(),
+        input.reason.as_str(),
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn dependency_change_matches_input_v1(
+    evidence: &DependencyChangeEvidenceV1,
+    input: &DependencyChangeInputV1,
+) -> bool {
+    evidence.record_id == dependency_change_record_id_v1(input)
+        && evidence.scope_digest == input.scope_digest
+        && evidence.observation_epoch_digest == input.observation_epoch_digest
+        && evidence.dependency_key_digest == input.dependency_key_digest
+        && evidence.prior_dependency_value_digest == input.prior_dependency_value_digest
+        && evidence.current_dependency_value_digest == input.current_dependency_value_digest
+        && evidence.reason == input.reason
+}
+
+struct DependencyChangeEvidenceRowV1 {
+    record_id: String,
+    scope_digest: String,
+    observation_epoch_digest: String,
+    dependency_key_digest: String,
+    prior_dependency_value_digest: String,
+    current_dependency_value_digest: String,
+    reason_code: String,
+    created_ms: i64,
+}
+
+fn dependency_change_evidence_row_v1(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<DependencyChangeEvidenceRowV1> {
+    Ok(DependencyChangeEvidenceRowV1 {
+        record_id: row.get(0)?,
+        scope_digest: row.get(1)?,
+        observation_epoch_digest: row.get(2)?,
+        dependency_key_digest: row.get(3)?,
+        prior_dependency_value_digest: row.get(4)?,
+        current_dependency_value_digest: row.get(5)?,
+        reason_code: row.get(6)?,
+        created_ms: row.get(7)?,
+    })
+}
+
+fn dependency_change_evidence_from_row_v1(
+    row: DependencyChangeEvidenceRowV1,
+) -> Result<DependencyChangeEvidenceV1> {
+    let input = DependencyChangeInputV1 {
+        scope_digest: row.scope_digest,
+        observation_epoch_digest: row.observation_epoch_digest,
+        dependency_key_digest: row.dependency_key_digest,
+        prior_dependency_value_digest: row.prior_dependency_value_digest,
+        current_dependency_value_digest: row.current_dependency_value_digest,
+        reason: DependencyChangeReasonV1::new(row.reason_code)?,
+    };
+    validate_dependency_change_input_v1(&input)?;
+    if row.created_ms < 0 || dependency_change_record_id_v1(&input) != row.record_id {
+        bail!("dependency change evidence row failed immutable identity verification");
+    }
+    Ok(DependencyChangeEvidenceV1 {
+        record_id: row.record_id,
+        scope_digest: input.scope_digest,
+        observation_epoch_digest: input.observation_epoch_digest,
+        dependency_key_digest: input.dependency_key_digest,
+        prior_dependency_value_digest: input.prior_dependency_value_digest,
+        current_dependency_value_digest: input.current_dependency_value_digest,
+        reason: input.reason,
+        created_ms: row.created_ms,
+    })
+}
+
+fn load_dependency_change_evidence_by_id_v1(
+    transaction: &Transaction<'_>,
+    record_id: &str,
+) -> Result<Option<DependencyChangeEvidenceV1>> {
+    validate_digest(record_id, "dependency change record identity")?;
+    let row = transaction
+        .query_row(
+            "SELECT record_id, scope_digest, observation_epoch_digest, dependency_key_digest, prior_dependency_value_digest, current_dependency_value_digest, reason_code, created_ms FROM dependency_change_evidence WHERE record_id = ?1",
+            [record_id],
+            dependency_change_evidence_row_v1,
+        )
+        .optional()?;
+    row.map(dependency_change_evidence_from_row_v1).transpose()
+}
+
+fn dependency_change_report_v1_tx(
+    transaction: &Transaction<'_>,
+    scope_digest: &str,
+    observation_epoch_digest: &str,
+    dependency_key_digest: &str,
+    max_affected_results: usize,
+) -> Result<DependencyChangeReportV1> {
+    let evidence_limit = i64::try_from(DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY + 1)?;
+    let evidence_rows = {
+        let mut statement = transaction.prepare(
+            "SELECT record_id, scope_digest, observation_epoch_digest, dependency_key_digest, prior_dependency_value_digest, current_dependency_value_digest, reason_code, created_ms FROM dependency_change_evidence WHERE scope_digest = ?1 AND observation_epoch_digest = ?2 AND dependency_key_digest = ?3 ORDER BY record_id LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    scope_digest,
+                    observation_epoch_digest,
+                    dependency_key_digest,
+                    evidence_limit
+                ],
+                dependency_change_evidence_row_v1,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if evidence_rows.len() > DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY {
+        bail!("dependency change evidence row bound was violated");
+    }
+    let evidence = evidence_rows
+        .into_iter()
+        .map(dependency_change_evidence_from_row_v1)
+        .collect::<Result<Vec<_>>>()?;
+    let state = match evidence.first() {
+        None => DependencyChangeStateV1::Unknown,
+        Some(first) => {
+            let contradictory = evidence.iter().skip(1).any(|item| {
+                item.prior_dependency_value_digest != first.prior_dependency_value_digest
+                    || item.current_dependency_value_digest != first.current_dependency_value_digest
+            });
+            if contradictory {
+                DependencyChangeStateV1::Contradictory
+            } else if first.prior_dependency_value_digest == first.current_dependency_value_digest {
+                DependencyChangeStateV1::Unchanged
+            } else {
+                DependencyChangeStateV1::Changed
+            }
+        }
+    };
+    let sql_limit = i64::try_from(
+        max_affected_results
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("dependency change affected-result limit overflow"))?,
+    )?;
+    let mut affected_gateway_result_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT result_dependencies.gateway_result_id
+             FROM dependency_change_evidence
+             JOIN result_dependencies
+               ON result_dependencies.dependency_key_digest = dependency_change_evidence.dependency_key_digest
+              AND result_dependencies.dependency_value_digest = dependency_change_evidence.prior_dependency_value_digest
+             WHERE dependency_change_evidence.scope_digest = ?1
+               AND dependency_change_evidence.observation_epoch_digest = ?2
+               AND dependency_change_evidence.dependency_key_digest = ?3
+               AND dependency_change_evidence.prior_dependency_value_digest != dependency_change_evidence.current_dependency_value_digest
+             ORDER BY result_dependencies.gateway_result_id
+             LIMIT ?4",
+        )?;
+        statement
+            .query_map(
+                params![
+                    scope_digest,
+                    observation_epoch_digest,
+                    dependency_key_digest,
+                    sql_limit
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for gateway_result_id in &affected_gateway_result_ids {
+        validate_digest(gateway_result_id, "affected gateway result identity")?;
+    }
+    let affected_results_truncated = affected_gateway_result_ids.len() > max_affected_results;
+    affected_gateway_result_ids.truncate(max_affected_results);
+    Ok(DependencyChangeReportV1 {
+        state,
+        evidence,
+        affected_gateway_result_ids,
+        affected_results_truncated,
+    })
 }
 
 fn validate_gateway_owner(owner: &str) -> Result<()> {
@@ -9641,6 +9730,19 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             ],
         ),
         (
+            "dependency_change_evidence",
+            &[
+                "record_id",
+                "scope_digest",
+                "observation_epoch_digest",
+                "dependency_key_digest",
+                "prior_dependency_value_digest",
+                "current_dependency_value_digest",
+                "reason_code",
+                "created_ms",
+            ],
+        ),
+        (
             "inflight_leases",
             &[
                 "lease_id",
@@ -10050,6 +10152,30 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             false,
         ),
         (
+            "dependency_change_evidence",
+            "dependency_change_evidence_lookup_idx",
+            &[
+                "scope_digest",
+                "observation_epoch_digest",
+                "dependency_key_digest",
+                "record_id",
+            ],
+            false,
+            false,
+        ),
+        (
+            "dependency_change_evidence",
+            "dependency_change_evidence_reverse_idx",
+            &[
+                "dependency_key_digest",
+                "prior_dependency_value_digest",
+                "scope_digest",
+                "observation_epoch_digest",
+            ],
+            false,
+            false,
+        ),
+        (
             "inflight_leases",
             "inflight_leases_active_idx",
             &["binding_digest"],
@@ -10323,6 +10449,42 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         (
             "result_dependencies",
             "UNIQUE (gateway_result_id, dependency_key_digest)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(record_id) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(scope_digest) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(observation_epoch_digest) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(dependency_key_digest) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(prior_dependency_value_digest) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "CHECK(length(current_dependency_value_digest) = 64)",
+        ),
+        (
+            "dependency_change_evidence",
+            "length(reason_code) BETWEEN 1 AND 64",
+        ),
+        (
+            "dependency_change_evidence",
+            "reason_code NOT GLOB '*[^a-z0-9_]*'",
+        ),
+        (
+            "dependency_change_evidence",
+            "UNIQUE (\n                        scope_digest, observation_epoch_digest, dependency_key_digest,\n                        prior_dependency_value_digest, current_dependency_value_digest, reason_code\n                    )",
         ),
         ("inflight_leases", "CHECK(length(request_digest) = 64)"),
         ("inflight_leases", "CHECK(length(owner) BETWEEN 1 AND 128)"),
@@ -10625,6 +10787,43 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             bail!("Again gateway schema table {table} is missing a required constraint");
         }
     }
+    for trigger in [
+        "dependency_change_evidence_no_update",
+        "dependency_change_evidence_no_delete",
+    ] {
+        let trigger_sql: Option<String> = connection
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1 AND tbl_name = 'dependency_change_evidence'",
+                [trigger],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(trigger_sql) = trigger_sql else {
+            bail!("Again gateway schema is missing immutable evidence trigger {trigger}");
+        };
+        if !trigger_sql.contains("RAISE(ABORT, 'dependency change evidence is immutable')") {
+            bail!("Again gateway schema trigger {trigger} does not fail closed");
+        }
+    }
+    let malformed_dependency_evidence: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM dependency_change_evidence
+            WHERE length(record_id) != 64 OR record_id GLOB '*[^0-9a-f]*'
+               OR length(scope_digest) != 64 OR scope_digest GLOB '*[^0-9a-f]*'
+               OR length(observation_epoch_digest) != 64 OR observation_epoch_digest GLOB '*[^0-9a-f]*'
+               OR length(dependency_key_digest) != 64 OR dependency_key_digest GLOB '*[^0-9a-f]*'
+               OR length(prior_dependency_value_digest) != 64 OR prior_dependency_value_digest GLOB '*[^0-9a-f]*'
+               OR length(current_dependency_value_digest) != 64 OR current_dependency_value_digest GLOB '*[^0-9a-f]*'
+               OR length(reason_code) NOT BETWEEN 1 AND 64 OR reason_code GLOB '*[^a-z0-9_]*'
+               OR created_ms < 0
+            LIMIT 1
+        )",
+        [],
+        |row| row.get(0),
+    )?;
+    if malformed_dependency_evidence {
+        bail!("Again gateway schema contains malformed dependency change evidence");
+    }
     let expected_foreign_keys: &[ExpectedTableForeignKeysV1] = &[
         (
             "context_task_aliases_v1",
@@ -10784,6 +10983,7 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "CASCADE",
             )],
         ),
+        ("dependency_change_evidence", &[]),
         (
             "gateway_delivery_receipts",
             &[(
@@ -12581,20 +12781,7 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
-                     DROP TABLE context_task_transitions_v1;
-                     DROP TABLE context_task_relations_v1;
-                     DROP TABLE context_task_aliases_v1;
-                     DROP TABLE context_tasks_v1;
-                     DROP TABLE context_ledger_delivery_savings_v1;
-                     DROP TABLE context_ledger_delivery_receipts_v1;
-                     DROP TABLE context_ledger_fact_versions_v1;
-                     DROP TABLE context_ledger_result_references_v1;
-                     DROP TABLE context_ledger_event_dependencies_v1;
-                     DROP TABLE context_ledger_event_sources_v1;
-                     DROP TABLE context_ledger_events_v1;
-                     DROP TABLE context_ledger_recipients_v1;
-                     DROP TABLE context_ledger_leases_v1;
+                    "DROP TABLE dependency_change_evidence;
                      DROP TABLE gateway_delivery_savings_v2;
                      DROP TABLE gateway_retrieval_grants_v2;
                      DROP TABLE gateway_delivery_receipts_v2;
@@ -12742,20 +12929,7 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
-                     DROP TABLE context_task_transitions_v1;
-                     DROP TABLE context_task_relations_v1;
-                     DROP TABLE context_task_aliases_v1;
-                     DROP TABLE context_tasks_v1;
-                     DROP TABLE context_ledger_delivery_savings_v1;
-                     DROP TABLE context_ledger_delivery_receipts_v1;
-                     DROP TABLE context_ledger_fact_versions_v1;
-                     DROP TABLE context_ledger_result_references_v1;
-                     DROP TABLE context_ledger_event_dependencies_v1;
-                     DROP TABLE context_ledger_event_sources_v1;
-                     DROP TABLE context_ledger_events_v1;
-                     DROP TABLE context_ledger_recipients_v1;
-                     DROP TABLE context_ledger_leases_v1;
+                    "DROP TABLE dependency_change_evidence;
                      DROP TABLE gateway_delivery_savings_v2;
                      DROP TABLE gateway_retrieval_grants_v2;
                      DROP TABLE gateway_delivery_receipts_v2;
@@ -12794,20 +12968,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
-                     DROP TABLE context_workspace_quota_v1;
-                     DROP TABLE context_task_transitions_v1;
-                     DROP TABLE context_task_relations_v1;
-                     DROP TABLE context_task_aliases_v1;
-                     DROP TABLE context_tasks_v1;
-                     DROP TABLE context_ledger_delivery_savings_v1;
-                     DROP TABLE context_ledger_delivery_receipts_v1;
-                     DROP TABLE context_ledger_fact_versions_v1;
-                     DROP TABLE context_ledger_result_references_v1;
-                     DROP TABLE context_ledger_event_dependencies_v1;
-                     DROP TABLE context_ledger_event_sources_v1;
-                     DROP TABLE context_ledger_events_v1;
-                     DROP TABLE context_ledger_recipients_v1;
-                     DROP TABLE context_ledger_leases_v1;
+                     DROP TABLE dependency_change_evidence;
                      DROP TABLE gateway_delivery_savings_v2;
                      DROP TABLE gateway_retrieval_grants_v2;
                      DROP TABLE gateway_delivery_receipts_v2;
@@ -12839,6 +13000,483 @@ mod tests {
                 .unwrap();
             assert!(exists, "missing additive migration table {table}");
         }
+    }
+
+    fn dependency_test_digest(label: &str) -> String {
+        blake3::hash(label.as_bytes()).to_hex().to_string()
+    }
+
+    fn dependency_change_input(
+        scope: &str,
+        epoch: &str,
+        key: &str,
+        prior: &str,
+        current: &str,
+        reason: &str,
+    ) -> DependencyChangeInputV1 {
+        DependencyChangeInputV1 {
+            scope_digest: dependency_test_digest(scope),
+            observation_epoch_digest: dependency_test_digest(epoch),
+            dependency_key_digest: dependency_test_digest(key),
+            prior_dependency_value_digest: dependency_test_digest(prior),
+            current_dependency_value_digest: dependency_test_digest(current),
+            reason: DependencyChangeReasonV1::new(reason).unwrap(),
+        }
+    }
+
+    fn publish_dependency_test_result(
+        store: &mut Store,
+        label: &str,
+        key_digest: &str,
+        value_digest: &str,
+    ) -> String {
+        let observed_at_ms = now_ms();
+        let state_digest = dependency_test_digest(&format!("state-{label}"));
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: dependency_test_digest(&format!("request-{label}")),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest("dependency-change-test-v1"),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms,
+                valid_until_ms: observed_at_ms + 60_000,
+            },
+            dependencies: vec![GatewayDependencyV1 {
+                key_digest: key_digest.to_owned(),
+                value_digest: value_digest.to_owned(),
+            }],
+        })
+        .unwrap();
+        let owner = format!("dependency-owner-{label}");
+        let lease_id = match store.acquire_gateway_call(&binding, &owner).unwrap() {
+            GatewayCallAcquisition::Leader { lease_id, .. } => lease_id,
+            other => panic!("expected dependency test leader, got {other:?}"),
+        };
+        assert_eq!(
+            store.start_gateway_execution(&lease_id, &owner).unwrap(),
+            GatewayExecutionStart::Started
+        );
+        let result = store
+            .insert_result(
+                binding.request_digest(),
+                format!("result-{label}").as_bytes(),
+                b"",
+                0,
+                1,
+                "dependency-change-test-v1",
+                r#"{"proof":"dependency-change-test-v1"}"#,
+            )
+            .unwrap();
+        match store.complete_gateway_call(&lease_id, &result.id).unwrap() {
+            GatewayCompletion::Completed {
+                gateway_result_id, ..
+            } => gateway_result_id,
+            other => panic!("expected dependency test completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn new_store_creates_immutable_dependency_change_schema() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let version: i64 = store
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let schema_objects: Vec<String> = store
+            .conn
+            .prepare(
+                "SELECT name FROM sqlite_schema WHERE tbl_name = 'dependency_change_evidence' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(schema_objects.contains(&"dependency_change_evidence".to_owned()));
+        assert!(schema_objects.contains(&"dependency_change_evidence_lookup_idx".to_owned()));
+        assert!(schema_objects.contains(&"dependency_change_evidence_reverse_idx".to_owned()));
+        assert!(schema_objects.contains(&"dependency_change_evidence_no_update".to_owned()));
+        assert!(schema_objects.contains(&"dependency_change_evidence_no_delete".to_owned()));
+    }
+
+    #[test]
+    fn schema_v10_migrates_additively_and_preserves_existing_rows() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("state");
+        let legacy_result = {
+            let mut store = Store::open(&root).unwrap();
+            let result = store
+                .insert_result("schema-v10-result", b"legacy", b"", 0, 1, "v10", "{}")
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE dependency_change_evidence;
+                     PRAGMA user_version = 10;",
+                )
+                .unwrap();
+            result
+        };
+
+        let reopened = Store::open(&root).unwrap();
+        assert_eq!(
+            reopened.get_result("schema-v10-result").unwrap(),
+            Some(legacy_result)
+        );
+        assert!(
+            reopened
+                .dependency_change_report_v1(
+                    &dependency_test_digest("scope"),
+                    &dependency_test_digest("epoch"),
+                    &dependency_test_digest("key"),
+                    1,
+                )
+                .is_ok()
+        );
+        assert_eq!(
+            reopened
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn dependency_change_recording_is_idempotent_and_reopens_with_stable_source() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("state");
+        let input = dependency_change_input(
+            "scope-idempotent",
+            "epoch-idempotent",
+            "key-idempotent",
+            "prior-idempotent",
+            "current-idempotent",
+            "repository_content",
+        );
+        let first = {
+            let store = Store::open(&root).unwrap();
+            let first = store.record_dependency_change_v1(&input, 8).unwrap();
+            let duplicate = store.record_dependency_change_v1(&input, 8).unwrap();
+            assert!(first.inserted);
+            assert!(!duplicate.inserted);
+            assert_eq!(first.evidence, duplicate.evidence);
+            assert_eq!(duplicate.report.evidence.len(), 1);
+            assert_eq!(duplicate.report.state, DependencyChangeStateV1::Changed);
+            first
+        };
+
+        let reopened = Store::open(&root).unwrap();
+        let report = reopened
+            .dependency_change_report_v1(
+                &input.scope_digest,
+                &input.observation_epoch_digest,
+                &input.dependency_key_digest,
+                8,
+            )
+            .unwrap();
+        assert_eq!(report.evidence, vec![first.evidence.clone()]);
+        assert_eq!(report.evidence[0].source(), first.evidence.source());
+        let count: u64 = reopened
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM dependency_change_evidence",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn dependency_change_lookup_is_exact_and_preserves_unrelated_results() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let key = dependency_test_digest("affected-key");
+        let prior = dependency_test_digest("affected-prior");
+        let other_key = dependency_test_digest("unrelated-key");
+        let other_value = dependency_test_digest("unrelated-value");
+        let different_prior = dependency_test_digest("different-prior");
+        let affected = publish_dependency_test_result(&mut store, "affected", &key, &prior);
+        let unrelated =
+            publish_dependency_test_result(&mut store, "unrelated", &other_key, &other_value);
+        let same_key_other_value = publish_dependency_test_result(
+            &mut store,
+            "same-key-other-value",
+            &key,
+            &different_prior,
+        );
+        let input = DependencyChangeInputV1 {
+            scope_digest: dependency_test_digest("exact-scope"),
+            observation_epoch_digest: dependency_test_digest("exact-epoch"),
+            dependency_key_digest: key,
+            prior_dependency_value_digest: prior,
+            current_dependency_value_digest: dependency_test_digest("affected-current"),
+            reason: DependencyChangeReasonV1::new("repository_content").unwrap(),
+        };
+        let recorded = store.record_dependency_change_v1(&input, 16).unwrap();
+        assert_eq!(
+            recorded.report.affected_gateway_result_ids,
+            vec![affected.clone()]
+        );
+        assert!(!recorded.report.affected_results_truncated);
+        for preserved in [affected, unrelated, same_key_other_value] {
+            let status: String = store
+                .conn
+                .query_row(
+                    "SELECT status FROM gateway_results WHERE gateway_result_id = ?1",
+                    [preserved],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(status, "ready");
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT COUNT(*) FROM result_dependencies", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn dependency_change_reports_unknown_unchanged_and_contradictory_evidence() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let unknown = dependency_change_input(
+            "unknown-scope",
+            "unknown-epoch",
+            "unknown-key",
+            "unknown-prior",
+            "unknown-current",
+            "repository_content",
+        );
+        let unknown_report = store
+            .dependency_change_report_v1(
+                &unknown.scope_digest,
+                &unknown.observation_epoch_digest,
+                &unknown.dependency_key_digest,
+                1,
+            )
+            .unwrap();
+        assert_eq!(unknown_report.state, DependencyChangeStateV1::Unknown);
+        assert!(unknown_report.evidence.is_empty());
+        assert!(unknown_report.affected_gateway_result_ids.is_empty());
+
+        let unchanged = dependency_change_input(
+            "unchanged-scope",
+            "unchanged-epoch",
+            "unchanged-key",
+            "unchanged-value",
+            "unchanged-value",
+            "repository_content",
+        );
+        let unchanged_report = store
+            .record_dependency_change_v1(&unchanged, 1)
+            .unwrap()
+            .report;
+        assert_eq!(unchanged_report.state, DependencyChangeStateV1::Unchanged);
+        assert!(unchanged_report.affected_gateway_result_ids.is_empty());
+
+        let first = dependency_change_input(
+            "conflict-scope",
+            "conflict-epoch",
+            "conflict-key",
+            "conflict-prior",
+            "conflict-current-a",
+            "repository_content",
+        );
+        let second = dependency_change_input(
+            "conflict-scope",
+            "conflict-epoch",
+            "conflict-key",
+            "conflict-prior",
+            "conflict-current-b",
+            "repository_content",
+        );
+        store.record_dependency_change_v1(&first, 1).unwrap();
+        let conflict = store.record_dependency_change_v1(&second, 1).unwrap();
+        assert_eq!(
+            conflict.report.state,
+            DependencyChangeStateV1::Contradictory
+        );
+        assert_eq!(conflict.report.evidence.len(), 2);
+        assert_ne!(
+            conflict.report.evidence[0].record_id,
+            conflict.report.evidence[1].record_id
+        );
+    }
+
+    #[test]
+    fn dependency_change_reverse_lookup_and_evidence_are_strictly_bounded() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let input = dependency_change_input(
+            "bounded-scope",
+            "bounded-epoch",
+            "bounded-key",
+            "bounded-prior",
+            "bounded-current",
+            "repository_content",
+        );
+        let expected = (0..3)
+            .map(|index| {
+                publish_dependency_test_result(
+                    &mut store,
+                    &format!("bounded-{index}"),
+                    &input.dependency_key_digest,
+                    &input.prior_dependency_value_digest,
+                )
+            })
+            .collect::<Vec<_>>();
+        let report = store.record_dependency_change_v1(&input, 2).unwrap().report;
+        assert_eq!(report.affected_gateway_result_ids.len(), 2);
+        assert!(report.affected_results_truncated);
+        assert!(
+            report
+                .affected_gateway_result_ids
+                .iter()
+                .all(|result| expected.contains(result))
+        );
+        assert!(
+            store
+                .dependency_change_report_v1(
+                    &input.scope_digest,
+                    &input.observation_epoch_digest,
+                    &input.dependency_key_digest,
+                    0,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .dependency_change_report_v1(
+                    &input.scope_digest,
+                    &input.observation_epoch_digest,
+                    &input.dependency_key_digest,
+                    DEPENDENCY_CHANGE_MAX_AFFECTED_RESULTS + 1,
+                )
+                .is_err()
+        );
+
+        for index in 1..DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY {
+            let conflicting = dependency_change_input(
+                "bounded-scope",
+                "bounded-epoch",
+                "bounded-key",
+                "bounded-prior",
+                &format!("bounded-current-{index}"),
+                "repository_content",
+            );
+            store.record_dependency_change_v1(&conflicting, 1).unwrap();
+        }
+        let excess = dependency_change_input(
+            "bounded-scope",
+            "bounded-epoch",
+            "bounded-key",
+            "bounded-prior",
+            "bounded-current-excess",
+            "repository_content",
+        );
+        assert!(store.record_dependency_change_v1(&excess, 1).is_err());
+        assert_eq!(
+            store
+                .dependency_change_report_v1(
+                    &input.scope_digest,
+                    &input.observation_epoch_digest,
+                    &input.dependency_key_digest,
+                    1,
+                )
+                .unwrap()
+                .evidence
+                .len(),
+            DEPENDENCY_CHANGE_MAX_EVIDENCE_PER_KEY
+        );
+    }
+
+    #[test]
+    fn dependency_change_evidence_is_immutable_and_tampering_fails_verification() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        let input = dependency_change_input(
+            "immutable-scope",
+            "immutable-epoch",
+            "immutable-key",
+            "immutable-prior",
+            "immutable-current",
+            "repository_content",
+        );
+        let record = store.record_dependency_change_v1(&input, 1).unwrap();
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE dependency_change_evidence SET created_ms = created_ms + 1 WHERE record_id = ?1",
+                [&record.evidence.record_id],
+            )
+            .is_err());
+        assert!(
+            store
+                .conn
+                .execute(
+                    "DELETE FROM dependency_change_evidence WHERE record_id = ?1",
+                    [&record.evidence.record_id],
+                )
+                .is_err()
+        );
+
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO dependency_change_evidence (record_id, scope_digest, observation_epoch_digest, dependency_key_digest, prior_dependency_value_digest, current_dependency_value_digest, reason_code, created_ms) VALUES ('malformed', ?1, ?2, ?3, ?4, ?5, 'repository_content', 1)",
+                params![
+                    dependency_test_digest("tampered-scope"),
+                    dependency_test_digest("tampered-epoch"),
+                    dependency_test_digest("tampered-key"),
+                    dependency_test_digest("tampered-prior"),
+                    dependency_test_digest("tampered-current"),
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+        assert!(verify_gateway_schema_current(&store.conn).is_err());
+    }
+
+    #[test]
+    fn cleanup_does_not_remove_dependency_change_evidence() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let input = dependency_change_input(
+            "cleanup-scope",
+            "cleanup-epoch",
+            "cleanup-key",
+            "cleanup-prior",
+            "cleanup-current",
+            "repository_content",
+        );
+        let record = store.record_dependency_change_v1(&input, 1).unwrap();
+        store.cleanup_at(now_ms() + EVENT_TTL_MS + 1, true).unwrap();
+        let report = store
+            .dependency_change_report_v1(
+                &input.scope_digest,
+                &input.observation_epoch_digest,
+                &input.dependency_key_digest,
+                1,
+            )
+            .unwrap();
+        assert_eq!(report.evidence, vec![record.evidence]);
     }
 
     #[test]
