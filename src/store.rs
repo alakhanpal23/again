@@ -138,6 +138,46 @@ pub struct StoreStats {
     pub confirmed_tokens_avoided: u64,
     pub false_hit_quarantines: u64,
     pub estimated_execution_time_saved_ms: u64,
+    pub context_events: u64,
+    pub verified_facts_admitted: u64,
+    pub suggestions_published: u64,
+    pub completed_observations: u64,
+    pub explicit_unknowns: u64,
+    pub result_references_admitted: u64,
+    pub invalidation_events: u64,
+    pub current_verified_facts: u64,
+    pub current_result_references: u64,
+    pub active_work_leases: u64,
+    pub context_delivery_receipts: u64,
+    pub context_delivery_confirmed_bytes_omitted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ContextLedgerStatsV1 {
+    pub events: u64,
+    pub verified_facts_admitted: u64,
+    pub suggestions_published: u64,
+    pub completed_observations: u64,
+    pub explicit_unknowns: u64,
+    pub result_references_admitted: u64,
+    pub invalidation_events: u64,
+    pub current_verified_facts: u64,
+    pub current_result_references: u64,
+    pub active_work_leases: u64,
+    pub delivery_receipts: u64,
+    pub delivery_confirmed_bytes_omitted: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LatestDecisionExplanationV1 {
+    pub source: String,
+    pub decision: String,
+    pub reason: String,
+    pub result_id: Option<String>,
+    /// Backward-compatible durable event spelling used by existing scripts.
+    pub disposition: String,
+    pub raw_event: String,
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -4606,6 +4646,120 @@ impl Store {
             .context("read last event")
     }
 
+    /// Explain the latest terminal product decision across both the explicit
+    /// execution path and the repository gateway. Intermediate gateway events
+    /// (request and candidate discovery) are deliberately excluded.
+    pub fn latest_decision_explanation_v1(&self) -> Result<Option<LatestDecisionExplanationV1>> {
+        let row: Option<(String, String, String, Option<String>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT source, raw_event, reason, result_id, created_ms FROM (
+                     SELECT 'explicit' AS source, disposition AS raw_event,
+                            reason_code AS reason, result_id, created_ms, id
+                     FROM events
+                     UNION ALL
+                     SELECT 'gateway' AS source, event_type AS raw_event,
+                            COALESCE(reason, 'unspecified') AS reason,
+                            gateway_result_id AS result_id, created_ms, id
+                     FROM gateway_events
+                     WHERE event_type IN (
+                         'executed', 'exact_hit', 'coverage_hit', 'inflight_join',
+                         'stale_completion', 'divergent_result', 'binding_quarantined'
+                     )
+                 ) ORDER BY created_ms DESC, id DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("read latest product decision")?;
+        Ok(
+            row.map(|(source, raw_event, reason, result_id, created_ms)| {
+                let decision = match (source.as_str(), raw_event.as_str(), reason.as_str()) {
+                    ("explicit", "executed", _) => "executed",
+                    ("gateway", "executed", reason) if reason != "direct" => "executed",
+                    ("explicit", "replayed_full" | "replayed_compact", _)
+                    | ("gateway", "exact_hit" | "coverage_hit", _) => "reused",
+                    ("gateway", "inflight_join", _) => "joined",
+                    ("explicit", "passed_through" | "bypassed_no_store", _)
+                    | ("gateway", "executed", "direct") => "bypassed",
+                    ("explicit", "quarantined", _)
+                    | (
+                        "gateway",
+                        "stale_completion" | "divergent_result" | "binding_quarantined",
+                        _,
+                    ) => "refused",
+                    _ => "unknown",
+                };
+                LatestDecisionExplanationV1 {
+                    source,
+                    decision: decision.to_owned(),
+                    reason,
+                    result_id,
+                    disposition: raw_event.clone(),
+                    raw_event,
+                    created_ms,
+                }
+            }),
+        )
+    }
+
+    pub fn context_ledger_stats_v1(&self) -> Result<ContextLedgerStatsV1> {
+        let mut stats = ContextLedgerStatsV1::default();
+        let mut statement = self
+            .conn
+            .prepare("SELECT kind, COUNT(*) FROM context_ledger_events_v1 GROUP BY kind")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        for row in rows {
+            let (kind, count) = row?;
+            stats.events = stats.events.saturating_add(count);
+            match kind.as_str() {
+                "verified_fact_admission" => stats.verified_facts_admitted = count,
+                "unverified_suggestion" => stats.suggestions_published = count,
+                "completed_observation" => stats.completed_observations = count,
+                "explicit_unknown" => stats.explicit_unknowns = count,
+                "result_reference" => stats.result_references_admitted = count,
+                "invalidation" => stats.invalidation_events = count,
+                _ => {}
+            }
+        }
+        stats.current_verified_facts = self.conn.query_row(
+            "SELECT COUNT(*) FROM context_ledger_fact_versions_v1 WHERE retired_event_sequence IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        stats.current_result_references = self.conn.query_row(
+            "SELECT COUNT(*) FROM context_ledger_result_references_v1 WHERE retired_event_sequence IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        stats.active_work_leases = self.conn.query_row(
+            "SELECT COUNT(*) FROM context_ledger_leases_v1 WHERE status = 'active'",
+            [],
+            |row| row.get(0),
+        )?;
+        stats.delivery_receipts = self.conn.query_row(
+            "SELECT COUNT(*) FROM context_ledger_delivery_receipts_v1",
+            [],
+            |row| row.get(0),
+        )?;
+        stats.delivery_confirmed_bytes_omitted = self.conn.query_row(
+            "SELECT COALESCE(SUM(bytes_omitted), 0) FROM context_ledger_delivery_savings_v1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(stats)
+    }
+
     /// Run one bounded lifecycle-maintenance pass immediately.
     ///
     /// Results, deliveries, quarantined evidence, and referenced CAS blobs are
@@ -4763,6 +4917,19 @@ impl Store {
         stats.confirmed_tokens_avoided = gateway.confirmed_tokens_avoided;
         stats.false_hit_quarantines = gateway.false_hit_quarantines;
         stats.estimated_execution_time_saved_ms = gateway.estimated_execution_time_saved_ms;
+        let context = self.context_ledger_stats_v1()?;
+        stats.context_events = context.events;
+        stats.verified_facts_admitted = context.verified_facts_admitted;
+        stats.suggestions_published = context.suggestions_published;
+        stats.completed_observations = context.completed_observations;
+        stats.explicit_unknowns = context.explicit_unknowns;
+        stats.result_references_admitted = context.result_references_admitted;
+        stats.invalidation_events = context.invalidation_events;
+        stats.current_verified_facts = context.current_verified_facts;
+        stats.current_result_references = context.current_result_references;
+        stats.active_work_leases = context.active_work_leases;
+        stats.context_delivery_receipts = context.delivery_receipts;
+        stats.context_delivery_confirmed_bytes_omitted = context.delivery_confirmed_bytes_omitted;
         Ok(stats)
     }
 }
@@ -10712,5 +10879,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(quarantine_events, 1);
+    }
+
+    #[test]
+    fn product_diagnostics_cover_context_and_both_decision_paths() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+
+        assert_eq!(
+            store.context_ledger_stats_v1().unwrap(),
+            ContextLedgerStatsV1::default()
+        );
+        store
+            .record_event(
+                None,
+                None,
+                EventDisposition::PassedThrough,
+                "unsafe_effect",
+                0,
+                0,
+            )
+            .unwrap();
+        let explicit = store.latest_decision_explanation_v1().unwrap().unwrap();
+        assert_eq!(explicit.source, "explicit");
+        assert_eq!(explicit.decision, "bypassed");
+        assert_eq!(explicit.reason, "unsafe_effect");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_events (event_type, reason, estimated_tokens_avoided, created_ms)
+                 VALUES ('inflight_join', 'joined_current_leader', 0, ?1)",
+                [i64::MAX - 1],
+            )
+            .unwrap();
+        let joined = store.latest_decision_explanation_v1().unwrap().unwrap();
+        assert_eq!(joined.source, "gateway");
+        assert_eq!(joined.decision, "joined");
+        assert_eq!(joined.raw_event, "inflight_join");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO gateway_events (event_type, reason, estimated_tokens_avoided, created_ms)
+                 VALUES ('executed', 'direct', 0, ?1)",
+                [i64::MAX],
+            )
+            .unwrap();
+        let direct = store.latest_decision_explanation_v1().unwrap().unwrap();
+        assert_eq!(direct.decision, "bypassed");
+        assert_eq!(direct.reason, "direct");
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.context_events, 0);
+        assert_eq!(stats.current_verified_facts, 0);
+        assert_eq!(stats.context_delivery_receipts, 0);
     }
 }

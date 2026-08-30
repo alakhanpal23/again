@@ -409,6 +409,33 @@ struct DoctorReport {
     seatbelt_runtime_probe: String,
     seatbelt_used_for_profile: bool,
     trace_backed_replay: bool,
+    coordinator: CoordinatorDoctorReport,
+    pytest_profile: PytestProfileDoctorReport,
+}
+
+#[derive(Debug, Serialize)]
+struct CoordinatorDoctorReport {
+    status: &'static str,
+    feature_enabled: bool,
+    platform_supported: bool,
+    transport: &'static str,
+    same_user_authenticated: bool,
+    ordinary_stdio_grants_recipient_authority: bool,
+    public_tools: [&'static str; 5],
+    blockers: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PytestProfileDoctorReport {
+    profile_id: &'static str,
+    registry_status: &'static str,
+    routing: &'static str,
+    portable_control_plane_enabled: bool,
+    native_linux_qualification_host: bool,
+    execution_qualified: bool,
+    promotion_issuer_available: bool,
+    reuse_enabled: bool,
+    blockers: Vec<&'static str>,
 }
 
 #[cfg(feature = "linux-pytest")]
@@ -2302,20 +2329,15 @@ fn explain(args: ExplainArgs) -> Result<i32> {
             );
             println!("proof: {}", result.proof_json);
         }
-    } else if let Some((disposition, reason, result_id)) = store.last_event()? {
+    } else if let Some(explanation) = store.latest_decision_explanation_v1()? {
         if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "disposition": disposition,
-                    "reason": reason,
-                    "result_id": result_id,
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&explanation)?);
         } else {
-            println!("decision: {disposition}");
-            println!("reason: {reason}");
-            if let Some(result_id) = result_id {
+            println!("decision: {}", explanation.decision);
+            println!("source: {}", explanation.source);
+            println!("reason: {}", explanation.reason);
+            println!("event: {}", explanation.raw_event);
+            if let Some(result_id) = explanation.result_id {
                 println!("result: {result_id}");
             }
         }
@@ -2343,7 +2365,14 @@ fn stats(json: bool) -> Result<i32> {
         println!("gateway requests: {}", stats.requested);
         println!("gateway provider executions: {}", stats.executed);
         println!("gateway exact hits: {}", stats.exact_hits);
+        println!("gateway coverage hits: {}", stats.coverage_hits);
         println!("gateway in-flight joins: {}", stats.inflight_joins);
+        println!("gateway compact deliveries: {}", stats.compact_deliveries);
+        println!("gateway facts reused: {}", stats.facts_reused);
+        println!(
+            "gateway investigations avoided: {}",
+            stats.investigations_avoided
+        );
         println!(
             "gateway provider calls avoided: {}",
             stats.provider_calls_avoided
@@ -2355,6 +2384,42 @@ fn stats(json: bool) -> Result<i32> {
         println!(
             "estimated gateway execution time saved: {} ms",
             stats.estimated_execution_time_saved_ms
+        );
+        println!("context ledger events: {}", stats.context_events);
+        println!(
+            "context verified facts admitted: {}",
+            stats.verified_facts_admitted
+        );
+        println!(
+            "context suggestions published: {}",
+            stats.suggestions_published
+        );
+        println!(
+            "context completed observations: {}",
+            stats.completed_observations
+        );
+        println!("context explicit unknowns: {}", stats.explicit_unknowns);
+        println!(
+            "context result references admitted: {}",
+            stats.result_references_admitted
+        );
+        println!(
+            "context current verified facts: {}",
+            stats.current_verified_facts
+        );
+        println!(
+            "context current result references: {}",
+            stats.current_result_references
+        );
+        println!("context active work leases: {}", stats.active_work_leases);
+        println!("context invalidation events: {}", stats.invalidation_events);
+        println!(
+            "context delivery receipts: {}",
+            stats.context_delivery_receipts
+        );
+        println!(
+            "context acknowledged bytes omitted: {}",
+            stats.context_delivery_confirmed_bytes_omitted
         );
     }
     Ok(0)
@@ -2373,6 +2438,34 @@ fn doctor(json: bool) -> Result<i32> {
         Ok(()) => "available".to_owned(),
         Err(error) => format!("unavailable: {error}"),
     };
+    let coordinator_feature_enabled = cfg!(feature = "daemon");
+    let coordinator_platform_supported = cfg!(unix);
+    let mut coordinator_blockers = Vec::new();
+    if !coordinator_feature_enabled {
+        coordinator_blockers.push("daemon_feature_disabled");
+    }
+    if !coordinator_platform_supported {
+        coordinator_blockers.push("same_user_unix_transport_unavailable");
+    }
+    let coordinator_status = if coordinator_blockers.is_empty() {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    let native_linux_qualification_host = cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ));
+    let mut pytest_blockers = Vec::new();
+    if !cfg!(feature = "linux-pytest") {
+        pytest_blockers.push("linux_pytest_feature_disabled");
+    }
+    if !native_linux_qualification_host {
+        pytest_blockers.push("native_x86_64_linux_qualification_required");
+    }
+    pytest_blockers.push("same_child_filter_and_tree_supervision_qualification_required");
     let report = DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
         executable: executable.display().to_string(),
@@ -2394,6 +2487,33 @@ fn doctor(json: bool) -> Result<i32> {
         seatbelt_runtime_probe,
         seatbelt_used_for_profile: false,
         trace_backed_replay: false,
+        coordinator: CoordinatorDoctorReport {
+            status: coordinator_status,
+            feature_enabled: coordinator_feature_enabled,
+            platform_supported: coordinator_platform_supported,
+            transport: "same_user_os_authenticated_unix",
+            same_user_authenticated: coordinator_platform_supported,
+            ordinary_stdio_grants_recipient_authority: false,
+            public_tools: [
+                "task.start",
+                "context.delta",
+                "context.publish",
+                "context.retrieve",
+                "context.cancel",
+            ],
+            blockers: coordinator_blockers,
+        },
+        pytest_profile: PytestProfileDoctorReport {
+            profile_id: "linux-pytest-v1",
+            registry_status: "contract_only",
+            routing: "passthrough_without_storage",
+            portable_control_plane_enabled: cfg!(feature = "linux-pytest"),
+            native_linux_qualification_host,
+            execution_qualified: false,
+            promotion_issuer_available: false,
+            reuse_enabled: false,
+            blockers: pytest_blockers,
+        },
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2421,6 +2541,35 @@ fn doctor(json: bool) -> Result<i32> {
         println!("Seatbelt used by active profile: no");
         println!(
             "trace-backed replay: unavailable; explicit ineligible calls fail before execution"
+        );
+        println!("local coordinator: {}", report.coordinator.status);
+        println!(
+            "coordinator transport: {} (same-user authenticated: {})",
+            report.coordinator.transport, report.coordinator.same_user_authenticated
+        );
+        println!(
+            "ordinary stdio recipient authority: {}",
+            report.coordinator.ordinary_stdio_grants_recipient_authority
+        );
+        if !report.coordinator.blockers.is_empty() {
+            println!(
+                "coordinator blockers: {}",
+                report.coordinator.blockers.join(", ")
+            );
+        }
+        println!(
+            "pytest profile: {} ({}, {})",
+            report.pytest_profile.profile_id,
+            report.pytest_profile.registry_status,
+            report.pytest_profile.routing
+        );
+        println!(
+            "pytest reuse enabled: {}",
+            report.pytest_profile.reuse_enabled
+        );
+        println!(
+            "pytest blockers: {}",
+            report.pytest_profile.blockers.join(", ")
         );
     }
     Ok(0)

@@ -224,6 +224,19 @@ fn user_facing_help_and_dry_run_output_are_actionable() {
     let stats_stdout = String::from_utf8(stats.stdout).unwrap();
     assert!(stats_stdout.contains("gateway requests: 0"));
     assert!(stats_stdout.contains("gateway provider calls avoided: 0"));
+    assert!(stats_stdout.contains("context ledger events: 0"));
+    assert!(stats_stdout.contains("context delivery receipts: 0"));
+
+    let stats_json = run_again(temp.path(), &["stats", "--json"], None);
+    assert!(
+        stats_json.status.success(),
+        "stats JSON failed: {:?}",
+        stats_json.stderr
+    );
+    let stats_json: serde_json::Value = serde_json::from_slice(&stats_json.stdout).unwrap();
+    assert_eq!(stats_json["coverage_hits"], 0);
+    assert_eq!(stats_json["current_verified_facts"], 0);
+    assert_eq!(stats_json["context_delivery_receipts"], 0);
 
     let doctor = run_again(temp.path(), &["doctor"], None);
     assert!(
@@ -232,6 +245,26 @@ fn user_facing_help_and_dry_run_output_are_actionable() {
         doctor.stderr
     );
     assert!(String::from_utf8_lossy(&doctor.stdout).contains("state writable: true"));
+    let doctor_stdout = String::from_utf8(doctor.stdout).unwrap();
+    assert!(doctor_stdout.contains("local coordinator:"));
+    assert!(doctor_stdout.contains("pytest reuse enabled: false"));
+
+    let doctor_json = run_again(temp.path(), &["doctor", "--json"], None);
+    assert!(
+        doctor_json.status.success(),
+        "doctor JSON failed: {:?}",
+        doctor_json.stderr
+    );
+    let doctor_json: serde_json::Value = serde_json::from_slice(&doctor_json.stdout).unwrap();
+    assert_eq!(
+        doctor_json["coordinator"]["ordinary_stdio_grants_recipient_authority"],
+        false
+    );
+    assert_eq!(
+        doctor_json["pytest_profile"]["registry_status"],
+        "contract_only"
+    );
+    assert_eq!(doctor_json["pytest_profile"]["reuse_enabled"], false);
 }
 
 #[cfg(any(

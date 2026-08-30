@@ -372,9 +372,9 @@ Exit:
 Goal: make the existing cache fast and general enough to support the edit brief
 and later validation profiles.
 
-Status: core implementation landed in Wave 1 through `45b0284`; retained
-cross-component product benchmarks and paired-agent evidence remain for
-Terminal G.
+Status: core implementation landed in Wave 1 through `45b0284`; the deterministic
+paired product gate is implemented. Hosted and diverse-repository performance
+qualification remain release work.
 
 Work:
 
@@ -400,9 +400,9 @@ Exit:
 Goal: replace broad agent orientation with one bounded verified edit brief.
 
 Status: implemented locally through the durable ledger, same-user coordinator,
-public task/context tools, and bounded code-intelligence index. Deterministic
-paired-client correctness is covered; retained cold/hot latency, byte, and
-real-agent task-quality measurements remain in Terminal G.
+public task/context tools, bounded code-intelligence index, paired-client gate,
+durable diagnostics, and an editable paired benchmark. Its offline oracle is
+qualified; pinned live-agent task-quality evidence remains open.
 
 Work:
 
@@ -458,6 +458,12 @@ Exit:
 ### Phase 4 — editable real-agent product gate
 
 Goal: prove Again reduces planning and coding time, not merely tool latency.
+
+Status: the bounded editable harness, exact patch oracle, collateral-mutation
+refusal, balanced ordering, monotonic timing markers, durable-product-activity
+check, and retained offline qualification are implemented. Live Codex/Claude
+cohorts, diverse repositories, provider usage, patch rubrics, and outside-user
+evidence remain open; no acceleration claim exists yet.
 
 Work:
 

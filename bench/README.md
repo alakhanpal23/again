@@ -146,6 +146,35 @@ of current Worker-isolate heap usage, 100,000-case stateful D1/R2 path, and cros
 post-decrypt trust race remain missing. See the exact [rollout contract and
 evidence](../docs/TEAM_LOOKUP_BUNDLE_V1.md).
 
+## Paired editable-agent benchmark
+
+[`agent_gateway_editable_pair.py`](agent_gateway_editable_pair.py) is the
+fail-closed editable companion to the existing read-only real-agent harness. It
+creates independent identical Git fixtures, permits exactly one known source
+repair, rejects test/collateral edits, runs a fixed acceptance suite, alternates
+baseline/Again order, and retains monotonic first-edit, accepted-edit,
+validation, final-outcome, and total timing markers. Live mode requires explicit
+network authorization, a credential environment-name binding, pinned model and
+settings IDs, absolute command arrays with standalone placeholders, and an
+exact Again binary. An Again treatment passes only when durable workspace
+gateway/context counters move; a command label or socket alone is not evidence.
+
+Qualify the harness and oracle offline before any paid run:
+
+```bash
+python3 -B bench/agent_gateway_editable_pair.py \
+  --mode qualify \
+  --runs 10 \
+  --json-out bench/results/YYYY-MM-DD-agent-gateway-editable-qualification.json
+```
+
+The retained
+[`2026-08-29 qualification`](results/2026-08-29-agent-gateway-editable-pair-qualification-v1.json)
+passed 10/10 baseline and 10/10 treatment-shaped observations. It measures a
+deterministic reference editor and the harness only: it is not real-agent task
+quality, model usage, or Again acceleration evidence. Live Codex/Claude runs
+remain a separate explicit external gate.
+
 ## Retained diagnostic artifacts
 
 The following files are retained for regression archaeology, not as current
