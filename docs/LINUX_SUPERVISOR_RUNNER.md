@@ -3,9 +3,12 @@
 The manual
 [`linux-supervisor-qualification`](../.github/workflows/linux-supervisor-qualification.yml)
 workflow is limited to the pinned Gate 2 kernel-evidence lane. A qualifying run
-executes a fixed, argument-free, non-authoritative diagnostic 100 times and
-requires both observed fork-delivery orders. It does not accept a workload or
-grant Python, EffectIR, execution-profile, execution, or reuse authority.
+executes one bounded cohort of 100 independent copies of the fixed,
+argument-free, non-authoritative diagnostic and requires both observed
+fork-delivery orders. Cohort contention gives the kernel both real scheduling
+paths without choosing a wait target or synthesizing an event. The diagnostic
+does not accept a workload or grant Python, EffectIR, execution-profile,
+execution, or reuse authority.
 
 ## Required runner contract
 
