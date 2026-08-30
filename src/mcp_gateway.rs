@@ -51,6 +51,7 @@ const UPSTREAM_RESPONSE_QUEUE_V1: usize = 32;
 const MAX_REASONING_DELIVERY_ACKNOWLEDGMENTS_V1: usize = 128;
 const INTERNAL_DELIVERY_FIELD_V2: &str = "__again_internal_delivery_v2";
 const INTERNAL_REASONING_DELIVERY_FIELD_V2: &str = "__again_internal_reasoning_delivery_v2";
+const INTERNAL_WRITE_COMPLETION_FIELD_V1: &str = "__again_internal_write_completion_v1";
 
 /// Construction seal owned only by the live transport. Protocol bindings can
 /// require this type, but no caller or sibling module can manufacture one from
@@ -75,6 +76,23 @@ pub(crate) struct AuthenticatedStdioRecipientV1 {
 }
 
 impl AuthenticatedStdioRecipientV1 {
+    /// Issue an opaque recipient for one kernel-authenticated local daemon
+    /// connection. The identifiers are descriptive selectors only; the live
+    /// connection remains the authority and none of these values are accepted
+    /// from MCP input.
+    #[allow(
+        dead_code,
+        reason = "path-included protocol tests omit the local daemon"
+    )]
+    pub(crate) fn issue_for_local_daemon_v1() -> Self {
+        Self {
+            agent_id: format!("agent:{}", uuid::Uuid::new_v4().simple()),
+            session_id: format!("session:{}", uuid::Uuid::new_v4().simple()),
+            turn_id: format!("turn:{}", uuid::Uuid::new_v4().simple()),
+            compaction_generation: 0,
+        }
+    }
+
     /// Test-only named issuance. Production clients cannot supply recipient
     /// identity through MCP fields.
     #[cfg(test)]
@@ -109,7 +127,7 @@ impl AuthenticatedStdioRecipientV1 {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ReasoningTransportRecipientV1 {
     pub(crate) agent_id: String,
     pub(crate) session_id: String,
@@ -143,6 +161,25 @@ pub(crate) type OpaqueReasoningAcknowledgmentV1 = Arc<dyn Any + Send + Sync>;
 
 pub(crate) trait ReasoningDeliveryCompletionV1: Send {
     fn complete(self: Box<Self>) -> Result<OpaqueReasoningAcknowledgmentV1, ()>;
+}
+
+/// Opaque provider completion invoked only after the complete JSON-RPC
+/// response and trailing newline have been written and flushed. Dropping a
+/// response, partial writes, cancellation, and writer failure cannot create a
+/// delivery receipt.
+pub(crate) trait ResponseWriteCompletionV1: Send {
+    fn complete(self: Box<Self>, delivered_response: &[u8]);
+}
+
+pub(crate) trait RecipientLifecycleSinkV1: Send + Sync {
+    fn retire(&self, recipient: &ReasoningTransportRecipientV1, reason: &'static str);
+}
+
+#[derive(Default)]
+struct NoopRecipientLifecycleSinkV1;
+
+impl RecipientLifecycleSinkV1 for NoopRecipientLifecycleSinkV1 {
+    fn retire(&self, _recipient: &ReasoningTransportRecipientV1, _reason: &'static str) {}
 }
 
 pub(crate) struct PreparedReasoningContextV1 {
@@ -658,7 +695,15 @@ pub struct CapturedToolResult {
     exact: Value,
     delivery: Option<CapturedDeliveryV1>,
     reasoning: Option<Box<dyn ReasoningContextCandidateV1>>,
+    write_completion: Option<Box<dyn ResponseWriteCompletionV1>>,
 }
+
+type CapturedToolResultPartsV1 = (
+    Value,
+    Option<CapturedDeliveryV1>,
+    Option<Box<dyn ReasoningContextCandidateV1>>,
+    Option<Box<dyn ResponseWriteCompletionV1>>,
+);
 
 impl fmt::Debug for CapturedToolResult {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -673,6 +718,24 @@ impl CapturedToolResult {
             exact: value,
             delivery: None,
             reasoning: None,
+            write_completion: None,
+        }
+    }
+
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "path-included protocol tests omit context providers"
+    )]
+    pub(crate) fn exact_with_write_completion(
+        value: Value,
+        completion: Box<dyn ResponseWriteCompletionV1>,
+    ) -> Self {
+        Self {
+            exact: value,
+            delivery: None,
+            reasoning: None,
+            write_completion: Some(completion),
         }
     }
 
@@ -692,18 +755,18 @@ impl CapturedToolResult {
                 streams,
             }),
             reasoning,
+            write_completion: None,
         }
     }
 
     #[must_use]
-    fn into_parts(
-        self,
-    ) -> (
-        Value,
-        Option<CapturedDeliveryV1>,
-        Option<Box<dyn ReasoningContextCandidateV1>>,
-    ) {
-        (self.exact, self.delivery, self.reasoning)
+    fn into_parts(self) -> CapturedToolResultPartsV1 {
+        (
+            self.exact,
+            self.delivery,
+            self.reasoning,
+            self.write_completion,
+        )
     }
 
     #[must_use]
@@ -1093,6 +1156,10 @@ pub struct ProviderCall {
     pub freshness: Freshness,
     pub effect: EffectClass,
     pub translation: GatewayToolCallTranslationV1,
+    /// Transport-authenticated recipient metadata. This is absent for direct
+    /// calls and ordinary stdio. It is not serialized and grants no authority
+    /// outside the live connection that issued it.
+    pub(crate) transport_recipient: Option<ReasoningTransportRecipientV1>,
 }
 
 impl fmt::Debug for ProviderCall {
@@ -1107,7 +1174,21 @@ impl fmt::Debug for ProviderCall {
             .field("arguments", &"<redacted>")
             .field("effect", &self.effect)
             .field("translation", &self.translation)
+            .field(
+                "transport_recipient",
+                &self.transport_recipient.as_ref().map(|_| "<redacted>"),
+            )
             .finish()
+    }
+}
+
+impl ProviderCall {
+    #[allow(
+        dead_code,
+        reason = "path-included protocol tests omit context providers"
+    )]
+    pub(crate) fn transport_recipient_v1(&self) -> Option<&ReasoningTransportRecipientV1> {
+        self.transport_recipient.as_ref()
     }
 }
 
@@ -2588,6 +2669,7 @@ struct ReasoningWriteCompletionV1 {
 struct StdioResponseV1 {
     bytes: Vec<u8>,
     flushed_challenge_id: Option<String>,
+    write_completion: Option<Box<dyn ResponseWriteCompletionV1>>,
 }
 
 fn hex_v1(digest: &[u8; 32]) -> String {
@@ -2630,6 +2712,8 @@ pub struct McpGateway {
     delivery_sink: Arc<dyn DeliveryConfirmationSink>,
     reasoning_delivery_ledger: Mutex<ReasoningDeliveryLedgerV1>,
     pending_reasoning_writes: Mutex<BTreeMap<String, ReasoningWriteCompletionV1>>,
+    pending_write_completions: Mutex<BTreeMap<String, Box<dyn ResponseWriteCompletionV1>>>,
+    recipient_lifecycle_sink: Arc<dyn RecipientLifecycleSinkV1>,
     #[cfg(test)]
     reasoning_confirmation_count: Arc<AtomicU64>,
 }
@@ -2734,6 +2818,8 @@ impl McpGateway {
             delivery_sink: Arc::new(NoopDeliveryConfirmationSink),
             reasoning_delivery_ledger: Mutex::new(ReasoningDeliveryLedgerV1::default()),
             pending_reasoning_writes: Mutex::new(BTreeMap::new()),
+            pending_write_completions: Mutex::new(BTreeMap::new()),
+            recipient_lifecycle_sink: Arc::new(NoopRecipientLifecycleSinkV1),
             #[cfg(test)]
             reasoning_confirmation_count: Arc::new(AtomicU64::new(0)),
         })
@@ -2751,6 +2837,19 @@ impl McpGateway {
         sink: Arc<dyn DeliveryConfirmationSink>,
     ) -> Self {
         self.delivery_sink = sink;
+        self
+    }
+
+    #[must_use]
+    #[allow(
+        dead_code,
+        reason = "path-included protocol tests omit context providers"
+    )]
+    pub(crate) fn with_recipient_lifecycle_sink_v1(
+        mut self,
+        sink: Arc<dyn RecipientLifecycleSinkV1>,
+    ) -> Self {
+        self.recipient_lifecycle_sink = sink;
         self
     }
 
@@ -2929,6 +3028,7 @@ impl McpGateway {
         response.map(|mut value| {
             let pending = take_internal_delivery_v2(&mut value);
             let reasoning_delivery_id = take_internal_reasoning_delivery_v2(&mut value);
+            let write_completion_id = take_internal_write_completion_v1(&mut value);
             let mut encoded = serde_json::to_vec(&value)
                 .expect("JSON-RPC response values are always serializable");
             let mut reasoning_bound_to_challenge = false;
@@ -2979,6 +3079,12 @@ impl McpGateway {
             StdioResponseV1 {
                 bytes: encoded,
                 flushed_challenge_id,
+                write_completion: write_completion_id.and_then(|completion_id| {
+                    self.pending_write_completions
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&completion_id)
+                }),
             }
         })
     }
@@ -3005,6 +3111,26 @@ impl McpGateway {
 
     #[cfg(test)]
     pub(crate) fn serve_stdio_for_authenticated_recipient_v1<R: BufRead, W: Write + Send>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        authorization_scope: &AuthorizationScopeId,
+        secrets: EphemeralSecrets<'_>,
+        recipient: AuthenticatedStdioRecipientV1,
+    ) -> io::Result<()> {
+        self.serve_stdio_for_local_recipient_v1(
+            reader,
+            writer,
+            authorization_scope,
+            secrets,
+            recipient,
+        )
+    }
+
+    /// Serve a transport whose peer and workspace were authenticated by the
+    /// same-user local daemon. This boundary is crate-private so ordinary MCP
+    /// input cannot mint recipient identity.
+    pub(crate) fn serve_stdio_for_local_recipient_v1<R: BufRead, W: Write + Send>(
         &self,
         reader: &mut R,
         writer: &mut W,
@@ -3085,6 +3211,9 @@ impl McpGateway {
                                 .unwrap_or_else(|poison| poison.into_inner())
                                 .mark_response_flushed(session_id, &challenge_id);
                         }
+                        if let Some(completion) = response.write_completion {
+                            completion.complete(&response.bytes);
+                        }
                     }
                     Ok(())
                 })();
@@ -3131,6 +3260,7 @@ impl McpGateway {
                                     ))
                                     .expect("JSON-RPC error values are serializable"),
                                     flushed_challenge_id: None,
+                                    write_completion: None,
                                 })
                             });
                         job.activation.signal();
@@ -3184,6 +3314,7 @@ impl McpGateway {
                                         StdioResponseV1 {
                                             bytes: response,
                                             flushed_challenge_id: None,
+                                            write_completion: None,
                                         },
                                     )?;
                                     continue;
@@ -3236,6 +3367,7 @@ impl McpGateway {
                                 StdioResponseV1 {
                                     bytes: response,
                                     flushed_challenge_id: None,
+                                    write_completion: None,
                                 },
                             )?;
                         }
@@ -3255,6 +3387,10 @@ impl McpGateway {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .retire_session(session_id);
             self.retire_connection_retrievals_v2(&connection, "connection_closed");
+            if let Ok(recipient) = connection.current_reasoning_recipient() {
+                self.recipient_lifecycle_sink
+                    .retire(&recipient, "connection_closed");
+            }
             self.invalidate_reasoning_session_v1(&connection);
             drop(job_sender);
             for worker in workers {
@@ -3551,6 +3687,8 @@ impl McpGateway {
             freshness,
             effect: route.effect,
             translation,
+            transport_recipient: connection
+                .and_then(|connection| connection.current_reasoning_recipient().ok()),
         };
         let delivery_call_digest = *call.translation.canonical_digest();
         enum CallResult {
@@ -3558,6 +3696,7 @@ impl McpGateway {
                 Value,
                 Option<CapturedDeliveryV1>,
                 Option<Box<dyn ReasoningContextCandidateV1>>,
+                Option<Box<dyn ResponseWriteCompletionV1>>,
             ),
             Error(McpError),
         }
@@ -3570,10 +3709,10 @@ impl McpGateway {
         }));
         let (mut result, mut outcome) = match upstream {
             Ok(Ok(captured)) => {
-                let (exact, delivery, reasoning) = captured.into_parts();
+                let (exact, delivery, reasoning, write_completion) = captured.into_parts();
                 match validate_tool_result(&exact, self.limits) {
                     Ok(()) => (
-                        CallResult::Success(exact, delivery, reasoning),
+                        CallResult::Success(exact, delivery, reasoning, write_completion),
                         AuditOutcome::Succeeded,
                     ),
                     Err(error) => (CallResult::Error(error), AuditOutcome::Rejected),
@@ -3598,7 +3737,7 @@ impl McpGateway {
             ),
         };
 
-        if active_registration.complete() && matches!(result, CallResult::Success(_, _, _)) {
+        if active_registration.complete() && matches!(result, CallResult::Success(_, _, _, _)) {
             result = CallResult::Error(McpError::typed(
                 McpErrorCode::RequestCancelled,
                 "request was cancelled",
@@ -3607,7 +3746,7 @@ impl McpGateway {
         }
         self.record_call_audit(context, &route, physical_attempt_id, outcome);
         Some(match result {
-            CallResult::Success(mut exact, delivery, reasoning) => {
+            CallResult::Success(mut exact, delivery, reasoning, write_completion) => {
                 let reasoning_delivery_id =
                     if let (Some(reasoning), Some(connection)) = (reasoning, connection) {
                         self.attach_reasoning_context_v1(&mut exact, reasoning, connection)
@@ -3624,6 +3763,19 @@ impl McpGateway {
                     object.insert(
                         INTERNAL_REASONING_DELIVERY_FIELD_V2.to_owned(),
                         Value::String(reasoning_delivery_id),
+                    );
+                }
+                if let Some(write_completion) = write_completion
+                    && let Some(object) = response.as_object_mut()
+                {
+                    let completion_id = format!("wc_{}", uuid::Uuid::new_v4().simple());
+                    self.pending_write_completions
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .insert(completion_id.clone(), write_completion);
+                    object.insert(
+                        INTERNAL_WRITE_COMPLETION_FIELD_V1.to_owned(),
+                        Value::String(completion_id),
                     );
                 }
                 response
@@ -3803,6 +3955,10 @@ impl McpGateway {
             .unwrap_or_else(|poison| poison.into_inner())
             .retire_session(connection.session_id);
         self.retire_connection_retrievals_v2(connection, "context_compacted");
+        if let Ok(recipient) = connection.current_reasoning_recipient() {
+            self.recipient_lifecycle_sink
+                .retire(&recipient, "context_compacted");
+        }
         self.invalidate_reasoning_session_v1(connection);
         let Some(object) = params.as_ref().and_then(Value::as_object) else {
             return;
@@ -3836,6 +3992,10 @@ impl McpGateway {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .retire_request(connection.session_id, &request_id);
             self.retire_connection_retrievals_v2(connection, "request_cancelled");
+            if let Ok(recipient) = connection.current_reasoning_recipient() {
+                self.recipient_lifecycle_sink
+                    .retire(&recipient, "request_cancelled");
+            }
             self.invalidate_reasoning_session_v1(connection);
         }
         let active = self.request_cancellation(&request_id, Some(&context.authorization_scope));
@@ -4152,6 +4312,14 @@ fn take_internal_reasoning_delivery_v2(value: &mut Value) -> Option<String> {
     value
         .as_object_mut()?
         .remove(INTERNAL_REASONING_DELIVERY_FIELD_V2)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn take_internal_write_completion_v1(value: &mut Value) -> Option<String> {
+    value
+        .as_object_mut()?
+        .remove(INTERNAL_WRITE_COMPLETION_FIELD_V1)?
         .as_str()
         .map(str::to_owned)
 }

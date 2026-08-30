@@ -2339,7 +2339,9 @@ impl Store {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing = context_recipient_row_v1(&transaction, identity)?;
         if let Some(existing) = existing {
-            if existing.lifecycle_generation > identity.lifecycle_generation()
+            if (!existing.active
+                && existing.lifecycle_generation >= identity.lifecycle_generation())
+                || existing.lifecycle_generation > identity.lifecycle_generation()
                 || (existing.lifecycle_generation == identity.lifecycle_generation()
                     && existing.compaction_generation > identity.compaction_generation())
                 || (existing.lifecycle_generation == identity.lifecycle_generation()
@@ -2816,6 +2818,73 @@ impl Store {
             has_more,
             events,
         ))
+    }
+
+    /// Retrieve one exact result only through a current task-scoped ledger
+    /// reference and a live recipient generation. The result identifier is a
+    /// selector, not a capability: absent, retired, stale, cross-task, or
+    /// authorization-mismatched references fail closed before bytes are read.
+    pub fn retrieve_context_result_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<GatewayFullResultV1> {
+        validate_digest(gateway_result_id, "context result selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let reference = transaction
+            .query_row(
+                "SELECT admission_event_sequence, result_digest, total_bytes
+                 FROM context_ledger_result_references_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND result_id = ?4 AND retired_event_sequence IS NULL
+                 ORDER BY reference_version DESC LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    gateway_result_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((event_sequence, result_digest, total_bytes)) = reference else {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        };
+        if result_digest != gateway_result_id
+            || !context_event_provenance_current_v1(&transaction, identity, event_sequence)?
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        let (result, dependencies) =
+            load_gateway_result_unbound_snapshot_v2(&transaction, gateway_result_id)?;
+        let observed_total = result
+            .stdout_bytes
+            .checked_add(result.stderr_bytes)
+            .ok_or_else(|| anyhow!(DeliveryAuthorityRefusalV1::InvalidBinding.code()))?;
+        if observed_total != total_bytes {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        let stdout = self.get_blob(&result.stdout_digest)?;
+        let stderr = self.get_blob(&result.stderr_digest)?;
+        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
+        {
+            bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
+        }
+        transaction.commit()?;
+        Ok(GatewayFullResultV1 {
+            gateway_result_id: gateway_result_id.to_owned(),
+            result,
+            stdout,
+            stderr,
+            dependencies,
+        })
     }
 
     pub fn acquire_context_lease_v1(
@@ -9149,6 +9218,15 @@ mod tests {
             _ => unreachable!(),
         };
         store.cancel_context_lease_v1(&leader, &lease_id).unwrap();
+        assert!(store.retire_context_recipient_v1(&leader).unwrap());
+        assert!(
+            store.activate_context_recipient_v1(&leader).is_err(),
+            "an explicitly retired lifecycle generation was resurrected"
+        );
+        let renewed_leader = leader.after_lifecycle_change(&"5".repeat(64)).unwrap();
+        store
+            .activate_context_recipient_v1(&renewed_leader)
+            .unwrap();
         assert!(matches!(
             store
                 .acquire_context_lease_v1(

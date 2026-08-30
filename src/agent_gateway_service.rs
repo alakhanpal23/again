@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
-use crate::mcp_gateway::AuthorizationScopeId;
+use crate::mcp_gateway::{AuthenticatedStdioRecipientV1, AuthorizationScopeId};
 use crate::store::Store;
 
 const HANDSHAKE_MAGIC_V1: &[u8; 8] = b"AGNGW001";
@@ -388,8 +388,9 @@ fn handle_connection_v1(
             let mut reader = BufReader::new(reader_stream);
             let gateway = ExperimentalMcpGatewayV1::build(workspace)
                 .map_err(|_| GatewayServiceError::Initialization)?;
+            let recipient = AuthenticatedStdioRecipientV1::issue_for_local_daemon_v1();
             gateway
-                .serve_io(&mut reader, &mut stream, authorization_scope)
+                .serve_authenticated_io(&mut reader, &mut stream, authorization_scope, recipient)
                 .map_err(GatewayServiceError::Io)
         }
     }
@@ -900,7 +901,82 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_gateway::MCP_PROTOCOL_VERSION;
+    use serde_json::{Value, json};
+    use std::io::BufRead;
     use std::os::unix::fs::symlink;
+
+    struct LocalMcpClientV1 {
+        stream: UnixStream,
+        reader: BufReader<UnixStream>,
+        next_id: u64,
+    }
+
+    impl LocalMcpClientV1 {
+        fn connect(workspace: &Path) -> Self {
+            let stream = connect_mcp_v1(workspace).unwrap();
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            let mut client = Self {
+                stream,
+                reader,
+                next_id: 1,
+            };
+            let initialized = client.request(
+                "initialize",
+                json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "context-test", "version": "1" }
+                }),
+            );
+            assert_eq!(
+                initialized["result"]["protocolVersion"],
+                MCP_PROTOCOL_VERSION
+            );
+            client
+        }
+
+        fn tool(&mut self, name: &str, arguments: Value) -> Value {
+            self.request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            });
+            serde_json::to_writer(&mut self.stream, &request).unwrap();
+            self.stream.write_all(b"\n").unwrap();
+            self.stream.flush().unwrap();
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            assert!(
+                !line.is_empty(),
+                "daemon closed before replying to {method}"
+            );
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            response
+        }
+
+        fn notify(&mut self, method: &str, params: Value) {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params
+            });
+            serde_json::to_writer(&mut self.stream, &request).unwrap();
+            self.stream.write_all(b"\n").unwrap();
+            self.stream.flush().unwrap();
+        }
+    }
 
     #[test]
     fn unsafe_runtime_permissions_and_symlinked_locator_fail_closed_without_chmod() {
@@ -982,5 +1058,220 @@ mod tests {
         assert!(valid_socket_name_v1("0123456789abcdef0123456789abcdef"));
         assert!(!valid_socket_name_v1("../shared.sock"));
         assert!(!valid_socket_name_v1("0123456789abcdef0123456789abcdeg"));
+    }
+
+    #[test]
+    fn two_authenticated_clients_share_facts_work_retrieval_and_mutation_deltas() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_symbol() -> usize { 1 }\n",
+        )
+        .unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("same-user-test-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let first_start = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            first_start["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let read = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert!(read.get("error").is_none(), "{read}");
+        let result_id = read["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let work = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "shared-task",
+                "kind": "work_start",
+                "workKey": "inspect-input",
+                "summary": "inspect the shared input",
+                "ttlMs": 30_000
+            }),
+        );
+        assert_eq!(
+            work["result"]["structuredContent"]["outcome"]["status"],
+            "leader"
+        );
+        let suggestion = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "shared-task",
+                "kind": "suggestion",
+                "subject": "shared-symbol",
+                "statement": "Check shared_symbol(), then preserve its public API.\nThis remains unverified."
+            }),
+        );
+        assert_eq!(
+            suggestion["result"]["structuredContent"]["outcome"]["verified"],
+            false
+        );
+
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let shared = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            shared["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let context = &shared["result"]["structuredContent"]["context"];
+        assert!(!context["current_facts"].as_array().unwrap().is_empty());
+        assert_eq!(
+            context["current_facts"][0]["sources"][0]["locator"],
+            "repo.read:input.txt"
+        );
+        assert!(!context["suggestions"].as_array().unwrap().is_empty());
+        assert!(!context["result_references"].as_array().unwrap().is_empty());
+        assert!(!context["inflight_work"].as_array().unwrap().is_empty());
+        assert!(
+            !shared["result"]["structuredContent"]["relevantCode"]["candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = shared["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let retrieved = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "shared-task", "resultId": result_id }),
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "first\n"
+        );
+        let cross_task = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "other-task", "resultId": result_id }),
+        );
+        assert_eq!(
+            cross_task["error"]["data"]["reason"], "retrieval_refused",
+            "{cross_task}"
+        );
+
+        let compact = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            compact["result"]["structuredContent"]["presentation"],
+            "compact"
+        );
+
+        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        let reread = agent_b.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(reread["result"]["content"][0]["text"], "second\n");
+        let delta = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "shared-task", "afterCursor": cursor, "limit": 64 }),
+        );
+        let events = delta["result"]["structuredContent"]["delta"]["events"]
+            .as_array()
+            .unwrap();
+        assert!(events.iter().any(|event| event["kind"] == "invalidation"));
+
+        agent_b.notify(
+            "notifications/again/context-compacted",
+            json!({ "compactionGeneration": 1 }),
+        );
+        let stale_delta = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "shared-task", "afterCursor": cursor, "limit": 64 }),
+        );
+        assert_eq!(
+            stale_delta["error"]["data"]["reason"],
+            "full_delivery_required"
+        );
+        let after_compaction = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            after_compaction["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let overflow_cursor = after_compaction["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        for index in 0..65 {
+            let published = agent_b.tool(
+                "context.publish",
+                json!({
+                    "taskId": "shared-task",
+                    "kind": "unknown",
+                    "subject": format!("unknown-{index}"),
+                    "explanation": "bounded follow-up required"
+                }),
+            );
+            assert!(published.get("error").is_none(), "{published}");
+        }
+        let bounded = agent_b.tool(
+            "context.delta",
+            json!({
+                "taskId": "shared-task",
+                "afterCursor": overflow_cursor,
+                "limit": 64
+            }),
+        );
+        assert_eq!(
+            bounded["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            bounded["result"]["structuredContent"]["delta"]["has_more"],
+            true
+        );
+
+        for index in 0..63 {
+            let task = agent_b.tool(
+                "task.start",
+                json!({ "taskId": format!("bounded-task-{index}") }),
+            );
+            assert!(task.get("error").is_none(), "{task}");
+        }
+        let capacity = agent_b.tool("task.start", json!({ "taskId": "one-task-too-many" }));
+        assert_eq!(
+            capacity["error"]["data"]["reason"],
+            "context_capacity_exceeded"
+        );
+
+        let cancelled = agent_b.tool("context.cancel", json!({ "taskId": "shared-task" }));
+        assert_eq!(
+            cancelled["result"]["structuredContent"]["status"],
+            "retired"
+        );
+        let retired = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "must use a new lifecycle" }),
+        );
+        assert_eq!(retired["error"]["data"]["reason"], "invalid_agent_context");
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
     }
 }

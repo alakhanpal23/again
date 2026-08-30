@@ -7,6 +7,8 @@
 
 #[path = "agent_gateway_runtime/context_compiler.rs"]
 pub mod context_compiler;
+#[path = "agent_gateway_runtime/context_coordinator.rs"]
+mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
 
@@ -39,6 +41,9 @@ use crate::agent_gateway_runtime::context_compiler::{
     CompiledReasoningBriefV1, ReasoningBriefPresentationRequestV1, ReasoningBriefPresentationV1,
     ReasoningDeliveryAcknowledgmentV1, compile_reasoning_brief_v1,
     complete_reasoning_brief_delivery_v1,
+};
+use crate::agent_gateway_runtime::context_coordinator::{
+    ContextProviderKindV1, LocalContextCoordinatorV1, LocalContextProviderV1,
 };
 use crate::mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
@@ -272,6 +277,7 @@ pub(crate) struct GatewayControlledProviderV1 {
     workspace: PathBuf,
     observed_workspace: SharedObservedWorkspaceV1,
     store: Arc<Mutex<Store>>,
+    context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
     pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
@@ -339,6 +345,7 @@ impl GatewayControlledProviderV1 {
             workspace,
             observed_workspace,
             store,
+            None,
         ))
     }
 
@@ -347,12 +354,14 @@ impl GatewayControlledProviderV1 {
         workspace: PathBuf,
         observed_workspace: SharedObservedWorkspaceV1,
         store: Arc<Mutex<Store>>,
+        context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     ) -> Self {
         Self {
             inner,
             workspace,
             observed_workspace,
             store,
+            context_coordinator,
             active: Mutex::new(BTreeMap::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
             recent_candidates: Mutex::new(BTreeMap::new()),
@@ -386,13 +395,20 @@ impl GatewayControlledProviderV1 {
             .manifest
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        resolve_repository_request_v1(
+        let resolved = resolve_repository_request_v1(
             &self.observed_workspace.execution_epoch,
             &mut manifest,
             call,
             operation,
         )
-        .ok()
+        .ok()?;
+        drop(manifest);
+        if let Some(coordinator) = self.context_coordinator.as_ref() {
+            coordinator
+                .observe_dependencies(call, &resolved.binding)
+                .ok()?;
+        }
+        Some(resolved)
     }
 
     fn owner(call: &ProviderCall) -> String {
@@ -513,6 +529,14 @@ impl GatewayControlledProviderV1 {
             .ok()
             .flatten();
         drop(store);
+        if let Some(coordinator) = self.context_coordinator.as_ref() {
+            let _ = coordinator.admit_verified_result(
+                call,
+                &resolved.binding,
+                &loaded.full.gateway_result_id,
+                loaded.full.result.duration_ms,
+            );
+        }
         let reasoning_token = reasoning.and_then(|reasoning| {
             let mut pending = self
                 .pending_reasoning
@@ -1297,6 +1321,11 @@ impl ExperimentalMcpGatewayV1 {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
         let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
+            &workspace,
+            Arc::clone(&store),
+            observed_workspace.clone(),
+        ));
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let repository_controlled: Arc<dyn UpstreamProvider> =
             Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
@@ -1304,25 +1333,38 @@ impl ExperimentalMcpGatewayV1 {
                 workspace.clone(),
                 observed_workspace.clone(),
                 Arc::clone(&store),
+                Some(Arc::clone(&context_coordinator)),
             ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
         let git_controlled: Arc<dyn UpstreamProvider> =
             Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
                 git,
-                workspace,
-                observed_workspace,
+                workspace.clone(),
+                observed_workspace.clone(),
                 Arc::clone(&store),
+                Some(Arc::clone(&context_coordinator)),
             ));
+        let task_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
+            ContextProviderKindV1::Task,
+            Arc::clone(&context_coordinator),
+        ));
+        let shared_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
+            ContextProviderKindV1::Context,
+            Arc::clone(&context_coordinator),
+        ));
         let gateway = McpGateway::new(
             vec![
                 ProviderRegistration::trusted_annotations(repository_controlled),
                 ProviderRegistration::trusted_annotations(git_controlled),
+                ProviderRegistration::trusted_annotations(task_context),
+                ProviderRegistration::trusted_annotations(shared_context),
             ],
             GatewayLimits::default(),
         )?
         .with_delivery_confirmation_sink(Arc::new(StoreDeliveryConfirmationSinkV1 {
             store: Arc::clone(&store),
-        }));
+        }))
+        .with_recipient_lifecycle_sink_v1(context_coordinator);
         Ok(Self { gateway, store })
     }
 
@@ -1358,6 +1400,23 @@ impl ExperimentalMcpGatewayV1 {
             writer,
             authorization_scope,
             EphemeralSecrets::default(),
+        )
+    }
+
+    #[cfg(feature = "daemon")]
+    pub(crate) fn serve_authenticated_io<R: std::io::BufRead, W: std::io::Write + Send>(
+        &self,
+        reader: &mut R,
+        writer: &mut W,
+        authorization_scope: &AuthorizationScopeId,
+        recipient: crate::mcp_gateway::AuthenticatedStdioRecipientV1,
+    ) -> io::Result<()> {
+        self.gateway.serve_stdio_for_local_recipient_v1(
+            reader,
+            writer,
+            authorization_scope,
+            EphemeralSecrets::default(),
+            recipient,
         )
     }
 }
@@ -1997,6 +2056,21 @@ mod product_tests {
         assert_eq!(after.epoch_advancements(), 1);
         assert_eq!(after.invalidation_events(), 1);
         assert!(after.invalidated_dependents() >= 4);
+    }
+
+    #[test]
+    fn task_start_requires_transport_authenticated_recipient_authority() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same").unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(gateway.gateway(), "context-init", initialize);
+        let start = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"task.start","arguments":{"taskId":"task"}}}"#;
+        let response = process(gateway.gateway(), "context-start", start);
+        assert_eq!(
+            response["error"]["data"]["reason"],
+            "recipient_authority_required"
+        );
     }
 
     #[test]
