@@ -34,7 +34,9 @@ publication.
 
 Before any build, the verify job runs formatting, clippy with warnings denied,
 all feature-enabled tests, the deterministic 100,000-case differential corpus,
-the RustSec vulnerability audit, a fail-closed exact license/source policy over
+the RustSec vulnerability audit against the explicit `Cargo.lock` file (the
+pinned `cargo-audit` does not accept Cargo's `--locked` flag), a fail-closed
+exact license/source policy over
 the locked Cargo metadata, shell and Python syntax checks, and the packaging
 rollback tests. Each platform job also runs the feature-enabled Rust tests
 natively before building. Release archives are then built with exactly the
