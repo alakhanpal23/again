@@ -471,7 +471,7 @@ def validate_scenario(report: Mapping[str, Any]) -> dict[str, str]:
         completion.get("dependency_completed") is True
         and completion.get("parent_completed") is True
         and completion.get("terminal_immutable") is True
-        and _is_int(completion.get("transition_history_count"), 4),
+        and _is_int(completion.get("transition_history_count"), 5),
         "lifecycle_completion",
         "completion transition evidence is incomplete",
     )

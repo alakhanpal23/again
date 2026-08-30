@@ -93,7 +93,7 @@ def _session_environment(state: pathlib.Path, label: str) -> dict[str, str]:
     # The daemon runtime namespace is keyed below TMPDIR, so all connectors
     # for one exact probe must share this directory.
     temporary = state.parent / "runtime-tmp"
-    home.mkdir(mode=0o700)
+    home.mkdir(mode=0o700, exist_ok=True)
     temporary.mkdir(mode=0o700, exist_ok=True)
     return {
         "PATH": "/usr/bin:/bin",
@@ -998,7 +998,7 @@ def _fixture(root: pathlib.Path) -> pathlib.Path:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
-    pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
+    pathlib.Path(environment["HOME"]).mkdir(mode=0o700, exist_ok=True)
     commands = (
         ["/usr/bin/git", "init", "-q", "--initial-branch=main"],
         ["/usr/bin/git", "add", "README.md"],
@@ -1157,7 +1157,7 @@ def _stop_automatic_daemon(
         "GIT_ALLOW_PROTOCOL": "file",
         "CARGO_NET_OFFLINE": "true",
     }
-    pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
+    pathlib.Path(environment["HOME"]).mkdir(mode=0o700, exist_ok=True)
     pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700, exist_ok=True)
     stop_argv = [str(binary), "mcp", "daemon", "stop", "--workspace", str(repo)]
     status_argv = [str(binary), "mcp", "daemon", "status", "--workspace", str(repo)]

@@ -47,6 +47,32 @@ invalidation; maintenance-mode inspect/export/delete/prune/GC/doctor/stats;
 private no-overwrite exports; zero automatic eviction; safe upgrade draining;
 exact client removal; and uninstall.
 
+Generate the lifecycle and composed scenario evidence from real binaries and
+retained subordinate reports:
+
+```bash
+python3 -B bench/local_beta_lifecycle_e2e.py \
+  --again-binary /absolute/path/to/again \
+  --source-git-sha "$SOURCE_SHA" \
+  --output /absolute/path/to/lifecycle.json
+
+python3 -B bench/local_beta_product_scenario.py \
+  --initial-archive /absolute/path/to/initial.tar.gz \
+  --upgraded-archive /absolute/path/to/upgraded.tar.gz \
+  --initial-native-evidence /absolute/path/to/initial-native.json \
+  --upgraded-native-evidence /absolute/path/to/upgraded-native.json \
+  --lifecycle-evidence /absolute/path/to/lifecycle.json \
+  --product-e2e-evidence /absolute/path/to/product-e2e.json \
+  --chaos-evidence /absolute/path/to/chaos-beta.json \
+  --source-git-sha "$SOURCE_SHA" \
+  --output /absolute/path/to/product-scenario.json
+```
+
+The producer refuses mixed source or binary identities, reruns the locked Rust
+and 100,000-case differential gates, performs an actual two-archive in-place
+upgrade and uninstall, and publishes evidence with private no-overwrite
+semantics.
+
 The same report must retain the adversarial matrix. It requires 100 concurrent
 clients, at least two repositories, a positive retained soak duration, all
 transport/storage/graph/migration/hostile-input probes, and zero cross-scope

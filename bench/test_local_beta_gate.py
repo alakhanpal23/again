@@ -103,7 +103,7 @@ def scenario_report() -> dict[str, object]:
                 "dependency_completed": True,
                 "parent_completed": True,
                 "terminal_immutable": True,
-                "transition_history_count": 4,
+                "transition_history_count": 5,
             },
         ),
         step(
