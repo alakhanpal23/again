@@ -622,6 +622,31 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
         "outside_user",
         "outside-user real-agent evidence is absent",
     )
+    outside_user_count = report.get("outside_user_count")
+    accepted_attempts = report.get("accepted_attempts")
+    repository_count = report.get("repository_count")
+    _require(
+        _is_int(outside_user_count, 5)
+        and _is_int(accepted_attempts, 50)
+        and _is_int(repository_count, 5),
+        "agent_sample",
+        "real-agent evidence does not meet the outside-user sample threshold",
+    )
+    methodology = _mapping(report.get("methodology"), "agent_methodology")
+    required_methodology = {
+        "balanced_order",
+        "fixed_acceptance_tests",
+        "identical_worktrees",
+        "models_pinned",
+        "provider_usage_retained",
+        "settings_pinned",
+    }
+    _require(
+        set(methodology) == required_methodology
+        and all(value is True for value in methodology.values()),
+        "agent_methodology",
+        "real-agent comparison methodology is incomplete",
+    )
     quality = _mapping(report.get("quality"), "agent_quality")
     _require(
         quality.get("incorrect_hits") == 0
@@ -645,9 +670,11 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
         "tool_calls",
         "validated_completion_ms",
     }
+    paired_run_count = 0
     for client in clients.values():
         pair = _mapping(client, "agent_pair")
         _require(_is_int(pair.get("paired_runs"), 1), "agent_pair", "real-agent pair count is invalid")
+        paired_run_count += int(pair["paired_runs"])
         baseline = _mapping(pair.get("baseline"), "agent_metrics")
         enabled = _mapping(pair.get("again_enabled"), "agent_metrics")
         _require(
@@ -661,6 +688,11 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
             "agent_metrics",
             "real-agent metrics are incomplete or show a quality regression",
         )
+    _require(
+        paired_run_count == accepted_attempts,
+        "agent_sample",
+        "accepted attempt count does not match the retained client pairs",
+    )
     return {
         "source_git_sha": str(source),
         "binary_sha256": str(binary),

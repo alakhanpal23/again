@@ -93,7 +93,10 @@ archive and installed-binary digests must equal the corresponding signed
 release subject. Duplicate targets do not fill a missing job.
 
 The outside-user report uses `again.local-beta-real-agent-review.v1`. Codex and
-Claude each need paired baseline/Again observations for first correct edit,
+Claude together need at least fifty accepted paired baseline/Again observations
+from at least five outside users across at least five repositories. The report
+must retain balanced order, pinned models and settings, identical worktrees,
+fixed acceptance tests, and provider usage. Each client records first correct edit,
 duplicate reads and investigations, tool calls, response bytes, input/output
 tokens, cost, validated completion time, and patch quality. The report must
 state that it is outside-user evidence rather than a deterministic-harness-only

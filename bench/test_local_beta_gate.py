@@ -227,7 +227,18 @@ def real_agent_report() -> dict[str, object]:
         "source_git_sha": SOURCE,
         "binary_sha256": INITIAL,
         "outside_user": True,
+        "outside_user_count": 5,
+        "accepted_attempts": 50,
+        "repository_count": 5,
         "deterministic_harness_only": False,
+        "methodology": {
+            "balanced_order": True,
+            "fixed_acceptance_tests": True,
+            "identical_worktrees": True,
+            "models_pinned": True,
+            "provider_usage_retained": True,
+            "settings_pinned": True,
+        },
         "quality": {
             "incorrect_hits": 0,
             "quality_regressions": 0,
@@ -236,7 +247,7 @@ def real_agent_report() -> dict[str, object]:
         },
         "clients": {
             client: {
-                "paired_runs": 2,
+                "paired_runs": 25,
                 "baseline": metrics(90),
                 "again_enabled": metrics(90),
             }
@@ -415,6 +426,18 @@ class LocalBetaGateTests(unittest.TestCase):
         with self.assertRaises(gate.GateRefusal) as quality:
             gate.validate_real_agent(report)
         self.assertEqual(quality.exception.code, "agent_metrics")
+
+        report = real_agent_report()
+        report["accepted_attempts"] = 49
+        with self.assertRaises(gate.GateRefusal) as sample:
+            gate.validate_real_agent(report)
+        self.assertEqual(sample.exception.code, "agent_sample")
+
+        report = real_agent_report()
+        report["methodology"]["balanced_order"] = False  # type: ignore[index]
+        with self.assertRaises(gate.GateRefusal) as methodology:
+            gate.validate_real_agent(report)
+        self.assertEqual(methodology.exception.code, "agent_methodology")
 
     def test_exact_native_target_matrix_and_source_binding_are_required(self) -> None:
         duplicate = native_reports()
