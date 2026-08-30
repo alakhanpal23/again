@@ -500,7 +500,7 @@ struct CoordinatorDoctorReport {
     transport: &'static str,
     same_user_authenticated: bool,
     ordinary_stdio_grants_recipient_authority: bool,
-    public_tools: [&'static str; 5],
+    public_tools: [&'static str; 9],
     blockers: Vec<&'static str>,
 }
 
@@ -2899,6 +2899,10 @@ fn doctor(json: bool) -> Result<i32> {
             ordinary_stdio_grants_recipient_authority: false,
             public_tools: [
                 "task.start",
+                "task.inspect",
+                "task.list",
+                "task.claim",
+                "task.transition",
                 "context.delta",
                 "context.publish",
                 "context.retrieve",
