@@ -753,9 +753,8 @@ impl GatewayControlledProviderV1 {
                     {
                         break Ok(None);
                     }
-                    if !self.register_result_dependency(resolved, &gateway_result_id) {
-                        break Ok(None);
-                    }
+                    let dependency_registered =
+                        self.register_result_dependency(resolved, &gateway_result_id);
                     let loaded =
                         self.load_exact(resolved, &gateway_result_id, call)
                             .map_err(|_| {
@@ -767,7 +766,7 @@ impl GatewayControlledProviderV1 {
                                     .with_data(json!({ "reason": "verified_result_unavailable" })),
                                 )
                             });
-                    if matches!(loaded, Ok(Some(_))) {
+                    if matches!(loaded, Ok(Some(_))) && dependency_registered {
                         self.remember_candidate(call, &resolved.binding, &gateway_result_id);
                         let _ = self
                             .store
@@ -951,19 +950,20 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     if let Some((candidate, loaded)) = preloaded
                         && candidate.binding.binding_digest() == resolved.binding.binding_digest()
                         && candidate.gateway_result_id == gateway_result_id
-                        && self.register_result_dependency(&resolved, &gateway_result_id)
                     {
                         let value = self.attach_loaded_exact(&resolved, &call, loaded);
-                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
-                        let _ = self
-                            .store
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .record_gateway_route_served(
-                                &call_id,
-                                &gateway_result_id,
-                                GatewayServedRouteV1::Exact,
-                            );
+                        if self.register_result_dependency(&resolved, &gateway_result_id) {
+                            self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_route_served(
+                                    &call_id,
+                                    &gateway_result_id,
+                                    GatewayServedRouteV1::Exact,
+                                );
+                        }
                         return Ok(value);
                     }
                     let value = self.load_exact(&resolved, &gateway_result_id, &call);
@@ -973,18 +973,19 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         .map(|request| request.binding.binding_digest())
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
-                        && self.register_result_dependency(&resolved, &gateway_result_id)
                     {
-                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
-                        let _ = self
-                            .store
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .record_gateway_route_served(
-                                &call_id,
-                                &gateway_result_id,
-                                GatewayServedRouteV1::Exact,
-                            );
+                        if self.register_result_dependency(&resolved, &gateway_result_id) {
+                            self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_route_served(
+                                    &call_id,
+                                    &gateway_result_id,
+                                    GatewayServedRouteV1::Exact,
+                                );
+                        }
                         return Ok(value);
                     }
                 }
