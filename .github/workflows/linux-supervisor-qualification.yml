@@ -26,9 +26,15 @@ jobs:
         run: |
           uname -a
           ls -l /dev/kvm
-          command -v qemu-system-x86_64 || true
-          command -v lxc || true
           grep -Ec '(vmx|svm)' /proc/cpuinfo
+          sudo lxd init --auto
+          sudo lxc launch ubuntu:24.04 again-qualification --vm \
+            -c limits.cpu=2 -c limits.memory=4GiB
+          sudo lxc exec again-qualification -- cloud-init status --wait
+          sudo lxc exec again-qualification -- uname -a
+          sudo lxc exec again-qualification -- systemd-detect-virt --vm
+          sudo lxc image info ubuntu:24.04
+          sudo lxc delete --force again-qualification
           exit 1
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
