@@ -62,6 +62,11 @@ STDIO_MAX_INFLIGHT = 16
 MAX_CPU_SECONDS = 1_800.0
 MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024
 RUNTIME_SLACK_SECONDS = 45.0
+EXPECTED_DAEMON_TOOLS = frozenset(
+    (*product.EXPECTED_ADVERTISED_TOOLS, "context.cancel", "context.delta",
+     "context.publish", "context.retrieve", "task.claim", "task.inspect",
+     "task.list", "task.start", "task.transition")
+)
 
 
 class HarnessRefusal(RuntimeError):
@@ -521,15 +526,8 @@ class Session:
         tools = listing.get("result", {}).get("tools")
         names = [item.get("name") for item in tools] if isinstance(tools, list) else []
         if self.automatic_daemon:
-            required = {
-                "task.start",
-                "task.inspect",
-                "task.list",
-                "task.claim",
-                "task.transition",
-            }
-            if len(names) != len(set(names)) or not required.issubset(names):
-                raise HarnessRefusal("tools", "beta task tool list is incomplete")
+            if len(names) != len(EXPECTED_DAEMON_TOOLS) or set(names) != EXPECTED_DAEMON_TOOLS:
+                raise HarnessRefusal("tools", "beta daemon tool list changed")
         elif names != list(product.EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("tools", "MCP tool list changed")
 
