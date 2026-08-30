@@ -33,11 +33,19 @@ fn workspace() -> TempDir {
 }
 
 fn daemon(workspace: &Path) -> GatewayDaemonV1 {
-    GatewayDaemonV1::bind(
-        workspace,
-        AuthorizationScopeId::new("daemon-test-scope").unwrap(),
-    )
-    .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match GatewayDaemonV1::bind(
+            workspace,
+            AuthorizationScopeId::new("daemon-test-scope").unwrap(),
+        ) {
+            Ok(daemon) => return daemon,
+            Err(GatewayServiceError::SocketExists) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("bind test daemon: {error}"),
+        }
+    }
 }
 
 fn start_daemon(workspace: &Path) -> (std::path::PathBuf, thread::JoinHandle<()>) {
