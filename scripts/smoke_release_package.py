@@ -17,6 +17,7 @@ import platform
 import re
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -29,11 +30,13 @@ SEMVER_TAG = re.compile(
     r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
     r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$"
 )
+SOURCE_SHA = re.compile(r"^[0-9a-f]{40}$")
 MCP_PROTOCOL_VERSION = "2025-06-18"
 COMMAND_TIMEOUT_SECONDS = 15.0
 DAEMON_READY_TIMEOUT_SECONDS = 10.0
 MAX_DIAGNOSTIC_BYTES = 16 * 1024
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
+MAX_BINARY_BYTES = 256 * 1024 * 1024
 
 EXPECTED_TOOLS = {
     "context.cancel",
@@ -69,6 +72,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--archive", required=True, type=Path)
     parser.add_argument("--version", required=True)
+    parser.add_argument("--source-git-sha")
+    parser.add_argument("--evidence-output", type=Path)
     return parser.parse_args()
 
 
@@ -88,6 +93,77 @@ def host_target() -> str:
 
 def bounded_text(payload: bytes) -> str:
     return payload[:MAX_DIAGNOSTIC_BYTES].decode("utf-8", "replace")
+
+
+def sha256_file(path: Path, maximum_bytes: int) -> str:
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= maximum_bytes:
+        raise SmokeFailure("file identity is not a bounded regular file")
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise SmokeFailure("file could not be opened without following links") from error
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        opened = os.fstat(descriptor)
+        if file_identity(opened) != file_identity(before):
+            raise SmokeFailure("file changed while opening")
+        while block := os.read(descriptor, 1024 * 1024):
+            total += len(block)
+            if total > maximum_bytes:
+                raise SmokeFailure("file exceeded its digest bound")
+            digest.update(block)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    final = path.lstat()
+    if (
+        total != before.st_size
+        or file_identity(before) != file_identity(after)
+        or file_identity(before) != file_identity(final)
+    ):
+        raise SmokeFailure("file changed while hashing")
+    return digest.hexdigest()
+
+
+def file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def write_private_evidence(path: Path, report: dict[str, Any]) -> None:
+    if not path.is_absolute():
+        raise SmokeFailure("evidence output must be an absolute path")
+    payload = (
+        json.dumps(report, allow_nan=False, separators=(",", ":"), sort_keys=True).encode()
+        + b"\n"
+    )
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise SmokeFailure("evidence output could not be created exclusively") from error
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise SmokeFailure("evidence output write made no progress")
+            view = view[written:]
+        os.fsync(descriptor)
+        if os.fstat(descriptor).st_mode & 0o777 != 0o600:
+            raise SmokeFailure("evidence output permissions are not private")
+    finally:
+        os.close(descriptor)
 
 
 def run(
@@ -319,9 +395,14 @@ def main() -> int:
     args = parse_args()
     repository = Path(__file__).resolve().parent.parent
     archive = args.archive.resolve()
+    if (args.evidence_output is None) != (args.source_git_sha is None):
+        raise SmokeFailure("evidence output and source Git SHA must be provided together")
+    if args.source_git_sha is not None and SOURCE_SHA.fullmatch(args.source_git_sha) is None:
+        raise SmokeFailure("source Git SHA is not a lowercase 40-character digest")
     if SEMVER_TAG.fullmatch(args.version) is None:
         raise SmokeFailure("version is not a supported SemVer release tag")
-    expected_name = f"again-{args.version}-{host_target()}.tar.gz"
+    target = host_target()
+    expected_name = f"again-{args.version}-{target}.tar.gz"
     if (
         archive.name != expected_name
         or not archive.is_file()
@@ -341,7 +422,7 @@ def main() -> int:
             directory.mkdir(mode=0o700)
         installed_archive = artifacts / expected_name
         shutil.copyfile(archive, installed_archive)
-        digest = hashlib.sha256(installed_archive.read_bytes()).hexdigest()
+        digest = sha256_file(installed_archive, MAX_ARCHIVE_BYTES)
         (artifacts / "SHA256SUMS").write_text(
             f"{digest}  {expected_name}\n", encoding="ascii"
         )
@@ -355,6 +436,7 @@ def main() -> int:
         run(["git", "init", "--quiet"], cwd=workspace, env=env)
 
         binary = install_root / "again"
+        installed_binary_digest: str | None = None
         daemon_started = False
         uninstall_complete = False
         try:
@@ -373,6 +455,7 @@ def main() -> int:
                 env=env,
             )
             version = run([str(binary), "--version"], cwd=workspace, env=env)
+            installed_binary_digest = sha256_file(binary, MAX_BINARY_BYTES)
             crate_version = args.version[1:].split("-", 1)[0]
             if version.stdout.decode("utf-8", "strict").strip() != f"again {crate_version}":
                 raise SmokeFailure("installed binary reported an unexpected version")
@@ -465,6 +548,34 @@ def main() -> int:
                     check=False,
                     timeout=2.0,
                 )
+
+    if args.evidence_output is not None:
+        if installed_binary_digest is None:
+            raise SmokeFailure("installed binary identity was not retained")
+        write_private_evidence(
+            args.evidence_output,
+            {
+                "schema": "again.local-beta-native-smoke.v1",
+                "classification": {
+                    "type": "pass",
+                    "code": "native_package_smoke_passed",
+                },
+                "target": target,
+                "source_git_sha": args.source_git_sha,
+                "archive_sha256": digest,
+                "installed_binary_sha256": installed_binary_digest,
+                "checks": {
+                    "authenticated_mcp": True,
+                    "automatic_daemon_start": True,
+                    "client_setup_plans": True,
+                    "daemon_started": True,
+                    "doctor_passed": True,
+                    "exact_tool_catalog": True,
+                    "installed": True,
+                    "uninstalled": True,
+                },
+            },
+        )
 
     print(f"native daemon-only package smoke passed: {expected_name}")
     return 0

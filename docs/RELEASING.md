@@ -44,7 +44,11 @@ smoke installs the archive, checks the daemon-only capability report,
 validates the exact Codex and Claude setup plans, starts the daemon through the
 first connector, negotiates an authenticated MCP session, verifies the exact
 repository/task/context tool catalog, confirms that pytest and team entry
-points are absent, stops the daemon, and cleanly uninstalls the package.
+points are absent, stops the daemon, and cleanly uninstalls the package. Each
+native job retains a private JSON smoke report bound to the source commit,
+archive digest, installed-binary digest, target, and completed checks for the
+final local-beta evidence gate; these reports are workflow artifacts, not
+published release assets.
 
 ## Native release matrix
 
