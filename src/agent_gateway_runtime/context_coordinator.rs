@@ -737,11 +737,11 @@ struct ContextDeliveryCompletionV1 {
 
 impl ResponseWriteCompletionV1 for ContextDeliveryCompletionV1 {
     fn complete(self: Box<Self>, delivered_response: &[u8]) {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(b"again.context.response-envelope.v1\0");
-        hasher.update(&(delivered_response.len() as u64).to_le_bytes());
-        hasher.update(delivered_response);
-        let envelope = hasher.finalize().to_hex().to_string();
+        let envelope = event_digest_v1(
+            b"again.context.response-envelope.v1\0",
+            &self.identity,
+            delivered_response,
+        );
         let acknowledged = self
             .coordinator
             .store

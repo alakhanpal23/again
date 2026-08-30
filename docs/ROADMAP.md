@@ -399,9 +399,10 @@ Exit:
 
 Goal: replace broad agent orientation with one bounded verified edit brief.
 
-Status: next. The durable context ledger landed in Wave 1; the public
-task-start/coordinator and bounded code-intelligence work remain in Terminals D
-and E.
+Status: implemented locally through the durable ledger, same-user coordinator,
+public task/context tools, and bounded code-intelligence index. Deterministic
+paired-client correctness is covered; retained cold/hot latency, byte, and
+real-agent task-quality measurements remain in Terminal G.
 
 Work:
 
@@ -428,6 +429,10 @@ Exit:
 
 Goal: use models for relevance without paying repeatedly for rediscovery or
 weakening truth.
+
+Status: authenticated local recipient issuance, full retrieval, write/flush
+receipts, compact delivery, deltas, and lifecycle retirement are implemented.
+Optional model usage and provider-reported cost/token measurements remain open.
 
 Work:
 

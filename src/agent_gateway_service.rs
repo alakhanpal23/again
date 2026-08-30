@@ -905,6 +905,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::io::BufRead;
     use std::os::unix::fs::symlink;
+    use std::sync::Barrier;
 
     struct LocalMcpClientV1 {
         stream: UnixStream,
@@ -1268,6 +1269,243 @@ mod tests {
             json!({ "taskId": "shared-task", "task": "must use a new lifecycle" }),
         );
         assert_eq!(retired["error"]["data"]["reason"], "invalid_agent_context");
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn paired_agents_converge_and_invalidate_as_one_local_product() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::write(workspace.path().join("unrelated.txt"), b"stable\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_value() -> &'static str { \"first\" }\n",
+        )
+        .unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("paired-product-gate-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let start_a = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+        );
+        let start_b = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+        );
+        for start in [&start_a, &start_b] {
+            assert_eq!(start["result"]["structuredContent"]["presentation"], "full");
+            assert_eq!(
+                start["result"]["structuredContent"]["validationPreview"]["status"],
+                "execute_required"
+            );
+            assert!(
+                start["result"]["structuredContent"]["validationPreview"]["selectors"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "an unqualified validation profile supplied a reusable selector"
+            );
+        }
+        let start_cursor_a = start_a["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let start_cursor_b = start_b["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let barrier_a = Arc::clone(&barrier);
+        let reader_a = thread::spawn(move || {
+            barrier_a.wait();
+            let read = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+            (agent_a, read)
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let reader_b = thread::spawn(move || {
+            barrier_b.wait();
+            let read = agent_b.tool("repo.read", json!({ "path": "input.txt" }));
+            (agent_b, read)
+        });
+        barrier.wait();
+        let (mut agent_a, read_a) = reader_a.join().unwrap();
+        let (mut agent_b, read_b) = reader_b.join().unwrap();
+        assert_eq!(read_a["result"]["content"], read_b["result"]["content"]);
+        let initial_result_id = read_a["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            read_b["result"]["_meta"]["again"]["resultId"],
+            initial_result_id
+        );
+
+        let stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.requested, 2, "{stats:?}");
+        assert_eq!(stats.executed, 1, "{stats:?}");
+        assert_eq!(stats.exact_hits + stats.inflight_joins, 1, "{stats:?}");
+        assert_eq!(stats.false_hit_quarantines, 0, "{stats:?}");
+
+        let delta_a = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": start_cursor_a, "limit": 64 }),
+        );
+        let delta_b = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": start_cursor_b, "limit": 64 }),
+        );
+        for delta in [&delta_a, &delta_b] {
+            let events = delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap_or_else(|| panic!("context delta failed: {delta}"));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "verified_fact_admission")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "result_reference")
+            );
+        }
+        let admitted_cursor_a = delta_a["result"]["structuredContent"]["delta"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let admitted_cursor_b = delta_b["result"]["structuredContent"]["delta"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let retrieved = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": initial_result_id }),
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "first\n"
+        );
+        for compact in [
+            agent_a.tool(
+                "task.start",
+                json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+            ),
+            agent_b.tool(
+                "task.start",
+                json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+            ),
+        ] {
+            assert_eq!(
+                compact["result"]["structuredContent"]["presentation"],
+                "compact"
+            );
+        }
+
+        fs::write(
+            workspace.path().join("unrelated.txt"),
+            b"changed elsewhere\n",
+        )
+        .unwrap();
+        let preserved = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(
+            preserved["result"]["_meta"]["again"]["resultId"],
+            initial_result_id
+        );
+        let after_irrelevant = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(after_irrelevant.executed, 1, "{after_irrelevant:?}");
+        let quiet = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_a, "limit": 64 }),
+        );
+        assert!(
+            quiet["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an unrelated content edit invalidated the exact read"
+        );
+
+        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        let changed = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(changed["result"]["content"][0]["text"], "second\n");
+        let changed_result_id = changed["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(changed_result_id, initial_result_id);
+        let after_relevant = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(after_relevant.executed, 2, "{after_relevant:?}");
+        assert_eq!(
+            after_relevant.false_hit_quarantines, 0,
+            "{after_relevant:?}"
+        );
+
+        let mutation_a = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_a, "limit": 64 }),
+        );
+        let mutation_b = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_b, "limit": 64 }),
+        );
+        for delta in [&mutation_a, &mutation_b] {
+            assert!(
+                delta["result"]["structuredContent"]["delta"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "invalidation"),
+                "a recipient missed the relevant mutation delta"
+            );
+        }
+        let stale_retrieval = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": initial_result_id }),
+        );
+        assert_eq!(
+            stale_retrieval["error"]["data"]["reason"],
+            "retrieval_refused"
+        );
+        let current_retrieval = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": changed_result_id }),
+        );
+        assert_eq!(
+            current_retrieval["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "second\n"
+        );
+
+        fs::write(workspace.path().join("unrelated.txt"), b"changed twice\n").unwrap();
+        let warm = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(
+            warm["result"]["_meta"]["again"]["resultId"],
+            changed_result_id
+        );
+        let final_stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(final_stats.executed, 2, "{final_stats:?}");
+        assert_eq!(final_stats.false_hit_quarantines, 0, "{final_stats:?}");
 
         agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
         agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
