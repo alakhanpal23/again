@@ -87,6 +87,8 @@ matrix.
 Each native report uses `again.local-beta-native-smoke.v1` and records one of
 the four closed target names, source, archive and installed-binary digests, and
 passing install, daemon, authenticated MCP, doctor, and uninstall checks. The
+same report also proves connector-driven automatic startup, exact Codex and
+Claude setup plans, and the closed task/context/repository tool catalog. The
 archive and installed-binary digests must equal the corresponding signed
 release subject. Duplicate targets do not fill a missing job.
 

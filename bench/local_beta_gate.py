@@ -554,7 +554,16 @@ def validate_native(report: Mapping[str, Any]) -> dict[str, str]:
         "native smoke identity is invalid",
     )
     checks = _mapping(report.get("checks"), "native_checks")
-    required = {"authenticated_mcp", "daemon_started", "doctor_passed", "installed", "uninstalled"}
+    required = {
+        "authenticated_mcp",
+        "automatic_daemon_start",
+        "client_setup_plans",
+        "daemon_started",
+        "doctor_passed",
+        "exact_tool_catalog",
+        "installed",
+        "uninstalled",
+    }
     _require(
         set(checks) == required and all(value is True for value in checks.values()),
         "native_checks",

@@ -299,8 +299,11 @@ def native_reports() -> list[dict[str, object]]:
             "installed_binary_sha256": archives[target]["binary_sha256"],
             "checks": {
                 "authenticated_mcp": True,
+                "automatic_daemon_start": True,
+                "client_setup_plans": True,
                 "daemon_started": True,
                 "doctor_passed": True,
+                "exact_tool_catalog": True,
                 "installed": True,
                 "uninstalled": True,
             },
