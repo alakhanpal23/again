@@ -34,9 +34,16 @@ publication.
 
 Before any build, the verify job runs formatting, clippy with warnings denied,
 all feature-enabled tests, the deterministic 100,000-case differential corpus,
-shell and Python syntax checks, and the packaging rollback tests. Each platform
-job also runs the feature-enabled Rust tests natively before building and
-smoke-tests the packaged binary's reported version.
+the RustSec vulnerability audit, a fail-closed exact license/source policy over
+the locked Cargo metadata, shell and Python syntax checks, and the packaging
+rollback tests. Each platform job also runs the feature-enabled Rust tests
+natively before building. Release archives are then built with exactly the
+`daemon` feature: `linux-pytest`,
+`team-alpha`, and the experimental hook are not enabled. The native package
+smoke installs the archive, checks the daemon-only capability report,
+negotiates an authenticated MCP session, verifies the exact
+repository/task/context tool catalog, confirms that pytest and team entry
+points are absent, stops the daemon, and cleanly uninstalls the package.
 
 ## Native release matrix
 
@@ -115,14 +122,21 @@ the seven subjects. Checksums alone do not authenticate the publisher.
 3. Run the same source and packaging gates locally:
 
    ```sh
-   cargo +1.88.0 fmt --check
+   cargo +1.88.0 fmt --all --check
    cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
    cargo +1.88.0 test --locked --all-features
    cargo +1.88.0 test --locked --test generated_differential \
      generated_differential_100k -- --ignored --exact --nocapture
+   cargo +1.88.0 audit --locked
+   license_metadata=$(mktemp "${TMPDIR:-/tmp}/again-cargo-metadata.XXXXXXXX")
+   cargo +1.88.0 metadata --locked --format-version 1 > "$license_metadata"
+   python3 scripts/audit_dependency_licenses.py --metadata "$license_metadata"
+   rm -f "$license_metadata"
    sh -n scripts/install.sh scripts/uninstall.sh scripts/test_packaging.sh \
      scripts/test_installer_crash_matrix.sh
-   python3 -m py_compile scripts/package_release.py
+   python3 -m py_compile scripts/package_release.py \
+     scripts/audit_dependency_licenses.py scripts/smoke_release_package.py
+   python3 -B -m unittest discover -s bench -p 'test_*.py'
    sh scripts/test_packaging.sh
    sh scripts/test_installer_crash_matrix.sh
    ```
