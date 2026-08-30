@@ -60,10 +60,11 @@ use crate::store::{
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
-    ExecutableObservationRequestV1, ExternalFreshnessV1, McpIdentityV1, RepositoryGitStateV1,
-    RepositoryObservationKindV1, StateDigestV1, StateDimensionV1, TaskStateInputV1, TaskStateV1,
-    WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1, issue_no_external_dependencies_v1,
-    observe_environment_v1,
+    ExecutableObservationRequestV1, ExternalFreshnessV1, ManifestDependentKindV1,
+    ManifestDependentV1, McpIdentityV1, ObservedManifestV1, RepositoryGitStateV1,
+    RepositoryObservationKindV1, RepositoryObservationPlanV1, StateDigestV1, StateDimensionV1,
+    TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1,
+    issue_no_external_dependencies_v1, observe_environment_v1,
 };
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
@@ -238,6 +239,7 @@ impl RepositoryOperationV1 {
 struct ResolvedRequestV1 {
     core_call: GatewayToolCallV1,
     binding: ValidatedGatewayReadV1,
+    observation_plan: RepositoryObservationPlanV1,
 }
 
 #[derive(Clone)]
@@ -268,10 +270,34 @@ trait RepositoryEpochProviderV1: UpstreamProvider {
 pub(crate) struct GatewayControlledProviderV1 {
     inner: Arc<dyn RepositoryEpochProviderV1>,
     workspace: PathBuf,
+    observed_workspace: SharedObservedWorkspaceV1,
     store: Arc<Mutex<Store>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
     pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
+}
+
+#[derive(Clone)]
+struct SharedObservedWorkspaceV1 {
+    execution_epoch: Arc<WorkspaceExecutionEpochV1>,
+    manifest: Arc<Mutex<ObservedManifestV1>>,
+}
+
+impl SharedObservedWorkspaceV1 {
+    fn begin(workspace: &Path) -> Result<Self> {
+        let limits = gateway_workspace_limits_v1();
+        let execution_epoch = Arc::new(
+            WorkspaceExecutionEpochV1::begin(workspace, &limits)
+                .map_err(|_| anyhow!("descriptor-retained workspace issuance failed"))?,
+        );
+        let manifest = execution_epoch
+            .begin_observed_manifest(&limits)
+            .map_err(|_| anyhow!("sealed observed manifest issuance failed"))?;
+        Ok(Self {
+            execution_epoch,
+            manifest: Arc::new(Mutex::new(manifest)),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -301,14 +327,31 @@ impl Drop for ActiveRegistrationV1<'_> {
 }
 
 impl GatewayControlledProviderV1 {
+    #[cfg(test)]
     fn new(
         inner: Arc<dyn RepositoryEpochProviderV1>,
         workspace: PathBuf,
+        store: Arc<Mutex<Store>>,
+    ) -> Result<Self> {
+        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        Ok(Self::new_with_observed_workspace(
+            inner,
+            workspace,
+            observed_workspace,
+            store,
+        ))
+    }
+
+    fn new_with_observed_workspace(
+        inner: Arc<dyn RepositoryEpochProviderV1>,
+        workspace: PathBuf,
+        observed_workspace: SharedObservedWorkspaceV1,
         store: Arc<Mutex<Store>>,
     ) -> Self {
         Self {
             inner,
             workspace,
+            observed_workspace,
             store,
             active: Mutex::new(BTreeMap::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
@@ -331,18 +374,25 @@ impl GatewayControlledProviderV1 {
         self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
-    fn resolve(
-        &self,
-        epoch: &WorkspaceExecutionEpochV1,
-        call: &ProviderCall,
-    ) -> Option<ResolvedRequestV1> {
+    fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
         let operation = RepositoryOperationV1::from_call(call)?;
         let descriptor = self.inner.descriptor();
         let (provider_id, implementation) = operation.provider_boundary();
         if descriptor.id != provider_id || descriptor.implementation != implementation {
             return None;
         }
-        resolve_repository_request_v1(epoch, call, operation).ok()
+        let mut manifest = self
+            .observed_workspace
+            .manifest
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        resolve_repository_request_v1(
+            &self.observed_workspace.execution_epoch,
+            &mut manifest,
+            call,
+            operation,
+        )
+        .ok()
     }
 
     fn owner(call: &ProviderCall) -> String {
@@ -393,6 +443,26 @@ impl GatewayControlledProviderV1 {
                 gateway_result_id: gateway_result_id.to_owned(),
             },
         );
+    }
+
+    fn register_result_dependency(
+        &self,
+        resolved: &ResolvedRequestV1,
+        gateway_result_id: &str,
+    ) -> bool {
+        let dependent = ManifestDependentV1::new(
+            ManifestDependentKindV1::Result,
+            StateDigestV1::from_domain_and_bytes(
+                b"again.gateway-result-dependent.v1",
+                gateway_result_id.as_bytes(),
+            ),
+        );
+        self.observed_workspace
+            .manifest
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .register_dependent(&resolved.observation_plan, dependent)
+            .is_ok()
     }
 
     fn remember_active(
@@ -536,7 +606,7 @@ impl GatewayControlledProviderV1 {
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
                     return Ok(value);
                 }
-                let revalidated = self.resolve(epoch, &verification_call);
+                let revalidated = self.resolve(&verification_call);
                 if revalidated
                     .as_ref()
                     .map(|request| request.binding.binding_digest())
@@ -593,7 +663,9 @@ impl GatewayControlledProviderV1 {
                     | Ok(GatewayCompletion::AlreadyCompleted {
                         gateway_result_id, ..
                     }) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
-                        Ok(Some(exact)) => {
+                        Ok(Some(exact))
+                            if self.register_result_dependency(resolved, &gateway_result_id) =>
+                        {
                             self.remember_candidate(
                                 &verification_call,
                                 &resolved.binding,
@@ -601,7 +673,7 @@ impl GatewayControlledProviderV1 {
                             );
                             Ok(exact)
                         }
-                        Ok(None) | Err(_) => Ok(value),
+                        Ok(Some(_)) | Ok(None) | Err(_) => Ok(value),
                     },
                     Ok(_) | Err(_) => Ok(value),
                 }
@@ -627,7 +699,6 @@ impl GatewayControlledProviderV1 {
 
     fn wait_as_follower(
         &self,
-        epoch: &WorkspaceExecutionEpochV1,
         call: &ProviderCall,
         resolved: &ResolvedRequestV1,
         call_id: &str,
@@ -646,11 +717,14 @@ impl GatewayControlledProviderV1 {
             match observation {
                 Ok(GatewayCallObservation::Ready { gateway_result_id }) => {
                     if self
-                        .resolve(epoch, call)
+                        .resolve(call)
                         .as_ref()
                         .map(|request| request.binding.binding_digest())
                         != Some(resolved.binding.binding_digest())
                     {
+                        break Ok(None);
+                    }
+                    if !self.register_result_dependency(resolved, &gateway_result_id) {
                         break Ok(None);
                     }
                     let loaded =
@@ -795,10 +869,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        let limits = gateway_workspace_limits_v1();
-        let epoch = WorkspaceExecutionEpochV1::begin(&self.workspace, &limits).map_err(|_| {
-            provider_io_v1(anyhow!("descriptor-retained workspace issuance failed"))
-        })?;
+        let epoch = Arc::clone(&self.observed_workspace.execution_epoch);
         if call.effect != EffectClass::ReadOnly {
             return self.execute_direct(&epoch, call, secrets, true);
         }
@@ -814,7 +885,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .flatten()
                     .map(|loaded| (candidate, loaded))
             });
-        let Some(resolved) = self.resolve(&epoch, &call) else {
+        let Some(resolved) = self.resolve(&call) else {
             return self.execute_direct(&epoch, call, secrets, true);
         };
         let owner = Self::owner(&call);
@@ -851,6 +922,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     if let Some((candidate, loaded)) = preloaded
                         && candidate.binding.binding_digest() == resolved.binding.binding_digest()
                         && candidate.gateway_result_id == gateway_result_id
+                        && self.register_result_dependency(&resolved, &gateway_result_id)
                     {
                         let value = self.attach_loaded_exact(&resolved, &call, loaded);
                         self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
@@ -866,12 +938,13 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         return Ok(value);
                     }
                     let value = self.load_exact(&resolved, &gateway_result_id, &call);
-                    let revalidated = self.resolve(&epoch, &call);
+                    let revalidated = self.resolve(&call);
                     if revalidated
                         .as_ref()
                         .map(|request| request.binding.binding_digest())
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
+                        && self.register_result_dependency(&resolved, &gateway_result_id)
                     {
                         self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
                         let _ = self
@@ -929,7 +1002,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 };
                 if decision == GatewayDecision::JoinInflight
                     && let Some(value) =
-                        self.wait_as_follower(&epoch, &call, &resolved, &call_id, &cancelled)?
+                        self.wait_as_follower(&call, &resolved, &call_id, &cancelled)?
                 {
                     return Ok(value);
                 }
@@ -1223,16 +1296,23 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
-        let repository_controlled: Arc<dyn UpstreamProvider> = Arc::new(
-            GatewayControlledProviderV1::new(repository, workspace.clone(), Arc::clone(&store)),
-        );
+        let repository_controlled: Arc<dyn UpstreamProvider> =
+            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
+                repository,
+                workspace.clone(),
+                observed_workspace.clone(),
+                Arc::clone(&store),
+            ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
-        let git_controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            git,
-            workspace,
-            Arc::clone(&store),
-        ));
+        let git_controlled: Arc<dyn UpstreamProvider> =
+            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
+                git,
+                workspace,
+                observed_workspace,
+                Arc::clone(&store),
+            ));
         let gateway = McpGateway::new(
             vec![
                 ProviderRegistration::trusted_annotations(repository_controlled),
@@ -1284,6 +1364,7 @@ impl ExperimentalMcpGatewayV1 {
 
 fn resolve_repository_request_v1(
     execution_epoch: &WorkspaceExecutionEpochV1,
+    observed_manifest: &mut ObservedManifestV1,
     call: &ProviderCall,
     operation: RepositoryOperationV1,
 ) -> Result<ResolvedRequestV1> {
@@ -1291,8 +1372,8 @@ fn resolve_repository_request_v1(
     let workspace = execution_epoch.canonical_workspace();
     let observation_plan =
         repository_tools::observation_plan_v1(execution_epoch, &call.arguments, operation)?;
-    let repository = execution_epoch
-        .observe_repository(&observation_plan, &limits)
+    let repository = observed_manifest
+        .observe_repository(&observation_plan)
         .map_err(|_| anyhow!("repository state is incomplete"))?;
     if operation.is_git()
         && !matches!(
@@ -1471,7 +1552,11 @@ fn resolve_repository_request_v1(
         },
         dependencies,
     })?;
-    Ok(ResolvedRequestV1 { core_call, binding })
+    Ok(ResolvedRequestV1 {
+        core_call,
+        binding,
+        observation_plan,
+    })
 }
 
 fn attach_result_reference_v1(
@@ -1778,11 +1863,14 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            upstream.clone(),
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-        ));
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
+            GatewayControlledProviderV1::new(
+                upstream.clone(),
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],
@@ -1860,17 +1948,72 @@ mod product_tests {
     }
 
     #[test]
+    fn one_gateway_manifest_shares_nodes_and_invalidates_cross_tool_results() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"needle one").unwrap();
+        let state = TempDir::new().unwrap();
+        let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
+        let repository = Arc::new(RepositoryProviderV1::new(workspace.path()).unwrap());
+        let controlled = Arc::new(
+            GatewayControlledProviderV1::new(
+                repository,
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
+        let registered: Arc<dyn UpstreamProvider> = controlled.clone();
+        let gateway = McpGateway::new(
+            vec![ProviderRegistration::trusted_annotations(registered)],
+            GatewayLimits::default(),
+        )
+        .unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(&gateway, "init-shared-manifest", initialize);
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        let search = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repo.search","arguments":{"pattern":"needle"}}}"#;
+        process(&gateway, "manifest-read", read);
+        process(&gateway, "manifest-search", search);
+
+        let before = controlled
+            .observed_workspace
+            .manifest
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .accounting();
+        assert_eq!(before.physical_content_hashes(), 1);
+        assert!(before.node_reuse_hits() >= 1);
+        assert!(before.dependent_count() >= 4);
+
+        fs::write(workspace.path().join("input.txt"), b"needle two").unwrap();
+        process(&gateway, "manifest-search-after-mutation", search);
+        let after = controlled
+            .observed_workspace
+            .manifest
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .accounting();
+        assert_eq!(after.physical_content_hashes(), 2);
+        assert_eq!(after.epoch_advancements(), 1);
+        assert_eq!(after.invalidation_events(), 1);
+        assert!(after.invalidated_dependents() >= 4);
+    }
+
+    #[test]
     fn warm_preload_is_partitioned_by_authorization_scope() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.txt"), b"same").unwrap();
         let state = TempDir::new().unwrap();
         let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
         let repository = Arc::new(RepositoryProviderV1::new(workspace.path()).unwrap());
-        let controlled = Arc::new(GatewayControlledProviderV1::new(
-            repository,
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-        ));
+        let controlled = Arc::new(
+            GatewayControlledProviderV1::new(
+                repository,
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let registered: Arc<dyn UpstreamProvider> = controlled.clone();
         let gateway = McpGateway::new(
             vec![ProviderRegistration::trusted_annotations(registered)],
@@ -1929,11 +2072,14 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            upstream.clone(),
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-        ));
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
+            GatewayControlledProviderV1::new(
+                upstream.clone(),
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],
