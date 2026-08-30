@@ -390,6 +390,45 @@ impl Write for LineWriter {
     }
 }
 
+struct FlushGateLineWriter {
+    pending: Vec<u8>,
+    lines: mpsc::Sender<Vec<u8>>,
+    emitted_lines: usize,
+    pause_after_line: usize,
+    release: mpsc::Receiver<()>,
+}
+
+impl Write for FlushGateLineWriter {
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        for byte in input {
+            if *byte == b'\n' {
+                let line = std::mem::take(&mut self.pending);
+                self.lines
+                    .send(line)
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "test receiver"))?;
+                self.emitted_lines += 1;
+                if self.emitted_lines == self.pause_after_line {
+                    self.release
+                        .recv_timeout(Duration::from_secs(2))
+                        .map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!("test flush gate was not released: {error}"),
+                            )
+                        })?;
+                }
+            } else {
+                self.pending.push(*byte);
+            }
+        }
+        Ok(input.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct ProtocolDeliverySink {
     consumed: AtomicBool,
@@ -1387,12 +1426,16 @@ fn negotiated_delivery_grant_is_same_connection_and_one_use() {
     );
     let (input_sender, input_receiver) = mpsc::channel();
     let (line_sender, line_receiver) = mpsc::channel();
+    let (flush_release, flush_wait) = mpsc::channel();
     let serving_gateway = Arc::clone(&gateway);
     let server = thread::spawn(move || {
         let mut reader = BufReader::new(ChannelReader::new(input_receiver));
-        let mut writer = LineWriter {
+        let mut writer = FlushGateLineWriter {
             pending: Vec::new(),
             lines: line_sender,
+            emitted_lines: 0,
+            pause_after_line: 3,
+            release: flush_wait,
         };
         serving_gateway.serve_stdio_for_authenticated_recipient_v1(
             &mut reader,
@@ -1452,6 +1495,11 @@ fn negotiated_delivery_grant_is_same_connection_and_one_use() {
             "params":challenge
         })))
         .unwrap();
+    assert!(matches!(
+        line_receiver.recv_timeout(Duration::from_millis(50)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    flush_release.send(()).unwrap();
     let acknowledged: Value =
         serde_json::from_slice(&line_receiver.recv_timeout(Duration::from_secs(2)).unwrap())
             .unwrap();

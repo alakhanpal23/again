@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,6 +41,7 @@ const STDIO_RESPONSE_QUEUE_V1: usize = STDIO_MAX_INFLIGHT_V1 * 2;
 const MAX_OUTSTANDING_DELIVERY_CHALLENGES_V1: usize = 128;
 const MAX_RETIRED_DELIVERY_CHALLENGES_V1: usize = 256;
 const DELIVERY_CHALLENGE_TTL_V1: Duration = Duration::from_secs(30);
+const DELIVERY_FLUSH_ACK_WAIT_V1: Duration = Duration::from_secs(1);
 const MAX_UPSTREAM_ARGUMENTS_V1: usize = 64;
 const MAX_UPSTREAM_ENVIRONMENT_V1: usize = 64;
 const MAX_UPSTREAM_CONFIG_STRING_BYTES_V1: usize = 4_096;
@@ -2453,6 +2454,22 @@ impl DeliveryLedgerV1 {
         }
     }
 
+    fn matching_acknowledgement_awaits_flush(
+        &self,
+        connection: &StdioConnectionV1,
+        acknowledgement: &DeliveryAcknowledgementV1,
+    ) -> bool {
+        let Some(pending) = self.pending.get(acknowledgement.challenge_id()) else {
+            return false;
+        };
+        pending.stdio_session_id == connection.session_id
+            && pending.expires_at > Instant::now()
+            && pending.challenge.binding().connection_digest() == connection.connection_digest
+            && acknowledgement.acknowledgement_token() == pending.challenge.acknowledgement_token()
+            && acknowledgement.binding() == pending.challenge.binding()
+            && !pending.response_flushed
+    }
+
     fn acknowledge(
         &mut self,
         connection: &StdioConnectionV1,
@@ -2709,6 +2726,7 @@ pub struct McpGateway {
     active: Mutex<BTreeMap<JsonRpcId, ActiveCall>>,
     audit: Arc<dyn GatewayAuditSink>,
     delivery_ledger: Mutex<DeliveryLedgerV1>,
+    delivery_flush_changed: Condvar,
     delivery_sink: Arc<dyn DeliveryConfirmationSink>,
     reasoning_delivery_ledger: Mutex<ReasoningDeliveryLedgerV1>,
     pending_reasoning_writes: Mutex<BTreeMap<String, ReasoningWriteCompletionV1>>,
@@ -2815,6 +2833,7 @@ impl McpGateway {
             active: Mutex::new(BTreeMap::new()),
             audit: Arc::new(NoopAuditSink),
             delivery_ledger: Mutex::new(DeliveryLedgerV1::default()),
+            delivery_flush_changed: Condvar::new(),
             delivery_sink: Arc::new(NoopDeliveryConfirmationSink),
             reasoning_delivery_ledger: Mutex::new(ReasoningDeliveryLedgerV1::default()),
             pending_reasoning_writes: Mutex::new(BTreeMap::new()),
@@ -3206,10 +3225,13 @@ impl McpGateway {
                         writer.write_all(b"\n")?;
                         writer.flush()?;
                         if let Some(challenge_id) = response.flushed_challenge_id {
-                            self.delivery_ledger
+                            let mut ledger = self
+                                .delivery_ledger
                                 .lock()
-                                .unwrap_or_else(|poison| poison.into_inner())
-                                .mark_response_flushed(session_id, &challenge_id);
+                                .unwrap_or_else(|poison| poison.into_inner());
+                            ledger.mark_response_flushed(session_id, &challenge_id);
+                            drop(ledger);
+                            self.delivery_flush_changed.notify_all();
                         }
                         if let Some(completion) = response.write_completion {
                             completion.complete(&response.bytes);
@@ -3382,10 +3404,14 @@ impl McpGateway {
             // cancelled and asks its exact physical attempt to stop.
             session_closed.store(true, Ordering::Release);
             self.cancel_stdio_session(session_id);
-            self.delivery_ledger
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .retire_session(session_id);
+            {
+                let mut ledger = self
+                    .delivery_ledger
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                ledger.retire_session(session_id);
+            }
+            self.delivery_flush_changed.notify_all();
             self.retire_connection_retrievals_v2(&connection, "connection_closed");
             if let Ok(recipient) = connection.current_reasoning_recipient() {
                 self.recipient_lifecycle_sink
@@ -3814,11 +3840,28 @@ impl McpGateway {
             Ok(acknowledgement) => acknowledgement,
             Err(refusal) => return delivery_refusal_response_v1(response_id, refusal),
         };
-        let confirmation = self
-            .delivery_ledger
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .acknowledge(connection, acknowledgement);
+        let confirmation = {
+            let mut ledger = self
+                .delivery_ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let deadline = Instant::now() + DELIVERY_FLUSH_ACK_WAIT_V1;
+            while ledger.matching_acknowledgement_awaits_flush(connection, &acknowledgement) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let (next, wait) = self
+                    .delivery_flush_changed
+                    .wait_timeout(ledger, remaining)
+                    .unwrap_or_else(|poison| poison.into_inner());
+                ledger = next;
+                if wait.timed_out() {
+                    break;
+                }
+            }
+            ledger.acknowledge(connection, acknowledgement)
+        };
         match confirmation {
             Ok(confirmation) => {
                 let reasoning_delivery_id = confirmation.reasoning_delivery_id().map(str::to_owned);
@@ -3950,10 +3993,14 @@ impl McpGateway {
         let Some(connection) = connection else {
             return;
         };
-        self.delivery_ledger
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .retire_session(connection.session_id);
+        {
+            let mut ledger = self
+                .delivery_ledger
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            ledger.retire_session(connection.session_id);
+        }
+        self.delivery_flush_changed.notify_all();
         self.retire_connection_retrievals_v2(connection, "context_compacted");
         if let Ok(recipient) = connection.current_reasoning_recipient() {
             self.recipient_lifecycle_sink
