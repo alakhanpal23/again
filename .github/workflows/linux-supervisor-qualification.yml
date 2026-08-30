@@ -28,11 +28,9 @@ jobs:
           ls -l /dev/kvm
           grep -Ec '(vmx|svm)' /proc/cpuinfo
           sudo lxd init --auto
-          cleanup_guest() {
-            sudo lxc delete --force again-qualification 2>/dev/null || true
-          }
-          trap cleanup_guest EXIT
-          sudo lxc launch ubuntu:24.04 again-qualification --vm \
+          sudo lxc launch \
+            ubuntu:249184e85e137481972f08080a0fe4e2371835d876e186af78f4cb809057c98c \
+            again-qualification --vm \
             -c limits.cpu=2 -c limits.memory=4GiB
           ready=false
           for _ in $(seq 1 60); do
@@ -44,10 +42,8 @@ jobs:
           done
           test "$ready" = true
           sudo lxc exec again-qualification -- cloud-init status --wait
-          sudo lxc exec again-qualification -- uname -a
-          sudo lxc exec again-qualification -- systemd-detect-virt --vm
-          sudo lxc image info ubuntu:24.04
-          exit 1
+          test "$(sudo lxc exec again-qualification -- uname -m)" = x86_64
+          test "$(sudo lxc exec again-qualification -- systemd-detect-virt --vm)" = kvm
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
       - name: Require the provisioned kernel contract
@@ -57,7 +53,30 @@ jobs:
       - name: Build the fixed diagnostic
         run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Require 100 samples and both kernel fork-delivery orders
-        run: sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh
+        run: |
+          sudo lxc exec again-qualification -- apt-get update -qq
+          sudo lxc exec again-qualification -- apt-get install -y jq
+          sudo lxc file push target/debug/again again-qualification/root/again
+          sudo lxc file push scripts/preflight_linux_supervisor_runner.sh \
+            again-qualification/root/preflight_linux_supervisor_runner.sh
+          sudo lxc file push scripts/qualify_linux_supervisor.sh \
+            again-qualification/root/qualify_linux_supervisor.sh
+          sudo lxc exec again-qualification -- chmod 700 \
+            /root/again \
+            /root/preflight_linux_supervisor_runner.sh \
+            /root/qualify_linux_supervisor.sh
+          sudo lxc exec again-qualification -- \
+            /root/preflight_linux_supervisor_runner.sh
+          sudo lxc exec again-qualification -- env \
+            GITHUB_SHA="$GITHUB_SHA" \
+            AGAIN_SUPERVISOR_BINARY=/root/again \
+            AGAIN_SUPERVISOR_EVIDENCE_DIR=/root/linux-supervisor-qualification \
+            /root/qualify_linux_supervisor.sh
+          sudo lxc file pull --recursive \
+            again-qualification/root/linux-supervisor-qualification .
+      - name: Destroy the disposable qualification guest
+        if: always()
+        run: sudo lxc delete --force again-qualification 2>/dev/null || true
       - name: Return evidence ownership to the unprivileged job user
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" linux-supervisor-qualification 2>/dev/null || true
