@@ -33,18 +33,28 @@ fi
 mkdir -m 700 "$evidence_dir"
 : > "$evidence_dir/validated.jsonl"
 
+# Keep samples independent and preserve their invocation order. The kernel
+# alone chooses which live fork-delivery order each fixed probe observes.
 iteration=1
-failed_sample_count=0
 while [ "$iteration" -le "$sample_count" ]; do
   sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
   mkdir -m 700 "$sample_dir"
   set +e
-  "$binary" __linux-pytest-supervisor-tree-probe-v1 \
+  AGAIN_SUPERVISOR_QUALIFICATION_ITERATION=$iteration \
+    "$binary" __linux-pytest-supervisor-tree-probe-v1 \
     > "$sample_dir/stdout.raw" \
     2> "$sample_dir/stderr.raw"
   probe_exit=$?
   set -e
   printf '%d\n' "$probe_exit" > "$sample_dir/exit-status.txt"
+  iteration=$((iteration + 1))
+done
+
+iteration=1
+failed_sample_count=0
+while [ "$iteration" -le "$sample_count" ]; do
+  sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
+  probe_exit=$(cat "$sample_dir/exit-status.txt")
   validated_record="$sample_dir/validated.json"
   sample_valid=true
   if [ "$probe_exit" -ne 0 ] || [ -s "$sample_dir/stderr.raw" ]; then

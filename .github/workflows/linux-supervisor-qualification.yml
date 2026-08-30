@@ -13,25 +13,99 @@ concurrency:
   group: linux-supervisor-qualification-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  QUALIFICATION_GUEST: again-qualification
+  QUALIFICATION_IMAGE_FINGERPRINT: aa5e27c9f434c8a5b06fc9d1875c5b32df01cbf82f8d8caf08e06f243c9b54cf
+  QUALIFICATION_KERNEL_RELEASE: 6.8.0-138-generic
+
 jobs:
   qualify:
-    name: Pinned provisioned Linux supervisor 100-sample qualification
-    runs-on: [self-hosted, linux, x64, again-linux-pytest-v1]
+    name: Disposable hosted Linux supervisor 100-sample qualification
+    runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Provision the sealed native x86_64 KVM guest
+        run: |
+          test "$(uname -m)" = x86_64
+          test -c /dev/kvm
+          grep -Eq '(vmx|svm)' /proc/cpuinfo
+          sudo lxd init --auto
+          sudo lxc launch "ubuntu:$QUALIFICATION_IMAGE_FINGERPRINT" \
+            "$QUALIFICATION_GUEST" --vm \
+            -c limits.cpu=2 -c limits.memory=4GiB
+          ready=false
+          for _ in $(seq 1 60); do
+            if sudo lxc exec "$QUALIFICATION_GUEST" -- true 2>/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
+          timeout --foreground 180s sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            cloud-init status --wait
+          test "$(sudo lxc config get "$QUALIFICATION_GUEST" volatile.base_image)" \
+            = "$QUALIFICATION_IMAGE_FINGERPRINT"
+          test "$(sudo lxc exec "$QUALIFICATION_GUEST" -- uname -m)" = x86_64
+          test "$(sudo lxc exec "$QUALIFICATION_GUEST" -- uname -r)" \
+            = "$QUALIFICATION_KERNEL_RELEASE"
+          test "$(sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            systemd-detect-virt --vm)" = kvm
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
-      - name: Require the provisioned kernel contract
-        run: scripts/preflight_linux_supervisor_runner.sh
       - name: Strict Linux source validation
         run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
       - name: Build the fixed diagnostic
-        run: cargo +1.88.0 build --locked --bin again
+        run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Require 100 samples and both kernel fork-delivery orders
-        run: scripts/qualify_linux_supervisor.sh
+        run: |
+          timeout --foreground 180s sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+          timeout --foreground 180s sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            env DEBIAN_FRONTEND=noninteractive apt-get install \
+              --no-install-recommends -y jq
+          sudo lxc file push target/debug/again \
+            "$QUALIFICATION_GUEST/root/again"
+          sudo lxc file push scripts/preflight_linux_supervisor_runner.sh \
+            "$QUALIFICATION_GUEST/root/preflight_linux_supervisor_runner.sh"
+          sudo lxc file push scripts/qualify_linux_supervisor.sh \
+            "$QUALIFICATION_GUEST/root/qualify_linux_supervisor.sh"
+          sudo lxc exec "$QUALIFICATION_GUEST" -- chmod 700 \
+            /root/again \
+            /root/preflight_linux_supervisor_runner.sh \
+            /root/qualify_linux_supervisor.sh
+          host_binary_sha=$(sha256sum target/debug/again | awk '{print $1}')
+          guest_binary_sha=$(sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            sha256sum /root/again | awk '{print $1}')
+          test "$guest_binary_sha" = "$host_binary_sha"
+          sudo lxc exec "$QUALIFICATION_GUEST" -- \
+            /root/preflight_linux_supervisor_runner.sh
+          set +e
+          sudo lxc exec "$QUALIFICATION_GUEST" -- env \
+            GITHUB_SHA="$GITHUB_SHA" \
+            AGAIN_SUPERVISOR_BINARY=/root/again \
+            AGAIN_SUPERVISOR_EVIDENCE_DIR=/root/linux-supervisor-qualification \
+            /root/qualify_linux_supervisor.sh
+          qualification_exit=$?
+          set -e
+          sudo lxc file pull --recursive \
+            "$QUALIFICATION_GUEST/root/linux-supervisor-qualification" .
+          exit "$qualification_exit"
+      - name: Destroy the disposable qualification guest
+        if: always()
+        run: |
+          if sudo lxc info "$QUALIFICATION_GUEST" > /dev/null 2>&1; then
+            sudo lxc delete --force "$QUALIFICATION_GUEST"
+          fi
+      - name: Return evidence ownership to the unprivileged job user
+        if: always()
+        run: |
+          if [ -e linux-supervisor-qualification ]; then
+            sudo chown -R "$(id -u):$(id -g)" linux-supervisor-qualification
+          fi
       - name: Upload exact qualification evidence
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

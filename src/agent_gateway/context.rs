@@ -433,6 +433,368 @@ pub const MAX_REASONING_DEPTH_V1: usize = 6;
 pub const MAX_REASONING_TEXT_BYTES_V1: usize = 1024;
 const MAX_REASONING_LOCATOR_BYTES_V1: usize = 512;
 
+pub const CONTEXT_LEDGER_SCHEMA_VERSION_V1: u16 = 1;
+pub const MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1: usize = 4_096;
+pub const MAX_CONTEXT_LEDGER_SNAPSHOT_ITEMS_V1: usize = 64;
+pub const MAX_CONTEXT_LEDGER_DELTA_ITEMS_V1: usize = 256;
+pub const MAX_CONTEXT_LEDGER_DEPENDENCIES_V1: usize = 64;
+
+/// Complete identity for one local shared-context participant. Repository and
+/// workspace identity scope shared truth; the remaining fields scope delivery
+/// and lease authority. Private fields and validation prevent a deserialized
+/// identifier from silently becoming an active recipient.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLedgerIdentityV1 {
+    schema_version: u16,
+    repository_id: String,
+    workspace_id: String,
+    task_id: String,
+    authorization_scope_digest: String,
+    agent_id: String,
+    session_id: String,
+    turn_id: String,
+    connection_generation: String,
+    compaction_generation: u64,
+    lifecycle_generation: u64,
+}
+
+impl fmt::Debug for ContextLedgerIdentityV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ContextLedgerIdentityV1(<redacted>)")
+    }
+}
+
+impl ContextLedgerIdentityV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        repository_id: &str,
+        workspace_id: &str,
+        task_id: &str,
+        authorization_scope_digest: &str,
+        agent_id: &str,
+        session_id: &str,
+        turn_id: &str,
+        connection_generation: &str,
+        compaction_generation: u64,
+        lifecycle_generation: u64,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        for value in [
+            repository_id,
+            workspace_id,
+            task_id,
+            agent_id,
+            session_id,
+            turn_id,
+        ] {
+            validate_reasoning_identifier_v1(value)?;
+        }
+        for value in [authorization_scope_digest, connection_generation] {
+            validate_reasoning_digest_v1(value)?;
+        }
+        if lifecycle_generation == 0 {
+            return Err(ReasoningContextRefusalV1::InvalidGeneration);
+        }
+        Ok(Self {
+            schema_version: CONTEXT_LEDGER_SCHEMA_VERSION_V1,
+            repository_id: repository_id.to_owned(),
+            workspace_id: workspace_id.to_owned(),
+            task_id: task_id.to_owned(),
+            authorization_scope_digest: authorization_scope_digest.to_owned(),
+            agent_id: agent_id.to_owned(),
+            session_id: session_id.to_owned(),
+            turn_id: turn_id.to_owned(),
+            connection_generation: connection_generation.to_owned(),
+            compaction_generation,
+            lifecycle_generation,
+        })
+    }
+
+    pub const fn schema_version(&self) -> u16 {
+        self.schema_version
+    }
+    pub fn repository_id(&self) -> &str {
+        &self.repository_id
+    }
+    pub fn workspace_id(&self) -> &str {
+        &self.workspace_id
+    }
+    pub fn task_id(&self) -> &str {
+        &self.task_id
+    }
+    pub fn authorization_scope_digest(&self) -> &str {
+        &self.authorization_scope_digest
+    }
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+    pub fn turn_id(&self) -> &str {
+        &self.turn_id
+    }
+    pub fn connection_generation(&self) -> &str {
+        &self.connection_generation
+    }
+    pub const fn compaction_generation(&self) -> u64 {
+        self.compaction_generation
+    }
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub fn after_compaction(&self) -> Result<Self, ReasoningContextRefusalV1> {
+        let mut next = self.clone();
+        next.compaction_generation = next
+            .compaction_generation
+            .checked_add(1)
+            .ok_or(ReasoningContextRefusalV1::InvalidGeneration)?;
+        Ok(next)
+    }
+
+    pub fn after_lifecycle_change(
+        &self,
+        connection_generation: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_digest_v1(connection_generation)?;
+        let mut next = self.clone();
+        next.connection_generation = connection_generation.to_owned();
+        next.lifecycle_generation = next
+            .lifecycle_generation
+            .checked_add(1)
+            .ok_or(ReasoningContextRefusalV1::InvalidGeneration)?;
+        Ok(next)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextLedgerEventKindV1 {
+    VerifiedFactAdmission,
+    UnverifiedSuggestion,
+    CompletedObservation,
+    InflightWork,
+    FailedApproach,
+    ExplicitUnknown,
+    ResultReference,
+    Invalidation,
+    Retirement,
+}
+
+impl ContextLedgerEventKindV1 {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::VerifiedFactAdmission => "verified_fact_admission",
+            Self::UnverifiedSuggestion => "unverified_suggestion",
+            Self::CompletedObservation => "completed_observation",
+            Self::InflightWork => "inflight_work",
+            Self::FailedApproach => "failed_approach",
+            Self::ExplicitUnknown => "explicit_unknown",
+            Self::ResultReference => "result_reference",
+            Self::Invalidation => "invalidation",
+            Self::Retirement => "retirement",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLedgerSuggestionV1 {
+    subject: String,
+    statement: String,
+    relevance_digest: String,
+}
+
+impl ContextLedgerSuggestionV1 {
+    pub fn new(
+        subject: &str,
+        statement: &str,
+        relevance_digest: &str,
+    ) -> Result<Self, ReasoningContextRefusalV1> {
+        validate_reasoning_identifier_v1(subject)?;
+        validate_reasoning_text_v1(statement, MAX_REASONING_TEXT_BYTES_V1)?;
+        validate_reasoning_digest_v1(relevance_digest)?;
+        Ok(Self {
+            subject: subject.to_owned(),
+            statement: statement.to_owned(),
+            relevance_digest: relevance_digest.to_owned(),
+        })
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+    pub fn relevance_digest(&self) -> &str {
+        &self.relevance_digest
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLedgerEventV1 {
+    sequence: u64,
+    envelope_digest: String,
+    kind: ContextLedgerEventKindV1,
+    subject_id: String,
+    subject_version: u64,
+    summary: String,
+    value_digest: Option<String>,
+    created_ms: u64,
+}
+
+impl ContextLedgerEventV1 {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_store(
+        sequence: u64,
+        envelope_digest: String,
+        kind: ContextLedgerEventKindV1,
+        subject_id: String,
+        subject_version: u64,
+        summary: String,
+        value_digest: Option<String>,
+        created_ms: u64,
+    ) -> Self {
+        Self {
+            sequence,
+            envelope_digest,
+            kind,
+            subject_id,
+            subject_version,
+            summary,
+            value_digest,
+            created_ms,
+        }
+    }
+
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub fn envelope_digest(&self) -> &str {
+        &self.envelope_digest
+    }
+    pub const fn kind(&self) -> ContextLedgerEventKindV1 {
+        self.kind
+    }
+    pub fn subject_id(&self) -> &str {
+        &self.subject_id
+    }
+    pub const fn subject_version(&self) -> u64 {
+        self.subject_version
+    }
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+    pub fn value_digest(&self) -> Option<&str> {
+        self.value_digest.as_deref()
+    }
+    pub const fn created_ms(&self) -> u64 {
+        self.created_ms
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(transparent)]
+pub struct ContextLedgerCursorV1(u64);
+
+impl ContextLedgerCursorV1 {
+    pub const fn new(sequence: u64) -> Self {
+        Self(sequence)
+    }
+    pub const fn sequence(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLedgerTaskSnapshotV1 {
+    cursor: ContextLedgerCursorV1,
+    current_facts: Vec<ReasoningFactV1>,
+    suggestions: Vec<ContextLedgerSuggestionV1>,
+    explicit_unknowns: Vec<ReasoningUnknownV1>,
+    result_references: Vec<ReasoningRetrievalIdentityV1>,
+    inflight_work: Vec<InflightReasoningWorkV1>,
+}
+
+impl ContextLedgerTaskSnapshotV1 {
+    pub(crate) fn from_store(
+        cursor: ContextLedgerCursorV1,
+        current_facts: Vec<ReasoningFactV1>,
+        suggestions: Vec<ContextLedgerSuggestionV1>,
+        explicit_unknowns: Vec<ReasoningUnknownV1>,
+        result_references: Vec<ReasoningRetrievalIdentityV1>,
+        inflight_work: Vec<InflightReasoningWorkV1>,
+    ) -> Self {
+        Self {
+            cursor,
+            current_facts,
+            suggestions,
+            explicit_unknowns,
+            result_references,
+            inflight_work,
+        }
+    }
+    pub const fn cursor(&self) -> ContextLedgerCursorV1 {
+        self.cursor
+    }
+    pub fn current_facts(&self) -> &[ReasoningFactV1] {
+        &self.current_facts
+    }
+    pub fn suggestions(&self) -> &[ContextLedgerSuggestionV1] {
+        &self.suggestions
+    }
+    pub fn explicit_unknowns(&self) -> &[ReasoningUnknownV1] {
+        &self.explicit_unknowns
+    }
+    pub fn result_references(&self) -> &[ReasoningRetrievalIdentityV1] {
+        &self.result_references
+    }
+    pub fn inflight_work(&self) -> &[InflightReasoningWorkV1] {
+        &self.inflight_work
+    }
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextLedgerDeltaV1 {
+    after: ContextLedgerCursorV1,
+    cursor: ContextLedgerCursorV1,
+    has_more: bool,
+    events: Vec<ContextLedgerEventV1>,
+}
+
+impl ContextLedgerDeltaV1 {
+    pub(crate) fn from_store(
+        after: ContextLedgerCursorV1,
+        cursor: ContextLedgerCursorV1,
+        has_more: bool,
+        events: Vec<ContextLedgerEventV1>,
+    ) -> Self {
+        Self {
+            after,
+            cursor,
+            has_more,
+            events,
+        }
+    }
+    pub const fn after(&self) -> ContextLedgerCursorV1 {
+        self.after
+    }
+    pub const fn cursor(&self) -> ContextLedgerCursorV1 {
+        self.cursor
+    }
+    pub const fn has_more(&self) -> bool {
+        self.has_more
+    }
+    pub fn events(&self) -> &[ContextLedgerEventV1] {
+        &self.events
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReasoningScopeV1 {
@@ -763,6 +1125,10 @@ impl ReasoningFactV1 {
         &self.topic
     }
 
+    pub fn statement(&self) -> &str {
+        &self.statement
+    }
+
     pub fn value_digest(&self) -> &str {
         &self.value_digest
     }
@@ -817,6 +1183,18 @@ impl ReasoningChangeV1 {
             current_digest: current_digest.to_owned(),
         })
     }
+
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    pub fn prior_digest(&self) -> &str {
+        &self.prior_digest
+    }
+
+    pub fn current_digest(&self) -> &str {
+        &self.current_digest
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -867,6 +1245,14 @@ impl ReasoningUnknownV1 {
             subject: subject.to_owned(),
             explanation: explanation.to_owned(),
         })
+    }
+
+    pub fn subject(&self) -> &str {
+        &self.subject
+    }
+
+    pub fn explanation(&self) -> &str {
+        &self.explanation
     }
 }
 
@@ -942,6 +1328,18 @@ impl CompletedReasoningObservationV1 {
         &self.retrieval
     }
 
+    pub fn observation_id(&self) -> &str {
+        &self.observation_id
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub const fn duration_ms(&self) -> u64 {
+        self.duration_ms
+    }
+
     pub fn sources(&self) -> &[ReasoningSourceReferenceV1] {
         &self.sources
     }
@@ -975,6 +1373,22 @@ impl InflightReasoningWorkV1 {
             lifecycle_generation,
             summary: summary.to_owned(),
         })
+    }
+
+    pub fn call_id(&self) -> &str {
+        &self.call_id
+    }
+
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
+    }
+
+    pub const fn lifecycle_generation(&self) -> u64 {
+        self.lifecycle_generation
+    }
+
+    pub fn summary(&self) -> &str {
+        &self.summary
     }
 }
 
@@ -1010,6 +1424,18 @@ impl FailedReasoningApproachV1 {
 
     pub fn sources(&self) -> &[ReasoningSourceReferenceV1] {
         &self.sources
+    }
+
+    pub fn approach_id(&self) -> &str {
+        &self.approach_id
+    }
+
+    pub fn approach(&self) -> &str {
+        &self.approach
+    }
+
+    pub fn verified_cause(&self) -> &str {
+        &self.verified_cause
     }
 }
 

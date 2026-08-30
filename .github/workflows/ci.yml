@@ -25,7 +25,7 @@ jobs:
       - name: Build the independent read-only capability probe
         run: rustc +1.88.0 --edition 2024 -D warnings ci/linux_capability_probe.rs -o linux-capability-probe
       - name: Build the fixed Again Linux diagnostics
-        run: cargo +1.88.0 build --locked --bin again
+        run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Collect typed hosted Linux capability evidence
         id: capability-probe
         shell: bash
@@ -279,6 +279,11 @@ jobs:
       - run: cargo +1.88.0 fmt --check
       - run: cargo +1.88.0 clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo +1.88.0 test --locked --all-features
+      - name: Audit locked Rust dependencies
+        if: runner.os == 'Linux'
+        run: |
+          cargo +1.88.0 install cargo-audit --version 0.22.2 --locked
+          cargo +1.88.0 audit
       - name: Test the offline Linux supervisor evidence verifier
         run: python3 -B -m unittest scripts/test_verify_linux_supervisor_evidence.py
       - name: Test the offline Linux pytest execute-only evidence verifier

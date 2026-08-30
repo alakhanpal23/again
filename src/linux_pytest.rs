@@ -78,6 +78,7 @@ mod execute_only_stdio;
 mod filesystem_ready_diagnostic;
 mod identity;
 mod isolation_qualification;
+mod profile_store;
 mod ptrace_transport_qualification;
 mod snapshot_connector;
 mod snapshot_manifest;
@@ -3937,7 +3938,13 @@ pub trait PromotionStore: Send {
 
 #[cfg(test)]
 mod tests {
+    use super::profile_store::{
+        FreshPythonCapabilityWitnessV1, SqlitePytestProfileStoreV1, native_execution_gate_v1,
+        validation_dependent_v1,
+    };
     use super::*;
+    use crate::workspace_authority::{ManifestDependentKindV1, ManifestDependentV1, StateDigestV1};
+    use tempfile::TempDir;
 
     macro_rules! digest {
         ($kind:ident, $label:expr) => {
@@ -5282,5 +5289,227 @@ mod tests {
         let mut reversed_tie = vec![candidate_pair(0, 20), candidate_pair(1, 20)];
         reversed_tie.sort_by_key(|candidate| std::cmp::Reverse(candidate.pair.request_key));
         assert!(PromotedLookupV2::new(shape_key, reversed_tie).is_err());
+    }
+
+    #[test]
+    fn portable_profile_store_separates_execute_only_from_promotion() {
+        let temp = TempDir::new().unwrap();
+        let mut store =
+            SqlitePytestProfileStoreV1::open(&temp.path().join("pytest.sqlite")).unwrap();
+
+        let prepared = prepared();
+        let mut executed = record();
+        executed.record_id = RecordId::from_bytes([9; 16]);
+        executed.disposition = EffectRecordDispositionV2::ExecutedOnly;
+        executed.disposition_reason = Some(ExecuteOnlyCode::ForegroundNonzeroExit);
+        executed.result.raw_linux_wait_status = RawLinuxWaitStatusV1::exited(1);
+        let execution = VerifiedExecutionRecordV2::bind(
+            &prepared,
+            TraceExecutionMode::Foreground,
+            CanonicalEffectRecordV2::from_record(executed).unwrap(),
+        )
+        .unwrap();
+        let receipt = store.record_execute_only(&execution).unwrap();
+        assert!(!receipt.reusable);
+        assert!(!receipt.candidate);
+        assert!(!receipt.shadow);
+        assert!(!receipt.promoted);
+        assert!(
+            store
+                .lookup_promoted_by_shape(record().shape_key)
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+
+        let primary = verified_candidate(record());
+        let job = store.record_primary(&primary).unwrap();
+        let mut shadow_record = record();
+        shadow_record.record_id = RecordId::from_bytes([3; 16]);
+        shadow_record.disposition = EffectRecordDispositionV2::ShadowCandidate;
+        shadow_record.primary_record_id = Some(primary.record().record_id);
+        shadow_record.created_monotonic_ns = MonotonicNs(11);
+        let shadow = verified_candidate(shadow_record);
+        let pair = store.finish_shadow(&job, &shadow).unwrap();
+
+        let lookup = store.lookup_promoted_by_shape(pair.shape_key()).unwrap();
+        assert_eq!(lookup.candidates().len(), 1);
+        assert_eq!(
+            lookup.candidates()[0].pair().request_key(),
+            pair.request_key()
+        );
+    }
+
+    #[test]
+    fn fresh_validation_is_mandatory_and_manifest_invalidation_is_precise() {
+        let temp = TempDir::new().unwrap();
+        let mut store =
+            SqlitePytestProfileStoreV1::open(&temp.path().join("pytest.sqlite")).unwrap();
+        let primary = verified_candidate(record());
+        let job = store.record_primary(&primary).unwrap();
+        let mut shadow_record = record();
+        shadow_record.record_id = RecordId::from_bytes([4; 16]);
+        shadow_record.disposition = EffectRecordDispositionV2::ShadowCandidate;
+        shadow_record.primary_record_id = Some(primary.record().record_id);
+        shadow_record.created_monotonic_ns = MonotonicNs(12);
+        let shadow = verified_candidate(shadow_record);
+        let pair = store.finish_shadow(&job, &shadow).unwrap();
+
+        let promoted = store
+            .lookup_promoted_by_shape(pair.shape_key())
+            .unwrap()
+            .candidates
+            .pop()
+            .unwrap();
+        let validation = RevalidatedObservationClosureV1::new(
+            ValidationSnapshot::from_sealed(sealed_snapshot()),
+            primary.record().observation_closure.clone(),
+        )
+        .unwrap();
+        let capability = FreshPythonCapabilityWitnessV1::for_test(&validation);
+        let hit = store
+            .freshly_validate(promoted, &validation, &capability)
+            .unwrap();
+        assert_eq!(hit.consume().pair().request_key(), pair.request_key());
+
+        let unrelated = ManifestDependentV1::new(
+            ManifestDependentKindV1::Fact,
+            StateDigestV1::from_domain_and_bytes(b"unrelated pytest test", b"fact"),
+        );
+        assert_eq!(
+            store
+                .retire_validation_dependents(&[unrelated])
+                .unwrap()
+                .retired_promotions,
+            0
+        );
+        assert_eq!(
+            store
+                .lookup_promoted_by_shape(pair.shape_key())
+                .unwrap()
+                .candidates()
+                .len(),
+            1
+        );
+
+        let retained_before_edit = store
+            .lookup_promoted_by_shape(pair.shape_key())
+            .unwrap()
+            .candidates
+            .pop()
+            .unwrap();
+
+        let relevant = validation_dependent_v1(pair.request_key());
+        assert_eq!(
+            store
+                .retire_validation_dependents(&[relevant])
+                .unwrap()
+                .retired_promotions,
+            1
+        );
+        assert!(
+            store
+                .lookup_promoted_by_shape(pair.shape_key())
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
+        assert!(matches!(
+            store.freshly_validate(retained_before_edit, &validation, &capability),
+            Err(ProfileFailure::Quarantined {
+                code: QuarantineCode::ObservationMismatch,
+            })
+        ));
+    }
+
+    #[test]
+    fn promotion_is_compare_and_swap_and_current_host_does_not_claim_f2() {
+        let temp = TempDir::new().unwrap();
+        let mut store =
+            SqlitePytestProfileStoreV1::open(&temp.path().join("pytest.sqlite")).unwrap();
+        let primary = verified_candidate(record());
+        let job = store.record_primary(&primary).unwrap();
+        let mut shadow_record = record();
+        shadow_record.record_id = RecordId::from_bytes([5; 16]);
+        shadow_record.disposition = EffectRecordDispositionV2::ShadowCandidate;
+        shadow_record.primary_record_id = Some(primary.record().record_id);
+        shadow_record.created_monotonic_ns = MonotonicNs(13);
+        let shadow = verified_candidate(shadow_record);
+        store.finish_shadow(&job, &shadow).unwrap();
+        assert_eq!(
+            store.finish_shadow(&job, &shadow),
+            Err(ProfileFailure::Shadow {
+                code: ShadowTerminalCode::PromotionCompareAndSwapLost,
+            })
+        );
+
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            native_execution_gate_v1(),
+            Err(ProfileFailure::refused(RefusalCode::UnsupportedOs))
+        );
+        #[cfg(all(target_os = "linux", not(target_arch = "x86_64")))]
+        assert_eq!(
+            native_execution_gate_v1(),
+            Err(ProfileFailure::refused(
+                RefusalCode::UnsupportedArchitecture
+            ))
+        );
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        assert_eq!(
+            native_execution_gate_v1(),
+            Err(ProfileFailure::refused(RefusalCode::KernelTupleNotEnabled))
+        );
+    }
+
+    #[test]
+    fn divergence_and_corrupt_durable_records_are_quarantined() {
+        let divergent_temp = TempDir::new().unwrap();
+        let mut divergent =
+            SqlitePytestProfileStoreV1::open(&divergent_temp.path().join("pytest.sqlite")).unwrap();
+        let primary = verified_candidate(record());
+        let job = divergent.record_primary(&primary).unwrap();
+        let mut shadow_record = record();
+        shadow_record.record_id = RecordId::from_bytes([6; 16]);
+        shadow_record.disposition = EffectRecordDispositionV2::ShadowCandidate;
+        shadow_record.primary_record_id = Some(primary.record().record_id);
+        shadow_record.created_monotonic_ns = MonotonicNs(14);
+        shadow_record.result.stdout = StreamCaptureV2::Complete {
+            blob: blob("divergent-stdout", 2),
+        };
+        let shadow = verified_candidate(shadow_record);
+        assert_eq!(
+            divergent.finish_shadow(&job, &shadow),
+            Err(ProfileFailure::Shadow {
+                code: ShadowTerminalCode::SemanticMismatch,
+            })
+        );
+
+        let corrupt_temp = TempDir::new().unwrap();
+        let mut corrupt =
+            SqlitePytestProfileStoreV1::open(&corrupt_temp.path().join("pytest.sqlite")).unwrap();
+        let primary = verified_candidate(record());
+        let job = corrupt.record_primary(&primary).unwrap();
+        let mut shadow_record = record();
+        shadow_record.record_id = RecordId::from_bytes([7; 16]);
+        shadow_record.disposition = EffectRecordDispositionV2::ShadowCandidate;
+        shadow_record.primary_record_id = Some(primary.record().record_id);
+        shadow_record.created_monotonic_ns = MonotonicNs(15);
+        let shadow = verified_candidate(shadow_record);
+        let pair = corrupt.finish_shadow(&job, &shadow).unwrap();
+        corrupt.corrupt_record_for_test(pair.primary_record_id());
+        assert!(matches!(
+            corrupt.lookup_promoted_by_shape(pair.shape_key()),
+            Err(ProfileFailure::Quarantined {
+                code: QuarantineCode::RecordCasCorruption,
+            })
+        ));
+        assert!(
+            corrupt
+                .lookup_promoted_by_shape(pair.shape_key())
+                .unwrap()
+                .candidates()
+                .is_empty()
+        );
     }
 }

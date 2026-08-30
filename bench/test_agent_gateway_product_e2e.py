@@ -22,6 +22,36 @@ class GatewayProductE2ETest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_exact_catalog_includes_context_repository_and_task_lifecycle(self) -> None:
+        self.assertEqual(harness.EXPECTED_DATABASE_SCHEMA, 13)
+        self.assertEqual(
+            harness.EXPECTED_ADVERTISED_TOOLS,
+            (
+                "context.cancel",
+                "context.delta",
+                "context.publish",
+                "context.retrieve",
+                "git.blame",
+                "git.diff",
+                "git.log",
+                "git.show",
+                "git.status",
+                "repo.glob",
+                "repo.list",
+                "repo.manifest",
+                "repo.read",
+                "repo.references",
+                "repo.search",
+                "repo.stat",
+                "repo.tree",
+                "task.claim",
+                "task.inspect",
+                "task.list",
+                "task.start",
+                "task.transition",
+            ),
+        )
+
     def database(self, *, version: int = harness.EXPECTED_DATABASE_SCHEMA) -> pathlib.Path:
         path = self.root / f"gateway-{time.time_ns()}.sqlite"
         connection = sqlite3.connect(path)

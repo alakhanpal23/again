@@ -26,11 +26,11 @@ set -eu
 test "$#" -eq 1
 test "$1" = "__linux-pytest-supervisor-tree-probe-v1"
 counter=${FAKE_SUPERVISOR_COUNTER:?}
-iteration=1
-if [ -f "$counter" ]; then
-  iteration=$(( $(cat "$counter") + 1 ))
-fi
-printf '%d\n' "$iteration" > "$counter"
+iteration=${AGAIN_SUPERVISOR_QUALIFICATION_ITERATION:?}
+case "$iteration" in
+  *[!0-9]*|'') exit 2 ;;
+esac
+printf '%d\n' "$iteration" > "$counter.$iteration"
 if [ "${FAKE_FAIL_AT:-0}" -eq "$iteration" ]; then
   printf '%s\n' '{"schema":"again.linux-pytest-supervisor-tree-probe.v1","profile_id":"linux-pytest-v1","scope":{"kind":"fixed_no_command_two_task_supervisor","profile_qualification":false,"accepts_command":false,"effect_ir_authority":false,"execution_authority":false,"reuse_authority":false},"status":"broken","result":null,"refusal":{"code":"isolation_preflight_failed","stage":"planner","reason":"supervisor_unexpected_ptrace_event","errno":null,"cleanup_complete":true,"cleanup_errno":null}}'
   exit 1
@@ -60,8 +60,9 @@ jq -e '
   and .scope.reuse_authority == false
 ' "$temporary_root/success/report.json" > /dev/null
 test "$(find "$temporary_root/success" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
+test "$(find "$temporary_root" -maxdepth 1 -type f -name 'counter.*' | wc -l | tr -d ' ')" -eq 100
 
-printf '0\n' > "$counter"
+rm -f "$counter".*
 set +e
 PATH="$fake_tools:$PATH" \
 FAKE_SUPERVISOR_COUNTER="$counter" \
@@ -72,12 +73,12 @@ AGAIN_SUPERVISOR_EVIDENCE_DIR="$temporary_root/one-order" \
 one_order_exit=$?
 set -e
 test "$one_order_exit" -ne 0
-test "$(cat "$counter")" -eq 100
+test "$(find "$temporary_root" -maxdepth 1 -type f -name 'counter.*' | wc -l | tr -d ' ')" -eq 100
 test "$(find "$temporary_root/one-order" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
 test "$(wc -l < "$temporary_root/one-order/validated.jsonl" | tr -d ' ')" -eq 100
 test ! -e "$temporary_root/one-order/report.json"
 
-printf '0\n' > "$counter"
+rm -f "$counter".*
 set +e
 PATH="$fake_tools:$PATH" \
 FAKE_SUPERVISOR_COUNTER="$counter" \
@@ -88,7 +89,7 @@ AGAIN_SUPERVISOR_EVIDENCE_DIR="$temporary_root/sample-11-failure" \
 sample_failure_exit=$?
 set -e
 test "$sample_failure_exit" -ne 0
-test "$(cat "$counter")" -eq 100
+test "$(find "$temporary_root" -maxdepth 1 -type f -name 'counter.*' | wc -l | tr -d ' ')" -eq 100
 test "$(find "$temporary_root/sample-11-failure" -type f -name 'exit-status.txt' | wc -l | tr -d ' ')" -eq 100
 test "$(wc -l < "$temporary_root/sample-11-failure/validated.jsonl" | tr -d ' ')" -eq 99
 test "$(cat "$temporary_root/sample-11-failure/sample-011/exit-status.txt")" -eq 1

@@ -1,76 +1,63 @@
-# Ephemeral Linux supervisor qualification runner
+# Disposable hosted Linux supervisor qualification
 
 The manual
 [`linux-supervisor-qualification`](../.github/workflows/linux-supervisor-qualification.yml)
 workflow is limited to the pinned Gate 2 kernel-evidence lane. A qualifying run
-executes a fixed, argument-free, non-authoritative diagnostic 100 times and
-requires both observed fork-delivery orders. It does not accept a workload or
-grant Python, EffectIR, execution-profile, execution, or reuse authority.
+executes 100 independent, sequential copies of the fixed, argument-free,
+non-authoritative diagnostic and requires both observed fork-delivery orders.
+The kernel chooses every live delivery order; the lane does not select a wait
+target, alter scheduling policy, or synthesize an event. The diagnostic does
+not accept a workload or grant Python, EffectIR, execution-profile, execution,
+or reuse authority.
 
 ## Required runner contract
 
-Register one fresh, repository-scoped GitHub Actions runner with all four
-labels used by the workflow:
-
-```text
-self-hosted, linux, x64, again-linux-pytest-v1
-```
-
-The job process must run on Linux x86_64. Its running kernel must expose
+The manual workflow uses GitHub's disposable `ubuntu-22.04` x86_64 VM only as
+an outer KVM host. It requires hardware virtualization and launches a native
+x86_64 Ubuntu VM from the exact image fingerprint checked into the workflow.
+The guest identity is sealed to KVM and kernel `6.8.0-138-generic`; neither
+Rosetta nor CPU emulation is involved. Its running kernel must expose
 `CONFIG_SECCOMP_FILTER=y` and `CONFIG_CHECKPOINT_RESTORE=y` through
 `/proc/config.gz` or `/boot/config-$(uname -r)`. The job process must have
 effective `CAP_SYS_ADMIN` in the user namespace governing the diagnostic
 tracees, which is required for `PTRACE_SECCOMP_GET_FILTER`.
 
-Run `scripts/preflight_linux_supervisor_runner.sh` from an ordinary shell in
-the intended runner environment before registration. The preflight only reads
-kernel identity, kernel configuration, and `/proc/self/status`; it does not
-change capabilities, namespaces, sysctls, mounts, or host configuration.
+Checkout, compilation, and all source validation stay unprivileged on the
+outer host. Host elevation is limited to provisioning, inspecting, copying
+into, and destroying the disposable KVM guest. The workflow verifies the
+copied diagnostic byte-for-byte before running the read-only preflight and
+fixed diagnostic as root inside the guest. The preflight only reads kernel
+identity, kernel configuration, and `/proc/self/status`; it does not change
+capabilities, namespaces, sysctls, mounts, or host configuration.
 
 ## Security boundary
 
-- Use a dedicated, disposable VM or equivalently disposable host and a fresh
-  runner directory. Do not attach a persistent developer workstation.
-- Prefer a dedicated user namespace that maps a non-root host UID to namespace
-  root. Never grant host-user-namespace `CAP_SYS_ADMIN` to a reusable runner.
-- Register the runner to this repository, not an organization or enterprise.
-  Do not share it with other repositories or let an earlier job use it.
+- Use only the disposable hosted VM and its disposable sealed KVM guest. Never
+  move this lane to a persistent or automatically restarted runner while it
+  uses elevated capability.
 - Dispatch only a reviewed immutable commit. Checkout and the pinned Rust build
-  execute repository code and dependencies with the runner's namespace
-  capability; the preflight does not make untrusted code safe.
+  run before elevation. The privileged diagnostic accepts no arguments or
+  workload; the preflight does not make untrusted code safe.
 - Provide no cloud credentials, repository write token, SSH key, package-publish
   secret, or unrelated service secret. The workflow itself has only
   `contents: read`, disables persisted checkout credentials, and remains manual.
-- Treat the VM, runner work directory, compiler caches, logs, and all local
-  state as contaminated after the job. Destroy them instead of reusing them.
+- The workflow destroys the nested guest even after qualification failure, and
+  GitHub destroys the outer hosted VM after the job. Do not add persistent
+  caches, service containers, deployment credentials, or later privileged
+  steps.
 
 These controls limit the blast radius of the required namespace capability.
 They do not turn the diagnostic into an isolation or execution authority and do
 not make the runner safe against its host administrator.
 
-## Register, run once, and remove
+## Run once
 
-1. Create the disposable Linux x86_64 environment and verify the contract with
-   the preflight script.
-2. In the repository's **Settings → Actions → Runners**, choose **New
-   self-hosted runner** and follow GitHub's generated Linux download and
-   checksum instructions inside the fresh runner directory.
-3. Use the generated, short-lived repository registration token once. Append
-   `--ephemeral --labels again-linux-pytest-v1` to the generated `config.sh`
-   registration command. Do not put the token in a repository file, image,
-   script, persistent environment, CI log, or shell-history file.
-4. Verify that GitHub shows the default `self-hosted`, `linux`, and `x64` labels
-   plus `again-linux-pytest-v1`. Start `run.sh` in the foreground, then manually
-   dispatch `linux-supervisor-qualification` at the reviewed commit SHA.
-5. An ephemeral runner accepts at most one job and normally deregisters after
-   it finishes. Verify its repository runner entry is gone. If registration
-   must be canceled before a job, obtain a fresh removal token from repository
-   settings and use the runner's `config.sh remove` flow; do not preserve that
-   token. Delete any stale offline entry in settings, then destroy the entire
-   disposable environment.
-
-Never install this lane as an automatically restarted service. A canceled,
-timed-out, or failed job still requires runner removal and host destruction.
+Review an immutable commit, manually dispatch
+`linux-supervisor-qualification` at that ref, and retain the completed run and
+artifact identifiers. A failed preflight is a host-image non-pass, never
+qualification. A VM-image, kernel, architecture, or KVM identity mismatch also
+fails closed. No runner registration, Rosetta installation, developer-host
+mutation, or cleanup credential is required.
 
 ## Expected retained evidence
 

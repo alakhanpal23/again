@@ -24,24 +24,32 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
-use crate::mcp_gateway::AuthorizationScopeId;
+use crate::mcp_gateway::{
+    AuthenticatedStdioRecipientV1, AuthorizationScopeId, MCP_PROTOCOL_VERSION,
+};
 use crate::store::Store;
 
 const HANDSHAKE_MAGIC_V1: &[u8; 8] = b"AGNGW001";
 const RESPONSE_MAGIC_V1: &[u8; 8] = b"AGNR0001";
 const ENDPOINT_MAGIC_V1: &[u8; 8] = b"AGNEP001";
+const COMPATIBILITY_DIGEST_BYTES_V1: usize = 32;
 const SESSION_NONCE_BYTES_V1: usize = 16;
 const SOCKET_NAME_BYTES_V1: usize = 32;
 const ENDPOINT_BYTES_V1: usize = 8 + SESSION_NONCE_BYTES_V1 + SOCKET_NAME_BYTES_V1;
-const HANDSHAKE_BYTES_V1: usize = 8 + 1 + 32 + SESSION_NONCE_BYTES_V1;
+const HANDSHAKE_BYTES_V1: usize =
+    8 + 1 + 32 + SESSION_NONCE_BYTES_V1 + COMPATIBILITY_DIGEST_BYTES_V1;
 const MAX_CONTROL_PAYLOAD_BYTES_V1: usize = 4 * 1024;
-const MAX_ACTIVE_CONNECTIONS_V1: usize = 32;
+const MAX_DAEMON_BINARY_BYTES_V1: u64 = 256 * 1024 * 1024;
+const MAX_ACTIVE_CONNECTIONS_V1: usize = 128;
 const HANDSHAKE_TIMEOUT_V1: Duration = Duration::from_secs(5);
 const MCP_IDLE_READ_TIMEOUT_V1: Duration = Duration::from_secs(60);
 const MCP_WRITE_TIMEOUT_V1: Duration = Duration::from_secs(10);
 const MAX_SESSION_LIFETIME_V1: Duration = Duration::from_secs(8 * 60 * 60);
 const SHUTDOWN_TIMEOUT_V1: Duration = Duration::from_secs(10);
 const ACCEPT_POLL_V1: Duration = Duration::from_millis(10);
+const DAEMON_IDLE_TIMEOUT_V1: Duration = Duration::from_secs(10 * 60);
+
+static TERMINATION_REQUESTED_V1: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -71,6 +79,8 @@ enum ResponseCodeV1 {
     Invalid = 1,
     Busy = 2,
     Internal = 3,
+    Incompatible = 4,
+    Draining = 5,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +101,12 @@ pub enum GatewayServiceError {
     InvalidHandshake,
     #[error("gateway daemon is at its bounded connection capacity")]
     Busy,
+    #[error(
+        "gateway daemon protocol or binary is incompatible; upgrade Again and reconnect after existing sessions drain"
+    )]
+    Incompatible,
+    #[error("gateway daemon is draining existing sessions; retry after it exits")]
+    Draining,
     #[error("gateway daemon peer authentication is unsupported on this platform")]
     UnsupportedPlatform,
     #[error("gateway daemon workers did not stop before the shutdown deadline")]
@@ -111,6 +127,9 @@ pub struct GatewayDaemonStatusV1 {
     active_connections: usize,
     max_active_connections: usize,
     peer_authentication: String,
+    protocol_version: String,
+    binary_version: String,
+    idle_timeout_seconds: u64,
 }
 
 impl GatewayDaemonStatusV1 {
@@ -159,10 +178,18 @@ struct RuntimePathsV1 {
     endpoint: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+struct HandshakeBindingV1 {
+    workspace_digest: [u8; 32],
+    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
+    compatibility_digest: [u8; COMPATIBILITY_DIGEST_BYTES_V1],
+}
+
 struct ActiveConnectionGuardV1 {
     id: u64,
     active: Arc<AtomicUsize>,
     peers: Arc<Mutex<BTreeMap<u64, UnixStream>>>,
+    last_activity: Arc<Mutex<Instant>>,
 }
 
 impl Drop for ActiveConnectionGuardV1 {
@@ -172,6 +199,10 @@ impl Drop for ActiveConnectionGuardV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&self.id);
         self.active.fetch_sub(1, Ordering::AcqRel);
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Instant::now();
     }
 }
 
@@ -182,6 +213,7 @@ impl Drop for ActiveConnectionGuardV1 {
 pub struct GatewayDaemonV1 {
     workspace: PathBuf,
     workspace_digest: [u8; 32],
+    compatibility_digest: [u8; COMPATIBILITY_DIGEST_BYTES_V1],
     authorization_scope: AuthorizationScopeId,
     listener: UnixListener,
     runtime_cleanup: RuntimeCleanupV1,
@@ -190,6 +222,8 @@ pub struct GatewayDaemonV1 {
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     peers: Arc<Mutex<BTreeMap<u64, UnixStream>>>,
+    last_activity: Arc<Mutex<Instant>>,
+    idle_timeout: Duration,
     next_connection: AtomicU64,
     _instance_lock: File,
 }
@@ -207,6 +241,14 @@ impl GatewayDaemonV1 {
     pub fn bind(
         workspace: &Path,
         authorization_scope: AuthorizationScopeId,
+    ) -> Result<Self, GatewayServiceError> {
+        Self::bind_with_idle_timeout_v1(workspace, authorization_scope, DAEMON_IDLE_TIMEOUT_V1)
+    }
+
+    fn bind_with_idle_timeout_v1(
+        workspace: &Path,
+        authorization_scope: AuthorizationScopeId,
+        idle_timeout: Duration,
     ) -> Result<Self, GatewayServiceError> {
         ensure_supported_platform_v1()?;
         let workspace =
@@ -238,6 +280,7 @@ impl GatewayDaemonV1 {
 
         Ok(Self {
             workspace_digest: canonical_workspace_digest_v1(&workspace),
+            compatibility_digest: compatibility_digest_v1()?,
             workspace,
             authorization_scope,
             listener,
@@ -247,6 +290,8 @@ impl GatewayDaemonV1 {
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            idle_timeout,
             next_connection: AtomicU64::new(1),
             _instance_lock: instance_lock,
         })
@@ -263,14 +308,28 @@ impl GatewayDaemonV1 {
     pub fn serve(self) -> Result<(), GatewayServiceError> {
         let mut workers = Vec::new();
         let mut worker_panicked = false;
-        while !self.stop.load(Ordering::Acquire) {
+        loop {
+            if TERMINATION_REQUESTED_V1.load(Ordering::Acquire) {
+                self.stop.store(true, Ordering::Release);
+            }
             if self.started.elapsed() >= MAX_SESSION_LIFETIME_V1 {
                 self.stop.store(true, Ordering::Release);
-                break;
+            }
+            if self.active.load(Ordering::Acquire) == 0
+                && self
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .elapsed()
+                    >= self.idle_timeout
+            {
+                self.stop.store(true, Ordering::Release);
             }
             reap_finished_workers_v1(&mut workers, &mut worker_panicked);
             if worker_panicked {
                 self.stop.store(true, Ordering::Release);
+            }
+            if self.stop.load(Ordering::Acquire) && self.active.load(Ordering::Acquire) == 0 {
                 break;
             }
             match self.listener.accept() {
@@ -297,21 +356,33 @@ impl GatewayDaemonV1 {
                         .unwrap_or_else(|poison| poison.into_inner())
                         .insert(id, peer_copy);
                     self.active.fetch_add(1, Ordering::AcqRel);
+                    *self
+                        .last_activity
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Instant::now();
                     let workspace = self.workspace.clone();
-                    let workspace_digest = self.workspace_digest;
-                    let session_nonce = self.session_nonce;
+                    let handshake = HandshakeBindingV1 {
+                        workspace_digest: self.workspace_digest,
+                        session_nonce: self.session_nonce,
+                        compatibility_digest: self.compatibility_digest,
+                    };
                     let authorization_scope = self.authorization_scope.clone();
                     let stop = Arc::clone(&self.stop);
                     let active = Arc::clone(&self.active);
                     let active_for_handler = Arc::clone(&self.active);
                     let peers = Arc::clone(&self.peers);
+                    let last_activity = Arc::clone(&self.last_activity);
                     workers.push(thread::spawn(move || {
-                        let _guard = ActiveConnectionGuardV1 { id, active, peers };
+                        let _guard = ActiveConnectionGuardV1 {
+                            id,
+                            active,
+                            peers,
+                            last_activity,
+                        };
                         let _ = handle_connection_v1(
                             stream,
                             &workspace,
-                            workspace_digest,
-                            session_nonce,
+                            handshake,
                             &authorization_scope,
                             &stop,
                             &active_for_handler,
@@ -325,14 +396,6 @@ impl GatewayDaemonV1 {
             }
         }
 
-        let peers = self
-            .peers
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        for peer in peers.values() {
-            let _ = peer.shutdown(std::net::Shutdown::Both);
-        }
-        drop(peers);
         join_workers_until_v1(
             &mut workers,
             Instant::now() + SHUTDOWN_TIMEOUT_V1,
@@ -345,25 +408,56 @@ impl GatewayDaemonV1 {
     }
 }
 
+/// Install a signal-safe SIGTERM handler for the daemon CLI. The handler only
+/// flips an atomic flag; normal daemon code performs connection retirement and
+/// endpoint cleanup outside signal context.
+pub fn install_termination_handler_v1() -> Result<(), GatewayServiceError> {
+    extern "C" fn request_termination(_signal: libc::c_int) {
+        TERMINATION_REQUESTED_V1.store(true, Ordering::Release);
+    }
+
+    TERMINATION_REQUESTED_V1.store(false, Ordering::Release);
+    // SAFETY: `signal` installs a function with the required C ABI. The
+    // function performs only a lock-free atomic store and retains no pointers.
+    let previous =
+        unsafe { libc::signal(libc::SIGTERM, request_termination as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 fn handle_connection_v1(
     mut stream: UnixStream,
     workspace: &Path,
-    workspace_digest: [u8; 32],
-    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
+    handshake: HandshakeBindingV1,
     authorization_scope: &AuthorizationScopeId,
     stop: &AtomicBool,
     active: &AtomicUsize,
 ) -> Result<(), GatewayServiceError> {
-    let mode = read_handshake_v1(&mut stream, &workspace_digest, &session_nonce)?;
+    let mode = read_handshake_v1(
+        &mut stream,
+        &handshake.workspace_digest,
+        &handshake.session_nonce,
+        &handshake.compatibility_digest,
+    )?;
     match mode {
         ConnectionModeV1::Status => {
             let status = GatewayDaemonStatusV1 {
                 schema_version: 1,
-                status: "ready".to_owned(),
-                workspace_digest: hex_digest_v1(&workspace_digest),
+                status: if stop.load(Ordering::Acquire) {
+                    "draining"
+                } else {
+                    "ready"
+                }
+                .to_owned(),
+                workspace_digest: hex_digest_v1(&handshake.workspace_digest),
                 active_connections: active.load(Ordering::Acquire),
                 max_active_connections: MAX_ACTIVE_CONNECTIONS_V1,
                 peer_authentication: peer_authentication_name_v1().to_owned(),
+                protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                idle_timeout_seconds: DAEMON_IDLE_TIMEOUT_V1.as_secs(),
             };
             write_response_v1(&mut stream, ResponseCodeV1::Ready, &status)
         }
@@ -377,6 +471,17 @@ fn handle_connection_v1(
             Ok(())
         }
         ConnectionModeV1::Mcp => {
+            if stop.load(Ordering::Acquire) {
+                return write_response_v1(
+                    &mut stream,
+                    ResponseCodeV1::Draining,
+                    &serde_json::json!({
+                        "schemaVersion": 1,
+                        "status": "draining",
+                        "guidance": "retry after the existing sessions finish"
+                    }),
+                );
+            }
             write_response_v1(
                 &mut stream,
                 ResponseCodeV1::Ready,
@@ -388,8 +493,9 @@ fn handle_connection_v1(
             let mut reader = BufReader::new(reader_stream);
             let gateway = ExperimentalMcpGatewayV1::build(workspace)
                 .map_err(|_| GatewayServiceError::Initialization)?;
+            let recipient = AuthenticatedStdioRecipientV1::issue_for_local_daemon_v1();
             gateway
-                .serve_io(&mut reader, &mut stream, authorization_scope)
+                .serve_authenticated_io(&mut reader, &mut stream, authorization_scope, recipient)
                 .map_err(GatewayServiceError::Io)
         }
     }
@@ -430,7 +536,8 @@ fn connect_mode_v1(
     request[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
     request[8] = mode as u8;
     request[9..41].copy_from_slice(&digest);
-    request[41..].copy_from_slice(&session_nonce);
+    request[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&session_nonce);
+    request[41 + SESSION_NONCE_BYTES_V1..].copy_from_slice(&compatibility_digest_v1()?);
     stream.write_all(&request)?;
     stream.flush()?;
     let (code, payload) = read_response_v1(&mut stream)?;
@@ -440,6 +547,8 @@ fn connect_mode_v1(
             ResponseCodeV1::Invalid | ResponseCodeV1::Internal => {
                 GatewayServiceError::InvalidHandshake
             }
+            ResponseCodeV1::Incompatible => GatewayServiceError::Incompatible,
+            ResponseCodeV1::Draining => GatewayServiceError::Draining,
             ResponseCodeV1::Ready => unreachable!(),
         });
     }
@@ -454,12 +563,13 @@ fn read_handshake_v1(
     stream: &mut UnixStream,
     expected_workspace: &[u8; 32],
     expected_session_nonce: &[u8; SESSION_NONCE_BYTES_V1],
+    expected_compatibility_digest: &[u8; COMPATIBILITY_DIGEST_BYTES_V1],
 ) -> Result<ConnectionModeV1, GatewayServiceError> {
     let mut request = [0_u8; HANDSHAKE_BYTES_V1];
     stream.read_exact(&mut request)?;
     if &request[..8] != HANDSHAKE_MAGIC_V1
         || &request[9..41] != expected_workspace
-        || &request[41..] != expected_session_nonce
+        || &request[41..41 + SESSION_NONCE_BYTES_V1] != expected_session_nonce
     {
         let _ = write_response_v1(
             stream,
@@ -467,6 +577,18 @@ fn read_handshake_v1(
             &serde_json::json!({"schemaVersion":1,"status":"refused"}),
         );
         return Err(GatewayServiceError::InvalidHandshake);
+    }
+    if request[41 + SESSION_NONCE_BYTES_V1..] != *expected_compatibility_digest {
+        let _ = write_response_v1(
+            stream,
+            ResponseCodeV1::Incompatible,
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "status": "incompatible",
+                "guidance": "upgrade Again and reconnect after existing sessions drain"
+            }),
+        );
+        return Err(GatewayServiceError::Incompatible);
     }
     ConnectionModeV1::try_from(request[8])
 }
@@ -501,6 +623,8 @@ fn read_response_v1(
         1 => ResponseCodeV1::Invalid,
         2 => ResponseCodeV1::Busy,
         3 => ResponseCodeV1::Internal,
+        4 => ResponseCodeV1::Incompatible,
+        5 => ResponseCodeV1::Draining,
         _ => return Err(GatewayServiceError::InvalidHandshake),
     };
     let length = u32::from_be_bytes(header[9..13].try_into().expect("fixed header")) as usize;
@@ -724,6 +848,27 @@ fn canonical_workspace_digest_v1(workspace: &Path) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn compatibility_digest_v1() -> Result<[u8; COMPATIBILITY_DIGEST_BYTES_V1], GatewayServiceError> {
+    let mut hasher = blake3::Hasher::new_derive_key("again.gateway-daemon-compatibility.v1");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(&[0]);
+    hasher.update(MCP_PROTOCOL_VERSION.as_bytes());
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let metadata = fs::symlink_metadata(&executable)?;
+    if !metadata.is_file() || metadata.len() > MAX_DAEMON_BINARY_BYTES_V1 {
+        return Err(GatewayServiceError::Initialization);
+    }
+    hasher.update(executable.as_os_str().as_encoded_bytes());
+    hasher.update(&metadata.dev().to_be_bytes());
+    hasher.update(&metadata.ino().to_be_bytes());
+    hasher.update(&metadata.len().to_be_bytes());
+    hasher.update(&metadata.mtime().to_be_bytes());
+    hasher.update(&metadata.mtime_nsec().to_be_bytes());
+    hasher.update(&metadata.ctime().to_be_bytes());
+    hasher.update(&metadata.ctime_nsec().to_be_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn hex_digest_v1(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -848,9 +993,14 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
     let mut input = stdin.lock();
     let mut output = stdout.lock();
     let mut input_open = true;
+    let mut input_closed_at = None;
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
+        if input_closed_at.is_some_and(|closed: Instant| closed.elapsed() >= Duration::from_secs(1))
+        {
+            return Ok(());
+        }
         let mut descriptors = [
             libc::pollfd {
                 fd: input.as_raw_fd(),
@@ -865,7 +1015,14 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
         ];
         // SAFETY: the pollfd array is valid for its declared length and poll
         // does not retain the pointer after returning.
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        let poll_timeout_ms = if input_open { -1 } else { 100 };
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                poll_timeout_ms,
+            )
+        };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -878,9 +1035,15 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
                 0 => {
                     input_open = false;
                     stream.shutdown(std::net::Shutdown::Write)?;
+                    input_closed_at = Some(Instant::now());
                 }
                 count => stream.write_all(&buffer[..count])?,
             }
+        }
+        if input_open && descriptors[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            input_open = false;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            input_closed_at = Some(Instant::now());
         }
         if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match stream.read(&mut buffer)? {
@@ -900,7 +1063,83 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp_gateway::MCP_PROTOCOL_VERSION;
+    use serde_json::{Value, json};
+    use std::io::BufRead;
     use std::os::unix::fs::symlink;
+    use std::sync::Barrier;
+
+    struct LocalMcpClientV1 {
+        stream: UnixStream,
+        reader: BufReader<UnixStream>,
+        next_id: u64,
+    }
+
+    impl LocalMcpClientV1 {
+        fn connect(workspace: &Path) -> Self {
+            let stream = connect_mcp_v1(workspace).unwrap();
+            let reader = BufReader::new(stream.try_clone().unwrap());
+            let mut client = Self {
+                stream,
+                reader,
+                next_id: 1,
+            };
+            let initialized = client.request(
+                "initialize",
+                json!({
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": { "name": "context-test", "version": "1" }
+                }),
+            );
+            assert_eq!(
+                initialized["result"]["protocolVersion"],
+                MCP_PROTOCOL_VERSION
+            );
+            client
+        }
+
+        fn tool(&mut self, name: &str, arguments: Value) -> Value {
+            self.request(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+            )
+        }
+
+        fn request(&mut self, method: &str, params: Value) -> Value {
+            let id = self.next_id;
+            self.next_id += 1;
+            let request = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": method,
+                "params": params
+            });
+            serde_json::to_writer(&mut self.stream, &request).unwrap();
+            self.stream.write_all(b"\n").unwrap();
+            self.stream.flush().unwrap();
+            let mut line = String::new();
+            self.reader.read_line(&mut line).unwrap();
+            assert!(
+                !line.is_empty(),
+                "daemon closed before replying to {method}"
+            );
+            let response: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(response["id"], id);
+            response
+        }
+
+        fn notify(&mut self, method: &str, params: Value) {
+            let request = json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params
+            });
+            serde_json::to_writer(&mut self.stream, &request).unwrap();
+            self.stream.write_all(b"\n").unwrap();
+            self.stream.flush().unwrap();
+        }
+    }
 
     #[test]
     fn unsafe_runtime_permissions_and_symlinked_locator_fail_closed_without_chmod() {
@@ -954,15 +1193,17 @@ mod tests {
         let workspace = [7_u8; 32];
         let old_nonce = [3_u8; SESSION_NONCE_BYTES_V1];
         let current_nonce = [4_u8; SESSION_NONCE_BYTES_V1];
+        let compatibility = compatibility_digest_v1().unwrap();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let mut replay = [0_u8; HANDSHAKE_BYTES_V1];
         replay[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
         replay[8] = ConnectionModeV1::Status as u8;
         replay[9..41].copy_from_slice(&workspace);
-        replay[41..].copy_from_slice(&old_nonce);
+        replay[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&old_nonce);
+        replay[41 + SESSION_NONCE_BYTES_V1..].copy_from_slice(&compatibility);
         client.write_all(&replay).unwrap();
         assert!(matches!(
-            read_handshake_v1(&mut server, &workspace, &current_nonce),
+            read_handshake_v1(&mut server, &workspace, &current_nonce, &compatibility),
             Err(GatewayServiceError::InvalidHandshake)
         ));
 
@@ -972,9 +1213,49 @@ mod tests {
             .unwrap();
         slow_client.write_all(HANDSHAKE_MAGIC_V1).unwrap();
         assert!(matches!(
-            read_handshake_v1(&mut slow_server, &workspace, &current_nonce),
+            read_handshake_v1(&mut slow_server, &workspace, &current_nonce, &compatibility),
             Err(GatewayServiceError::Io(_))
         ));
+    }
+
+    #[test]
+    fn incompatible_binary_handshake_is_actionable_without_touching_live_sessions() {
+        let workspace = [7_u8; 32];
+        let nonce = [4_u8; SESSION_NONCE_BYTES_V1];
+        let compatibility = compatibility_digest_v1().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut request = [0_u8; HANDSHAKE_BYTES_V1];
+        request[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
+        request[8] = ConnectionModeV1::Status as u8;
+        request[9..41].copy_from_slice(&workspace);
+        request[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&nonce);
+        request[41 + SESSION_NONCE_BYTES_V1..].fill(9);
+        client.write_all(&request).unwrap();
+        assert!(matches!(
+            read_handshake_v1(&mut server, &workspace, &nonce, &compatibility),
+            Err(GatewayServiceError::Incompatible)
+        ));
+        let (code, payload) = read_response_v1(&mut client).unwrap();
+        assert_eq!(code, ResponseCodeV1::Incompatible);
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(payload["status"], "incompatible");
+        assert!(payload["guidance"].as_str().unwrap().contains("upgrade"));
+    }
+
+    #[test]
+    fn idle_daemon_retires_endpoint_after_bounded_inactivity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let daemon = GatewayDaemonV1::bind_with_idle_timeout_v1(
+            workspace.path(),
+            AuthorizationScopeId::new("idle-test-scope").unwrap(),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        let socket = daemon.socket_path().to_owned();
+        thread::spawn(move || daemon.serve().unwrap())
+            .join()
+            .unwrap();
+        assert!(!socket.exists());
     }
 
     #[test]
@@ -982,5 +1263,603 @@ mod tests {
         assert!(valid_socket_name_v1("0123456789abcdef0123456789abcdef"));
         assert!(!valid_socket_name_v1("../shared.sock"));
         assert!(!valid_socket_name_v1("0123456789abcdef0123456789abcdeg"));
+    }
+
+    #[test]
+    fn two_authenticated_clients_share_facts_work_retrieval_and_mutation_deltas() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_symbol() -> usize { 1 }\n",
+        )
+        .unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("same-user-test-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let first_start = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            first_start["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let read = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert!(read.get("error").is_none(), "{read}");
+        let result_id = read["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let work = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "shared-task",
+                "kind": "work_start",
+                "workKey": "inspect-input",
+                "summary": "inspect the shared input",
+                "ttlMs": 30_000
+            }),
+        );
+        assert_eq!(
+            work["result"]["structuredContent"]["outcome"]["status"],
+            "leader"
+        );
+        let suggestion = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "shared-task",
+                "kind": "suggestion",
+                "subject": "shared-symbol",
+                "statement": "Check shared_symbol(), then preserve its public API.\nThis remains unverified."
+            }),
+        );
+        assert_eq!(
+            suggestion["result"]["structuredContent"]["outcome"]["verified"],
+            false
+        );
+
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let shared = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            shared["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let context = &shared["result"]["structuredContent"]["context"];
+        assert!(!context["current_facts"].as_array().unwrap().is_empty());
+        assert_eq!(
+            context["current_facts"][0]["sources"][0]["locator"],
+            "repo.read:input.txt"
+        );
+        assert!(!context["suggestions"].as_array().unwrap().is_empty());
+        assert!(!context["result_references"].as_array().unwrap().is_empty());
+        assert!(!context["inflight_work"].as_array().unwrap().is_empty());
+        assert!(
+            !shared["result"]["structuredContent"]["relevantCode"]["candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let cursor = shared["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let retrieved = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "shared-task", "resultId": result_id }),
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "first\n"
+        );
+        let cross_task = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "other-task", "resultId": result_id }),
+        );
+        assert_eq!(
+            cross_task["error"]["data"]["reason"], "retrieval_refused",
+            "{cross_task}"
+        );
+
+        let compact = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            compact["result"]["structuredContent"]["presentation"],
+            "compact"
+        );
+
+        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        let reread = agent_b.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(reread["result"]["content"][0]["text"], "second\n");
+        let delta = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "shared-task", "afterCursor": cursor, "limit": 64 }),
+        );
+        let events = delta["result"]["structuredContent"]["delta"]["events"]
+            .as_array()
+            .unwrap();
+        assert!(events.iter().any(|event| event["kind"] == "invalidation"));
+
+        agent_b.notify(
+            "notifications/again/context-compacted",
+            json!({ "compactionGeneration": 1 }),
+        );
+        let stale_delta = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "shared-task", "afterCursor": cursor, "limit": 64 }),
+        );
+        assert_eq!(
+            stale_delta["error"]["data"]["reason"],
+            "full_delivery_required"
+        );
+        let after_compaction = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+        );
+        assert_eq!(
+            after_compaction["result"]["structuredContent"]["presentation"],
+            "full"
+        );
+        let overflow_cursor = after_compaction["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        for index in 0..65 {
+            let published = agent_b.tool(
+                "context.publish",
+                json!({
+                    "taskId": "shared-task",
+                    "kind": "unknown",
+                    "subject": format!("unknown-{index}"),
+                    "explanation": "bounded follow-up required"
+                }),
+            );
+            assert!(published.get("error").is_none(), "{published}");
+        }
+        let bounded = agent_b.tool(
+            "context.delta",
+            json!({
+                "taskId": "shared-task",
+                "afterCursor": overflow_cursor,
+                "limit": 64
+            }),
+        );
+        assert_eq!(
+            bounded["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(
+            bounded["result"]["structuredContent"]["delta"]["has_more"],
+            true
+        );
+
+        for index in 0..63 {
+            let task = agent_b.tool(
+                "task.start",
+                json!({ "taskId": format!("bounded-task-{index}") }),
+            );
+            assert!(task.get("error").is_none(), "{task}");
+        }
+        let capacity = agent_b.tool("task.start", json!({ "taskId": "one-task-too-many" }));
+        assert_eq!(
+            capacity["error"]["data"]["reason"],
+            "context_capacity_exceeded"
+        );
+
+        let cancelled = agent_b.tool("context.cancel", json!({ "taskId": "shared-task" }));
+        assert_eq!(
+            cancelled["result"]["structuredContent"]["status"],
+            "retired"
+        );
+        let retired = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "shared-task", "task": "must use a new lifecycle" }),
+        );
+        assert_eq!(
+            retired["error"]["data"]["reason"],
+            "task_definition_conflict"
+        );
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn exact_prompts_converge_task_aliases_and_survive_daemon_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_task() {}\n",
+        )
+        .unwrap();
+        let scope = AuthorizationScopeId::new("task-intent-scope").unwrap();
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope.clone()).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let first = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "external-a", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(first["result"]["structuredContent"]["taskId"], "external-a");
+        assert_eq!(
+            first["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "created"
+        );
+        assert_eq!(
+            first["result"]["structuredContent"]["coordination"]["status"],
+            "leader"
+        );
+        let first_cursor = first["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let joined = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "external-b", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["taskId"],
+            "external-a"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["requestedTaskId"],
+            "external-b"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "joined_by_prompt"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["coordination"]["status"],
+            "join"
+        );
+
+        let lease_id = first["result"]["structuredContent"]["coordination"]["leaseId"]
+            .as_str()
+            .unwrap();
+        let renewed = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-a",
+                "kind": "work_heartbeat",
+                "leaseId": lease_id,
+                "ttlMs": 300_000
+            }),
+        );
+        assert_eq!(
+            renewed["result"]["structuredContent"]["outcome"]["status"],
+            "renewed"
+        );
+        let follower_renewal = agent_b.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-b",
+                "kind": "work_heartbeat",
+                "leaseId": lease_id,
+                "ttlMs": 300_000
+            }),
+        );
+        assert_eq!(
+            follower_renewal["error"]["data"]["reason"], "owner_mismatch",
+            "{follower_renewal}"
+        );
+
+        let published = agent_b.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-b",
+                "kind": "unknown",
+                "subject": "shared-task-constraint",
+                "explanation": "confirm callers before editing"
+            }),
+        );
+        assert!(published.get("error").is_none(), "{published}");
+        let shared_delta = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "external-a", "afterCursor": first_cursor, "limit": 64 }),
+        );
+        assert!(
+            shared_delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "explicit_unknown")
+        );
+
+        let conflict = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "external-b", "task": "delete the public API" }),
+        );
+        assert_eq!(
+            conflict["error"]["data"]["reason"],
+            "task_definition_conflict"
+        );
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent_c = LocalMcpClientV1::connect(workspace.path());
+        let restarted = agent_c.tool(
+            "task.start",
+            json!({ "taskId": "external-c", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["taskId"],
+            "external-a"
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "joined_by_prompt"
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["coordination"]["status"],
+            "leader"
+        );
+        agent_c.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn paired_agents_converge_and_invalidate_as_one_local_product() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::write(workspace.path().join("unrelated.txt"), b"stable\n").unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_value() -> &'static str { \"first\" }\n",
+        )
+        .unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("paired-product-gate-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let start_a = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+        );
+        let start_b = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+        );
+        for start in [&start_a, &start_b] {
+            assert_eq!(start["result"]["structuredContent"]["presentation"], "full");
+            assert_eq!(
+                start["result"]["structuredContent"]["validationPreview"]["status"],
+                "execute_required"
+            );
+            assert!(
+                start["result"]["structuredContent"]["validationPreview"]["selectors"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty(),
+                "an unqualified validation profile supplied a reusable selector"
+            );
+        }
+        let start_cursor_a = start_a["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let start_cursor_b = start_b["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(3));
+        let barrier_a = Arc::clone(&barrier);
+        let reader_a = thread::spawn(move || {
+            barrier_a.wait();
+            let read = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+            (agent_a, read)
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let reader_b = thread::spawn(move || {
+            barrier_b.wait();
+            let read = agent_b.tool("repo.read", json!({ "path": "input.txt" }));
+            (agent_b, read)
+        });
+        barrier.wait();
+        let (mut agent_a, read_a) = reader_a.join().unwrap();
+        let (mut agent_b, read_b) = reader_b.join().unwrap();
+        assert_eq!(read_a["result"]["content"], read_b["result"]["content"]);
+        let initial_result_id = read_a["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            read_b["result"]["_meta"]["again"]["resultId"],
+            initial_result_id
+        );
+
+        let stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.requested, 2, "{stats:?}");
+        assert_eq!(stats.executed, 1, "{stats:?}");
+        assert_eq!(stats.exact_hits + stats.inflight_joins, 1, "{stats:?}");
+        assert_eq!(stats.false_hit_quarantines, 0, "{stats:?}");
+
+        let delta_a = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": start_cursor_a, "limit": 64 }),
+        );
+        let delta_b = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": start_cursor_b, "limit": 64 }),
+        );
+        for delta in [&delta_a, &delta_b] {
+            let events = delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap_or_else(|| panic!("context delta failed: {delta}"));
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "verified_fact_admission")
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "result_reference")
+            );
+        }
+        let admitted_cursor_a = delta_a["result"]["structuredContent"]["delta"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let admitted_cursor_b = delta_b["result"]["structuredContent"]["delta"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let retrieved = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": initial_result_id }),
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "first\n"
+        );
+        for compact in [
+            agent_a.tool(
+                "task.start",
+                json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+            ),
+            agent_b.tool(
+                "task.start",
+                json!({ "taskId": "paired-gate", "task": "update shared_value safely" }),
+            ),
+        ] {
+            assert_eq!(
+                compact["result"]["structuredContent"]["presentation"],
+                "compact"
+            );
+        }
+
+        fs::write(
+            workspace.path().join("unrelated.txt"),
+            b"changed elsewhere\n",
+        )
+        .unwrap();
+        let preserved = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(
+            preserved["result"]["_meta"]["again"]["resultId"],
+            initial_result_id
+        );
+        let after_irrelevant = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(after_irrelevant.executed, 1, "{after_irrelevant:?}");
+        let quiet = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_a, "limit": 64 }),
+        );
+        assert!(
+            quiet["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "an unrelated content edit invalidated the exact read"
+        );
+
+        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        let changed = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(changed["result"]["content"][0]["text"], "second\n");
+        let changed_result_id = changed["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_ne!(changed_result_id, initial_result_id);
+        let after_relevant = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(after_relevant.executed, 2, "{after_relevant:?}");
+        assert_eq!(
+            after_relevant.false_hit_quarantines, 0,
+            "{after_relevant:?}"
+        );
+
+        let mutation_a = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_a, "limit": 64 }),
+        );
+        let mutation_b = agent_b.tool(
+            "context.delta",
+            json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_b, "limit": 64 }),
+        );
+        for delta in [&mutation_a, &mutation_b] {
+            assert!(
+                delta["result"]["structuredContent"]["delta"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "invalidation"),
+                "a recipient missed the relevant mutation delta"
+            );
+        }
+        let stale_retrieval = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": initial_result_id }),
+        );
+        assert_eq!(
+            stale_retrieval["error"]["data"]["reason"],
+            "retrieval_refused"
+        );
+        let current_retrieval = agent_b.tool(
+            "context.retrieve",
+            json!({ "taskId": "paired-gate", "resultId": changed_result_id }),
+        );
+        assert_eq!(
+            current_retrieval["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "second\n"
+        );
+
+        fs::write(workspace.path().join("unrelated.txt"), b"changed twice\n").unwrap();
+        let warm = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(
+            warm["result"]["_meta"]["again"]["resultId"],
+            changed_result_id
+        );
+        let final_stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(final_stats.executed, 2, "{final_stats:?}");
+        assert_eq!(final_stats.false_hit_quarantines, 0, "{final_stats:?}");
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
     }
 }

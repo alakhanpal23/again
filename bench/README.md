@@ -1,5 +1,21 @@
 # Benchmarks
 
+## Local beta release gate
+
+[`local_beta_gate.py`](local_beta_gate.py) is the fail-closed final aggregator
+for the daemon/task-lifecycle local beta. It requires the ordered 12-step
+release-binary product scenario, a 100-client automatic-daemon chaos run,
+exactly four native package smokes, authenticated 14-asset release evidence,
+and outside-user paired Codex/Claude evidence. All inputs must bind to one
+source commit, and product/chaos/agent observations must bind to one binary.
+The output contains only compact digests and release decisions.
+
+The complete evidence schemas, beta chaos command, aggregation command, privacy
+rules, and Wave 2 integration boundary are documented in
+[`LOCAL_BETA_GATE.md`](../docs/LOCAL_BETA_GATE.md). No existing private-alpha
+artifact satisfies this gate: in particular, a quick 2-client chaos report or
+a deterministic/dry-run agent report is an explicit non-pass.
+
 ## Direct product benchmark
 
 [`direct_benchmark.py`](direct_benchmark.py) is the current product harness. It
@@ -145,6 +161,35 @@ The full four-size by four-delay local matrix plus live counterpart, direct proo
 of current Worker-isolate heap usage, 100,000-case stateful D1/R2 path, and cross-layer
 post-decrypt trust race remain missing. See the exact [rollout contract and
 evidence](../docs/TEAM_LOOKUP_BUNDLE_V1.md).
+
+## Paired editable-agent benchmark
+
+[`agent_gateway_editable_pair.py`](agent_gateway_editable_pair.py) is the
+fail-closed editable companion to the existing read-only real-agent harness. It
+creates independent identical Git fixtures, permits exactly one known source
+repair, rejects test/collateral edits, runs a fixed acceptance suite, alternates
+baseline/Again order, and retains monotonic first-edit, accepted-edit,
+validation, final-outcome, and total timing markers. Live mode requires explicit
+network authorization, a credential environment-name binding, pinned model and
+settings IDs, absolute command arrays with standalone placeholders, and an
+exact Again binary. An Again treatment passes only when durable workspace
+gateway/context counters move; a command label or socket alone is not evidence.
+
+Qualify the harness and oracle offline before any paid run:
+
+```bash
+python3 -B bench/agent_gateway_editable_pair.py \
+  --mode qualify \
+  --runs 10 \
+  --json-out bench/results/YYYY-MM-DD-agent-gateway-editable-qualification.json
+```
+
+The retained
+[`2026-08-29 qualification`](results/2026-08-29-agent-gateway-editable-pair-qualification-v1.json)
+passed 10/10 baseline and 10/10 treatment-shaped observations. It measures a
+deterministic reference editor and the harness only: it is not real-agent task
+quality, model usage, or Again acceleration evidence. Live Codex/Claude runs
+remain a separate explicit external gate.
 
 ## Retained diagnostic artifacts
 

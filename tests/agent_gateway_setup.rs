@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 #[path = "../src/agent_gateway_setup.rs"]
 mod agent_gateway_setup;
 
@@ -26,7 +27,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         codex.local_cli_command,
         format!(
-            "codex mcp add again -- {} mcp serve --workspace {}",
+            "codex mcp add again -- {} mcp connect --workspace {}",
             executable.display(),
             workspace.display()
         )
@@ -34,7 +35,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(codex.stdio.command, executable);
     assert_eq!(
         codex.stdio.args,
-        ["mcp", "serve", "--workspace", workspace.to_str().unwrap()]
+        ["mcp", "connect", "--workspace", workspace.to_str().unwrap()]
     );
     assert_eq!(codex.workspace, workspace);
     assert!(!codex.writes_by_default);
@@ -52,7 +53,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         codex.to_string(),
         format!(
-            "Dry run only. Install with:\ncodex mcp add again -- {} mcp serve --workspace {}",
+            "Dry run only. Install with:\ncodex mcp add again -- {} mcp connect --workspace {}",
             executable.display(),
             workspace.display()
         )
@@ -63,7 +64,7 @@ fn dry_run_is_deterministic_machine_readable_and_never_writes() {
     assert_eq!(
         claude.local_cli_command,
         format!(
-            "claude mcp add -s user again -- {} mcp serve --workspace {}",
+            "claude mcp add --transport stdio --scope user again -- {} mcp connect --workspace {}",
             executable.display(),
             workspace.display()
         )

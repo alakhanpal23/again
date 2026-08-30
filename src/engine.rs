@@ -3,9 +3,15 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(all(feature = "daemon", unix))]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+#[cfg(feature = "daemon")]
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
 use crate::agent_gateway_setup::{
-    AgentGatewayClientV1, AgentGatewaySetupPlanV1, install_owned_config,
+    AgentGatewayClientV1, AgentGatewaySetupPlanV1, ClientSetupActionV1, execute_client_setup_v1,
 };
 use crate::executable::{
     ExecutableIdentity, ToolKind, host_audited_apple_profile, verify_executable,
@@ -58,6 +64,8 @@ enum CommandName {
     Team(TeamArgs),
     /// Run or configure the repository-aware MCP gateway.
     Mcp(McpArgs),
+    /// Inspect, export, delete, or prune durable local tasks.
+    Task(TaskArgs),
     #[cfg(feature = "hook")]
     #[command(hide = true)]
     Hook(HookArgs),
@@ -103,12 +111,10 @@ enum McpCommand {
     /// Print an opt-in Codex or Claude MCP setup plan.
     Setup(McpSetupArgs),
     #[cfg(feature = "daemon")]
-    /// Run or inspect the opt-in, same-user local gateway daemon.
-    #[command(hide = true)]
+    /// Run, inspect, or stop the same-user local gateway daemon.
     Daemon(McpDaemonArgs),
     #[cfg(feature = "daemon")]
-    /// Proxy stdio to an authenticated local gateway daemon.
-    #[command(hide = true)]
+    /// Start or join the workspace daemon and proxy MCP over stdio.
     Connect(McpConnectArgs),
 }
 
@@ -136,7 +142,7 @@ enum McpDaemonCommand {
     Serve(McpDaemonServeArgs),
     /// Query a live daemon without opening an MCP session.
     Status(McpDaemonWorkspaceArgs),
-    /// Stop a live daemon and close its active MCP sessions.
+    /// Stop a live daemon and retire its active MCP sessions.
     Stop(McpDaemonWorkspaceArgs),
 }
 
@@ -183,9 +189,82 @@ struct McpSetupArgs {
     /// Emit the machine-readable setup plan.
     #[arg(long)]
     json: bool,
-    /// Explicit path for a wholly Again-owned config file. Existing unowned files are refused.
+    /// Apply the exact setup plan through the official client CLI.
+    #[arg(long, conflicts_with_all = ["inspect", "remove"])]
+    apply: bool,
+    /// Inspect and verify the current client entry without changing it.
+    #[arg(long, conflicts_with_all = ["apply", "remove"])]
+    inspect: bool,
+    /// Remove an exact Again-owned entry through the official client CLI.
+    #[arg(long, conflicts_with_all = ["apply", "inspect"])]
+    remove: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
+    /// Stable, non-secret local authorization-scope identifier.
+    #[arg(long, global = true)]
+    authorization_scope: Option<String>,
+    #[command(subcommand)]
+    command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List durable tasks in this workspace and authorization scope.
+    List(TaskListArgs),
+    /// Inspect one task definition and lifecycle state.
+    Inspect(TaskInspectArgs),
+    /// Export one task and its transition history to a new private file.
+    Export(TaskExportArgs),
+    /// Permanently delete one terminal, unreferenced task.
+    Delete(TaskDeleteArgs),
+    /// Preview or explicitly apply bounded terminal-task pruning.
+    Prune(TaskPruneArgs),
+}
+
+#[derive(Debug, Args)]
+struct TaskListArgs {
+    /// Maximum tasks to return.
+    #[arg(long, default_value_t = crate::task_lifecycle::MAX_TASK_LIST_ITEMS_V1)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct TaskInspectArgs {
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct TaskExportArgs {
+    id: String,
+    /// Absolute output path. Existing paths are never replaced.
     #[arg(long)]
-    install_owned_config: Option<PathBuf>,
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct TaskDeleteArgs {
+    id: String,
+    /// Confirm permanent deletion.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskPruneArgs {
+    /// Select terminal tasks last updated before this many days ago.
+    #[arg(long)]
+    terminal_before_days: u64,
+    /// Preview candidates without deleting them.
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    /// Delete every eligible candidate, in bounded transactional batches.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -409,6 +488,33 @@ struct DoctorReport {
     seatbelt_runtime_probe: String,
     seatbelt_used_for_profile: bool,
     trace_backed_replay: bool,
+    coordinator: CoordinatorDoctorReport,
+    pytest_profile: PytestProfileDoctorReport,
+}
+
+#[derive(Debug, Serialize)]
+struct CoordinatorDoctorReport {
+    status: &'static str,
+    feature_enabled: bool,
+    platform_supported: bool,
+    transport: &'static str,
+    same_user_authenticated: bool,
+    ordinary_stdio_grants_recipient_authority: bool,
+    public_tools: [&'static str; 9],
+    blockers: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PytestProfileDoctorReport {
+    profile_id: &'static str,
+    registry_status: &'static str,
+    routing: &'static str,
+    portable_control_plane_enabled: bool,
+    native_linux_qualification_host: bool,
+    execution_qualified: bool,
+    promotion_issuer_available: bool,
+    reuse_enabled: bool,
+    blockers: Vec<&'static str>,
 }
 
 #[cfg(feature = "linux-pytest")]
@@ -579,6 +685,7 @@ pub fn run_cli() -> Result<i32> {
             #[cfg(feature = "daemon")]
             McpCommand::Connect(args) => mcp_connect(args),
         },
+        CommandName::Task(args) => task_cli(args),
         #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         #[cfg(feature = "hook")]
@@ -944,7 +1051,9 @@ fn local_mcp_authorization_scope_v1(
 #[cfg(feature = "daemon")]
 #[cfg(unix)]
 fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
-    use crate::agent_gateway_service::{GatewayDaemonV1, daemon_status_v1, stop_daemon_v1};
+    use crate::agent_gateway_service::{
+        GatewayDaemonV1, daemon_status_v1, install_termination_handler_v1, stop_daemon_v1,
+    };
 
     match args.command {
         McpDaemonCommand::Serve(args) => {
@@ -952,6 +1061,7 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
             let authorization_scope =
                 local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
             let daemon = GatewayDaemonV1::bind(&workspace, authorization_scope)?;
+            install_termination_handler_v1()?;
             eprintln!(
                 "Again MCP daemon is experimental; socket peers are restricted to the current uid."
             );
@@ -982,9 +1092,82 @@ fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
 #[cfg(unix)]
 fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
     let workspace = resolve_mcp_workspace(args.workspace)?;
-    let stream = crate::agent_gateway_service::connect_mcp_v1(&workspace)?;
+    let stream = connect_or_start_daemon_v1(&workspace)?;
     crate::agent_gateway_service::proxy_current_stdio_v1(stream)?;
     Ok(0)
+}
+
+#[cfg(feature = "daemon")]
+#[cfg(unix)]
+fn connect_or_start_daemon_v1(workspace: &Path) -> Result<std::os::unix::net::UnixStream> {
+    use crate::agent_gateway_service::{GatewayServiceError, connect_mcp_v1};
+
+    match connect_mcp_v1(workspace) {
+        Ok(stream) => return Ok(stream),
+        Err(error) if daemon_start_is_safe_v1(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let executable = fs::canonicalize(std::env::current_exe()?)
+        .context("resolve the exact Again executable for daemon startup")?;
+    let mut daemon_command = Command::new(&executable);
+    daemon_command
+        .args([OsStr::new("mcp"), OsStr::new("daemon"), OsStr::new("serve")])
+        .arg("--workspace")
+        .arg(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = daemon_command
+        .spawn()
+        .with_context(|| format!("start workspace daemon with {}", executable.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let last_error = match connect_mcp_v1(workspace) {
+            Ok(stream) => {
+                // Rust deliberately does not reap a dropped Child. A connector
+                // that lost the startup election therefore hands its exact
+                // child to a bounded-purpose reaper; the winner is reaped when
+                // its idle/draining daemon eventually exits.
+                let _ = thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(stream);
+            }
+            Err(GatewayServiceError::Incompatible) => {
+                return Err(GatewayServiceError::Incompatible.into());
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                let _ = child.wait();
+            }
+            bail!("workspace daemon did not become ready within 5 seconds: {last_error}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(feature = "daemon")]
+#[cfg(unix)]
+fn daemon_start_is_safe_v1(error: &crate::agent_gateway_service::GatewayServiceError) -> bool {
+    use crate::agent_gateway_service::GatewayServiceError;
+    match error {
+        GatewayServiceError::InvalidHandshake => true,
+        GatewayServiceError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -998,41 +1181,282 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         McpClientArg::Codex => AgentGatewayClientV1::Codex,
         McpClientArg::Claude => AgentGatewayClientV1::Claude,
     };
-    let config_path = match args.install_owned_config.as_ref() {
-        Some(path) => path.clone(),
-        None => {
-            let home = std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is unavailable; pass --install-owned-config"))?;
-            match client {
-                AgentGatewayClientV1::Codex => home.join(".codex").join("config.toml"),
-                AgentGatewayClientV1::Claude => home.join(".claude.json"),
-            }
-        }
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is unavailable; setup cannot describe the client scope"))?;
+    // This path is descriptive legacy plan metadata only. Setup never opens it;
+    // every mutation and verification goes through the official client CLI.
+    let config_path = match client {
+        AgentGatewayClientV1::Codex => home.join(".codex").join("config.toml"),
+        AgentGatewayClientV1::Claude => home.join(".claude.json"),
     };
     let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path, &args.workspace)?;
-    if args.json {
+    let action = if args.apply {
+        Some(ClientSetupActionV1::Apply)
+    } else if args.inspect {
+        Some(ClientSetupActionV1::Inspect)
+    } else if args.remove {
+        Some(ClientSetupActionV1::Remove)
+    } else {
+        None
+    };
+    if let Some(action) = action {
+        let outcome = execute_client_setup_v1(&plan, action)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+        } else {
+            println!(
+                "{} MCP setup: action={}, before={:?}, after={:?}, changed={}, verified={}",
+                client.as_str(),
+                outcome.action,
+                outcome.before,
+                outcome.after,
+                outcome.changed,
+                outcome.verified
+            );
+        }
+    } else if args.json {
         println!("{}", plan.machine_readable_json()?);
     } else {
         println!("{plan}");
-        if args.install_owned_config.is_none() {
-            println!("# dry run; no configuration was changed");
-        }
-    }
-    if args.install_owned_config.is_some() {
-        let outcome = install_owned_config(&plan)?;
-        eprintln!(
-            "Again-owned MCP configuration result: {}",
-            match outcome {
-                crate::agent_gateway_setup::OwnedInstallOutcomeV1::Installed => "installed",
-                crate::agent_gateway_setup::OwnedInstallOutcomeV1::AlreadyInstalledOwned => {
-                    "already_installed_owned"
-                }
-            }
-        );
+        println!("# dry run; no configuration was changed");
     }
     Ok(0)
+}
+
+struct HumanTaskScopeV1 {
+    store: Store,
+    repository_id: String,
+    workspace_id: String,
+    authorization_scope_digest: String,
+}
+
+fn task_cli(args: TaskArgs) -> Result<i32> {
+    let scope = open_human_task_scope_v1(args.workspace, args.authorization_scope)?;
+    match args.command {
+        TaskCommand::List(args) => {
+            let tasks = scope.store.list_tasks_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                args.limit,
+            )?;
+            let quota = scope
+                .store
+                .task_quota_status_v1(&scope.repository_id, &scope.workspace_id)?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.list",
+                "tasks": tasks,
+                "quota": quota
+            }))?;
+        }
+        TaskCommand::Inspect(args) => {
+            let task = scope
+                .store
+                .inspect_task_v1(
+                    &scope.repository_id,
+                    &scope.workspace_id,
+                    &scope.authorization_scope_digest,
+                    &args.id,
+                )?
+                .ok_or_else(|| anyhow!("task does not exist in this workspace scope"))?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.inspect",
+                "task": task
+            }))?;
+        }
+        TaskCommand::Export(args) => {
+            if !args.output.is_absolute() {
+                bail!("task export output must be an absolute path");
+            }
+            let export = scope
+                .store
+                .export_task_v1(
+                    &scope.repository_id,
+                    &scope.workspace_id,
+                    &scope.authorization_scope_digest,
+                    &args.id,
+                )?
+                .ok_or_else(|| anyhow!("task does not exist in this workspace scope"))?;
+            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.export",
+                "export": export
+            }))?;
+            bytes.push(b'\n');
+            write_private_task_export_v1(&args.output, &bytes)?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.export",
+                "status": "exported",
+                "output": args.output
+            }))?;
+        }
+        TaskCommand::Delete(args) => {
+            if !args.yes {
+                bail!("task delete requires --yes");
+            }
+            let deleted = scope.store.delete_task_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                &args.id,
+            )?;
+            if !deleted {
+                bail!("task does not exist in this workspace scope");
+            }
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.delete",
+                "taskId": args.id,
+                "status": "deleted"
+            }))?;
+        }
+        TaskCommand::Prune(args) => task_prune_v1(&scope, args)?,
+    }
+    Ok(0)
+}
+
+fn open_human_task_scope_v1(
+    workspace: Option<PathBuf>,
+    authorization_scope: Option<String>,
+) -> Result<HumanTaskScopeV1> {
+    let workspace = resolve_mcp_workspace(workspace)?;
+    let authorization_scope = local_mcp_authorization_scope_v1(&workspace, authorization_scope)?;
+    let authorization_scope_digest =
+        crate::mcp_gateway::authorization_scope_digest_v1(&authorization_scope);
+    let mut hasher = Hasher::new();
+    hasher.update(b"again.local-context.workspace.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize().to_hex().to_string();
+    Ok(HumanTaskScopeV1 {
+        store: Store::open_for_workspace(&workspace)?,
+        repository_id: format!("repository:{}", &digest[..24]),
+        workspace_id: format!("workspace:{}", &digest[..24]),
+        authorization_scope_digest,
+    })
+}
+
+fn task_prune_v1(scope: &HumanTaskScopeV1, args: TaskPruneArgs) -> Result<()> {
+    if args.dry_run == args.apply {
+        bail!("task prune requires exactly one of --dry-run or --apply");
+    }
+    if args.terminal_before_days > 36_500 {
+        bail!("terminal-before-days exceeds the bounded interval");
+    }
+    let age_ms = args
+        .terminal_before_days
+        .checked_mul(24 * 60 * 60 * 1_000)
+        .ok_or_else(|| anyhow!("terminal-before-days overflow"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_millis();
+    let now_ms = i64::try_from(now_ms).context("system clock exceeds the supported range")?;
+    let cutoff_ms = now_ms.saturating_sub(i64::try_from(age_ms)?);
+    let batch_limit = crate::task_lifecycle::MAX_TASK_LIST_ITEMS_V1;
+
+    if args.dry_run {
+        let tasks = scope.store.list_deletable_terminal_tasks_before_v1(
+            &scope.repository_id,
+            &scope.workspace_id,
+            &scope.authorization_scope_digest,
+            cutoff_ms,
+            batch_limit,
+        )?;
+        let task_ids = tasks
+            .iter()
+            .map(|task| task.canonical_task_id.as_str())
+            .collect::<Vec<_>>();
+        return print_pretty_json_v1(&serde_json::json!({
+            "schemaVersion": 1,
+            "operation": "task.prune",
+            "mode": "dry_run",
+            "terminalBeforeDays": args.terminal_before_days,
+            "candidateTaskIds": task_ids,
+            "candidateCount": task_ids.len(),
+            "truncated": task_ids.len() == batch_limit
+        }));
+    }
+
+    let mut deleted = Vec::new();
+    loop {
+        let tasks = scope.store.list_deletable_terminal_tasks_before_v1(
+            &scope.repository_id,
+            &scope.workspace_id,
+            &scope.authorization_scope_digest,
+            cutoff_ms,
+            batch_limit,
+        )?;
+        if tasks.is_empty() {
+            break;
+        }
+        let count = tasks.len();
+        for task in tasks {
+            let task_id = task.canonical_task_id;
+            if scope.store.delete_task_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                &task_id,
+            )? {
+                deleted.push(task_id);
+            }
+        }
+        if count < batch_limit {
+            break;
+        }
+    }
+    print_pretty_json_v1(&serde_json::json!({
+        "schemaVersion": 1,
+        "operation": "task.prune",
+        "mode": "apply",
+        "terminalBeforeDays": args.terminal_before_days,
+        "deletedTaskIds": deleted,
+        "deletedCount": deleted.len()
+    }))
+}
+
+fn print_pretty_json_v1(value: &impl Serialize) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, value)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_task_export_v1(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("task export output has no parent directory"))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect task export parent {}", parent.display()))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!("task export parent must be a real directory");
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("create new private task export {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let metadata = file.metadata()?;
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        bail!("task export permissions are not private");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_task_export_v1(_path: &Path, _bytes: &[u8]) -> Result<()> {
+    bail!("private task export is unsupported on this platform")
 }
 
 fn setup(args: SetupArgs) -> Result<i32> {
@@ -2302,20 +2726,15 @@ fn explain(args: ExplainArgs) -> Result<i32> {
             );
             println!("proof: {}", result.proof_json);
         }
-    } else if let Some((disposition, reason, result_id)) = store.last_event()? {
+    } else if let Some(explanation) = store.latest_decision_explanation_v1()? {
         if args.json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "disposition": disposition,
-                    "reason": reason,
-                    "result_id": result_id,
-                }))?
-            );
+            println!("{}", serde_json::to_string_pretty(&explanation)?);
         } else {
-            println!("decision: {disposition}");
-            println!("reason: {reason}");
-            if let Some(result_id) = result_id {
+            println!("decision: {}", explanation.decision);
+            println!("source: {}", explanation.source);
+            println!("reason: {}", explanation.reason);
+            println!("event: {}", explanation.raw_event);
+            if let Some(result_id) = explanation.result_id {
                 println!("result: {result_id}");
             }
         }
@@ -2343,7 +2762,14 @@ fn stats(json: bool) -> Result<i32> {
         println!("gateway requests: {}", stats.requested);
         println!("gateway provider executions: {}", stats.executed);
         println!("gateway exact hits: {}", stats.exact_hits);
+        println!("gateway coverage hits: {}", stats.coverage_hits);
         println!("gateway in-flight joins: {}", stats.inflight_joins);
+        println!("gateway compact deliveries: {}", stats.compact_deliveries);
+        println!("gateway facts reused: {}", stats.facts_reused);
+        println!(
+            "gateway investigations avoided: {}",
+            stats.investigations_avoided
+        );
         println!(
             "gateway provider calls avoided: {}",
             stats.provider_calls_avoided
@@ -2355,6 +2781,48 @@ fn stats(json: bool) -> Result<i32> {
         println!(
             "estimated gateway execution time saved: {} ms",
             stats.estimated_execution_time_saved_ms
+        );
+        println!("context ledger events: {}", stats.context_events);
+        println!("context canonical tasks: {}", stats.context_tasks);
+        println!("context task aliases: {}", stats.context_task_aliases);
+        println!(
+            "context task aliases converged: {}",
+            stats.context_task_aliases_converged
+        );
+        println!(
+            "context verified facts admitted: {}",
+            stats.verified_facts_admitted
+        );
+        println!(
+            "context suggestions published: {}",
+            stats.suggestions_published
+        );
+        println!(
+            "context completed observations: {}",
+            stats.completed_observations
+        );
+        println!("context explicit unknowns: {}", stats.explicit_unknowns);
+        println!(
+            "context result references admitted: {}",
+            stats.result_references_admitted
+        );
+        println!(
+            "context current verified facts: {}",
+            stats.current_verified_facts
+        );
+        println!(
+            "context current result references: {}",
+            stats.current_result_references
+        );
+        println!("context active work leases: {}", stats.active_work_leases);
+        println!("context invalidation events: {}", stats.invalidation_events);
+        println!(
+            "context delivery receipts: {}",
+            stats.context_delivery_receipts
+        );
+        println!(
+            "context acknowledged bytes omitted: {}",
+            stats.context_delivery_confirmed_bytes_omitted
         );
     }
     Ok(0)
@@ -2373,6 +2841,34 @@ fn doctor(json: bool) -> Result<i32> {
         Ok(()) => "available".to_owned(),
         Err(error) => format!("unavailable: {error}"),
     };
+    let coordinator_feature_enabled = cfg!(feature = "daemon");
+    let coordinator_platform_supported = cfg!(unix);
+    let mut coordinator_blockers = Vec::new();
+    if !coordinator_feature_enabled {
+        coordinator_blockers.push("daemon_feature_disabled");
+    }
+    if !coordinator_platform_supported {
+        coordinator_blockers.push("same_user_unix_transport_unavailable");
+    }
+    let coordinator_status = if coordinator_blockers.is_empty() {
+        "ready"
+    } else {
+        "unavailable"
+    };
+    let native_linux_qualification_host = cfg!(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_env = "gnu",
+        target_pointer_width = "64"
+    ));
+    let mut pytest_blockers = Vec::new();
+    if !cfg!(feature = "linux-pytest") {
+        pytest_blockers.push("linux_pytest_feature_disabled");
+    }
+    if !native_linux_qualification_host {
+        pytest_blockers.push("native_x86_64_linux_qualification_required");
+    }
+    pytest_blockers.push("same_child_filter_and_tree_supervision_qualification_required");
     let report = DoctorReport {
         version: env!("CARGO_PKG_VERSION"),
         executable: executable.display().to_string(),
@@ -2394,6 +2890,37 @@ fn doctor(json: bool) -> Result<i32> {
         seatbelt_runtime_probe,
         seatbelt_used_for_profile: false,
         trace_backed_replay: false,
+        coordinator: CoordinatorDoctorReport {
+            status: coordinator_status,
+            feature_enabled: coordinator_feature_enabled,
+            platform_supported: coordinator_platform_supported,
+            transport: "same_user_os_authenticated_unix",
+            same_user_authenticated: coordinator_platform_supported,
+            ordinary_stdio_grants_recipient_authority: false,
+            public_tools: [
+                "task.start",
+                "task.inspect",
+                "task.list",
+                "task.claim",
+                "task.transition",
+                "context.delta",
+                "context.publish",
+                "context.retrieve",
+                "context.cancel",
+            ],
+            blockers: coordinator_blockers,
+        },
+        pytest_profile: PytestProfileDoctorReport {
+            profile_id: "linux-pytest-v1",
+            registry_status: "contract_only",
+            routing: "passthrough_without_storage",
+            portable_control_plane_enabled: cfg!(feature = "linux-pytest"),
+            native_linux_qualification_host,
+            execution_qualified: false,
+            promotion_issuer_available: false,
+            reuse_enabled: false,
+            blockers: pytest_blockers,
+        },
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2421,6 +2948,35 @@ fn doctor(json: bool) -> Result<i32> {
         println!("Seatbelt used by active profile: no");
         println!(
             "trace-backed replay: unavailable; explicit ineligible calls fail before execution"
+        );
+        println!("local coordinator: {}", report.coordinator.status);
+        println!(
+            "coordinator transport: {} (same-user authenticated: {})",
+            report.coordinator.transport, report.coordinator.same_user_authenticated
+        );
+        println!(
+            "ordinary stdio recipient authority: {}",
+            report.coordinator.ordinary_stdio_grants_recipient_authority
+        );
+        if !report.coordinator.blockers.is_empty() {
+            println!(
+                "coordinator blockers: {}",
+                report.coordinator.blockers.join(", ")
+            );
+        }
+        println!(
+            "pytest profile: {} ({}, {})",
+            report.pytest_profile.profile_id,
+            report.pytest_profile.registry_status,
+            report.pytest_profile.routing
+        );
+        println!(
+            "pytest reuse enabled: {}",
+            report.pytest_profile.reuse_enabled
+        );
+        println!(
+            "pytest blockers: {}",
+            report.pytest_profile.blockers.join(", ")
         );
     }
     Ok(0)

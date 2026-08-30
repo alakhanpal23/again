@@ -33,11 +33,19 @@ fn workspace() -> TempDir {
 }
 
 fn daemon(workspace: &Path) -> GatewayDaemonV1 {
-    GatewayDaemonV1::bind(
-        workspace,
-        AuthorizationScopeId::new("daemon-test-scope").unwrap(),
-    )
-    .unwrap()
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        match GatewayDaemonV1::bind(
+            workspace,
+            AuthorizationScopeId::new("daemon-test-scope").unwrap(),
+        ) {
+            Ok(daemon) => return daemon,
+            Err(GatewayServiceError::SocketExists) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("bind test daemon: {error}"),
+        }
+    }
 }
 
 fn start_daemon(workspace: &Path) -> (std::path::PathBuf, thread::JoinHandle<()>) {
@@ -131,6 +139,7 @@ fn same_uid_status_and_stop_are_workspace_bound_and_clean() {
     let (socket, server) = start_daemon(workspace.path());
     let mut malformed = UnixStream::connect(&socket).unwrap();
     malformed.write_all(&[0_u8; 57]).unwrap();
+    malformed.shutdown(std::net::Shutdown::Write).unwrap();
     malformed
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
@@ -145,7 +154,7 @@ fn same_uid_status_and_stop_are_workspace_bound_and_clean() {
 }
 
 #[test]
-fn daemon_serves_the_real_gateway_and_shutdown_retires_the_connection() {
+fn daemon_drains_a_live_gateway_session_before_shutdown() {
     let workspace = workspace();
     let (socket, server) = start_daemon(workspace.path());
     let mut stream = connect_mcp_v1(workspace.path()).unwrap();
@@ -187,13 +196,13 @@ fn daemon_serves_the_real_gateway_and_shutdown_retires_the_connection() {
     );
 
     stop_daemon_v1(workspace.path()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let mut line = String::new();
-        if reader.read_line(&mut line).unwrap_or(0) == 0 {
-            break;
-        }
-    }
+    assert!(matches!(
+        connect_mcp_v1(workspace.path()),
+        Err(GatewayServiceError::Draining)
+    ));
+    request(&mut stream, "draining-tools", "tools/list", json!({}));
+    assert_eq!(response(&mut reader)["id"], "draining-tools");
+    stream.shutdown(std::net::Shutdown::Both).unwrap();
     drop(reader);
     drop(stream);
     server.join().unwrap();
@@ -376,4 +385,72 @@ fn production_daemon_reclaims_only_lock_proven_crash_stale_socket() {
             .success()
     );
     assert!(wait_for_exit(&mut replacement).success());
+}
+
+#[test]
+fn twenty_simultaneous_connectors_elect_one_automatic_daemon() {
+    let workspace = workspace();
+    let fixture = TempDir::new().unwrap();
+    fs::create_dir(fixture.path().join("home")).unwrap();
+    let workspace_path = workspace.path().to_owned();
+    let fixture_path = fixture.path().to_owned();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(21));
+    let mut connectors = Vec::new();
+    for _ in 0..20 {
+        let workspace_path = workspace_path.clone();
+        let fixture_path = fixture_path.clone();
+        let barrier = std::sync::Arc::clone(&barrier);
+        connectors.push(thread::spawn(move || {
+            barrier.wait();
+            cli(&workspace_path, &fixture_path)
+                .args([
+                    "mcp",
+                    "connect",
+                    "--workspace",
+                    workspace_path.to_str().unwrap(),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .unwrap()
+        }));
+    }
+    barrier.wait();
+    for connector in connectors {
+        let output = connector.join().unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+    }
+
+    let status = cli(&workspace_path, &fixture_path)
+        .args([
+            "mcp",
+            "daemon",
+            "status",
+            "--workspace",
+            workspace_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "{:?}", status.stderr);
+    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["status"], "ready");
+    assert_eq!(status["protocolVersion"], "2025-06-18");
+    assert_eq!(status["idleTimeoutSeconds"], 600);
+
+    assert!(
+        cli(&workspace_path, &fixture_path)
+            .args([
+                "mcp",
+                "daemon",
+                "stop",
+                "--workspace",
+                workspace_path.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
 }

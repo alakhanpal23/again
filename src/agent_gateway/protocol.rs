@@ -32,6 +32,9 @@ pub const MAX_DELIVERY_IDENTIFIER_BYTES_V1: usize = 128;
 pub const TOOL_POLICY_SCHEMA_VERSION_V1: u16 = 1;
 pub const MAX_TOOL_POLICY_IDENTIFIER_BYTES_V1: usize = 128;
 pub const MAX_TOOL_POLICY_DEPENDENCIES_V1: usize = 64;
+pub const MAX_COMMAND_ARGUMENTS_V1: usize = 256;
+pub const MAX_COMMAND_ARGUMENT_BYTES_V1: usize = 16 * 1024;
+pub const MAX_COMPLETE_STREAM_BYTES_V1: usize = 64 * 1024 * 1024;
 
 const REQUEST_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.request.v1\0";
 const ADAPTER_DIGEST_DOMAIN: &[u8] = b"again.agent-gateway.adapter.v1\0";
@@ -678,6 +681,7 @@ pub enum ToolCapabilityClassV1 {
     Communication,
     Deployment,
     Payment,
+    Interactive,
     Unknown,
 }
 
@@ -694,8 +698,177 @@ impl ToolCapabilityClassV1 {
                 | Self::Communication
                 | Self::Deployment
                 | Self::Payment
+                | Self::Interactive
                 | Self::Unknown
         )
+    }
+}
+
+/// Runtime interaction state which cannot be recovered from a command name or
+/// provider annotation. Any non-batch value forces uncached passthrough.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolInteractionModeV1 {
+    Batch,
+    Interactive,
+    Watch,
+    Repl,
+}
+
+/// Whether a call's standard input is closed or part of its behavior. A
+/// declared digest remains insufficient for the initial universal profiles;
+/// only a closed stream can enter the reusable lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolStdinModeV1 {
+    Closed,
+    DeclaredDigest,
+    Inherited,
+    Unknown,
+}
+
+/// Bounded command syntax for classification only. This value has no execute
+/// method and is never accepted as profile or reuse authority.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CommandInvocationV1 {
+    argv: Vec<String>,
+}
+
+impl fmt::Debug for CommandInvocationV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CommandInvocationV1(<redacted>)")
+    }
+}
+
+impl CommandInvocationV1 {
+    pub fn new(argv: Vec<String>) -> Result<Self, ToolPolicyRefusalV1> {
+        if argv.is_empty() || argv.len() > MAX_COMMAND_ARGUMENTS_V1 {
+            return Err(ToolPolicyRefusalV1::InvalidCommandInvocation);
+        }
+        let mut total_bytes = 0_usize;
+        for argument in &argv {
+            if argument.is_empty() || argument.as_bytes().contains(&0) {
+                return Err(ToolPolicyRefusalV1::InvalidCommandInvocation);
+            }
+            total_bytes = total_bytes
+                .checked_add(argument.len())
+                .and_then(|bytes| bytes.checked_add(1))
+                .ok_or(ToolPolicyRefusalV1::InvalidCommandInvocation)?;
+        }
+        if total_bytes > MAX_COMMAND_ARGUMENT_BYTES_V1 {
+            return Err(ToolPolicyRefusalV1::InvalidCommandInvocation);
+        }
+        Ok(Self { argv })
+    }
+
+    pub fn argv(&self) -> &[String] {
+        &self.argv
+    }
+}
+
+/// Runtime facts accompanying one automatic routing decision. The command is
+/// optional because native MCP reads are identified by their sealed profile.
+#[derive(Clone, PartialEq, Eq)]
+pub struct UniversalActionContextV1 {
+    interaction: ToolInteractionModeV1,
+    stdin: ToolStdinModeV1,
+    command: Option<CommandInvocationV1>,
+}
+
+impl fmt::Debug for UniversalActionContextV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("UniversalActionContextV1(<redacted>)")
+    }
+}
+
+impl UniversalActionContextV1 {
+    pub fn batch_without_stdin() -> Self {
+        Self {
+            interaction: ToolInteractionModeV1::Batch,
+            stdin: ToolStdinModeV1::Closed,
+            command: None,
+        }
+    }
+
+    pub fn new(
+        interaction: ToolInteractionModeV1,
+        stdin: ToolStdinModeV1,
+        command: Option<CommandInvocationV1>,
+    ) -> Self {
+        Self {
+            interaction,
+            stdin,
+            command,
+        }
+    }
+
+    pub const fn interaction(&self) -> ToolInteractionModeV1 {
+        self.interaction
+    }
+
+    pub const fn stdin(&self) -> ToolStdinModeV1 {
+        self.stdin
+    }
+
+    pub fn command(&self) -> Option<&CommandInvocationV1> {
+        self.command.as_ref()
+    }
+
+    pub const fn requires_uncached_passthrough(&self) -> bool {
+        !matches!(self.interaction, ToolInteractionModeV1::Batch)
+            || !matches!(self.stdin, ToolStdinModeV1::Closed)
+    }
+}
+
+/// Exact captured output. Construction requires both streams to be complete,
+/// and the bounded bytes stay available whenever compact delivery is not
+/// authorized for the exact recipient context.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CompleteToolStreamsV1 {
+    status: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl fmt::Debug for CompleteToolStreamsV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("CompleteToolStreamsV1(<redacted>)")
+    }
+}
+
+impl CompleteToolStreamsV1 {
+    pub fn new(
+        status: i32,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        stdout_complete: bool,
+        stderr_complete: bool,
+    ) -> Result<Self, ToolPolicyRefusalV1> {
+        if !stdout_complete || !stderr_complete {
+            return Err(ToolPolicyRefusalV1::IncompleteStreams);
+        }
+        if stdout.len() > MAX_COMPLETE_STREAM_BYTES_V1
+            || stderr.len() > MAX_COMPLETE_STREAM_BYTES_V1
+        {
+            return Err(ToolPolicyRefusalV1::StreamBoundExceeded);
+        }
+        Ok(Self {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+
+    pub const fn status(&self) -> i32 {
+        self.status
+    }
+
+    pub fn stdout(&self) -> &[u8] {
+        &self.stdout
+    }
+
+    pub fn stderr(&self) -> &[u8] {
+        &self.stderr
     }
 }
 
@@ -910,6 +1083,12 @@ pub enum ToolPolicyRefusalV1 {
     InvalidFreshnessValidator,
     #[error("unexpected_freshness_validator")]
     UnexpectedFreshnessValidator,
+    #[error("invalid_command_invocation")]
+    InvalidCommandInvocation,
+    #[error("incomplete_streams")]
+    IncompleteStreams,
+    #[error("stream_bound_exceeded")]
+    StreamBoundExceeded,
 }
 
 fn validate_tool_policy_identifier_v1(value: &str) -> Result<(), ToolPolicyRefusalV1> {

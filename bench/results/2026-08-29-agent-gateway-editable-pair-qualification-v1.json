@@ -1,0 +1,757 @@
+{
+  "binding": {
+    "again_binary_sha256": null,
+    "again_executable_sha256": null,
+    "again_template_sha256": null,
+    "baseline_executable_sha256": null,
+    "baseline_template_sha256": null,
+    "credential_env_name": null,
+    "credential_present": false,
+    "model": null,
+    "settings_id": null
+  },
+  "claims": {
+    "again_acceleration": false,
+    "editable_oracle_qualified": true,
+    "note": "Qualification timings measure the deterministic reference editor and harness only.",
+    "real_agent_task_quality": false
+  },
+  "evidence_class": "deterministic_editable_harness_qualification",
+  "fixture_sha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+  "generated_at": "2026-08-30T06:02:29.262227+00:00",
+  "harness_sha256": "4baf5bda01d1b21e609ffbb9625e22a3ba81b740abe8becee9c573ed1699371c",
+  "harness_version": "1.0.0",
+  "host": {
+    "machine": "arm64",
+    "python": "3.9.6",
+    "python_executable": "/Library/Developer/CommandLineTools/usr/bin/python3",
+    "release": "25.5.0",
+    "system": "Darwin"
+  },
+  "limits": {
+    "runs": 10,
+    "timeout_seconds": 30.0
+  },
+  "mode": "qualify",
+  "observations": [
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 149.924,
+      "milestones_ms": {
+        "accepted_edit": 0.11,
+        "agent_completed": 0.11,
+        "final_outcome": 149.924,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 149.924
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 148.776,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 0,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 140.981,
+      "milestones_ms": {
+        "accepted_edit": 0.108,
+        "agent_completed": 0.108,
+        "final_outcome": 140.981,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 140.981
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 139.835,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 0,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 140.18,
+      "milestones_ms": {
+        "accepted_edit": 0.115,
+        "agent_completed": 0.115,
+        "final_outcome": 140.18,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 140.18
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 139.006,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 1,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 144.664,
+      "milestones_ms": {
+        "accepted_edit": 0.134,
+        "agent_completed": 0.134,
+        "final_outcome": 144.664,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 144.664
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 143.482,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 1,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 139.185,
+      "milestones_ms": {
+        "accepted_edit": 0.112,
+        "agent_completed": 0.112,
+        "final_outcome": 139.185,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 139.185
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 138.091,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 2,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 139.055,
+      "milestones_ms": {
+        "accepted_edit": 0.116,
+        "agent_completed": 0.116,
+        "final_outcome": 139.055,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 139.055
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 137.914,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 2,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 141.258,
+      "milestones_ms": {
+        "accepted_edit": 0.12,
+        "agent_completed": 0.12,
+        "final_outcome": 141.258,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 141.258
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 140.134,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 3,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 150.252,
+      "milestones_ms": {
+        "accepted_edit": 0.128,
+        "agent_completed": 0.128,
+        "final_outcome": 150.252,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 150.252
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 149.008,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 3,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 137.647,
+      "milestones_ms": {
+        "accepted_edit": 0.116,
+        "agent_completed": 0.116,
+        "final_outcome": 137.647,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 137.647
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 136.538,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 4,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 140.341,
+      "milestones_ms": {
+        "accepted_edit": 0.109,
+        "agent_completed": 0.109,
+        "final_outcome": 140.341,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 140.341
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 139.247,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 4,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 139.593,
+      "milestones_ms": {
+        "accepted_edit": 0.119,
+        "agent_completed": 0.119,
+        "final_outcome": 139.593,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 139.593
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 138.426,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 5,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 139.311,
+      "milestones_ms": {
+        "accepted_edit": 0.124,
+        "agent_completed": 0.124,
+        "final_outcome": 139.311,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 139.311
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 137.812,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 5,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 140.059,
+      "milestones_ms": {
+        "accepted_edit": 0.114,
+        "agent_completed": 0.114,
+        "final_outcome": 140.059,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 140.059
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 138.907,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 6,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 137.334,
+      "milestones_ms": {
+        "accepted_edit": 0.118,
+        "agent_completed": 0.118,
+        "final_outcome": 137.334,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 137.334
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 136.223,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 6,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 141.166,
+      "milestones_ms": {
+        "accepted_edit": 0.123,
+        "agent_completed": 0.123,
+        "final_outcome": 141.166,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 141.166
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 140.069,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 7,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 139.07,
+      "milestones_ms": {
+        "accepted_edit": 0.149,
+        "agent_completed": 0.149,
+        "final_outcome": 139.07,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 139.07
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 137.531,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 7,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 140.002,
+      "milestones_ms": {
+        "accepted_edit": 0.117,
+        "agent_completed": 0.117,
+        "final_outcome": 140.002,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 140.002
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 138.909,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 8,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 141.343,
+      "milestones_ms": {
+        "accepted_edit": 0.139,
+        "agent_completed": 0.139,
+        "final_outcome": 141.343,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 141.343
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 140.183,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "baseline",
+        "again"
+      ],
+      "output_limited": false,
+      "pair": 8,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "again",
+      "elapsed_ms": 152.777,
+      "milestones_ms": {
+        "accepted_edit": 0.119,
+        "agent_completed": 0.119,
+        "final_outcome": 152.777,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 152.777
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 151.639,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 9,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    },
+    {
+      "again_stats_delta": null,
+      "combined_output_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "condition": "baseline",
+      "elapsed_ms": 152.151,
+      "milestones_ms": {
+        "accepted_edit": 0.126,
+        "agent_completed": 0.126,
+        "final_outcome": 152.151,
+        "first_edit": 0.0,
+        "task_started": 0.0,
+        "validation_completed": 152.151
+      },
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 150.954,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "order": [
+        "again",
+        "baseline"
+      ],
+      "output_limited": false,
+      "pair": 9,
+      "product_observed": null,
+      "returncode": 0,
+      "timed_out": false
+    }
+  ],
+  "passed": true,
+  "prompt_sha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "schema": "again.agent-gateway-editable-pair.v1",
+  "summary": {
+    "again": {
+      "mean_ms": 141.403,
+      "p50_ms": 140.981,
+      "p95_ms": 152.777,
+      "passed": 10,
+      "runs": 10
+    },
+    "baseline": {
+      "mean_ms": 143.227,
+      "p50_ms": 140.059,
+      "p95_ms": 152.151,
+      "passed": 10,
+      "runs": 10
+    }
+  }
+}

@@ -45,7 +45,8 @@ from bench import agent_gateway_product_e2e as product
 
 
 SCHEMA = "again.agent-gateway-chaos-soak.v3"
-MAX_PROCESSES = 32
+MAX_PROCESSES = 128
+VALID_CONCURRENCIES = (1, 2, 4, 8, 16, 32, 64, 100, 128)
 MAX_OPERATIONS = 2_000
 MAX_EVIDENCE_BYTES = 1_000_000
 MAX_BINARY_BYTES = 256 * 1024 * 1024
@@ -54,6 +55,7 @@ MAX_STDERR_BYTES = 2 * 1024 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 250_000
 PROCESS_STOP_SECONDS = 2.0
+DAEMON_RESPONSE_TIMEOUT_SECONDS = 15.0
 LEASE_SECONDS = int(product.LEASE_TTL_SECONDS)
 RESULT_ID_LENGTH = 64
 TRANSPORT_FIXTURE_BYTES = 12 * 1024 * 1024
@@ -61,6 +63,7 @@ STDIO_MAX_INFLIGHT = 16
 MAX_CPU_SECONDS = 1_800.0
 MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024
 RUNTIME_SLACK_SECONDS = 45.0
+EXPECTED_DAEMON_TOOLS = frozenset(product.EXPECTED_ADVERTISED_TOOLS)
 
 
 class HarnessRefusal(RuntimeError):
@@ -73,6 +76,42 @@ class HarnessRefusal(RuntimeError):
 
 class HarnessUnsupported(HarnessRefusal):
     """A constrained-host condition, separate from a product or harness failure."""
+
+
+def _create_run_root() -> pathlib.Path:
+    """Create a compact private root suitable for Unix-domain socket paths."""
+
+    parent = pathlib.Path("/tmp").resolve(strict=True)
+    if not parent.is_dir():
+        raise HarnessUnsupported("temporary_root", "the host has no usable /tmp directory")
+    root = pathlib.Path(tempfile.mkdtemp(prefix="again-c-", dir=parent)).resolve()
+    root.chmod(0o700)
+    return root
+
+
+def _session_environment(state: pathlib.Path, label: str) -> dict[str, str]:
+    home = state.parent / f"home-{label}"
+    # The daemon runtime namespace is keyed below TMPDIR, so all connectors
+    # for one exact probe must share this directory.
+    temporary = state.parent / "runtime-tmp"
+    home.mkdir(mode=0o700, exist_ok=True)
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "AGAIN_HOME": str(state),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
+        "CARGO_NET_OFFLINE": "true",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
+    }
 
 
 def canonical_json(value: Any) -> bytes:
@@ -321,34 +360,24 @@ class Session:
         state: pathlib.Path,
         label: str,
         timeout: float = 5.0,
+        automatic_daemon: bool = False,
+        authorization_scope: str = "again-chaos-soak:exact-v2",
     ) -> None:
+        self.automatic_daemon = automatic_daemon
         self.argv = (
-            str(binary),
-            "mcp",
-            "serve",
-            "--workspace",
-            str(repo),
-            "--authorization-scope",
-            "again-chaos-soak:exact-v2",
+            (str(binary), "mcp", "connect", "--workspace", str(repo))
+            if automatic_daemon
+            else (
+                str(binary),
+                "mcp",
+                "serve",
+                "--workspace",
+                str(repo),
+                "--authorization-scope",
+                authorization_scope,
+            )
         )
-        environment = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(state.parent / f"home-{label}"),
-            "TMPDIR": str(state.parent / f"tmp-{label}"),
-            "AGAIN_HOME": str(state),
-            "LC_ALL": "C",
-            "LANG": "C",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ALLOW_PROTOCOL": "file",
-            "CARGO_NET_OFFLINE": "true",
-            "HTTP_PROXY": "http://127.0.0.1:9",
-            "HTTPS_PROXY": "http://127.0.0.1:9",
-            "ALL_PROXY": "http://127.0.0.1:9",
-            "NO_PROXY": "",
-        }
-        pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
-        pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700)
+        environment = _session_environment(state, label)
         state.mkdir(mode=0o700, exist_ok=True)
         try:
             self.process = subprocess.Popen(
@@ -385,7 +414,7 @@ class Session:
         while True:
             try:
                 block = os.read(self.stderr.fileno(), 65536)
-            except OSError:
+            except (OSError, ValueError):
                 return
             if not block:
                 return
@@ -513,7 +542,10 @@ class Session:
         listing = self.request("tools", "tools/list", {})
         tools = listing.get("result", {}).get("tools")
         names = [item.get("name") for item in tools] if isinstance(tools, list) else []
-        if names != list(product.EXPECTED_ADVERTISED_TOOLS):
+        if self.automatic_daemon:
+            if len(names) != len(EXPECTED_DAEMON_TOOLS) or set(names) != EXPECTED_DAEMON_TOOLS:
+                raise HarnessRefusal("tools", "beta daemon tool list changed")
+        elif names != list(product.EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("tools", "MCP tool list changed")
 
     def close(self) -> dict[str, Any]:
@@ -861,12 +893,14 @@ def _harden_product_harness() -> Iterator[dict[str, Any]]:
     original_pin = product.pin_binary
     registry: dict[pathlib.Path, PinnedBinary] = {}
     process_groups: set[int] = set()
+    processes: dict[int, subprocess.Popen[bytes]] = {}
     revalidations = 0
 
     class HardenedSession(original_session):  # type: ignore[misc, valid-type]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             process_groups.add(self.process.pid)
+            processes[self.process.pid] = self.process
 
         def kill(self) -> None:
             if _process_group_exists(self.process.pid):
@@ -930,8 +964,9 @@ def _harden_product_harness() -> Iterator[dict[str, Any]]:
         product.McpSession = original_session
         product.pin_binary = original_pin
         cleanup_error: BaseException | None = None
-        for process_group in sorted(process_groups):
+        for process_group, process in sorted(processes.items()):
             try:
+                product.terminate_process_group(process)
                 terminate_owned_process_group(process_group)
             except BaseException as error:
                 cleanup_error = cleanup_error or error
@@ -965,7 +1000,7 @@ def _fixture(root: pathlib.Path) -> pathlib.Path:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_TERMINAL_PROMPT": "0",
     }
-    pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
+    pathlib.Path(environment["HOME"]).mkdir(mode=0o700, exist_ok=True)
     commands = (
         ["/usr/bin/git", "init", "-q", "--initial-branch=main"],
         ["/usr/bin/git", "add", "README.md"],
@@ -1004,23 +1039,35 @@ def _exact_probe(
     concurrency: int,
     operations: int,
     rng: random.Random,
+    *,
+    automatic_daemon: bool = False,
 ) -> dict[str, Any]:
     repo = _fixture(root)
     state = root / "exact-probe-state"
     sessions: list[Session] = []
     cleanup: list[dict[str, Any]] = []
-    result_ids: list[str] = []
+    observed_result_ids: list[str | None] = []
+    daemon_observed = False
+    daemon_stop: dict[str, Any] | None = None
     active_error: BaseException | None = None
     try:
         for index in range(concurrency):
-            session = Session(binary, repo, state, f"probe-{index}")
+            session = Session(
+                binary,
+                repo,
+                state,
+                f"probe-{index}",
+                timeout=DAEMON_RESPONSE_TIMEOUT_SECONDS if automatic_daemon else 5.0,
+                automatic_daemon=automatic_daemon,
+            )
             sessions.append(session)
             session.handshake()
+            daemon_observed |= automatic_daemon
 
         schedule = [index % concurrency for index in range(operations)]
         rng.shuffle(schedule)
 
-        def call(item: tuple[int, int]) -> str:
+        def call(item: tuple[int, int]) -> str | None:
             index, session_index = item
             session = sessions[session_index]
             response = session.request(
@@ -1038,12 +1085,12 @@ def _exact_probe(
             if product.result_without_reference(result) != expected:
                 raise HarnessRefusal("exact_result", "repo.read result bytes changed")
             identifier = product.result_id(result)
-            if not _valid_result_id(identifier):
-                raise HarnessRefusal("exact_result_id", "repo.read result ID is missing")
-            return str(identifier)
+            if identifier is not None and not _valid_result_id(identifier):
+                raise HarnessRefusal("exact_result_id", "repo.read result ID is malformed")
+            return str(identifier) if identifier is not None else None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            result_ids = list(executor.map(call, enumerate(schedule)))
+            observed_result_ids = list(executor.map(call, enumerate(schedule)))
     except BaseException as error:
         active_error = error
         raise
@@ -1054,19 +1101,32 @@ def _exact_probe(
                 cleanup.append(session.close())
             except BaseException as error:
                 cleanup_error = cleanup_error or error
+        if daemon_observed:
+            try:
+                daemon_stop = _stop_automatic_daemon(binary, repo, state, root)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
         if cleanup_error is not None and active_error is None:
             raise cleanup_error
-    if len(set(result_ids)) != 1:
-        raise HarnessRefusal("probe_result_divergence", "exact probe returned divergent result IDs")
-    expected_argv = [
-        str(binary),
-        "mcp",
-        "serve",
-        "--workspace",
-        str(repo),
-        "--authorization-scope",
-        "again-chaos-soak:exact-v2",
-    ]
+    result_ids = [identifier for identifier in observed_result_ids if identifier is not None]
+    if len(result_ids) != len(observed_result_ids) or len(set(result_ids)) != 1:
+        raise HarnessRefusal(
+            "probe_result_divergence",
+            "exact beta probe did not reference one canonical result for every operation",
+        )
+    expected_argv = (
+        [str(binary), "mcp", "connect", "--workspace", str(repo)]
+        if automatic_daemon
+        else [
+            str(binary),
+            "mcp",
+            "serve",
+            "--workspace",
+            str(repo),
+            "--authorization-scope",
+            "again-chaos-soak:exact-v2",
+        ]
+    )
     if any(item["argv"] != expected_argv for item in cleanup):
         raise HarnessRefusal("probe_argv", "exact probe launched an unexpected argv")
     if any(not _clean_exit_code(item.get("return_code")) for item in cleanup):
@@ -1074,13 +1134,86 @@ def _exact_probe(
     if any(not _cleanup_absent(item) for item in cleanup):
         raise HarnessRefusal("probe_cleanup", "exact probe left an owned process group")
     return {
+        "automatic_daemon": automatic_daemon,
+        "daemon_stop": daemon_stop,
         "operations": operations,
+        "referenced_results": len(result_ids),
+        "unreferenced_direct_results": len(observed_result_ids) - len(result_ids),
         "sessions": concurrency,
         "unique_result_ids": len(set(result_ids)),
         "result_id": result_ids[0],
         "result_sha256": sha256_bytes(canonical_json({"text": "chaos fixture\n"})),
         "schedule_sha256": sha256_bytes(canonical_json(schedule)),
         "cleanup": cleanup,
+    }
+
+
+def _stop_automatic_daemon(
+    binary: pathlib.Path,
+    repo: pathlib.Path,
+    state: pathlib.Path,
+    root: pathlib.Path,
+) -> dict[str, Any]:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root / "daemon-control-home"),
+        "TMPDIR": str(root / "runtime-tmp"),
+        "AGAIN_HOME": str(state),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
+        "CARGO_NET_OFFLINE": "true",
+    }
+    pathlib.Path(environment["HOME"]).mkdir(mode=0o700, exist_ok=True)
+    pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700, exist_ok=True)
+    stop_argv = [str(binary), "mcp", "daemon", "stop", "--workspace", str(repo)]
+    status_argv = [str(binary), "mcp", "daemon", "status", "--workspace", str(repo)]
+    try:
+        stopped = subprocess.run(
+            stop_argv,
+            cwd=repo,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=PROCESS_STOP_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise HarnessRefusal("daemon_stop", "automatic daemon stop command failed") from error
+    if stopped.returncode != 0 or len(stopped.stdout) > MAX_FRAME_BYTES or len(stopped.stderr) > MAX_STDERR_BYTES:
+        raise HarnessRefusal("daemon_stop", "automatic daemon did not accept bounded stop")
+    deadline = time.monotonic() + PROCESS_STOP_SECONDS * 2
+    status_attempts = 0
+    while True:
+        status_attempts += 1
+        try:
+            status = subprocess.run(
+                status_argv,
+                cwd=repo,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=PROCESS_STOP_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise HarnessRefusal("daemon_stop", "automatic daemon status command failed") from error
+        if status.returncode != 0:
+            break
+        if time.monotonic() >= deadline:
+            raise HarnessRefusal("daemon_stop", "automatic daemon remained live after stop")
+        time.sleep(0.02)
+    return {
+        "stop_argv": stop_argv,
+        "stop_return_code": stopped.returncode,
+        "stop_stdout_sha256": sha256_bytes(stopped.stdout),
+        "stop_stderr_sha256": sha256_bytes(stopped.stderr),
+        "status_attempts": status_attempts,
+        "absent_after_stop": True,
     }
 
 
@@ -1536,12 +1669,15 @@ def run(
     seed: int = 1,
     output: pathlib.Path | None = None,
 ) -> dict[str, Any]:
-    if mode not in {"quick", "soak"}:
-        raise HarnessRefusal("mode", "mode must be quick or soak")
+    if mode not in {"quick", "soak", "beta"}:
+        raise HarnessRefusal("mode", "mode must be quick, soak, or beta")
     if concurrency is None:
-        concurrency = 2 if mode == "quick" else 4
-    if concurrency not in {1, 2, 4, 8, 16, 32} or concurrency > MAX_PROCESSES:
-        raise HarnessRefusal("concurrency", "concurrency must be one of 1,2,4,8,16,32")
+        concurrency = {"quick": 2, "soak": 4, "beta": 100}[mode]
+    if concurrency not in VALID_CONCURRENCIES or concurrency > MAX_PROCESSES:
+        allowed = ",".join(str(value) for value in VALID_CONCURRENCIES)
+        raise HarnessRefusal("concurrency", f"concurrency must be one of {allowed}")
+    if mode == "beta" and concurrency != 100:
+        raise HarnessRefusal("concurrency", "beta mode requires exactly 100 clients")
     if isinstance(seed, bool) or not 0 <= seed < 2**64:
         raise HarnessRefusal("seed", "seed must be an unsigned 64-bit integer")
     if not product.LEASE_TTL_SECONDS + product.RECOVERY_GRACE_SECONDS < duration <= 3600:
@@ -1557,8 +1693,7 @@ def run(
     baseline_descendants = _descendant_snapshot()
     baseline_resources = _resource_snapshot()
     started = time.monotonic_ns()
-    root = pathlib.Path(tempfile.mkdtemp(prefix="again-chaos-soak-v2-")).resolve()
-    root.chmod(0o700)
+    root = _create_run_root()
     process_cleanup: list[dict[str, Any]] = []
     product_temp_paths: set[pathlib.Path] = set()
     product_process_ids: list[int] = []
@@ -1602,7 +1737,12 @@ def run(
         if false_hits:
             raise HarnessRefusal("false_hit", f"observed {false_hits} false-hit scenarios")
         exact_probe = _exact_probe(
-            outer_pin.executable_path, root, concurrency, operations, rng
+            outer_pin.executable_path,
+            root,
+            concurrency,
+            operations,
+            rng,
+            automatic_daemon=mode == "beta",
         )
         transport_probe = _transport_chaos_probe(
             outer_pin.executable_path,
@@ -1769,7 +1909,7 @@ def run(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--again-binary", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("quick", "soak"), default="quick")
+    parser.add_argument("--mode", choices=("quick", "soak", "beta"), default="quick")
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--duration", type=float, default=45.0)
     parser.add_argument("--seed", type=int, default=1)

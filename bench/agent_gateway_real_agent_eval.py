@@ -338,10 +338,12 @@ def _terminate_process(process: subprocess.Popen[bytes], timeout: float = 1.0) -
                 return True
             except ProcessLookupError:
                 return False
-            except PermissionError as error:
-                raise HarnessRefusal(
-                    "process_cleanup", "could not verify the isolated process group"
-                ) from error
+            except PermissionError:
+                # POSIX uses EPERM to report that the group still exists but
+                # cannot currently be signalled. Treat that as live and keep
+                # driving the bounded cleanup path; an actual TERM/KILL
+                # permission failure below remains a hard refusal.
+                return True
 
         try:
             os.killpg(process.pid, signal.SIGTERM)

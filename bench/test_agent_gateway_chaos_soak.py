@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,20 @@ def scenario_report() -> dict[str, object]:
 
 
 class ChaosSoakHarnessTests(unittest.TestCase):
+    def test_compact_private_root_and_shared_daemon_runtime_namespace(self) -> None:
+        root = harness._create_run_root()
+        try:
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertLess(len(str(root)), 64)
+            state = root / "state"
+            first = harness._session_environment(state, "first")
+            second = harness._session_environment(state, "second")
+            self.assertNotEqual(first["HOME"], second["HOME"])
+            self.assertEqual(first["TMPDIR"], second["TMPDIR"])
+            self.assertEqual(first["AGAIN_HOME"], second["AGAIN_HOME"])
+        finally:
+            shutil.rmtree(root)
+
     def test_canonical_json_and_digest_are_stable(self) -> None:
         self.assertEqual(
             harness.canonical_json({"z": 1, "a": "x"}), b'{"a":"x","z":1}\n'
@@ -244,12 +259,18 @@ class ChaosSoakHarnessTests(unittest.TestCase):
 
     def test_bounds_and_network_nonclaim_are_explicit(self) -> None:
         self.assertEqual(harness.SCHEMA, "again.agent-gateway-chaos-soak.v3")
-        self.assertEqual(harness.MAX_PROCESSES, 32)
+        self.assertEqual(harness.MAX_PROCESSES, 128)
+        self.assertIn(100, harness.VALID_CONCURRENCIES)
         self.assertEqual(harness.LEASE_SECONDS, 30)
         self.assertEqual(harness.STDIO_MAX_INFLIGHT, 16)
+        self.assertEqual(harness.DAEMON_RESPONSE_TIMEOUT_SECONDS, 15.0)
         self.assertGreater(harness.TRANSPORT_FIXTURE_BYTES, 8 * 1024 * 1024)
         self.assertGreater(harness.MAX_CPU_SECONDS, 0)
         self.assertGreater(harness.MAX_RSS_BYTES, 0)
+        self.assertEqual(
+            harness.EXPECTED_DAEMON_TOOLS,
+            frozenset(harness.product.EXPECTED_ADVERTISED_TOOLS),
+        )
         self.assertEqual(
             json.loads(harness.canonical_json({"mode": "quick"})), {"mode": "quick"}
         )
@@ -289,6 +310,18 @@ class ChaosSoakHarnessTests(unittest.TestCase):
             ) as refused:
                 harness.run(pathlib.Path("/does/not/exist"), seed=seed)
             self.assertEqual(refused.exception.code, "seed")
+
+    def test_beta_mode_requires_exactly_100_clients_before_environmental_work(self) -> None:
+        for concurrency in (32, 64, 128):
+            with self.subTest(concurrency=concurrency), self.assertRaises(
+                harness.HarnessRefusal
+            ) as refused:
+                harness.run(
+                    pathlib.Path("/does/not/exist"),
+                    mode="beta",
+                    concurrency=concurrency,
+                )
+            self.assertEqual(refused.exception.code, "concurrency")
 
     def test_main_separates_unsupported_environment_from_failure(self) -> None:
         cases = (

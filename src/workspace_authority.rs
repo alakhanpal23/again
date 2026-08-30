@@ -14,6 +14,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
 use blake3::Hasher;
 
@@ -37,6 +38,9 @@ pub struct WorkspaceAuthorityLimitsV1 {
     pub max_task_field_bytes: usize,
     pub max_external_dependencies: usize,
     pub max_external_token_bytes: usize,
+    pub max_manifest_dependents: usize,
+    pub max_manifest_dependency_edges: usize,
+    pub max_manifest_invalidation_work: usize,
 }
 
 impl Default for WorkspaceAuthorityLimitsV1 {
@@ -57,6 +61,9 @@ impl Default for WorkspaceAuthorityLimitsV1 {
             max_task_field_bytes: 64 * 1024,
             max_external_dependencies: 256,
             max_external_token_bytes: 1024 * 1024,
+            max_manifest_dependents: 4_096,
+            max_manifest_dependency_edges: 262_144,
+            max_manifest_invalidation_work: 262_144,
         }
     }
 }
@@ -490,14 +497,16 @@ pub(crate) struct WorkspaceExecutionEpochV1 {
 // Phase 1 deliberately lands this authority primitive before its MCP consumer.
 // Keep the private integration surface reviewable without pretending it is live.
 #[allow(dead_code)]
-pub(crate) struct ObservedManifestV1<'epoch> {
-    execution_epoch: &'epoch WorkspaceExecutionEpochV1,
+pub(crate) struct ObservedManifestV1 {
+    execution_epoch: Arc<WorkspaceExecutionEpochV1>,
     limits: WorkspaceAuthorityLimitsV1,
     observations: BTreeMap<ManifestObservationKeyV1, SealedManifestObservationV1>,
     nodes: ManifestNodeCacheV1,
+    invalidation_index: DependencyInvalidationIndexV1,
+    last_git: Option<RepositoryGitStateV1>,
+    pending_invalidations: Vec<ObservedManifestInvalidationV1>,
     poison: Option<IncompleteToolStateV1>,
     accounting: ObservedManifestAccountingV1,
-    dependency_invalidation_index: DependencyInvalidationIndexV1,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -523,39 +532,181 @@ struct SealedManifestObservationV1 {
     witnesses: Vec<ManifestWitnessV1>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[allow(dead_code)]
-#[derive(Clone, Debug)]
-struct DependentObservationV1 {
-    observation_key: ManifestObservationKeyV1,
-    path: PathBuf,
+pub(crate) enum ManifestDependentKindV1 {
+    Observation,
+    Result,
+    Fact,
+    Validation,
+    Artifact,
+}
+
+/// A typed dependent identity. The digest names metadata; it never grants
+/// result retrieval, freshness, delivery, or reuse authority.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[allow(dead_code)]
+pub(crate) struct ManifestDependentV1 {
+    kind: ManifestDependentKindV1,
+    identity: StateDigestV1,
 }
 
 #[allow(dead_code)]
+impl ManifestDependentV1 {
+    pub(crate) const fn new(kind: ManifestDependentKindV1, identity: StateDigestV1) -> Self {
+        Self { kind, identity }
+    }
+
+    pub(crate) const fn kind(self) -> ManifestDependentKindV1 {
+        self.kind
+    }
+
+    pub(crate) const fn identity(self) -> StateDigestV1 {
+        self.identity
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum ManifestDependencyV1 {
+    Workspace,
+    Git,
+    RepositoryPath(PathBuf),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ObservedManifestInvalidationV1 {
+    dependency_count: usize,
+    dependents: Vec<ManifestDependentV1>,
+}
+
+#[allow(dead_code)]
+impl ObservedManifestInvalidationV1 {
+    pub(crate) const fn dependency_count(&self) -> usize {
+        self.dependency_count
+    }
+
+    pub(crate) fn dependents(&self) -> &[ManifestDependentV1] {
+        &self.dependents
+    }
+}
+
 #[derive(Default)]
 struct DependencyInvalidationIndexV1 {
-    path_to_dependents: BTreeMap<PathBuf, Vec<DependentObservationV1>>,
+    dependency_to_dependents: BTreeMap<ManifestDependencyV1, BTreeSet<ManifestDependentV1>>,
+    dependent_to_dependencies: BTreeMap<ManifestDependentV1, BTreeSet<ManifestDependencyV1>>,
+    edges: usize,
 }
 
 impl DependencyInvalidationIndexV1 {
-    fn add_dependent(&mut self, observation_key: ManifestObservationKeyV1, path: PathBuf) {
-        self.path_to_dependents
-            .entry(path)
-            .or_default()
-            .push(DependentObservationV1 {
-                observation_key: observation_key.clone(),
-                path: observation_key.path.clone(),
-            });
-    }
-
-    fn get_dependents(&self, path: &Path) -> Option<&Vec<DependentObservationV1>> {
-        self.path_to_dependents.get(path)
-    }
-
-    fn remove_dependent(&mut self, observation_key: &ManifestObservationKeyV1) {
-        for dependents in self.path_to_dependents.values_mut() {
-            dependents.retain(|dep| &dep.observation_key != observation_key);
+    fn register(
+        &mut self,
+        dependent: ManifestDependentV1,
+        dependencies: BTreeSet<ManifestDependencyV1>,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<()> {
+        let existing = self.dependent_to_dependencies.get(&dependent);
+        let new_edges = dependencies
+            .iter()
+            .filter(|dependency| existing.is_none_or(|current| !current.contains(*dependency)))
+            .count();
+        let next_dependents = self
+            .dependent_to_dependencies
+            .len()
+            .checked_add(usize::from(existing.is_none()))
+            .ok_or_else(|| manifest_index_limit("count manifest dependents"))?;
+        let next_edges = self
+            .edges
+            .checked_add(new_edges)
+            .ok_or_else(|| manifest_index_limit("count manifest dependency edges"))?;
+        if next_dependents > limits.max_manifest_dependents
+            || next_edges > limits.max_manifest_dependency_edges
+        {
+            return Err(manifest_index_limit("bound manifest dependency index"));
         }
+
+        for dependency in dependencies {
+            if self
+                .dependent_to_dependencies
+                .entry(dependent)
+                .or_default()
+                .insert(dependency.clone())
+            {
+                self.dependency_to_dependents
+                    .entry(dependency)
+                    .or_default()
+                    .insert(dependent);
+                self.edges += 1;
+            }
+        }
+        Ok(())
     }
+
+    fn invalidate(
+        &mut self,
+        dependencies: &BTreeSet<ManifestDependencyV1>,
+        limits: &WorkspaceAuthorityLimitsV1,
+    ) -> AuthorityResult<Vec<ManifestDependentV1>> {
+        let mut dependents = BTreeSet::new();
+        for dependency in dependencies {
+            if let Some(found) = self.dependency_to_dependents.get(dependency) {
+                dependents.extend(found.iter().copied());
+            }
+        }
+        let edge_work = dependents.iter().try_fold(0usize, |total, dependent| {
+            total.checked_add(
+                self.dependent_to_dependencies
+                    .get(dependent)
+                    .map_or(0, BTreeSet::len),
+            )
+        });
+        let work = dependencies
+            .len()
+            .checked_add(dependents.len())
+            .and_then(|total| edge_work.and_then(|edges| total.checked_add(edges)))
+            .ok_or_else(|| manifest_index_limit("count manifest invalidation work"))?;
+        if work > limits.max_manifest_invalidation_work {
+            return Err(manifest_index_limit("bound manifest invalidation work"));
+        }
+
+        for dependent in &dependents {
+            let Some(bound_dependencies) = self.dependent_to_dependencies.remove(dependent) else {
+                continue;
+            };
+            for dependency in bound_dependencies {
+                let remove_key = if let Some(bound_dependents) =
+                    self.dependency_to_dependents.get_mut(&dependency)
+                {
+                    if bound_dependents.remove(dependent) {
+                        self.edges = self.edges.saturating_sub(1);
+                    }
+                    bound_dependents.is_empty()
+                } else {
+                    false
+                };
+                if remove_key {
+                    self.dependency_to_dependents.remove(&dependency);
+                }
+            }
+        }
+        Ok(dependents.into_iter().collect())
+    }
+
+    fn dependency_count(&self) -> usize {
+        self.dependency_to_dependents.len()
+    }
+
+    fn dependent_count(&self) -> usize {
+        self.dependent_to_dependencies.len()
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges
+    }
+}
+
+fn manifest_index_limit(operation: &'static str) -> IncompleteToolStateV1 {
+    incomplete_limit(StateDimensionV1::RepositoryContent, None, operation)
 }
 
 #[allow(dead_code)]
@@ -637,6 +788,14 @@ impl ManifestNodeCacheV1 {
         self.max_depth = self.max_depth.max(depth);
         Ok(())
     }
+
+    fn invalidate_paths(&mut self, changed: &BTreeSet<PathBuf>) {
+        self.nodes.retain(|path, _| {
+            !changed
+                .iter()
+                .any(|dependency| path == dependency || path.starts_with(dependency))
+        });
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -652,6 +811,12 @@ pub(crate) struct ObservedManifestAccountingV1 {
     physical_directory_listings: u64,
     node_reuse_hits: u64,
     reuse_hits: u64,
+    dependency_count: u64,
+    dependent_count: u64,
+    dependency_edges: u64,
+    invalidation_events: u64,
+    invalidated_dependents: u64,
+    epoch_advancements: u64,
 }
 
 #[allow(dead_code)]
@@ -681,23 +846,53 @@ impl ObservedManifestAccountingV1 {
     }
 
     #[cfg(test)]
-    const fn physical_content_hashes(self) -> u64 {
+    pub(crate) const fn physical_content_hashes(self) -> u64 {
         self.physical_content_hashes
     }
 
     #[cfg(test)]
-    const fn physical_directory_listings(self) -> u64 {
+    pub(crate) const fn physical_directory_listings(self) -> u64 {
         self.physical_directory_listings
     }
 
     #[cfg(test)]
-    const fn node_reuse_hits(self) -> u64 {
+    pub(crate) const fn node_reuse_hits(self) -> u64 {
         self.node_reuse_hits
     }
 
     #[cfg(test)]
-    const fn reuse_hits(self) -> u64 {
+    pub(crate) const fn reuse_hits(self) -> u64 {
         self.reuse_hits
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn dependency_count(self) -> u64 {
+        self.dependency_count
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn dependent_count(self) -> u64 {
+        self.dependent_count
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn dependency_edges(self) -> u64 {
+        self.dependency_edges
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn invalidation_events(self) -> u64 {
+        self.invalidation_events
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn invalidated_dependents(self) -> u64 {
+        self.invalidated_dependents
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn epoch_advancements(self) -> u64 {
+        self.epoch_advancements
     }
 }
 
@@ -1136,6 +1331,7 @@ impl WorkspaceExecutionEpochV1 {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn observe_repository(
         &self,
         plan: &RepositoryObservationPlanV1,
@@ -1148,18 +1344,56 @@ impl WorkspaceExecutionEpochV1 {
     pub(crate) fn begin_observed_manifest(
         &self,
         limits: &WorkspaceAuthorityLimitsV1,
-    ) -> AuthorityResult<ObservedManifestV1<'_>> {
+    ) -> AuthorityResult<ObservedManifestV1> {
         validate_limits(limits)?;
         self.verify_current_path()?;
+        let retained = self.retained_clone()?;
         Ok(ObservedManifestV1 {
-            execution_epoch: self,
+            execution_epoch: Arc::new(retained),
             limits: limits.clone(),
             observations: BTreeMap::new(),
             nodes: ManifestNodeCacheV1::default(),
+            invalidation_index: DependencyInvalidationIndexV1::default(),
+            last_git: None,
+            pending_invalidations: Vec::new(),
             poison: None,
             accounting: ObservedManifestAccountingV1::default(),
-            dependency_invalidation_index: DependencyInvalidationIndexV1::default(),
         })
+    }
+
+    fn retained_clone(&self) -> AuthorityResult<Self> {
+        let root_handle = self.root_handle.try_clone().map_err(|error| {
+            incomplete_io(
+                StateDimensionV1::Repository,
+                &self.canonical_workspace,
+                "duplicate provider workspace epoch",
+                error,
+            )
+        })?;
+        let identity =
+            FilesystemIdentityV1::from_metadata(&root_handle.metadata().map_err(|error| {
+                incomplete_io(
+                    StateDimensionV1::Repository,
+                    &self.canonical_workspace,
+                    "inspect duplicated provider workspace epoch",
+                    error,
+                )
+            })?);
+        if !self.root_identity.same_authority(identity) {
+            return Err(concurrent(
+                StateDimensionV1::Repository,
+                &self.canonical_workspace,
+                "authenticate duplicated provider workspace epoch",
+            ));
+        }
+        let retained = Self {
+            requested_workspace: self.requested_workspace.clone(),
+            canonical_workspace: self.canonical_workspace.clone(),
+            root_handle,
+            root_identity: self.root_identity,
+        };
+        retained.verify_current_path()?;
+        Ok(retained)
     }
 
     pub(crate) fn read_repository_file(
@@ -1445,7 +1679,41 @@ impl WorkspaceExecutionEpochV1 {
 }
 
 #[allow(dead_code)]
-impl ObservedManifestV1<'_> {
+impl ObservedManifestV1 {
+    /// Bind a result, fact, validation, or artifact identity to every complete
+    /// witness in an already-observed plan. This is an invalidation index only:
+    /// the dependent identity cannot be used to retrieve or serve anything.
+    pub(crate) fn register_dependent(
+        &mut self,
+        plan: &RepositoryObservationPlanV1,
+        dependent: ManifestDependentV1,
+    ) -> AuthorityResult<()> {
+        if let Some(error) = &self.poison {
+            return Err(error.clone());
+        }
+        let plan = normalize_plan(plan, &self.limits)?;
+        let mut dependencies =
+            BTreeSet::from([ManifestDependencyV1::Workspace, ManifestDependencyV1::Git]);
+        for key in manifest_observation_keys_v1(&plan) {
+            let sealed = self.observations.get(&key).ok_or_else(|| {
+                incomplete_plan(
+                    StateDimensionV1::RepositoryContent,
+                    Some(&key.path),
+                    "register dependent from complete manifest coverage",
+                )
+            })?;
+            dependencies.extend(sealed.witnesses.iter().map(|witness| {
+                ManifestDependencyV1::RepositoryPath(witness.relative_path.clone())
+            }));
+        }
+        self.invalidation_index
+            .register(dependent, dependencies, &self.limits)
+    }
+
+    pub(crate) fn take_invalidations(&mut self) -> Vec<ObservedManifestInvalidationV1> {
+        std::mem::take(&mut self.pending_invalidations)
+    }
+
     pub(crate) fn observe_repository(
         &mut self,
         plan: &RepositoryObservationPlanV1,
@@ -1509,6 +1777,7 @@ impl ObservedManifestV1<'_> {
         }
 
         let git_before = observe_git_state(&canonical_workspace, &self.limits)?;
+        self.advance_for_stale_dependencies(&git_before)?;
         let keys = manifest_observation_keys_v1(&plan);
         let mut observations = Vec::new();
         observations.try_reserve_exact(keys.len()).map_err(|_| {
@@ -1521,7 +1790,11 @@ impl ObservedManifestV1<'_> {
 
         for key in &keys {
             if let Some(cached) = self.observations.get(key) {
-                validate_manifest_witnesses_v1(self.execution_epoch, &cached.witnesses)?;
+                validate_manifest_witnesses_v1(
+                    &self.execution_epoch,
+                    &cached.witnesses,
+                    &self.limits,
+                )?;
                 self.accounting.reuse_hits =
                     self.accounting.reuse_hits.checked_add(1).ok_or_else(|| {
                         incomplete_limit(
@@ -1535,7 +1808,7 @@ impl ObservedManifestV1<'_> {
             }
 
             let sealed = observe_manifest_entry_v1(
-                self.execution_epoch,
+                &self.execution_epoch,
                 key,
                 &self.limits,
                 &mut self.nodes,
@@ -1586,9 +1859,16 @@ impl ObservedManifestV1<'_> {
             self.accounting.cached_observations = next_cached;
             self.accounting.observed_entries = next_entries;
             self.accounting.observed_bytes = next_bytes;
+            let observation_dependent = manifest_observation_dependent_v1(key);
+            let dependencies = sealed
+                .witnesses
+                .iter()
+                .map(|witness| ManifestDependencyV1::RepositoryPath(witness.relative_path.clone()))
+                .collect();
+            self.invalidation_index
+                .register(observation_dependent, dependencies, &self.limits)?;
             observations.push(sealed.observation.clone());
             self.observations.insert(key.clone(), sealed);
-            self.dependency_invalidation_index.add_dependent(key.clone(), key.path.clone());
         }
 
         between_observation_and_fence();
@@ -1600,7 +1880,7 @@ impl ObservedManifestV1<'_> {
                     "require sealed manifest observation",
                 )
             })?;
-            validate_manifest_witnesses_v1(self.execution_epoch, &sealed.witnesses)?;
+            validate_manifest_witnesses_v1(&self.execution_epoch, &sealed.witnesses, &self.limits)?;
         }
         self.execution_epoch.verify_current_path()?;
         let git_after = observe_git_state(&canonical_workspace, &self.limits)?;
@@ -1657,7 +1937,95 @@ impl ObservedManifestV1<'_> {
             b"again.repository-epoch.v1",
             &encode_repository_epoch(&repository_epoch),
         );
+        self.last_git = Some(git_after);
         Ok(repository_epoch)
+    }
+
+    fn advance_for_stale_dependencies(
+        &mut self,
+        current_git: &RepositoryGitStateV1,
+    ) -> AuthorityResult<()> {
+        let mut changed_dependencies = BTreeSet::new();
+        if self
+            .last_git
+            .as_ref()
+            .is_some_and(|previous| previous != current_git)
+        {
+            changed_dependencies.insert(ManifestDependencyV1::Git);
+        }
+        for sealed in self.observations.values() {
+            for witness in &sealed.witnesses {
+                if !manifest_witness_is_current_v1(&self.execution_epoch, witness, &self.limits)? {
+                    changed_dependencies.insert(ManifestDependencyV1::RepositoryPath(
+                        witness.relative_path.clone(),
+                    ));
+                }
+            }
+        }
+        if changed_dependencies.is_empty() {
+            return Ok(());
+        }
+
+        let dependents = self
+            .invalidation_index
+            .invalidate(&changed_dependencies, &self.limits)?;
+        let invalidated: BTreeSet<_> = dependents.iter().copied().collect();
+        let observation_keys: Vec<_> = self
+            .observations
+            .keys()
+            .filter(|key| invalidated.contains(&manifest_observation_dependent_v1(key)))
+            .cloned()
+            .collect();
+        for key in observation_keys {
+            if let Some(sealed) = self.observations.remove(&key) {
+                self.accounting.cached_observations =
+                    self.accounting.cached_observations.saturating_sub(1);
+                self.accounting.observed_entries = self
+                    .accounting
+                    .observed_entries
+                    .saturating_sub(sealed.observation.entries);
+                self.accounting.observed_bytes = self
+                    .accounting
+                    .observed_bytes
+                    .saturating_sub(sealed.observation.bytes);
+            }
+        }
+        let changed_paths = changed_dependencies
+            .iter()
+            .filter_map(|dependency| match dependency {
+                ManifestDependencyV1::RepositoryPath(path) => Some(path.clone()),
+                ManifestDependencyV1::Workspace | ManifestDependencyV1::Git => None,
+            })
+            .collect();
+        self.nodes.invalidate_paths(&changed_paths);
+
+        if self.pending_invalidations.len() >= self.limits.max_manifest_dependents {
+            return Err(manifest_index_limit("bound pending manifest invalidations"));
+        }
+        self.pending_invalidations
+            .try_reserve(1)
+            .map_err(|_| manifest_index_limit("allocate manifest invalidation"))?;
+        self.pending_invalidations
+            .push(ObservedManifestInvalidationV1 {
+                dependency_count: changed_dependencies.len(),
+                dependents,
+            });
+        self.accounting.invalidation_events = self
+            .accounting
+            .invalidation_events
+            .checked_add(1)
+            .ok_or_else(|| manifest_index_limit("count manifest invalidations"))?;
+        self.accounting.invalidated_dependents = self
+            .accounting
+            .invalidated_dependents
+            .checked_add(invalidated.len() as u64)
+            .ok_or_else(|| manifest_index_limit("count invalidated dependents"))?;
+        self.accounting.epoch_advancements = self
+            .accounting
+            .epoch_advancements
+            .checked_add(1)
+            .ok_or_else(|| manifest_index_limit("count manifest epoch advancements"))?;
+        Ok(())
     }
 
     pub(crate) fn accounting(&self) -> ObservedManifestAccountingV1 {
@@ -1668,6 +2036,9 @@ impl ObservedManifestV1<'_> {
             physical_content_hashes: self.nodes.physical_content_hashes,
             physical_directory_listings: self.nodes.physical_directory_listings,
             node_reuse_hits: self.nodes.node_reuse_hits,
+            dependency_count: self.invalidation_index.dependency_count() as u64,
+            dependent_count: self.invalidation_index.dependent_count() as u64,
+            dependency_edges: self.invalidation_index.edge_count() as u64,
             ..self.accounting
         }
     }
@@ -1704,6 +2075,118 @@ impl ObservedManifestV1<'_> {
             encoder.digest(value.observation.digest);
         }
         encoder.finish()
+    }
+}
+
+fn manifest_observation_dependent_v1(key: &ManifestObservationKeyV1) -> ManifestDependentV1 {
+    let mut encoder = CanonicalEncoder::new(b"again.manifest-observation-dependent.v1");
+    encoder.u8(observation_kind_tag(key.kind));
+    encoder.path(&key.path);
+    ManifestDependentV1::new(ManifestDependentKindV1::Observation, encoder.finish())
+}
+
+fn manifest_witness_is_current_v1(
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    witness: &ManifestWitnessV1,
+    limits: &WorkspaceAuthorityLimitsV1,
+) -> AuthorityResult<bool> {
+    let display = execution_epoch
+        .canonical_workspace
+        .join(&witness.relative_path);
+    let kind = match secure_node_kind_relative(
+        &execution_epoch.root_handle,
+        &witness.relative_path,
+        StateDimensionV1::RepositoryContent,
+        &display,
+        "inspect manifest dependency freshness",
+    ) {
+        Ok(kind) => kind,
+        Err(error)
+            if matches!(
+                error.primary_code(),
+                IncompleteReasonCodeV1::SymlinkRefused | IncompleteReasonCodeV1::SpecialFileRefused
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
+    match &witness.state {
+        ManifestWitnessStateV1::Missing => Ok(kind.is_none()),
+        ManifestWitnessStateV1::Regular(expected) => {
+            if kind != Some(SecureNodeKindV1::Regular) {
+                return Ok(false);
+            }
+            let handle = secure_open_relative(
+                &execution_epoch.root_handle,
+                &witness.relative_path,
+                ExpectedNodeV1::Regular,
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "open manifest dependency freshness",
+            )?;
+            let observed =
+                FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "inspect manifest dependency freshness",
+                        error,
+                    )
+                })?);
+            Ok(observed == *expected)
+        }
+        ManifestWitnessStateV1::DirectoryIdentity(expected) => {
+            if kind != Some(SecureNodeKindV1::Directory) {
+                return Ok(false);
+            }
+            let handle = secure_open_relative(
+                &execution_epoch.root_handle,
+                &witness.relative_path,
+                ExpectedNodeV1::Directory,
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "open manifest directory-identity freshness",
+            )?;
+            let observed =
+                FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "inspect manifest directory-identity freshness",
+                        error,
+                    )
+                })?);
+            Ok(observed == *expected)
+        }
+        ManifestWitnessStateV1::Directory { identity, names } => {
+            if kind != Some(SecureNodeKindV1::Directory) {
+                return Ok(false);
+            }
+            let handle = secure_open_relative(
+                &execution_epoch.root_handle,
+                &witness.relative_path,
+                ExpectedNodeV1::Directory,
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "open manifest directory freshness",
+            )?;
+            let observed =
+                FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
+                    incomplete_io(
+                        StateDimensionV1::RepositoryContent,
+                        &display,
+                        "inspect manifest directory freshness",
+                        error,
+                    )
+                })?);
+            if observed != *identity {
+                return Ok(false);
+            }
+            let current_names = directory_names_from_handle(&handle, &display, limits)?;
+            let current_names_again = directory_names_from_handle(&handle, &display, limits)?;
+            Ok(current_names == *names && current_names_again == *names)
+        }
     }
 }
 
@@ -2464,7 +2947,10 @@ fn validate_limits(limits: &WorkspaceAuthorityLimitsV1) -> AuthorityResult<()> {
         && limits.max_identity_bytes > 0
         && limits.max_task_field_bytes > 0
         && limits.max_external_dependencies > 0
-        && limits.max_external_token_bytes > 0;
+        && limits.max_external_token_bytes > 0
+        && limits.max_manifest_dependents > 0
+        && limits.max_manifest_dependency_edges > 0
+        && limits.max_manifest_invalidation_work > 0;
     if !valid || limits.max_file_bytes > limits.max_total_bytes {
         return Err(incomplete_plan(
             StateDimensionV1::Repository,
@@ -2710,107 +3196,18 @@ fn observe_manifest_entry_v1(
 fn validate_manifest_witnesses_v1(
     execution_epoch: &WorkspaceExecutionEpochV1,
     witnesses: &[ManifestWitnessV1],
+    limits: &WorkspaceAuthorityLimitsV1,
 ) -> AuthorityResult<()> {
     for witness in witnesses {
         let display = execution_epoch
             .canonical_workspace
             .join(&witness.relative_path);
-        match &witness.state {
-            ManifestWitnessStateV1::Missing => {
-                if secure_node_kind_relative(
-                    &execution_epoch.root_handle,
-                    &witness.relative_path,
-                    StateDimensionV1::RepositoryContent,
-                    &display,
-                    "revalidate missing manifest node",
-                )?
-                .is_some()
-                {
-                    return Err(concurrent(
-                        StateDimensionV1::RepositoryContent,
-                        &display,
-                        "revalidate missing manifest node",
-                    ));
-                }
-            }
-            ManifestWitnessStateV1::Regular(expected) => {
-                let handle = secure_open_relative(
-                    &execution_epoch.root_handle,
-                    &witness.relative_path,
-                    ExpectedNodeV1::Regular,
-                    StateDimensionV1::RepositoryContent,
-                    &display,
-                    "revalidate manifest regular file",
-                )?;
-                let observed =
-                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
-                        incomplete_io(
-                            StateDimensionV1::RepositoryContent,
-                            &display,
-                            "inspect revalidated manifest regular file",
-                            error,
-                        )
-                    })?);
-                if observed != *expected {
-                    return Err(concurrent(
-                        StateDimensionV1::RepositoryContent,
-                        &display,
-                        "revalidate manifest regular file",
-                    ));
-                }
-            }
-            ManifestWitnessStateV1::DirectoryIdentity(expected) => {
-                let handle = secure_open_relative(
-                    &execution_epoch.root_handle,
-                    &witness.relative_path,
-                    ExpectedNodeV1::Directory,
-                    StateDimensionV1::RepositoryContent,
-                    &display,
-                    "revalidate manifest directory identity",
-                )?;
-                let observed =
-                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
-                        incomplete_io(
-                            StateDimensionV1::RepositoryContent,
-                            &display,
-                            "inspect revalidated manifest directory identity",
-                            error,
-                        )
-                    })?);
-                if observed != *expected {
-                    return Err(concurrent(
-                        StateDimensionV1::RepositoryContent,
-                        &display,
-                        "revalidate manifest directory identity",
-                    ));
-                }
-            }
-            ManifestWitnessStateV1::Directory { identity, names: _ } => {
-                let handle = secure_open_relative(
-                    &execution_epoch.root_handle,
-                    &witness.relative_path,
-                    ExpectedNodeV1::Directory,
-                    StateDimensionV1::RepositoryContent,
-                    &display,
-                    "revalidate manifest directory",
-                )?;
-                let observed =
-                    FilesystemIdentityV1::from_metadata(&handle.metadata().map_err(|error| {
-                        incomplete_io(
-                            StateDimensionV1::RepositoryContent,
-                            &display,
-                            "inspect revalidated manifest directory",
-                            error,
-                        )
-                    })?);
-                if observed != *identity {
-                    return Err(concurrent(
-                        StateDimensionV1::RepositoryContent,
-                        &display,
-                        "revalidate manifest directory listing",
-                    ));
-                }
-            }
+        if !manifest_witness_is_current_v1(execution_epoch, witness, limits)? {
+            return Err(concurrent(
+                StateDimensionV1::RepositoryContent,
+                &display,
+                "revalidate manifest dependency",
+            ));
         }
     }
     execution_epoch.verify_current_path()
@@ -6337,7 +6734,7 @@ mod retained_epoch_tests {
     }
 
     #[test]
-    fn observed_manifest_relevant_mutation_poisons_future_reuse() {
+    fn observed_manifest_relevant_mutation_advances_and_invalidates_dependents() {
         let temporary = TempDir::new().unwrap();
         let repository = fs::canonicalize(temporary.path()).unwrap();
         fs::write(repository.join("input"), b"before").unwrap();
@@ -6350,23 +6747,38 @@ mod retained_epoch_tests {
             Vec::new(),
             Vec::new(),
         );
-        manifest.observe_repository(&plan).unwrap();
+        let before = manifest.observe_repository(&plan).unwrap();
+        let result = ManifestDependentV1::new(
+            ManifestDependentKindV1::Result,
+            StateDigestV1::from_domain_and_bytes(b"again.test-result.v1", b"result"),
+        );
+        manifest.register_dependent(&plan, result).unwrap();
+        assert_eq!(manifest.accounting().dependent_count(), 2);
+        assert_eq!(manifest.accounting().dependency_edges(), 4);
 
         fs::write(repository.join("input"), b"after!").unwrap();
-        let error = manifest.observe_repository(&plan).unwrap_err();
-        assert_eq!(
-            error.primary_code(),
-            IncompleteReasonCodeV1::ConcurrentMutation
-        );
+        let after = manifest.observe_repository(&plan).unwrap();
+        assert_ne!(before.digest(), after.digest());
         assert_eq!(
             manifest.coverage_for(&plan).unwrap(),
-            ObservedManifestCoverageV1::Poisoned
+            ObservedManifestCoverageV1::Complete
         );
-        assert_eq!(
-            manifest.observe_repository(&plan).unwrap_err(),
-            error,
-            "poisoned manifests must never resume from remaining entries"
+        let invalidations = manifest.take_invalidations();
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].dependency_count(), 1);
+        assert!(invalidations[0].dependents().contains(&result));
+        assert!(
+            invalidations[0]
+                .dependents()
+                .iter()
+                .any(|dependent| { dependent.kind() == ManifestDependentKindV1::Observation })
         );
+        let accounting = manifest.accounting();
+        assert_eq!(accounting.invalidation_events(), 1);
+        assert_eq!(accounting.invalidated_dependents(), 2);
+        assert_eq!(accounting.epoch_advancements(), 1);
+        assert_eq!(accounting.dependent_count(), 1);
+        assert_eq!(accounting.dependency_edges(), 1);
     }
 
     #[test]
@@ -6384,16 +6796,12 @@ mod retained_epoch_tests {
             Vec::new(),
             Vec::new(),
         );
-        manifest.observe_repository(&plan).unwrap();
+        let before = manifest.observe_repository(&plan).unwrap();
 
         fs::write(repository.join("src/two"), b"two").unwrap();
-        assert_eq!(
-            manifest
-                .observe_repository(&plan)
-                .unwrap_err()
-                .primary_code(),
-            IncompleteReasonCodeV1::ConcurrentMutation
-        );
+        let after = manifest.observe_repository(&plan).unwrap();
+        assert_ne!(before.digest(), after.digest());
+        assert_eq!(manifest.accounting().epoch_advancements(), 1);
     }
 
     #[test]
@@ -6412,7 +6820,7 @@ mod retained_epoch_tests {
             Vec::new(),
             Vec::new(),
         );
-        manifest.observe_repository(&plan).unwrap();
+        let before = manifest.observe_repository(&plan).unwrap();
 
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"after!").unwrap();
@@ -6422,13 +6830,9 @@ mod retained_epoch_tests {
             .unwrap()
             .set_times(FileTimes::new().set_modified(modified))
             .unwrap();
-        assert_eq!(
-            manifest
-                .observe_repository(&plan)
-                .unwrap_err()
-                .primary_code(),
-            IncompleteReasonCodeV1::ConcurrentMutation
-        );
+        let after = manifest.observe_repository(&plan).unwrap();
+        assert_ne!(before.digest(), after.digest());
+        assert_eq!(manifest.accounting().epoch_advancements(), 1);
     }
 
     #[test]
@@ -6444,16 +6848,13 @@ mod retained_epoch_tests {
             Vec::new(),
             vec![PathBuf::from("missing")],
         );
-        manifest.observe_repository(&plan).unwrap();
+        let before = manifest.observe_repository(&plan).unwrap();
 
         fs::write(repository.join("missing"), b"present").unwrap();
-        assert_eq!(
-            manifest
-                .observe_repository(&plan)
-                .unwrap_err()
-                .primary_code(),
-            IncompleteReasonCodeV1::ConcurrentMutation
-        );
+        let after = manifest.observe_repository(&plan).unwrap();
+        assert_ne!(before.digest(), after.digest());
+        assert!(after.observations()[0].is_present());
+        assert_eq!(manifest.accounting().epoch_advancements(), 1);
     }
 
     #[test]
@@ -6478,6 +6879,43 @@ mod retained_epoch_tests {
         let second = manifest.observe_repository(&plan).unwrap();
         assert_eq!(first, second);
         assert_eq!(manifest.accounting().physical_content_hashes(), hashes);
+        assert_eq!(manifest.accounting().invalidation_events(), 0);
+        assert!(manifest.take_invalidations().is_empty());
+    }
+
+    #[test]
+    fn observed_manifest_dependency_index_bounds_fail_closed() {
+        let temporary = TempDir::new().unwrap();
+        let repository = fs::canonicalize(temporary.path()).unwrap();
+        fs::write(repository.join("input"), b"input").unwrap();
+        let limits = WorkspaceAuthorityLimitsV1 {
+            max_manifest_dependents: 1,
+            max_manifest_dependency_edges: 1,
+            max_manifest_invalidation_work: 4,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        manifest.observe_repository(&plan).unwrap();
+        let dependent = ManifestDependentV1::new(
+            ManifestDependentKindV1::Fact,
+            StateDigestV1::from_domain_and_bytes(b"again.test-fact.v1", b"fact"),
+        );
+        assert_eq!(
+            manifest
+                .register_dependent(&plan, dependent)
+                .unwrap_err()
+                .primary_code(),
+            IncompleteReasonCodeV1::InputLimitExceeded
+        );
+        assert_eq!(manifest.accounting().dependent_count(), 1);
+        assert_eq!(manifest.accounting().dependency_edges(), 1);
     }
 
     #[test]
@@ -6678,6 +7116,87 @@ mod retained_epoch_tests {
 
         assert_eq!(observed, expected);
         assert_eq!(observed.digest(), expected.digest());
+    }
+
+    /// Manual Phase-1 performance harness. It is ignored because it creates
+    /// more than 11,000 files; retained benchmark evidence must record the
+    /// exact source and binary identities outside the ordinary unit suite.
+    #[test]
+    #[ignore = "manual observed-manifest scale benchmark"]
+    fn observed_manifest_scale_benchmark() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Instant;
+
+        for file_count in [1_000usize, 10_000] {
+            let temporary = TempDir::new().unwrap();
+            let repository = fs::canonicalize(temporary.path()).unwrap();
+            fs::create_dir(repository.join("src")).unwrap();
+            for index in 0..file_count {
+                fs::write(
+                    repository.join(format!("src/file-{index:05}.rs")),
+                    format!("pub const VALUE_{index}: usize = {index};\n"),
+                )
+                .unwrap();
+            }
+            fs::write(repository.join("large.bin"), vec![b'x'; 8 * 1024 * 1024]).unwrap();
+            let limits = WorkspaceAuthorityLimitsV1::default();
+            let plan = RepositoryObservationPlanV1::new(
+                vec![PathBuf::from("large.bin")],
+                vec![PathBuf::from("src")],
+                Vec::new(),
+                Vec::new(),
+            );
+            let epoch = WorkspaceExecutionEpochV1::begin(&repository, &limits).unwrap();
+            let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+
+            let cold_started = Instant::now();
+            manifest.observe_repository(&plan).unwrap();
+            let cold_ms = cold_started.elapsed().as_millis();
+            let cold_hashes = manifest.accounting().physical_content_hashes();
+
+            let warm_started = Instant::now();
+            manifest.observe_repository(&plan).unwrap();
+            let warm_ms = warm_started.elapsed().as_millis();
+            assert_eq!(manifest.accounting().physical_content_hashes(), cold_hashes);
+
+            fs::write(
+                repository.join("src/file-00000.rs"),
+                b"pub const VALUE_0: usize = 1;\n",
+            )
+            .unwrap();
+            let mutation_started = Instant::now();
+            manifest.observe_repository(&plan).unwrap();
+            let mutation_ms = mutation_started.elapsed().as_millis();
+            assert_eq!(
+                manifest.accounting().physical_content_hashes(),
+                cold_hashes + 1
+            );
+
+            let shared_repository = Arc::new(repository);
+            let barrier = Arc::new(Barrier::new(4));
+            let concurrent_started = Instant::now();
+            thread::scope(|scope| {
+                for _ in 0..4 {
+                    let repository = Arc::clone(&shared_repository);
+                    let barrier = Arc::clone(&barrier);
+                    let plan = plan.clone();
+                    let limits = limits.clone();
+                    scope.spawn(move || {
+                        let epoch =
+                            WorkspaceExecutionEpochV1::begin(repository.as_ref(), &limits).unwrap();
+                        let mut manifest = epoch.begin_observed_manifest(&limits).unwrap();
+                        barrier.wait();
+                        manifest.observe_repository(&plan).unwrap();
+                    });
+                }
+            });
+            let concurrent_ms = concurrent_started.elapsed().as_millis();
+
+            println!(
+                "{{\"schema\":\"again.observed-manifest-benchmark.v1\",\"files\":{file_count},\"coldMs\":{cold_ms},\"warmMs\":{warm_ms},\"mutationMs\":{mutation_ms},\"fourReaderConcurrentMs\":{concurrent_ms},\"physicalHashes\":{cold_hashes}}}"
+            );
+        }
     }
 }
 

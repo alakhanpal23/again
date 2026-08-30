@@ -6,6 +6,7 @@ pub mod agent_gateway_service;
 #[path = "agent_gateway_service_unsupported.rs"]
 pub mod agent_gateway_service;
 pub mod agent_gateway_setup;
+pub mod code_intelligence;
 pub mod effect;
 pub mod engine;
 pub mod executable;
@@ -29,6 +30,7 @@ pub(crate) mod runtime_attestation;
 pub mod sandbox;
 pub mod setup;
 pub mod store;
+pub mod task_lifecycle;
 #[cfg(feature = "team-alpha")]
 pub mod team;
 #[cfg(feature = "team-alpha")]

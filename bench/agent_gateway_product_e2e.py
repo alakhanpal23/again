@@ -37,7 +37,7 @@ from typing import Any, BinaryIO
 
 REPORT_SCHEMA = "again.agent-gateway-product-e2e.v1"
 HARNESS_VERSION = "1.0.0"
-EXPECTED_DATABASE_SCHEMA = 10
+EXPECTED_DATABASE_SCHEMA = 13
 MCP_PROTOCOL_VERSION = "2025-06-18"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RESULT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -53,6 +53,10 @@ RECOVERY_GRACE_SECONDS = 6.0
 PROCESS_STOP_SECONDS = 2.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 EXPECTED_ADVERTISED_TOOLS = (
+    "context.cancel",
+    "context.delta",
+    "context.publish",
+    "context.retrieve",
     "git.blame",
     "git.diff",
     "git.log",
@@ -66,6 +70,11 @@ EXPECTED_ADVERTISED_TOOLS = (
     "repo.search",
     "repo.stat",
     "repo.tree",
+    "task.claim",
+    "task.inspect",
+    "task.list",
+    "task.start",
+    "task.transition",
 )
 E2E_EXERCISED_TOOLS = frozenset(("repo.read", "repo.search"))
 
