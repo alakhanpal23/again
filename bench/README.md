@@ -1,5 +1,21 @@
 # Benchmarks
 
+## Local beta release gate
+
+[`local_beta_gate.py`](local_beta_gate.py) is the fail-closed final aggregator
+for the daemon/task-lifecycle local beta. It requires the ordered 12-step
+release-binary product scenario, a 100-client automatic-daemon chaos run,
+exactly four native package smokes, authenticated 14-asset release evidence,
+and outside-user paired Codex/Claude evidence. All inputs must bind to one
+source commit, and product/chaos/agent observations must bind to one binary.
+The output contains only compact digests and release decisions.
+
+The complete evidence schemas, beta chaos command, aggregation command, privacy
+rules, and Wave 2 integration boundary are documented in
+[`LOCAL_BETA_GATE.md`](../docs/LOCAL_BETA_GATE.md). No existing private-alpha
+artifact satisfies this gate: in particular, a quick 2-client chaos report or
+a deterministic/dry-run agent report is an explicit non-pass.
+
 ## Direct product benchmark
 
 [`direct_benchmark.py`](direct_benchmark.py) is the current product harness. It

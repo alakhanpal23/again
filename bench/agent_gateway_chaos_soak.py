@@ -45,7 +45,8 @@ from bench import agent_gateway_product_e2e as product
 
 
 SCHEMA = "again.agent-gateway-chaos-soak.v3"
-MAX_PROCESSES = 32
+MAX_PROCESSES = 128
+VALID_CONCURRENCIES = (1, 2, 4, 8, 16, 32, 64, 100, 128)
 MAX_OPERATIONS = 2_000
 MAX_EVIDENCE_BYTES = 1_000_000
 MAX_BINARY_BYTES = 256 * 1024 * 1024
@@ -321,15 +322,21 @@ class Session:
         state: pathlib.Path,
         label: str,
         timeout: float = 5.0,
+        automatic_daemon: bool = False,
     ) -> None:
+        self.automatic_daemon = automatic_daemon
         self.argv = (
-            str(binary),
-            "mcp",
-            "serve",
-            "--workspace",
-            str(repo),
-            "--authorization-scope",
-            "again-chaos-soak:exact-v2",
+            (str(binary), "mcp", "connect", "--workspace", str(repo))
+            if automatic_daemon
+            else (
+                str(binary),
+                "mcp",
+                "serve",
+                "--workspace",
+                str(repo),
+                "--authorization-scope",
+                "again-chaos-soak:exact-v2",
+            )
         )
         environment = {
             "PATH": "/usr/bin:/bin",
@@ -513,7 +520,17 @@ class Session:
         listing = self.request("tools", "tools/list", {})
         tools = listing.get("result", {}).get("tools")
         names = [item.get("name") for item in tools] if isinstance(tools, list) else []
-        if names != list(product.EXPECTED_ADVERTISED_TOOLS):
+        if self.automatic_daemon:
+            required = {
+                "task.start",
+                "task.inspect",
+                "task.list",
+                "task.claim",
+                "task.transition",
+            }
+            if len(names) != len(set(names)) or not required.issubset(names):
+                raise HarnessRefusal("tools", "beta task tool list is incomplete")
+        elif names != list(product.EXPECTED_ADVERTISED_TOOLS):
             raise HarnessRefusal("tools", "MCP tool list changed")
 
     def close(self) -> dict[str, Any]:
@@ -1004,18 +1021,29 @@ def _exact_probe(
     concurrency: int,
     operations: int,
     rng: random.Random,
+    *,
+    automatic_daemon: bool = False,
 ) -> dict[str, Any]:
     repo = _fixture(root)
     state = root / "exact-probe-state"
     sessions: list[Session] = []
     cleanup: list[dict[str, Any]] = []
     result_ids: list[str] = []
+    daemon_observed = False
+    daemon_stop: dict[str, Any] | None = None
     active_error: BaseException | None = None
     try:
         for index in range(concurrency):
-            session = Session(binary, repo, state, f"probe-{index}")
+            session = Session(
+                binary,
+                repo,
+                state,
+                f"probe-{index}",
+                automatic_daemon=automatic_daemon,
+            )
             sessions.append(session)
             session.handshake()
+            daemon_observed |= automatic_daemon
 
         schedule = [index % concurrency for index in range(operations)]
         rng.shuffle(schedule)
@@ -1054,19 +1082,28 @@ def _exact_probe(
                 cleanup.append(session.close())
             except BaseException as error:
                 cleanup_error = cleanup_error or error
+        if daemon_observed:
+            try:
+                daemon_stop = _stop_automatic_daemon(binary, repo, state, root)
+            except BaseException as error:
+                cleanup_error = cleanup_error or error
         if cleanup_error is not None and active_error is None:
             raise cleanup_error
     if len(set(result_ids)) != 1:
         raise HarnessRefusal("probe_result_divergence", "exact probe returned divergent result IDs")
-    expected_argv = [
-        str(binary),
-        "mcp",
-        "serve",
-        "--workspace",
-        str(repo),
-        "--authorization-scope",
-        "again-chaos-soak:exact-v2",
-    ]
+    expected_argv = (
+        [str(binary), "mcp", "connect", "--workspace", str(repo)]
+        if automatic_daemon
+        else [
+            str(binary),
+            "mcp",
+            "serve",
+            "--workspace",
+            str(repo),
+            "--authorization-scope",
+            "again-chaos-soak:exact-v2",
+        ]
+    )
     if any(item["argv"] != expected_argv for item in cleanup):
         raise HarnessRefusal("probe_argv", "exact probe launched an unexpected argv")
     if any(not _clean_exit_code(item.get("return_code")) for item in cleanup):
@@ -1074,6 +1111,8 @@ def _exact_probe(
     if any(not _cleanup_absent(item) for item in cleanup):
         raise HarnessRefusal("probe_cleanup", "exact probe left an owned process group")
     return {
+        "automatic_daemon": automatic_daemon,
+        "daemon_stop": daemon_stop,
         "operations": operations,
         "sessions": concurrency,
         "unique_result_ids": len(set(result_ids)),
@@ -1081,6 +1120,75 @@ def _exact_probe(
         "result_sha256": sha256_bytes(canonical_json({"text": "chaos fixture\n"})),
         "schedule_sha256": sha256_bytes(canonical_json(schedule)),
         "cleanup": cleanup,
+    }
+
+
+def _stop_automatic_daemon(
+    binary: pathlib.Path,
+    repo: pathlib.Path,
+    state: pathlib.Path,
+    root: pathlib.Path,
+) -> dict[str, Any]:
+    environment = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(root / "daemon-control-home"),
+        "TMPDIR": str(root / "daemon-control-tmp"),
+        "AGAIN_HOME": str(state),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
+        "CARGO_NET_OFFLINE": "true",
+    }
+    pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
+    pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700)
+    stop_argv = [str(binary), "mcp", "daemon", "stop", "--workspace", str(repo)]
+    status_argv = [str(binary), "mcp", "daemon", "status", "--workspace", str(repo)]
+    try:
+        stopped = subprocess.run(
+            stop_argv,
+            cwd=repo,
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=PROCESS_STOP_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise HarnessRefusal("daemon_stop", "automatic daemon stop command failed") from error
+    if stopped.returncode != 0 or len(stopped.stdout) > MAX_FRAME_BYTES or len(stopped.stderr) > MAX_STDERR_BYTES:
+        raise HarnessRefusal("daemon_stop", "automatic daemon did not accept bounded stop")
+    deadline = time.monotonic() + PROCESS_STOP_SECONDS * 2
+    status_attempts = 0
+    while True:
+        status_attempts += 1
+        try:
+            status = subprocess.run(
+                status_argv,
+                cwd=repo,
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=PROCESS_STOP_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise HarnessRefusal("daemon_stop", "automatic daemon status command failed") from error
+        if status.returncode != 0:
+            break
+        if time.monotonic() >= deadline:
+            raise HarnessRefusal("daemon_stop", "automatic daemon remained live after stop")
+        time.sleep(0.02)
+    return {
+        "stop_argv": stop_argv,
+        "stop_return_code": stopped.returncode,
+        "stop_stdout_sha256": sha256_bytes(stopped.stdout),
+        "stop_stderr_sha256": sha256_bytes(stopped.stderr),
+        "status_attempts": status_attempts,
+        "absent_after_stop": True,
     }
 
 
@@ -1536,12 +1644,15 @@ def run(
     seed: int = 1,
     output: pathlib.Path | None = None,
 ) -> dict[str, Any]:
-    if mode not in {"quick", "soak"}:
-        raise HarnessRefusal("mode", "mode must be quick or soak")
+    if mode not in {"quick", "soak", "beta"}:
+        raise HarnessRefusal("mode", "mode must be quick, soak, or beta")
     if concurrency is None:
-        concurrency = 2 if mode == "quick" else 4
-    if concurrency not in {1, 2, 4, 8, 16, 32} or concurrency > MAX_PROCESSES:
-        raise HarnessRefusal("concurrency", "concurrency must be one of 1,2,4,8,16,32")
+        concurrency = {"quick": 2, "soak": 4, "beta": 100}[mode]
+    if concurrency not in VALID_CONCURRENCIES or concurrency > MAX_PROCESSES:
+        allowed = ",".join(str(value) for value in VALID_CONCURRENCIES)
+        raise HarnessRefusal("concurrency", f"concurrency must be one of {allowed}")
+    if mode == "beta" and concurrency != 100:
+        raise HarnessRefusal("concurrency", "beta mode requires exactly 100 clients")
     if isinstance(seed, bool) or not 0 <= seed < 2**64:
         raise HarnessRefusal("seed", "seed must be an unsigned 64-bit integer")
     if not product.LEASE_TTL_SECONDS + product.RECOVERY_GRACE_SECONDS < duration <= 3600:
@@ -1602,7 +1713,12 @@ def run(
         if false_hits:
             raise HarnessRefusal("false_hit", f"observed {false_hits} false-hit scenarios")
         exact_probe = _exact_probe(
-            outer_pin.executable_path, root, concurrency, operations, rng
+            outer_pin.executable_path,
+            root,
+            concurrency,
+            operations,
+            rng,
+            automatic_daemon=mode == "beta",
         )
         transport_probe = _transport_chaos_probe(
             outer_pin.executable_path,
@@ -1769,7 +1885,7 @@ def run(
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--again-binary", type=pathlib.Path, required=True)
-    parser.add_argument("--mode", choices=("quick", "soak"), default="quick")
+    parser.add_argument("--mode", choices=("quick", "soak", "beta"), default="quick")
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--duration", type=float, default=45.0)
     parser.add_argument("--seed", type=int, default=1)

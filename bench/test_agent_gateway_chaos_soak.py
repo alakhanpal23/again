@@ -244,7 +244,8 @@ class ChaosSoakHarnessTests(unittest.TestCase):
 
     def test_bounds_and_network_nonclaim_are_explicit(self) -> None:
         self.assertEqual(harness.SCHEMA, "again.agent-gateway-chaos-soak.v3")
-        self.assertEqual(harness.MAX_PROCESSES, 32)
+        self.assertEqual(harness.MAX_PROCESSES, 128)
+        self.assertIn(100, harness.VALID_CONCURRENCIES)
         self.assertEqual(harness.LEASE_SECONDS, 30)
         self.assertEqual(harness.STDIO_MAX_INFLIGHT, 16)
         self.assertGreater(harness.TRANSPORT_FIXTURE_BYTES, 8 * 1024 * 1024)
@@ -289,6 +290,18 @@ class ChaosSoakHarnessTests(unittest.TestCase):
             ) as refused:
                 harness.run(pathlib.Path("/does/not/exist"), seed=seed)
             self.assertEqual(refused.exception.code, "seed")
+
+    def test_beta_mode_requires_exactly_100_clients_before_environmental_work(self) -> None:
+        for concurrency in (32, 64, 128):
+            with self.subTest(concurrency=concurrency), self.assertRaises(
+                harness.HarnessRefusal
+            ) as refused:
+                harness.run(
+                    pathlib.Path("/does/not/exist"),
+                    mode="beta",
+                    concurrency=concurrency,
+                )
+            self.assertEqual(refused.exception.code, "concurrency")
 
     def test_main_separates_unsupported_environment_from_failure(self) -> None:
         cases = (
