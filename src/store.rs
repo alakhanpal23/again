@@ -30,10 +30,18 @@ use crate::fingerprint::{FileDigestCache, FileIdentity};
 use crate::mcp_gateway::{
     ConfirmedDeliveryV1, RecipientConnectionRetirementV2, RecipientRetrievalAuthorityV2,
 };
+use crate::task_lifecycle::{
+    MAX_TASK_GRAPH_DEPTH_V1, MAX_TASK_LIST_ITEMS_V1, TaskBlockerV1, TaskClaimOutcomeV1,
+    TaskDefinitionV1, TaskExportV1, TaskRecordV1, TaskRelationKindV1, TaskStateV1,
+    TaskTransitionV1, screen_sensitive_text_v1, task_definition_digest_v1,
+    validate_task_selector_v1,
+};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
 const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
+const MAX_TASK_CONTEXT_LOGICAL_BYTES_V1: u64 = 256 * 1024 * 1024;
+const MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1: u64 = 1024 * 1024 * 1024;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -191,6 +199,23 @@ pub struct ContextTaskResolutionV1 {
     pub prompt: String,
     pub prompt_digest: String,
     pub matched_by: ContextTaskMatchV1,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskStartOutcomeV1 {
+    pub task: TaskRecordV1,
+    pub matched_by: ContextTaskMatchV1,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TaskQuotaStatusV1 {
+    pub task_context_bytes: u64,
+    pub task_context_limit_bytes: u64,
+    pub workspace_state_bytes: u64,
+    pub workspace_state_limit_bytes: u64,
+    pub maintenance_mode: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1701,6 +1726,161 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 13 {
+            let transaction =
+                Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            transaction.execute_batch(
+                r#"
+                DROP INDEX context_tasks_prompt_idx;
+                ALTER TABLE context_tasks_v1 ADD COLUMN definition_digest TEXT
+                    CHECK(definition_digest IS NULL OR length(definition_digest) = 64);
+                ALTER TABLE context_tasks_v1 ADD COLUMN acceptance_criteria_json TEXT NOT NULL
+                    DEFAULT '[]' CHECK(json_valid(acceptance_criteria_json));
+                ALTER TABLE context_tasks_v1 ADD COLUMN revision INTEGER NOT NULL
+                    DEFAULT 1 CHECK(revision > 0);
+                ALTER TABLE context_tasks_v1 ADD COLUMN state TEXT NOT NULL
+                    DEFAULT 'active' CHECK(state IN (
+                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
+                    ));
+                ALTER TABLE context_tasks_v1 ADD COLUMN state_generation INTEGER NOT NULL
+                    DEFAULT 1 CHECK(state_generation > 0);
+                CREATE UNIQUE INDEX context_tasks_definition_idx
+                    ON context_tasks_v1(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        definition_digest
+                    );
+                CREATE INDEX context_tasks_state_idx
+                    ON context_tasks_v1(repository_id, workspace_id, state, created_ms);
+
+                CREATE TABLE context_task_relations_v1 (
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    source_task_id TEXT NOT NULL CHECK(length(source_task_id) BETWEEN 1 AND 128),
+                    relation_kind TEXT NOT NULL CHECK(relation_kind IN ('parent', 'dependency', 'supersedes')),
+                    target_task_id TEXT NOT NULL CHECK(length(target_task_id) BETWEEN 1 AND 128),
+                    ordinal INTEGER NOT NULL CHECK(ordinal >= 0 AND ordinal < 64),
+                    created_ms INTEGER NOT NULL,
+                    PRIMARY KEY(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        source_task_id, relation_kind, target_task_id
+                    ),
+                    UNIQUE(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        source_task_id, relation_kind, ordinal
+                    ),
+                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, source_task_id)
+                        REFERENCES context_tasks_v1(
+                            repository_id, workspace_id, authorization_scope_digest,
+                            canonical_task_id
+                        ) ON DELETE CASCADE,
+                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, target_task_id)
+                        REFERENCES context_tasks_v1(
+                            repository_id, workspace_id, authorization_scope_digest,
+                            canonical_task_id
+                        ) ON DELETE RESTRICT,
+                    CHECK(source_task_id != target_task_id)
+                ) WITHOUT ROWID;
+                CREATE INDEX context_task_relations_target_idx
+                    ON context_task_relations_v1(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        target_task_id, relation_kind
+                    );
+
+                CREATE TABLE context_task_transitions_v1 (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
+                    from_state TEXT CHECK(from_state IS NULL OR from_state IN (
+                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
+                    )),
+                    to_state TEXT NOT NULL CHECK(to_state IN (
+                        'waiting', 'active', 'blocked', 'completed', 'failed', 'cancelled'
+                    )),
+                    state_generation INTEGER NOT NULL CHECK(state_generation > 0),
+                    lease_id TEXT,
+                    agent_id TEXT,
+                    session_id TEXT,
+                    lifecycle_generation INTEGER,
+                    reason TEXT NOT NULL CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 512),
+                    created_ms INTEGER NOT NULL,
+                    UNIQUE(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        canonical_task_id, state_generation
+                    ),
+                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
+                        REFERENCES context_tasks_v1(
+                            repository_id, workspace_id, authorization_scope_digest,
+                            canonical_task_id
+                        ) ON DELETE CASCADE,
+                    CHECK((agent_id IS NULL) = (session_id IS NULL)),
+                    CHECK((agent_id IS NULL) = (lifecycle_generation IS NULL)),
+                    CHECK(lifecycle_generation IS NULL OR lifecycle_generation > 0)
+                );
+                CREATE INDEX context_task_transitions_task_idx
+                    ON context_task_transitions_v1(
+                        repository_id, workspace_id, authorization_scope_digest,
+                        canonical_task_id, sequence
+                    );
+
+                CREATE TABLE context_workspace_quota_v1 (
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    task_context_bytes INTEGER NOT NULL CHECK(task_context_bytes >= 0),
+                    workspace_state_bytes INTEGER NOT NULL CHECK(workspace_state_bytes >= 0),
+                    maintenance_mode INTEGER NOT NULL CHECK(maintenance_mode IN (0, 1)),
+                    counter_checksum TEXT NOT NULL CHECK(length(counter_checksum) = 64),
+                    reconciled_ms INTEGER NOT NULL,
+                    PRIMARY KEY(repository_id, workspace_id)
+                ) WITHOUT ROWID;
+                "#,
+            )?;
+            let legacy_tasks = {
+                let mut statement = transaction.prepare(
+                    "SELECT repository_id, workspace_id, authorization_scope_digest,
+                            canonical_task_id, prompt_text, created_ms
+                     FROM context_tasks_v1
+                     ORDER BY repository_id, workspace_id,
+                              authorization_scope_digest, canonical_task_id",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (repository, workspace, authorization, task_id, prompt, created_ms) in legacy_tasks
+            {
+                let digest = task_definition_digest_v1(&prompt, &[], None, &[], None);
+                transaction.execute(
+                    "UPDATE context_tasks_v1 SET definition_digest = ?5
+                     WHERE repository_id = ?1 AND workspace_id = ?2
+                       AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+                    params![repository, workspace, authorization, task_id, digest],
+                )?;
+                transaction.execute(
+                    "INSERT INTO context_task_transitions_v1 (
+                        repository_id, workspace_id, authorization_scope_digest,
+                        canonical_task_id, from_state, to_state, state_generation,
+                        reason, created_ms
+                     ) VALUES (?1, ?2, ?3, ?4, NULL, 'active', 1,
+                               'schema_v12_migration', ?5)",
+                    params![repository, workspace, authorization, task_id, created_ms],
+                )?;
+            }
+            reconcile_all_task_quotas_v1_tx(&transaction, now_ms())?;
+            transaction.pragma_update(None, "user_version", 13)?;
+            transaction.commit()?;
+        }
         Ok(())
     }
 
@@ -1825,6 +2005,17 @@ impl Store {
         policy_version: &str,
         proof_json: &str,
     ) -> Result<StoredResult> {
+        // Refuse known maintenance/quota exhaustion before publishing even an
+        // orphan-eligible CAS blob. The serialized check below remains the
+        // authoritative race fence immediately before the result row.
+        {
+            let preflight = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+            enforce_workspace_result_capacity_v1(
+                &preflight,
+                (stdout.len() as u64).saturating_add(stderr.len() as u64),
+            )?;
+            preflight.commit()?;
+        }
         let stdout_digest = self.put_blob(stdout)?;
         let stderr_digest = self.put_blob(stderr)?;
         let result = StoredResult {
@@ -1884,6 +2075,10 @@ impl Store {
             transaction.commit()?;
             return Ok(existing);
         }
+        enforce_workspace_result_capacity_v1(
+            &transaction,
+            result.stdout_bytes.saturating_add(result.stderr_bytes),
+        )?;
         transaction.execute(
             "INSERT INTO results (id, request_key, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, policy_version, proof_json, created_ms, last_used_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
             params![
@@ -1900,6 +2095,7 @@ impl Store {
                 now,
             ],
         )?;
+        refresh_workspace_state_quota_v1_tx(&transaction, now)?;
         transaction.commit()?;
         Ok(result)
     }
@@ -2461,12 +2657,15 @@ impl Store {
         reasoning_item_v1(crate::agent_gateway::context::validate_reasoning_text_v1(
             prompt, 8192,
         ))?;
+        screen_sensitive_text_v1(prompt)?;
         let prompt_digest = context_task_prompt_digest_v1(prompt);
+        let definition_digest = task_definition_digest_v1(prompt, &[], None, &[], None);
         let now = now_ms();
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         let existing_alias = transaction
             .query_row(
-                "SELECT alias.canonical_task_id, task.prompt_digest, task.prompt_text
+                "SELECT alias.canonical_task_id, task.prompt_digest, task.prompt_text,
+                        task.definition_digest
                  FROM context_task_aliases_v1 AS alias
                  JOIN context_tasks_v1 AS task
                    ON task.repository_id = alias.repository_id
@@ -2486,15 +2685,21 @@ impl Store {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
                     ))
                 },
             )
             .optional()?;
-        if let Some((canonical_task_id, stored_digest, stored_prompt)) = existing_alias {
+        if let Some((canonical_task_id, stored_digest, stored_prompt, stored_definition_digest)) =
+            existing_alias
+        {
             if context_task_prompt_digest_v1(&stored_prompt) != stored_digest {
                 bail!("context_task_corrupt");
             }
-            if supplied_prompt.is_some() && stored_digest != prompt_digest {
+            if supplied_prompt.is_some()
+                && (stored_digest != prompt_digest
+                    || stored_definition_digest.as_deref() != Some(&definition_digest))
+            {
                 bail!("task_definition_conflict");
             }
             transaction.execute(
@@ -2523,12 +2728,12 @@ impl Store {
             .query_row(
                 "SELECT canonical_task_id, prompt_text FROM context_tasks_v1
                  WHERE repository_id = ?1 AND workspace_id = ?2
-                   AND authorization_scope_digest = ?3 AND prompt_digest = ?4",
+                   AND authorization_scope_digest = ?3 AND definition_digest = ?4",
                 params![
                     repository_id,
                     workspace_id,
                     authorization_scope_digest,
-                    prompt_digest
+                    definition_digest
                 ],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -2546,6 +2751,12 @@ impl Store {
             if alias_count >= MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1 {
                 bail!("context_task_alias_capacity_exceeded");
             }
+            reserve_task_context_bytes_v1(
+                &transaction,
+                repository_id,
+                workspace_id,
+                task_alias_logical_bytes_v1(requested_task_id, &canonical_task_id),
+            )?;
             transaction.execute(
                 "INSERT INTO context_task_aliases_v1 (
                     repository_id, workspace_id, authorization_scope_digest,
@@ -2600,11 +2811,24 @@ impl Store {
         if alias_count >= MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1 {
             bail!("context_task_alias_capacity_exceeded");
         }
+        let acceptance_json = "[]";
+        let initial_bytes = task_row_logical_bytes_v1(requested_task_id, prompt, acceptance_json)
+            .saturating_add(task_alias_logical_bytes_v1(
+                requested_task_id,
+                requested_task_id,
+            ))
+            .saturating_add(task_transition_logical_bytes_v1(
+                requested_task_id,
+                "task_started",
+                None,
+            ));
+        reserve_task_context_bytes_v1(&transaction, repository_id, workspace_id, initial_bytes)?;
         transaction.execute(
             "INSERT INTO context_tasks_v1 (
                 repository_id, workspace_id, authorization_scope_digest,
-                canonical_task_id, prompt_digest, prompt_text, created_ms, updated_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+                canonical_task_id, prompt_digest, prompt_text, created_ms, updated_ms,
+                definition_digest, acceptance_criteria_json, revision, state, state_generation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, '[]', 1, 'active', 1)",
             params![
                 repository_id,
                 workspace_id,
@@ -2612,7 +2836,8 @@ impl Store {
                 requested_task_id,
                 prompt_digest,
                 prompt,
-                now
+                now,
+                definition_digest
             ],
         )?;
         transaction.execute(
@@ -2620,6 +2845,20 @@ impl Store {
                 repository_id, workspace_id, authorization_scope_digest,
                 requested_task_id, canonical_task_id, created_ms
              ) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO context_task_transitions_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                canonical_task_id, from_state, to_state, state_generation,
+                reason, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, NULL, 'active', 1, 'task_started', ?5)",
             params![
                 repository_id,
                 workspace_id,
@@ -2652,46 +2891,1014 @@ impl Store {
             authorization_scope_digest,
             "context task authorization scope",
         )?;
-        let row = self
-            .conn
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let Some(canonical_task_id) = resolve_task_alias_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let task = load_task_record_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            &canonical_task_id,
+            requested_task_id,
+        )?;
+        let prompt_digest = context_task_prompt_digest_v1(task.definition.prompt());
+        let prompt = task.definition.prompt().to_owned();
+        transaction.commit()?;
+        Ok(Some(ContextTaskResolutionV1 {
+            canonical_task_id,
+            requested_task_id: requested_task_id.to_owned(),
+            prompt,
+            prompt_digest,
+            matched_by: ContextTaskMatchV1::JoinedByTaskId,
+        }))
+    }
+
+    /// Start or converge one immutable task definition in the authenticated scope.
+    pub fn start_task_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+        supplied: &TaskDefinitionV1,
+    ) -> Result<TaskStartOutcomeV1> {
+        validate_task_selector_v1(repository_id)?;
+        validate_task_selector_v1(workspace_id)?;
+        validate_task_selector_v1(requested_task_id)?;
+        validate_digest(
+            authorization_scope_digest,
+            "task authorization scope digest",
+        )?;
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let resolve_relation = |selector: Option<&str>| -> Result<Option<String>> {
+            selector
+                .map(|selector| {
+                    if selector == requested_task_id {
+                        bail!("task_graph_self_edge");
+                    }
+                    resolve_task_alias_tx_v1(
+                        &transaction,
+                        repository_id,
+                        workspace_id,
+                        authorization_scope_digest,
+                        selector,
+                    )?
+                    .ok_or_else(|| anyhow!("task_relation_unavailable"))
+                })
+                .transpose()
+        };
+        let parent = resolve_relation(supplied.parent_task_id())?;
+        let supersedes = resolve_relation(supplied.supersedes_task_id())?;
+        let mut dependencies = Vec::with_capacity(supplied.dependency_task_ids().len());
+        for dependency in supplied.dependency_task_ids() {
+            if dependency == requested_task_id {
+                bail!("task_graph_self_edge");
+            }
+            dependencies.push(
+                resolve_task_alias_tx_v1(
+                    &transaction,
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    dependency,
+                )?
+                .ok_or_else(|| anyhow!("task_relation_unavailable"))?,
+            );
+        }
+        dependencies.sort();
+        if dependencies.windows(2).any(|pair| pair[0] == pair[1]) {
+            bail!("duplicate_task_dependency");
+        }
+        let definition = TaskDefinitionV1::new(
+            supplied.prompt(),
+            supplied.acceptance_criteria().to_vec(),
+            parent,
+            dependencies,
+            supersedes,
+        )?;
+
+        if let Some(canonical) = resolve_task_alias_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+        )? {
+            let task = load_task_record_tx_v1(
+                &transaction,
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                &canonical,
+                requested_task_id,
+            )?;
+            if task.definition.definition_digest() != definition.definition_digest() {
+                bail!("task_definition_conflict");
+            }
+            transaction.commit()?;
+            return Ok(TaskStartOutcomeV1 {
+                task,
+                matched_by: ContextTaskMatchV1::JoinedByTaskId,
+            });
+        }
+
+        let definition_match = transaction
             .query_row(
-                "SELECT alias.canonical_task_id, task.prompt_digest, task.prompt_text
-                 FROM context_task_aliases_v1 AS alias
-                 JOIN context_tasks_v1 AS task
-                   ON task.repository_id = alias.repository_id
-                  AND task.workspace_id = alias.workspace_id
-                  AND task.authorization_scope_digest = alias.authorization_scope_digest
-                  AND task.canonical_task_id = alias.canonical_task_id
-                 WHERE alias.repository_id = ?1 AND alias.workspace_id = ?2
-                   AND alias.authorization_scope_digest = ?3 AND alias.requested_task_id = ?4",
+                "SELECT canonical_task_id FROM context_tasks_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND definition_digest = ?4",
                 params![
                     repository_id,
                     workspace_id,
                     authorization_scope_digest,
-                    requested_task_id
+                    definition.definition_digest()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(canonical) = definition_match {
+            enforce_task_alias_capacity_tx_v1(&transaction, repository_id, workspace_id)?;
+            reserve_task_context_bytes_v1(
+                &transaction,
+                repository_id,
+                workspace_id,
+                task_alias_logical_bytes_v1(requested_task_id, &canonical),
+            )?;
+            transaction.execute(
+                "INSERT INTO context_task_aliases_v1 (
+                    repository_id, workspace_id, authorization_scope_digest,
+                    requested_task_id, canonical_task_id, created_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    requested_task_id,
+                    canonical,
+                    now
+                ],
+            )?;
+            let task = load_task_record_tx_v1(
+                &transaction,
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                &canonical,
+                requested_task_id,
+            )?;
+            transaction.commit()?;
+            return Ok(TaskStartOutcomeV1 {
+                task,
+                matched_by: ContextTaskMatchV1::JoinedByPrompt,
+            });
+        }
+
+        enforce_task_capacity_tx_v1(&transaction, repository_id, workspace_id)?;
+        enforce_task_alias_capacity_tx_v1(&transaction, repository_id, workspace_id)?;
+        for target in definition
+            .parent_task_id()
+            .into_iter()
+            .chain(definition.dependency_task_ids().iter().map(String::as_str))
+            .chain(definition.supersedes_task_id())
+        {
+            ensure_task_graph_edge_v1(
+                &transaction,
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                target,
+            )?;
+        }
+        let blockers = dependency_blockers_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            definition.dependency_task_ids(),
+        )?;
+        let state = if blockers.is_empty() {
+            TaskStateV1::Active
+        } else {
+            TaskStateV1::Waiting
+        };
+        let revision = match definition.supersedes_task_id() {
+            Some(task_id) => transaction.query_row(
+                "SELECT revision + 1 FROM context_tasks_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    task_id
+                ],
+                |row| row.get::<_, u64>(0),
+            )?,
+            None => 1,
+        };
+        let acceptance_json = serde_json::to_string(definition.acceptance_criteria())?;
+        let relation_bytes = definition
+            .parent_task_id()
+            .into_iter()
+            .chain(definition.dependency_task_ids().iter().map(String::as_str))
+            .chain(definition.supersedes_task_id())
+            .map(|target| task_relation_logical_bytes_v1(requested_task_id, target))
+            .fold(0_u64, u64::saturating_add);
+        let initial_reason = if state == TaskStateV1::Waiting {
+            "task_started_waiting_for_dependencies"
+        } else {
+            "task_started"
+        };
+        let logical_bytes =
+            task_row_logical_bytes_v1(requested_task_id, definition.prompt(), &acceptance_json)
+                .saturating_add(task_alias_logical_bytes_v1(
+                    requested_task_id,
+                    requested_task_id,
+                ))
+                .saturating_add(relation_bytes)
+                .saturating_add(task_transition_logical_bytes_v1(
+                    requested_task_id,
+                    initial_reason,
+                    None,
+                ));
+        reserve_task_context_bytes_v1(&transaction, repository_id, workspace_id, logical_bytes)?;
+        transaction.execute(
+            "INSERT INTO context_tasks_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                canonical_task_id, prompt_digest, prompt_text, created_ms, updated_ms,
+                definition_digest, acceptance_criteria_json, revision, state, state_generation
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, ?9, ?10, ?11, 1)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                context_task_prompt_digest_v1(definition.prompt()),
+                definition.prompt(),
+                now,
+                definition.definition_digest(),
+                acceptance_json,
+                revision,
+                state.code()
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO context_task_aliases_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                requested_task_id, canonical_task_id, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                now
+            ],
+        )?;
+        insert_task_relations_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+            &definition,
+            now,
+        )?;
+        insert_task_transition_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+            None,
+            state,
+            1,
+            None,
+            None,
+            initial_reason,
+            now,
+        )?;
+        let task = load_task_record_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+            requested_task_id,
+        )?;
+        transaction.commit()?;
+        Ok(TaskStartOutcomeV1 {
+            task,
+            matched_by: ContextTaskMatchV1::Created,
+        })
+    }
+
+    pub fn inspect_task_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+    ) -> Result<Option<TaskRecordV1>> {
+        validate_task_selector_v1(requested_task_id)?;
+        validate_digest(
+            authorization_scope_digest,
+            "task authorization scope digest",
+        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let Some(canonical) = resolve_task_alias_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let task = load_task_record_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            &canonical,
+            requested_task_id,
+        )?;
+        transaction.commit()?;
+        Ok(Some(task))
+    }
+
+    pub fn list_tasks_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        limit: usize,
+    ) -> Result<Vec<TaskRecordV1>> {
+        if !(1..=MAX_TASK_LIST_ITEMS_V1).contains(&limit) {
+            bail!("invalid_task_list_limit");
+        }
+        validate_digest(
+            authorization_scope_digest,
+            "task authorization scope digest",
+        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let task_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT canonical_task_id FROM context_tasks_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3
+                 ORDER BY created_ms DESC, canonical_task_id ASC LIMIT ?4",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        repository_id,
+                        workspace_id,
+                        authorization_scope_digest,
+                        limit
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tasks = task_ids
+            .iter()
+            .map(|task_id| {
+                load_task_record_tx_v1(
+                    &transaction,
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    task_id,
+                    task_id,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        transaction.commit()?;
+        Ok(tasks)
+    }
+
+    pub fn claim_task_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        expected_state_generation: u64,
+        ttl_ms: u64,
+        deadline_ms: i64,
+    ) -> Result<TaskClaimOutcomeV1> {
+        validate_context_identity_v1(identity)?;
+        let ttl_ms = i64::try_from(ttl_ms).context("task lease ttl overflow")?;
+        if ttl_ms <= 0 || ttl_ms > CONTEXT_LEASE_TTL_MAX_MS_V1 {
+            bail!("context lease ttl is outside the bounded interval");
+        }
+        let now = now_ms();
+        if deadline_ms <= now {
+            bail!(GatewayRefusalReason::LeaseExpired.as_str());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        expire_context_leases_v1(&transaction, now)?;
+        let mut task = load_task_record_tx_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.authorization_scope_digest(),
+            identity.task_id(),
+            identity.task_id(),
+        )?;
+        if task.state_generation != expected_state_generation {
+            bail!("task_state_cas_mismatch");
+        }
+        if task.state.is_terminal() {
+            transaction.commit()?;
+            return Ok(TaskClaimOutcomeV1::Terminal {
+                state: task.state,
+                state_generation: task.state_generation,
+            });
+        }
+        if task.state == TaskStateV1::Waiting && !task.blockers.is_empty() {
+            transaction.commit()?;
+            return Ok(TaskClaimOutcomeV1::Waiting {
+                state_generation: task.state_generation,
+                blockers: task.blockers,
+            });
+        }
+        if matches!(task.state, TaskStateV1::Waiting | TaskStateV1::Blocked) {
+            let previous = task.state;
+            task.state_generation = task
+                .state_generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("task_state_generation_overflow"))?;
+            task.state = TaskStateV1::Active;
+            let changed = transaction.execute(
+                "UPDATE context_tasks_v1 SET state = 'active', state_generation = ?6,
+                        updated_ms = ?7
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4
+                   AND state_generation = ?5 AND state = ?8",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest(),
+                    identity.task_id(),
+                    expected_state_generation,
+                    task.state_generation,
+                    now,
+                    previous.code()
+                ],
+            )?;
+            if changed != 1 {
+                bail!("task_state_cas_mismatch");
+            }
+            let reason = if previous == TaskStateV1::Blocked {
+                "task_reclaimed"
+            } else {
+                "dependencies_completed"
+            };
+            reserve_task_context_bytes_v1(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                task_transition_logical_bytes_v1(identity.task_id(), reason, None),
+            )?;
+            insert_task_transition_tx_v1(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.authorization_scope_digest(),
+                identity.task_id(),
+                Some(previous),
+                TaskStateV1::Active,
+                task.state_generation,
+                None,
+                Some(identity),
+                reason,
+                now,
+            )?;
+        }
+        let work_key_digest = task.definition.definition_digest();
+        if let Some((lease_id, generation, leader_agent_id, expires_at_ms)) = transaction
+            .query_row(
+                "SELECT lease_id, generation, leader_agent_id, expires_ms
+                 FROM context_ledger_leases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND authorization_scope_digest = ?4 AND work_key_digest = ?5
+                   AND status = 'active'",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    work_key_digest
                 ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok(TaskClaimOutcomeV1::Join {
+                lease_id,
+                lease_generation: generation,
+                state_generation: task.state_generation,
+                leader_agent_id,
+                expires_at_ms,
+            });
+        }
+        let lease_generation = transaction.query_row(
+            "SELECT COALESCE(MAX(generation), 0) + 1 FROM context_ledger_leases_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+               AND authorization_scope_digest = ?4 AND work_key_digest = ?5",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                identity.authorization_scope_digest(),
+                work_key_digest
+            ],
+            |row| row.get::<_, u64>(0),
+        )?;
+        let expires_at_ms = deadline_ms.min(now.saturating_add(ttl_ms));
+        let lease_id = format!("cl_{}", Uuid::new_v4().simple());
+        let summary = task_lease_summary_v1(task.definition.prompt());
+        transaction.execute(
+            "INSERT INTO context_ledger_leases_v1 (
+                lease_id, repository_id, workspace_id, task_id, authorization_scope_digest,
+                work_key_digest, generation, leader_agent_id, leader_session_id,
+                leader_lifecycle_generation, summary, status, acquired_ms, heartbeat_ms,
+                deadline_ms, expires_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                       'active', ?12, ?12, ?13, ?14)",
+            params![
+                lease_id,
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                identity.authorization_scope_digest(),
+                work_key_digest,
+                lease_generation,
+                identity.agent_id(),
+                identity.session_id(),
+                identity.lifecycle_generation(),
+                summary,
+                now,
+                deadline_ms,
+                expires_at_ms
+            ],
+        )?;
+        let envelope_digest = blake3::hash(format!("context-lease:{lease_id}").as_bytes())
+            .to_hex()
+            .to_string();
+        let fields = ContextEventFieldsV1 {
+            kind: ContextLedgerEventKindV1::InflightWork,
+            subject_id: &lease_id,
+            subject_version: lease_generation,
+            summary: &summary,
+            value_digest: Some(work_key_digest),
+            result_id: None,
+            result_digest: None,
+            total_bytes: None,
+            duration_ms: None,
+        };
+        let canonical_digest =
+            context_event_canonical_digest_v1(identity, &fields, work_key_digest.as_bytes(), &[]);
+        insert_context_event_v1(
+            &transaction,
+            identity,
+            &envelope_digest,
+            &canonical_digest,
+            &fields,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(TaskClaimOutcomeV1::Leader {
+            lease_id,
+            lease_generation,
+            state_generation: task.state_generation,
+            expires_at_ms,
+        })
+    }
+
+    pub fn transition_task_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        lease_id: &str,
+        expected_state_generation: u64,
+        target: TaskStateV1,
+        reason: &str,
+    ) -> Result<TaskRecordV1> {
+        validate_context_identity_v1(identity)?;
+        crate::agent_gateway::context::validate_reasoning_text_v1(reason, 512)
+            .map_err(|refusal| anyhow!(refusal.code()))?;
+        screen_sensitive_text_v1(reason)?;
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        expire_context_leases_v1(&transaction, now)?;
+        let task = load_task_record_tx_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.authorization_scope_digest(),
+            identity.task_id(),
+            identity.task_id(),
+        )?;
+        if task.state_generation != expected_state_generation {
+            bail!("task_state_cas_mismatch");
+        }
+        if task.state.is_terminal() {
+            bail!("task_terminal_immutable");
+        }
+        if task.state != TaskStateV1::Active
+            || !matches!(
+                target,
+                TaskStateV1::Blocked
+                    | TaskStateV1::Completed
+                    | TaskStateV1::Failed
+                    | TaskStateV1::Cancelled
+            )
+        {
+            bail!("invalid_task_transition");
+        }
+        context_owned_lease_deadline_v1(&transaction, identity, lease_id)?;
+        let next_generation = expected_state_generation
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task_state_generation_overflow"))?;
+        let changed = transaction.execute(
+            "UPDATE context_tasks_v1 SET state = ?6, state_generation = ?7, updated_ms = ?8
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND canonical_task_id = ?4
+               AND state = 'active' AND state_generation = ?5",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.authorization_scope_digest(),
+                identity.task_id(),
+                expected_state_generation,
+                target.code(),
+                next_generation,
+                now
+            ],
+        )?;
+        if changed != 1 {
+            bail!("task_state_cas_mismatch");
+        }
+        reserve_task_context_bytes_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            task_transition_logical_bytes_v1(identity.task_id(), reason, Some(lease_id)),
+        )?;
+        insert_task_transition_tx_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.authorization_scope_digest(),
+            identity.task_id(),
+            Some(TaskStateV1::Active),
+            target,
+            next_generation,
+            Some(lease_id),
+            Some(identity),
+            reason,
+            now,
+        )?;
+        let lease_status = match target {
+            TaskStateV1::Completed => "completed",
+            TaskStateV1::Failed => "failed",
+            TaskStateV1::Blocked | TaskStateV1::Cancelled => "cancelled",
+            TaskStateV1::Waiting | TaskStateV1::Active => unreachable!(),
+        };
+        transaction.execute(
+            "UPDATE context_ledger_leases_v1 SET status = ?2, completed_ms = ?3
+             WHERE lease_id = ?1 AND status = 'active'",
+            params![lease_id, lease_status, now],
+        )?;
+        if target.is_terminal() {
+            transaction.execute(
+                "UPDATE context_ledger_leases_v1 SET status = 'cancelled', completed_ms = ?5
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND authorization_scope_digest = ?4 AND status = 'active'",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    now
+                ],
+            )?;
+        }
+        let updated = load_task_record_tx_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.authorization_scope_digest(),
+            identity.task_id(),
+            identity.task_id(),
+        )?;
+        transaction.commit()?;
+        Ok(updated)
+    }
+
+    pub fn export_task_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+    ) -> Result<Option<TaskExportV1>> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let Some(canonical) = resolve_task_alias_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let task = load_task_record_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            &canonical,
+            requested_task_id,
+        )?;
+        let aliases = {
+            let mut statement = transaction.prepare(
+                "SELECT requested_task_id FROM context_task_aliases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4
+                 ORDER BY requested_task_id",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        repository_id,
+                        workspace_id,
+                        authorization_scope_digest,
+                        canonical
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let transitions = load_task_transitions_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            &canonical,
+        )?;
+        transaction.commit()?;
+        Ok(Some(TaskExportV1 {
+            task,
+            aliases,
+            transitions,
+        }))
+    }
+
+    /// Explicitly delete one terminal, unreferenced task and its bounded local
+    /// context. Result blobs remain subject to the existing unreferenced CAS GC.
+    pub fn delete_task_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+    ) -> Result<bool> {
+        validate_task_selector_v1(requested_task_id)?;
+        validate_digest(
+            authorization_scope_digest,
+            "task authorization scope digest",
+        )?;
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let Some(canonical) = resolve_task_alias_tx_v1(
+            &transaction,
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            requested_task_id,
+        )?
+        else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        let state = transaction.query_row(
+            "SELECT state FROM context_tasks_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                canonical
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        if !TaskStateV1::parse(&state)?.is_terminal() {
+            bail!("task_delete_requires_terminal");
+        }
+        let referenced: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM context_task_relations_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND target_task_id = ?4
+             )",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                canonical
+            ],
+            |row| row.get(0),
+        )?;
+        if referenced {
+            bail!("task_delete_referenced");
+        }
+        let active_lease: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM context_ledger_leases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND authorization_scope_digest = ?4 AND status = 'active'
+             )",
+            params![
+                repository_id,
+                workspace_id,
+                canonical,
+                authorization_scope_digest
+            ],
+            |row| row.get(0),
+        )?;
+        if active_lease {
+            bail!("task_delete_active_lease");
+        }
+        transaction.execute(
+            "DELETE FROM context_ledger_delivery_savings_v1
+             WHERE receipt_digest IN (
+                 SELECT receipt_digest FROM context_ledger_delivery_receipts_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+             )",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_delivery_receipts_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_fact_versions_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_result_references_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_event_dependencies_v1
+             WHERE event_sequence IN (
+                 SELECT sequence FROM context_ledger_events_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+             )",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_event_sources_v1
+             WHERE event_sequence IN (
+                 SELECT sequence FROM context_ledger_events_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+             )",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_events_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3",
+            params![repository_id, workspace_id, canonical],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_recipients_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+               AND authorization_scope_digest = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                canonical,
+                authorization_scope_digest
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_ledger_leases_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+               AND authorization_scope_digest = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                canonical,
+                authorization_scope_digest
+            ],
+        )?;
+        transaction.execute(
+            "DELETE FROM context_task_aliases_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                canonical
+            ],
+        )?;
+        let changed = transaction.execute(
+            "DELETE FROM context_tasks_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                canonical
+            ],
+        )?;
+        if changed != 1 {
+            bail!("context_task_corrupt");
+        }
+        reconcile_task_quota_scope_v1_tx(&transaction, repository_id, workspace_id, now)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn task_quota_status_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+    ) -> Result<TaskQuotaStatusV1> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT task_context_bytes, workspace_state_bytes, maintenance_mode,
+                        counter_checksum
+                 FROM context_workspace_quota_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2",
+                params![repository_id, workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, u64>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()?;
-        row.map(|(canonical_task_id, prompt_digest, prompt)| {
-            if context_task_prompt_digest_v1(&prompt) != prompt_digest {
-                bail!("context_task_corrupt");
-            }
-            Ok(ContextTaskResolutionV1 {
-                canonical_task_id,
-                requested_task_id: requested_task_id.to_owned(),
-                prompt,
-                prompt_digest,
-                matched_by: ContextTaskMatchV1::JoinedByTaskId,
-            })
+        let (task_context_bytes, workspace_state_bytes, maintenance_mode) =
+            if let Some((task_bytes, workspace_bytes, maintenance, checksum)) = row {
+                if checksum
+                    != task_quota_checksum_v1(
+                        repository_id,
+                        workspace_id,
+                        task_bytes,
+                        workspace_bytes,
+                        maintenance,
+                    )
+                {
+                    bail!("task_quota_counter_corrupt");
+                }
+                (task_bytes, workspace_bytes, maintenance)
+            } else {
+                (0, 0, false)
+            };
+        Ok(TaskQuotaStatusV1 {
+            task_context_bytes,
+            task_context_limit_bytes: MAX_TASK_CONTEXT_LOGICAL_BYTES_V1,
+            workspace_state_bytes,
+            workspace_state_limit_bytes: MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1,
+            maintenance_mode,
         })
-        .transpose()
     }
 
     pub fn activate_context_recipient_v1(&self, identity: &ContextLedgerIdentityV1) -> Result<()> {
@@ -3280,6 +4487,7 @@ impl Store {
         reasoning_item_v1(crate::agent_gateway::context::validate_reasoning_text_v1(
             summary, 1024,
         ))?;
+        screen_sensitive_text_v1(summary)?;
         let ttl_ms = i64::try_from(ttl_ms).context("context lease ttl overflow")?;
         if ttl_ms <= 0 || ttl_ms > CONTEXT_LEASE_TTL_MAX_MS_V1 {
             bail!("context lease ttl is outside the bounded interval");
@@ -3594,6 +4802,12 @@ impl Store {
             transaction.commit()?;
             return Ok(false);
         }
+        reserve_task_context_bytes_v1(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            512,
+        )?;
         if bytes_omitted > 0 {
             transaction.execute(
                 "INSERT INTO context_ledger_delivery_savings_v1 (
@@ -3617,6 +4831,12 @@ impl Store {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         ensure_current_context_recipient_v1(&transaction, identity)?;
         let report = gc_context_ledger_tx_v1(&transaction, identity, maximum_events)?;
+        reconcile_task_quota_scope_v1_tx(
+            &transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            now_ms(),
+        )?;
         transaction.commit()?;
         Ok(report)
     }
@@ -5438,6 +6658,762 @@ struct ContextEventFieldsV1<'a> {
     duration_ms: Option<u64>,
 }
 
+fn resolve_task_alias_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    requested_task_id: &str,
+) -> Result<Option<String>> {
+    transaction
+        .query_row(
+            "SELECT canonical_task_id FROM context_task_aliases_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND requested_task_id = ?4",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("resolve task alias")
+}
+
+fn enforce_task_capacity_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+) -> Result<()> {
+    let count: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM context_tasks_v1
+         WHERE repository_id = ?1 AND workspace_id = ?2",
+        params![repository_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    if count >= MAX_CONTEXT_TASKS_PER_WORKSPACE_V1 {
+        bail!("context_task_capacity_exceeded");
+    }
+    Ok(())
+}
+
+fn enforce_task_alias_capacity_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+) -> Result<()> {
+    let count: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM context_task_aliases_v1
+         WHERE repository_id = ?1 AND workspace_id = ?2",
+        params![repository_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    if count >= MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1 {
+        bail!("context_task_alias_capacity_exceeded");
+    }
+    Ok(())
+}
+
+fn ensure_task_graph_edge_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    source_task_id: &str,
+    target_task_id: &str,
+) -> Result<()> {
+    if source_task_id == target_task_id {
+        bail!("task_graph_self_edge");
+    }
+    let (cycle, maximum_depth): (bool, u64) = transaction.query_row(
+        "WITH RECURSIVE reachable(task_id, depth) AS (
+             SELECT ?5, 1
+             UNION ALL
+             SELECT relation.target_task_id, reachable.depth + 1
+             FROM reachable
+             JOIN context_task_relations_v1 AS relation
+               ON relation.repository_id = ?1 AND relation.workspace_id = ?2
+              AND relation.authorization_scope_digest = ?3
+              AND relation.source_task_id = reachable.task_id
+             WHERE reachable.depth <= ?6
+         )
+         SELECT COALESCE(MAX(task_id = ?4), 0), COALESCE(MAX(depth), 1)
+         FROM reachable",
+        params![
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            source_task_id,
+            target_task_id,
+            MAX_TASK_GRAPH_DEPTH_V1
+        ],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if cycle {
+        bail!("task_graph_cycle");
+    }
+    if maximum_depth >= MAX_TASK_GRAPH_DEPTH_V1 as u64 {
+        bail!("task_graph_depth_exceeded");
+    }
+    Ok(())
+}
+
+fn insert_task_relations_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    source_task_id: &str,
+    definition: &TaskDefinitionV1,
+    now: i64,
+) -> Result<()> {
+    let insert = |kind: TaskRelationKindV1, target: &str, ordinal: usize| -> Result<()> {
+        transaction.execute(
+            "INSERT INTO context_task_relations_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                source_task_id, relation_kind, target_task_id, ordinal, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                source_task_id,
+                kind.code(),
+                target,
+                ordinal,
+                now
+            ],
+        )?;
+        Ok(())
+    };
+    if let Some(parent) = definition.parent_task_id() {
+        insert(TaskRelationKindV1::Parent, parent, 0)?;
+    }
+    for (ordinal, dependency) in definition.dependency_task_ids().iter().enumerate() {
+        insert(TaskRelationKindV1::Dependency, dependency, ordinal)?;
+    }
+    if let Some(supersedes) = definition.supersedes_task_id() {
+        insert(TaskRelationKindV1::Supersedes, supersedes, 0)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_task_transition_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    canonical_task_id: &str,
+    from_state: Option<TaskStateV1>,
+    to_state: TaskStateV1,
+    state_generation: u64,
+    lease_id: Option<&str>,
+    identity: Option<&ContextLedgerIdentityV1>,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO context_task_transitions_v1 (
+            repository_id, workspace_id, authorization_scope_digest,
+            canonical_task_id, from_state, to_state, state_generation,
+            lease_id, agent_id, session_id, lifecycle_generation, reason, created_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            canonical_task_id,
+            from_state.map(TaskStateV1::code),
+            to_state.code(),
+            state_generation,
+            lease_id,
+            identity.map(ContextLedgerIdentityV1::agent_id),
+            identity.map(ContextLedgerIdentityV1::session_id),
+            identity.map(ContextLedgerIdentityV1::lifecycle_generation),
+            reason,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_task_record_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    canonical_task_id: &str,
+    requested_task_id: &str,
+) -> Result<TaskRecordV1> {
+    type TaskRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        u64,
+        String,
+        u64,
+        i64,
+        i64,
+    );
+    let row: TaskRow = transaction.query_row(
+        "SELECT prompt_text, prompt_digest, definition_digest,
+                acceptance_criteria_json, revision, state, state_generation,
+                created_ms, updated_ms
+         FROM context_tasks_v1
+         WHERE repository_id = ?1 AND workspace_id = ?2
+           AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+        params![
+            repository_id,
+            workspace_id,
+            authorization_scope_digest,
+            canonical_task_id
+        ],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        },
+    )?;
+    if context_task_prompt_digest_v1(&row.0) != row.1 {
+        bail!("context_task_corrupt");
+    }
+    let acceptance_criteria: Vec<String> =
+        serde_json::from_str(&row.3).context("context_task_corrupt")?;
+    let mut parent = None;
+    let mut supersedes = None;
+    let mut dependencies = Vec::new();
+    {
+        let mut statement = transaction.prepare(
+            "SELECT relation_kind, target_task_id, ordinal
+             FROM context_task_relations_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2
+               AND authorization_scope_digest = ?3 AND source_task_id = ?4
+             ORDER BY relation_kind, ordinal, target_task_id",
+        )?;
+        let relations = statement
+            .query_map(
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    canonical_task_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u64>(2)?,
+                    ))
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (kind, target, ordinal) in relations {
+            match TaskRelationKindV1::parse(&kind)? {
+                TaskRelationKindV1::Parent if ordinal == 0 && parent.is_none() => {
+                    parent = Some(target)
+                }
+                TaskRelationKindV1::Dependency if ordinal == dependencies.len() as u64 => {
+                    dependencies.push(target)
+                }
+                TaskRelationKindV1::Supersedes if ordinal == 0 && supersedes.is_none() => {
+                    supersedes = Some(target)
+                }
+                _ => bail!("context_task_relation_corrupt"),
+            }
+        }
+    }
+    let definition = TaskDefinitionV1::new(
+        &row.0,
+        acceptance_criteria,
+        parent,
+        dependencies,
+        supersedes,
+    )?;
+    if row.2.as_deref() != Some(definition.definition_digest()) {
+        bail!("context_task_corrupt");
+    }
+    let state = TaskStateV1::parse(&row.5)?;
+    let blockers = dependency_blockers_tx_v1(
+        transaction,
+        repository_id,
+        workspace_id,
+        authorization_scope_digest,
+        definition.dependency_task_ids(),
+    )?;
+    Ok(TaskRecordV1 {
+        canonical_task_id: canonical_task_id.to_owned(),
+        requested_task_id: requested_task_id.to_owned(),
+        definition,
+        revision: row.4,
+        state,
+        state_generation: row.6,
+        blockers,
+        created_ms: row.7,
+        updated_ms: row.8,
+    })
+}
+
+fn dependency_blockers_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    dependencies: &[String],
+) -> Result<Vec<TaskBlockerV1>> {
+    let mut blockers = Vec::new();
+    for dependency in dependencies {
+        let state = transaction
+            .query_row(
+                "SELECT state FROM context_tasks_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    dependency
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("context_task_relation_corrupt"))?;
+        let state = TaskStateV1::parse(&state)?;
+        if state != TaskStateV1::Completed {
+            let reason = match state {
+                TaskStateV1::Failed => "dependency_failed",
+                TaskStateV1::Cancelled => "dependency_cancelled",
+                _ => "dependency_incomplete",
+            };
+            blockers.push(TaskBlockerV1 {
+                task_id: dependency.clone(),
+                state,
+                reason: reason.to_owned(),
+            });
+        }
+    }
+    Ok(blockers)
+}
+
+fn load_task_transitions_tx_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    authorization_scope_digest: &str,
+    canonical_task_id: &str,
+) -> Result<Vec<TaskTransitionV1>> {
+    type TransitionRow = (
+        u64,
+        Option<String>,
+        String,
+        u64,
+        Option<String>,
+        String,
+        i64,
+    );
+    let mut statement = transaction.prepare(
+        "SELECT sequence, from_state, to_state, state_generation, lease_id, reason, created_ms
+         FROM context_task_transitions_v1
+         WHERE repository_id = ?1 AND workspace_id = ?2
+           AND authorization_scope_digest = ?3 AND canonical_task_id = ?4
+         ORDER BY sequence",
+    )?;
+    statement
+        .query_map(
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                canonical_task_id
+            ],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )?
+        .map(|row| {
+            let row: TransitionRow = row?;
+            Ok(TaskTransitionV1 {
+                sequence: row.0,
+                task_id: canonical_task_id.to_owned(),
+                from_state: row.1.as_deref().map(TaskStateV1::parse).transpose()?,
+                to_state: TaskStateV1::parse(&row.2)?,
+                state_generation: row.3,
+                lease_id: row.4,
+                reason: row.5,
+                created_ms: row.6,
+            })
+        })
+        .collect()
+}
+
+fn task_lease_summary_v1(prompt: &str) -> String {
+    let prefix = "task intent: ";
+    let mut summary = String::with_capacity(1024.min(prompt.len().saturating_add(prefix.len())));
+    summary.push_str(prefix);
+    for character in prompt.chars() {
+        if summary.len().saturating_add(character.len_utf8()) > 1024 {
+            break;
+        }
+        summary.push(character);
+    }
+    summary
+}
+
+fn task_row_logical_bytes_v1(task_id: &str, prompt: &str, acceptance_json: &str) -> u64 {
+    (task_id.len() as u64)
+        .saturating_add(prompt.len() as u64)
+        .saturating_add(acceptance_json.len() as u64)
+        .saturating_add(256)
+}
+
+fn task_alias_logical_bytes_v1(requested: &str, canonical: &str) -> u64 {
+    (requested.len() as u64)
+        .saturating_add(canonical.len() as u64)
+        .saturating_add(128)
+}
+
+fn task_relation_logical_bytes_v1(source: &str, target: &str) -> u64 {
+    (source.len() as u64)
+        .saturating_add(target.len() as u64)
+        .saturating_add(128)
+}
+
+fn task_transition_logical_bytes_v1(task_id: &str, reason: &str, lease_id: Option<&str>) -> u64 {
+    (task_id.len() as u64)
+        .saturating_add(reason.len() as u64)
+        .saturating_add(lease_id.map_or(0, |lease| lease.len() as u64))
+        .saturating_add(256)
+}
+
+fn context_event_logical_bytes_v1(subject_id: &str, summary: &str) -> u64 {
+    (subject_id.len() as u64)
+        .saturating_add(summary.len() as u64)
+        .saturating_add(512)
+}
+
+fn task_quota_checksum_v1(
+    repository_id: &str,
+    workspace_id: &str,
+    task_context_bytes: u64,
+    workspace_state_bytes: u64,
+    maintenance_mode: bool,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.context-workspace-quota.v1\0");
+    hash_field(&mut hasher, repository_id.as_bytes());
+    hash_field(&mut hasher, workspace_id.as_bytes());
+    hasher.update(&task_context_bytes.to_le_bytes());
+    hasher.update(&workspace_state_bytes.to_le_bytes());
+    hasher.update(&[u8::from(maintenance_mode)]);
+    hasher.finalize().to_hex().to_string()
+}
+
+fn reserve_task_context_bytes_v1(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    additional_bytes: u64,
+) -> Result<()> {
+    let existing = transaction
+        .query_row(
+            "SELECT task_context_bytes, workspace_state_bytes, maintenance_mode,
+                    counter_checksum
+             FROM context_workspace_quota_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2",
+            params![repository_id, workspace_id],
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (current_task_bytes, current_workspace_bytes, maintenance_mode) = existing
+        .as_ref()
+        .map_or((0, 0, false), |row| (row.0, row.1, row.2));
+    if let Some((task_bytes, workspace_bytes, maintenance, checksum)) = existing {
+        if checksum
+            != task_quota_checksum_v1(
+                repository_id,
+                workspace_id,
+                task_bytes,
+                workspace_bytes,
+                maintenance,
+            )
+        {
+            bail!("task_quota_counter_corrupt");
+        }
+    }
+    if maintenance_mode {
+        bail!("workspace_maintenance_mode");
+    }
+    let next_task_bytes = current_task_bytes
+        .checked_add(additional_bytes)
+        .ok_or_else(|| anyhow!("task_context_quota_exceeded"))?;
+    let stored_result_bytes = stored_result_logical_bytes_v1(transaction)?;
+    let next_workspace_bytes = next_task_bytes
+        .checked_add(stored_result_bytes)
+        .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))?;
+    if next_task_bytes > MAX_TASK_CONTEXT_LOGICAL_BYTES_V1 {
+        bail!("task_context_quota_exceeded");
+    }
+    if next_workspace_bytes > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1 {
+        bail!("workspace_state_quota_exceeded");
+    }
+    let checksum = task_quota_checksum_v1(
+        repository_id,
+        workspace_id,
+        next_task_bytes,
+        next_workspace_bytes,
+        false,
+    );
+    transaction.execute(
+        "INSERT INTO context_workspace_quota_v1 (
+            repository_id, workspace_id, task_context_bytes, workspace_state_bytes,
+            maintenance_mode, counter_checksum, reconciled_ms
+         ) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)
+         ON CONFLICT(repository_id, workspace_id) DO UPDATE SET
+            task_context_bytes = excluded.task_context_bytes,
+            workspace_state_bytes = excluded.workspace_state_bytes,
+            maintenance_mode = 0,
+            counter_checksum = excluded.counter_checksum,
+            reconciled_ms = excluded.reconciled_ms",
+        params![
+            repository_id,
+            workspace_id,
+            next_task_bytes,
+            next_workspace_bytes,
+            checksum,
+            now_ms()
+        ],
+    )?;
+    let _ = current_workspace_bytes;
+    Ok(())
+}
+
+fn stored_result_logical_bytes_v1(transaction: &Transaction<'_>) -> Result<u64> {
+    let complete_columns: u64 = transaction.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('results')
+         WHERE name IN ('stdout_bytes', 'stderr_bytes')",
+        [],
+        |row| row.get(0),
+    )?;
+    if complete_columns != 2 {
+        return Ok(0);
+    }
+    transaction
+        .query_row(
+            "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0) FROM results",
+            [],
+            |row| row.get(0),
+        )
+        .context("count logical result bytes")
+}
+
+fn enforce_workspace_result_capacity_v1(
+    transaction: &Transaction<'_>,
+    additional_bytes: u64,
+) -> Result<()> {
+    let current_results = stored_result_logical_bytes_v1(transaction)?;
+    let next_results = current_results
+        .checked_add(additional_bytes)
+        .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))?;
+    if next_results > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1 {
+        bail!("workspace_state_quota_exceeded");
+    }
+    let mut statement = transaction.prepare(
+        "SELECT repository_id, workspace_id, task_context_bytes,
+                workspace_state_bytes, maintenance_mode, counter_checksum
+         FROM context_workspace_quota_v1",
+    )?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?,
+                row.get::<_, bool>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (repository, workspace, task_bytes, workspace_bytes, maintenance, checksum) in rows {
+        if checksum
+            != task_quota_checksum_v1(
+                &repository,
+                &workspace,
+                task_bytes,
+                workspace_bytes,
+                maintenance,
+            )
+        {
+            bail!("task_quota_counter_corrupt");
+        }
+        if maintenance {
+            bail!("workspace_maintenance_mode");
+        }
+        if task_bytes.saturating_add(next_results) > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1 {
+            bail!("workspace_state_quota_exceeded");
+        }
+    }
+    Ok(())
+}
+
+fn refresh_workspace_state_quota_v1_tx(transaction: &Transaction<'_>, now: i64) -> Result<()> {
+    let result_bytes = stored_result_logical_bytes_v1(transaction)?;
+    let scopes = {
+        let mut statement = transaction.prepare(
+            "SELECT repository_id, workspace_id, task_context_bytes
+             FROM context_workspace_quota_v1",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (repository, workspace, task_bytes) in scopes {
+        let workspace_bytes = task_bytes.saturating_add(result_bytes);
+        let maintenance = task_bytes > MAX_TASK_CONTEXT_LOGICAL_BYTES_V1
+            || workspace_bytes > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1;
+        let checksum = task_quota_checksum_v1(
+            &repository,
+            &workspace,
+            task_bytes,
+            workspace_bytes,
+            maintenance,
+        );
+        transaction.execute(
+            "UPDATE context_workspace_quota_v1
+             SET workspace_state_bytes = ?3, maintenance_mode = ?4,
+                 counter_checksum = ?5, reconciled_ms = ?6
+             WHERE repository_id = ?1 AND workspace_id = ?2",
+            params![
+                repository,
+                workspace,
+                workspace_bytes,
+                maintenance,
+                checksum,
+                now
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn reconcile_all_task_quotas_v1_tx(transaction: &Transaction<'_>, now: i64) -> Result<()> {
+    let scopes = {
+        let mut statement = transaction.prepare(
+            "SELECT repository_id, workspace_id FROM context_tasks_v1
+             UNION
+             SELECT repository_id, workspace_id FROM context_ledger_events_v1
+             ORDER BY repository_id, workspace_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (repository_id, workspace_id) in scopes {
+        reconcile_task_quota_scope_v1_tx(transaction, &repository_id, &workspace_id, now)?;
+    }
+    Ok(())
+}
+
+fn reconcile_task_quota_scope_v1_tx(
+    transaction: &Transaction<'_>,
+    repository_id: &str,
+    workspace_id: &str,
+    now: i64,
+) -> Result<()> {
+    let task_bytes: u64 = transaction.query_row(
+        "SELECT
+            COALESCE((SELECT SUM(length(canonical_task_id) + length(CAST(prompt_text AS BLOB)) +
+                        length(CAST(acceptance_criteria_json AS BLOB)) + 256)
+                      FROM context_tasks_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0) +
+            COALESCE((SELECT SUM(length(requested_task_id) + length(canonical_task_id) + 128)
+                      FROM context_task_aliases_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0) +
+            COALESCE((SELECT SUM(length(source_task_id) + length(target_task_id) + 128)
+                      FROM context_task_relations_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0) +
+            COALESCE((SELECT SUM(length(canonical_task_id) + length(CAST(reason AS BLOB)) +
+                        COALESCE(length(lease_id), 0) + 256)
+                      FROM context_task_transitions_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0) +
+            COALESCE((SELECT SUM(length(subject_id) + length(CAST(summary AS BLOB)) + 512)
+                      FROM context_ledger_events_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0) +
+            COALESCE((SELECT COUNT(*) * 512
+                      FROM context_ledger_delivery_receipts_v1
+                      WHERE repository_id = ?1 AND workspace_id = ?2), 0)",
+        params![repository_id, workspace_id],
+        |row| row.get(0),
+    )?;
+    let stored_result_bytes = stored_result_logical_bytes_v1(transaction)?;
+    let workspace_bytes = task_bytes.saturating_add(stored_result_bytes);
+    let maintenance_mode = task_bytes > MAX_TASK_CONTEXT_LOGICAL_BYTES_V1
+        || workspace_bytes > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1;
+    let checksum = task_quota_checksum_v1(
+        repository_id,
+        workspace_id,
+        task_bytes,
+        workspace_bytes,
+        maintenance_mode,
+    );
+    transaction.execute(
+        "INSERT INTO context_workspace_quota_v1 (
+            repository_id, workspace_id, task_context_bytes, workspace_state_bytes,
+            maintenance_mode, counter_checksum, reconciled_ms
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(repository_id, workspace_id) DO UPDATE SET
+            task_context_bytes = excluded.task_context_bytes,
+            workspace_state_bytes = excluded.workspace_state_bytes,
+            maintenance_mode = excluded.maintenance_mode,
+            counter_checksum = excluded.counter_checksum,
+            reconciled_ms = excluded.reconciled_ms",
+        params![
+            repository_id,
+            workspace_id,
+            task_bytes,
+            workspace_bytes,
+            maintenance_mode,
+            checksum,
+            now
+        ],
+    )?;
+    Ok(())
+}
+
 fn validate_context_task_selector_v1(value: &str) -> Result<()> {
     if value.is_empty()
         || value.len() > 128
@@ -5599,21 +7575,24 @@ fn context_event_input_fields_v1(
     &[ContextVerifiedObservationV1],
 )> {
     match input {
-        ContextLedgerEventInputV1::UnverifiedSuggestion(suggestion) => Ok((
-            ContextEventFieldsV1 {
-                kind: ContextLedgerEventKindV1::UnverifiedSuggestion,
-                subject_id: suggestion.subject(),
-                subject_version: 1,
-                summary: suggestion.statement(),
-                value_digest: Some(suggestion.relevance_digest()),
-                result_id: None,
-                result_digest: None,
-                total_bytes: None,
-                duration_ms: None,
-            },
-            serde_json::to_vec(suggestion)?,
-            &[],
-        )),
+        ContextLedgerEventInputV1::UnverifiedSuggestion(suggestion) => {
+            screen_sensitive_text_v1(suggestion.statement())?;
+            Ok((
+                ContextEventFieldsV1 {
+                    kind: ContextLedgerEventKindV1::UnverifiedSuggestion,
+                    subject_id: suggestion.subject(),
+                    subject_version: 1,
+                    summary: suggestion.statement(),
+                    value_digest: Some(suggestion.relevance_digest()),
+                    result_id: None,
+                    result_digest: None,
+                    total_bytes: None,
+                    duration_ms: None,
+                },
+                serde_json::to_vec(suggestion)?,
+                &[],
+            ))
+        }
         ContextLedgerEventInputV1::CompletedObservation {
             observation,
             verified_sources,
@@ -5653,6 +7632,7 @@ fn context_event_input_fields_v1(
             approach,
             verified_sources,
         } => {
+            screen_sensitive_text_v1(approach.verified_cause())?;
             if approach.sources().len() != verified_sources.len()
                 || approach
                     .sources()
@@ -5678,21 +7658,24 @@ fn context_event_input_fields_v1(
                 verified_sources,
             ))
         }
-        ContextLedgerEventInputV1::ExplicitUnknown(unknown) => Ok((
-            ContextEventFieldsV1 {
-                kind: ContextLedgerEventKindV1::ExplicitUnknown,
-                subject_id: unknown.subject(),
-                subject_version: 1,
-                summary: unknown.explanation(),
-                value_digest: None,
-                result_id: None,
-                result_digest: None,
-                total_bytes: None,
-                duration_ms: None,
-            },
-            serde_json::to_vec(unknown)?,
-            &[],
-        )),
+        ContextLedgerEventInputV1::ExplicitUnknown(unknown) => {
+            screen_sensitive_text_v1(unknown.explanation())?;
+            Ok((
+                ContextEventFieldsV1 {
+                    kind: ContextLedgerEventKindV1::ExplicitUnknown,
+                    subject_id: unknown.subject(),
+                    subject_version: 1,
+                    summary: unknown.explanation(),
+                    value_digest: None,
+                    result_id: None,
+                    result_digest: None,
+                    total_bytes: None,
+                    duration_ms: None,
+                },
+                serde_json::to_vec(unknown)?,
+                &[],
+            ))
+        }
         ContextLedgerEventInputV1::ResultReference {
             reference,
             reference_version,
@@ -5780,6 +7763,12 @@ fn insert_context_event_v1(
     fields: &ContextEventFieldsV1<'_>,
     now: i64,
 ) -> Result<u64> {
+    reserve_task_context_bytes_v1(
+        transaction,
+        identity.repository_id(),
+        identity.workspace_id(),
+        context_event_logical_bytes_v1(fields.subject_id, fields.summary),
+    )?;
     transaction.execute(
         "INSERT INTO context_ledger_events_v1 (
             envelope_digest, canonical_digest, schema_version, repository_id, workspace_id,
@@ -5950,6 +7939,12 @@ fn enforce_context_quota_v1(
     if count >= MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1 as u64 {
         let target = MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1.saturating_sub(1);
         gc_context_ledger_tx_v1(transaction, identity, target)?;
+        reconcile_task_quota_scope_v1_tx(
+            transaction,
+            identity.repository_id(),
+            identity.workspace_id(),
+            now_ms(),
+        )?;
         count = context_event_count_v1(transaction, identity)?;
     }
     if count >= MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1 as u64 {
@@ -7443,6 +9438,12 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "through_sequence"
             | "delivered_bytes"
             | "active"
+            | "revision"
+            | "state_generation"
+            | "task_context_bytes"
+            | "workspace_state_bytes"
+            | "maintenance_mode"
+            | "reconciled_ms"
     ) || (table == "gateway_events" && column == "id");
     let nullable = matches!(
         (table, column),
@@ -7485,6 +9486,16 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
                 "retired_event_sequence" | "retirement_reason"
             )
             | ("context_ledger_leases_v1", "lease_id" | "completed_ms")
+            | ("context_tasks_v1", "definition_digest")
+            | (
+                "context_task_transitions_v1",
+                "sequence"
+                    | "from_state"
+                    | "lease_id"
+                    | "agent_id"
+                    | "session_id"
+                    | "lifecycle_generation"
+            )
     );
     (if integer { "INTEGER" } else { "TEXT" }, !nullable)
 }
@@ -7694,6 +9705,55 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "prompt_text",
                 "created_ms",
                 "updated_ms",
+                "definition_digest",
+                "acceptance_criteria_json",
+                "revision",
+                "state",
+                "state_generation",
+            ],
+        ),
+        (
+            "context_task_relations_v1",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "source_task_id",
+                "relation_kind",
+                "target_task_id",
+                "ordinal",
+                "created_ms",
+            ],
+        ),
+        (
+            "context_task_transitions_v1",
+            &[
+                "sequence",
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "canonical_task_id",
+                "from_state",
+                "to_state",
+                "state_generation",
+                "lease_id",
+                "agent_id",
+                "session_id",
+                "lifecycle_generation",
+                "reason",
+                "created_ms",
+            ],
+        ),
+        (
+            "context_workspace_quota_v1",
+            &[
+                "repository_id",
+                "workspace_id",
+                "task_context_bytes",
+                "workspace_state_bytes",
+                "maintenance_mode",
+                "counter_checksum",
+                "reconciled_ms",
             ],
         ),
         (
@@ -8001,14 +10061,47 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ),
         (
             "context_tasks_v1",
-            "context_tasks_prompt_idx",
+            "context_tasks_definition_idx",
             &[
                 "repository_id",
                 "workspace_id",
                 "authorization_scope_digest",
-                "prompt_digest",
+                "definition_digest",
             ],
             true,
+            false,
+        ),
+        (
+            "context_tasks_v1",
+            "context_tasks_state_idx",
+            &["repository_id", "workspace_id", "state", "created_ms"],
+            false,
+            false,
+        ),
+        (
+            "context_task_relations_v1",
+            "context_task_relations_target_idx",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "target_task_id",
+                "relation_kind",
+            ],
+            false,
+            false,
+        ),
+        (
+            "context_task_transitions_v1",
+            "context_task_transitions_task_idx",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "canonical_task_id",
+                "sequence",
+            ],
+            false,
             false,
         ),
         (
@@ -8383,6 +10476,35 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "CHECK(length(CAST(prompt_text AS BLOB)) BETWEEN 1 AND 8192)",
         ),
         (
+            "context_tasks_v1",
+            "CHECK(definition_digest IS NULL OR length(definition_digest) = 64)",
+        ),
+        (
+            "context_tasks_v1",
+            "CHECK(json_valid(acceptance_criteria_json))",
+        ),
+        ("context_tasks_v1", "CHECK(state IN ("),
+        (
+            "context_task_relations_v1",
+            "CHECK(relation_kind IN ('parent', 'dependency', 'supersedes'))",
+        ),
+        (
+            "context_task_relations_v1",
+            "CHECK(source_task_id != target_task_id)",
+        ),
+        (
+            "context_task_transitions_v1",
+            "CHECK(length(CAST(reason AS BLOB)) BETWEEN 1 AND 512)",
+        ),
+        (
+            "context_task_transitions_v1",
+            "CHECK((agent_id IS NULL) = (session_id IS NULL))",
+        ),
+        (
+            "context_workspace_quota_v1",
+            "CHECK(maintenance_mode IN (0, 1))",
+        ),
+        (
             "context_task_aliases_v1",
             "CHECK(length(authorization_scope_digest) = 64)",
         ),
@@ -8683,18 +10805,140 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
     if alias_capacity_exceeded {
         bail!("Again context task registry exceeds its alias capacity");
     }
-    let mut task_statement = connection.prepare(
-        "SELECT prompt_digest, prompt_text FROM context_tasks_v1 ORDER BY repository_id, workspace_id, authorization_scope_digest, canonical_task_id",
-    )?;
-    let tasks = task_statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-    })?;
-    for task in tasks {
-        let (digest, prompt) = task?;
-        if digest != context_task_prompt_digest_v1(&prompt) {
-            bail!("Again context task registry contains a corrupt prompt binding");
+    let transaction = Transaction::new_unchecked(connection, TransactionBehavior::Deferred)?;
+    let task_keys = {
+        let mut statement = transaction.prepare(
+            "SELECT repository_id, workspace_id, authorization_scope_digest, canonical_task_id
+             FROM context_tasks_v1
+             ORDER BY repository_id, workspace_id, authorization_scope_digest, canonical_task_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (repository, workspace, authorization, task_id) in &task_keys {
+        let task = load_task_record_tx_v1(
+            &transaction,
+            repository,
+            workspace,
+            authorization,
+            task_id,
+            task_id,
+        )
+        .context("Again context task registry contains a corrupt definition")?;
+        let transitions = load_task_transitions_tx_v1(
+            &transaction,
+            repository,
+            workspace,
+            authorization,
+            task_id,
+        )?;
+        let Some(last) = transitions.last() else {
+            bail!("Again context task registry is missing transition history");
+        };
+        if last.to_state != task.state
+            || last.state_generation != task.state_generation
+            || transitions.len() as u64 != task.state_generation
+            || transitions.first().is_some_and(|transition| {
+                transition.from_state.is_some() || transition.state_generation != 1
+            })
+            || transitions.windows(2).any(|pair| {
+                pair[1].state_generation != pair[0].state_generation.saturating_add(1)
+                    || pair[1].from_state != Some(pair[0].to_state)
+            })
+        {
+            bail!("Again context task transition history is inconsistent");
         }
     }
+    let graph_edges = {
+        let mut statement = transaction.prepare(
+            "SELECT repository_id, workspace_id, authorization_scope_digest,
+                    source_task_id, target_task_id
+             FROM context_task_relations_v1
+             ORDER BY repository_id, workspace_id, authorization_scope_digest,
+                      source_task_id, relation_kind, ordinal",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (repository, workspace, authorization, source, target) in graph_edges {
+        ensure_task_graph_edge_v1(
+            &transaction,
+            &repository,
+            &workspace,
+            &authorization,
+            &source,
+            &target,
+        )
+        .context("Again context task graph is corrupt")?;
+    }
+    let quotas = {
+        let mut statement = transaction.prepare(
+            "SELECT repository_id, workspace_id, task_context_bytes,
+                    workspace_state_bytes, maintenance_mode, counter_checksum
+             FROM context_workspace_quota_v1
+             ORDER BY repository_id, workspace_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (repository, workspace, task_bytes, workspace_bytes, maintenance, checksum) in quotas {
+        if checksum
+            != task_quota_checksum_v1(
+                &repository,
+                &workspace,
+                task_bytes,
+                workspace_bytes,
+                maintenance,
+            )
+            || (!maintenance
+                && (task_bytes > MAX_TASK_CONTEXT_LOGICAL_BYTES_V1
+                    || workspace_bytes > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1))
+        {
+            bail!("Again context workspace quota accounting is corrupt");
+        }
+    }
+    let missing_quota: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM context_tasks_v1 AS task
+             LEFT JOIN context_workspace_quota_v1 AS quota
+               ON quota.repository_id = task.repository_id
+              AND quota.workspace_id = task.workspace_id
+             WHERE quota.repository_id IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_quota {
+        bail!("Again context workspace quota accounting is incomplete");
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -10264,7 +12508,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_task_aliases_v1;
+                    "DROP TABLE context_workspace_quota_v1;
+                     DROP TABLE context_task_transitions_v1;
+                     DROP TABLE context_task_relations_v1;
+                     DROP TABLE context_task_aliases_v1;
                      DROP TABLE context_tasks_v1;
                      DROP TABLE context_ledger_delivery_savings_v1;
                      DROP TABLE context_ledger_delivery_receipts_v1;
@@ -10422,7 +12669,10 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_task_aliases_v1;
+                    "DROP TABLE context_workspace_quota_v1;
+                     DROP TABLE context_task_transitions_v1;
+                     DROP TABLE context_task_relations_v1;
+                     DROP TABLE context_task_aliases_v1;
                      DROP TABLE context_tasks_v1;
                      DROP TABLE context_ledger_delivery_savings_v1;
                      DROP TABLE context_ledger_delivery_receipts_v1;
@@ -10471,6 +12721,9 @@ mod tests {
                 .conn
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
+                     DROP TABLE context_workspace_quota_v1;
+                     DROP TABLE context_task_transitions_v1;
+                     DROP TABLE context_task_relations_v1;
                      DROP TABLE context_task_aliases_v1;
                      DROP TABLE context_tasks_v1;
                      DROP TABLE context_ledger_delivery_savings_v1;
@@ -11586,5 +13839,165 @@ mod tests {
             .unwrap();
         assert_eq!(tasks, 1);
         assert_eq!(aliases, 8);
+    }
+
+    #[test]
+    fn quota_maintenance_refuses_writes_but_keeps_inspect_export_and_delete_available() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let authorization = "c".repeat(64);
+        let task = TaskDefinitionV1::new(
+            "terminal maintenance task",
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        store
+            .start_task_v1(
+                "repository",
+                "workspace",
+                &authorization,
+                "maintenance-task",
+                &task,
+            )
+            .unwrap();
+        let identity = ContextLedgerIdentityV1::new(
+            "repository",
+            "workspace",
+            "maintenance-task",
+            &authorization,
+            "agent",
+            "session",
+            "turn",
+            &"d".repeat(64),
+            0,
+            1,
+        )
+        .unwrap();
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let lease = match store
+            .claim_task_v1(&identity, 1, 30_000, now_ms().saturating_add(60_000))
+            .unwrap()
+        {
+            TaskClaimOutcomeV1::Leader { lease_id, .. } => lease_id,
+            other => panic!("unexpected claim: {other:?}"),
+        };
+        store
+            .transition_task_v1(
+                &identity,
+                &lease,
+                1,
+                TaskStateV1::Completed,
+                "complete before maintenance",
+            )
+            .unwrap();
+        let workspace_bytes = MAX_TASK_CONTEXT_LOGICAL_BYTES_V1.saturating_add(1);
+        let checksum = task_quota_checksum_v1(
+            "repository",
+            "workspace",
+            workspace_bytes,
+            workspace_bytes,
+            true,
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE context_workspace_quota_v1
+                 SET task_context_bytes = ?1, workspace_state_bytes = ?1,
+                     maintenance_mode = 1, counter_checksum = ?2
+                 WHERE repository_id = 'repository' AND workspace_id = 'workspace'",
+                params![workspace_bytes, checksum],
+            )
+            .unwrap();
+        drop(store);
+
+        let mut reopened = Store::open(temp.path()).unwrap();
+        assert!(
+            reopened
+                .task_quota_status_v1("repository", "workspace")
+                .unwrap()
+                .maintenance_mode
+        );
+        assert!(
+            reopened
+                .start_task_v1(
+                    "repository",
+                    "workspace",
+                    &authorization,
+                    "refused-write",
+                    &TaskDefinitionV1::new(
+                        "this write must be refused",
+                        Vec::new(),
+                        None,
+                        Vec::new(),
+                        None,
+                    )
+                    .unwrap(),
+                )
+                .is_err()
+        );
+        let artifacts_before: u64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            reopened
+                .insert_result(
+                    "maintenance-result",
+                    b"stdout",
+                    b"stderr",
+                    0,
+                    1,
+                    "policy-v1",
+                    "{}",
+                )
+                .is_err()
+        );
+        let artifacts_after: u64 = reopened
+            .conn
+            .query_row("SELECT COUNT(*) FROM artifacts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(artifacts_after, artifacts_before);
+        assert!(
+            reopened
+                .inspect_task_v1(
+                    "repository",
+                    "workspace",
+                    &authorization,
+                    "maintenance-task",
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .export_task_v1(
+                    "repository",
+                    "workspace",
+                    &authorization,
+                    "maintenance-task",
+                )
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .delete_task_v1(
+                    "repository",
+                    "workspace",
+                    &authorization,
+                    "maintenance-task",
+                )
+                .unwrap()
+        );
+        assert!(
+            !reopened
+                .task_quota_status_v1("repository", "workspace")
+                .unwrap()
+                .maintenance_mode
+        );
     }
 }

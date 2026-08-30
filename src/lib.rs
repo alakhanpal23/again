@@ -30,6 +30,7 @@ pub(crate) mod runtime_attestation;
 pub mod sandbox;
 pub mod setup;
 pub mod store;
+pub mod task_lifecycle;
 #[cfg(feature = "team-alpha")]
 pub mod team;
 #[cfg(feature = "team-alpha")]

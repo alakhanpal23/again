@@ -294,7 +294,7 @@ fn legacy_compact_events_summaries_and_result_ids_confirm_no_savings() {
     let version: i64 = connection(&fixture.root)
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
