@@ -66,13 +66,17 @@ jobs:
             /root/qualify_linux_supervisor.sh
           sudo lxc exec again-qualification -- \
             /root/preflight_linux_supervisor_runner.sh
+          set +e
           sudo lxc exec again-qualification -- env \
             GITHUB_SHA="$GITHUB_SHA" \
             AGAIN_SUPERVISOR_BINARY=/root/again \
             AGAIN_SUPERVISOR_EVIDENCE_DIR=/root/linux-supervisor-qualification \
             /root/qualify_linux_supervisor.sh
+          qualification_exit=$?
+          set -e
           sudo lxc file pull --recursive \
             again-qualification/root/linux-supervisor-qualification .
+          exit "$qualification_exit"
       - name: Destroy the disposable qualification guest
         if: always()
         run: sudo lxc delete --force again-qualification 2>/dev/null || true
