@@ -843,13 +843,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         _require(len(args.native_evidence) == 4, "native_matrix", "exactly four native evidence files are required")
         report = build_gate(
-            scenario=read_json(args.scenario_evidence.resolve(strict=False)),
-            chaos=read_json(args.chaos_evidence.resolve(strict=False)),
-            real_agent=read_json(args.real_agent_evidence.resolve(strict=False)),
-            release=read_json(args.release_evidence.resolve(strict=False)),
-            native=[read_json(path.resolve(strict=False)) for path in args.native_evidence],
+            scenario=read_json(args.scenario_evidence),
+            chaos=read_json(args.chaos_evidence),
+            real_agent=read_json(args.real_agent_evidence),
+            release=read_json(args.release_evidence),
+            native=[read_json(path) for path in args.native_evidence],
         )
-        write_exclusive(args.output.resolve(strict=False), report)
+        write_exclusive(args.output, report)
     except GateRefusal as error:
         failure = {
             "schema": SCHEMA,

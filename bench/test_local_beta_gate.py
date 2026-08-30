@@ -460,6 +460,27 @@ class LocalBetaGateTests(unittest.TestCase):
             gate.read_json(link)
         self.assertEqual(unsafe.exception.code, "evidence_unsafe")
 
+        argv = [
+            "--scenario-evidence",
+            str(link),
+            "--chaos-evidence",
+            str(target),
+            "--real-agent-evidence",
+            str(target),
+            "--release-evidence",
+            str(target),
+        ]
+        for _ in range(4):
+            argv.extend(("--native-evidence", str(target)))
+        argv.extend(("--output", str(self.root / "must-not-exist.json")))
+        stream = io.StringIO()
+        with contextlib.redirect_stdout(stream):
+            self.assertEqual(gate.main(argv), 3)
+        self.assertEqual(
+            json.loads(stream.getvalue())["classification"]["code"],
+            "evidence_unsafe",
+        )
+
     def test_output_is_private_exclusive_and_never_overwritten(self) -> None:
         output = self.root / "gate.json"
         report = self.build()
