@@ -1520,6 +1520,20 @@ mod platform {
                 child_exit_v1(CHILD_FAILURE_EXIT_V1);
             }
 
+            let scheduler = libc::sched_param { sched_priority: 1 };
+            if raw_syscall6_v1(
+                libc::SYS_sched_setscheduler,
+                0,
+                i64::from(libc::SCHED_FIFO),
+                (&scheduler as *const libc::sched_param) as i64,
+                0,
+                0,
+                0,
+            ) != 0
+            {
+                child_exit_v1(CHILD_FAILURE_EXIT_V1);
+            }
+
             let mapping = raw_syscall6_v1(
                 libc::SYS_mmap,
                 0,
