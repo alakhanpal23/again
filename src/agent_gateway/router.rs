@@ -2,10 +2,18 @@
 
 use std::fmt;
 
+use super::profile_registry::{
+    ClassifiedUniversalActionV1, ProfileSelectionStatusV1, SealedProfileRegistryV1,
+};
 use super::protocol::{
-    DigestReferenceV1, EffectClass, FreshnessRequirementV1, GatewayAdapterToolCallV1,
-    GatewayToolCallV1, PermissionClass, RepositoryEnvironmentStateV1, RequestDigestV1,
-    ToolCapabilityClassV1, ToolPolicyDispositionV1, UniversalToolPolicyV1,
+    CompleteToolStreamsV1, DigestReferenceV1, EffectClass, FreshnessRequirementV1,
+    GatewayAdapterToolCallV1, GatewayToolCallV1, PermissionClass, RepositoryEnvironmentStateV1,
+    RequestDigestV1, ToolCapabilityClassV1, ToolPolicyDispositionV1, UniversalActionContextV1,
+    UniversalToolPolicyV1,
+};
+use super::{
+    DeliveryReceiptV1, GatewayResultIdentityV1, PresentationContextV1, PresentationDecisionV1,
+    PresentationRefusalV1, decide_presentation_v1,
 };
 use crate::store::{StoreExactResultProofV1, StoreInflightJoinProofV1};
 
@@ -27,12 +35,168 @@ pub enum GatewayDecision {
 /// outcomes add constraints to [`GatewayDecision`]; they never mint authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UniversalGatewayDecisionV1 {
+    /// Automatic-router hit after the sealed profile and existing store proof
+    /// both agree. The profile identity alone can never produce this variant.
+    ReusePromotedResult,
     ReuseExact,
     ReuseDeterministicCoverage,
     JoinInflight,
     ExecuteAndObserve,
     PassthroughWithoutStorage,
     RefuseByPolicy,
+    RefuseDangerousInvalidConfiguration,
+}
+
+/// Conservative economics for the reusable lane. Missing or overflowing
+/// measurements bypass lookup, validation, materialization, and storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReuseValueModelV1 {
+    Unknown,
+    Measured {
+        native_execution_micros: u64,
+        lookup_micros: u64,
+        validation_micros: u64,
+        materialization_micros: u64,
+        minimum_savings_micros: u64,
+    },
+}
+
+impl ReuseValueModelV1 {
+    pub const fn unknown() -> Self {
+        Self::Unknown
+    }
+
+    pub const fn measured(
+        native_execution_micros: u64,
+        lookup_micros: u64,
+        validation_micros: u64,
+        materialization_micros: u64,
+        minimum_savings_micros: u64,
+    ) -> Self {
+        Self::Measured {
+            native_execution_micros,
+            lookup_micros,
+            validation_micros,
+            materialization_micros,
+            minimum_savings_micros,
+        }
+    }
+
+    pub const fn has_positive_value(self) -> bool {
+        let Self::Measured {
+            native_execution_micros,
+            lookup_micros,
+            validation_micros,
+            materialization_micros,
+            minimum_savings_micros,
+        } = self
+        else {
+            return false;
+        };
+        let Some(cost) = lookup_micros.checked_add(validation_micros) else {
+            return false;
+        };
+        let Some(cost) = cost.checked_add(materialization_micros) else {
+            return false;
+        };
+        let Some(required) = cost.checked_add(minimum_savings_micros) else {
+            return false;
+        };
+        native_execution_micros >= required
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UniversalGatewayMetricEventV1 {
+    Route,
+    Miss,
+    Join,
+    Candidate,
+    Promotion,
+    Invalidation,
+    Quarantine,
+    Bytes(u64),
+    MeasuredTimeMicros(u64),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UniversalGatewayMetricsV1 {
+    routes: u64,
+    misses: u64,
+    joins: u64,
+    candidates: u64,
+    promotions: u64,
+    invalidations: u64,
+    quarantines: u64,
+    bytes: u64,
+    measured_time_micros: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UniversalGatewayMetricOverflowV1;
+
+impl UniversalGatewayMetricsV1 {
+    pub fn record(
+        &mut self,
+        event: UniversalGatewayMetricEventV1,
+    ) -> Result<(), UniversalGatewayMetricOverflowV1> {
+        let counter = match event {
+            UniversalGatewayMetricEventV1::Route => &mut self.routes,
+            UniversalGatewayMetricEventV1::Miss => &mut self.misses,
+            UniversalGatewayMetricEventV1::Join => &mut self.joins,
+            UniversalGatewayMetricEventV1::Candidate => &mut self.candidates,
+            UniversalGatewayMetricEventV1::Promotion => &mut self.promotions,
+            UniversalGatewayMetricEventV1::Invalidation => &mut self.invalidations,
+            UniversalGatewayMetricEventV1::Quarantine => &mut self.quarantines,
+            UniversalGatewayMetricEventV1::Bytes(_) => &mut self.bytes,
+            UniversalGatewayMetricEventV1::MeasuredTimeMicros(_) => &mut self.measured_time_micros,
+        };
+        let amount = match event {
+            UniversalGatewayMetricEventV1::Bytes(bytes)
+            | UniversalGatewayMetricEventV1::MeasuredTimeMicros(bytes) => bytes,
+            _ => 1,
+        };
+        *counter = counter
+            .checked_add(amount)
+            .ok_or(UniversalGatewayMetricOverflowV1)?;
+        Ok(())
+    }
+
+    pub const fn routes(&self) -> u64 {
+        self.routes
+    }
+
+    pub const fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub const fn joins(&self) -> u64 {
+        self.joins
+    }
+
+    pub const fn candidates(&self) -> u64 {
+        self.candidates
+    }
+
+    pub const fn promotions(&self) -> u64 {
+        self.promotions
+    }
+
+    pub const fn invalidations(&self) -> u64 {
+        self.invalidations
+    }
+
+    pub const fn quarantines(&self) -> u64 {
+        self.quarantines
+    }
+
+    pub const fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub const fn measured_time_micros(&self) -> u64 {
+        self.measured_time_micros
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -428,8 +592,115 @@ pub fn route_with_tool_policy_v1(
         | ToolCapabilityClassV1::Communication
         | ToolCapabilityClassV1::Deployment
         | ToolCapabilityClassV1::Payment
+        | ToolCapabilityClassV1::Interactive
         | ToolCapabilityClassV1::Unknown => UniversalGatewayDecisionV1::PassthroughWithoutStorage,
     }
+}
+
+/// Classify an action through the immutable built-in registry. This is the one
+/// automatic classification entrance; callers cannot supply or register a
+/// policy that upgrades profile authority.
+pub fn classify_action_v1(
+    call: &GatewayToolCallV1,
+    context: &UniversalActionContextV1,
+) -> ClassifiedUniversalActionV1 {
+    SealedProfileRegistryV1::builtin().classify(call, context)
+}
+
+/// Route every action to one deterministic, safe product decision. This API
+/// has no executor and never accepts a command string as authority.
+pub fn route_automatically_v1(
+    call: &GatewayToolCallV1,
+    candidates: &RoutingCandidatesV1,
+    context: &UniversalActionContextV1,
+    value: ReuseValueModelV1,
+) -> UniversalGatewayDecisionV1 {
+    let classification = classify_action_v1(call, context);
+    if classification.status() == ProfileSelectionStatusV1::DangerousInvalidConfiguration {
+        return UniversalGatewayDecisionV1::RefuseDangerousInvalidConfiguration;
+    }
+
+    if !matches!(call.permission_class(), PermissionClass::Preapproved) {
+        return UniversalGatewayDecisionV1::RefuseByPolicy;
+    }
+
+    // This branch precedes candidate inspection. Callers can therefore apply
+    // the same value gate before store lookup and avoid lookup, validation,
+    // materialization, and candidate storage together.
+    if classification.status() == ProfileSelectionStatusV1::Qualified && !value.has_positive_value()
+    {
+        return UniversalGatewayDecisionV1::PassthroughWithoutStorage;
+    }
+
+    let policy_decision = route_with_tool_policy_v1(call, candidates, classification.policy());
+    if matches!(policy_decision, UniversalGatewayDecisionV1::RefuseByPolicy) {
+        return policy_decision;
+    }
+
+    match classification.status() {
+        ProfileSelectionStatusV1::DangerousInvalidConfiguration => {
+            UniversalGatewayDecisionV1::RefuseDangerousInvalidConfiguration
+        }
+        ProfileSelectionStatusV1::ContractOnly => {
+            UniversalGatewayDecisionV1::PassthroughWithoutStorage
+        }
+        ProfileSelectionStatusV1::Unprofiled => match classification.capability() {
+            ToolCapabilityClassV1::FreshnessBoundRead => {
+                UniversalGatewayDecisionV1::ExecuteAndObserve
+            }
+            ToolCapabilityClassV1::NonReusableRead
+            | ToolCapabilityClassV1::Mutation
+            | ToolCapabilityClassV1::CredentialOperation
+            | ToolCapabilityClassV1::Communication
+            | ToolCapabilityClassV1::Deployment
+            | ToolCapabilityClassV1::Payment
+            | ToolCapabilityClassV1::Interactive
+            | ToolCapabilityClassV1::Unknown => {
+                UniversalGatewayDecisionV1::PassthroughWithoutStorage
+            }
+            ToolCapabilityClassV1::ExactStateBoundRead
+            | ToolCapabilityClassV1::DeterministicCommand => {
+                UniversalGatewayDecisionV1::PassthroughWithoutStorage
+            }
+        },
+        ProfileSelectionStatusV1::Qualified => match policy_decision {
+            UniversalGatewayDecisionV1::ReuseExact
+            | UniversalGatewayDecisionV1::ReuseDeterministicCoverage => {
+                UniversalGatewayDecisionV1::ReusePromotedResult
+            }
+            UniversalGatewayDecisionV1::JoinInflight => UniversalGatewayDecisionV1::JoinInflight,
+            UniversalGatewayDecisionV1::ExecuteAndObserve => {
+                UniversalGatewayDecisionV1::ExecuteAndObserve
+            }
+            UniversalGatewayDecisionV1::PassthroughWithoutStorage => {
+                UniversalGatewayDecisionV1::PassthroughWithoutStorage
+            }
+            UniversalGatewayDecisionV1::RefuseByPolicy => {
+                UniversalGatewayDecisionV1::RefuseByPolicy
+            }
+            UniversalGatewayDecisionV1::ReusePromotedResult
+            | UniversalGatewayDecisionV1::RefuseDangerousInvalidConfiguration => {
+                UniversalGatewayDecisionV1::RefuseDangerousInvalidConfiguration
+            }
+        },
+    }
+}
+
+/// Select compact presentation only through the existing recipient-bound
+/// complete-delivery receipt. Otherwise the exact complete streams remain the
+/// required presentation.
+pub fn decide_complete_stream_presentation_v1(
+    context: &PresentationContextV1,
+    call: &GatewayToolCallV1,
+    streams: &CompleteToolStreamsV1,
+    receipt: Option<&DeliveryReceiptV1>,
+) -> Result<PresentationDecisionV1, PresentationRefusalV1> {
+    let result = GatewayResultIdentityV1::from_streams(
+        streams.status(),
+        streams.stdout(),
+        streams.stderr(),
+    )?;
+    Ok(decide_presentation_v1(context, call, result, receipt))
 }
 
 fn freshness_satisfies(

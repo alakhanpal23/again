@@ -6,6 +6,8 @@
 
 #[path = "agent_gateway/context.rs"]
 pub mod context;
+#[path = "agent_gateway/profile_registry.rs"]
+pub mod profile_registry;
 #[path = "agent_gateway/protocol.rs"]
 pub mod protocol;
 #[path = "agent_gateway/router.rs"]
@@ -15,19 +17,27 @@ pub use context::{
     AgentContextIdentityV1, DeliveryReceiptV1, GatewayResultIdentityV1, PresentationContextV1,
     PresentationDecisionV1, PresentationRefusalV1, decide_presentation_v1, select_presentation,
 };
+pub use profile_registry::{
+    ClassifiedUniversalActionV1, ProfileContractV1, ProfileFamilyV1, ProfileIdentityV1,
+    ProfileLifecycleRefusalV1, ProfileLifecycleStageV1, ProfileLifecycleTransitionV1,
+    ProfileLifecycleV1, ProfileQualificationV1, ProfileSelectionStatusV1, SealedProfileRegistryV1,
+};
 pub use protocol::{
-    AgentCallIdentityV1, CanonicalArguments, CanonicalJsonError, DigestReferenceV1, EffectClass,
-    ExternalFreshnessValidatorV1, FreshnessRequirementV1, GatewayAdapterToolCallV1,
-    GatewayEffectClassV1, GatewayProtocolError, GatewayProtocolRefusalV1, GatewayToolCallInputV1,
-    GatewayToolCallV1, ModelIdentityV1, PermissionClass, PresentationMode, ProviderIdentityV1,
-    RepositoryEnvironmentStateV1, RequestDigestV1, StateDigestReferenceV1, TaskIdentityV1,
-    ToolCapabilityClassV1, ToolDependencyBindingV1, ToolDependencyKindV1, ToolDependencySetV1,
-    ToolIdentityV1, ToolPolicyDispositionV1, ToolPolicyRefusalV1, UniversalToolPolicyV1,
-    WorkspaceIdentityV1,
+    AgentCallIdentityV1, CanonicalArguments, CanonicalJsonError, CommandInvocationV1,
+    CompleteToolStreamsV1, DigestReferenceV1, EffectClass, ExternalFreshnessValidatorV1,
+    FreshnessRequirementV1, GatewayAdapterToolCallV1, GatewayEffectClassV1, GatewayProtocolError,
+    GatewayProtocolRefusalV1, GatewayToolCallInputV1, GatewayToolCallV1, ModelIdentityV1,
+    PermissionClass, PresentationMode, ProviderIdentityV1, RepositoryEnvironmentStateV1,
+    RequestDigestV1, StateDigestReferenceV1, TaskIdentityV1, ToolCapabilityClassV1,
+    ToolDependencyBindingV1, ToolDependencyKindV1, ToolDependencySetV1, ToolIdentityV1,
+    ToolInteractionModeV1, ToolPolicyDispositionV1, ToolPolicyRefusalV1, ToolStdinModeV1,
+    UniversalActionContextV1, UniversalToolPolicyV1, WorkspaceIdentityV1,
 };
 pub use router::{
     CandidateEvidenceRefusalV1, CandidateFreshnessV1, GatewayCandidateKindV1,
     GatewayCandidateRequestV1, GatewayDecision, GatewayRouteDecisionV1, GatewayRouteRefusalV1,
-    ReuseCandidateV1, RoutingCandidatesV1, UniversalGatewayDecisionV1, route,
+    ReuseCandidateV1, ReuseValueModelV1, RoutingCandidatesV1, UniversalGatewayDecisionV1,
+    UniversalGatewayMetricEventV1, UniversalGatewayMetricOverflowV1, UniversalGatewayMetricsV1,
+    classify_action_v1, decide_complete_stream_presentation_v1, route, route_automatically_v1,
     route_gateway_candidate_v1, route_with_tool_policy_v1,
 };
