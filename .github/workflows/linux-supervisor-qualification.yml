@@ -22,6 +22,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Inspect native nested virtualization
+        run: |
+          uname -a
+          ls -l /dev/kvm
+          command -v qemu-system-x86_64 || true
+          command -v lxc || true
+          grep -Ec '(vmx|svm)' /proc/cpuinfo
+          exit 1
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
       - name: Require the provisioned kernel contract
