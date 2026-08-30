@@ -9,6 +9,8 @@
 mod adapters;
 #[path = "profile_registry/lifecycle.rs"]
 mod lifecycle;
+#[path = "profile_registry/pytest.rs"]
+mod pytest;
 
 use super::protocol::{
     EffectClass, FreshnessRequirementV1, GatewayToolCallV1, RepositoryEnvironmentStateV1,
@@ -419,13 +421,7 @@ fn command_contract(argv: &[String]) -> Option<&'static ProfileContractV1> {
 }
 
 fn is_pytest_contract(argv: &[&str]) -> bool {
-    argv.len() >= 5
-        && argv[0].ends_with("/.venv/bin/python")
-        && argv[1..4] == ["-I", "-m", "pytest"]
-        && argv[4..].iter().all(|value| !value.is_empty())
-        && !argv[4..]
-            .iter()
-            .any(|value| matches!(*value, "-" | "--collect-only" | "--fixtures"))
+    pytest::is_frozen_pytest_contract_v1(argv)
 }
 
 fn is_rust_contract(argv: &[&str]) -> bool {

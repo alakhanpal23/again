@@ -240,6 +240,69 @@ fn command_shapes_are_non_authoritative_contracts_and_basenames_do_not_upgrade()
 }
 
 #[test]
+fn pytest_contract_is_exact_and_never_upgrades_to_storage() {
+    let shell = call(
+        "shell.exec",
+        EffectClass::DeterministicCompute,
+        FreshnessRequirementV1::Snapshot,
+    );
+    let context = |argv: &[&str]| {
+        UniversalActionContextV1::new(
+            ToolInteractionModeV1::Batch,
+            ToolStdinModeV1::Closed,
+            Some(
+                CommandInvocationV1::new(argv.iter().map(|value| (*value).to_owned()).collect())
+                    .unwrap(),
+            ),
+        )
+    };
+    let exact = context(&[
+        ".venv/bin/python",
+        "-I",
+        "-m",
+        "pytest",
+        "tests/test_unit.py::test_value",
+    ]);
+    assert_eq!(
+        classify_action_v1(&shell, &exact).status(),
+        ProfileSelectionStatusV1::ContractOnly
+    );
+    assert_eq!(
+        route_automatically_v1(
+            &shell,
+            &RoutingCandidatesV1::default(),
+            &exact,
+            positive_value(),
+        ),
+        UniversalGatewayDecisionV1::PassthroughWithoutStorage
+    );
+
+    for rejected in [
+        context(&[".venv/bin/python", "-I", "-m", "pytest", "--pdb"]),
+        context(&[
+            ".venv/bin/python",
+            "-I",
+            "-m",
+            "pytest",
+            "tests/test_unit.py",
+            "tests/test_other.py",
+        ]),
+        context(&[
+            "/tmp/.venv/bin/python",
+            "-I",
+            "-m",
+            "pytest",
+            "tests/test_unit.py",
+        ]),
+    ] {
+        assert_eq!(
+            classify_action_v1(&shell, &rejected).status(),
+            ProfileSelectionStatusV1::Unprofiled
+        );
+    }
+}
+
+#[test]
 fn negative_value_bypasses_reusable_lookup_lane_and_invalid_profiles_refuse() {
     let read = call(
         "repo.read",
