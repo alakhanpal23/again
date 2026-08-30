@@ -354,6 +354,7 @@ mod platform {
     const MAX_ENVIRONMENT_BYTES_V1: usize = 1024 * 1024;
     const MAX_PROC_TEXT_BYTES_V1: usize = 1024 * 1024;
     const WAIT_BACKOFF_NANOSECONDS_V1: i64 = 50_000;
+    const FORK_ORDER_OBSERVATION_NANOSECONDS_V1: i64 = 2_000_000;
     const RELEASE_BYTE_V1: u8 = 0x5a;
     const CHILD_FAILURE_EXIT_V1: u32 = 125;
     const KERNEL_SIGNAL_SET_BYTES_V1: i64 = 8;
@@ -1243,23 +1244,41 @@ mod platform {
                         .confirm_resume_succeeded(resume)
                         .map_err(planner_failure_v1)?
                 }
-                TracerSupervisorIntentV1::WaitForNextStop => match wait_any_v1(faults, deadline)? {
-                    Some((raw_tid, status)) => {
-                        if wait_status_is_ptrace_stop_v1(status) {
-                            tree.record_ptrace_stop(raw_tid)?;
-                        }
-                        if wait_status_is_final_v1(status) {
-                            tree.record_reap(raw_tid);
-                        }
-                        supervisor
-                            .observe_wait(raw_tid, status, &mut sink)
-                            .map_err(planner_failure_v1)?
+                TracerSupervisorIntentV1::WaitForNextStop => {
+                    // A nonblocking wait issued immediately after resuming the
+                    // root overwhelmingly consumes its already-pending fork
+                    // event before Linux has scheduled the new child. Give
+                    // both tracees one fixed, bounded scheduling window until
+                    // their real fork order is known. This does not select a
+                    // task or manufacture a stop: waitpid(__WALL) still
+                    // supplies the next live kernel event.
+                    if tree.fork_delivery_order.is_none() {
+                        wait_fork_order_observation_v1().map_err(|errno| {
+                            failure_v1(
+                                FixedTwoTaskSupervisorStageV1::WaitEvent,
+                                FixedTwoTaskSupervisorReasonV1::Io,
+                                Some(errno),
+                            )
+                        })?;
                     }
-                    None => {
-                        tree.prove_final_echild()?;
-                        return Ok(supervisor);
+                    match wait_any_v1(faults, deadline)? {
+                        Some((raw_tid, status)) => {
+                            if wait_status_is_ptrace_stop_v1(status) {
+                                tree.record_ptrace_stop(raw_tid)?;
+                            }
+                            if wait_status_is_final_v1(status) {
+                                tree.record_reap(raw_tid);
+                            }
+                            supervisor
+                                .observe_wait(raw_tid, status, &mut sink)
+                                .map_err(planner_failure_v1)?
+                        }
+                        None => {
+                            tree.prove_final_echild()?;
+                            return Ok(supervisor);
+                        }
                     }
-                },
+                }
             };
         }
         Err(failure_v1(
@@ -2488,9 +2507,17 @@ mod platform {
     }
 
     fn wait_backoff_v1() -> Result<(), i32> {
+        sleep_nanoseconds_v1(WAIT_BACKOFF_NANOSECONDS_V1)
+    }
+
+    fn wait_fork_order_observation_v1() -> Result<(), i32> {
+        sleep_nanoseconds_v1(FORK_ORDER_OBSERVATION_NANOSECONDS_V1)
+    }
+
+    fn sleep_nanoseconds_v1(nanoseconds: i64) -> Result<(), i32> {
         let mut remaining = libc::timespec {
             tv_sec: 0,
-            tv_nsec: WAIT_BACKOFF_NANOSECONDS_V1,
+            tv_nsec: nanoseconds,
         };
         loop {
             let requested = remaining;
