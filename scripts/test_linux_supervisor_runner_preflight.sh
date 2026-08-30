@@ -135,14 +135,29 @@ grep -Fqx '  contents: read' "$workflow" ||
   fail 'qualification workflow no longer has contents-read authority'
 grep -Fqx '    runs-on: ubuntu-22.04' "$workflow" ||
   fail 'qualification workflow is not pinned to the disposable x86_64 hosted image'
-grep -Fqx '        run: sudo --preserve-env=PATH scripts/preflight_linux_supervisor_runner.sh' "$workflow" ||
-  fail 'qualification workflow does not invoke the production preflight'
-grep -Fqx '        run: sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh' "$workflow" ||
-  fail 'qualification workflow does not scope elevated execution to the fixed diagnostic'
+grep -Fqx '  QUALIFICATION_IMAGE_FINGERPRINT: aa5e27c9f434c8a5b06fc9d1875c5b32df01cbf82f8d8caf08e06f243c9b54cf' "$workflow" ||
+  fail 'qualification workflow does not pin the proven x86_64 VM image'
+grep -Fqx '  QUALIFICATION_KERNEL_RELEASE: 6.8.0-138-generic' "$workflow" ||
+  fail 'qualification workflow does not seal the proven guest kernel'
+grep -Fq '"ubuntu:$QUALIFICATION_IMAGE_FINGERPRINT"' "$workflow" ||
+  fail 'qualification workflow does not launch the pinned image fingerprint'
+grep -Fq '"$QUALIFICATION_GUEST" --vm' "$workflow" ||
+  fail 'qualification workflow does not require hardware virtualization'
+grep -Fq 'systemd-detect-virt --vm' "$workflow" ||
+  fail 'qualification workflow does not verify the KVM guest boundary'
+grep -Fq '/root/preflight_linux_supervisor_runner.sh' "$workflow" ||
+  fail 'qualification workflow does not invoke the production preflight in the guest'
+grep -Fq '/root/qualify_linux_supervisor.sh' "$workflow" ||
+  fail 'qualification workflow does not invoke the fixed diagnostic in the guest'
+grep -Fq 'sudo lxc delete --force "$QUALIFICATION_GUEST"' "$workflow" ||
+  fail 'qualification workflow does not destroy its disposable guest'
 grep -Fqx '        run: cargo +1.88.0 build --locked --features linux-pytest --bin again' "$workflow" ||
   fail 'qualification workflow does not build the hidden diagnostic surface'
-if grep -Eq 'CapEff:|CONFIG_SECCOMP_FILTER|CONFIG_CHECKPOINT_RESTORE|uname -[sm]' "$workflow"; then
+if grep -Eq 'CapEff:|CONFIG_SECCOMP_FILTER|CONFIG_CHECKPOINT_RESTORE' "$workflow"; then
   fail 'qualification workflow still duplicates the extracted host contract'
+fi
+if grep -Fq 'lxc launch ubuntu:24.04' "$workflow"; then
+  fail 'qualification workflow uses a floating VM image alias'
 fi
 
 printf 'Linux supervisor runner preflight tests passed.\n'
