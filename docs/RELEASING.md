@@ -134,7 +134,7 @@ the seven subjects. Checksums alone do not authenticate the publisher.
    cargo +1.88.0 test --locked --all-features
    cargo +1.88.0 test --locked --test generated_differential \
      generated_differential_100k -- --ignored --exact --nocapture
-   cargo +1.88.0 audit --locked
+   cargo +1.88.0 audit --file Cargo.lock
    license_metadata=$(mktemp "${TMPDIR:-/tmp}/again-cargo-metadata.XXXXXXXX")
    cargo +1.88.0 metadata --locked --format-version 1 > "$license_metadata"
    python3 scripts/audit_dependency_licenses.py --metadata "$license_metadata"
