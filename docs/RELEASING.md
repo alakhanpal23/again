@@ -41,7 +41,8 @@ natively before building. Release archives are then built with exactly the
 `daemon` feature: `linux-pytest`,
 `team-alpha`, and the experimental hook are not enabled. The native package
 smoke installs the archive, checks the daemon-only capability report,
-negotiates an authenticated MCP session, verifies the exact
+validates the exact Codex and Claude setup plans, starts the daemon through the
+first connector, negotiates an authenticated MCP session, verifies the exact
 repository/task/context tool catalog, confirms that pytest and team entry
 points are absent, stops the daemon, and cleanly uninstalls the package.
 

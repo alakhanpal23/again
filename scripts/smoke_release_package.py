@@ -53,7 +53,11 @@ EXPECTED_TOOLS = {
     "repo.search",
     "repo.stat",
     "repo.tree",
+    "task.claim",
+    "task.inspect",
+    "task.list",
     "task.start",
+    "task.transition",
 }
 
 
@@ -181,6 +185,69 @@ def wait_for_daemon(binary: Path, workspace: Path, env: dict[str, str]) -> dict[
     raise SmokeFailure("installed daemon did not become ready")
 
 
+def wait_for_daemon_stopped(binary: Path, workspace: Path, env: dict[str, str]) -> None:
+    deadline = time.monotonic() + DAEMON_READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        status = run(
+            [str(binary), "mcp", "daemon", "status", "--workspace", str(workspace)],
+            cwd=workspace,
+            env=env,
+            check=False,
+            timeout=2.0,
+        )
+        if status.returncode != 0:
+            return
+        time.sleep(0.05)
+    raise SmokeFailure("installed daemon did not retire after stop")
+
+
+def exercise_setup_plans(binary: Path, workspace: Path, env: dict[str, str]) -> None:
+    expected_binary = str(binary.resolve())
+    expected_workspace = str(workspace.resolve())
+    for client in ("codex", "claude"):
+        plan = strict_json(
+            run(
+                [
+                    str(binary),
+                    "mcp",
+                    "setup",
+                    "--client",
+                    client,
+                    "--workspace",
+                    str(workspace),
+                    "--json",
+                ],
+                cwd=workspace,
+                env=env,
+            ).stdout
+        )
+        if (
+            plan.get("version") != 3
+            or plan.get("client") != client
+            or plan.get("server_name") != "again"
+            or plan.get("workspace") != expected_workspace
+            or plan.get("writes_by_default") is not False
+            or plan.get("install_policy") != "official_client_cli_only_v1"
+            or plan.get("stdio")
+            != {
+                "transport": "stdio",
+                "command": expected_binary,
+                "args": ["mcp", "connect", "--workspace", expected_workspace],
+            }
+        ):
+            raise SmokeFailure(f"installed {client} setup plan is not exact")
+        local_command = plan.get("local_cli_command")
+        if not isinstance(local_command, str):
+            raise SmokeFailure(f"installed {client} setup command is malformed")
+        expected_prefix = (
+            "codex mcp add again -- "
+            if client == "codex"
+            else "claude mcp add --transport stdio --scope user again -- "
+        )
+        if not local_command.startswith(expected_prefix):
+            raise SmokeFailure(f"installed {client} setup command is unsupported")
+
+
 def exercise_mcp(binary: Path, workspace: Path, env: dict[str, str]) -> None:
     proxy = subprocess.Popen(
         [str(binary), "mcp", "connect", "--workspace", str(workspace)],
@@ -244,6 +311,8 @@ def exercise_mcp(binary: Path, workspace: Path, env: dict[str, str]) -> None:
             except subprocess.TimeoutExpired:
                 proxy.kill()
                 proxy.wait(timeout=2.0)
+    if proxy.returncode != 0:
+        raise SmokeFailure("installed MCP proxy did not exit cleanly")
 
 
 def main() -> int:
@@ -262,7 +331,7 @@ def main() -> int:
         raise SmokeFailure(f"archive must be a regular non-symlink file named {expected_name}")
 
     with tempfile.TemporaryDirectory(prefix="again-release-package-smoke.") as raw_fixture:
-        fixture = Path(raw_fixture)
+        fixture = Path(raw_fixture).resolve()
         artifacts = fixture / "artifacts"
         install_root = fixture / "install"
         workspace = fixture / "workspace"
@@ -286,7 +355,7 @@ def main() -> int:
         run(["git", "init", "--quiet"], cwd=workspace, env=env)
 
         binary = install_root / "again"
-        daemon: subprocess.Popen[bytes] | None = None
+        daemon_started = False
         uninstall_complete = False
         try:
             run(
@@ -321,6 +390,10 @@ def main() -> int:
                 raise SmokeFailure("shipping daemon capability is not ready")
             if set(coordinator.get("public_tools", [])) != {
                 "task.start",
+                "task.inspect",
+                "task.list",
+                "task.claim",
+                "task.transition",
                 "context.delta",
                 "context.publish",
                 "context.retrieve",
@@ -336,37 +409,30 @@ def main() -> int:
                 raise SmokeFailure("shipping package gained Linux pytest authority")
             assert_unavailable(binary, "team", workspace, env)
             assert_unavailable(binary, "__linux-pytest-namespace-probe-v1", workspace, env)
+            exercise_setup_plans(binary, workspace, env)
 
-            daemon = subprocess.Popen(
-                [
-                    str(binary),
-                    "mcp",
-                    "daemon",
-                    "serve",
-                    "--workspace",
-                    str(workspace),
-                ],
+            before_connect = run(
+                [str(binary), "mcp", "daemon", "status", "--workspace", str(workspace)],
                 cwd=workspace,
                 env=env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                check=False,
             )
+            if before_connect.returncode == 0:
+                raise SmokeFailure("daemon was already running before the first connector")
+
+            # The installed connector itself must elect and start the daemon.
+            daemon_started = True
+            exercise_mcp(binary, workspace, env)
             status = wait_for_daemon(binary, workspace, env)
             if status.get("peerAuthentication") not in {"getpeereid_euid", "so_peercred_euid"}:
                 raise SmokeFailure("daemon did not report same-user peer authentication")
-            exercise_mcp(binary, workspace, env)
             run(
                 [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
                 cwd=workspace,
                 env=env,
             )
-            try:
-                daemon.wait(timeout=COMMAND_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired as error:
-                raise SmokeFailure("daemon did not stop within the deadline") from error
-            if daemon.returncode != 0:
-                raise SmokeFailure("daemon did not stop cleanly")
+            wait_for_daemon_stopped(binary, workspace, env)
+            daemon_started = False
 
             run(
                 ["sh", str(repository / "scripts" / "uninstall.sh"), "--dest", str(binary)],
@@ -383,7 +449,7 @@ def main() -> int:
             if any(path.exists() or path.is_symlink() for path in adjacent_state):
                 raise SmokeFailure("uninstall left managed package state behind")
         finally:
-            if daemon is not None and daemon.poll() is None:
+            if daemon_started and binary.exists():
                 run(
                     [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
                     cwd=workspace,
@@ -391,11 +457,6 @@ def main() -> int:
                     check=False,
                     timeout=2.0,
                 )
-                try:
-                    daemon.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    daemon.terminate()
-                    daemon.wait(timeout=2.0)
             if not uninstall_complete and binary.exists():
                 run(
                     ["sh", str(repository / "scripts" / "uninstall.sh"), "--dest", str(binary)],
