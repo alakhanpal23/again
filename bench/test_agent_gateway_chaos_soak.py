@@ -5,6 +5,7 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,20 @@ def scenario_report() -> dict[str, object]:
 
 
 class ChaosSoakHarnessTests(unittest.TestCase):
+    def test_compact_private_root_and_shared_daemon_runtime_namespace(self) -> None:
+        root = harness._create_run_root()
+        try:
+            self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+            self.assertLess(len(str(root)), 64)
+            state = root / "state"
+            first = harness._session_environment(state, "first")
+            second = harness._session_environment(state, "second")
+            self.assertNotEqual(first["HOME"], second["HOME"])
+            self.assertEqual(first["TMPDIR"], second["TMPDIR"])
+            self.assertEqual(first["AGAIN_HOME"], second["AGAIN_HOME"])
+        finally:
+            shutil.rmtree(root)
+
     def test_canonical_json_and_digest_are_stable(self) -> None:
         self.assertEqual(
             harness.canonical_json({"z": 1, "a": "x"}), b'{"a":"x","z":1}\n'

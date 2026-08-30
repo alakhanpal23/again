@@ -40,7 +40,7 @@ const HANDSHAKE_BYTES_V1: usize =
     8 + 1 + 32 + SESSION_NONCE_BYTES_V1 + COMPATIBILITY_DIGEST_BYTES_V1;
 const MAX_CONTROL_PAYLOAD_BYTES_V1: usize = 4 * 1024;
 const MAX_DAEMON_BINARY_BYTES_V1: u64 = 256 * 1024 * 1024;
-const MAX_ACTIVE_CONNECTIONS_V1: usize = 32;
+const MAX_ACTIVE_CONNECTIONS_V1: usize = 128;
 const HANDSHAKE_TIMEOUT_V1: Duration = Duration::from_secs(5);
 const MCP_IDLE_READ_TIMEOUT_V1: Duration = Duration::from_secs(60);
 const MCP_WRITE_TIMEOUT_V1: Duration = Duration::from_secs(10);
@@ -1260,6 +1260,7 @@ mod tests {
 
     #[test]
     fn locator_encoding_accepts_only_fixed_random_socket_names() {
+        assert!(MAX_ACTIVE_CONNECTIONS_V1 >= 100);
         assert!(valid_socket_name_v1("0123456789abcdef0123456789abcdef"));
         assert!(!valid_socket_name_v1("../shared.sock"));
         assert!(!valid_socket_name_v1("0123456789abcdef0123456789abcdeg"));

@@ -77,6 +77,42 @@ class HarnessUnsupported(HarnessRefusal):
     """A constrained-host condition, separate from a product or harness failure."""
 
 
+def _create_run_root() -> pathlib.Path:
+    """Create a compact private root suitable for Unix-domain socket paths."""
+
+    parent = pathlib.Path("/tmp").resolve(strict=True)
+    if not parent.is_dir():
+        raise HarnessUnsupported("temporary_root", "the host has no usable /tmp directory")
+    root = pathlib.Path(tempfile.mkdtemp(prefix="again-c-", dir=parent)).resolve()
+    root.chmod(0o700)
+    return root
+
+
+def _session_environment(state: pathlib.Path, label: str) -> dict[str, str]:
+    home = state.parent / f"home-{label}"
+    # The daemon runtime namespace is keyed below TMPDIR, so all connectors
+    # for one exact probe must share this directory.
+    temporary = state.parent / "runtime-tmp"
+    home.mkdir(mode=0o700)
+    temporary.mkdir(mode=0o700, exist_ok=True)
+    return {
+        "PATH": "/usr/bin:/bin",
+        "HOME": str(home),
+        "TMPDIR": str(temporary),
+        "AGAIN_HOME": str(state),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": "file",
+        "CARGO_NET_OFFLINE": "true",
+        "HTTP_PROXY": "http://127.0.0.1:9",
+        "HTTPS_PROXY": "http://127.0.0.1:9",
+        "ALL_PROXY": "http://127.0.0.1:9",
+        "NO_PROXY": "",
+    }
+
+
 def canonical_json(value: Any) -> bytes:
     try:
         rendered = json.dumps(
@@ -339,24 +375,7 @@ class Session:
                 "again-chaos-soak:exact-v2",
             )
         )
-        environment = {
-            "PATH": "/usr/bin:/bin",
-            "HOME": str(state.parent / f"home-{label}"),
-            "TMPDIR": str(state.parent / f"tmp-{label}"),
-            "AGAIN_HOME": str(state),
-            "LC_ALL": "C",
-            "LANG": "C",
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_ALLOW_PROTOCOL": "file",
-            "CARGO_NET_OFFLINE": "true",
-            "HTTP_PROXY": "http://127.0.0.1:9",
-            "HTTPS_PROXY": "http://127.0.0.1:9",
-            "ALL_PROXY": "http://127.0.0.1:9",
-            "NO_PROXY": "",
-        }
-        pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
-        pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700)
+        environment = _session_environment(state, label)
         state.mkdir(mode=0o700, exist_ok=True)
         try:
             self.process = subprocess.Popen(
@@ -393,7 +412,7 @@ class Session:
         while True:
             try:
                 block = os.read(self.stderr.fileno(), 65536)
-            except OSError:
+            except (OSError, ValueError):
                 return
             if not block:
                 return
@@ -1129,7 +1148,7 @@ def _stop_automatic_daemon(
     environment = {
         "PATH": "/usr/bin:/bin",
         "HOME": str(root / "daemon-control-home"),
-        "TMPDIR": str(root / "daemon-control-tmp"),
+        "TMPDIR": str(root / "runtime-tmp"),
         "AGAIN_HOME": str(state),
         "LC_ALL": "C",
         "LANG": "C",
@@ -1139,7 +1158,7 @@ def _stop_automatic_daemon(
         "CARGO_NET_OFFLINE": "true",
     }
     pathlib.Path(environment["HOME"]).mkdir(mode=0o700)
-    pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700)
+    pathlib.Path(environment["TMPDIR"]).mkdir(mode=0o700, exist_ok=True)
     stop_argv = [str(binary), "mcp", "daemon", "stop", "--workspace", str(repo)]
     status_argv = [str(binary), "mcp", "daemon", "status", "--workspace", str(repo)]
     try:
@@ -1665,8 +1684,7 @@ def run(
     baseline_descendants = _descendant_snapshot()
     baseline_resources = _resource_snapshot()
     started = time.monotonic_ns()
-    root = pathlib.Path(tempfile.mkdtemp(prefix="again-chaos-soak-v2-")).resolve()
-    root.chmod(0o700)
+    root = _create_run_root()
     process_cleanup: list[dict[str, Any]] = []
     product_temp_paths: set[pathlib.Path] = set()
     product_process_ids: list[int] = []
