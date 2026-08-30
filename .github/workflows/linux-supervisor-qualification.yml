@@ -28,13 +28,25 @@ jobs:
           ls -l /dev/kvm
           grep -Ec '(vmx|svm)' /proc/cpuinfo
           sudo lxd init --auto
+          cleanup_guest() {
+            sudo lxc delete --force again-qualification 2>/dev/null || true
+          }
+          trap cleanup_guest EXIT
           sudo lxc launch ubuntu:24.04 again-qualification --vm \
             -c limits.cpu=2 -c limits.memory=4GiB
+          ready=false
+          for _ in $(seq 1 60); do
+            if sudo lxc exec again-qualification -- true 2>/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 2
+          done
+          test "$ready" = true
           sudo lxc exec again-qualification -- cloud-init status --wait
           sudo lxc exec again-qualification -- uname -a
           sudo lxc exec again-qualification -- systemd-detect-virt --vm
           sudo lxc image info ubuntu:24.04
-          sudo lxc delete --force again-qualification
           exit 1
       - name: Install the pinned Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --component clippy
