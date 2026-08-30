@@ -593,11 +593,9 @@ def validate_chaos(report: Mapping[str, Any]) -> dict[str, str]:
         and exact_probe.get("automatic_daemon") is True
         and exact_probe.get("sessions") == 100
         and exact_probe.get("unique_result_ids") == 1
-        and _is_int(exact_probe.get("referenced_results"), 1)
-        and _is_int(exact_probe.get("unreferenced_direct_results"), 0)
-        and exact_probe.get("referenced_results")
-        + exact_probe.get("unreferenced_direct_results")
-        == exact_probe.get("operations")
+        and _is_int(exact_probe.get("operations"), 1)
+        and exact_probe.get("referenced_results") == exact_probe.get("operations")
+        and exact_probe.get("unreferenced_direct_results") == 0
         and _mapping(exact_probe.get("daemon_stop"), "chaos_daemon_stop").get(
             "absent_after_stop"
         )
@@ -815,9 +813,10 @@ def build_gate(
         "gate evidence does not bind to one source commit",
     )
     initial_binary = scenario_summary["initial_binary_sha256"]
+    qualified_binary = scenario_summary["upgraded_binary_sha256"]
     _require(
-        chaos_summary["binary_sha256"] == initial_binary
-        and agent_summary["binary_sha256"] == initial_binary,
+        chaos_summary["binary_sha256"] == qualified_binary
+        and agent_summary["binary_sha256"] == qualified_binary,
         "binary_mismatch",
         "product, chaos, and real-agent evidence used different binaries",
     )
@@ -829,7 +828,7 @@ def build_gate(
             and item["installed_binary_sha256"] == release_binaries[item["target"]]
             for item in native_summaries
         )
-        and initial_binary == release_binaries[scenario_summary["target"]],
+        and qualified_binary == release_binaries[scenario_summary["target"]],
         "release_binary_mismatch",
         "native or product evidence does not match the signed release archives",
     )
@@ -839,8 +838,8 @@ def build_gate(
         "source_git_sha": source,
         "release_tag": release_summary["tag"],
         "binary": {
-            "qualified_sha256": initial_binary,
-            "upgrade_sha256": scenario_summary["upgraded_binary_sha256"],
+            "upgrade_from_sha256": initial_binary,
+            "qualified_sha256": qualified_binary,
         },
         "coverage": {
             "product_scenario_steps": len(SCENARIO_STEPS),

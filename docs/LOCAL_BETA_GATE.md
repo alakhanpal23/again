@@ -68,10 +68,11 @@ python3 -B bench/local_beta_product_scenario.py \
   --output /absolute/path/to/product-scenario.json
 ```
 
-The producer refuses mixed source or binary identities, reruns the locked Rust
-and 100,000-case differential gates, performs an actual two-archive in-place
-upgrade and uninstall, and publishes evidence with private no-overwrite
-semantics.
+The producer currently fails closed before emitting release evidence. Its v1
+inputs do not execute every required client apply/remove, quota-maintenance,
+upgrade-draining, and adversarial probe. Those executable probes must land
+before the twelve-step scenario can qualify a release; passing unit tests or
+setup-plan evidence is not substituted for missing observations.
 
 The same report must retain the adversarial matrix. It requires 100 concurrent
 clients, at least two repositories, a positive retained soak duration, all

@@ -399,6 +399,17 @@ def main() -> int:
         raise SmokeFailure("evidence output and source Git SHA must be provided together")
     if args.source_git_sha is not None and SOURCE_SHA.fullmatch(args.source_git_sha) is None:
         raise SmokeFailure("source Git SHA is not a lowercase 40-character digest")
+    if args.source_git_sha is not None:
+        head = run(
+            ["git", "rev-parse", "HEAD"], cwd=repository, env=os.environ.copy(),
+            check=True, timeout=5.0,
+        ).stdout.decode("ascii").strip()
+        dirty = run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repository, env=os.environ.copy(), check=True, timeout=5.0,
+        ).stdout
+        if head != args.source_git_sha or dirty:
+            raise SmokeFailure("release smoke source checkout is dirty or does not match the claimed Git SHA")
     if SEMVER_TAG.fullmatch(args.version) is None:
         raise SmokeFailure("version is not a supported SemVer release tag")
     target = host_target()

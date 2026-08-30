@@ -1108,8 +1108,11 @@ def _exact_probe(
         if cleanup_error is not None and active_error is None:
             raise cleanup_error
     result_ids = [identifier for identifier in observed_result_ids if identifier is not None]
-    if not result_ids or len(set(result_ids)) != 1:
-        raise HarnessRefusal("probe_result_divergence", "exact probe returned divergent result IDs")
+    if len(result_ids) != len(observed_result_ids) or len(set(result_ids)) != 1:
+        raise HarnessRefusal(
+            "probe_result_divergence",
+            "exact beta probe did not reference one canonical result for every operation",
+        )
     expected_argv = (
         [str(binary), "mcp", "connect", "--workspace", str(repo)]
         if automatic_daemon

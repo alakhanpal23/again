@@ -187,16 +187,16 @@ def chaos_report() -> dict[str, object]:
         "schema": gate.CHAOS_SCHEMA,
         "classification": {"type": "pass", "code": "all_exact_scenarios_reconciled"},
         "source_git_sha": SOURCE,
-        "binary": {"sha256": INITIAL},
+        "binary": {"sha256": UPGRADED},
         "mode": "beta",
         "concurrency": 100,
         "false_hit_count": 0,
         "exact_probe": {
             "automatic_daemon": True,
             "operations": 2_000,
-            "referenced_results": 1_999,
+            "referenced_results": 2_000,
             "sessions": 100,
-            "unreferenced_direct_results": 1,
+            "unreferenced_direct_results": 0,
             "unique_result_ids": 1,
             "daemon_stop": {"absent_after_stop": True},
         },
@@ -229,7 +229,7 @@ def real_agent_report() -> dict[str, object]:
         "schema": gate.REAL_AGENT_SCHEMA,
         "classification": {"type": "pass", "code": "outside_user_pairs_passed"},
         "source_git_sha": SOURCE,
-        "binary_sha256": INITIAL,
+        "binary_sha256": UPGRADED,
         "outside_user": True,
         "outside_user_count": 5,
         "accepted_attempts": 50,
@@ -277,7 +277,7 @@ def release_report() -> dict[str, object]:
         if name.endswith(".tar.gz"):
             detail["target"] = name[len("again-v1.0.0-beta.1-") : -len(".tar.gz")]
             detail["binary_sha256"] = (
-                INITIAL if detail["target"] == "aarch64-apple-darwin" else "d" * 64
+                UPGRADED if detail["target"] == "aarch64-apple-darwin" else "d" * 64
             )
         artifacts.append(
             detail
@@ -348,6 +348,8 @@ class LocalBetaGateTests(unittest.TestCase):
         report = self.build()
         self.assertEqual(report["classification"]["type"], "pass")  # type: ignore[index]
         self.assertEqual(report["source_git_sha"], SOURCE)
+        self.assertEqual(report["binary"]["upgrade_from_sha256"], INITIAL)  # type: ignore[index]
+        self.assertEqual(report["binary"]["qualified_sha256"], UPGRADED)  # type: ignore[index]
         self.assertEqual(report["coverage"]["native_targets"], list(gate.TARGETS))  # type: ignore[index]
         self.assertEqual(report["coverage"]["release_asset_count"], 14)  # type: ignore[index]
         self.assertTrue(gate._digest(report["report_sha256"]))

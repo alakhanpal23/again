@@ -32,6 +32,20 @@ class ScenarioFailure(RuntimeError):
     pass
 
 
+def verify_source_checkout(repository: pathlib.Path, source_git_sha: str) -> None:
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repository, check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True,
+    ).stdout
+    if head != source_git_sha or dirty:
+        raise ScenarioFailure("scenario source checkout is dirty or does not match --source-git-sha")
+
+
 def load(path: pathlib.Path) -> dict[str, Any]:
     if not path.is_file() or path.is_symlink() or path.stat().st_size > 16 * 1024 * 1024:
         raise ScenarioFailure("evidence input is not a bounded regular file")
@@ -167,6 +181,7 @@ def main() -> int:
         parser.error(f"refusing to replace existing evidence: {output}")
 
     repository = pathlib.Path(__file__).resolve().parent.parent
+    verify_source_checkout(repository, args.source_git_sha)
     initial = load(args.initial_native_evidence.resolve(strict=True))
     upgraded = load(args.upgraded_native_evidence.resolve(strict=True))
     lifecycle = load(args.lifecycle_evidence.resolve(strict=True))
@@ -177,6 +192,15 @@ def main() -> int:
     gate.validate_chaos(chaos_report)
     passed(lifecycle, "again.local-beta-lifecycle-e2e.v1")
     passed(product, "again.agent-gateway-product-e2e.v1")
+
+    # The v1 subordinate reports do not yet carry executable observations for
+    # client apply/remove, quota maintenance, daemon upgrade draining, and the
+    # complete adversarial matrix. Never manufacture those release claims from
+    # a successful unit-test command or setup-plan-only evidence.
+    raise ScenarioFailure(
+        "executable 12-step evidence is incomplete: client apply/remove, quota "
+        "maintenance, upgrade draining, and adversarial probe reports are required"
+    )
 
     upgraded_binary = upgraded["installed_binary_sha256"]
     initial_binary = initial["installed_binary_sha256"]

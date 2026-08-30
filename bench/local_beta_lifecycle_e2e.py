@@ -25,6 +25,21 @@ class LifecycleFailure(RuntimeError):
     pass
 
 
+def verify_source_checkout(source_git_sha: str) -> None:
+    repository = pathlib.Path(__file__).resolve().parent.parent
+    head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    ).stdout.strip()
+    dirty = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=repository, check=True, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, text=True,
+    ).stdout
+    if head != source_git_sha or dirty:
+        raise LifecycleFailure("lifecycle source checkout is dirty or does not match --source-git-sha")
+
+
 def canonical(value: Any) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
 
@@ -141,6 +156,7 @@ def export_task(
 
 
 def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
+    verify_source_checkout(source_git_sha)
     root = chaos._create_run_root()
     workspace = chaos._fixture(root)
     state = root / "state"
