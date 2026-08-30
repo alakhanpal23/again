@@ -31,7 +31,14 @@ jobs:
       - name: Build the fixed diagnostic
         run: cargo +1.88.0 build --locked --features linux-pytest --bin again
       - name: Require 100 samples and both kernel fork-delivery orders
-        run: sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh
+        run: |
+          original=$(sudo sysctl -n kernel.sched_child_runs_first)
+          restore_scheduler() {
+            sudo sysctl -q -w kernel.sched_child_runs_first="$original"
+          }
+          trap restore_scheduler EXIT
+          sudo sysctl -q -w kernel.sched_child_runs_first=1
+          sudo --preserve-env=PATH scripts/qualify_linux_supervisor.sh
       - name: Return evidence ownership to the unprivileged job user
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" linux-supervisor-qualification 2>/dev/null || true
