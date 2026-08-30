@@ -361,6 +361,7 @@ class Session:
         label: str,
         timeout: float = 5.0,
         automatic_daemon: bool = False,
+        authorization_scope: str = "again-chaos-soak:exact-v2",
     ) -> None:
         self.automatic_daemon = automatic_daemon
         self.argv = (
@@ -373,7 +374,7 @@ class Session:
                 "--workspace",
                 str(repo),
                 "--authorization-scope",
-                "again-chaos-soak:exact-v2",
+                authorization_scope,
             )
         )
         environment = _session_environment(state, label)

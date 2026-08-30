@@ -155,6 +155,14 @@ def export_task(
     return document
 
 
+def daemon_endpoint_identity(root: pathlib.Path) -> tuple[int, int]:
+    endpoints = list((root / "runtime-tmp").glob("again-*/gateway-*.endpoint"))
+    if len(endpoints) != 1 or endpoints[0].is_symlink():
+        raise LifecycleFailure("daemon endpoint identity is missing or ambiguous")
+    metadata = endpoints[0].stat()
+    return metadata.st_dev, metadata.st_ino
+
+
 def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
     verify_source_checkout(source_git_sha)
     root = chaos._create_run_root()
@@ -167,6 +175,7 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
     try:
         first.handshake()
         second.handshake()
+        daemon_before = daemon_endpoint_identity(root)
 
         alias_a = start(first, "alias-a", "alias-a", "one canonical beta task")
         alias_b = start(second, "alias-b", "alias-b", "one canonical beta task")
@@ -220,6 +229,33 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
         blockers = blocked["coordination"].get("blockers", [])
         if not blockers or blockers[0].get("state") != "cancelled":
             raise LifecycleFailure("cancelled dependency blocker was not explicit")
+
+        parent = start(first, "parent", "parent", "complete parent after child")
+        child = start(
+            second,
+            "parent-child",
+            "parent-child",
+            "complete child before parent",
+            parentTaskId="parent",
+        )
+        child_coordination = child["coordination"]
+        transition(
+            second,
+            "complete-parent-child",
+            "parent-child",
+            child_coordination["leaseId"],
+            1,
+            "completed",
+        )
+        parent_coordination = parent["coordination"]
+        transition(
+            first,
+            "complete-parent",
+            "parent",
+            parent_coordination["leaseId"],
+            1,
+            "completed",
+        )
 
         dependency_coordination = dependency["coordination"]
         transition(
@@ -328,15 +364,62 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
             "context.publish",
             {"taskId": "alias-a", "kind": "work_finish", "leaseId": work["leaseId"], "succeeded": False},
         )
-        read = tool(second, "reference", "repo.read", {"path": "README.md"})
-        if read.get("path") != "README.md":
+        second.request(
+            "reference-cold",
+            "tools/call",
+            {"name": "repo.read", "arguments": {"path": "README.md"}},
+        )
+        read_response = second.request(
+            "reference-warm",
+            "tools/call",
+            {"name": "repo.read", "arguments": {"path": "README.md"}},
+        )
+        read_result = read_response.get("result")
+        if (
+            not isinstance(read_result, dict)
+            or chaos.product.result_id(read_result) is None
+            or chaos.product.result_without_reference(read_result)
+            .get("structuredContent", {})
+            .get("path")
+            != "README.md"
+        ):
             raise LifecycleFailure("verified repository reference failed")
+
+        wrong_scope = chaos.Session(
+            binary,
+            workspace,
+            state,
+            "wrong-scope",
+            authorization_scope="again-local-beta:wrong-scope-v1",
+        )
+        try:
+            wrong_scope.handshake()
+            cross_scope_refused = refused(
+                wrong_scope,
+                "cross-scope-inspect",
+                "task.inspect",
+                {"taskId": "alias-a"},
+            )
+        finally:
+            wrong_scope.close()
+        if not cross_scope_refused:
+            raise LifecycleFailure("cross-scope task retrieval was authorized")
 
         before_dependency = export_task(binary, workspace, state, root, "dependency", "dependency-before")
         before_dependent = export_task(binary, workspace, state, root, "dependent", "dependent-before")
-        history_before = digest([before_dependency["export"], before_dependent["export"]])
-        transition_count = len(before_dependency["export"]["transitions"]) + len(
-            before_dependent["export"]["transitions"]
+        before_parent = export_task(binary, workspace, state, root, "parent", "parent-before")
+        before_child = export_task(binary, workspace, state, root, "parent-child", "parent-child-before")
+        history_before = digest(
+            [
+                before_dependency["export"],
+                before_dependent["export"],
+                before_parent["export"],
+                before_child["export"],
+            ]
+        )
+        transition_count = sum(
+            len(document["export"]["transitions"])
+            for document in (before_dependency, before_dependent, before_parent, before_child)
         )
         second.close()
         second_closed = True
@@ -348,12 +431,24 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
             recovered = tool(restarted, "recovered", "task.inspect", {"taskId": "dependent"})["task"]
             if recovered["state"] != "completed":
                 raise LifecycleFailure("terminal history was not recovered")
+            daemon_after = daemon_endpoint_identity(root)
+            if daemon_after == daemon_before:
+                raise LifecycleFailure("daemon endpoint identity did not change after restart")
         finally:
             restarted.close()
         chaos._stop_automatic_daemon(binary, workspace, state, root)
         after_dependency = export_task(binary, workspace, state, root, "dependency", "dependency-after")
         after_dependent = export_task(binary, workspace, state, root, "dependent", "dependent-after")
-        history_after = digest([after_dependency["export"], after_dependent["export"]])
+        after_parent = export_task(binary, workspace, state, root, "parent", "parent-after")
+        after_child = export_task(binary, workspace, state, root, "parent-child", "parent-child-after")
+        history_after = digest(
+            [
+                after_dependency["export"],
+                after_dependent["export"],
+                after_parent["export"],
+                after_child["export"],
+            ]
+        )
         if history_before != history_after:
             raise LifecycleFailure("restart changed task history")
 
@@ -376,8 +471,8 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
             },
             "context_exchange": {
                 "kinds": ["verified_fact", "unknown", "failure", "reference", "in_flight"],
-                "cross_scope_deliveries": 0,
-                "unauthorized_retrievals": 0,
+                "cross_scope_deliveries": 0 if cross_scope_refused else 1,
+                "unauthorized_retrievals": 0 if cross_scope_refused else 1,
             },
             "leader_takeover": {
                 "leader_generation_before": takeover_first["leaseGeneration"],
@@ -386,14 +481,14 @@ def run(binary: pathlib.Path, source_git_sha: str) -> dict[str, Any]:
                 "stale_leader_transition_refused": stale_refused,
             },
             "lifecycle_completion": {
-                "dependency_completed": True,
-                "parent_completed": True,
+                "dependency_completed": after_dependency["export"]["task"]["state"] == "completed",
+                "parent_completed": after_parent["export"]["task"]["state"] == "completed",
                 "terminal_immutable": terminal_refused,
                 "transition_history_count": transition_count,
             },
             "daemon_restart_recovery": {
-                "daemon_identity_changed": True,
-                "complete_history_recovered": True,
+                "daemon_identity_changed": daemon_after != daemon_before,
+                "complete_history_recovered": history_before == history_after,
                 "history_digest_before": history_before,
                 "history_digest_after": history_after,
             },

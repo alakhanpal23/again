@@ -79,6 +79,7 @@ ZERO_SAFETY_COUNTERS = (
     "cross_scope_hits",
     "duplicated_completions",
     "false_hits",
+    "resource_leaks",
     "secret_leaks",
     "silent_evictions",
     "unauthorized_retrievals",
