@@ -33,18 +33,59 @@ fi
 mkdir -m 700 "$evidence_dir"
 : > "$evidence_dir/validated.jsonl"
 
+# Run the fixed probes as one bounded cohort. The contention is deliberate:
+# Linux may report either the new child's stop or the parent's fork event
+# first, but an otherwise idle hosted runner overwhelmingly schedules the
+# parent path first. Concurrent independent probes exercise both live kernel
+# paths without selecting a wait target, changing the diagnostic, or
+# manufacturing an event.
+cleanup_running_probes() {
+  for pid_file in "$evidence_dir"/sample-*/probe.pid; do
+    [ -f "$pid_file" ] || continue
+    probe_pid=$(cat "$pid_file")
+    kill "$probe_pid" 2>/dev/null || true
+  done
+  for pid_file in "$evidence_dir"/sample-*/probe.pid; do
+    [ -f "$pid_file" ] || continue
+    probe_pid=$(cat "$pid_file")
+    wait "$probe_pid" 2>/dev/null || true
+    rm -f "$pid_file"
+  done
+}
+trap cleanup_running_probes EXIT
+trap 'exit 1' HUP INT TERM
+
+iteration=1
+while [ "$iteration" -le "$sample_count" ]; do
+  sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
+  mkdir -m 700 "$sample_dir"
+  AGAIN_SUPERVISOR_QUALIFICATION_ITERATION=$iteration \
+    "$binary" __linux-pytest-supervisor-tree-probe-v1 \
+    > "$sample_dir/stdout.raw" \
+    2> "$sample_dir/stderr.raw" &
+  printf '%d\n' "$!" > "$sample_dir/probe.pid"
+  iteration=$((iteration + 1))
+done
+
+iteration=1
+while [ "$iteration" -le "$sample_count" ]; do
+  sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
+  probe_pid=$(cat "$sample_dir/probe.pid")
+  set +e
+  wait "$probe_pid"
+  probe_exit=$?
+  set -e
+  printf '%d\n' "$probe_exit" > "$sample_dir/exit-status.txt"
+  rm -f "$sample_dir/probe.pid"
+  iteration=$((iteration + 1))
+done
+trap - EXIT HUP INT TERM
+
 iteration=1
 failed_sample_count=0
 while [ "$iteration" -le "$sample_count" ]; do
   sample_dir=$(printf '%s/sample-%03d' "$evidence_dir" "$iteration")
-  mkdir -m 700 "$sample_dir"
-  set +e
-  "$binary" __linux-pytest-supervisor-tree-probe-v1 \
-    > "$sample_dir/stdout.raw" \
-    2> "$sample_dir/stderr.raw"
-  probe_exit=$?
-  set -e
-  printf '%d\n' "$probe_exit" > "$sample_dir/exit-status.txt"
+  probe_exit=$(cat "$sample_dir/exit-status.txt")
   validated_record="$sample_dir/validated.json"
   sample_valid=true
   if [ "$probe_exit" -ne 0 ] || [ -s "$sample_dir/stderr.raw" ]; then
