@@ -252,6 +252,10 @@ class ChaosSoakHarnessTests(unittest.TestCase):
         self.assertGreater(harness.MAX_CPU_SECONDS, 0)
         self.assertGreater(harness.MAX_RSS_BYTES, 0)
         self.assertEqual(
+            harness.EXPECTED_DAEMON_TOOLS,
+            frozenset(harness.product.EXPECTED_ADVERTISED_TOOLS),
+        )
+        self.assertEqual(
             json.loads(harness.canonical_json({"mode": "quick"})), {"mode": "quick"}
         )
 

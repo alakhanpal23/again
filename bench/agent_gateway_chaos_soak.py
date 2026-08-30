@@ -62,11 +62,7 @@ STDIO_MAX_INFLIGHT = 16
 MAX_CPU_SECONDS = 1_800.0
 MAX_RSS_BYTES = 2 * 1024 * 1024 * 1024
 RUNTIME_SLACK_SECONDS = 45.0
-EXPECTED_DAEMON_TOOLS = frozenset(
-    (*product.EXPECTED_ADVERTISED_TOOLS, "context.cancel", "context.delta",
-     "context.publish", "context.retrieve", "task.claim", "task.inspect",
-     "task.list", "task.start", "task.transition")
-)
+EXPECTED_DAEMON_TOOLS = frozenset(product.EXPECTED_ADVERTISED_TOOLS)
 
 
 class HarnessRefusal(RuntimeError):
@@ -876,12 +872,14 @@ def _harden_product_harness() -> Iterator[dict[str, Any]]:
     original_pin = product.pin_binary
     registry: dict[pathlib.Path, PinnedBinary] = {}
     process_groups: set[int] = set()
+    processes: dict[int, subprocess.Popen[bytes]] = {}
     revalidations = 0
 
     class HardenedSession(original_session):  # type: ignore[misc, valid-type]
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             super().__init__(*args, **kwargs)
             process_groups.add(self.process.pid)
+            processes[self.process.pid] = self.process
 
         def kill(self) -> None:
             if _process_group_exists(self.process.pid):
@@ -945,8 +943,9 @@ def _harden_product_harness() -> Iterator[dict[str, Any]]:
         product.McpSession = original_session
         product.pin_binary = original_pin
         cleanup_error: BaseException | None = None
-        for process_group in sorted(process_groups):
+        for process_group, process in sorted(processes.items()):
             try:
+                product.terminate_process_group(process)
                 terminate_owned_process_group(process_group)
             except BaseException as error:
                 cleanup_error = cleanup_error or error

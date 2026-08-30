@@ -53,6 +53,10 @@ RECOVERY_GRACE_SECONDS = 6.0
 PROCESS_STOP_SECONDS = 2.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 EXPECTED_ADVERTISED_TOOLS = (
+    "context.cancel",
+    "context.delta",
+    "context.publish",
+    "context.retrieve",
     "git.blame",
     "git.diff",
     "git.log",
@@ -66,6 +70,11 @@ EXPECTED_ADVERTISED_TOOLS = (
     "repo.search",
     "repo.stat",
     "repo.tree",
+    "task.claim",
+    "task.inspect",
+    "task.list",
+    "task.start",
+    "task.transition",
 )
 E2E_EXERCISED_TOOLS = frozenset(("repo.read", "repo.search"))
 
