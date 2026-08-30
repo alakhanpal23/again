@@ -10,19 +10,25 @@
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use serde_json::Value;
 use thiserror::Error;
 
-const PLAN_VERSION: u32 = 2;
+const PLAN_VERSION: u32 = 3;
 const SERVER_NAME: &str = "again";
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 64 * 1_024;
 const OWNERSHIP_SUFFIX: &str = ".again-owner-v2";
+const CLIENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CLIENT_OUTPUT_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -32,7 +38,7 @@ pub enum AgentGatewayClientV1 {
 }
 
 impl AgentGatewayClientV1 {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
@@ -92,7 +98,7 @@ impl AgentGatewaySetupPlanV1 {
         let ownership_path = ownership_path_for(&config_path)?;
         let args = vec![
             "mcp".to_owned(),
-            "serve".to_owned(),
+            "connect".to_owned(),
             "--workspace".to_owned(),
             workspace.to_string_lossy().into_owned(),
         ];
@@ -117,7 +123,7 @@ impl AgentGatewaySetupPlanV1 {
             ownership_path,
             ownership_digest,
             writes_by_default: false,
-            install_policy: "create_absent_or_verify_exact_owned_v1",
+            install_policy: "official_client_cli_only_v1",
             config_document,
         })
     }
@@ -179,6 +185,23 @@ pub enum AgentGatewaySetupError {
     SerializePlan(serde_json::Error),
     #[error("gateway setup plan is internally inconsistent")]
     InvalidPlan,
+    #[error("{client} CLI is unavailable or unsupported; run manually: {manual_command}")]
+    UnsupportedClient {
+        client: &'static str,
+        manual_command: String,
+    },
+    #[error("{client} MCP entry conflicts with the exact Again command; refusing to change it")]
+    ConflictingClientEntry { client: &'static str },
+    #[error("{client} CLI command timed out")]
+    ClientCommandTimeout { client: &'static str },
+    #[error("{client} CLI output exceeded the fixed diagnostic bound")]
+    ClientOutputTooLarge { client: &'static str },
+    #[error("{client} CLI rejected the requested MCP change")]
+    ClientCommandFailed { client: &'static str },
+    #[error("{client} MCP change could not be verified exactly")]
+    ClientVerificationFailed { client: &'static str },
+    #[error("{client} MCP apply failed verification and its exact rollback could not be verified")]
+    ClientRollbackFailed { client: &'static str },
     #[error("gateway config parent is missing, not a directory, or is a symlink")]
     UnsafeConfigParent,
     #[error("gateway config or ownership record is a symlink or non-regular file")]
@@ -193,11 +216,418 @@ pub enum AgentGatewaySetupError {
 
 pub type Result<T> = std::result::Result<T, AgentGatewaySetupError>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClientSetupActionV1 {
+    Inspect,
+    Apply,
+    Remove,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientEntryStateV1 {
+    Absent,
+    Exact,
+    Conflict,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ClientSetupOutcomeV1 {
+    pub client: AgentGatewayClientV1,
+    pub action: &'static str,
+    pub before: ClientEntryStateV1,
+    pub after: ClientEntryStateV1,
+    pub changed: bool,
+    pub verified: bool,
+}
+
+#[derive(Debug)]
+struct BoundedOutputV1 {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Inspect, apply, or remove the exact Again entry through the client's
+/// supported CLI. This function never opens a client configuration file.
+pub fn execute_client_setup_v1(
+    plan: &AgentGatewaySetupPlanV1,
+    action: ClientSetupActionV1,
+) -> Result<ClientSetupOutcomeV1> {
+    validate_plan_paths(plan)?;
+    probe_client_cli_v1(plan)?;
+    let before = inspect_client_entry_v1(plan)?;
+    match action {
+        ClientSetupActionV1::Inspect => Ok(ClientSetupOutcomeV1 {
+            client: plan.client,
+            action: "inspect",
+            before,
+            after: before,
+            changed: false,
+            verified: true,
+        }),
+        ClientSetupActionV1::Apply => {
+            if before == ClientEntryStateV1::Conflict {
+                return Err(AgentGatewaySetupError::ConflictingClientEntry {
+                    client: plan.client.as_str(),
+                });
+            }
+            if before == ClientEntryStateV1::Exact {
+                return Ok(ClientSetupOutcomeV1 {
+                    client: plan.client,
+                    action: "apply",
+                    before,
+                    after: before,
+                    changed: false,
+                    verified: true,
+                });
+            }
+            let output = run_client_command_v1(plan, &add_arguments_v1(plan))?;
+            if !output.status.success() {
+                return Err(AgentGatewaySetupError::ClientCommandFailed {
+                    client: plan.client.as_str(),
+                });
+            }
+            match inspect_client_entry_v1(plan) {
+                Ok(ClientEntryStateV1::Exact) => Ok(ClientSetupOutcomeV1 {
+                    client: plan.client,
+                    action: "apply",
+                    before,
+                    after: ClientEntryStateV1::Exact,
+                    changed: true,
+                    verified: true,
+                }),
+                _ => {
+                    // The entry was absent before this invocation, so removing
+                    // it is a bounded rollback of only our own attempted add.
+                    let rollback = run_client_command_v1(plan, &remove_arguments_v1(plan));
+                    if rollback.is_err()
+                        || !rollback.is_ok_and(|output| output.status.success())
+                        || inspect_client_entry_v1(plan).ok() != Some(ClientEntryStateV1::Absent)
+                    {
+                        Err(AgentGatewaySetupError::ClientRollbackFailed {
+                            client: plan.client.as_str(),
+                        })
+                    } else {
+                        Err(AgentGatewaySetupError::ClientVerificationFailed {
+                            client: plan.client.as_str(),
+                        })
+                    }
+                }
+            }
+        }
+        ClientSetupActionV1::Remove => {
+            if before == ClientEntryStateV1::Conflict {
+                return Err(AgentGatewaySetupError::ConflictingClientEntry {
+                    client: plan.client.as_str(),
+                });
+            }
+            if before == ClientEntryStateV1::Absent {
+                return Ok(ClientSetupOutcomeV1 {
+                    client: plan.client,
+                    action: "remove",
+                    before,
+                    after: before,
+                    changed: false,
+                    verified: true,
+                });
+            }
+            let output = run_client_command_v1(plan, &remove_arguments_v1(plan))?;
+            if !output.status.success() {
+                return Err(AgentGatewaySetupError::ClientCommandFailed {
+                    client: plan.client.as_str(),
+                });
+            }
+            let after = inspect_client_entry_v1(plan)?;
+            if after != ClientEntryStateV1::Absent {
+                return Err(AgentGatewaySetupError::ClientVerificationFailed {
+                    client: plan.client.as_str(),
+                });
+            }
+            Ok(ClientSetupOutcomeV1 {
+                client: plan.client,
+                action: "remove",
+                before,
+                after,
+                changed: true,
+                verified: true,
+            })
+        }
+    }
+}
+
+fn probe_client_cli_v1(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
+    for arguments in [
+        vec!["mcp".to_owned(), "add".to_owned(), "--help".to_owned()],
+        vec!["mcp".to_owned(), "get".to_owned(), "--help".to_owned()],
+        vec!["mcp".to_owned(), "list".to_owned(), "--help".to_owned()],
+        vec!["mcp".to_owned(), "remove".to_owned(), "--help".to_owned()],
+    ] {
+        let output = match run_client_command_v1(plan, &arguments) {
+            Ok(output) => output,
+            Err(AgentGatewaySetupError::Io(_)) => return Err(unsupported_client_v1(plan)),
+            Err(error) => return Err(error),
+        };
+        if !output.status.success() {
+            return Err(unsupported_client_v1(plan));
+        }
+        let combined = [output.stdout.as_slice(), output.stderr.as_slice()].concat();
+        if !combined.windows(3).any(|window| window == b"mcp")
+            && !combined.windows(5).any(|window| window == b"Usage")
+        {
+            return Err(unsupported_client_v1(plan));
+        }
+        if plan.client == AgentGatewayClientV1::Codex
+            && arguments[1] == "get"
+            && !combined.windows(6).any(|window| window == b"--json")
+        {
+            return Err(unsupported_client_v1(plan));
+        }
+        if plan.client == AgentGatewayClientV1::Claude
+            && arguments[1] == "add"
+            && (!combined.windows(11).any(|window| window == b"--transport")
+                || !combined.windows(7).any(|window| window == b"--scope"))
+        {
+            return Err(unsupported_client_v1(plan));
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_client_v1(plan: &AgentGatewaySetupPlanV1) -> AgentGatewaySetupError {
+    AgentGatewaySetupError::UnsupportedClient {
+        client: plan.client.as_str(),
+        manual_command: plan.local_cli_command.clone(),
+    }
+}
+
+fn inspect_client_entry_v1(plan: &AgentGatewaySetupPlanV1) -> Result<ClientEntryStateV1> {
+    let mut get_arguments = vec!["mcp".to_owned(), "get".to_owned(), SERVER_NAME.to_owned()];
+    if plan.client == AgentGatewayClientV1::Codex {
+        get_arguments.push("--json".to_owned());
+    }
+    let get = run_client_command_v1(plan, &get_arguments)?;
+    if get.status.success() {
+        let definition = match plan.client {
+            AgentGatewayClientV1::Codex => {
+                let value: Value =
+                    serde_json::from_slice(&get.stdout).map_err(|_| unsupported_client_v1(plan))?;
+                find_client_definition_v1(&value)
+            }
+            AgentGatewayClientV1::Claude => parse_claude_definition_v1(&get.stdout),
+        };
+        let Some((command, args)) = definition else {
+            return Err(unsupported_client_v1(plan));
+        };
+        return Ok(
+            if command == plan.stdio.command && args == plan.stdio.args {
+                ClientEntryStateV1::Exact
+            } else {
+                ClientEntryStateV1::Conflict
+            },
+        );
+    }
+
+    let mut list_arguments = vec!["mcp".to_owned(), "list".to_owned()];
+    if plan.client == AgentGatewayClientV1::Codex {
+        list_arguments.push("--json".to_owned());
+    }
+    let list = run_client_command_v1(plan, &list_arguments)?;
+    if !list.status.success() {
+        return Err(unsupported_client_v1(plan));
+    }
+    let contains_server = match plan.client {
+        AgentGatewayClientV1::Codex => {
+            let value: Value =
+                serde_json::from_slice(&list.stdout).map_err(|_| unsupported_client_v1(plan))?;
+            json_contains_named_server_v1(&value, SERVER_NAME)
+        }
+        AgentGatewayClientV1::Claude => text_contains_named_server_v1(&list.stdout, SERVER_NAME),
+    };
+    if contains_server {
+        Err(unsupported_client_v1(plan))
+    } else {
+        Ok(ClientEntryStateV1::Absent)
+    }
+}
+
+fn parse_claude_definition_v1(output: &[u8]) -> Option<(PathBuf, Vec<String>)> {
+    let output = std::str::from_utf8(output).ok()?;
+    let mut command = None;
+    let mut args = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("Command:") {
+            command = Some(PathBuf::from(value.trim()));
+        } else if let Some(value) = line.strip_prefix("Args:") {
+            args = shell_words::split(value.trim()).ok();
+        }
+    }
+    Some((command?, args?))
+}
+
+fn text_contains_named_server_v1(output: &[u8], name: &str) -> bool {
+    std::str::from_utf8(output).is_ok_and(|output| {
+        output.lines().any(|line| {
+            let first = line
+                .trim_start()
+                .split_ascii_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(':');
+            first == name
+        })
+    })
+}
+
+fn find_client_definition_v1(value: &Value) -> Option<(PathBuf, Vec<String>)> {
+    match value {
+        Value::Object(object) => {
+            let candidate = object
+                .get("transport")
+                .and_then(Value::as_object)
+                .unwrap_or(object);
+            if let (Some(command), Some(args)) = (
+                candidate.get("command").and_then(Value::as_str),
+                candidate.get("args").and_then(Value::as_array),
+            ) {
+                let args = args
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                return Some((PathBuf::from(command), args));
+            }
+            object.values().find_map(find_client_definition_v1)
+        }
+        Value::Array(values) => values.iter().find_map(find_client_definition_v1),
+        _ => None,
+    }
+}
+
+fn json_contains_named_server_v1(value: &Value, name: &str) -> bool {
+    match value {
+        Value::Object(object) => {
+            object.get("name").and_then(Value::as_str) == Some(name)
+                || object.contains_key(name)
+                || object
+                    .values()
+                    .any(|value| json_contains_named_server_v1(value, name))
+        }
+        Value::Array(values) => values
+            .iter()
+            .any(|value| json_contains_named_server_v1(value, name)),
+        _ => false,
+    }
+}
+
+fn add_arguments_v1(plan: &AgentGatewaySetupPlanV1) -> Vec<String> {
+    let mut arguments = match plan.client {
+        AgentGatewayClientV1::Codex => vec!["mcp", "add", SERVER_NAME, "--"],
+        AgentGatewayClientV1::Claude => vec![
+            "mcp",
+            "add",
+            "--transport",
+            "stdio",
+            "--scope",
+            "user",
+            SERVER_NAME,
+            "--",
+        ],
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    arguments.push(plan.stdio.command.to_string_lossy().into_owned());
+    arguments.extend(plan.stdio.args.iter().cloned());
+    arguments
+}
+
+fn remove_arguments_v1(plan: &AgentGatewaySetupPlanV1) -> Vec<String> {
+    match plan.client {
+        AgentGatewayClientV1::Codex => vec!["mcp", "remove", SERVER_NAME],
+        AgentGatewayClientV1::Claude => {
+            vec!["mcp", "remove", SERVER_NAME, "--scope", "user"]
+        }
+    }
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+fn run_client_command_v1(
+    plan: &AgentGatewaySetupPlanV1,
+    arguments: &[String],
+) -> Result<BoundedOutputV1> {
+    let mut child = Command::new(plan.client.as_str())
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(AgentGatewaySetupError::Io)?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(AgentGatewaySetupError::InvalidPlan)?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(AgentGatewaySetupError::InvalidPlan)?;
+    let stdout_reader = thread::spawn(move || read_bounded_v1(stdout));
+    let stderr_reader = thread::spawn(move || read_bounded_v1(stderr));
+    let deadline = Instant::now() + CLIENT_COMMAND_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(AgentGatewaySetupError::ClientCommandTimeout {
+                client: plan.client.as_str(),
+            });
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| AgentGatewaySetupError::InvalidPlan)??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| AgentGatewaySetupError::InvalidPlan)??;
+    if stdout.len() as u64 > MAX_CLIENT_OUTPUT_BYTES
+        || stderr.len() as u64 > MAX_CLIENT_OUTPUT_BYTES
+    {
+        return Err(AgentGatewaySetupError::ClientOutputTooLarge {
+            client: plan.client.as_str(),
+        });
+    }
+    Ok(BoundedOutputV1 {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_bounded_v1(reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    reader
+        .take(MAX_CLIENT_OUTPUT_BYTES + 1)
+        .read_to_end(&mut output)?;
+    Ok(output)
+}
+
 /// Explicitly install a plan into a previously absent file. Planning never
 /// calls this function. Existing user-managed configuration is always refused,
 /// even when it happens to contain an equivalent `again` entry.
 pub fn install_owned_config(plan: &AgentGatewaySetupPlanV1) -> Result<OwnedInstallOutcomeV1> {
     validate_plan_paths(plan)?;
+    validate_config_parent_v1(&plan.config_path)?;
     let ownership_record = plan.ownership_record();
     let config = inspect_regular_file(&plan.config_path, MAX_CONFIG_BYTES)?;
     let ownership = inspect_regular_file(&plan.ownership_path, 1_024)?;
@@ -236,7 +666,7 @@ fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
     let executable = validate_executable(&plan.stdio.command)?;
     let expected_args = vec![
         "mcp".to_owned(),
-        "serve".to_owned(),
+        "connect".to_owned(),
         "--workspace".to_owned(),
         workspace.to_string_lossy().into_owned(),
     ];
@@ -248,7 +678,7 @@ fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
         || plan.stdio.args != expected_args
         || plan.local_cli_command != local_cli_command(plan.client, &executable, &expected_args)
         || plan.writes_by_default
-        || plan.install_policy != "create_absent_or_verify_exact_owned_v1"
+        || plan.install_policy != "official_client_cli_only_v1"
         || plan.config_document != expected_document
     {
         return Err(AgentGatewaySetupError::InvalidPlan);
@@ -265,7 +695,11 @@ fn validate_plan_paths(plan: &AgentGatewaySetupPlanV1) -> Result<()> {
     {
         return Err(AgentGatewaySetupError::InvalidConfigPath);
     }
-    let Some(parent) = plan.config_path.parent() else {
+    Ok(())
+}
+
+fn validate_config_parent_v1(config_path: &Path) -> Result<()> {
+    let Some(parent) = config_path.parent() else {
         return Err(AgentGatewaySetupError::UnsafeConfigParent);
     };
     let metadata =
@@ -397,7 +831,9 @@ fn managed_config_document(
 fn local_cli_command(client: AgentGatewayClientV1, executable: &Path, args: &[String]) -> String {
     let mut command = match client {
         AgentGatewayClientV1::Codex => "codex mcp add again --".to_owned(),
-        AgentGatewayClientV1::Claude => "claude mcp add -s user again --".to_owned(),
+        AgentGatewayClientV1::Claude => {
+            "claude mcp add --transport stdio --scope user again --".to_owned()
+        }
     };
     command.push(' ');
     command.push_str(&shell_quote(&executable.to_string_lossy()));

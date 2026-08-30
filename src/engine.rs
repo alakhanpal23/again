@@ -3,9 +3,13 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(all(feature = "daemon", unix))]
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+#[cfg(feature = "daemon")]
+use std::time::Duration;
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -15,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
 use crate::agent_gateway_setup::{
-    AgentGatewayClientV1, AgentGatewaySetupPlanV1, install_owned_config,
+    AgentGatewayClientV1, AgentGatewaySetupPlanV1, ClientSetupActionV1, execute_client_setup_v1,
 };
 use crate::executable::{
     ExecutableIdentity, ToolKind, host_audited_apple_profile, verify_executable,
@@ -103,12 +107,10 @@ enum McpCommand {
     /// Print an opt-in Codex or Claude MCP setup plan.
     Setup(McpSetupArgs),
     #[cfg(feature = "daemon")]
-    /// Run or inspect the opt-in, same-user local gateway daemon.
-    #[command(hide = true)]
+    /// Run, inspect, or stop the same-user local gateway daemon.
     Daemon(McpDaemonArgs),
     #[cfg(feature = "daemon")]
-    /// Proxy stdio to an authenticated local gateway daemon.
-    #[command(hide = true)]
+    /// Start or join the workspace daemon and proxy MCP over stdio.
     Connect(McpConnectArgs),
 }
 
@@ -136,7 +138,7 @@ enum McpDaemonCommand {
     Serve(McpDaemonServeArgs),
     /// Query a live daemon without opening an MCP session.
     Status(McpDaemonWorkspaceArgs),
-    /// Stop a live daemon and close its active MCP sessions.
+    /// Stop a live daemon and retire its active MCP sessions.
     Stop(McpDaemonWorkspaceArgs),
 }
 
@@ -183,9 +185,15 @@ struct McpSetupArgs {
     /// Emit the machine-readable setup plan.
     #[arg(long)]
     json: bool,
-    /// Explicit path for a wholly Again-owned config file. Existing unowned files are refused.
-    #[arg(long)]
-    install_owned_config: Option<PathBuf>,
+    /// Apply the exact setup plan through the official client CLI.
+    #[arg(long, conflicts_with_all = ["inspect", "remove"])]
+    apply: bool,
+    /// Inspect and verify the current client entry without changing it.
+    #[arg(long, conflicts_with_all = ["apply", "remove"])]
+    inspect: bool,
+    /// Remove an exact Again-owned entry through the official client CLI.
+    #[arg(long, conflicts_with_all = ["apply", "inspect"])]
+    remove: bool,
 }
 
 #[derive(Debug, Args)]
@@ -971,7 +979,9 @@ fn local_mcp_authorization_scope_v1(
 #[cfg(feature = "daemon")]
 #[cfg(unix)]
 fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
-    use crate::agent_gateway_service::{GatewayDaemonV1, daemon_status_v1, stop_daemon_v1};
+    use crate::agent_gateway_service::{
+        GatewayDaemonV1, daemon_status_v1, install_termination_handler_v1, stop_daemon_v1,
+    };
 
     match args.command {
         McpDaemonCommand::Serve(args) => {
@@ -979,6 +989,7 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
             let authorization_scope =
                 local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
             let daemon = GatewayDaemonV1::bind(&workspace, authorization_scope)?;
+            install_termination_handler_v1()?;
             eprintln!(
                 "Again MCP daemon is experimental; socket peers are restricted to the current uid."
             );
@@ -1009,9 +1020,82 @@ fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
 #[cfg(unix)]
 fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
     let workspace = resolve_mcp_workspace(args.workspace)?;
-    let stream = crate::agent_gateway_service::connect_mcp_v1(&workspace)?;
+    let stream = connect_or_start_daemon_v1(&workspace)?;
     crate::agent_gateway_service::proxy_current_stdio_v1(stream)?;
     Ok(0)
+}
+
+#[cfg(feature = "daemon")]
+#[cfg(unix)]
+fn connect_or_start_daemon_v1(workspace: &Path) -> Result<std::os::unix::net::UnixStream> {
+    use crate::agent_gateway_service::{GatewayServiceError, connect_mcp_v1};
+
+    match connect_mcp_v1(workspace) {
+        Ok(stream) => return Ok(stream),
+        Err(error) if daemon_start_is_safe_v1(&error) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let executable = fs::canonicalize(std::env::current_exe()?)
+        .context("resolve the exact Again executable for daemon startup")?;
+    let mut daemon_command = Command::new(&executable);
+    daemon_command
+        .args([OsStr::new("mcp"), OsStr::new("daemon"), OsStr::new("serve")])
+        .arg("--workspace")
+        .arg(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    let mut child = daemon_command
+        .spawn()
+        .with_context(|| format!("start workspace daemon with {}", executable.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let last_error = match connect_mcp_v1(workspace) {
+            Ok(stream) => {
+                // Rust deliberately does not reap a dropped Child. A connector
+                // that lost the startup election therefore hands its exact
+                // child to a bounded-purpose reaper; the winner is reaped when
+                // its idle/draining daemon eventually exits.
+                let _ = thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(stream);
+            }
+            Err(GatewayServiceError::Incompatible) => {
+                return Err(GatewayServiceError::Incompatible.into());
+            }
+            Err(error) => error,
+        };
+        if Instant::now() >= deadline {
+            if child.try_wait()?.is_none() {
+                child.kill()?;
+                let _ = child.wait();
+            }
+            bail!("workspace daemon did not become ready within 5 seconds: {last_error}");
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(feature = "daemon")]
+#[cfg(unix)]
+fn daemon_start_is_safe_v1(error: &crate::agent_gateway_service::GatewayServiceError) -> bool {
+    use crate::agent_gateway_service::GatewayServiceError;
+    match error {
+        GatewayServiceError::InvalidHandshake => true,
+        GatewayServiceError::Io(error) => matches!(
+            error.kind(),
+            io::ErrorKind::NotFound
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(feature = "daemon")]
@@ -1025,39 +1109,46 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         McpClientArg::Codex => AgentGatewayClientV1::Codex,
         McpClientArg::Claude => AgentGatewayClientV1::Claude,
     };
-    let config_path = match args.install_owned_config.as_ref() {
-        Some(path) => path.clone(),
-        None => {
-            let home = std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
-                .map(PathBuf::from)
-                .ok_or_else(|| anyhow!("HOME is unavailable; pass --install-owned-config"))?;
-            match client {
-                AgentGatewayClientV1::Codex => home.join(".codex").join("config.toml"),
-                AgentGatewayClientV1::Claude => home.join(".claude.json"),
-            }
-        }
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("HOME is unavailable; setup cannot describe the client scope"))?;
+    // This path is descriptive legacy plan metadata only. Setup never opens it;
+    // every mutation and verification goes through the official client CLI.
+    let config_path = match client {
+        AgentGatewayClientV1::Codex => home.join(".codex").join("config.toml"),
+        AgentGatewayClientV1::Claude => home.join(".claude.json"),
     };
     let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path, &args.workspace)?;
-    if args.json {
+    let action = if args.apply {
+        Some(ClientSetupActionV1::Apply)
+    } else if args.inspect {
+        Some(ClientSetupActionV1::Inspect)
+    } else if args.remove {
+        Some(ClientSetupActionV1::Remove)
+    } else {
+        None
+    };
+    if let Some(action) = action {
+        let outcome = execute_client_setup_v1(&plan, action)?;
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+        } else {
+            println!(
+                "{} MCP setup: action={}, before={:?}, after={:?}, changed={}, verified={}",
+                client.as_str(),
+                outcome.action,
+                outcome.before,
+                outcome.after,
+                outcome.changed,
+                outcome.verified
+            );
+        }
+    } else if args.json {
         println!("{}", plan.machine_readable_json()?);
     } else {
         println!("{plan}");
-        if args.install_owned_config.is_none() {
-            println!("# dry run; no configuration was changed");
-        }
-    }
-    if args.install_owned_config.is_some() {
-        let outcome = install_owned_config(&plan)?;
-        eprintln!(
-            "Again-owned MCP configuration result: {}",
-            match outcome {
-                crate::agent_gateway_setup::OwnedInstallOutcomeV1::Installed => "installed",
-                crate::agent_gateway_setup::OwnedInstallOutcomeV1::AlreadyInstalledOwned => {
-                    "already_installed_owned"
-                }
-            }
-        );
+        println!("# dry run; no configuration was changed");
     }
     Ok(0)
 }

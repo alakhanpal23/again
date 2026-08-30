@@ -24,17 +24,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent_gateway_runtime::ExperimentalMcpGatewayV1;
-use crate::mcp_gateway::{AuthenticatedStdioRecipientV1, AuthorizationScopeId};
+use crate::mcp_gateway::{
+    AuthenticatedStdioRecipientV1, AuthorizationScopeId, MCP_PROTOCOL_VERSION,
+};
 use crate::store::Store;
 
 const HANDSHAKE_MAGIC_V1: &[u8; 8] = b"AGNGW001";
 const RESPONSE_MAGIC_V1: &[u8; 8] = b"AGNR0001";
 const ENDPOINT_MAGIC_V1: &[u8; 8] = b"AGNEP001";
+const COMPATIBILITY_DIGEST_BYTES_V1: usize = 32;
 const SESSION_NONCE_BYTES_V1: usize = 16;
 const SOCKET_NAME_BYTES_V1: usize = 32;
 const ENDPOINT_BYTES_V1: usize = 8 + SESSION_NONCE_BYTES_V1 + SOCKET_NAME_BYTES_V1;
-const HANDSHAKE_BYTES_V1: usize = 8 + 1 + 32 + SESSION_NONCE_BYTES_V1;
+const HANDSHAKE_BYTES_V1: usize =
+    8 + 1 + 32 + SESSION_NONCE_BYTES_V1 + COMPATIBILITY_DIGEST_BYTES_V1;
 const MAX_CONTROL_PAYLOAD_BYTES_V1: usize = 4 * 1024;
+const MAX_DAEMON_BINARY_BYTES_V1: u64 = 256 * 1024 * 1024;
 const MAX_ACTIVE_CONNECTIONS_V1: usize = 32;
 const HANDSHAKE_TIMEOUT_V1: Duration = Duration::from_secs(5);
 const MCP_IDLE_READ_TIMEOUT_V1: Duration = Duration::from_secs(60);
@@ -42,6 +47,9 @@ const MCP_WRITE_TIMEOUT_V1: Duration = Duration::from_secs(10);
 const MAX_SESSION_LIFETIME_V1: Duration = Duration::from_secs(8 * 60 * 60);
 const SHUTDOWN_TIMEOUT_V1: Duration = Duration::from_secs(10);
 const ACCEPT_POLL_V1: Duration = Duration::from_millis(10);
+const DAEMON_IDLE_TIMEOUT_V1: Duration = Duration::from_secs(10 * 60);
+
+static TERMINATION_REQUESTED_V1: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -71,6 +79,8 @@ enum ResponseCodeV1 {
     Invalid = 1,
     Busy = 2,
     Internal = 3,
+    Incompatible = 4,
+    Draining = 5,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +101,12 @@ pub enum GatewayServiceError {
     InvalidHandshake,
     #[error("gateway daemon is at its bounded connection capacity")]
     Busy,
+    #[error(
+        "gateway daemon protocol or binary is incompatible; upgrade Again and reconnect after existing sessions drain"
+    )]
+    Incompatible,
+    #[error("gateway daemon is draining existing sessions; retry after it exits")]
+    Draining,
     #[error("gateway daemon peer authentication is unsupported on this platform")]
     UnsupportedPlatform,
     #[error("gateway daemon workers did not stop before the shutdown deadline")]
@@ -111,6 +127,9 @@ pub struct GatewayDaemonStatusV1 {
     active_connections: usize,
     max_active_connections: usize,
     peer_authentication: String,
+    protocol_version: String,
+    binary_version: String,
+    idle_timeout_seconds: u64,
 }
 
 impl GatewayDaemonStatusV1 {
@@ -159,10 +178,18 @@ struct RuntimePathsV1 {
     endpoint: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+struct HandshakeBindingV1 {
+    workspace_digest: [u8; 32],
+    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
+    compatibility_digest: [u8; COMPATIBILITY_DIGEST_BYTES_V1],
+}
+
 struct ActiveConnectionGuardV1 {
     id: u64,
     active: Arc<AtomicUsize>,
     peers: Arc<Mutex<BTreeMap<u64, UnixStream>>>,
+    last_activity: Arc<Mutex<Instant>>,
 }
 
 impl Drop for ActiveConnectionGuardV1 {
@@ -172,6 +199,10 @@ impl Drop for ActiveConnectionGuardV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .remove(&self.id);
         self.active.fetch_sub(1, Ordering::AcqRel);
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Instant::now();
     }
 }
 
@@ -182,6 +213,7 @@ impl Drop for ActiveConnectionGuardV1 {
 pub struct GatewayDaemonV1 {
     workspace: PathBuf,
     workspace_digest: [u8; 32],
+    compatibility_digest: [u8; COMPATIBILITY_DIGEST_BYTES_V1],
     authorization_scope: AuthorizationScopeId,
     listener: UnixListener,
     runtime_cleanup: RuntimeCleanupV1,
@@ -190,6 +222,8 @@ pub struct GatewayDaemonV1 {
     stop: Arc<AtomicBool>,
     active: Arc<AtomicUsize>,
     peers: Arc<Mutex<BTreeMap<u64, UnixStream>>>,
+    last_activity: Arc<Mutex<Instant>>,
+    idle_timeout: Duration,
     next_connection: AtomicU64,
     _instance_lock: File,
 }
@@ -207,6 +241,14 @@ impl GatewayDaemonV1 {
     pub fn bind(
         workspace: &Path,
         authorization_scope: AuthorizationScopeId,
+    ) -> Result<Self, GatewayServiceError> {
+        Self::bind_with_idle_timeout_v1(workspace, authorization_scope, DAEMON_IDLE_TIMEOUT_V1)
+    }
+
+    fn bind_with_idle_timeout_v1(
+        workspace: &Path,
+        authorization_scope: AuthorizationScopeId,
+        idle_timeout: Duration,
     ) -> Result<Self, GatewayServiceError> {
         ensure_supported_platform_v1()?;
         let workspace =
@@ -238,6 +280,7 @@ impl GatewayDaemonV1 {
 
         Ok(Self {
             workspace_digest: canonical_workspace_digest_v1(&workspace),
+            compatibility_digest: compatibility_digest_v1()?,
             workspace,
             authorization_scope,
             listener,
@@ -247,6 +290,8 @@ impl GatewayDaemonV1 {
             stop: Arc::new(AtomicBool::new(false)),
             active: Arc::new(AtomicUsize::new(0)),
             peers: Arc::new(Mutex::new(BTreeMap::new())),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
+            idle_timeout,
             next_connection: AtomicU64::new(1),
             _instance_lock: instance_lock,
         })
@@ -263,14 +308,28 @@ impl GatewayDaemonV1 {
     pub fn serve(self) -> Result<(), GatewayServiceError> {
         let mut workers = Vec::new();
         let mut worker_panicked = false;
-        while !self.stop.load(Ordering::Acquire) {
+        loop {
+            if TERMINATION_REQUESTED_V1.load(Ordering::Acquire) {
+                self.stop.store(true, Ordering::Release);
+            }
             if self.started.elapsed() >= MAX_SESSION_LIFETIME_V1 {
                 self.stop.store(true, Ordering::Release);
-                break;
+            }
+            if self.active.load(Ordering::Acquire) == 0
+                && self
+                    .last_activity
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .elapsed()
+                    >= self.idle_timeout
+            {
+                self.stop.store(true, Ordering::Release);
             }
             reap_finished_workers_v1(&mut workers, &mut worker_panicked);
             if worker_panicked {
                 self.stop.store(true, Ordering::Release);
+            }
+            if self.stop.load(Ordering::Acquire) && self.active.load(Ordering::Acquire) == 0 {
                 break;
             }
             match self.listener.accept() {
@@ -297,21 +356,33 @@ impl GatewayDaemonV1 {
                         .unwrap_or_else(|poison| poison.into_inner())
                         .insert(id, peer_copy);
                     self.active.fetch_add(1, Ordering::AcqRel);
+                    *self
+                        .last_activity
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner()) = Instant::now();
                     let workspace = self.workspace.clone();
-                    let workspace_digest = self.workspace_digest;
-                    let session_nonce = self.session_nonce;
+                    let handshake = HandshakeBindingV1 {
+                        workspace_digest: self.workspace_digest,
+                        session_nonce: self.session_nonce,
+                        compatibility_digest: self.compatibility_digest,
+                    };
                     let authorization_scope = self.authorization_scope.clone();
                     let stop = Arc::clone(&self.stop);
                     let active = Arc::clone(&self.active);
                     let active_for_handler = Arc::clone(&self.active);
                     let peers = Arc::clone(&self.peers);
+                    let last_activity = Arc::clone(&self.last_activity);
                     workers.push(thread::spawn(move || {
-                        let _guard = ActiveConnectionGuardV1 { id, active, peers };
+                        let _guard = ActiveConnectionGuardV1 {
+                            id,
+                            active,
+                            peers,
+                            last_activity,
+                        };
                         let _ = handle_connection_v1(
                             stream,
                             &workspace,
-                            workspace_digest,
-                            session_nonce,
+                            handshake,
                             &authorization_scope,
                             &stop,
                             &active_for_handler,
@@ -325,14 +396,6 @@ impl GatewayDaemonV1 {
             }
         }
 
-        let peers = self
-            .peers
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        for peer in peers.values() {
-            let _ = peer.shutdown(std::net::Shutdown::Both);
-        }
-        drop(peers);
         join_workers_until_v1(
             &mut workers,
             Instant::now() + SHUTDOWN_TIMEOUT_V1,
@@ -345,25 +408,56 @@ impl GatewayDaemonV1 {
     }
 }
 
+/// Install a signal-safe SIGTERM handler for the daemon CLI. The handler only
+/// flips an atomic flag; normal daemon code performs connection retirement and
+/// endpoint cleanup outside signal context.
+pub fn install_termination_handler_v1() -> Result<(), GatewayServiceError> {
+    extern "C" fn request_termination(_signal: libc::c_int) {
+        TERMINATION_REQUESTED_V1.store(true, Ordering::Release);
+    }
+
+    TERMINATION_REQUESTED_V1.store(false, Ordering::Release);
+    // SAFETY: `signal` installs a function with the required C ABI. The
+    // function performs only a lock-free atomic store and retains no pointers.
+    let previous =
+        unsafe { libc::signal(libc::SIGTERM, request_termination as libc::sighandler_t) };
+    if previous == libc::SIG_ERR {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
 fn handle_connection_v1(
     mut stream: UnixStream,
     workspace: &Path,
-    workspace_digest: [u8; 32],
-    session_nonce: [u8; SESSION_NONCE_BYTES_V1],
+    handshake: HandshakeBindingV1,
     authorization_scope: &AuthorizationScopeId,
     stop: &AtomicBool,
     active: &AtomicUsize,
 ) -> Result<(), GatewayServiceError> {
-    let mode = read_handshake_v1(&mut stream, &workspace_digest, &session_nonce)?;
+    let mode = read_handshake_v1(
+        &mut stream,
+        &handshake.workspace_digest,
+        &handshake.session_nonce,
+        &handshake.compatibility_digest,
+    )?;
     match mode {
         ConnectionModeV1::Status => {
             let status = GatewayDaemonStatusV1 {
                 schema_version: 1,
-                status: "ready".to_owned(),
-                workspace_digest: hex_digest_v1(&workspace_digest),
+                status: if stop.load(Ordering::Acquire) {
+                    "draining"
+                } else {
+                    "ready"
+                }
+                .to_owned(),
+                workspace_digest: hex_digest_v1(&handshake.workspace_digest),
                 active_connections: active.load(Ordering::Acquire),
                 max_active_connections: MAX_ACTIVE_CONNECTIONS_V1,
                 peer_authentication: peer_authentication_name_v1().to_owned(),
+                protocol_version: MCP_PROTOCOL_VERSION.to_owned(),
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                idle_timeout_seconds: DAEMON_IDLE_TIMEOUT_V1.as_secs(),
             };
             write_response_v1(&mut stream, ResponseCodeV1::Ready, &status)
         }
@@ -377,6 +471,17 @@ fn handle_connection_v1(
             Ok(())
         }
         ConnectionModeV1::Mcp => {
+            if stop.load(Ordering::Acquire) {
+                return write_response_v1(
+                    &mut stream,
+                    ResponseCodeV1::Draining,
+                    &serde_json::json!({
+                        "schemaVersion": 1,
+                        "status": "draining",
+                        "guidance": "retry after the existing sessions finish"
+                    }),
+                );
+            }
             write_response_v1(
                 &mut stream,
                 ResponseCodeV1::Ready,
@@ -431,7 +536,8 @@ fn connect_mode_v1(
     request[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
     request[8] = mode as u8;
     request[9..41].copy_from_slice(&digest);
-    request[41..].copy_from_slice(&session_nonce);
+    request[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&session_nonce);
+    request[41 + SESSION_NONCE_BYTES_V1..].copy_from_slice(&compatibility_digest_v1()?);
     stream.write_all(&request)?;
     stream.flush()?;
     let (code, payload) = read_response_v1(&mut stream)?;
@@ -441,6 +547,8 @@ fn connect_mode_v1(
             ResponseCodeV1::Invalid | ResponseCodeV1::Internal => {
                 GatewayServiceError::InvalidHandshake
             }
+            ResponseCodeV1::Incompatible => GatewayServiceError::Incompatible,
+            ResponseCodeV1::Draining => GatewayServiceError::Draining,
             ResponseCodeV1::Ready => unreachable!(),
         });
     }
@@ -455,12 +563,13 @@ fn read_handshake_v1(
     stream: &mut UnixStream,
     expected_workspace: &[u8; 32],
     expected_session_nonce: &[u8; SESSION_NONCE_BYTES_V1],
+    expected_compatibility_digest: &[u8; COMPATIBILITY_DIGEST_BYTES_V1],
 ) -> Result<ConnectionModeV1, GatewayServiceError> {
     let mut request = [0_u8; HANDSHAKE_BYTES_V1];
     stream.read_exact(&mut request)?;
     if &request[..8] != HANDSHAKE_MAGIC_V1
         || &request[9..41] != expected_workspace
-        || &request[41..] != expected_session_nonce
+        || &request[41..41 + SESSION_NONCE_BYTES_V1] != expected_session_nonce
     {
         let _ = write_response_v1(
             stream,
@@ -468,6 +577,18 @@ fn read_handshake_v1(
             &serde_json::json!({"schemaVersion":1,"status":"refused"}),
         );
         return Err(GatewayServiceError::InvalidHandshake);
+    }
+    if request[41 + SESSION_NONCE_BYTES_V1..] != *expected_compatibility_digest {
+        let _ = write_response_v1(
+            stream,
+            ResponseCodeV1::Incompatible,
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "status": "incompatible",
+                "guidance": "upgrade Again and reconnect after existing sessions drain"
+            }),
+        );
+        return Err(GatewayServiceError::Incompatible);
     }
     ConnectionModeV1::try_from(request[8])
 }
@@ -502,6 +623,8 @@ fn read_response_v1(
         1 => ResponseCodeV1::Invalid,
         2 => ResponseCodeV1::Busy,
         3 => ResponseCodeV1::Internal,
+        4 => ResponseCodeV1::Incompatible,
+        5 => ResponseCodeV1::Draining,
         _ => return Err(GatewayServiceError::InvalidHandshake),
     };
     let length = u32::from_be_bytes(header[9..13].try_into().expect("fixed header")) as usize;
@@ -725,6 +848,27 @@ fn canonical_workspace_digest_v1(workspace: &Path) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn compatibility_digest_v1() -> Result<[u8; COMPATIBILITY_DIGEST_BYTES_V1], GatewayServiceError> {
+    let mut hasher = blake3::Hasher::new_derive_key("again.gateway-daemon-compatibility.v1");
+    hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+    hasher.update(&[0]);
+    hasher.update(MCP_PROTOCOL_VERSION.as_bytes());
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let metadata = fs::symlink_metadata(&executable)?;
+    if !metadata.is_file() || metadata.len() > MAX_DAEMON_BINARY_BYTES_V1 {
+        return Err(GatewayServiceError::Initialization);
+    }
+    hasher.update(executable.as_os_str().as_encoded_bytes());
+    hasher.update(&metadata.dev().to_be_bytes());
+    hasher.update(&metadata.ino().to_be_bytes());
+    hasher.update(&metadata.len().to_be_bytes());
+    hasher.update(&metadata.mtime().to_be_bytes());
+    hasher.update(&metadata.mtime_nsec().to_be_bytes());
+    hasher.update(&metadata.ctime().to_be_bytes());
+    hasher.update(&metadata.ctime_nsec().to_be_bytes());
+    Ok(*hasher.finalize().as_bytes())
+}
+
 fn hex_digest_v1(digest: &[u8; 32]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -849,9 +993,14 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
     let mut input = stdin.lock();
     let mut output = stdout.lock();
     let mut input_open = true;
+    let mut input_closed_at = None;
     let mut buffer = [0_u8; 16 * 1024];
 
     loop {
+        if input_closed_at.is_some_and(|closed: Instant| closed.elapsed() >= Duration::from_secs(1))
+        {
+            return Ok(());
+        }
         let mut descriptors = [
             libc::pollfd {
                 fd: input.as_raw_fd(),
@@ -866,7 +1015,14 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
         ];
         // SAFETY: the pollfd array is valid for its declared length and poll
         // does not retain the pointer after returning.
-        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), descriptors.len() as _, -1) };
+        let poll_timeout_ms = if input_open { -1 } else { 100 };
+        let result = unsafe {
+            libc::poll(
+                descriptors.as_mut_ptr(),
+                descriptors.len() as _,
+                poll_timeout_ms,
+            )
+        };
         if result < 0 {
             let error = io::Error::last_os_error();
             if error.kind() == io::ErrorKind::Interrupted {
@@ -879,9 +1035,15 @@ pub fn proxy_current_stdio_v1(mut stream: UnixStream) -> Result<(), GatewayServi
                 0 => {
                     input_open = false;
                     stream.shutdown(std::net::Shutdown::Write)?;
+                    input_closed_at = Some(Instant::now());
                 }
                 count => stream.write_all(&buffer[..count])?,
             }
+        }
+        if input_open && descriptors[0].revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            input_open = false;
+            stream.shutdown(std::net::Shutdown::Write)?;
+            input_closed_at = Some(Instant::now());
         }
         if descriptors[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match stream.read(&mut buffer)? {
@@ -1031,15 +1193,17 @@ mod tests {
         let workspace = [7_u8; 32];
         let old_nonce = [3_u8; SESSION_NONCE_BYTES_V1];
         let current_nonce = [4_u8; SESSION_NONCE_BYTES_V1];
+        let compatibility = compatibility_digest_v1().unwrap();
         let (mut client, mut server) = UnixStream::pair().unwrap();
         let mut replay = [0_u8; HANDSHAKE_BYTES_V1];
         replay[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
         replay[8] = ConnectionModeV1::Status as u8;
         replay[9..41].copy_from_slice(&workspace);
-        replay[41..].copy_from_slice(&old_nonce);
+        replay[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&old_nonce);
+        replay[41 + SESSION_NONCE_BYTES_V1..].copy_from_slice(&compatibility);
         client.write_all(&replay).unwrap();
         assert!(matches!(
-            read_handshake_v1(&mut server, &workspace, &current_nonce),
+            read_handshake_v1(&mut server, &workspace, &current_nonce, &compatibility),
             Err(GatewayServiceError::InvalidHandshake)
         ));
 
@@ -1049,9 +1213,49 @@ mod tests {
             .unwrap();
         slow_client.write_all(HANDSHAKE_MAGIC_V1).unwrap();
         assert!(matches!(
-            read_handshake_v1(&mut slow_server, &workspace, &current_nonce),
+            read_handshake_v1(&mut slow_server, &workspace, &current_nonce, &compatibility),
             Err(GatewayServiceError::Io(_))
         ));
+    }
+
+    #[test]
+    fn incompatible_binary_handshake_is_actionable_without_touching_live_sessions() {
+        let workspace = [7_u8; 32];
+        let nonce = [4_u8; SESSION_NONCE_BYTES_V1];
+        let compatibility = compatibility_digest_v1().unwrap();
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let mut request = [0_u8; HANDSHAKE_BYTES_V1];
+        request[..8].copy_from_slice(HANDSHAKE_MAGIC_V1);
+        request[8] = ConnectionModeV1::Status as u8;
+        request[9..41].copy_from_slice(&workspace);
+        request[41..41 + SESSION_NONCE_BYTES_V1].copy_from_slice(&nonce);
+        request[41 + SESSION_NONCE_BYTES_V1..].fill(9);
+        client.write_all(&request).unwrap();
+        assert!(matches!(
+            read_handshake_v1(&mut server, &workspace, &nonce, &compatibility),
+            Err(GatewayServiceError::Incompatible)
+        ));
+        let (code, payload) = read_response_v1(&mut client).unwrap();
+        assert_eq!(code, ResponseCodeV1::Incompatible);
+        let payload: Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(payload["status"], "incompatible");
+        assert!(payload["guidance"].as_str().unwrap().contains("upgrade"));
+    }
+
+    #[test]
+    fn idle_daemon_retires_endpoint_after_bounded_inactivity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let daemon = GatewayDaemonV1::bind_with_idle_timeout_v1(
+            workspace.path(),
+            AuthorizationScopeId::new("idle-test-scope").unwrap(),
+            Duration::from_millis(30),
+        )
+        .unwrap();
+        let socket = daemon.socket_path().to_owned();
+        thread::spawn(move || daemon.serve().unwrap())
+            .join()
+            .unwrap();
+        assert!(!socket.exists());
     }
 
     #[test]

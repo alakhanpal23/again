@@ -6,8 +6,9 @@ Again is a repository-aware execution memory and tool-call control plane for cod
 
 - `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
 - `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
-- `again mcp serve --workspace <path>` — expose 13 bounded, read-only repository and Git tools over MCP stdio.
-- `again mcp setup --client codex|claude --workspace <path>` — print an ownership-checked setup plan; it does not write configuration unless `--install-owned-config` is explicit.
+- `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.
+- `again mcp setup --client codex|claude --workspace <path>` — print an exact dry-run plan. Add `--apply`, `--inspect`, or `--remove`; changes use only the official client CLI and are verified afterward.
+- `again mcp daemon status|stop --workspace <path>` — inspect or drain the local workspace daemon. New sessions fail with upgrade guidance when the executable or protocol differs.
 - `again setup --codex` — install the instruction-only personal Codex skill.
 - `again explain [id]` / `again show <id>` — inspect the latest decision or retrieve exact stored output.
 
@@ -38,9 +39,9 @@ The target outcome is to help coding agents start with verified repository under
 ## Quickstart
 
 ```bash
-cargo install --locked --path .
+cargo install --locked --path . --features daemon
 again setup --codex
-again mcp setup --client codex --workspace "$(pwd -P)"
+again mcp setup --client codex --workspace "$(pwd -P)" --apply
 again run -- cat path/to/file
 ```
 
