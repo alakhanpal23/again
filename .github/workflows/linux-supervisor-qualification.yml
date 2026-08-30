@@ -28,9 +28,8 @@ jobs:
           ls -l /dev/kvm
           grep -Ec '(vmx|svm)' /proc/cpuinfo
           sudo lxd init --auto
-          sudo lxc launch \
-            ubuntu:249184e85e137481972f08080a0fe4e2371835d876e186af78f4cb809057c98c \
-            again-qualification --vm \
+          sudo lxc image list ubuntu:24.04 --format json
+          sudo lxc launch ubuntu:24.04 again-qualification --vm \
             -c limits.cpu=2 -c limits.memory=4GiB
           ready=false
           for _ in $(seq 1 60); do
