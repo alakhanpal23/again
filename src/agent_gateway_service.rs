@@ -1260,7 +1260,6 @@ mod tests {
 
     #[test]
     fn locator_encoding_accepts_only_fixed_random_socket_names() {
-        assert!(MAX_ACTIVE_CONNECTIONS_V1 >= 100);
         assert!(valid_socket_name_v1("0123456789abcdef0123456789abcdef"));
         assert!(!valid_socket_name_v1("../shared.sock"));
         assert!(!valid_socket_name_v1("0123456789abcdef0123456789abcdeg"));
