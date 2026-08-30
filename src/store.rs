@@ -3292,6 +3292,79 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Return a bounded oldest-first batch that is safe for explicit human
+    /// pruning. This is discovery only: deletion rechecks every invariant in
+    /// the same immediate transaction used by `delete_task_v1`.
+    pub fn list_deletable_terminal_tasks_before_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        terminal_before_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<TaskRecordV1>> {
+        if !(1..=MAX_TASK_LIST_ITEMS_V1).contains(&limit) {
+            bail!("invalid_task_list_limit");
+        }
+        validate_digest(
+            authorization_scope_digest,
+            "task authorization scope digest",
+        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        let task_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT task.canonical_task_id FROM context_tasks_v1 AS task
+                 WHERE task.repository_id = ?1 AND task.workspace_id = ?2
+                   AND task.authorization_scope_digest = ?3
+                   AND task.state IN ('completed', 'failed', 'cancelled')
+                   AND task.updated_ms < ?4
+                   AND NOT EXISTS (
+                       SELECT 1 FROM context_task_relations_v1 AS relation
+                       WHERE relation.repository_id = task.repository_id
+                         AND relation.workspace_id = task.workspace_id
+                         AND relation.authorization_scope_digest = task.authorization_scope_digest
+                         AND relation.target_task_id = task.canonical_task_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM context_ledger_leases_v1 AS lease
+                       WHERE lease.repository_id = task.repository_id
+                         AND lease.workspace_id = task.workspace_id
+                         AND lease.authorization_scope_digest = task.authorization_scope_digest
+                         AND lease.task_id = task.canonical_task_id
+                         AND lease.status = 'active'
+                   )
+                 ORDER BY task.updated_ms ASC, task.canonical_task_id ASC LIMIT ?5",
+            )?;
+            statement
+                .query_map(
+                    params![
+                        repository_id,
+                        workspace_id,
+                        authorization_scope_digest,
+                        terminal_before_ms,
+                        limit
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let tasks = task_ids
+            .iter()
+            .map(|task_id| {
+                load_task_record_tx_v1(
+                    &transaction,
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    task_id,
+                    task_id,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        transaction.commit()?;
+        Ok(tasks)
+    }
+
     pub fn claim_task_v1(
         &self,
         identity: &ContextLedgerIdentityV1,

@@ -3,6 +3,8 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(all(feature = "daemon", unix))]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,8 @@ enum CommandName {
     Team(TeamArgs),
     /// Run or configure the repository-aware MCP gateway.
     Mcp(McpArgs),
+    /// Inspect, export, delete, or prune durable local tasks.
+    Task(TaskArgs),
     #[cfg(feature = "hook")]
     #[command(hide = true)]
     Hook(HookArgs),
@@ -194,6 +198,73 @@ struct McpSetupArgs {
     /// Remove an exact Again-owned entry through the official client CLI.
     #[arg(long, conflicts_with_all = ["apply", "inspect"])]
     remove: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long, global = true)]
+    workspace: Option<PathBuf>,
+    /// Stable, non-secret local authorization-scope identifier.
+    #[arg(long, global = true)]
+    authorization_scope: Option<String>,
+    #[command(subcommand)]
+    command: TaskCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum TaskCommand {
+    /// List durable tasks in this workspace and authorization scope.
+    List(TaskListArgs),
+    /// Inspect one task definition and lifecycle state.
+    Inspect(TaskInspectArgs),
+    /// Export one task and its transition history to a new private file.
+    Export(TaskExportArgs),
+    /// Permanently delete one terminal, unreferenced task.
+    Delete(TaskDeleteArgs),
+    /// Preview or explicitly apply bounded terminal-task pruning.
+    Prune(TaskPruneArgs),
+}
+
+#[derive(Debug, Args)]
+struct TaskListArgs {
+    /// Maximum tasks to return.
+    #[arg(long, default_value_t = crate::task_lifecycle::MAX_TASK_LIST_ITEMS_V1)]
+    limit: usize,
+}
+
+#[derive(Debug, Args)]
+struct TaskInspectArgs {
+    id: String,
+}
+
+#[derive(Debug, Args)]
+struct TaskExportArgs {
+    id: String,
+    /// Absolute output path. Existing paths are never replaced.
+    #[arg(long)]
+    output: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct TaskDeleteArgs {
+    id: String,
+    /// Confirm permanent deletion.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct TaskPruneArgs {
+    /// Select terminal tasks last updated before this many days ago.
+    #[arg(long)]
+    terminal_before_days: u64,
+    /// Preview candidates without deleting them.
+    #[arg(long, conflicts_with = "apply")]
+    dry_run: bool,
+    /// Delete every eligible candidate, in bounded transactional batches.
+    #[arg(long, conflicts_with = "dry_run")]
+    apply: bool,
 }
 
 #[derive(Debug, Args)]
@@ -614,6 +685,7 @@ pub fn run_cli() -> Result<i32> {
             #[cfg(feature = "daemon")]
             McpCommand::Connect(args) => mcp_connect(args),
         },
+        CommandName::Task(args) => task_cli(args),
         #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         #[cfg(feature = "hook")]
@@ -1151,6 +1223,240 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         println!("# dry run; no configuration was changed");
     }
     Ok(0)
+}
+
+struct HumanTaskScopeV1 {
+    store: Store,
+    repository_id: String,
+    workspace_id: String,
+    authorization_scope_digest: String,
+}
+
+fn task_cli(args: TaskArgs) -> Result<i32> {
+    let scope = open_human_task_scope_v1(args.workspace, args.authorization_scope)?;
+    match args.command {
+        TaskCommand::List(args) => {
+            let tasks = scope.store.list_tasks_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                args.limit,
+            )?;
+            let quota = scope
+                .store
+                .task_quota_status_v1(&scope.repository_id, &scope.workspace_id)?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.list",
+                "tasks": tasks,
+                "quota": quota
+            }))?;
+        }
+        TaskCommand::Inspect(args) => {
+            let task = scope
+                .store
+                .inspect_task_v1(
+                    &scope.repository_id,
+                    &scope.workspace_id,
+                    &scope.authorization_scope_digest,
+                    &args.id,
+                )?
+                .ok_or_else(|| anyhow!("task does not exist in this workspace scope"))?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.inspect",
+                "task": task
+            }))?;
+        }
+        TaskCommand::Export(args) => {
+            if !args.output.is_absolute() {
+                bail!("task export output must be an absolute path");
+            }
+            let export = scope
+                .store
+                .export_task_v1(
+                    &scope.repository_id,
+                    &scope.workspace_id,
+                    &scope.authorization_scope_digest,
+                    &args.id,
+                )?
+                .ok_or_else(|| anyhow!("task does not exist in this workspace scope"))?;
+            let mut bytes = serde_json::to_vec_pretty(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.export",
+                "export": export
+            }))?;
+            bytes.push(b'\n');
+            write_private_task_export_v1(&args.output, &bytes)?;
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.export",
+                "status": "exported",
+                "output": args.output
+            }))?;
+        }
+        TaskCommand::Delete(args) => {
+            if !args.yes {
+                bail!("task delete requires --yes");
+            }
+            let deleted = scope.store.delete_task_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                &args.id,
+            )?;
+            if !deleted {
+                bail!("task does not exist in this workspace scope");
+            }
+            print_pretty_json_v1(&serde_json::json!({
+                "schemaVersion": 1,
+                "operation": "task.delete",
+                "taskId": args.id,
+                "status": "deleted"
+            }))?;
+        }
+        TaskCommand::Prune(args) => task_prune_v1(&scope, args)?,
+    }
+    Ok(0)
+}
+
+fn open_human_task_scope_v1(
+    workspace: Option<PathBuf>,
+    authorization_scope: Option<String>,
+) -> Result<HumanTaskScopeV1> {
+    let workspace = resolve_mcp_workspace(workspace)?;
+    let authorization_scope = local_mcp_authorization_scope_v1(&workspace, authorization_scope)?;
+    let authorization_scope_digest =
+        crate::mcp_gateway::authorization_scope_digest_v1(&authorization_scope);
+    let mut hasher = Hasher::new();
+    hasher.update(b"again.local-context.workspace.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize().to_hex().to_string();
+    Ok(HumanTaskScopeV1 {
+        store: Store::open_for_workspace(&workspace)?,
+        repository_id: format!("repository:{}", &digest[..24]),
+        workspace_id: format!("workspace:{}", &digest[..24]),
+        authorization_scope_digest,
+    })
+}
+
+fn task_prune_v1(scope: &HumanTaskScopeV1, args: TaskPruneArgs) -> Result<()> {
+    if args.dry_run == args.apply {
+        bail!("task prune requires exactly one of --dry-run or --apply");
+    }
+    if args.terminal_before_days > 36_500 {
+        bail!("terminal-before-days exceeds the bounded interval");
+    }
+    let age_ms = args
+        .terminal_before_days
+        .checked_mul(24 * 60 * 60 * 1_000)
+        .ok_or_else(|| anyhow!("terminal-before-days overflow"))?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_millis();
+    let now_ms = i64::try_from(now_ms).context("system clock exceeds the supported range")?;
+    let cutoff_ms = now_ms.saturating_sub(i64::try_from(age_ms)?);
+    let batch_limit = crate::task_lifecycle::MAX_TASK_LIST_ITEMS_V1;
+
+    if args.dry_run {
+        let tasks = scope.store.list_deletable_terminal_tasks_before_v1(
+            &scope.repository_id,
+            &scope.workspace_id,
+            &scope.authorization_scope_digest,
+            cutoff_ms,
+            batch_limit,
+        )?;
+        let task_ids = tasks
+            .iter()
+            .map(|task| task.canonical_task_id.as_str())
+            .collect::<Vec<_>>();
+        return print_pretty_json_v1(&serde_json::json!({
+            "schemaVersion": 1,
+            "operation": "task.prune",
+            "mode": "dry_run",
+            "terminalBeforeDays": args.terminal_before_days,
+            "candidateTaskIds": task_ids,
+            "candidateCount": task_ids.len(),
+            "truncated": task_ids.len() == batch_limit
+        }));
+    }
+
+    let mut deleted = Vec::new();
+    loop {
+        let tasks = scope.store.list_deletable_terminal_tasks_before_v1(
+            &scope.repository_id,
+            &scope.workspace_id,
+            &scope.authorization_scope_digest,
+            cutoff_ms,
+            batch_limit,
+        )?;
+        if tasks.is_empty() {
+            break;
+        }
+        let count = tasks.len();
+        for task in tasks {
+            let task_id = task.canonical_task_id;
+            if scope.store.delete_task_v1(
+                &scope.repository_id,
+                &scope.workspace_id,
+                &scope.authorization_scope_digest,
+                &task_id,
+            )? {
+                deleted.push(task_id);
+            }
+        }
+        if count < batch_limit {
+            break;
+        }
+    }
+    print_pretty_json_v1(&serde_json::json!({
+        "schemaVersion": 1,
+        "operation": "task.prune",
+        "mode": "apply",
+        "terminalBeforeDays": args.terminal_before_days,
+        "deletedTaskIds": deleted,
+        "deletedCount": deleted.len()
+    }))
+}
+
+fn print_pretty_json_v1(value: &impl Serialize) -> Result<()> {
+    let stdout = io::stdout();
+    let mut output = stdout.lock();
+    serde_json::to_writer_pretty(&mut output, value)?;
+    output.write_all(b"\n")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_private_task_export_v1(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("task export output has no parent directory"))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .with_context(|| format!("inspect task export parent {}", parent.display()))?;
+    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+        bail!("task export parent must be a real directory");
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("create new private task export {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    let metadata = file.metadata()?;
+    if metadata.permissions().mode() & 0o777 != 0o600 {
+        bail!("task export permissions are not private");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_private_task_export_v1(_path: &Path, _bytes: &[u8]) -> Result<()> {
+    bail!("private task export is unsupported on this platform")
 }
 
 fn setup(args: SetupArgs) -> Result<i32> {
