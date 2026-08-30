@@ -263,6 +263,7 @@ class ChaosSoakHarnessTests(unittest.TestCase):
         self.assertIn(100, harness.VALID_CONCURRENCIES)
         self.assertEqual(harness.LEASE_SECONDS, 30)
         self.assertEqual(harness.STDIO_MAX_INFLIGHT, 16)
+        self.assertEqual(harness.DAEMON_RESPONSE_TIMEOUT_SECONDS, 15.0)
         self.assertGreater(harness.TRANSPORT_FIXTURE_BYTES, 8 * 1024 * 1024)
         self.assertGreater(harness.MAX_CPU_SECONDS, 0)
         self.assertGreater(harness.MAX_RSS_BYTES, 0)

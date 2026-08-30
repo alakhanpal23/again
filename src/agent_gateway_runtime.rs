@@ -687,17 +687,22 @@ impl GatewayControlledProviderV1 {
                     | Ok(GatewayCompletion::AlreadyCompleted {
                         gateway_result_id, ..
                     }) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
-                        Ok(Some(exact))
-                            if self.register_result_dependency(resolved, &gateway_result_id) =>
-                        {
-                            self.remember_candidate(
-                                &verification_call,
-                                &resolved.binding,
-                                &gateway_result_id,
-                            );
+                        Ok(Some(exact)) => {
+                            // Dependency-proof registration controls only
+                            // future reuse authority. The just-executed,
+                            // durably loaded result remains valid for this
+                            // exact current call even if registration briefly
+                            // contends under high client concurrency.
+                            if self.register_result_dependency(resolved, &gateway_result_id) {
+                                self.remember_candidate(
+                                    &verification_call,
+                                    &resolved.binding,
+                                    &gateway_result_id,
+                                );
+                            }
                             Ok(exact)
                         }
-                        Ok(Some(_)) | Ok(None) | Err(_) => Ok(value),
+                        Ok(None) | Err(_) => Ok(value),
                     },
                     Ok(_) | Err(_) => Ok(value),
                 }

@@ -55,6 +55,7 @@ MAX_STDERR_BYTES = 2 * 1024 * 1024
 MAX_JSON_DEPTH = 64
 MAX_JSON_NODES = 250_000
 PROCESS_STOP_SECONDS = 2.0
+DAEMON_RESPONSE_TIMEOUT_SECONDS = 15.0
 LEASE_SECONDS = int(product.LEASE_TTL_SECONDS)
 RESULT_ID_LENGTH = 64
 TRANSPORT_FIXTURE_BYTES = 12 * 1024 * 1024
@@ -1055,6 +1056,7 @@ def _exact_probe(
                 repo,
                 state,
                 f"probe-{index}",
+                timeout=DAEMON_RESPONSE_TIMEOUT_SECONDS if automatic_daemon else 5.0,
                 automatic_daemon=automatic_daemon,
             )
             sessions.append(session)
