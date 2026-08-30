@@ -193,7 +193,11 @@ def chaos_report() -> dict[str, object]:
         "false_hit_count": 0,
         "exact_probe": {
             "automatic_daemon": True,
+            "operations": 2_000,
+            "referenced_results": 1_999,
             "sessions": 100,
+            "unreferenced_direct_results": 1,
+            "unique_result_ids": 1,
             "daemon_stop": {"absent_after_stop": True},
         },
         "resource_observation": {

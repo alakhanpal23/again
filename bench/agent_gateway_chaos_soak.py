@@ -1045,7 +1045,7 @@ def _exact_probe(
     state = root / "exact-probe-state"
     sessions: list[Session] = []
     cleanup: list[dict[str, Any]] = []
-    result_ids: list[str] = []
+    observed_result_ids: list[str | None] = []
     daemon_observed = False
     daemon_stop: dict[str, Any] | None = None
     active_error: BaseException | None = None
@@ -1066,7 +1066,7 @@ def _exact_probe(
         schedule = [index % concurrency for index in range(operations)]
         rng.shuffle(schedule)
 
-        def call(item: tuple[int, int]) -> str:
+        def call(item: tuple[int, int]) -> str | None:
             index, session_index = item
             session = sessions[session_index]
             response = session.request(
@@ -1084,12 +1084,12 @@ def _exact_probe(
             if product.result_without_reference(result) != expected:
                 raise HarnessRefusal("exact_result", "repo.read result bytes changed")
             identifier = product.result_id(result)
-            if not _valid_result_id(identifier):
-                raise HarnessRefusal("exact_result_id", "repo.read result ID is missing")
-            return str(identifier)
+            if identifier is not None and not _valid_result_id(identifier):
+                raise HarnessRefusal("exact_result_id", "repo.read result ID is malformed")
+            return str(identifier) if identifier is not None else None
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
-            result_ids = list(executor.map(call, enumerate(schedule)))
+            observed_result_ids = list(executor.map(call, enumerate(schedule)))
     except BaseException as error:
         active_error = error
         raise
@@ -1107,7 +1107,8 @@ def _exact_probe(
                 cleanup_error = cleanup_error or error
         if cleanup_error is not None and active_error is None:
             raise cleanup_error
-    if len(set(result_ids)) != 1:
+    result_ids = [identifier for identifier in observed_result_ids if identifier is not None]
+    if not result_ids or len(set(result_ids)) != 1:
         raise HarnessRefusal("probe_result_divergence", "exact probe returned divergent result IDs")
     expected_argv = (
         [str(binary), "mcp", "connect", "--workspace", str(repo)]
@@ -1132,6 +1133,8 @@ def _exact_probe(
         "automatic_daemon": automatic_daemon,
         "daemon_stop": daemon_stop,
         "operations": operations,
+        "referenced_results": len(result_ids),
+        "unreferenced_direct_results": len(observed_result_ids) - len(result_ids),
         "sessions": concurrency,
         "unique_result_ids": len(set(result_ids)),
         "result_id": result_ids[0],

@@ -592,6 +592,12 @@ def validate_chaos(report: Mapping[str, Any]) -> dict[str, str]:
         and report.get("false_hit_count") == 0
         and exact_probe.get("automatic_daemon") is True
         and exact_probe.get("sessions") == 100
+        and exact_probe.get("unique_result_ids") == 1
+        and _is_int(exact_probe.get("referenced_results"), 1)
+        and _is_int(exact_probe.get("unreferenced_direct_results"), 0)
+        and exact_probe.get("referenced_results")
+        + exact_probe.get("unreferenced_direct_results")
+        == exact_probe.get("operations")
         and _mapping(exact_probe.get("daemon_stop"), "chaos_daemon_stop").get(
             "absent_after_stop"
         )

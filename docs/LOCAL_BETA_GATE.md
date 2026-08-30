@@ -101,8 +101,10 @@ python3 -B bench/agent_gateway_chaos_soak.py \
 
 Beta mode uses `again mcp connect` for all exact-probe sessions. The first
 connection must lazily start the workspace daemon, the task lifecycle tools
-must be advertised, all sessions must return one exact result identity, and an
-authenticated daemon stop must make the endpoint unavailable. The harness
+must be advertised, every response payload must be exact, all issued reusable
+result references must converge to one identity, safe unreferenced direct
+fallbacks are counted explicitly, and an authenticated daemon stop must make
+the endpoint unavailable. The harness
 still performs transport corruption, partial-frame, duplicate-ID, saturation,
 restart, store-corruption, cleanup, descriptor, CPU, RSS, and temporary-state
 checks. A host resource refusal is a non-pass, not evidence for a smaller
