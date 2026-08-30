@@ -340,6 +340,13 @@ the diverse-repository product gate.
 
 ## Delivery sequence
 
+Paste-ready workstream prompts, dependency ordering, ownership boundaries, and
+acceptance gates for this sequence live in
+[`IMPLEMENTATION_PROMPTS.md`](IMPLEMENTATION_PROMPTS.md). The first product
+milestone is a paired local two-agent flow in which verified observations and
+in-flight work are shared, an eligible command executes once, and a relevant
+mutation invalidates both derived context and execution memory.
+
 ### Phase 0 — retain the working exact-reuse foundation
 
 Status: implemented local foundation; outside qualification remains open.
@@ -365,6 +372,10 @@ Exit:
 Goal: make the existing cache fast and general enough to support the edit brief
 and later validation profiles.
 
+Status: core implementation landed in Wave 1 through `45b0284`; retained
+cross-component product benchmarks and paired-agent evidence remain for
+Terminal G.
+
 Work:
 
 - add a sealed per-epoch observed manifest;
@@ -387,6 +398,10 @@ Exit:
 ### Phase 2 — straight-to-code task start
 
 Goal: replace broad agent orientation with one bounded verified edit brief.
+
+Status: next. The durable context ledger landed in Wave 1; the public
+task-start/coordinator and bounded code-intelligence work remain in Terminals D
+and E.
 
 Work:
 
