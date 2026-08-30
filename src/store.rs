@@ -31,7 +31,9 @@ use crate::mcp_gateway::{
     ConfirmedDeliveryV1, RecipientConnectionRetirementV2, RecipientRetrievalAuthorityV2,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
+const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
+const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
 const MAX_FILE_DIGEST_ROWS: i64 = 50_000;
 const FILE_DIGEST_PRUNE_INTERVAL: u16 = 256;
 const PENDING_CALL_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
@@ -150,6 +152,9 @@ pub struct StoreStats {
     pub active_work_leases: u64,
     pub context_delivery_receipts: u64,
     pub context_delivery_confirmed_bytes_omitted: u64,
+    pub context_tasks: u64,
+    pub context_task_aliases: u64,
+    pub context_task_aliases_converged: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -166,6 +171,26 @@ pub struct ContextLedgerStatsV1 {
     pub active_work_leases: u64,
     pub delivery_receipts: u64,
     pub delivery_confirmed_bytes_omitted: u64,
+    pub tasks: u64,
+    pub task_aliases: u64,
+    pub task_aliases_converged: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextTaskMatchV1 {
+    Created,
+    JoinedByTaskId,
+    JoinedByPrompt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextTaskResolutionV1 {
+    pub canonical_task_id: String,
+    pub requested_task_id: String,
+    pub prompt: String,
+    pub prompt_digest: String,
+    pub matched_by: ContextTaskMatchV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1634,6 +1659,48 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 12 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE context_tasks_v1 (
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
+                    prompt_digest TEXT NOT NULL CHECK(length(prompt_digest) = 64),
+                    prompt_text TEXT NOT NULL CHECK(length(CAST(prompt_text AS BLOB)) BETWEEN 1 AND 8192),
+                    created_ms INTEGER NOT NULL,
+                    updated_ms INTEGER NOT NULL,
+                    PRIMARY KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
+                ) WITHOUT ROWID;
+                CREATE UNIQUE INDEX context_tasks_prompt_idx
+                    ON context_tasks_v1(
+                        repository_id, workspace_id, authorization_scope_digest, prompt_digest
+                    );
+
+                CREATE TABLE context_task_aliases_v1 (
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    requested_task_id TEXT NOT NULL CHECK(length(requested_task_id) BETWEEN 1 AND 128),
+                    canonical_task_id TEXT NOT NULL CHECK(length(canonical_task_id) BETWEEN 1 AND 128),
+                    created_ms INTEGER NOT NULL,
+                    PRIMARY KEY(repository_id, workspace_id, authorization_scope_digest, requested_task_id),
+                    FOREIGN KEY(repository_id, workspace_id, authorization_scope_digest, canonical_task_id)
+                        REFERENCES context_tasks_v1(
+                            repository_id, workspace_id, authorization_scope_digest, canonical_task_id
+                        ) ON DELETE RESTRICT
+                ) WITHOUT ROWID;
+                CREATE INDEX context_task_aliases_canonical_idx
+                    ON context_task_aliases_v1(
+                        repository_id, workspace_id, authorization_scope_digest, canonical_task_id
+                    );
+                PRAGMA user_version = 12;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -2373,6 +2440,260 @@ impl Store {
 
     /// Make this exact recipient generation current for ledger reads and
     /// leases. Lower lifecycle/compaction generations can never reactivate.
+    /// Resolve caller task aliases onto one durable exact-prompt identity.
+    /// Prompt equality can converge work; prompt similarity never does.
+    pub fn resolve_context_task_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+        supplied_prompt: Option<&str>,
+    ) -> Result<ContextTaskResolutionV1> {
+        validate_context_task_selector_v1(repository_id)?;
+        validate_context_task_selector_v1(workspace_id)?;
+        validate_context_task_selector_v1(requested_task_id)?;
+        validate_digest(
+            authorization_scope_digest,
+            "context task authorization scope",
+        )?;
+        let prompt = supplied_prompt.unwrap_or(requested_task_id);
+        reasoning_item_v1(crate::agent_gateway::context::validate_reasoning_text_v1(
+            prompt, 8192,
+        ))?;
+        let prompt_digest = context_task_prompt_digest_v1(prompt);
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let existing_alias = transaction
+            .query_row(
+                "SELECT alias.canonical_task_id, task.prompt_digest, task.prompt_text
+                 FROM context_task_aliases_v1 AS alias
+                 JOIN context_tasks_v1 AS task
+                   ON task.repository_id = alias.repository_id
+                  AND task.workspace_id = alias.workspace_id
+                  AND task.authorization_scope_digest = alias.authorization_scope_digest
+                  AND task.canonical_task_id = alias.canonical_task_id
+                 WHERE alias.repository_id = ?1 AND alias.workspace_id = ?2
+                   AND alias.authorization_scope_digest = ?3 AND alias.requested_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    requested_task_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((canonical_task_id, stored_digest, stored_prompt)) = existing_alias {
+            if context_task_prompt_digest_v1(&stored_prompt) != stored_digest {
+                bail!("context_task_corrupt");
+            }
+            if supplied_prompt.is_some() && stored_digest != prompt_digest {
+                bail!("task_definition_conflict");
+            }
+            transaction.execute(
+                "UPDATE context_tasks_v1 SET updated_ms = ?5
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    canonical_task_id,
+                    now
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(ContextTaskResolutionV1 {
+                canonical_task_id,
+                requested_task_id: requested_task_id.to_owned(),
+                prompt: stored_prompt,
+                prompt_digest: stored_digest,
+                matched_by: ContextTaskMatchV1::JoinedByTaskId,
+            });
+        }
+
+        let prompt_match = transaction
+            .query_row(
+                "SELECT canonical_task_id, prompt_text FROM context_tasks_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND prompt_digest = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    prompt_digest
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        if let Some((canonical_task_id, stored_prompt)) = prompt_match {
+            if context_task_prompt_digest_v1(&stored_prompt) != prompt_digest {
+                bail!("context_task_corrupt");
+            }
+            let alias_count: u64 = transaction.query_row(
+                "SELECT COUNT(*) FROM context_task_aliases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2",
+                params![repository_id, workspace_id],
+                |row| row.get(0),
+            )?;
+            if alias_count >= MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1 {
+                bail!("context_task_alias_capacity_exceeded");
+            }
+            transaction.execute(
+                "INSERT INTO context_task_aliases_v1 (
+                    repository_id, workspace_id, authorization_scope_digest,
+                    requested_task_id, canonical_task_id, created_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    requested_task_id,
+                    canonical_task_id,
+                    now
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE context_tasks_v1 SET updated_ms = ?5
+                 WHERE repository_id = ?1 AND workspace_id = ?2
+                   AND authorization_scope_digest = ?3 AND canonical_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    canonical_task_id,
+                    now
+                ],
+            )?;
+            transaction.commit()?;
+            return Ok(ContextTaskResolutionV1 {
+                canonical_task_id,
+                requested_task_id: requested_task_id.to_owned(),
+                prompt: stored_prompt,
+                prompt_digest,
+                matched_by: ContextTaskMatchV1::JoinedByPrompt,
+            });
+        }
+
+        let count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM context_tasks_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2",
+            params![repository_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        if count >= MAX_CONTEXT_TASKS_PER_WORKSPACE_V1 {
+            bail!("context_task_capacity_exceeded");
+        }
+        let alias_count: u64 = transaction.query_row(
+            "SELECT COUNT(*) FROM context_task_aliases_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2",
+            params![repository_id, workspace_id],
+            |row| row.get(0),
+        )?;
+        if alias_count >= MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1 {
+            bail!("context_task_alias_capacity_exceeded");
+        }
+        transaction.execute(
+            "INSERT INTO context_tasks_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                canonical_task_id, prompt_digest, prompt_text, created_ms, updated_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                prompt_digest,
+                prompt,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO context_task_aliases_v1 (
+                repository_id, workspace_id, authorization_scope_digest,
+                requested_task_id, canonical_task_id, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?4, ?5)",
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+                now
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(ContextTaskResolutionV1 {
+            canonical_task_id: requested_task_id.to_owned(),
+            requested_task_id: requested_task_id.to_owned(),
+            prompt: prompt.to_owned(),
+            prompt_digest,
+            matched_by: ContextTaskMatchV1::Created,
+        })
+    }
+
+    pub fn context_task_by_alias_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        requested_task_id: &str,
+    ) -> Result<Option<ContextTaskResolutionV1>> {
+        validate_context_task_selector_v1(repository_id)?;
+        validate_context_task_selector_v1(workspace_id)?;
+        validate_context_task_selector_v1(requested_task_id)?;
+        validate_digest(
+            authorization_scope_digest,
+            "context task authorization scope",
+        )?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT alias.canonical_task_id, task.prompt_digest, task.prompt_text
+                 FROM context_task_aliases_v1 AS alias
+                 JOIN context_tasks_v1 AS task
+                   ON task.repository_id = alias.repository_id
+                  AND task.workspace_id = alias.workspace_id
+                  AND task.authorization_scope_digest = alias.authorization_scope_digest
+                  AND task.canonical_task_id = alias.canonical_task_id
+                 WHERE alias.repository_id = ?1 AND alias.workspace_id = ?2
+                   AND alias.authorization_scope_digest = ?3 AND alias.requested_task_id = ?4",
+                params![
+                    repository_id,
+                    workspace_id,
+                    authorization_scope_digest,
+                    requested_task_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|(canonical_task_id, prompt_digest, prompt)| {
+            if context_task_prompt_digest_v1(&prompt) != prompt_digest {
+                bail!("context_task_corrupt");
+            }
+            Ok(ContextTaskResolutionV1 {
+                canonical_task_id,
+                requested_task_id: requested_task_id.to_owned(),
+                prompt,
+                prompt_digest,
+                matched_by: ContextTaskMatchV1::JoinedByTaskId,
+            })
+        })
+        .transpose()
+    }
+
     pub fn activate_context_recipient_v1(&self, identity: &ContextLedgerIdentityV1) -> Result<()> {
         validate_context_identity_v1(identity)?;
         let now = now_ms();
@@ -2417,7 +2738,9 @@ impl Store {
 
     pub fn retire_context_recipient_v1(&self, identity: &ContextLedgerIdentityV1) -> Result<bool> {
         validate_context_identity_v1(identity)?;
-        let changed = self.conn.execute(
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
             "UPDATE context_ledger_recipients_v1 SET active = 0, updated_ms = ?11
              WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
                AND authorization_scope_digest = ?4 AND agent_id = ?5 AND session_id = ?6
@@ -2434,9 +2757,27 @@ impl Store {
                 identity.connection_generation(),
                 identity.compaction_generation(),
                 identity.lifecycle_generation(),
-                now_ms(),
+                now,
             ],
         )?;
+        transaction.execute(
+            "UPDATE context_ledger_leases_v1 SET status = 'cancelled', completed_ms = ?7
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+               AND authorization_scope_digest = ?4 AND leader_agent_id = ?5
+               AND leader_session_id = ?6 AND leader_lifecycle_generation = ?8
+               AND status = 'active'",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                identity.authorization_scope_digest(),
+                identity.agent_id(),
+                identity.session_id(),
+                now,
+                identity.lifecycle_generation(),
+            ],
+        )?;
+        transaction.commit()?;
         Ok(changed == 1)
     }
 
@@ -4757,6 +5098,17 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
+        stats.tasks = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_tasks_v1", [], |row| {
+                row.get(0)
+            })?;
+        stats.task_aliases =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM context_task_aliases_v1", [], |row| {
+                    row.get(0)
+                })?;
+        stats.task_aliases_converged = stats.task_aliases.saturating_sub(stats.tasks);
         Ok(stats)
     }
 
@@ -4930,6 +5282,9 @@ impl Store {
         stats.active_work_leases = context.active_work_leases;
         stats.context_delivery_receipts = context.delivery_receipts;
         stats.context_delivery_confirmed_bytes_omitted = context.delivery_confirmed_bytes_omitted;
+        stats.context_tasks = context.tasks;
+        stats.context_task_aliases = context.task_aliases;
+        stats.context_task_aliases_converged = context.task_aliases_converged;
         Ok(stats)
     }
 }
@@ -5081,6 +5436,25 @@ struct ContextEventFieldsV1<'a> {
     result_digest: Option<&'a str>,
     total_bytes: Option<u64>,
     duration_ms: Option<u64>,
+}
+
+fn validate_context_task_selector_v1(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 128
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':' | b'/' | b' ')
+        })
+    {
+        bail!("invalid_context_task_selector");
+    }
+    Ok(())
+}
+
+fn context_task_prompt_digest_v1(prompt: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.context.task-prompt.v1\0");
+    hash_field(&mut hasher, prompt.as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn validate_context_identity_v1(identity: &ContextLedgerIdentityV1) -> Result<()> {
@@ -7310,6 +7684,30 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             ],
         ),
         (
+            "context_tasks_v1",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "canonical_task_id",
+                "prompt_digest",
+                "prompt_text",
+                "created_ms",
+                "updated_ms",
+            ],
+        ),
+        (
+            "context_task_aliases_v1",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "requested_task_id",
+                "canonical_task_id",
+                "created_ms",
+            ],
+        ),
+        (
             "context_ledger_recipients_v1",
             &[
                 "repository_id",
@@ -7598,6 +7996,30 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "gateway_events",
             "gateway_events_type_idx",
             &["event_type"],
+            false,
+            false,
+        ),
+        (
+            "context_tasks_v1",
+            "context_tasks_prompt_idx",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "prompt_digest",
+            ],
+            true,
+            false,
+        ),
+        (
+            "context_task_aliases_v1",
+            "context_task_aliases_canonical_idx",
+            &[
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "canonical_task_id",
+            ],
             false,
             false,
         ),
@@ -7952,6 +8374,18 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             "gateway_events",
             "CHECK(length(event_type) BETWEEN 1 AND 64)",
         ),
+        (
+            "context_tasks_v1",
+            "CHECK(length(authorization_scope_digest) = 64)",
+        ),
+        (
+            "context_tasks_v1",
+            "CHECK(length(CAST(prompt_text AS BLOB)) BETWEEN 1 AND 8192)",
+        ),
+        (
+            "context_task_aliases_v1",
+            "CHECK(length(authorization_scope_digest) = 64)",
+        ),
         ("context_ledger_events_v1", "CHECK(schema_version = 1)"),
         ("context_ledger_events_v1", "CHECK(kind IN ("),
         (
@@ -7997,6 +8431,35 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let expected_foreign_keys: &[ExpectedTableForeignKeysV1] = &[
+        (
+            "context_task_aliases_v1",
+            &[
+                (
+                    "context_tasks_v1",
+                    "repository_id",
+                    "repository_id",
+                    "RESTRICT",
+                ),
+                (
+                    "context_tasks_v1",
+                    "workspace_id",
+                    "workspace_id",
+                    "RESTRICT",
+                ),
+                (
+                    "context_tasks_v1",
+                    "authorization_scope_digest",
+                    "authorization_scope_digest",
+                    "RESTRICT",
+                ),
+                (
+                    "context_tasks_v1",
+                    "canonical_task_id",
+                    "canonical_task_id",
+                    "RESTRICT",
+                ),
+            ],
+        ),
         (
             "context_ledger_event_sources_v1",
             &[
@@ -8178,6 +8641,59 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         .optional()?;
     if let Some(table) = foreign_key_failure {
         bail!("Again gateway schema foreign-key violation in {table}");
+    }
+    let missing_canonical_alias: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM context_tasks_v1 AS task
+             LEFT JOIN context_task_aliases_v1 AS alias
+               ON alias.repository_id = task.repository_id
+              AND alias.workspace_id = task.workspace_id
+              AND alias.authorization_scope_digest = task.authorization_scope_digest
+              AND alias.requested_task_id = task.canonical_task_id
+              AND alias.canonical_task_id = task.canonical_task_id
+             WHERE alias.requested_task_id IS NULL
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if missing_canonical_alias {
+        bail!("Again context task registry is missing a canonical alias");
+    }
+    let task_capacity_exceeded: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM context_tasks_v1
+             GROUP BY repository_id, workspace_id
+             HAVING COUNT(*) > ?1
+         )",
+        [MAX_CONTEXT_TASKS_PER_WORKSPACE_V1],
+        |row| row.get(0),
+    )?;
+    if task_capacity_exceeded {
+        bail!("Again context task registry exceeds its task capacity");
+    }
+    let alias_capacity_exceeded: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM context_task_aliases_v1
+             GROUP BY repository_id, workspace_id
+             HAVING COUNT(*) > ?1
+         )",
+        [MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1],
+        |row| row.get(0),
+    )?;
+    if alias_capacity_exceeded {
+        bail!("Again context task registry exceeds its alias capacity");
+    }
+    let mut task_statement = connection.prepare(
+        "SELECT prompt_digest, prompt_text FROM context_tasks_v1 ORDER BY repository_id, workspace_id, authorization_scope_digest, canonical_task_id",
+    )?;
+    let tasks = task_statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for task in tasks {
+        let (digest, prompt) = task?;
+        if digest != context_task_prompt_digest_v1(&prompt) {
+            bail!("Again context task registry contains a corrupt prompt binding");
+        }
     }
     Ok(())
 }
@@ -9748,7 +10264,9 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_ledger_delivery_savings_v1;
+                    "DROP TABLE context_task_aliases_v1;
+                     DROP TABLE context_tasks_v1;
+                     DROP TABLE context_ledger_delivery_savings_v1;
                      DROP TABLE context_ledger_delivery_receipts_v1;
                      DROP TABLE context_ledger_fact_versions_v1;
                      DROP TABLE context_ledger_result_references_v1;
@@ -9904,7 +10422,9 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_ledger_delivery_savings_v1;
+                    "DROP TABLE context_task_aliases_v1;
+                     DROP TABLE context_tasks_v1;
+                     DROP TABLE context_ledger_delivery_savings_v1;
                      DROP TABLE context_ledger_delivery_receipts_v1;
                      DROP TABLE context_ledger_fact_versions_v1;
                      DROP TABLE context_ledger_result_references_v1;
@@ -9951,6 +10471,8 @@ mod tests {
                 .conn
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
+                     DROP TABLE context_task_aliases_v1;
+                     DROP TABLE context_tasks_v1;
                      DROP TABLE context_ledger_delivery_savings_v1;
                      DROP TABLE context_ledger_delivery_receipts_v1;
                      DROP TABLE context_ledger_fact_versions_v1;
@@ -10935,5 +11457,134 @@ mod tests {
         assert_eq!(stats.context_events, 0);
         assert_eq!(stats.current_verified_facts, 0);
         assert_eq!(stats.context_delivery_receipts, 0);
+    }
+
+    #[test]
+    fn context_task_registry_converges_aliases_refuses_conflicts_and_rechecks_bytes() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let authorization = "a".repeat(64);
+        let first = store
+            .resolve_context_task_v1(
+                "repository",
+                "workspace",
+                &authorization,
+                "external-a",
+                Some("repair the shared parser"),
+            )
+            .unwrap();
+        assert_eq!(first.matched_by, ContextTaskMatchV1::Created);
+        let by_prompt = store
+            .resolve_context_task_v1(
+                "repository",
+                "workspace",
+                &authorization,
+                "external-b",
+                Some("repair the shared parser"),
+            )
+            .unwrap();
+        assert_eq!(by_prompt.canonical_task_id, "external-a");
+        assert_eq!(by_prompt.matched_by, ContextTaskMatchV1::JoinedByPrompt);
+        let by_alias = store
+            .resolve_context_task_v1(
+                "repository",
+                "workspace",
+                &authorization,
+                "external-b",
+                None,
+            )
+            .unwrap();
+        assert_eq!(by_alias.prompt, "repair the shared parser");
+        assert_eq!(by_alias.matched_by, ContextTaskMatchV1::JoinedByTaskId);
+        assert_eq!(
+            store
+                .resolve_context_task_v1(
+                    "repository",
+                    "workspace",
+                    &authorization,
+                    "external-b",
+                    Some("replace the public API"),
+                )
+                .unwrap_err()
+                .to_string(),
+            "task_definition_conflict"
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE context_tasks_v1 SET prompt_text = 'tampered' WHERE canonical_task_id = 'external-a'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .context_task_by_alias_v1("repository", "workspace", &authorization, "external-a")
+                .unwrap_err()
+                .to_string(),
+            "context_task_corrupt"
+        );
+        drop(store);
+        assert!(Store::open(temp.path()).is_err());
+    }
+
+    #[test]
+    fn concurrent_exact_prompts_create_one_task_and_every_alias() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        drop(Store::open(temp.path()).unwrap());
+        let root = temp.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(8));
+        let handles = (0..8)
+            .map(|index| {
+                let root = root.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    let store = Store::open(root).unwrap();
+                    barrier.wait();
+                    store
+                        .resolve_context_task_v1(
+                            "repository",
+                            "workspace",
+                            &"b".repeat(64),
+                            &format!("external-{index}"),
+                            Some("one exact concurrent task"),
+                        )
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let resolutions = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            resolutions
+                .iter()
+                .all(|resolution| resolution.canonical_task_id == resolutions[0].canonical_task_id)
+        );
+        assert_eq!(
+            resolutions
+                .iter()
+                .filter(|resolution| resolution.matched_by == ContextTaskMatchV1::Created)
+                .count(),
+            1
+        );
+        let store = Store::open(temp.path()).unwrap();
+        let tasks: u64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_tasks_v1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let aliases: u64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM context_task_aliases_v1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(tasks, 1);
+        assert_eq!(aliases, 8);
     }
 }

@@ -35,6 +35,8 @@ const MAX_CONTEXT_DELTA_ITEMS_V1: usize = 64;
 const MAX_CONTEXT_TEXT_BYTES_V1: usize = 1024;
 const MAX_ACTIVE_CONTEXT_TASKS_V1: usize = 64;
 const DEFAULT_CONTEXT_LEASE_TTL_MS_V1: u64 = 30_000;
+const TASK_COORDINATION_LEASE_TTL_MS_V1: u64 = 5 * 60_000;
+const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Clone, Copy)]
 pub(super) enum ContextProviderKindV1 {
@@ -112,7 +114,7 @@ impl LocalContextCoordinatorV1 {
         )
     }
 
-    fn activate(
+    fn activate_canonical(
         &self,
         recipient: &ReasoningTransportRecipientV1,
         task_id: &str,
@@ -157,6 +159,30 @@ impl LocalContextCoordinatorV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(recipient_key, identity_key);
         Ok(identity)
+    }
+
+    fn activate(
+        &self,
+        recipient: &ReasoningTransportRecipientV1,
+        requested_task_id: &str,
+        authorization_scope_digest: &str,
+    ) -> Result<ContextLedgerIdentityV1> {
+        let task = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .context_task_by_alias_v1(
+                &self.repository_id,
+                &self.workspace_id,
+                authorization_scope_digest,
+                requested_task_id,
+            )?
+            .ok_or_else(|| anyhow!("task_not_started"))?;
+        self.activate_canonical(
+            recipient,
+            &task.canonical_task_id,
+            authorization_scope_digest,
+        )
     }
 
     pub(super) fn active_identity_for_call(
@@ -304,23 +330,70 @@ impl LocalContextCoordinatorV1 {
 
     fn task_start(self: &Arc<Self>, call: &ProviderCall) -> Result<ContextOperationResultV1> {
         require_keys_v1(&call.arguments, &["taskId", "task"])?;
-        let task_id = bounded_string_v1(&call.arguments, "taskId", 128)?;
-        let task = call
-            .arguments
-            .get("task")
-            .and_then(Value::as_str)
-            .unwrap_or(task_id);
-        if task.is_empty() || task.len() > 8 * 1024 {
+        let requested_task_id = bounded_string_v1(&call.arguments, "taskId", 128)?;
+        let supplied_task = call.arguments.get("task").and_then(Value::as_str);
+        if supplied_task.is_some_and(|task| task.is_empty() || task.len() > 8 * 1024) {
             bail!("invalid_task_description");
         }
         let recipient = call
             .transport_recipient_v1()
             .ok_or_else(|| anyhow!("recipient_authority_required"))?;
-        let identity = self.activate(
+        let authorization_scope_digest =
+            crate::mcp_gateway::authorization_scope_digest_v1(&call.authorization_scope);
+        let task = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .resolve_context_task_v1(
+                &self.repository_id,
+                &self.workspace_id,
+                &authorization_scope_digest,
+                requested_task_id,
+                supplied_task,
+            )?;
+        let identity = self.activate_canonical(
             recipient,
-            task_id,
-            &crate::mcp_gateway::authorization_scope_digest_v1(&call.authorization_scope),
+            &task.canonical_task_id,
+            &authorization_scope_digest,
         )?;
+        let task_work_digest = task_coordination_digest_v1(&task.prompt_digest);
+        let coordination = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .acquire_context_lease_v1(
+                &identity,
+                &task_work_digest,
+                &task_coordination_summary_v1(&task.prompt),
+                TASK_COORDINATION_LEASE_TTL_MS_V1,
+                now_ms_v1().saturating_add(TASK_COORDINATION_DEADLINE_MS_V1),
+            )?;
+        let coordination = match coordination {
+            ContextLeaseAcquisitionV1::Leader {
+                lease_id,
+                generation,
+                expires_at_ms,
+            } => json!({
+                "status": "leader",
+                "leaseId": lease_id,
+                "generation": generation,
+                "expiresAtMs": expires_at_ms,
+                "guidance": "proceed_and_publish_findings"
+            }),
+            ContextLeaseAcquisitionV1::Join {
+                lease_id,
+                generation,
+                leader_agent_id,
+                expires_at_ms,
+            } => json!({
+                "status": "join",
+                "leaseId": lease_id,
+                "generation": generation,
+                "leaderAgentId": leader_agent_id,
+                "expiresAtMs": expires_at_ms,
+                "guidance": "inspect_shared_context_before_repeating_work"
+            }),
+        };
         let snapshot = self
             .store
             .lock()
@@ -343,7 +416,7 @@ impl LocalContextCoordinatorV1 {
                 &mut manifest,
                 &limits,
             );
-            let request = EditBriefRequestV1::new(task)
+            let request = EditBriefRequestV1::new(&task.prompt)
                 .and_then(|request| request.with_maximum_candidates(24));
             match (status, request) {
                 (Ok(_), Some(request)) => {
@@ -395,6 +468,16 @@ impl LocalContextCoordinatorV1 {
             "operation": "task.start",
             "presentation": presentation,
             "taskId": identity.task_id(),
+            "requestedTaskId": task.requested_task_id,
+            "taskIntent": {
+                "canonicalTaskId": task.canonical_task_id,
+                "prompt": task.prompt,
+                "promptDigest": task.prompt_digest,
+                "matchedBy": task.matched_by,
+                "authority": "agent_supplied_intent",
+                "verified": false
+            },
+            "coordination": coordination,
             "cursor": cursor.sequence(),
             "context": context,
             "relevantCode": code_brief,
@@ -590,6 +673,18 @@ impl LocalContextCoordinatorV1 {
                 store.finish_context_lease_v1(&identity, lease_id, succeeded)?;
                 json!({ "status": if succeeded { "completed" } else { "failed" } })
             }
+            "work_heartbeat" => {
+                require_keys_v1(&call.arguments, &["taskId", "kind", "leaseId", "ttlMs"])?;
+                let lease_id = bounded_string_v1(&call.arguments, "leaseId", 128)?;
+                let ttl_ms = call
+                    .arguments
+                    .get("ttlMs")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(DEFAULT_CONTEXT_LEASE_TTL_MS_V1);
+                let expires_at_ms =
+                    store.heartbeat_context_lease_v1(&identity, lease_id, ttl_ms)?;
+                json!({ "status": "renewed", "expiresAtMs": expires_at_ms })
+            }
             "work_cancel" => {
                 require_keys_v1(&call.arguments, &["taskId", "kind", "leaseId"])?;
                 let lease_id = bounded_string_v1(&call.arguments, "leaseId", 128)?;
@@ -613,11 +708,19 @@ impl LocalContextCoordinatorV1 {
         let recipient = call
             .transport_recipient_v1()
             .ok_or_else(|| anyhow!("recipient_authority_required"))?;
-        let identity = self.activate(
-            recipient,
-            task_id,
-            &crate::mcp_gateway::authorization_scope_digest_v1(&call.authorization_scope),
-        )?;
+        let identity = self
+            .activate(
+                recipient,
+                task_id,
+                &crate::mcp_gateway::authorization_scope_digest_v1(&call.authorization_scope),
+            )
+            .map_err(|error| {
+                if error.to_string() == "task_not_started" {
+                    anyhow!("retrieval_refused")
+                } else {
+                    error
+                }
+            })?;
         let full = self
             .store
             .lock()
@@ -830,7 +933,7 @@ impl ToolDiscovery for LocalContextProviderV1 {
                 name: "start".to_owned(),
                 title: Some("Start task with shared context".to_owned()),
                 description: Some(
-                    "Return one bounded verified edit brief for the active local task.".to_owned(),
+                    "Register an exact local task prompt, converge aliases, coordinate one leader, and return one bounded verified edit brief.".to_owned(),
                 ),
                 input_schema: json!({
                     "type": "object",
@@ -865,7 +968,7 @@ impl ToolDiscovery for LocalContextProviderV1 {
                         "type": "object",
                         "properties": {
                             "taskId": { "type": "string", "maxLength": 128 },
-                            "kind": { "type": "string", "enum": ["suggestion", "unknown", "work_start", "work_finish", "work_cancel"] },
+                            "kind": { "type": "string", "enum": ["suggestion", "unknown", "work_start", "work_heartbeat", "work_finish", "work_cancel"] },
                             "subject": { "type": "string", "maxLength": 128 },
                             "statement": { "type": "string", "maxLength": MAX_CONTEXT_TEXT_BYTES_V1 },
                             "explanation": { "type": "string", "maxLength": MAX_CONTEXT_TEXT_BYTES_V1 },
@@ -1052,6 +1155,26 @@ fn bounded_text_v1<'a>(arguments: &'a Value, name: &str, maximum: usize) -> Resu
         .ok_or_else(|| anyhow!("invalid_argument"))
 }
 
+fn task_coordination_digest_v1(prompt_digest: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.context.task-coordination.v1\0");
+    hasher.update(prompt_digest.as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
+fn task_coordination_summary_v1(prompt: &str) -> String {
+    const PREFIX: &str = "task intent: ";
+    let mut summary = String::with_capacity(MAX_CONTEXT_TEXT_BYTES_V1.min(prompt.len() + 16));
+    summary.push_str(PREFIX);
+    for character in prompt.chars() {
+        if summary.len() + character.len_utf8() > MAX_CONTEXT_TEXT_BYTES_V1 {
+            break;
+        }
+        summary.push(character);
+    }
+    summary
+}
+
 fn source_locator_v1(call: &ProviderCall) -> String {
     let tool = call.namespaced_tool_name.as_str();
     let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
@@ -1081,6 +1204,14 @@ fn context_error_code_v1(error: &anyhow::Error) -> &'static str {
         "unsupported_publish_kind" => "unsupported_publish_kind",
         "invalid_agent_context" => "invalid_agent_context",
         "context_capacity_exceeded" => "context_capacity_exceeded",
+        "context_task_capacity_exceeded" => "context_task_capacity_exceeded",
+        "context_task_alias_capacity_exceeded" => "context_task_alias_capacity_exceeded",
+        "task_definition_conflict" => "task_definition_conflict",
+        "task_not_started" => "task_not_started",
+        "context_task_corrupt" => "context_task_corrupt",
+        "lease_not_current" => "lease_not_current",
+        "lease_expired" => "lease_expired",
+        "owner_mismatch" => "owner_mismatch",
         "invalid_binding" => "retrieval_refused",
         "retrieval_refused" => "retrieval_refused",
         _ => "invalid_context_request",

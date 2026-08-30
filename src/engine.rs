@@ -2386,6 +2386,12 @@ fn stats(json: bool) -> Result<i32> {
             stats.estimated_execution_time_saved_ms
         );
         println!("context ledger events: {}", stats.context_events);
+        println!("context canonical tasks: {}", stats.context_tasks);
+        println!("context task aliases: {}", stats.context_task_aliases);
+        println!(
+            "context task aliases converged: {}",
+            stats.context_task_aliases_converged
+        );
         println!(
             "context verified facts admitted: {}",
             stats.verified_facts_admitted

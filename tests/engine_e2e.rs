@@ -237,6 +237,8 @@ fn user_facing_help_and_dry_run_output_are_actionable() {
     assert_eq!(stats_json["coverage_hits"], 0);
     assert_eq!(stats_json["current_verified_facts"], 0);
     assert_eq!(stats_json["context_delivery_receipts"], 0);
+    assert_eq!(stats_json["context_tasks"], 0);
+    assert_eq!(stats_json["context_task_aliases_converged"], 0);
 
     let doctor = run_again(temp.path(), &["doctor"], None);
     assert!(

@@ -31,6 +31,8 @@ The target user outcome is:
 ```text
 task arrives
   -> Again opens one current repository epoch
+  -> Again registers the exact prompt as one durable task intent
+  -> concurrent aliases join one leader instead of repeating orientation
   -> Again returns one bounded verified edit brief
   -> the agent inspects only unresolved details
   -> the agent makes the first correct edit
@@ -46,6 +48,13 @@ contains current entry points, exact source locators, verified constraints,
 invalidations, known failed approaches, explicit unknowns, and a proposed
 validation set. It does not dump a full repository tree, repeat already
 delivered output, or present model speculation as fact.
+
+Exact prompt bytes within one repository, workspace, and authorization scope
+resolve to one durable canonical task even when different agent clients supply
+different external task IDs. Reusing an external ID for different prompt bytes
+is refused. Similar prompts remain separate until an explicit deterministic
+relationship is supplied; model similarity never grants task-convergence
+authority.
 
 ## System architecture
 
@@ -347,6 +356,21 @@ milestone is a paired local two-agent flow in which verified observations and
 in-flight work are shared, an eligible command executes once, and a relevant
 mutation invalidates both derived context and execution memory.
 
+Current priority order after the local paired gate:
+
+1. Make the same-user daemon and task-start flow installable and automatic for
+   supported agent clients, with a clean upgrade/recovery path.
+2. Run and retain pinned live-agent editable cohorts so the task-quality and
+   acceleration claims are based on real Codex/Claude outcomes.
+3. Add explicit task revision, parent/child, dependency, and completion records
+   without silently merging semantically similar prompts.
+4. Finish the qualified Linux pytest execution path, then admit changed-only
+   reuse through the existing candidate/shadow/promotion contract.
+5. Extend qualified validation to Rust, TypeScript, Go, and Python before
+   materializing immutable build artifacts.
+6. Productize encrypted cross-machine coordination only after the local
+   installation, quality, and validation gates are stable.
+
 ### Phase 0 — retain the working exact-reuse foundation
 
 Status: implemented local foundation; outside qualification remains open.
@@ -404,6 +428,13 @@ public task/context tools, bounded code-intelligence index, paired-client gate,
 durable diagnostics, and an editable paired benchmark. Its offline oracle is
 qualified; pinned live-agent task-quality evidence remains open.
 
+The coordinator now persists exact agent-supplied prompts as unverified task
+intent, resolves exact-prompt aliases onto one canonical task across daemon
+restarts, refuses conflicting reuse of a task ID, automatically elects one
+bounded task leader, exposes owner-authenticated lease renewal, and retires
+leadership with the recipient lifecycle. Canonical tasks and aliases are both
+bounded and corruption-checked on open.
+
 Work:
 
 - admit typed facts from exact built-in tool observations;
@@ -412,6 +443,7 @@ Work:
 - create a purpose-specific edit-brief compiler smaller than the internal
   general reasoning brief;
 - expose one workspace-bound task-start MCP route;
+- persist exact task intent and automatically converge duplicate starts;
 - attach invalidations, unknowns, failed approaches, source locators,
   retrieval references, and validation preview;
 - update agent setup so a task begins with one brief, not a forced prose plan.

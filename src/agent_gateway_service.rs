@@ -1268,10 +1268,156 @@ mod tests {
             "task.start",
             json!({ "taskId": "shared-task", "task": "must use a new lifecycle" }),
         );
-        assert_eq!(retired["error"]["data"]["reason"], "invalid_agent_context");
+        assert_eq!(
+            retired["error"]["data"]["reason"],
+            "task_definition_conflict"
+        );
 
         agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
         agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn exact_prompts_converge_task_aliases_and_survive_daemon_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(
+            workspace.path().join("src/lib.rs"),
+            b"pub fn shared_task() {}\n",
+        )
+        .unwrap();
+        let scope = AuthorizationScopeId::new("task-intent-scope").unwrap();
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope.clone()).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut agent_a = LocalMcpClientV1::connect(workspace.path());
+        let mut agent_b = LocalMcpClientV1::connect(workspace.path());
+        let first = agent_a.tool(
+            "task.start",
+            json!({ "taskId": "external-a", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(first["result"]["structuredContent"]["taskId"], "external-a");
+        assert_eq!(
+            first["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "created"
+        );
+        assert_eq!(
+            first["result"]["structuredContent"]["coordination"]["status"],
+            "leader"
+        );
+        let first_cursor = first["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+
+        let joined = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "external-b", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["taskId"],
+            "external-a"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["requestedTaskId"],
+            "external-b"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "joined_by_prompt"
+        );
+        assert_eq!(
+            joined["result"]["structuredContent"]["coordination"]["status"],
+            "join"
+        );
+
+        let lease_id = first["result"]["structuredContent"]["coordination"]["leaseId"]
+            .as_str()
+            .unwrap();
+        let renewed = agent_a.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-a",
+                "kind": "work_heartbeat",
+                "leaseId": lease_id,
+                "ttlMs": 300_000
+            }),
+        );
+        assert_eq!(
+            renewed["result"]["structuredContent"]["outcome"]["status"],
+            "renewed"
+        );
+        let follower_renewal = agent_b.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-b",
+                "kind": "work_heartbeat",
+                "leaseId": lease_id,
+                "ttlMs": 300_000
+            }),
+        );
+        assert_eq!(
+            follower_renewal["error"]["data"]["reason"], "owner_mismatch",
+            "{follower_renewal}"
+        );
+
+        let published = agent_b.tool(
+            "context.publish",
+            json!({
+                "taskId": "external-b",
+                "kind": "unknown",
+                "subject": "shared-task-constraint",
+                "explanation": "confirm callers before editing"
+            }),
+        );
+        assert!(published.get("error").is_none(), "{published}");
+        let shared_delta = agent_a.tool(
+            "context.delta",
+            json!({ "taskId": "external-a", "afterCursor": first_cursor, "limit": 64 }),
+        );
+        assert!(
+            shared_delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "explicit_unknown")
+        );
+
+        let conflict = agent_b.tool(
+            "task.start",
+            json!({ "taskId": "external-b", "task": "delete the public API" }),
+        );
+        assert_eq!(
+            conflict["error"]["data"]["reason"],
+            "task_definition_conflict"
+        );
+
+        agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent_c = LocalMcpClientV1::connect(workspace.path());
+        let restarted = agent_c.tool(
+            "task.start",
+            json!({ "taskId": "external-c", "task": "repair shared_task without changing its API" }),
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["taskId"],
+            "external-a"
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["taskIntent"]["matchedBy"],
+            "joined_by_prompt"
+        );
+        assert_eq!(
+            restarted["result"]["structuredContent"]["coordination"]["status"],
+            "leader"
+        );
+        agent_c.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();
     }
