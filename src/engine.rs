@@ -1100,56 +1100,90 @@ fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
 #[cfg(feature = "daemon")]
 #[cfg(unix)]
 fn connect_or_start_daemon_v1(workspace: &Path) -> Result<std::os::unix::net::UnixStream> {
-    use crate::agent_gateway_service::{GatewayServiceError, connect_mcp_v1};
+    use crate::agent_gateway_service::{
+        GatewayServiceError, connect_mcp_v1, try_acquire_daemon_start_lock_v1,
+    };
 
-    match connect_mcp_v1(workspace) {
-        Ok(stream) => return Ok(stream),
-        Err(error) if daemon_start_is_safe_v1(&error) => {}
-        Err(error) => return Err(error.into()),
-    }
-
-    let executable = fs::canonicalize(std::env::current_exe()?)
-        .context("resolve the exact Again executable for daemon startup")?;
-    let mut daemon_command = Command::new(&executable);
-    daemon_command
-        .args([OsStr::new("mcp"), OsStr::new("daemon"), OsStr::new("serve")])
-        .arg("--workspace")
-        .arg(workspace)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
-    let mut child = daemon_command
-        .spawn()
-        .with_context(|| format!("start workspace daemon with {}", executable.display()))?;
-
+    // A distinct, owner-private startup lock prevents a cold connector storm
+    // from launching one losing daemon process per client. The elected
+    // connector holds it until the daemon is ready; waiters use bounded
+    // backoff and can take over automatically if that connector exits.
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut attempt = 0_u32;
+    let mut last_error: GatewayServiceError;
     loop {
-        let last_error = match connect_mcp_v1(workspace) {
-            Ok(stream) => {
-                // Rust deliberately does not reap a dropped Child. A connector
-                // that lost the startup election therefore hands its exact
-                // child to a bounded-purpose reaper; the winner is reaped when
-                // its idle/draining daemon eventually exits.
-                let _ = thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return Ok(stream);
-            }
-            Err(GatewayServiceError::Incompatible) => {
-                return Err(GatewayServiceError::Incompatible.into());
-            }
-            Err(error) => error,
-        };
+        match connect_mcp_v1(workspace) {
+            Ok(stream) => return Ok(stream),
+            Err(error) if daemon_start_is_safe_v1(&error) => last_error = error,
+            Err(error) => return Err(error.into()),
+        }
         if Instant::now() >= deadline {
-            if child.try_wait()?.is_none() {
-                child.kill()?;
-                let _ = child.wait();
-            }
             bail!("workspace daemon did not become ready within 5 seconds: {last_error}");
         }
-        thread::sleep(Duration::from_millis(20));
+
+        if let Some(_startup_lock) = try_acquire_daemon_start_lock_v1(workspace)? {
+            // The daemon may have become ready between the failed connect and
+            // acquisition. Never spawn without checking again under the lock.
+            match connect_mcp_v1(workspace) {
+                Ok(stream) => return Ok(stream),
+                Err(error) if daemon_start_is_safe_v1(&error) => {}
+                Err(error) => return Err(error.into()),
+            }
+
+            let executable = fs::canonicalize(std::env::current_exe()?)
+                .context("resolve the exact Again executable for daemon startup")?;
+            let mut daemon_command = Command::new(&executable);
+            daemon_command
+                .args([OsStr::new("mcp"), OsStr::new("daemon"), OsStr::new("serve")])
+                .arg("--workspace")
+                .arg(workspace)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let mut child = daemon_command
+                .spawn()
+                .with_context(|| format!("start workspace daemon with {}", executable.display()))?;
+
+            loop {
+                match connect_mcp_v1(workspace) {
+                    Ok(stream) => {
+                        // Rust deliberately does not reap a dropped Child. The
+                        // elected connector hands the daemon to a bounded
+                        // reaper that waits for idle or authenticated shutdown.
+                        let _ = thread::spawn(move || {
+                            let _ = child.wait();
+                        });
+                        return Ok(stream);
+                    }
+                    Err(GatewayServiceError::Incompatible) => {
+                        return Err(GatewayServiceError::Incompatible.into());
+                    }
+                    Err(error) => last_error = error,
+                }
+                if let Some(status) = child.try_wait()? {
+                    bail!("workspace daemon exited before readiness with {status}: {last_error}");
+                }
+                if Instant::now() >= deadline {
+                    child.kill()?;
+                    let _ = child.wait();
+                    bail!("workspace daemon did not become ready within 5 seconds: {last_error}");
+                }
+                thread::sleep(daemon_start_retry_delay_v1(attempt));
+                attempt = attempt.saturating_add(1);
+            }
+        }
+
+        thread::sleep(daemon_start_retry_delay_v1(attempt));
+        attempt = attempt.saturating_add(1);
     }
+}
+
+#[cfg(feature = "daemon")]
+#[cfg(unix)]
+fn daemon_start_retry_delay_v1(attempt: u32) -> Duration {
+    let delay_ms = 10_u64.saturating_mul(1_u64 << attempt.min(4));
+    Duration::from_millis(delay_ms.min(160))
 }
 
 #[cfg(feature = "daemon")]

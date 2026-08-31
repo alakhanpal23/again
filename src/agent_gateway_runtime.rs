@@ -81,7 +81,11 @@ const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
 const FOLLOWER_WAIT_V1: Duration = Duration::from_secs(30);
-const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_millis(250);
+// Under a 100-client cold start the elected leader may not be scheduled
+// immediately after durable acquisition. Preserve conservative bounded
+// waiting long enough for that leader to publish its execution-start proof,
+// rather than duplicating the provider read during transient scheduler load.
+const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_secs(2);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
 const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
@@ -664,7 +668,7 @@ impl GatewayControlledProviderV1 {
                         "externalWriteReplay": false
                     }
                 });
-                let completion = (|| -> Result<GatewayCompletion> {
+                let completion = (|| {
                     let mut store = self
                         .store
                         .lock()
@@ -678,15 +682,22 @@ impl GatewayControlledProviderV1 {
                         POLICY_VERSION_V1,
                         &serde_json::to_string(&proof)?,
                     )?;
-                    store.complete_gateway_call(&lease_id, &stored.id)
+                    let outcome = store.complete_gateway_call(&lease_id, &stored.id)?;
+                    Ok::<_, anyhow::Error>((outcome, stored))
                 })();
                 match completion {
-                    Ok(GatewayCompletion::Completed {
-                        gateway_result_id, ..
-                    })
-                    | Ok(GatewayCompletion::AlreadyCompleted {
-                        gateway_result_id, ..
-                    }) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
+                    Ok((
+                        GatewayCompletion::Completed {
+                            gateway_result_id, ..
+                        },
+                        stored,
+                    ))
+                    | Ok((
+                        GatewayCompletion::AlreadyCompleted {
+                            gateway_result_id, ..
+                        },
+                        stored,
+                    )) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
                         Ok(Some(exact)) => {
                             // Dependency-proof registration controls only
                             // future reuse authority. The just-executed,
@@ -702,7 +713,34 @@ impl GatewayControlledProviderV1 {
                             }
                             Ok(exact)
                         }
-                        Ok(None) | Err(_) => Ok(value),
+                        Ok(None) | Err(_) => {
+                            // Completion already proved and committed this
+                            // exact stored result. If a contended immediate
+                            // reload is unavailable, preserve the durable
+                            // reference on the validated provider value instead
+                            // of returning one unreferenced duplicate response.
+                            if let Some(coordinator) = self.context_coordinator.as_ref() {
+                                let _ = coordinator.admit_verified_result(
+                                    &verification_call,
+                                    &resolved.binding,
+                                    &gateway_result_id,
+                                    stored.duration_ms,
+                                );
+                            }
+                            if self.register_result_dependency(resolved, &gateway_result_id) {
+                                self.remember_candidate(
+                                    &verification_call,
+                                    &resolved.binding,
+                                    &gateway_result_id,
+                                );
+                            }
+                            Ok(attach_result_reference_v1(
+                                value,
+                                &gateway_result_id,
+                                &stored,
+                                None,
+                            ))
+                        }
                     },
                     Ok(_) | Err(_) => Ok(value),
                 }
@@ -1022,6 +1060,22 @@ impl ToolExecution for GatewayControlledProviderV1 {
                                 &RoutingCandidatesV1::default().with_store_inflight_proof(proof),
                             );
                         }
+                        Ok(GatewayRouteProofObservationV1::Exact(proof)) => {
+                            // The leader can complete between follower
+                            // acquisition and proof observation. Exact is a
+                            // monotonic strengthening of that same authority;
+                            // let the follower's normal wait/load path consume
+                            // it instead of duplicating provider execution.
+                            let exact = route(
+                                &resolved.core_call,
+                                &RoutingCandidatesV1::default().with_store_exact_proof(proof),
+                            );
+                            break if exact == GatewayDecision::ServeExact {
+                                GatewayDecision::JoinInflight
+                            } else {
+                                GatewayDecision::Execute
+                            };
+                        }
                         Ok(GatewayRouteProofObservationV1::Unavailable(
                             crate::store::GatewayRouteProofUnavailableV1::ExecutionNotStarted,
                         )) if Instant::now() < proof_deadline => {
@@ -1326,6 +1380,18 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        Self::build_with_shared_store_v1(&workspace, store)
+    }
+
+    /// Construct isolated MCP protocol state over one daemon-owned durable
+    /// store. Each connection still receives its own gateway and lifecycle,
+    /// while cold connection storms avoid concurrently reopening/migrating the
+    /// same SQLite authority.
+    pub(crate) fn build_with_shared_store_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+    ) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
         let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
             &workspace,

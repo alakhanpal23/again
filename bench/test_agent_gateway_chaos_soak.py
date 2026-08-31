@@ -323,6 +323,28 @@ class ChaosSoakHarnessTests(unittest.TestCase):
                 )
             self.assertEqual(refused.exception.code, "concurrency")
 
+    def test_cli_exposes_beta_mode_and_forwards_its_exact_defaults(self) -> None:
+        expected = {
+            "schema": harness.SCHEMA,
+            "classification": {"type": "pass", "code": "test"},
+        }
+        with mock.patch.object(harness, "run", return_value=expected) as run:
+            stream = io.StringIO()
+            with contextlib.redirect_stdout(stream):
+                status = harness.main(
+                    ["--again-binary", "/tmp/again", "--mode", "beta"]
+                )
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(stream.getvalue()), expected)
+        run.assert_called_once_with(
+            pathlib.Path("/tmp/again"),
+            mode="beta",
+            concurrency=None,
+            duration=45.0,
+            seed=1,
+            output=None,
+        )
+
     def test_main_separates_unsupported_environment_from_failure(self) -> None:
         cases = (
             (

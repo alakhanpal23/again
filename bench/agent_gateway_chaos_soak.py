@@ -24,6 +24,7 @@ import random
 import selectors
 import shutil
 import signal
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -1044,14 +1045,15 @@ def _exact_probe(
 ) -> dict[str, Any]:
     repo = _fixture(root)
     state = root / "exact-probe-state"
-    sessions: list[Session] = []
+    sessions: list[Session | None] = [None] * concurrency
     cleanup: list[dict[str, Any]] = []
     observed_result_ids: list[str | None] = []
-    daemon_observed = False
+    event_counts: dict[str, int] = {}
+    daemon_observed = automatic_daemon
     daemon_stop: dict[str, Any] | None = None
     active_error: BaseException | None = None
     try:
-        for index in range(concurrency):
+        def open_session(index: int) -> None:
             session = Session(
                 binary,
                 repo,
@@ -1060,9 +1062,19 @@ def _exact_probe(
                 timeout=DAEMON_RESPONSE_TIMEOUT_SECONDS if automatic_daemon else 5.0,
                 automatic_daemon=automatic_daemon,
             )
-            sessions.append(session)
+            sessions[index] = session
             session.handshake()
-            daemon_observed |= automatic_daemon
+
+        if automatic_daemon:
+            # Beta mode deliberately releases the complete connector wave at
+            # once. This makes the retained evidence cover cold-start
+            # election, admission, and retry behavior instead of only testing
+            # 100 sessions established serially.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+                list(executor.map(open_session, range(concurrency)))
+        else:
+            for index in range(concurrency):
+                open_session(index)
 
         schedule = [index % concurrency for index in range(operations)]
         rng.shuffle(schedule)
@@ -1070,6 +1082,8 @@ def _exact_probe(
         def call(item: tuple[int, int]) -> str | None:
             index, session_index = item
             session = sessions[session_index]
+            if session is None:
+                raise HarnessRefusal("probe_session", "exact probe session was not established")
             response = session.request(
                 f"probe-{index}",
                 "tools/call",
@@ -1091,12 +1105,22 @@ def _exact_probe(
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
             observed_result_ids = list(executor.map(call, enumerate(schedule)))
+        reader = product.GatewayEvents(state / "again.sqlite")
+        with reader._snapshot() as connection:
+            event_counts = {
+                str(row[0]): int(row[1])
+                for row in connection.execute(
+                    "SELECT event_type, COUNT(*) FROM gateway_events GROUP BY event_type"
+                )
+            }
     except BaseException as error:
         active_error = error
         raise
     finally:
         cleanup_error: BaseException | None = None
         for session in reversed(sessions):
+            if session is None:
+                continue
             try:
                 cleanup.append(session.close())
             except BaseException as error:
@@ -1110,9 +1134,16 @@ def _exact_probe(
             raise cleanup_error
     result_ids = [identifier for identifier in observed_result_ids if identifier is not None]
     if len(result_ids) != len(observed_result_ids) or len(set(result_ids)) != 1:
+        missing = [
+            {"operation": index, "session": schedule[index]}
+            for index, identifier in enumerate(observed_result_ids)
+            if identifier is None
+        ][:8]
         raise HarnessRefusal(
             "probe_result_divergence",
-            "exact beta probe did not reference one canonical result for every operation",
+            "exact beta probe reference counts diverged "
+            f"(operations={len(observed_result_ids)}, referenced={len(result_ids)}, "
+            f"unique={len(set(result_ids))}, missing={missing}, events={event_counts})",
         )
     expected_argv = (
         [str(binary), "mcp", "connect", "--workspace", str(repo)]
@@ -1144,6 +1175,7 @@ def _exact_probe(
         "result_id": result_ids[0],
         "result_sha256": sha256_bytes(canonical_json({"text": "chaos fixture\n"})),
         "schedule_sha256": sha256_bytes(canonical_json(schedule)),
+        "event_counts": dict(sorted(event_counts.items())),
         "cleanup": cleanup,
     }
 

@@ -100,16 +100,27 @@ python3 -B bench/agent_gateway_chaos_soak.py \
   --json-out /absolute/path/to/chaos-beta.json
 ```
 
-Beta mode uses `again mcp connect` for all exact-probe sessions. The first
-connection must lazily start the workspace daemon, the task lifecycle tools
-must be advertised, every response payload must be exact, all issued reusable
-result references must converge to one identity, safe unreferenced direct
-fallbacks are counted explicitly, and an authenticated daemon stop must make
-the endpoint unavailable. The harness
+Beta mode releases all 100 `again mcp connect` processes concurrently. One
+connector must lazily start the workspace daemon, the task lifecycle tools
+must be advertised, every response payload must be exact, every operation must
+carry a reusable result reference, all references must converge to one
+identity, and an authenticated daemon stop must make the endpoint unavailable. The harness
 still performs transport corruption, partial-frame, duplicate-ID, saturation,
 restart, store-corruption, cleanup, descriptor, CPU, RSS, and temporary-state
 checks. A host resource refusal is a non-pass, not evidence for a smaller
 matrix.
+
+For genuine multi-hour evidence, use the repeated fail-closed supervisor. It
+retains every complete beta cycle plus a private summary and refuses durations
+shorter than two hours:
+
+```bash
+python3 -B bench/agent_gateway_long_soak.py \
+  --again-binary /absolute/path/to/again \
+  --duration-seconds 7200 \
+  --seed 10000 \
+  --output-dir /absolute/new/path/long-soak
+```
 
 ## Native and real-agent evidence
 
@@ -120,6 +131,15 @@ same report also proves connector-driven automatic startup, exact Codex and
 Claude setup plans, and the closed task/context/repository tool catalog. The
 archive and installed-binary digests must equal the corresponding signed
 release subject. Duplicate targets do not fill a missing job.
+
+The manually dispatched `.github/workflows/native-beta-qualification.yml`
+workflow requires an exact 40-hex source commit and runs the same daemon-only
+build and installed-product smoke on all four native GitHub-hosted runners
+without creating or publishing a release tag. A final aggregation job requires
+exactly one passing report per target, all bound to the requested source commit.
+Each matrix job retains its archive and `again.local-beta-native-smoke.v1`
+report for thirty days. This is qualification evidence; signed exact-tag release
+evidence remains a separate human-authorized gate.
 
 The outside-user report uses `again.local-beta-real-agent-review.v1`. Codex and
 Claude together need at least fifty accepted paired baseline/Again observations

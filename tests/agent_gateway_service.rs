@@ -388,15 +388,15 @@ fn production_daemon_reclaims_only_lock_proven_crash_stale_socket() {
 }
 
 #[test]
-fn twenty_simultaneous_connectors_elect_one_automatic_daemon() {
+fn one_hundred_simultaneous_connectors_elect_one_automatic_daemon() {
     let workspace = workspace();
     let fixture = TempDir::new().unwrap();
     fs::create_dir(fixture.path().join("home")).unwrap();
     let workspace_path = workspace.path().to_owned();
     let fixture_path = fixture.path().to_owned();
-    let barrier = std::sync::Arc::new(std::sync::Barrier::new(21));
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(101));
     let mut connectors = Vec::new();
-    for _ in 0..20 {
+    for _ in 0..100 {
         let workspace_path = workspace_path.clone();
         let fixture_path = fixture_path.clone();
         let barrier = std::sync::Arc::clone(&barrier);
