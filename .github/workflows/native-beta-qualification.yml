@@ -64,9 +64,11 @@ jobs:
           set -euo pipefail
           source_sha=$(git rev-parse HEAD)
           source_epoch=$(git show -s --format=%ct HEAD)
-          mkdir -p dist
-          archive="dist/again-${VERSION}-${TARGET}.tar.gz"
-          report="dist/again-${VERSION}-${TARGET}.native-smoke.json"
+          evidence_dir="$RUNNER_TEMP/again-native-${TARGET}"
+          test ! -e "$evidence_dir"
+          mkdir -m 700 "$evidence_dir"
+          archive="$evidence_dir/again-${VERSION}-${TARGET}.tar.gz"
+          report="$evidence_dir/again-${VERSION}-${TARGET}.native-smoke.json"
           python3 scripts/package_release.py \
             --binary target/release/again \
             --output "$archive" \
@@ -83,8 +85,8 @@ jobs:
           if-no-files-found: error
           retention-days: 30
           path: |
-            dist/again-${{ inputs.version }}-${{ matrix.target }}.tar.gz
-            dist/again-${{ inputs.version }}-${{ matrix.target }}.native-smoke.json
+            ${{ runner.temp }}/again-native-${{ matrix.target }}/again-${{ inputs.version }}-${{ matrix.target }}.tar.gz
+            ${{ runner.temp }}/again-native-${{ matrix.target }}/again-${{ inputs.version }}-${{ matrix.target }}.native-smoke.json
 
   aggregate-native-evidence:
     name: bind four native reports to one source
