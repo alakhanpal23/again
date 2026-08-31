@@ -1301,6 +1301,12 @@ def run_product_e2e(
             if follower_response.get("error", {}).get("code") != -32800:
                 raise HarnessRefusal("follower_cancel_failed", "follower did not return cancellation")
             leader_result = require_success(leader_response, "leader after follower cancellation")
+            # Response delivery and durable event observation are independent
+            # threads. Wait for both terminal facts before closing the evidence
+            # window so scheduler timing cannot turn a correct cancellation
+            # into a missing-event false failure.
+            reader.wait_for_event(follower_binding, start, "follower_cancelled", 5.0)
+            reader.wait_for_event(follower_binding, start, "completed", 5.0)
             window = reader.end(start)
             binding, _, counts = _binding_and_events(
                 reader,
