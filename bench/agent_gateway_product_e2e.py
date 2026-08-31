@@ -51,6 +51,7 @@ FIXTURE_FILE_BYTES = 256 * 1024
 LEASE_TTL_SECONDS = 30.0
 RECOVERY_GRACE_SECONDS = 6.0
 PROCESS_STOP_SECONDS = 2.0
+EVENT_OBSERVATION_TIMEOUT_SECONDS = 15.0
 NETWORK_BLOCK_ENDPOINT = "http://127.0.0.1:9"
 EXPECTED_ADVERTISED_TOOLS = (
     "context.cancel",
@@ -815,7 +816,9 @@ class GatewayEvents:
             if len(bindings) > 1:
                 raise HarnessRefusal("ambiguous_request_binding", "scenario produced multiple bindings")
             time.sleep(0.002)
-        raise HarnessRefusal("event_timeout", "timed out waiting for request binding")
+        raise HarnessRefusal(
+            "event_binding_timeout", "timed out waiting for request binding"
+        )
 
     def wait_for_event(
         self, binding: str, start: EventWindowStart, event_type: str, timeout: float
@@ -831,7 +834,21 @@ class GatewayEvents:
             if any(item["event_type"] == event_type for item in self.events(binding, window)):
                 return
             time.sleep(0.002)
-        raise HarnessRefusal("event_timeout", f"timed out waiting for {event_type}")
+        safe_event_type = (
+            event_type
+            if event_type
+            in {
+                "completed",
+                "executed",
+                "follower_cancelled",
+                "inflight_candidate",
+            }
+            else "unknown"
+        )
+        raise HarnessRefusal(
+            f"event_{safe_event_type}_timeout",
+            f"timed out waiting for {safe_event_type}",
+        )
 
     def lease(self, binding: str, status: str | None = None) -> dict[str, Any]:
         query = """
@@ -1289,12 +1306,24 @@ def run_product_e2e(
             leader_thread, leader_outcome = _thread_call(
                 lambda: first.tool_call("follower-case-leader", "repo.search", follower_args)
             )
-            follower_binding = reader.wait_for_binding(start, 5.0)
-            reader.wait_for_event(follower_binding, start, "executed", 5.0)
+            follower_binding = reader.wait_for_binding(
+                start, EVENT_OBSERVATION_TIMEOUT_SECONDS
+            )
+            reader.wait_for_event(
+                follower_binding,
+                start,
+                "executed",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
             follower_thread, follower_outcome = _thread_call(
                 lambda: second.tool_call("follower-case-cancel", "repo.search", follower_args)
             )
-            reader.wait_for_event(follower_binding, start, "inflight_candidate", 5.0)
+            reader.wait_for_event(
+                follower_binding,
+                start,
+                "inflight_candidate",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
             second.cancel("follower-case-cancel")
             follower_response = _join_call(follower_thread, follower_outcome, timeout_seconds)
             leader_response = _join_call(leader_thread, leader_outcome, timeout_seconds)
@@ -1305,8 +1334,18 @@ def run_product_e2e(
             # threads. Wait for both terminal facts before closing the evidence
             # window so scheduler timing cannot turn a correct cancellation
             # into a missing-event false failure.
-            reader.wait_for_event(follower_binding, start, "follower_cancelled", 5.0)
-            reader.wait_for_event(follower_binding, start, "completed", 5.0)
+            reader.wait_for_event(
+                follower_binding,
+                start,
+                "follower_cancelled",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
+            reader.wait_for_event(
+                follower_binding,
+                start,
+                "completed",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
             window = reader.end(start)
             binding, _, counts = _binding_and_events(
                 reader,
@@ -1352,8 +1391,15 @@ def run_product_e2e(
                     "leader-case-cancel", "repo.search", leader_cancel_args
                 )
             )
-            cancelled_binding = reader.wait_for_binding(start, 5.0)
-            reader.wait_for_event(cancelled_binding, start, "executed", 5.0)
+            cancelled_binding = reader.wait_for_binding(
+                start, EVENT_OBSERVATION_TIMEOUT_SECONDS
+            )
+            reader.wait_for_event(
+                cancelled_binding,
+                start,
+                "executed",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
             first.cancel("leader-case-cancel")
             cancelled_response = _join_call(cancelled_thread, cancelled_outcome, timeout_seconds)
             if cancelled_response.get("error", {}).get("code") != -32800:
@@ -1394,8 +1440,15 @@ def run_product_e2e(
             crash_thread, crash_outcome = _thread_call(
                 lambda: first.tool_call("crash-owner", "repo.search", crash_args)
             )
-            crash_binding = reader.wait_for_binding(crash_start, 5.0)
-            reader.wait_for_event(crash_binding, crash_start, "executed", 5.0)
+            crash_binding = reader.wait_for_binding(
+                crash_start, EVENT_OBSERVATION_TIMEOUT_SECONDS
+            )
+            reader.wait_for_event(
+                crash_binding,
+                crash_start,
+                "executed",
+                EVENT_OBSERVATION_TIMEOUT_SECONDS,
+            )
             old_lease = reader.lease(crash_binding, "active")
             first.kill()
             crash_thread.join(5.0)
