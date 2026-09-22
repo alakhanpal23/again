@@ -2,6 +2,10 @@
 
 Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
 
+![Again system design: a command is classified, its scoped observation and stored proof are verified, then the result is reused or executed](docs/system-design.svg)
+
+*Pre-alpha architecture: a cache hit is returned only after current inputs, runtime, proof, and stored streams pass validation.*
+
 ## Current product
 
 - `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
