@@ -1,56 +1,49 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="590" viewBox="0 0 1200 590" role="img" aria-labelledby="title desc">
-<title id="title">Reuse only after the proof still holds</title>
-<desc id="desc">Conservative local execution memory for coding agents · pre-alpha</desc>
-<rect width="1200" height="590" rx="28" fill="#071521"/>
-<rect x="1" y="1" width="1198" height="588" rx="27" fill="none" stroke="#254256" stroke-width="2"/>
-<rect x="52" y="46" width="8" height="42" rx="4" fill="#ae9aff"/>
-<text x="77" y="67" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="2">AGAIN  /  SYSTEM DESIGN</text>
-<text x="52" y="120" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="37" font-weight="700">Reuse only after the proof still holds</text>
-<text x="52" y="154" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="19">Conservative local execution memory for coding agents · pre-alpha</text>
-<rect x="52" y="211" width="208" height="224" rx="18" fill="#102637" stroke="#2d4b5d" stroke-width="2"/>
-<circle cx="82" cy="244" r="15" fill="#ae9aff" opacity=".18"/>
-<text x="82" y="250" text-anchor="middle" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">01</text>
-<text x="72" y="295" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="1.4">REQUEST</text>
-<rect x="72" y="315" width="168" height="1" fill="#315469"/>
-<text x="72" y="357" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="19">Agent command</text>
-<text x="72" y="388" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="17">Workspace context</text>
-<path d="M 269 323 H 280" stroke="#ae9aff" stroke-width="3" stroke-linecap="round"/>
-<path d="M 275 317 L 282 323 L 275 329" fill="none" stroke="#ae9aff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-<rect x="284" y="211" width="208" height="224" rx="18" fill="#102637" stroke="#2d4b5d" stroke-width="2"/>
-<circle cx="314" cy="244" r="15" fill="#ae9aff" opacity=".18"/>
-<text x="314" y="250" text-anchor="middle" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">02</text>
-<text x="304" y="295" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="1.4">CLASSIFY</text>
-<rect x="304" y="315" width="168" height="1" fill="#315469"/>
-<text x="304" y="357" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="19">Tool policy</text>
-<text x="304" y="388" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="17">Scoped observation</text>
-<path d="M 501 323 H 512" stroke="#ae9aff" stroke-width="3" stroke-linecap="round"/>
-<path d="M 507 317 L 514 323 L 507 329" fill="none" stroke="#ae9aff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-<rect x="516" y="211" width="208" height="224" rx="18" fill="#102637" stroke="#2d4b5d" stroke-width="2"/>
-<circle cx="546" cy="244" r="15" fill="#ae9aff" opacity=".18"/>
-<text x="546" y="250" text-anchor="middle" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">03</text>
-<text x="536" y="295" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="1.4">VERIFY</text>
-<rect x="536" y="315" width="168" height="1" fill="#315469"/>
-<text x="536" y="357" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="19">Inputs + runtime</text>
-<text x="536" y="388" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="17">Proof + blob bytes</text>
-<path d="M 733 323 H 744" stroke="#ae9aff" stroke-width="3" stroke-linecap="round"/>
-<path d="M 739 317 L 746 323 L 739 329" fill="none" stroke="#ae9aff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-<rect x="748" y="211" width="208" height="224" rx="18" fill="#102637" stroke="#2d4b5d" stroke-width="2"/>
-<circle cx="778" cy="244" r="15" fill="#ae9aff" opacity=".18"/>
-<text x="778" y="250" text-anchor="middle" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">04</text>
-<text x="768" y="295" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="1.4">DECIDE</text>
-<rect x="768" y="315" width="168" height="1" fill="#315469"/>
-<text x="768" y="357" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="19">Valid hit → reuse</text>
-<text x="768" y="388" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="17">Miss → execute</text>
-<path d="M 965 323 H 976" stroke="#ae9aff" stroke-width="3" stroke-linecap="round"/>
-<path d="M 971 317 L 978 323 L 971 329" fill="none" stroke="#ae9aff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-<rect x="980" y="211" width="208" height="224" rx="18" fill="#102637" stroke="#2d4b5d" stroke-width="2"/>
-<circle cx="1010" cy="244" r="15" fill="#ae9aff" opacity=".18"/>
-<text x="1010" y="250" text-anchor="middle" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="12" font-weight="700">05</text>
-<text x="1000" y="295" fill="#ae9aff" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="700" letter-spacing="1.4">RETURN</text>
-<rect x="1000" y="315" width="168" height="1" fill="#315469"/>
-<text x="1000" y="357" fill="#f1f7fb" font-family="Arial, Helvetica, sans-serif" font-size="19">Exact streams</text>
-<text x="1000" y="388" fill="#a9bfcb" font-family="Arial, Helvetica, sans-serif" font-size="17">Status + reference</text>
-<rect x="52" y="474" width="1096" height="65" rx="13" fill="#112d3c" stroke="#2d4b5d"/>
-<circle cx="78" cy="507" r="6" fill="#ae9aff"/>
-<text x="98" y="514" fill="#d8e9ef" font-family="Arial, Helvetica, sans-serif" font-size="17" font-weight="600">LOCAL STATE   •   SQLite coordination + content-addressed stdout / stderr</text>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" role="img" aria-labelledby="title desc">
+<title id="title">Again — system diagram</title>
+<desc id="desc">A local coding-agent command is classified, revalidated against scoped observations and stored proof, then reused or executed.</desc>
+<defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4.5" orient="auto" markerUnits="userSpaceOnUse"><path d="M 0 0 L 9 4.5 L 0 9" fill="none" stroke="#465768" stroke-width="1.5"/></marker></defs>
+<rect width="1200" height="640" fill="#ffffff"/>
+<text x="40" y="52" font-family="Arial, Helvetica, sans-serif" font-size="26" font-weight="700" fill="#172b3a">Again — system diagram</text>
+<path d="M 40 69 H 1160" stroke="#d5dce2" stroke-width="1"/>
+<rect x="40" y="220" width="165" height="90" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="122.5" y="262.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Coding agent</text>
+<text x="122.5" y="287.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">tool call</text>
+<rect x="250" y="220" width="165" height="90" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="332.5" y="262.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Again CLI / MCP</text>
+<text x="332.5" y="287.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">workspace</text>
+<rect x="460" y="220" width="165" height="90" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="542.5" y="262.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Policy</text>
+<text x="542.5" y="287.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">eligible read?</text>
+<rect x="670" y="220" width="180" height="90" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="760.0" y="262.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Validation</text>
+<text x="760.0" y="287.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">scope · runtime · proof</text>
+<rect x="965" y="220" width="190" height="90" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="1060.0" y="262.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Response</text>
+<text x="1060.0" y="287.0" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">exact streams + status</text>
+<path d="M 205 265 L 250 265" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="250,265 239.0,270.0 239.0,260.0" fill="#465768"/>
+<path d="M 415 265 L 460 265" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="460,265 449.0,270.0 449.0,260.0" fill="#465768"/>
+<path d="M 625 265 L 670 265" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="670,265 659.0,270.0 659.0,260.0" fill="#465768"/>
+<path d="M 850 265 L 965 265" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="965,265 954.0,270.0 954.0,260.0" fill="#465768"/>
+<rect x="655" y="425" width="190" height="75" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="750.0" y="459.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">SQLite + CAS</text>
+<text x="750.0" y="484.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">proofs · stream blobs</text>
+<rect x="965" y="425" width="190" height="75" fill="#ffffff" stroke="#465768" stroke-width="1.7"/>
+<text x="1060.0" y="459.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="18" font-weight="700" fill="#172b3a">Execute command</text>
+<text x="1060.0" y="484.5" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">eligible miss only</text>
+<path d="M 748 425 L 748 310" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="748,310 753.0,321.0 743.0,321.0" fill="#465768"/>
+<text x="760" y="375" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#536777">lookup</text>
+<path d="M 850 285 L 905 285 L 905 462 L 965 462" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="965,462 954.0,467.0 954.0,457.0" fill="#465768"/>
+<text x="913" y="387" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#536777">miss</text>
+<path d="M 1060 425 L 1060 310" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="1060,310 1065.0,321.0 1055.0,321.0" fill="#465768"/>
+<path d="M 965 480 L 845 480" fill="none" stroke="#465768" stroke-width="1.8"/>
+<polygon points="845,480 856.0,475.0 856.0,485.0" fill="#465768"/>
+<text x="875" y="469" font-family="Arial, Helvetica, sans-serif" font-size="14" fill="#536777">record</text>
+<text x="40" y="548" font-family="Arial, Helvetica, sans-serif" font-size="15" fill="#536777">Pre-alpha: refused or unknown work returns to the caller to run unchanged.</text>
 </svg>
