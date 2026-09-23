@@ -274,6 +274,12 @@ seconds baseline, and input tokens were 122k versus 99k. This is a large
 reduction in follow-up calls on one fixture, but still misses the task-level
 speed and cost targets. The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-test-preview-v1.json)
 also passed the bounded test-candidate preview alongside its lifecycle cases.
+The [reverse-order pair](../bench/results/2026-09-23-codex-1k-test-preview-reverse-v1.json)
+at `8926d39` likewise passed both edits and made zero Again repository
+follow-up calls, but Again finished in 24.5 seconds versus 22.0 seconds
+baseline and used 150k versus 98k input tokens. It first tried unavailable
+`python`, then passed with `python3`. Together the two orders do not prove
+task-level acceleration on this fixture.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference

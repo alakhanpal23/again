@@ -152,6 +152,14 @@ has a persisted proof and an `explain` reason.
   This is still one unbalanced pair, and the task-level speed target remains
   unmet; run a balanced repeat-heavy cohort before treating the change as a
   reliable gain.
+  A reverse-order pair on the same fixture also passed both edit oracles but
+  finished in 24.5 seconds with Again versus 22.0 seconds baseline, using
+  150k versus 98k input tokens. Again made no repository follow-up calls, but
+  its first test command used unavailable `python` before succeeding with
+  `python3`. See
+  `bench/results/2026-09-23-codex-1k-test-preview-reverse-v1.json`.
+  These two opposing orders still show no task-level acceleration; move the
+  controlled evaluation to repeat-heavy and parallel-agent tasks.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
