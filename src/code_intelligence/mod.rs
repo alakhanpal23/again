@@ -39,6 +39,9 @@ pub const CODE_INTELLIGENCE_SCHEMA_VERSION_V1: u16 = 1;
 const INVENTORY_DEPENDENT_DOMAIN_V1: &[u8] = b"again.code-intelligence.inventory.v1";
 #[allow(dead_code)]
 const FILE_DEPENDENT_DOMAIN_V1: &[u8] = b"again.code-intelligence.file.v1";
+// Amortize workspace/Git fencing without exceeding a single bounded manifest
+// plan. Direct tools retain separate observation capacity below.
+const MAX_INDEX_OBSERVATION_BATCH_V1: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct CodeIntelligenceLimitsV1 {
@@ -776,7 +779,8 @@ impl CodeIntelligenceIndexV1 {
         // One manifest call validates a bounded group of source paths. The
         // previous per-file calls repeatedly reobserved Git control state and
         // made warm task starts scale poorly even when extraction was reused.
-        'batches: for batch in selected.chunks(64) {
+        let batch_size = MAX_INDEX_OBSERVATION_BATCH_V1.min(authority_limits.max_plan_entries);
+        'batches: for batch in selected.chunks(batch_size) {
             if started.elapsed() > self.limits.max_parse_time {
                 push_unknown_v1(
                     &mut refresh_unknowns,

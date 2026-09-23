@@ -128,7 +128,10 @@ has a persisted proof and an `explain` reason.
   measure whether real agents use it to avoid reads and whether omitted
   candidates hurt accepted-edit quality on large repositories.
 - Reduce the roughly two-second task-start index time on 1,000-file
-  repositories without dropping useful candidates. A 150 ms synchronous
+  repositories without dropping useful candidates. A 512-file manifest batch
+  brought the local release-binary median to 0.964 seconds from 2.220 seconds
+  and removed the parse-time unknown while retaining 24 candidates. This still
+  needs clean-source release and real-task validation. A 150 ms synchronous
   budget returned zero candidates in the local control and was reverted;
   investigate bounded filename routing or background index publication with
   fresh source validation before using that cutoff.

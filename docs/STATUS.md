@@ -33,6 +33,18 @@ Codex fixtures have not shown a validated completion or token-cost win. Wider di
 recovery, balanced repeat-heavy agent cohorts, and exact-SHA hosted gates
 remain open.
 
+The first `task.start` index refresh on the same 1,000-file fixture previously
+spent its full two-second parse budget and returned a brief marked
+`parse_time_exceeded`. Increasing the bounded manifest observation batch from
+64 to 512 amortizes workspace and Git fences. The [release-binary task-start
+probe](../bench/results/2026-09-23-release-task-start-batch512-v1.json)
+measured a 0.964-second median across twelve fresh tasks versus 2.220 seconds
+in the [previous release probe](../bench/results/2026-09-23-release-task-start-value-v1.json).
+Both returned 24 candidates; the faster brief no longer reported parse-time
+exhaustion. These are local synthetic task-start measurements with an unverified
+source-to-binary binding, not a coding-task speed result. The index still
+revalidates all admitted files and can remain expensive on larger repositories.
+
 Current hosted evidence checkpoint: source commit
 `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted
 [`CI run 33145078831`](https://github.com/alakhanpal23/again/actions/runs/33145078831)
