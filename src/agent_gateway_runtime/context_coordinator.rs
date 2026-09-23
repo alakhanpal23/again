@@ -463,6 +463,58 @@ impl LocalContextCoordinatorV1 {
         Ok(())
     }
 
+    fn explicit_task_source_previews(&self, prompt: &str) -> Vec<Value> {
+        let mut previews = Vec::new();
+        let mut seen = BTreeSet::new();
+        for token in prompt.split_whitespace() {
+            let trimmed = token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '`' | '"' | '\'' | '(' | ')' | '[' | ']' | ',' | ';'
+                )
+            });
+            let candidate = trimmed.split_once(':').map_or(trimmed, |(path, _)| path);
+            let path = Path::new(candidate);
+            if !path
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+                || !matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("rs" | "py" | "pyi" | "go" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+                )
+                || !seen.insert(candidate.to_owned())
+            {
+                continue;
+            }
+            let Ok(bytes) = self
+                .observed_workspace
+                .execution_epoch
+                .read_repository_file(path, MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1)
+            else {
+                continue;
+            };
+            let digest = StateDigestV1::from_domain_and_bytes(
+                b"again.code-intelligence.source-bytes.v1",
+                &bytes,
+            )
+            .to_hex();
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            previews.push(json!({
+                "path": candidate,
+                "sourceDigest": digest,
+                "text": text,
+                "complete": true,
+                "origin": "explicit_task_path"
+            }));
+            if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
+                break;
+            }
+        }
+        previews
+    }
+
     fn task_start(self: &Arc<Self>, call: &ProviderCall) -> Result<ContextOperationResultV1> {
         require_keys_v1(
             &call.arguments,
@@ -619,7 +671,11 @@ impl LocalContextCoordinatorV1 {
                     "incomplete": true,
                     "unknowns": [{ "kind": reason }]
                 }),
-                Vec::new(),
+                if include_source_previews {
+                    self.explicit_task_source_previews(task.task.definition.prompt())
+                } else {
+                    Vec::new()
+                },
             )
         } else {
             let mut index = self

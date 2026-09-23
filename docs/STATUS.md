@@ -222,9 +222,21 @@ references after an unobserved edit, including after daemon restart. An old
 reference with no recipe is retired before presentation. Authenticated tests
 cover read and search sources, Git HEAD changes, restart, recovery, and an
 unrelated edit that preserves the old reference. Freshness scans cap at 256
-sources per task and fail closed above that bound. Concurrent mutation during
+sources per task and withhold unchecked context above that bound. Concurrent mutation during
 reobservation and delivery, wider workload performance, and hosted
 qualification remain open.
+
+A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
+measured task-start median 4,254 ms across ten isolated daemon cases. The
+[bounded-index follow-up](../bench/results/2026-09-23-gateway-task-reuse-value-10k-preflight-v2.json)
+measured 3 ms median: a source-inventory preflight now declines optional full
+indexing above 4,096 source files and marks the edit brief incomplete. Exact
+tool-result digests matched the direct controls. All warm `repo.*` cases still
+executed each call; this is a task-start latency improvement, not redundant
+call avoidance or validated task completion. The current source also returns
+small explicit task-path previews when that fallback runs and previews were
+requested, with a focused authenticated service test. That preview behavior
+still needs clean-source release qualification.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference

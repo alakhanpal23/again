@@ -2482,6 +2482,47 @@ mod tests {
     }
 
     #[test]
+    fn large_index_task_start_previews_explicit_file_without_full_index() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        for index in 0..=4096 {
+            fs::write(
+                workspace.path().join(format!("src/module_{index:04}.py")),
+                format!("value = {index}\n"),
+            )
+            .unwrap();
+        }
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("large-index-preview-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let result = agent.tool(
+            "task.start",
+            json!({
+                "taskId": "large-index-preview",
+                "task": "Edit `src/module_0001.py` safely",
+                "includeSourcePreviews": true
+            }),
+        );
+        assert!(result.get("error").is_none(), "{result}");
+        let brief = &result["result"]["structuredContent"];
+        assert_eq!(brief["relevantCode"]["incomplete"], true);
+        assert_eq!(
+            brief["relevantCode"]["unknowns"][0]["kind"],
+            "index_preflight_file_budget_exceeded"
+        );
+        assert_eq!(brief["sourcePreviews"][0]["path"], "src/module_0001.py");
+        assert_eq!(brief["sourcePreviews"][0]["text"], "value = 1\n");
+        assert_eq!(brief["sourcePreviews"][0]["complete"], true);
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn retrieval_revalidates_unobserved_edit_without_a_new_tool_read() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();
