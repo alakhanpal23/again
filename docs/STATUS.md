@@ -16,7 +16,8 @@ Codex edited and tested without a helper search/read; cold Codex searched and
 read the helper first. Seeded/cold elapsed ratios were 0.752 and 0.839.
 This establishes retention beyond the old 64-file window for one synthetic
 task; worst-case 10,000-file lookup latency and diverse real tasks remain
-unqualified.
+unqualified. The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-f4510d8.json)
+also passed after this retrieval change.
 
 The authenticated release-binary product gate had an outdated read-only
 SQLite schema pin (15 versus the product's 18). Its verifier and unit fixture
