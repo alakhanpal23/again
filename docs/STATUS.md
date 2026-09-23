@@ -27,6 +27,10 @@ The [post-change live baseline-first pair](../bench/results/2026-09-23-codex-pai
 passed both edit oracles; the wrapper made no MCP calls before editing and
 reached first edit in 4.85 seconds versus 14.29 seconds for baseline. This
 single local pair does not qualify parallel-leader behavior with live agents.
+The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
+passed at clean source `917959f` after the peer observation and blocked-task
+guard were added. Its product lifecycle assertions do not exercise a real
+parallel Codex leader.
 The CLI was smoke-tested with a private temporary repository, a fake Codex
 executable that captured arguments, and a second authenticated MCP client.
 The same smoke passed on the release binary built from clean source
