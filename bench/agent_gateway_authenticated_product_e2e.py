@@ -363,7 +363,8 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     previews[0].get("text") == "value = 1\n" and
                     previews[0].get("complete") is True,
                     "explicit source preview was missing from bounded brief")
-            (workspace / "cancel.txt").write_text("CANCEL_SOURCE\n")
+            cancel_text = "CANCEL_SOURCE\n" + "x" * 8192
+            (workspace / "cancel.txt").write_text(cancel_text)
             cancel_owner = Client(binary, workspace, environment)
             cancel_peer = Client(binary, workspace, environment)
             clients.extend((cancel_owner, cancel_peer))
@@ -387,9 +388,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             owner_retrieval = structured(cancel_owner.tool("context.retrieve", {
                 "taskId": "cancel-source-task", "resultId": cancel_id,
             }), "owner retrieval after peer cancellation")
-            require(tool_text(owner_retrieval.get("toolResult", {})) == "CANCEL_SOURCE\n",
+            require(tool_text(owner_retrieval.get("toolResult", {})) == cancel_text,
                     "peer cancellation retired the surviving owner's source reference")
-            (workspace / "corruption.txt").write_text("TRUSTED_SOURCE\n")
+            corrupt_text = "TRUSTED_SOURCE\n" + "x" * 8192
+            (workspace / "corruption.txt").write_text(corrupt_text)
             corrupt_agent = Client(binary, workspace, environment)
             clients.append(corrupt_agent)
             corrupt_task = {"taskId": "corrupt-source-task", "task": "inspect corruption.txt"}
@@ -412,7 +414,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     f"corrupt evidence was not quarantined: {corruption_events}")
             reread = corrupt_agent.tool("repo.read", {"path": "corruption.txt"})
             structured(reread, "read after corruption")
-            require(tool_text(reread["result"]) == "TRUSTED_SOURCE\n",
+            require(tool_text(reread["result"]) == corrupt_text,
                     "corruption recovery did not execute a clean source read")
             require(result_id(reread["result"]) != corrupt_id,
                     "corrupted result reference was returned after quarantine")
