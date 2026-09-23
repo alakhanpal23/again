@@ -685,6 +685,7 @@ impl LocalContextCoordinatorV1 {
                 "dependencyTaskIds",
                 "supersedesTaskId",
                 "includeSourcePreviews",
+                "previewOnly",
             ],
         )?;
         let requested_task_id = bounded_string_v1(&call.arguments, "taskId", 128)?;
@@ -692,6 +693,12 @@ impl LocalContextCoordinatorV1 {
             Some(value) => value
                 .as_bool()
                 .ok_or_else(|| anyhow!("includeSourcePreviews_must_be_boolean"))?,
+            None => false,
+        };
+        let preview_only = match call.arguments.get("previewOnly") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow!("previewOnly_must_be_boolean"))?,
             None => false,
         };
         let prompt = call
@@ -741,63 +748,71 @@ impl LocalContextCoordinatorV1 {
             &task.task.canonical_task_id,
             &authorization_scope_digest,
         )?;
-        let coordination = self
-            .store
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .claim_task_v1(
-                &identity,
-                task.task.state_generation,
-                TASK_COORDINATION_LEASE_TTL_MS_V1,
-                now_ms_v1().saturating_add(TASK_COORDINATION_DEADLINE_MS_V1),
-            )?;
-        let coordination = match coordination {
-            TaskClaimOutcomeV1::Leader {
-                lease_id,
-                lease_generation,
-                state_generation,
-                expires_at_ms,
-            } => json!({
-                "status": "leader",
-                "leaseId": lease_id,
-                "leaseGeneration": lease_generation,
-                "stateGeneration": state_generation,
-                "expiresAtMs": expires_at_ms,
-                "guidance": "proceed_and_publish_findings"
-            }),
-            TaskClaimOutcomeV1::Join {
-                lease_id,
-                lease_generation,
-                state_generation,
-                leader_agent_id,
-                expires_at_ms,
-            } => json!({
-                "status": "join",
-                "leaseId": lease_id,
-                "leaseGeneration": lease_generation,
-                "stateGeneration": state_generation,
-                "leaderAgentId": leader_agent_id,
-                "expiresAtMs": expires_at_ms,
-                "guidance": "inspect_shared_context_before_repeating_work"
-            }),
-            TaskClaimOutcomeV1::Waiting {
-                state_generation,
-                blockers,
-            } => json!({
-                "status": "waiting",
-                "stateGeneration": state_generation,
-                "blockers": blockers,
-                "guidance": "wait_for_completed_dependencies"
-            }),
-            TaskClaimOutcomeV1::Terminal {
-                state,
-                state_generation,
-            } => json!({
-                "status": "terminal",
-                "state": state,
-                "stateGeneration": state_generation,
-                "guidance": "inspect_existing_task_history"
-            }),
+        let coordination = if preview_only {
+            json!({
+                "status": "preview",
+                "stateGeneration": task.task.state_generation,
+                "guidance": "claim_from_agent_session_before_coordinated_work"
+            })
+        } else {
+            let outcome = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .claim_task_v1(
+                    &identity,
+                    task.task.state_generation,
+                    TASK_COORDINATION_LEASE_TTL_MS_V1,
+                    now_ms_v1().saturating_add(TASK_COORDINATION_DEADLINE_MS_V1),
+                )?;
+            match outcome {
+                TaskClaimOutcomeV1::Leader {
+                    lease_id,
+                    lease_generation,
+                    state_generation,
+                    expires_at_ms,
+                } => json!({
+                    "status": "leader",
+                    "leaseId": lease_id,
+                    "leaseGeneration": lease_generation,
+                    "stateGeneration": state_generation,
+                    "expiresAtMs": expires_at_ms,
+                    "guidance": "proceed_and_publish_findings"
+                }),
+                TaskClaimOutcomeV1::Join {
+                    lease_id,
+                    lease_generation,
+                    state_generation,
+                    leader_agent_id,
+                    expires_at_ms,
+                } => json!({
+                    "status": "join",
+                    "leaseId": lease_id,
+                    "leaseGeneration": lease_generation,
+                    "stateGeneration": state_generation,
+                    "leaderAgentId": leader_agent_id,
+                    "expiresAtMs": expires_at_ms,
+                    "guidance": "inspect_shared_context_before_repeating_work"
+                }),
+                TaskClaimOutcomeV1::Waiting {
+                    state_generation,
+                    blockers,
+                } => json!({
+                    "status": "waiting",
+                    "stateGeneration": state_generation,
+                    "blockers": blockers,
+                    "guidance": "wait_for_completed_dependencies"
+                }),
+                TaskClaimOutcomeV1::Terminal {
+                    state,
+                    state_generation,
+                } => json!({
+                    "status": "terminal",
+                    "state": state,
+                    "stateGeneration": state_generation,
+                    "guidance": "inspect_existing_task_history"
+                }),
+            }
         };
         let freshness_issue = match self.refresh_current_sources(call, &identity) {
             Ok(()) => None,
@@ -1654,7 +1669,8 @@ impl ToolDiscovery for LocalContextProviderV1 {
                                 "items": { "type": "string", "maxLength": 128 }
                             },
                             "supersedesTaskId": { "type": "string", "maxLength": 128 },
-                            "includeSourcePreviews": { "type": "boolean", "default": false }
+                            "includeSourcePreviews": { "type": "boolean", "default": false },
+                            "previewOnly": { "type": "boolean", "default": false }
                         },
                         "required": ["taskId"],
                         "additionalProperties": false

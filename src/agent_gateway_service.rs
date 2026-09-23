@@ -1721,6 +1721,49 @@ mod tests {
     }
 
     #[test]
+    fn preview_only_task_start_keeps_coordination_lease_available() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("source.py"), b"value = 1\n").unwrap();
+        let scope = AuthorizationScopeId::new("prebrief-scope").unwrap();
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+
+        let mut launcher = LocalMcpClientV1::connect(workspace.path());
+        let preview = launcher.tool(
+            "task.start",
+            json!({
+                "taskId": "edit-source",
+                "task": "edit source.py",
+                "includeSourcePreviews": true,
+                "previewOnly": true
+            }),
+        );
+        assert_eq!(
+            preview["result"]["structuredContent"]["coordination"]["status"],
+            "preview"
+        );
+        assert!(
+            preview["result"]["structuredContent"]["coordination"]
+                .get("leaseId")
+                .is_none()
+        );
+        launcher.stream.shutdown(std::net::Shutdown::Both).unwrap();
+
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let claimed = agent.tool(
+            "task.start",
+            json!({ "taskId": "edit-source", "task": "edit source.py" }),
+        );
+        assert_eq!(
+            claimed["result"]["structuredContent"]["coordination"]["status"],
+            "leader"
+        );
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn exact_prompts_converge_task_aliases_and_survive_daemon_restart() {
         let workspace = tempfile::tempdir().unwrap();
         fs::create_dir(workspace.path().join("src")).unwrap();

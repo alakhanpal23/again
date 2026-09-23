@@ -20,6 +20,7 @@ import tempfile
 import time
 
 import agent_gateway_editable_pair as pair
+from agent_gateway_authenticated_product_e2e import Client, start_daemon, structured
 from agent_gateway_codex_live_probe_v1 import sha256, source_state
 
 
@@ -38,6 +39,8 @@ def run_condition(
     condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
     source_files: int = 0,
     task_start_only_surface: bool = False,
+    compact_task_result: bool = False,
+    prebrief_with_mcp: bool = False,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -50,6 +53,35 @@ def run_condition(
             )
     before = pair.snapshot(workspace)
     stats_before = pair.again_stats(binary, workspace)
+    preparation_ms = 0.0
+    initial_brief = ""
+    if condition == "prebrief":
+        preparation_started = time.monotonic()
+        environment = os.environ.copy()
+        daemon = start_daemon(binary, workspace, environment)
+        client = Client(binary, workspace, environment)
+        try:
+            brief = structured(client.tool("task.start", {
+                "taskId": "calculator-fix", "task": pair.PROMPT,
+                "includeSourcePreviews": True,
+                "previewOnly": True,
+            }), "precomputed task brief")
+        finally:
+            client.close()
+        previews = brief.get("sourcePreviews", [])
+        if not previews or not all(item.get("complete") is True for item in previews):
+            raise RuntimeError("precomputed brief lacked complete source previews")
+        initial_brief = (
+            "Again verified these complete source previews before this task. "
+            "They are current until you edit the files. Use them to make the repair; "
+            "run validation after editing.\n"
+            + "\n".join(
+                f"FILE {item['path']} DIGEST {item['sourceDigest']}\n{item['text']}"
+                for item in previews
+            )
+            + "\nVALIDATION " + json.dumps(brief.get("validationPreview")) + "\n"
+        )
+        preparation_ms = round((time.monotonic() - preparation_started) * 1000, 3)
     codex = pathlib.Path(subprocess.run(
         ["which", "codex"], capture_output=True, text=True, check=True
     ).stdout.strip()).resolve(strict=True)
@@ -57,11 +89,15 @@ def run_condition(
         str(codex), "exec", "--ephemeral", "--ignore-user-config", "--json",
         "--approve-for-me", "-m", model, "-C", str(workspace),
     ]
-    if condition == "again":
-        if task_start_only_surface:
+    if condition == "again" or (condition == "prebrief" and prebrief_with_mcp):
+        if task_start_only_surface or compact_task_result:
             bridge = pathlib.Path(__file__).with_name("agent_gateway_codex_task_start_surface_v1.py").resolve()
             server_command = sys.executable
             server_args = [str(bridge), "--binary", str(binary), "--workspace", str(workspace)]
+            if task_start_only_surface:
+                server_args.append("--task-start-only")
+            if compact_task_result:
+                server_args.append("--compact-task-result")
         else:
             server_command = str(binary)
             server_args = ["mcp", "connect", "--workspace", str(workspace)]
@@ -69,7 +105,7 @@ def run_condition(
             "-c", f"mcp_servers.again.command={json.dumps(server_command)}",
             "-c", f"mcp_servers.again.args={json.dumps(server_args)}",
         ]
-    command.append((AGAIN_INSTRUCTION if condition == "again" else "") + pair.PROMPT)
+    command.append((AGAIN_INSTRUCTION if condition == "again" else initial_brief) + pair.PROMPT)
     original = hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         started = time.monotonic()
@@ -87,10 +123,11 @@ def run_condition(
                 break
             target = workspace / pair.TARGET
             if first_edit_ms is None and target.is_file() and hashlib.sha256(target.read_bytes()).digest() != original:
-                first_edit_ms = round(elapsed * 1000, 3)
+                first_edit_ms = round(elapsed * 1000 + preparation_ms, 3)
             time.sleep(0.02)
         returncode = process.wait(timeout=10)
-        elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        codex_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+        elapsed_ms = round(codex_elapsed_ms + preparation_ms, 3)
         if first_edit_ms is None and (workspace / pair.TARGET).is_file() and hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest() != original:
             first_edit_ms = elapsed_ms
         stdout.seek(0)
@@ -129,17 +166,23 @@ def run_condition(
     )
     stats_after = pair.again_stats(binary, workspace)
     stats = {key: stats_after[key] - stats_before[key] for key in stats_before}
-    if condition == "again":
+    if condition in ("again", "prebrief"):
         subprocess.run(
             [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
             capture_output=True, text=True, timeout=10
         )
+        if condition == "prebrief":
+            daemon.wait(timeout=10)
+            if daemon.stderr is not None:
+                daemon.stderr.close()
     result = {
         "condition": condition,
         "exitCode": returncode,
         "timedOut": timed_out,
         "eventsCaptured": captured,
         "elapsedMs": elapsed_ms,
+        "preparationMs": preparation_ms,
+        "codexElapsedMs": codex_elapsed_ms,
         "firstEditMs": first_edit_ms,
         "rawEventBytes": len(raw),
         "rawEventSha256": hashlib.sha256(raw).hexdigest(),
@@ -159,12 +202,20 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-6-sol")
     parser.add_argument("--source-files", type=int, default=0)
     parser.add_argument("--order", choices=("baseline-first", "again-first"), default="baseline-first")
+    parser.add_argument("--prebrief", action="store_true",
+                        help="diagnostic: prepare the verified task brief before launching Codex")
+    parser.add_argument("--prebrief-with-mcp", action="store_true",
+                        help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
                         help="diagnostic: advertise only task.start while forwarding through the authenticated daemon")
+    parser.add_argument("--compact-task-result", action="store_true",
+                        help="diagnostic: shorten the text payload while preserving structuredContent")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.source_files <= 1000:
         parser.error("--source-files must be between 0 and 1000")
+    if args.prebrief_with_mcp and not args.prebrief:
+        parser.error("--prebrief-with-mcp requires --prebrief")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(
         [str(binary), "mcp", "connect", "--help"],
@@ -179,12 +230,14 @@ def main() -> int:
     version = subprocess.run([str(codex), "--version"], capture_output=True, text=True, check=True).stdout.strip()
     observations = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    order = ("baseline", "again") if args.order == "baseline-first" else ("again", "baseline")
+    treatment = "prebrief" if args.prebrief else "again"
+    order = ("baseline", treatment) if args.order == "baseline-first" else (treatment, "baseline")
     for condition in order:
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
             result, raw = run_condition(
                 condition, pathlib.Path(temporary), binary, args.model,
-                args.source_files, args.task_start_only_surface,
+                args.source_files, args.task_start_only_surface, args.compact_task_result,
+                args.prebrief_with_mcp,
             )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -210,7 +263,12 @@ def main() -> int:
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(pair.PROMPT.encode()).hexdigest(),
         "order": list(order),
-        "surface": "task-start-only-diagnostic" if args.task_start_only_surface else "full",
+        "surface": ("prebrief-with-mcp" if args.prebrief_with_mcp else
+                    "prebrief-no-mcp" if args.prebrief else
+                    "task-start-only-diagnostic" if args.task_start_only_surface else "full"),
+        "compactTaskResult": args.compact_task_result,
+        "prebrief": args.prebrief,
+        "prebriefWithMcp": args.prebrief_with_mcp,
         "observations": observations,
         "accepted": accepted,
     }

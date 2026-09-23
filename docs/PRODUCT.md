@@ -37,6 +37,8 @@ brew install again
 again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill
 # Start a new Codex session; it can now invoke:
 # Call the Again task.start MCP tool for a bounded shared edit brief.
+# Or prepare verified source previews before a noninteractive Codex run:
+again codex --workspace "$(pwd -P)" --task-id fix-calculator --task "Fix calculator addition" -- --ephemeral
 again run -- rg --no-ignore --sort=path needle src
 # only if those exact complete bytes remain visible in this active context:
 again reference -- rg --no-ignore --sort=path needle src
@@ -44,7 +46,9 @@ again reference -- rg --no-ignore --sort=path needle src
 
 `--apply --with-skill` verifies the Codex MCP entry through the official client CLI and installs the instruction-only personal skill at `$HOME/.agents/skills/again` in one flow. `--inspect --with-skill` checks both. `again setup --codex --project` remains available for an explicitly project-scoped skill; scoped `--remove` reverses an unchanged owned install. The skill guides task start, shared context, verified repository tools, explicit `again run --`, and context-safe `again reference --`. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
 
-Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
+`again codex` starts or joins the authenticated workspace daemon, registers the exact durable task, and supplies up to two complete source previews before calling `codex exec`. It preserves Codex's normal user configuration and approval policy, pins the Again MCP connection for this invocation, and forwards explicit Codex flags after `--`. The prebrief claims no coordination lease. Codex can call `task.start` in its own session when it needs a lease or fresh peer context. `again mcp brief --workspace <path> --task-id <id> --task <text>` prints the same structured preview for other launchers. Keep task text free of secrets. These commands require a daemon-enabled Unix build and an installed Codex CLI; this launch path has local diagnostic evidence but is not yet a qualified default workflow.
+
+The explicit `again run` path requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry. MCP context and prebrief use the authenticated local daemon.
 
 The MCP onboarding path is explicit and workspace-bound:
 

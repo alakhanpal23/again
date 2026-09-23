@@ -90,10 +90,14 @@ calls in real tasks; server-side caching alone cannot.
 4. Keep Git operations and any additional deterministic profile behind their
    own measured policy. Preserve effect classification, environment/executable
    observations, corruption quarantine, and full-result validation.
-5. Improve the client path: installed Codex and Claude sessions should use one
-   small `task.start` brief, then inspect unresolved details. Measure tool
-   schema and brief token cost as well as tool latency. Do not add a preview
-   merely because it removes a call if it worsens validated completion time.
+5. Improve the client path: supply a verified preview before the first model
+   turn when the launcher supports it, then let the agent inspect unresolved
+   details through MCP. A preview-only task start must not claim the agent's
+   coordination lease; the agent claims from its own authenticated session
+   when needed. Keep the regular `task.start` path for clients without a
+   prebrief launcher. Measure first edit, completion, tokens, and preparation
+   together. Do not add a preview merely because it removes a call if it
+   worsens validated completion time.
 
 ## Acceptance gates
 

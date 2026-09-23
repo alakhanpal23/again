@@ -2,6 +2,33 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 prebrief launch checkpoint
+
+The daemon now supports `task.start` with `previewOnly=true`: it registers exact
+task intent and returns verified source previews without claiming a
+coordination lease. `again mcp brief` exposes that result through the
+authenticated daemon, and `again codex` supplies the verified previews in the
+initial `codex exec` prompt while keeping the ordinary Again MCP connection
+available. The agent can claim the lease from its own connection when shared
+coordination is needed. A daemon regression test confirms that a second
+authenticated client can immediately become leader after a preview-only start.
+The CLI was smoke-tested with a private temporary repository, a fake Codex
+executable that captured arguments, and a second authenticated MCP client.
+
+Two live Codex pairs using preview-only prebrief and the full Again MCP
+connection passed the exact edit oracle in both treatment orders. In the
+[baseline-first pair](../bench/results/2026-09-23-codex-pair-preview-only-baseline-first-v1.json),
+first edit and completion took 8.43/15.99 seconds with prebrief versus
+13.15/20.99 seconds with baseline; input tokens were 48,218 versus 121,291.
+In the [reverse pair](../bench/results/2026-09-23-codex-pair-preview-only-again-first-v1.json),
+they took 5.11/11.04 versus 13.42/23.19 seconds; input tokens were 48,242
+versus 97,536. Times include 0.15 second of brief preparation. These are
+small local dirty-source diagnostics on one edit fixture, not a qualified
+speed or cost claim. A compact `task.start` text response and a one-tool MCP
+surface did not improve the same workload. The next gate is clean-source
+release-binary verification of the new CLI and balanced repeat-heavy parallel
+agent cohorts, including shared context after an agent claims its own task.
+
 ## 2026-09-23 direct context architecture checkpoint
 
 Schema v15 separates direct task observations from leased cache results.
