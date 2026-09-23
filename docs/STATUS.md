@@ -22,6 +22,17 @@ change and passes its acceptance oracle afterward. The runner uses both
 treatment orders for every case. This tranche still lacks returning-task
 outcome evidence and metered dollar-cost qualification, so it is not the
 single-agent release gate.
+At clean source `0d1008b`, the
+[release Brain gate](../bench/results/2026-09-23-brain-scoped-0d1008b.json)
+passed and the [cold cohort](../bench/results/2026-09-23-cold-cohort-0d1008b/summary.json)
+accepted all 10 paired patches and validations. Again's paired median
+completion ratio was 0.8703 (about 13% faster), short of the planned 0.80
+target. The nearest-rank p95 ratio was 1.039. Aggregate uncached input,
+cached input, and output tokens were all lower, but exact dollar-cost savings
+are not yet qualified. Rust was nearly neutral and one JavaScript and one
+feature pair regressed; those traces led to a trial prompt change that directs
+the agent to use the edit result and validation before repeating a read or
+diff. The trial needs its own paired outcome evidence before it is kept.
 
 ## 2026-09-23 source-matched native reads
 

@@ -1,0 +1,177 @@
+{
+  "accepted": true,
+  "againBinarySha256": "8f8f2cace6932f9271a4e4fce952a05d2a9a1c753c90468eeff8ca830d10010c",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "greeting-feature",
+  "fixtureSha256": "56ae0dc9be81ab387c3ed66b8ab213fa6aef0108790bd1108b143fcbcd58094b",
+  "harnessSha256": "2afec65c4165b72b6c7c85c11fca51d93950805e9dd228ea0793195234531f4c",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 16774.732,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'git diff -- src/greeting.py && git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 16774.732,
+      "eventCount": 11,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 6037.522,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 135.526,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 2224,
+      "rawEventFile": "greeting-feature-0-again-first-product.jsonl",
+      "rawEventSha256": "fb2b49bcedfaf825a19880b23d6f2f96437402bddab9f1ed78d25de8b7775840",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48793,
+        "output_tokens": 492,
+        "reasoning_output_tokens": 174
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 20868.881,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/greeting.py' -g 'test*' -g 'pyproject.toml' -g 'setup.cfg' -g 'Makefile'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,160p' src/greeting.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 20868.881,
+      "eventCount": 16,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 9951.469,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 120.232,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 3985,
+      "rawEventFile": "greeting-feature-0-again-first-baseline.jsonl",
+      "rawEventSha256": "1c6ac9924d3482e1ab84c8912bbd31e0863015bc37a7349e1941708c164e5509",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 75264,
+        "input_tokens": 80606,
+        "output_tokens": 543,
+        "reasoning_output_tokens": 58
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "0d4ba13d9402d8a7785ff4755e8c7e30c81c5e1ee3adbc00969ad8122eaed426",
+  "recordedAtUtc": "2026-09-23T22:29:17.475005+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "0d1008bb290da57782e767ada9113fe9b481db09"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}
