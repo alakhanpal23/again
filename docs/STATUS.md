@@ -241,6 +241,15 @@ similar small-call warm overhead; Git status kept a warm reuse win. These are
 local dirty-source per-call diagnostics. The initial admission cost and task
 latency need optimization before this path satisfies the acceleration gate.
 
+At source `2578646e152be5fc3fff42f665f99b06a1064438`, the clean-source
+production-binary product E2E harness stops in its first concurrent-search
+scenario with `result_reference_missing`. Both standalone `repo.search` calls
+correctly take the current direct-execution route and have no stored result
+ID; the harness still assumes the earlier storage route. This is a harness
+qualification gap, not passing release evidence. The harness must start
+authenticated tasks for shared-context and result-reference scenarios and
+check direct standalone behavior separately.
+
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that
 could keep a completed client waiting for EOF; the focused test now completes

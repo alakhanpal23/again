@@ -41,6 +41,12 @@ tool name, model statement, result ID, or digest into reuse authority.
 - Exercise installation, removal, two simultaneous clients, restart, stale
   binary, conflicting configuration, cancellation, and noninteractive client
   approval modes in clean isolated homes.
+- Move the production-binary product E2E harness onto authenticated task
+  sessions. Its standalone `repo.*` scenarios still require stored result IDs,
+  but standalone reads now execute directly by design. Start a task before
+  testing exact reuse, shared facts, and retrieval; retain separate assertions
+  that standalone cheap reads bypass storage. Bind the passing report to a
+  clean source SHA and exact binary.
 
 **Exit evidence:** release-binary onboarding run for Codex and Claude; a real
 agent can call `task.start` and a repository tool through the installed server.
