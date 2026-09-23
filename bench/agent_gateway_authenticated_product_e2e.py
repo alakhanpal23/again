@@ -306,6 +306,26 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     previews[0].get("text") == "value = 1\n" and
                     previews[0].get("complete") is True,
                     "explicit source preview was missing from bounded brief")
+            (workspace / "cancel.txt").write_text("CANCEL_SOURCE\n")
+            cancel_owner = Client(binary, workspace, environment)
+            cancel_peer = Client(binary, workspace, environment)
+            clients.extend((cancel_owner, cancel_peer))
+            cancel_task = {"taskId": "cancel-source-task", "task": "inspect cancel.txt"}
+            structured(cancel_owner.tool("task.start", cancel_task), "cancel owner task.start")
+            structured(cancel_peer.tool("task.start", cancel_task), "cancel peer task.start")
+            cancel_read = cancel_owner.tool("repo.read", {"path": "cancel.txt"})
+            structured(cancel_read, "cancel source read")
+            cancel_id = result_id(cancel_read["result"])
+            require(cancel_id is not None, "cancel source was not admitted")
+            cancel_result = structured(cancel_peer.tool("context.cancel", {
+                "taskId": "cancel-source-task",
+            }), "peer context.cancel")
+            require(cancel_result.get("status") == "retired", "cancel did not retire task")
+            cancelled_retrieval = cancel_owner.tool("context.retrieve", {
+                "taskId": "cancel-source-task", "resultId": cancel_id,
+            })
+            require(cancelled_retrieval.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
+                    "retired task reference remained retrievable")
             (workspace / "corruption.txt").write_text("TRUSTED_SOURCE\n")
             corrupt_agent = Client(binary, workspace, environment)
             clients.append(corrupt_agent)
@@ -331,7 +351,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "corrupt_result_refused"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "task_cancel_retired_reference", "corrupt_result_refused"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
@@ -340,6 +360,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "new_result_id": replacement_id,
                 "corrupted_result_id": corrupt_id,
                 "corruption": corruption,
+                "cancelled_result_id": cancel_id,
             }
         finally:
             for client in clients:
