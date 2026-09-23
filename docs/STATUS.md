@@ -294,6 +294,10 @@ repository calls, and ran `python3` successfully; it finished in 21.9 seconds
 versus 28.2 seconds baseline. Input tokens were 123k versus 113k. This is one
 unbalanced, dirty-source diagnostic, so task-level speed and token gates
 remain open.
+The [clean-source authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-validation-hint-v1.json)
+at `0e70e54` passed the bounded, unverified unittest selector along with the
+existing shared-context, source invalidation, in-flight follower cancellation,
+and lease-recovery lifecycle scenarios.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference
