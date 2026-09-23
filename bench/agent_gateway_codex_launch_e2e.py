@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the release Codex launcher lease lifecycle with two isolated fake clients."""
+"""Exercise a release agent launcher lease lifecycle with isolated fake clients."""
 
 from __future__ import annotations
 
@@ -31,7 +31,8 @@ def wait_for(path: pathlib.Path, process: subprocess.Popen[bytes], seconds: floa
     raise RuntimeError("fake Codex client did not become ready")
 
 
-def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dict[str, object]:
+def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str,
+        client: str) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="again-codex-launch-e2e-") as temporary:
         root = pathlib.Path(temporary).resolve()
         home, state, workspace, fake_bin = (root / name for name in ("home", "state", "workspace", "bin"))
@@ -41,19 +42,21 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
         pinned = pin_binary(binary, root / "pinned" / "again")
         (workspace / "a.py").write_text("value = 1\n")
         subprocess.run(["git", "init", "-q", str(workspace)], check=True, timeout=5)
-        fake_codex = fake_bin / "codex"
-        fake_codex.write_text(
+        fake_client = fake_bin / client
+        fake_client.write_text(
             "#!/usr/bin/env python3\n"
             "import json, os, pathlib, sys, time\n"
             "pathlib.Path(os.environ['FAKE_READY']).write_text(json.dumps(sys.argv[1:]))\n"
             "while not pathlib.Path(os.environ['FAKE_RELEASE']).exists(): time.sleep(0.025)\n"
         )
-        fake_codex.chmod(0o700)
+        fake_client.chmod(0o700)
         environment = os.environ.copy()
         environment.update(HOME=str(home), AGAIN_HOME=str(state), PATH=str(fake_bin) + os.pathsep + environment["PATH"])
         task = "Repair a.py"
-        command = [str(pinned.executable_path), "codex", "--workspace", str(workspace),
-                   "--task-id", "repair", "--task", task, "--", "--ephemeral"]
+        command_prefix = [str(pinned.executable_path), client, "--workspace", str(workspace),
+                          "--task-id", "repair", "--task", task]
+        client_flags = ["--ephemeral"] if client == "codex" else ["--output-format", "json"]
+        command = command_prefix + ["--"] + client_flags
         brief_command = [str(pinned.executable_path), "mcp", "brief", "--workspace", str(workspace),
                          "--task-id", "repair", "--task", task]
         processes: list[subprocess.Popen[bytes]] = []
@@ -77,8 +80,16 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
         try:
             leader, leader_ready, leader_release = launch("leader")
             leader_argv = json.loads(leader_ready.read_text())
-            require(leader_argv[0] == "exec" and "leader lease" in leader_argv[-1],
+            expected_mode = "exec" if client == "codex" else "-p"
+            require(leader_argv[0] == expected_mode and "leader lease" in leader_argv[-1],
                     "leader did not receive the verified lease brief")
+            if client == "claude":
+                config_index = leader_argv.index("--mcp-config")
+                config = json.loads(leader_argv[config_index + 1])
+                server = config["mcpServers"]["again"]
+                require(server["command"] == str(pinned.executable_path)
+                        and server["args"] == ["mcp", "connect", "--workspace", str(workspace)],
+                        "Claude did not receive the exact workspace MCP connection")
             require(brief()["coordination"]["peerActive"] is True,
                     "first live launcher did not expose an active leader")
             follower, follower_ready, follower_release = launch("follower", wait_ready=False)
@@ -102,7 +113,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(brief()["coordination"]["peerActive"] is False,
                     "follower lease remained active after follower exit")
             slow_leader, _, slow_leader_release = launch("slow-leader")
-            fallback_command = command[:-2] + ["--peer-wait-seconds", "1"] + command[-2:]
+            fallback_command = command_prefix + ["--peer-wait-seconds", "1", "--"] + client_flags
             slow_follower, slow_follower_ready, slow_follower_release = launch(
                 "slow-follower", invocation_command=fallback_command
             )
@@ -118,7 +129,8 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(brief()["coordination"]["peerActive"] is False,
                     "slow leader lease remained active after exit")
             return {
-                "schema": "again.codex-launch-e2e.v1",
+                "schema": "again.agent-launch-e2e.v1",
+                "client": client,
                 "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "classification": {"type": "pass", "code": "launcher_lease_handoff_passed"},
                 "source": source,
@@ -149,10 +161,11 @@ def main() -> int:
     parser.add_argument("--again-binary", required=True, type=pathlib.Path)
     parser.add_argument("--source-root", required=True, type=pathlib.Path)
     parser.add_argument("--source-git-sha", required=True)
+    parser.add_argument("--client", choices=("codex", "claude"), default="codex")
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
     require(args.output.is_absolute() and not args.output.exists(), "output must be a new absolute path")
-    report = run(args.again_binary, args.source_root, args.source_git_sha)
+    report = run(args.again_binary, args.source_root, args.source_git_sha, args.client)
     args.output.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
     print(json.dumps({"output": str(args.output), "classification": report["classification"]}))
     return 0

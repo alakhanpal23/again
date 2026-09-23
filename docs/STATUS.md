@@ -73,6 +73,12 @@ This is still a small local two-agent fixture; it does not prove repeat-heavy
 performance across repositories or a general completion-time gain.
 The [authenticated release-binary product lifecycle gate](../bench/results/2026-09-23-auth-product-e2e-peer-wait-v1.json)
 also passed at clean source `45a5777` after the peer-wait launcher change.
+`again claude` now shares the authenticated prebrief, bounded peer wait,
+lease renewal, and current-source takeover path in Claude Code print mode.
+The launcher passes a workspace-bound MCP configuration through the documented
+CLI flag. A fake-client release gate covers its argument shape and lease
+lifecycle; a live Claude Code binary is unavailable on this host, so Claude
+quality, latency, and token cost remain unverified.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real

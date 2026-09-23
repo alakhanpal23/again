@@ -201,6 +201,12 @@ has a persisted proof and an `explain` reason.
   default wait with accepted repairs and lower input tokens. The launcher gate
   now also tests a leader outliving a one-second wait. Expand this beyond the
   one calculator fixture and keep independent subtasks parallel.
+  `again claude` now uses the same launcher lifecycle with a per-invocation
+  workspace MCP configuration in noninteractive print mode. Its release gate
+  can verify argv and lease behavior with a fake executable, but a live Claude
+  CLI is unavailable on the current host. Run the accepted-edit and token
+  cohort on a host with an installed, authenticated Claude Code binary before
+  claiming both supported clients meet the task-level targets.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference

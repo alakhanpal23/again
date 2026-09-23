@@ -69,6 +69,9 @@ enum CommandName {
     #[cfg(feature = "daemon")]
     /// Launch Codex with an authenticated, verified task brief.
     Codex(CodexArgs),
+    #[cfg(feature = "daemon")]
+    /// Launch Claude Code with an authenticated, verified task brief.
+    Claude(ClaudeArgs),
     /// Inspect, export, delete, or prune durable local tasks.
     Task(TaskArgs),
     #[cfg(feature = "hook")]
@@ -212,6 +215,19 @@ struct CodexArgs {
     /// Additional codex exec flags after `--`.
     #[arg(last = true, num_args = 0..)]
     codex_args: Vec<OsString>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct ClaudeArgs {
+    #[command(flatten)]
+    brief: McpBriefArgs,
+    /// Wait this many seconds for an exact-task leader before launching a follower.
+    #[arg(long, default_value_t = 30)]
+    peer_wait_seconds: u64,
+    /// Additional Claude Code print-mode flags after `--`.
+    #[arg(last = true, num_args = 0..)]
+    claude_args: Vec<OsString>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -733,6 +749,8 @@ pub fn run_cli() -> Result<i32> {
         },
         #[cfg(feature = "daemon")]
         CommandName::Codex(args) => codex_launch(args),
+        #[cfg(feature = "daemon")]
+        CommandName::Claude(args) => claude_launch(args),
         CommandName::Task(args) => task_cli(args),
         #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
@@ -1346,14 +1364,14 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
     if args.peer_wait_seconds > 300 {
         bail!("--peer-wait-seconds must be between 0 and 300");
     }
-    validate_codex_launch_task_v1(&session.brief)?;
+    validate_agent_launch_task_v1(&session.brief)?;
     wait_for_peer_v1(
         &mut session,
         &args.brief,
         Duration::from_secs(args.peer_wait_seconds),
     )?;
-    validate_codex_launch_task_v1(&session.brief)?;
-    let prompt = codex_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    validate_agent_launch_task_v1(&session.brief)?;
+    let prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let workspace = &session.workspace;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let bridge_args = [
@@ -1364,7 +1382,7 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
             .to_str()
             .ok_or_else(|| anyhow!("workspace path is not UTF-8"))?,
     ];
-    let mut child = Command::new("codex")
+    let child = Command::new("codex")
         .arg("exec")
         .args(&args.codex_args)
         .arg("-C")
@@ -1383,6 +1401,52 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         .stdin(Stdio::null())
         .spawn()
         .context("launch Codex with authenticated task brief")?;
+    run_agent_child_v1(session, child, "Codex")
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn claude_launch(args: ClaudeArgs) -> Result<i32> {
+    let mut session = verified_task_brief_v1(&args.brief, true)?;
+    if args.peer_wait_seconds > 300 {
+        bail!("--peer-wait-seconds must be between 0 and 300");
+    }
+    validate_agent_launch_task_v1(&session.brief)?;
+    wait_for_peer_v1(
+        &mut session,
+        &args.brief,
+        Duration::from_secs(args.peer_wait_seconds),
+    )?;
+    validate_agent_launch_task_v1(&session.brief)?;
+    let prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let workspace = &session.workspace;
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "again": {
+                "command": executable,
+                "args": ["mcp", "connect", "--workspace", workspace]
+            }
+        }
+    });
+    let child = Command::new("claude")
+        .arg("-p")
+        .args(&args.claude_args)
+        .arg("--mcp-config")
+        .arg(serde_json::to_string(&mcp_config)?)
+        .arg(prompt)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .spawn()
+        .context("launch Claude Code with authenticated task brief")?;
+    run_agent_child_v1(session, child, "Claude Code")
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn run_agent_child_v1(
+    mut session: TaskBriefSessionV1,
+    mut child: std::process::Child,
+    client_name: &str,
+) -> Result<i32> {
     let lease_id = session.brief["coordination"]["leaseId"]
         .as_str()
         .filter(|_| session.brief["coordination"]["status"] == "leader")
@@ -1410,7 +1474,9 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
                 {
                     child.kill()?;
                     let _ = child.wait();
-                    bail!("task lease heartbeat failed; stopped Codex before uncoordinated work");
+                    bail!(
+                        "task lease heartbeat failed; stopped {client_name} before uncoordinated work"
+                    );
                 }
             }
             next_heartbeat = Instant::now() + Duration::from_secs(60);
@@ -1429,7 +1495,7 @@ fn wait_for_peer_v1(
         return Ok(());
     }
     eprintln!(
-        "Again: another agent leads this exact task; waiting up to {} seconds before launching Codex.",
+        "Again: another agent leads this exact task; waiting up to {} seconds before launching the coding agent.",
         max_wait.as_secs()
     );
     let task_id = session.brief["taskId"]
@@ -1475,7 +1541,9 @@ fn wait_for_peer_v1(
                     "expiresAtMs": claim["outcome"]["expires_at_ms"]
                 });
                 session.brief = refreshed;
-                eprintln!("Again: peer lease ended; launching Codex with a fresh brief.");
+                eprintln!(
+                    "Again: peer lease ended; launching the coding agent with a fresh brief."
+                );
                 return Ok(());
             }
             Some("join") => {
@@ -1507,24 +1575,24 @@ fn wait_for_peer_v1(
 }
 
 #[cfg(all(feature = "daemon", unix))]
-fn validate_codex_launch_task_v1(brief: &serde_json::Value) -> Result<()> {
+fn validate_agent_launch_task_v1(brief: &serde_json::Value) -> Result<()> {
     if brief["taskIntent"]["blockers"]
         .as_array()
         .is_some_and(|items| !items.is_empty())
     {
-        bail!("task dependencies are still blocked; inspect the task before launching Codex");
+        bail!("task dependencies are still blocked; inspect the task before launching an agent");
     }
     if matches!(
         brief["taskIntent"]["state"].as_str(),
         Some("completed" | "failed" | "cancelled")
     ) {
-        bail!("task is terminal; start a new task ID before launching Codex");
+        bail!("task is terminal; start a new task ID before launching an agent");
     }
     Ok(())
 }
 
 #[cfg(all(feature = "daemon", unix))]
-fn codex_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<String> {
+fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<String> {
     let task_id = brief["taskId"]
         .as_str()
         .ok_or_else(|| anyhow!("task brief omitted task ID"))?;
@@ -1591,6 +1659,11 @@ fn mcp_brief(_args: McpBriefArgs) -> Result<i32> {
 
 #[cfg(all(feature = "daemon", not(unix)))]
 fn codex_launch(_args: CodexArgs) -> Result<i32> {
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
+}
+
+#[cfg(all(feature = "daemon", not(unix)))]
+fn claude_launch(_args: ClaudeArgs) -> Result<i32> {
     Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
 }
 
@@ -3597,17 +3670,17 @@ mod tests {
                 "result_references": []
             }
         });
-        let prompt = codex_prebrief_prompt_v1("repair a.py", &brief).unwrap();
+        let prompt = agent_prebrief_prompt_v1("repair a.py", &brief).unwrap();
         assert!(prompt.contains("without repeating task.start"));
         assert!(prompt.contains("FILE a.py DIGEST abc"));
         assert!(prompt.contains("value is one"));
         assert!(prompt.contains("check edge cases"));
         let mut stale = brief;
         stale["coordination"]["peerActive"] = serde_json::json!(true);
-        let peer_prompt = codex_prebrief_prompt_v1("repair a.py", &stale).unwrap();
+        let peer_prompt = agent_prebrief_prompt_v1("repair a.py", &stale).unwrap();
         assert!(peer_prompt.contains("active peer leader"));
         stale["contextFreshness"]["status"] = serde_json::json!("incomplete");
-        let prompt = codex_prebrief_prompt_v1("repair a.py", &stale).unwrap();
+        let prompt = agent_prebrief_prompt_v1("repair a.py", &stale).unwrap();
         assert!(!prompt.contains("value is one"));
         assert!(prompt.contains("freshness incomplete"));
     }
@@ -3618,15 +3691,15 @@ mod tests {
         let ready = serde_json::json!({
             "taskIntent": {"state": "waiting", "blockers": []}
         });
-        assert!(validate_codex_launch_task_v1(&ready).is_ok());
+        assert!(validate_agent_launch_task_v1(&ready).is_ok());
         let blocked = serde_json::json!({
             "taskIntent": {"state": "waiting", "blockers": ["prerequisite"]}
         });
-        assert!(validate_codex_launch_task_v1(&blocked).is_err());
+        assert!(validate_agent_launch_task_v1(&blocked).is_err());
         let terminal = serde_json::json!({
             "taskIntent": {"state": "completed", "blockers": []}
         });
-        assert!(validate_codex_launch_task_v1(&terminal).is_err());
+        assert!(validate_agent_launch_task_v1(&terminal).is_err());
     }
 
     struct BrokenPipeWriter;
