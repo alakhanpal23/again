@@ -1,0 +1,264 @@
+{
+  "againBinarySha256": "76ead6260a813a3fbdf97e76b18cf1f8f80b32cfa9c0418643ae4fad3ec733bc",
+  "evidenceScope": "local authenticated daemon task diagnostic; not a live-agent speed result",
+  "harnessSha256": "f1362ec17c66cef46bd43bcb1d85f0a704408db27d14c7f5c75f31421949a00a",
+  "host": {
+    "machine": "arm64",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "includeSourcePreviews": true,
+  "observations": [
+    {
+      "case": "read-small",
+      "coldMicros": 310.792,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1889.208,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 219.639,
+      "warmP50Micros": 209.625,
+      "warmP95Micros": 249.667
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 19869.0,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1774.375,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 244.959,
+      "warmP50Micros": 238.417,
+      "warmP95Micros": 276.334
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 553.166,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1730.625,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 446.431,
+      "warmP50Micros": 442.75,
+      "warmP95Micros": 468.042
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 20153.292,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1601.916,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 456.251,
+      "warmP50Micros": 463.584,
+      "warmP95Micros": 474.959
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 58911.416,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1720.375,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 57938.861,
+      "warmP50Micros": 57883.542,
+      "warmP95Micros": 58419.125
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 231317.375,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1634.792,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 58689.889,
+      "warmP50Micros": 58914.667,
+      "warmP95Micros": 59047.708
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 27678.083,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1692.042,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 26727.597,
+      "warmP50Micros": 26802.0,
+      "warmP95Micros": 26942.833
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 203630.334,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1587.042,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 26723.542,
+      "warmP50Micros": 26457.417,
+      "warmP95Micros": 27446.5
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 27670.083,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "bb4a407e727a5f598d6531162fd3700bf6fb603a2f47c6422c2c3c90b0966f99",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1581.084,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 25671.792,
+      "warmP50Micros": 25147.25,
+      "warmP95Micros": 26784.333
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 292891.791,
+      "editBriefCandidateCount": 0,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "index_skipped_for_complete_explicit_preview"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "bb4a407e727a5f598d6531162fd3700bf6fb603a2f47c6422c2c3c90b0966f99",
+      "samples": 3,
+      "sourcePreviewCount": 1,
+      "taskStartMicros": 1713.125,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 27724.57,
+      "warmP50Micros": 27729.167,
+      "warmP95Micros": 27786.625
+    }
+  ],
+  "pairs": [
+    {
+      "automaticWarmP50Micros": 238.417,
+      "case": "read-small",
+      "directWarmP50Micros": 209.625,
+      "warmP50DeltaMicros": -28.792
+    },
+    {
+      "automaticWarmP50Micros": 463.584,
+      "case": "read-large",
+      "directWarmP50Micros": 442.75,
+      "warmP50DeltaMicros": -20.834
+    },
+    {
+      "automaticWarmP50Micros": 58914.667,
+      "case": "search-1000",
+      "directWarmP50Micros": 57883.542,
+      "warmP50DeltaMicros": -1031.125
+    },
+    {
+      "automaticWarmP50Micros": 26457.417,
+      "case": "tree-1000",
+      "directWarmP50Micros": 26802.0,
+      "warmP50DeltaMicros": 344.583
+    },
+    {
+      "automaticWarmP50Micros": 27729.167,
+      "case": "git-status",
+      "directWarmP50Micros": 25147.25,
+      "warmP50DeltaMicros": -2581.917
+    }
+  ],
+  "recordedAtUtc": "2026-09-23T16:39:07.788292+00:00",
+  "schema": "again.gateway-task-reuse-value-probe.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "db6d909522206912a10d465314a1ccaea6dcd6df"
+  },
+  "sourceFiles": 1000,
+  "taskText": "Edit `src/module_001.py` safely"
+}

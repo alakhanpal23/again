@@ -1,0 +1,268 @@
+{
+  "againBinarySha256": "76ead6260a813a3fbdf97e76b18cf1f8f80b32cfa9c0418643ae4fad3ec733bc",
+  "evidenceScope": "local authenticated daemon task diagnostic; not a live-agent speed result",
+  "harnessSha256": "f1362ec17c66cef46bd43bcb1d85f0a704408db27d14c7f5c75f31421949a00a",
+  "host": {
+    "machine": "arm64",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "includeSourcePreviews": false,
+  "observations": [
+    {
+      "case": "read-small",
+      "coldMicros": 928.875,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2168017.791,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 192.653,
+      "warmP50Micros": 204.5,
+      "warmP95Micros": 208.75
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 129969.292,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2156637.708,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 281.82,
+      "warmP50Micros": 282.209,
+      "warmP95Micros": 297.0
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 679.417,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2154245.333,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 453.917,
+      "warmP50Micros": 429.792,
+      "warmP95Micros": 524.5
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 132259.25,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2104923.333,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 485.611,
+      "warmP50Micros": 467.667,
+      "warmP95Micros": 552.291
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 59426.583,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2155693.208,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 58670.111,
+      "warmP50Micros": 58631.417,
+      "warmP95Micros": 58788.083
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 325479.667,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2167411.208,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 62305.639,
+      "warmP50Micros": 62109.125,
+      "warmP95Micros": 63479.25
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 29182.667,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2188207.959,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 28978.542,
+      "warmP50Micros": 29008.0,
+      "warmP95Micros": 29549.291
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 319634.75,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2262860.416,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 30991.152,
+      "warmP50Micros": 30725.458,
+      "warmP95Micros": 31671.083
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 20719.25,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "bb4a407e727a5f598d6531162fd3700bf6fb603a2f47c6422c2c3c90b0966f99",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2171608.875,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 15073.403,
+      "warmP50Micros": 15034.625,
+      "warmP95Micros": 15207.458
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 373156.167,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "bb4a407e727a5f598d6531162fd3700bf6fb603a2f47c6422c2c3c90b0966f99",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2154346.042,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 16759.014,
+      "warmP50Micros": 17282.792,
+      "warmP95Micros": 17798.708
+    }
+  ],
+  "pairs": [
+    {
+      "automaticWarmP50Micros": 282.209,
+      "case": "read-small",
+      "directWarmP50Micros": 204.5,
+      "warmP50DeltaMicros": -77.709
+    },
+    {
+      "automaticWarmP50Micros": 467.667,
+      "case": "read-large",
+      "directWarmP50Micros": 429.792,
+      "warmP50DeltaMicros": -37.875
+    },
+    {
+      "automaticWarmP50Micros": 62109.125,
+      "case": "search-1000",
+      "directWarmP50Micros": 58631.417,
+      "warmP50DeltaMicros": -3477.708
+    },
+    {
+      "automaticWarmP50Micros": 30725.458,
+      "case": "tree-1000",
+      "directWarmP50Micros": 29008.0,
+      "warmP50DeltaMicros": -1717.458
+    },
+    {
+      "automaticWarmP50Micros": 17282.792,
+      "case": "git-status",
+      "directWarmP50Micros": 15034.625,
+      "warmP50DeltaMicros": -2248.167
+    }
+  ],
+  "recordedAtUtc": "2026-09-23T16:39:45.136471+00:00",
+  "schema": "again.gateway-task-reuse-value-probe.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "db6d909522206912a10d465314a1ccaea6dcd6df"
+  },
+  "sourceFiles": 1000,
+  "taskText": "Edit `src/module_001.py` safely"
+}

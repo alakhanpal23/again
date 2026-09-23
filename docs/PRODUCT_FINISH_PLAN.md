@@ -116,6 +116,11 @@ has a persisted proof and an `explain` reason.
   budget returned zero candidates in the local control and was reverted;
   investigate bounded filename routing or background index publication with
   fresh source validation before using that cutoff.
+- Qualify the opt-in named-file preview route against the full-index path on
+  real accepted edits. It saves about two seconds on the local 1,000-file
+  task-start diagnostic, but the broader candidate list is explicitly
+  incomplete; retain the full-index route when no complete explicit preview
+  was requested.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference

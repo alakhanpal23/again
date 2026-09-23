@@ -269,7 +269,20 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
 
             large_code = workspace / "large-code"
             large_code.mkdir()
-            for index in range(4097):
+            for index in range(1000):
+                (large_code / f"module_{index:04}.py").write_text(f"value = {index}\n")
+            mid_agent = Client(binary, workspace, environment)
+            clients.append(mid_agent)
+            mid_task = structured(mid_agent.tool("task.start", {
+                "taskId": "mid-code-task",
+                "task": "Edit `large-code/module_0001.py` safely",
+                "includeSourcePreviews": True,
+            }), "mid code task.start")
+            require(mid_task.get("relevantCode", {}).get("unknowns", [{}])[0].get("kind") ==
+                    "index_skipped_for_complete_explicit_preview" and
+                    mid_task.get("sourcePreviews", [{}])[0].get("text") == "value = 1\n",
+                    "mid-sized explicit source preview route failed")
+            for index in range(1000, 4097):
                 (large_code / f"module_{index:04}.py").write_text(f"value = {index}\n")
             code_agent = Client(binary, workspace, environment)
             clients.append(code_agent)
@@ -292,9 +305,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "large_index_explicit_preview"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
+                "mid_index_source_files": 1000,
                 "large_index_source_files": 4097,
                 "old_result_id": original_id,
                 "new_result_id": replacement_id,
