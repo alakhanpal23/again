@@ -321,11 +321,16 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "taskId": "cancel-source-task",
             }), "peer context.cancel")
             require(cancel_result.get("status") == "retired", "cancel did not retire task")
-            cancelled_retrieval = cancel_owner.tool("context.retrieve", {
+            cancelled_retrieval = cancel_peer.tool("context.retrieve", {
                 "taskId": "cancel-source-task", "resultId": cancel_id,
             })
             require(cancelled_retrieval.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
-                    f"retired task reference remained retrievable: {cancelled_retrieval}")
+                    f"retired recipient reference remained retrievable: {cancelled_retrieval}")
+            owner_retrieval = structured(cancel_owner.tool("context.retrieve", {
+                "taskId": "cancel-source-task", "resultId": cancel_id,
+            }), "owner retrieval after peer cancellation")
+            require(tool_text(owner_retrieval.get("toolResult", {})) == "CANCEL_SOURCE\n",
+                    "peer cancellation retired the surviving owner's source reference")
             (workspace / "corruption.txt").write_text("TRUSTED_SOURCE\n")
             corrupt_agent = Client(binary, workspace, environment)
             clients.append(corrupt_agent)
@@ -351,7 +356,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "task_cancel_retired_reference", "corrupt_result_refused"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
