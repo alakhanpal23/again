@@ -5,7 +5,7 @@
 //! neither a socket path nor a serialized identifier grants retrieval.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,7 @@ use crate::task_lifecycle::{
     MAX_TASK_DEPENDENCIES_V1, MAX_TASK_LIST_ITEMS_V1, TaskClaimOutcomeV1, TaskDefinitionV1,
     TaskStateV1,
 };
-use crate::workspace_authority::StateDigestV1;
+use crate::workspace_authority::{RepositoryObservationPlanV1, StateDigestV1};
 
 const INTERNAL_COMPLETION_FIELD_V1: &str = "__again_context_completion_v1";
 const MAX_CONTEXT_DELTA_ITEMS_V1: usize = 64;
@@ -45,6 +45,7 @@ const TASK_COORDINATION_LEASE_TTL_MS_V1: u64 = 5 * 60_000;
 const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
+const MAX_CONTEXT_FRESHNESS_SOURCES_V1: usize = 256;
 
 #[derive(Clone, Copy)]
 pub(super) enum ContextProviderKindV1 {
@@ -60,6 +61,7 @@ struct ActiveContextV1 {
 
 pub(super) struct LocalContextCoordinatorV1 {
     store: Arc<Mutex<Store>>,
+    workspace: PathBuf,
     repository_id: String,
     workspace_id: String,
     observed_workspace: SharedObservedWorkspaceV1,
@@ -81,6 +83,7 @@ impl LocalContextCoordinatorV1 {
         let digest = hasher.finalize().to_hex().to_string();
         Self {
             store,
+            workspace: workspace.to_path_buf(),
             repository_id: format!("repository:{}", &digest[..24]),
             workspace_id: format!("workspace:{}", &digest[..24]),
             observed_workspace,
@@ -216,6 +219,8 @@ impl LocalContextCoordinatorV1 {
         &self,
         call: &ProviderCall,
         binding: &crate::store::ValidatedGatewayReadV1,
+        observation_plan: &RepositoryObservationPlanV1,
+        repository_digest: &str,
         gateway_result_id: &str,
         duration_ms: u64,
     ) -> Result<()> {
@@ -231,6 +236,14 @@ impl LocalContextCoordinatorV1 {
             binding,
             gateway_result_id,
             &source_locator_v1(call),
+        )?;
+        let plan_json = serde_json::to_vec(observation_plan)?;
+        store.admit_context_source_recipe_v1(
+            &identity,
+            binding,
+            gateway_result_id,
+            repository_digest,
+            &plan_json,
         )?;
         let admission_version =
             store.context_result_admission_version_v1(&identity, gateway_result_id)?;
@@ -397,6 +410,59 @@ impl LocalContextCoordinatorV1 {
             .context_result_reference_current_v1(&identity, gateway_result_id)
     }
 
+    fn revalidate_source(
+        &self,
+        observed: &SharedObservedWorkspaceV1,
+        call: &ProviderCall,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<bool> {
+        let recipe = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .context_source_recipe_v1(identity, gateway_result_id)?;
+        let current = match recipe {
+            Some((expected_digest, plan_json)) => {
+                match serde_json::from_slice::<RepositoryObservationPlanV1>(&plan_json) {
+                    Ok(plan) => observed
+                        .manifest
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .observe_repository(&plan)
+                        .is_ok_and(|repository| repository.digest().to_hex() == expected_digest),
+                    Err(_) => false,
+                }
+            }
+            None => false,
+        };
+        if !current {
+            self.invalidate_source_observation(call, gateway_result_id)?;
+        }
+        Ok(current)
+    }
+
+    fn refresh_current_sources(
+        &self,
+        call: &ProviderCall,
+        identity: &ContextLedgerIdentityV1,
+    ) -> Result<()> {
+        let source_ids = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .current_context_source_ids_v1(identity, MAX_CONTEXT_FRESHNESS_SOURCES_V1)?;
+        if source_ids.is_empty() {
+            return Ok(());
+        }
+        let observed = SharedObservedWorkspaceV1::begin(&self.workspace)
+            .map_err(|_| anyhow!("context_freshness_unavailable"))?;
+        for result_id in source_ids {
+            self.revalidate_source(&observed, call, identity, &result_id)?;
+        }
+        Ok(())
+    }
+
     fn task_start(self: &Arc<Self>, call: &ProviderCall) -> Result<ContextOperationResultV1> {
         require_keys_v1(
             &call.arguments,
@@ -522,6 +588,7 @@ impl LocalContextCoordinatorV1 {
                 "guidance": "inspect_existing_task_history"
             }),
         };
+        self.refresh_current_sources(call, &identity)?;
         let snapshot = self
             .store
             .lock()
@@ -845,6 +912,7 @@ impl LocalContextCoordinatorV1 {
         if !allowed {
             bail!("full_delivery_required");
         }
+        self.refresh_current_sources(call, &identity)?;
         let delta = self
             .store
             .lock()
@@ -1032,6 +1100,23 @@ impl LocalContextCoordinatorV1 {
                     error
                 }
             })?;
+        let current_reference = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .context_result_reference_current_v1(&identity, result_id)
+            .map_err(|_| anyhow!("retrieval_refused"))?;
+        if !current_reference {
+            bail!("retrieval_refused");
+        }
+        let observed = SharedObservedWorkspaceV1::begin(&self.workspace)
+            .map_err(|_| anyhow!("retrieval_refused"))?;
+        if !self
+            .revalidate_source(&observed, call, &identity, result_id)
+            .map_err(|_| anyhow!("retrieval_refused"))?
+        {
+            bail!("retrieval_refused");
+        }
         let full = self
             .store
             .lock()
@@ -1671,6 +1756,8 @@ fn context_error_code_v1(error: &anyhow::Error) -> &'static str {
         "unsupported_publish_kind" => "unsupported_publish_kind",
         "invalid_agent_context" => "invalid_agent_context",
         "context_capacity_exceeded" => "context_capacity_exceeded",
+        "context_freshness_capacity_exceeded" => "context_freshness_capacity_exceeded",
+        "context_freshness_unavailable" => "context_freshness_unavailable",
         "context_task_capacity_exceeded" => "context_task_capacity_exceeded",
         "context_task_alias_capacity_exceeded" => "context_task_alias_capacity_exceeded",
         "task_definition_conflict" => "task_definition_conflict",

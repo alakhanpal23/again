@@ -267,6 +267,7 @@ struct ResolvedRequestV1 {
     core_call: GatewayToolCallV1,
     binding: ValidatedGatewayReadV1,
     observation_plan: RepositoryObservationPlanV1,
+    repository_digest: String,
 }
 
 #[derive(Clone)]
@@ -632,6 +633,8 @@ impl GatewayControlledProviderV1 {
             let _ = coordinator.admit_verified_result(
                 call,
                 &resolved.binding,
+                &resolved.observation_plan,
+                &resolved.repository_digest,
                 &loaded.full.gateway_result_id,
                 loaded.full.result.duration_ms,
             );
@@ -818,6 +821,8 @@ impl GatewayControlledProviderV1 {
                                 let _ = coordinator.admit_verified_result(
                                     &verification_call,
                                     &resolved.binding,
+                                    &resolved.observation_plan,
+                                    &resolved.repository_digest,
                                     &gateway_result_id,
                                     stored.duration_ms,
                                 );
@@ -1864,7 +1869,7 @@ fn resolve_repository_request_v1(
         state: RepositoryEnvironmentStateV1::Known {
             reference: StateDigestReferenceV1 {
                 schema_version: 1,
-                repository: DigestReferenceV1::new("blake3", repository_digest)?,
+                repository: DigestReferenceV1::new("blake3", repository_digest.clone())?,
                 environment: DigestReferenceV1::new("blake3", environment_digest)?,
             },
         },
@@ -1912,6 +1917,7 @@ fn resolve_repository_request_v1(
         core_call,
         binding,
         observation_plan,
+        repository_digest,
     })
 }
 

@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
+use serde::{Deserialize, Serialize};
 
 pub const WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
 
@@ -250,7 +251,8 @@ fn incomplete_plan(
     )
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryObservationPlanV1 {
     /// Exact regular files whose metadata and content are relevant.
     content_paths: Vec<PathBuf>,

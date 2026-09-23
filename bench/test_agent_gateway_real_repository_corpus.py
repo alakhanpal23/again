@@ -576,7 +576,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 role TEXT,
                 status TEXT
             );
-            PRAGMA user_version=10;
+            PRAGMA user_version=14;
             """
         )
         now = int(corpus.time.time() * 1000)

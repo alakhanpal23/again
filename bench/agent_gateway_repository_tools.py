@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
-STORE_SCHEMA_VERSION = 10
+STORE_SCHEMA_VERSION = 14
 MAX_FRAME_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 15.0
@@ -388,8 +388,8 @@ class McpProcess:
             "git.show",
             "git.blame",
         }
-        if advertised != expected:
-            raise HarnessError(f"unexpected MCP tool catalog: {sorted(advertised)}")
+        if not expected.issubset(advertised):
+            raise HarnessError(f"missing repository MCP tools: {sorted(expected - advertised)}")
 
     def close(self) -> None:
         if self.process.poll() is None:

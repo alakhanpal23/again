@@ -87,10 +87,11 @@ has a persisted proof and an `explain` reason.
 - Test full-before-compact delivery, exact recipient retrieval, disconnect,
   cancellation, compaction, restart, relevant/irrelevant edits, corrupt store,
   quota exhaustion, and two agents publishing at the same time.
-- Validate source freshness at retrieval or task start, or consume a reliable
-  change feed, so unobserved edits cannot leave a stored fact apparently
-  current. Extend cross-task retirement to every qualified source change path;
-  keep retirement atomic, scope-bound, and fail closed on commit failure.
+- Qualify the new source-recipe reobservation across every built-in repository
+  and Git tool, relevant and irrelevant edits, daemon restart, quota limits,
+  concurrent mutation, and large task ledgers. Make task-start return a
+  bounded incomplete brief when freshness cannot finish instead of an error;
+  retain atomic, scope-bound cross-task retirement.
 - Keep task-start local and bounded. An unavailable index returns an explicit
   incomplete brief quickly; validation preview never declares a test skippable
   without a qualified execution profile.

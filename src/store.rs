@@ -37,7 +37,8 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
+const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
 const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
 const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
 const MAX_TASK_CONTEXT_LOGICAL_BYTES_V1: u64 = 256 * 1024 * 1024;
@@ -1880,6 +1881,27 @@ impl Store {
             reconcile_all_task_quotas_v1_tx(&transaction, now_ms())?;
             transaction.pragma_update(None, "user_version", 13)?;
             transaction.commit()?;
+        }
+        if version < 14 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE gateway_context_source_recipes_v1 (
+                    result_id TEXT PRIMARY KEY CHECK(length(result_id) = 64),
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    repository_digest TEXT NOT NULL CHECK(length(repository_digest) = 64),
+                    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)
+                        AND length(CAST(plan_json AS BLOB)) BETWEEN 1 AND 65536),
+                    plan_digest TEXT NOT NULL CHECK(length(plan_digest) = 64),
+                    created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+                    FOREIGN KEY(result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                PRAGMA user_version = 14;
+                COMMIT;
+                "#,
+            )?;
         }
         Ok(())
     }
@@ -4098,6 +4120,195 @@ impl Store {
                 .checked_add(result.result.stderr_bytes)
                 .ok_or_else(|| anyhow!("context source byte count overflow"))?,
         })
+    }
+
+    /// Retain the exact bounded repository observation plan that authorized a
+    /// source-backed result. It is private metadata, never model supplied.
+    pub fn admit_context_source_recipe_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        binding: &ValidatedGatewayReadV1,
+        gateway_result_id: &str,
+        repository_digest: &str,
+        plan_json: &[u8],
+    ) -> Result<()> {
+        validate_digest(gateway_result_id, "context source recipe result")?;
+        validate_digest(repository_digest, "context source repository digest")?;
+        if plan_json.is_empty() || plan_json.len() > MAX_CONTEXT_SOURCE_PLAN_BYTES_V1 {
+            bail!("context source observation plan exceeds its bound");
+        }
+        let _: serde_json::Value = serde_json::from_slice(plan_json)
+            .context("context source observation plan is not JSON")?;
+        let plan_text = std::str::from_utf8(plan_json)?;
+        let plan_digest = blake3::hash(plan_json).to_hex().to_string();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_results
+                           WHERE gateway_result_id = ?1 AND binding_digest = ?2
+                             AND status = 'ready' AND quarantine_reason IS NULL)",
+            params![gateway_result_id, binding.binding_digest()],
+            |row| row.get(0),
+        )?;
+        if !ready {
+            bail!(GatewayRefusalReason::ResultNotFound.as_str());
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_context_source_recipes_v1 WHERE result_id = ?1)",
+            [gateway_result_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            reserve_task_context_bytes_v1(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                0,
+            )?;
+            let additional = (plan_json.len() as u64).saturating_add(256);
+            let task_bytes: u64 = transaction.query_row(
+                "SELECT task_context_bytes FROM context_workspace_quota_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2",
+                params![identity.repository_id(), identity.workspace_id()],
+                |row| row.get(0),
+            )?;
+            let total = task_bytes
+                .checked_add(stored_result_logical_bytes_v1(&transaction)?)
+                .and_then(|bytes| bytes.checked_add(additional))
+                .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))?;
+            if total > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1 {
+                bail!("workspace_state_quota_exceeded");
+            }
+            transaction.execute(
+                "INSERT INTO gateway_context_source_recipes_v1 (
+                result_id, repository_id, workspace_id, authorization_scope_digest,
+                repository_digest, plan_json, plan_digest, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    gateway_result_id,
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest(),
+                    repository_digest,
+                    plan_text,
+                    plan_digest,
+                    now_ms()
+                ],
+            )?;
+            reconcile_task_quota_scope_v1_tx(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                now_ms(),
+            )?;
+        }
+        let current: (String, String, String, String, String, String) = transaction.query_row(
+            "SELECT repository_id, workspace_id, authorization_scope_digest,
+                    repository_digest, plan_json, plan_digest
+             FROM gateway_context_source_recipes_v1 WHERE result_id = ?1",
+            [gateway_result_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        if current
+            != (
+                identity.repository_id().to_owned(),
+                identity.workspace_id().to_owned(),
+                identity.authorization_scope_digest().to_owned(),
+                repository_digest.to_owned(),
+                plan_text.to_owned(),
+                plan_digest,
+            )
+        {
+            bail!("context source recipe conflicts with prior admission");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn context_source_recipe_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        validate_digest(gateway_result_id, "context source recipe selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let recipe: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT repository_digest, plan_json, plan_digest
+                 FROM gateway_context_source_recipes_v1
+                 WHERE result_id = ?1 AND repository_id = ?2 AND workspace_id = ?3
+                   AND authorization_scope_digest = ?4",
+                params![
+                    gateway_result_id,
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        transaction.commit()?;
+        let Some((repository_digest, plan_json, plan_digest)) = recipe else {
+            return Ok(None);
+        };
+        if blake3::hash(plan_json.as_bytes()).to_hex().as_str() != plan_digest {
+            bail!("context source recipe digest mismatch");
+        }
+        Ok(Some((repository_digest, plan_json.into_bytes())))
+    }
+
+    pub fn current_context_source_ids_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 || limit > MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1 {
+            bail!(ReasoningContextRefusalV1::ItemBound.code());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT source.result_id
+             FROM context_ledger_event_sources_v1 AS source
+             JOIN context_ledger_events_v1 AS event ON event.sequence = source.event_sequence
+             WHERE event.repository_id = ?1 AND event.workspace_id = ?2
+               AND event.task_id = ?3 AND event.authorization_scope_digest = ?4
+               AND (EXISTS(SELECT 1 FROM context_ledger_fact_versions_v1 AS fact
+                           WHERE fact.admission_event_sequence = event.sequence
+                             AND fact.retired_event_sequence IS NULL)
+                    OR EXISTS(SELECT 1 FROM context_ledger_result_references_v1 AS reference
+                              WHERE reference.admission_event_sequence = event.sequence
+                                AND reference.retired_event_sequence IS NULL))
+             ORDER BY source.result_id LIMIT ?5",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    limit + 1
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        transaction.commit()?;
+        if ids.len() > limit {
+            bail!("context_freshness_capacity_exceeded");
+        }
+        Ok(ids)
     }
 
     /// Select the current task reference version, or the next version after
@@ -7561,13 +7772,32 @@ fn stored_result_logical_bytes_v1(transaction: &Transaction<'_>) -> Result<u64> 
     if complete_columns != 2 {
         return Ok(0);
     }
-    transaction
+    let result_bytes: u64 = transaction
         .query_row(
             "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0) FROM results",
             [],
             |row| row.get(0),
         )
-        .context("count logical result bytes")
+        .context("count logical result bytes")?;
+    let recipes_exist: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                       WHERE type = 'table' AND name = 'gateway_context_source_recipes_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    let recipe_bytes: u64 = if recipes_exist {
+        transaction.query_row(
+            "SELECT COALESCE(SUM(length(CAST(plan_json AS BLOB)) + 256), 0)
+             FROM gateway_context_source_recipes_v1",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    result_bytes
+        .checked_add(recipe_bytes)
+        .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))
 }
 
 fn enforce_workspace_result_capacity_v1(
@@ -9976,6 +10206,19 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             ],
         ),
         (
+            "gateway_context_source_recipes_v1",
+            &[
+                "result_id",
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "repository_digest",
+                "plan_json",
+                "plan_digest",
+                "created_ms",
+            ],
+        ),
+        (
             "inflight_leases",
             &[
                 "lease_id",
@@ -10630,6 +10873,18 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let required_checks = [
+        (
+            "gateway_context_source_recipes_v1",
+            "CHECK(json_valid(plan_json)",
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            "length(CAST(plan_json AS BLOB)) BETWEEN 1 AND 65536",
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            "CHECK(length(plan_digest) = 64)",
+        ),
         ("gateway_requests", "CHECK(length(request_digest) = 64)"),
         ("gateway_requests", "CHECK(length(state_digest) = 64)"),
         ("gateway_requests", "CHECK(length(policy_digest) = 64)"),
@@ -10961,6 +11216,15 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let expected_foreign_keys: &[ExpectedTableForeignKeysV1] = &[
+        (
+            "gateway_context_source_recipes_v1",
+            &[(
+                "gateway_results",
+                "result_id",
+                "gateway_result_id",
+                "CASCADE",
+            )],
+        ),
         (
             "context_task_aliases_v1",
             &[
@@ -12362,6 +12626,66 @@ mod tests {
     }
 
     #[test]
+    fn source_recipe_is_scope_bound_idempotent_and_counted_once() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let identity = context_test_identity("agent-a", 'a', '1', 1);
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let (binding, result_id) = context_test_gateway_result(
+            &mut store,
+            "source-recipe",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let before = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        let plan = br#"{"content_paths":["input.txt"],"recursive_trees":[],"source_trees":[],"directory_listings":[],"negative_dependencies":[]}"#;
+        store
+            .admit_context_source_recipe_v1(&identity, &binding, &result_id, &"d".repeat(64), plan)
+            .unwrap();
+        let after_first = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        store
+            .admit_context_source_recipe_v1(&identity, &binding, &result_id, &"d".repeat(64), plan)
+            .unwrap();
+        let after = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        assert_eq!(
+            after.workspace_state_bytes,
+            after_first.workspace_state_bytes
+        );
+        let result = store
+            .get_gateway_result(&binding, &result_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.workspace_state_bytes,
+            before.workspace_state_bytes
+                + result.result.stdout_bytes
+                + result.result.stderr_bytes
+                + plan.len() as u64
+                + 256
+        );
+        assert_eq!(
+            store
+                .context_source_recipe_v1(&identity, &result_id)
+                .unwrap(),
+            Some(("d".repeat(64), plan.to_vec()))
+        );
+        let other_scope = context_test_identity("agent-b", 'e', '2', 1);
+        store.activate_context_recipient_v1(&other_scope).unwrap();
+        assert!(
+            store
+                .context_source_recipe_v1(&other_scope, &result_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn unavailable_source_retires_matching_dependencies_across_tasks_only() {
         let temp = TempDir::new().unwrap();
         let mut store = Store::open(temp.path().join("state")).unwrap();
@@ -13182,7 +13506,8 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
+                    "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
                      DROP TABLE context_task_aliases_v1;
@@ -13328,6 +13653,30 @@ mod tests {
     }
 
     #[test]
+    fn source_recipe_schema_migrates_from_thirteen_and_is_required_at_fourteen() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE gateway_context_source_recipes_v1; PRAGMA user_version = 13;",
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(temp.path().join("state")).unwrap();
+        let version: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        reopened
+            .conn
+            .execute_batch("DROP TABLE gateway_context_source_recipes_v1;")
+            .unwrap();
+        assert!(verify_gateway_schema_current(&reopened.conn).is_err());
+    }
+
+    #[test]
     fn version_eight_compact_savings_are_neutralized_without_a_receipt() {
         let temp = TempDir::new().unwrap();
         set_private_dir(temp.path()).unwrap();
@@ -13343,7 +13692,8 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
+                    "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
                      DROP TABLE context_task_aliases_v1;
@@ -13395,6 +13745,7 @@ mod tests {
                 .conn
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
+                     DROP TABLE gateway_context_source_recipes_v1;
                      DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;

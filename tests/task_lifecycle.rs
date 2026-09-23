@@ -304,6 +304,7 @@ fn schema_twelve_tasks_migrate_to_active_revision_one_with_history() {
         .unwrap()
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP TABLE gateway_context_source_recipes_v1;
              DROP TABLE context_workspace_quota_v1;
              DROP TABLE context_task_transitions_v1;
              DROP TABLE context_task_relations_v1;

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the schema-v13 task lifecycle through a real daemon-backed binary."""
+"""Exercise the current task lifecycle through a real daemon-backed binary."""
 
 from __future__ import annotations
 

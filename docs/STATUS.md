@@ -214,9 +214,17 @@ old references. The store matches old dependency keys and values within one
 repository and authorization scope, leaving unrelated references current. A
 restored read can admit a new verified result; the ledger also supports a
 later admission version if the same result ID is observed again. A failed
-retirement makes the observing tool call fail. Source changes that no task has
-observed still need retrieval-time freshness validation or a reliable change
-feed before all stored context can be treated as current.
+retirement makes the observing tool call fail. The schema-v14 source recipe
+now retains the bounded observation plan and repository digest for each newly
+admitted built-in result. `task.start`, `context.delta`, and `context.retrieve`
+reobserve that plan from a fresh descriptor-bound workspace epoch and retire
+references after an unobserved edit, including after daemon restart. An old
+reference with no recipe is retired before presentation. Authenticated tests
+cover read and search sources, Git HEAD changes, restart, recovery, and an
+unrelated edit that preserves the old reference. Freshness scans cap at 256
+sources per task and fail closed above that bound. Concurrent mutation during
+reobservation and delivery, wider workload performance, and hosted
+qualification remain open.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference
@@ -225,6 +233,13 @@ p50 versus execute-only; all three paths still executed 41 physical calls.
 This is a correctness guard with a measurable small-call cost, not evidence of
 faster repeated reads. Reducing that cost while preserving cross-connection
 and cross-process freshness remains open.
+
+With source recipes enabled, the [one-file daemon probe](../bench/results/2026-09-23-gateway-task-source-recipe-v1.json)
+measured a 22.85 ms first task-bound small read versus 0.57 ms execute-only,
+and 0.315 ms versus 0.244 ms warm p50 across 40 calls. Search and tree had
+similar small-call warm overhead; Git status kept a warm reuse win. These are
+local dirty-source per-call diagnostics. The initial admission cost and task
+latency need optimization before this path satisfies the acceleration gate.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

@@ -1252,6 +1252,7 @@ mod tests {
     use serde_json::{Value, json};
     use std::io::BufRead;
     use std::os::unix::fs::symlink;
+    use std::process::Command;
     use std::sync::Barrier;
 
     struct LocalMcpClientV1 {
@@ -2333,6 +2334,239 @@ mod tests {
             .stream
             .shutdown(std::net::Shutdown::Both)
             .unwrap();
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn task_start_revalidates_unobserved_edit_after_daemon_restart() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();
+        let scope = AuthorizationScopeId::new("restart-freshness-scope").unwrap();
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope.clone()).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "restart-freshness", "task": "inspect input.txt" }),
+        );
+        assert!(start.get("error").is_none(), "{start}");
+        let first = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let old_id = first["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+
+        fs::write(workspace.path().join("input.txt"), b"after\n").unwrap();
+        let daemon = GatewayDaemonV1::bind(workspace.path(), scope).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut resumed = LocalMcpClientV1::connect(workspace.path());
+        let reopened = resumed.tool(
+            "task.start",
+            json!({ "taskId": "restart-freshness", "task": "inspect input.txt" }),
+        );
+        assert!(reopened.get("error").is_none(), "{reopened}");
+        let context = &reopened["result"]["structuredContent"]["context"];
+        assert!(
+            context["current_facts"].as_array().unwrap().is_empty(),
+            "task start presented a stale fact: {reopened}"
+        );
+        assert!(
+            context["result_references"].as_array().unwrap().is_empty(),
+            "task start presented a stale reference: {reopened}"
+        );
+        let stale = resumed.tool(
+            "context.retrieve",
+            json!({ "taskId": "restart-freshness", "resultId": old_id }),
+        );
+        assert_eq!(
+            stale["error"]["data"]["reason"], "retrieval_refused",
+            "{stale}"
+        );
+        let refreshed = resumed.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(refreshed["result"]["content"][0]["text"], "after\n");
+        resumed.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn retrieval_revalidates_unobserved_edit_without_a_new_tool_read() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("retrieval-freshness-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "retrieval-freshness", "task": "inspect input.txt" }),
+        );
+        assert!(start.get("error").is_none(), "{start}");
+        let cursor = start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let first = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let old_id = first["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let available = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "retrieval-freshness", "resultId": old_id }),
+        );
+        assert_eq!(
+            available["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "before\n"
+        );
+        let search = agent.tool("repo.search", json!({ "path": ".", "pattern": "before" }));
+        let search_id = search["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fs::write(workspace.path().join("input.txt"), b"after\n").unwrap();
+        let stale = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "retrieval-freshness", "resultId": old_id }),
+        );
+        assert_eq!(
+            stale["error"]["data"]["reason"], "retrieval_refused",
+            "{stale}"
+        );
+        let stale_search = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "retrieval-freshness", "resultId": search_id }),
+        );
+        assert_eq!(
+            stale_search["error"]["data"]["reason"], "retrieval_refused",
+            "{stale_search}"
+        );
+        let delta = agent.tool(
+            "context.delta",
+            json!({ "taskId": "retrieval-freshness", "afterCursor": cursor, "limit": 64 }),
+        );
+        assert!(
+            delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation"),
+            "retrieval did not publish the unobserved edit: {delta}"
+        );
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn task_start_preserves_fact_after_unrelated_unobserved_edit() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"stable\n").unwrap();
+        fs::write(workspace.path().join("other.txt"), b"before\n").unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("irrelevant-freshness-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "irrelevant-freshness", "task": "inspect input.txt" }),
+        );
+        assert!(start.get("error").is_none(), "{start}");
+        let first = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let result_id = first["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fs::write(workspace.path().join("other.txt"), b"after\n").unwrap();
+        let resumed = agent.tool(
+            "task.start",
+            json!({ "taskId": "irrelevant-freshness", "task": "inspect input.txt" }),
+        );
+        assert!(resumed.get("error").is_none(), "{resumed}");
+        let retrieved = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "irrelevant-freshness", "resultId": result_id }),
+        );
+        assert_eq!(
+            retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "stable\n",
+            "unrelated edit retired the source: {retrieved}"
+        );
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn git_result_revalidation_detects_unobserved_head_change() {
+        let workspace = tempfile::tempdir().unwrap();
+        let git = |arguments: &[&str]| {
+            let status = Command::new("git")
+                .args(arguments)
+                .current_dir(workspace.path())
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "git fixture command failed: {arguments:?}"
+            );
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=Again Test",
+            "-c",
+            "user.email=again@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "first",
+        ]);
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("git-head-freshness-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "git-head-freshness", "task": "inspect Git status" }),
+        );
+        assert!(start.get("error").is_none(), "{start}");
+        let status = agent.tool("git.status", json!({ "path": "." }));
+        let result_id = status["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("Git status was not admitted: {status}"))
+            .to_owned();
+        git(&[
+            "-c",
+            "user.name=Again Test",
+            "-c",
+            "user.email=again@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "second",
+        ]);
+        let stale = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "git-head-freshness", "resultId": result_id }),
+        );
+        assert_eq!(
+            stale["error"]["data"]["reason"], "retrieval_refused",
+            "{stale}"
+        );
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();
