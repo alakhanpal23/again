@@ -329,8 +329,11 @@ at `717c980` additionally passed recipient-scoped cancellation, corrupt blob
 refusal with a `result_corrupt` quarantine event, and killed-daemon lease
 recovery after the recorded expiry. The recovery had one `lease_expired`
 event and a completed second lease generation. The full locked Rust suite and
-strict all-target/all-feature Clippy passed locally. In-flight request
-cancellation remains covered only by the older standalone harness. The local
+strict all-target/all-feature Clippy passed locally. Two further
+[authenticated runs](../bench/results/2026-09-23-auth-product-e2e-inflight-cancel-v1.json)
+at `110bf88` also passed in-flight follower cancellation: one provider
+execution and completed leader, one canceled joined follower, and no follower
+result delivery. The local
 beta aggregator now requires the authenticated report and binds its clean
 source and release-binary digests; its synthetic validator tests pass. The
 full packaged beta release decision remains unqualified because the current

@@ -8,7 +8,7 @@ missing release input.
 | Evidence | Required scope |
 |---|---|
 | Product scenario | The ordered 12-step install-to-uninstall lifecycle |
-| Authenticated task lifecycle | Shared source, duplicate-read avoidance, recipient cancellation, corrupt-result quarantine, and lease-owner crash recovery through the production daemon |
+| Authenticated task lifecycle | Shared source, duplicate-read avoidance, recipient and in-flight follower cancellation, corrupt-result quarantine, and lease-owner crash recovery through the production daemon |
 | Chaos/soak | `beta` mode, 100 concurrent `mcp connect` clients, one automatic daemon, zero false hits or resource leaks |
 | Native package smoke | Exactly one result for each macOS/Linux arm64/x86_64 target |
 | Real-agent review | Balanced existing-user or controlled-agent Codex and Claude pairs, direct metrics, independent patch review, zero incorrect hits, no quality regression, and measured acceleration |

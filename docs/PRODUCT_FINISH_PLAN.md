@@ -52,8 +52,10 @@ tool name, model statement, result ID, or digest into reuse authority.
   and recovery, alongside its shared-source and large-index scenarios. Its
   clean-source release-binary report is
   `bench/results/2026-09-23-auth-product-e2e-lifecycle-v2.json`. The beta
-  aggregator now requires this report; qualify in-flight request
-  cancellation separately. Keep the old standalone harness as historical
+  aggregator now requires this report. The authenticated harness also covers
+  an in-flight follower cancellation with one surviving leader execution;
+  two clean-source release-binary runs at `110bf88` passed. Keep the old
+  standalone harness as historical
   evidence for scenarios it still covers uniquely.
 
 **Exit evidence:** release-binary onboarding run for Codex and Claude; a real
