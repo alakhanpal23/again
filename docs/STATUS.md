@@ -483,6 +483,10 @@ at `d0ee560` passed the full task source lifecycle. In particular, a
 concurrent search of a bounded `lease/` subtree in the same large workspace
 still joined one in-flight execution after the route was scoped to the
 requested subtree.
+The [Codex](../bench/results/2026-09-23-codex-launch-scoped-overflow-release-v1.json)
+and [fake-Claude](../bench/results/2026-09-23-claude-launch-scoped-overflow-release-v1.json)
+clean-source launcher gates also passed lease handoff and stale-brief refresh
+on that release binary. A live Claude coding outcome remains unverified.
 
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
