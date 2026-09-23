@@ -239,6 +239,12 @@ requested. The [clean-source release-binary task gate](../bench/results/2026-09-
 at `ca721c2` passed this behavior with 4,097 source files, alongside the
 earlier shared-context and 257-source ledger scenarios. No live agent outcome
 has been measured for this fallback.
+The separate [1,000-file control](../bench/results/2026-09-23-gateway-task-reuse-value-1k-quality-control-v1.json)
+still took 2,152 ms median for task start and returned 24 code candidates.
+A local 150 ms synchronous index-budget trial reduced that to about 383 ms
+but returned zero candidates, so it was reverted. Faster task start on
+mid-sized repositories needs a path that preserves useful entry points;
+this control is a diagnostic with three warm calls per case.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference

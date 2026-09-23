@@ -111,6 +111,11 @@ has a persisted proof and an `explain` reason.
   index budget. The fast fallback can preview a small explicit task path;
   measure whether real agents use it to avoid reads and whether omitted
   candidates hurt accepted-edit quality on large repositories.
+- Reduce the roughly two-second task-start index time on 1,000-file
+  repositories without dropping useful candidates. A 150 ms synchronous
+  budget returned zero candidates in the local control and was reverted;
+  investigate bounded filename routing or background index publication with
+  fresh source validation before using that cutoff.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
