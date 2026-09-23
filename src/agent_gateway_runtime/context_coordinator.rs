@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -19,7 +19,7 @@ use crate::agent_gateway::context::{
 use crate::agent_gateway_runtime::SharedObservedWorkspaceV1;
 use crate::code_intelligence::{
     CodeIntelligenceIndexV1, CodeIntelligenceLimitsV1, CodeIntelligenceProviderV1,
-    EditBriefCandidateKindV1, EditBriefRequestV1,
+    EditBriefCandidateKindV1, EditBriefRequestV1, index_preflight_refusal_v1,
 };
 use crate::mcp_gateway::{
     CapturedToolResult, EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, McpError,
@@ -606,7 +606,22 @@ impl LocalContextCoordinatorV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .context_task_snapshot_v1(&identity)?;
         let cursor = snapshot.cursor();
-        let (mut code_brief, mut source_previews) = {
+        let index_preflight_refusal = index_preflight_refusal_v1(
+            &self.workspace,
+            &CodeIntelligenceLimitsV1::default(),
+            Duration::from_millis(50),
+        );
+        let (mut code_brief, mut source_previews) = if let Some(reason) = index_preflight_refusal {
+            (
+                json!({
+                    "schemaVersion": 1,
+                    "candidates": [],
+                    "incomplete": true,
+                    "unknowns": [{ "kind": reason }]
+                }),
+                Vec::new(),
+            )
+        } else {
             let mut index = self
                 .code_index
                 .lock()

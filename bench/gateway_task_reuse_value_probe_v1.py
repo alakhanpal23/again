@@ -89,6 +89,8 @@ def run_case(
         })
         if started["result"].get("isError"):
             raise RuntimeError(f"task.start refused: {started['result']}")
+        task_start = started["result"]["structuredContent"]
+        code_brief = task_start["relevantCode"]
         values: list[float] = []
         digests: list[str] = []
         for index in range(samples + 1):
@@ -120,6 +122,10 @@ def run_case(
         "mode": "execute-only" if execute_only else "automatic",
         "samples": samples,
         "taskStartMicros": round(task_start_micros, 3),
+        "taskStartPresentation": task_start["presentation"],
+        "editBriefIncomplete": code_brief["incomplete"],
+        "editBriefUnknownKinds": [item["kind"] for item in code_brief["unknowns"]],
+        "editBriefCandidateCount": len(code_brief["candidates"]),
         "coldMicros": round(values[0], 3),
         "warmP50Micros": percentile(values[1:], 0.5),
         "warmP95Micros": percentile(values[1:], 0.95),

@@ -13,6 +13,7 @@ mod extract;
 mod relevance;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -104,6 +105,53 @@ impl CodeIntelligenceLimitsV1 {
             && self.max_brief_bytes >= 4 * 1024
             && !self.max_parse_time.is_zero()
     }
+}
+
+/// This untrusted admission preflight may only decline optional indexing. It
+/// never issues source locators or facts; the manifest adapter remains the
+/// authority for every candidate that is actually returned.
+pub(crate) fn index_preflight_refusal_v1(
+    workspace: &Path,
+    limits: &CodeIntelligenceLimitsV1,
+    time_budget: Duration,
+) -> Option<&'static str> {
+    let started = Instant::now();
+    let mut pending = VecDeque::from([PathBuf::new()]);
+    let mut source_files = 0usize;
+    while let Some(directory) = pending.pop_front() {
+        if started.elapsed() >= time_budget {
+            return Some("index_preflight_time_budget_exceeded");
+        }
+        let Ok(entries) = fs::read_dir(workspace.join(&directory)) else {
+            return Some("index_preflight_unavailable");
+        };
+        for entry in entries {
+            if started.elapsed() >= time_budget {
+                return Some("index_preflight_time_budget_exceeded");
+            }
+            let Ok(entry) = entry else {
+                return Some("index_preflight_unavailable");
+            };
+            let path = directory.join(entry.file_name());
+            let Ok(kind) = entry.file_type() else {
+                return Some("index_preflight_unavailable");
+            };
+            if kind.is_dir() {
+                if !should_skip_directory_v1(&path) {
+                    pending.push_back(path);
+                }
+            } else if kind.is_file()
+                && CodeLanguageV1::from_path(&path).is_some()
+                && !is_generated_path_v1(&path)
+            {
+                source_files += 1;
+                if source_files > limits.max_files {
+                    return Some("index_preflight_file_budget_exceeded");
+                }
+            }
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1357,6 +1405,32 @@ mod tests {
     use crate::code_intelligence::relevance::{
         CandidateRankingFailureV1, CandidateRankingResponseV1,
     };
+
+    #[test]
+    fn preflight_declines_large_source_inventory_without_issuing_candidates() {
+        let workspace = TempDir::new().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        for index in 0..4 {
+            fs::write(
+                workspace.path().join(format!("src/file_{index}.py")),
+                b"value = 1\n",
+            )
+            .unwrap();
+        }
+        let limits = CodeIntelligenceLimitsV1 {
+            max_files: 3,
+            ..CodeIntelligenceLimitsV1::default()
+        };
+        assert_eq!(
+            index_preflight_refusal_v1(workspace.path(), &limits, Duration::from_secs(1)),
+            Some("index_preflight_file_budget_exceeded")
+        );
+        fs::remove_file(workspace.path().join("src/file_3.py")).unwrap();
+        assert_eq!(
+            index_preflight_refusal_v1(workspace.path(), &limits, Duration::from_secs(1)),
+            None
+        );
+    }
 
     const FIXTURES: [(&str, &str); 9] = [
         (
