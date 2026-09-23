@@ -352,12 +352,74 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             structured(reread, "read after corruption")
             require(tool_text(reread["result"]) == "TRUSTED_SOURCE\n",
                     "corruption recovery did not execute a clean source read")
+            lease_dir = workspace / "lease"
+            lease_dir.mkdir()
+            marker = b"TOKEN_LEASE_RECOVERY\n"
+            for index in range(56):
+                (lease_dir / f"payload-{index:03}.txt").write_bytes(
+                    (marker if index == 0 else b"bounded fixture\n") + b"x" * (256 * 1024 - (len(marker) if index == 0 else len(b"bounded fixture\n")))
+                )
+            lease_agent = Client(binary, workspace, environment)
+            clients.append(lease_agent)
+            lease_task = {"taskId": "lease-recovery-task", "task": "search lease directory"}
+            structured(lease_agent.tool("task.start", lease_task), "lease task.start")
+            lease_window_start = reader.begin()
+            lease_outcome: dict[str, Any] = {}
+
+            def execute_lease_owner() -> None:
+                try:
+                    lease_outcome["response"] = lease_agent.tool("repo.search", {
+                        "path": "lease", "pattern": "TOKEN_LEASE_RECOVERY",
+                    })
+                except BaseException as error:
+                    lease_outcome["error"] = str(error)
+
+            lease_worker = threading.Thread(target=execute_lease_owner)
+            lease_worker.start()
+            lease_binding = reader.wait_for_binding(lease_window_start, 5)
+            reader.wait_for_event(lease_binding, lease_window_start, "executed", 5)
+            old_lease = reader.lease(lease_binding, "active")
+            require("response" not in lease_outcome, "lease owner completed before crash")
+            daemon.kill()
+            daemon.wait(timeout=5)
+            lease_worker.join(timeout=5)
+            require(not lease_worker.is_alive() and "response" not in lease_outcome,
+                    "crashed lease owner returned a result")
+            require(reader.result_count(lease_binding, reader.end(lease_window_start)) == 0,
+                    "crashed lease owner published a result")
+            for client in clients:
+                client.close()
+            clients.clear()
+            deadline_ms = int(old_lease["expires_ms"]) + 25
+            remaining = max(0.0, (deadline_ms - int(time.time() * 1000)) / 1000)
+            require(remaining <= 31.0, "lease expiry exceeded declared TTL")
+            if remaining:
+                time.sleep(remaining)
+            daemon = start_daemon(binary, workspace, environment)
+            recovered_agent = Client(binary, workspace, environment)
+            clients.append(recovered_agent)
+            structured(recovered_agent.tool("task.start", lease_task), "recovered task.start")
+            recovery_start = reader.begin()
+            recovered = recovered_agent.tool("repo.search", {
+                "path": "lease", "pattern": "TOKEN_LEASE_RECOVERY",
+            })
+            structured(recovered, "lease recovery search")
+            recovery_events = Counter(event["event_type"] for event in reader.events(
+                lease_binding, reader.end(recovery_start)))
+            new_lease = reader.lease(lease_binding)
+            require(result_id(recovered["result"]) is not None and
+                    recovery_events["lease_expired"] == 1 and
+                    recovery_events["executed"] == 1 and
+                    recovery_events["completed"] == 1 and
+                    new_lease["status"] == "completed" and
+                    int(new_lease["lifecycle_generation"]) == int(old_lease["lifecycle_generation"]) + 1,
+                    f"lease owner recovery was not complete: events={dict(recovery_events)} lease={new_lease}")
             return {
                 "schema": SCHEMA,
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused", "lease_owner_crash_recovered"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
@@ -367,6 +429,9 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "corrupted_result_id": corrupt_id,
                 "corruption": corruption,
                 "cancelled_result_id": cancel_id,
+                "lease_recovery_events": dict(recovery_events),
+                "old_lease": old_lease,
+                "new_lease": new_lease,
             }
         finally:
             for client in clients:
