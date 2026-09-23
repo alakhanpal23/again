@@ -48,6 +48,9 @@ because the event stream does not prove their effective working directory or
 shell semantics. The 202 library tests pass, including preview suppression
 when a file was already supplied by the prebrief, mutation withholding, and
 absence of raw command output in the stored event.
+The [clean-source release launcher gate](../bench/results/2026-09-23-brain-read-31b1f06.json)
+passes at `31b1f06` with an observed absolute source read, next-task
+handoff, stale-read withholding, edit/test handoff, and Brain clear.
 
 ## 2026-09-23 single-agent Again Brain first slice
 

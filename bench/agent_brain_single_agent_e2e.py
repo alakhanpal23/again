@@ -19,6 +19,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
         workspace = root / "repo"
         workspace.mkdir()
         (workspace / "a.py").write_text("value = 1\n")
+        (workspace / "helper.py").write_text("def helper():\n    return 42\n")
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         fake_bin = root / "bin"
         fake_bin.mkdir()
@@ -30,6 +31,8 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "workspace = pathlib.Path(argv[argv.index('-C') + 1])\n"
             "with open(os.environ['FAKE_LOG'], 'a') as out: out.write(json.dumps(argv) + '\\n')\n"
             "if 'first task' in argv[-1]:\n"
+            "    helper = workspace / 'helper.py'\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'read_1','type':'command_execution','command':'cat ' + str(helper),'aggregated_output':'def helper():\\n    return 42\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
             "    path = workspace / 'a.py'\n"
             "    path.write_text('value = 2\\n')\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
@@ -69,14 +72,20 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             )
             return json.loads(result.stdout)
 
+        def brain_files_in_prompt(prompt: str) -> set[str]:
+            if "AGAIN_BRAIN " not in prompt:
+                return set()
+            payload = prompt.split("AGAIN_BRAIN ", 1)[1].split("\n", 1)[0]
+            return {item["path"] for item in json.loads(payload)["recentCurrentFiles"]}
+
         try:
             launch("first", "Repair a.py first task")
             snapshot = brain()
             observed = snapshot["recentEvents"]
-            if len(observed) != 2 or {row["kind"] for row in observed} != {"file_change", "test"}:
-                raise RuntimeError("completed edit and test were not retained")
-            if len(snapshot["fileObservations"]) != 1:
-                raise RuntimeError("latest file observation was not materialized")
+            if len(observed) != 4 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
+                raise RuntimeError("completed read, edit, and test were not retained")
+            if {item["path"] for item in snapshot["fileObservations"]} != {"a.py", "helper.py"}:
+                raise RuntimeError("latest file observations were not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
 
@@ -92,8 +101,18 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             (workspace / "a.py").write_text("value = 3\n")
             launch("third", "Inspect a.py third task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
-            if '"recentCurrentFiles":[]' not in calls[2][-1]:
+            if "a.py" in brain_files_in_prompt(calls[2][-1]):
                 raise RuntimeError("stale edit history remained current")
+
+            launch("fourth", "Inspect helper.py fourth task")
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if "helper.py" not in brain_files_in_prompt(calls[3][-1]):
+                raise RuntimeError("current read observation was not in the next task")
+            (workspace / "helper.py").write_text("def helper():\n    return 0\n")
+            launch("fifth", "Inspect helper.py fifth task")
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if "helper.py" in brain_files_in_prompt(calls[4][-1]):
+                raise RuntimeError("stale read observation remained current")
 
             subprocess.run(
                 [str(binary), "brain", "clear", "--workspace", str(workspace)],
@@ -112,6 +131,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "nextTaskReceivedCurrentEdit": True,
                 "nextTaskReceivedUnverifiedTestHint": True,
                 "staleEditWithheld": True,
+                "sourceReadObservedAndStaleWithheld": True,
                 "clearRemovedEvents": True,
             }
         finally:
