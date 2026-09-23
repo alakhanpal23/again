@@ -487,6 +487,13 @@ The [Codex](../bench/results/2026-09-23-codex-launch-scoped-overflow-release-v1.
 and [fake-Claude](../bench/results/2026-09-23-claude-launch-scoped-overflow-release-v1.json)
 clean-source launcher gates also passed lease handoff and stale-brief refresh
 on that release binary. A live Claude coding outcome remains unverified.
+The [clean-source 10,000-file release probe](../bench/results/2026-09-23-gateway-task-reuse-value-scoped-overflow-10k-clean-release-v1.json)
+using the same binary bytes measured cold task-bound search/tree/Git status at
+0.49/0.30/0.03 seconds. Warm p50 was 506/301/30 ms, near the respective
+direct controls of 493/302/28 ms. All six calls in each case executed the
+provider and none claimed a hit. The report does not independently verify
+binary-to-source binding; the clean-source authenticated gate pins the binary
+and source together.
 
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
