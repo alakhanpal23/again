@@ -269,7 +269,8 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             large = workspace / "large-ledger"
             large.mkdir()
             for index in range(257):
-                (large / f"source-{index:03}.txt").write_text(f"source {index}\n")
+                text = f"source {index}\n" + ("x" * 8192 if index == 0 else "")
+                (large / f"source-{index:03}.txt").write_text(text)
             large_agent = Client(binary, workspace, environment)
             clients.append(large_agent)
             large_task = {"taskId": "large-ledger-task", "task": "inspect the large ledger"}
@@ -282,9 +283,11 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 read = large_agent.tool("repo.read", {"path": f"large-ledger/source-{index:03}.txt"})
                 structured(read, f"large read {index}")
                 admitted_id = result_id(read["result"])
-                require(admitted_id is not None, f"large source {index} was not admitted")
                 if index == 0:
+                    require(admitted_id is not None, "leased large source was not admitted")
                     first_large_id = admitted_id
+                else:
+                    require(admitted_id is None, f"small source {index} unexpectedly received a result reference")
             require(first_large_id is not None, "first large source ID missing")
             (large / "source-000.txt").write_text("changed\n")
             large_delta = structured(large_agent.tool("context.delta", {
