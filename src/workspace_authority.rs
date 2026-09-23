@@ -1808,11 +1808,10 @@ impl ObservedManifestV1 {
 
         for key in &keys {
             if let Some(cached) = self.observations.get(key) {
-                validate_manifest_witnesses_v1(
-                    &self.execution_epoch,
-                    &cached.witnesses,
-                    &self.limits,
-                )?;
+                // advance_for_stale_dependencies validated every cached
+                // witness before this loop. The final fence below checks the
+                // requested witnesses again after observation and catches a
+                // mutation during this call.
                 self.accounting.reuse_hits =
                     self.accounting.reuse_hits.checked_add(1).ok_or_else(|| {
                         incomplete_limit(
