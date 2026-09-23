@@ -10,6 +10,8 @@ use serde_json::Value;
 use crate::store::{BrainEventV1, Store};
 
 const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
+const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
+const MAX_BRAIN_BRIEF_BYTES_V1: usize = 4 * 1024;
 
 /// The local Brain has one repository-owner scope until its records carry
 /// per-scope provenance. Do not present it through a custom MCP scope.
@@ -167,7 +169,7 @@ pub fn repository_brief_v1(
                 .any(|file: &Value| file["currentCompletePreview"].as_str().is_some())
                 && !already_previewed_paths.contains(path)
                 && source_code_path_v1(path)
-                && bytes.len() <= 256
+                && bytes.len() <= MAX_BRAIN_PREVIEW_BYTES_V1
                 && let Ok(text) = String::from_utf8(bytes.clone())
                 && crate::task_lifecycle::screen_sensitive_text_v1(&text).is_ok()
             {
@@ -293,16 +295,18 @@ pub fn repository_brief_for_task_v1(
             }
         }
     }
-    if serde_json::to_vec(&brain)?.len() > 1024 {
-        if let Some(files) = brain["recentCurrentFiles"].as_array_mut() {
-            for file in files.iter_mut() {
-                file["currentCompletePreview"] = Value::Null;
+    if serde_json::to_vec(&brain)?.len() > MAX_BRAIN_BRIEF_BYTES_V1 {
+        let file_count = brain["recentCurrentFiles"].as_array().map_or(0, Vec::len);
+        for index in (0..file_count).rev() {
+            if serde_json::to_vec(&brain)?.len() <= MAX_BRAIN_BRIEF_BYTES_V1 {
+                break;
             }
+            brain["recentCurrentFiles"][index]["currentCompletePreview"] = Value::Null;
         }
         while brain["recentCurrentFiles"]
             .as_array()
             .is_some_and(|files| files.len() > 1)
-            && serde_json::to_vec(&brain)?.len() > 1024
+            && serde_json::to_vec(&brain)?.len() > MAX_BRAIN_BRIEF_BYTES_V1
         {
             brain["recentCurrentFiles"].as_array_mut().unwrap().pop();
         }
@@ -311,7 +315,7 @@ pub fn repository_brief_for_task_v1(
         .as_array()
         .is_some_and(|files| !files.is_empty());
     let has_test = brain["previousSuccessfulTestCommand"].as_str().is_some();
-    if (has_files || has_test) && serde_json::to_vec(&brain)?.len() <= 1024 {
+    if (has_files || has_test) && serde_json::to_vec(&brain)?.len() <= MAX_BRAIN_BRIEF_BYTES_V1 {
         Ok(Some(brain))
     } else {
         Ok(None)
@@ -747,6 +751,42 @@ mod tests {
             codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
             1
         );
+    }
+
+    #[test]
+    fn brain_brief_keeps_a_larger_current_preview_inside_total_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let content = "value = 1\n".repeat(200);
+        for (index, name) in ["first.py", "second.py"].iter().enumerate() {
+            fs::write(workspace.join(name), &content).unwrap();
+            let completed = serde_json::json!({
+                "type":"item.completed",
+                "item":{"id":format!("edit_{index}"),"type":"file_change","status":"completed",
+                        "changes":[{"path":name}]}
+            });
+            for event in codex_completed_events_v1(&completed, &workspace, "session", "old-task") {
+                store.record_brain_event_v1(&event).unwrap();
+            }
+        }
+        let candidates = ["first.py".to_owned(), "second.py".to_owned()];
+        let brief = repository_brief_for_task_v1(
+            &store, &workspace, &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":candidates.iter().map(|path| serde_json::json!({"locator":{"path":path}})).collect::<Vec<_>>() }),
+            "Edit both values", "repository", "workspace", &scope,
+        ).unwrap().unwrap();
+        assert_eq!(
+            brief["recentCurrentFiles"][0]["currentCompletePreview"],
+            content
+        );
+        assert!(brief["recentCurrentFiles"][1]["currentCompletePreview"].is_null());
+        assert!(serde_json::to_vec(&brief).unwrap().len() <= MAX_BRAIN_BRIEF_BYTES_V1);
+        fs::write(workspace.join("first.py"), "value = 2\n").unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &candidates, &[], &scope).unwrap();
+        assert_eq!(stale["recentCurrentFiles"][0]["path"], "second.py");
     }
 
     #[test]

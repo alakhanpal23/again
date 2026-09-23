@@ -34,6 +34,7 @@ TASK_IDS = {
     "js-calculator": "js-calculator-fix",
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
+    "balance-helper-large": "balance-helper-large-fix",
 }
 
 
@@ -141,11 +142,15 @@ def configure_fixture(name: str) -> None:
             "README.md": "# Greeting feature fixture\nRun `python3 -m unittest discover -s tests`.\n",
         }
         return
-    if name == "balance-helper":
+    if name in ("balance-helper", "balance-helper-large"):
         pair.TARGET = "src/util.py"
         pair.TEST = "tests/test_ledger.py"
         pair.BUGGY = "def adjust_total(value):\n    return value + 1\n"
         pair.FIXED = "def adjust_total(value):\n    return value\n"
+        if name == "balance-helper-large":
+            context = "# Ledger totals use this helper at the final boundary.\n" * 30
+            pair.BUGGY += "\n" + context
+            pair.FIXED += "\n" + context
         pair.PROMPT = (
             "Fix the off-by-one total reported by src/ledger.py. Keep ledger.py's "
             "delegation to its helper and correct the underlying implementation. "
@@ -230,6 +235,7 @@ def again_instruction(task_id: str) -> str:
 
 def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path) -> dict[str, str]:
     """Create a prior completed source read through the real Again launcher."""
+    read_range = "1,200p" if len(pair.BUGGY) > 256 else "1,20p"
     with tempfile.TemporaryDirectory(prefix="again-prior-task-") as temporary:
         fake_bin = pathlib.Path(temporary)
         fake_codex = fake_bin / "codex"
@@ -240,7 +246,7 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path) -> dict[str,
             "workspace = pathlib.Path(sys.argv[sys.argv.index('-C') + 1])\n"
             "content = (workspace / target).read_text()\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
-            "'command':\"sed -n '1,20p' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}))\n"
+            f"'command':\"sed -n '{read_range}' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}}}))\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'done','type':'agent_message','text':'Done'}}))\n"
         )
         fake_codex.chmod(0o700)
@@ -450,7 +456,7 @@ def main() -> int:
     parser.add_argument("--product-wrapper", action="store_true",
                         help="diagnostic: launch through the production again codex command")
     parser.add_argument("--seed-prior-brain", action="store_true",
-                        help="seed a verified prior source read for the balance-helper returning task")
+                        help="seed a verified prior source read for a balance-helper returning task")
     parser.add_argument("--prebrief-with-mcp", action="store_true",
                         help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
@@ -466,8 +472,8 @@ def main() -> int:
         parser.error("--prebrief-with-mcp requires --prebrief")
     if args.product_wrapper and (args.prebrief or args.prebrief_with_mcp):
         parser.error("--product-wrapper cannot be combined with diagnostic prebrief modes")
-    if args.seed_prior_brain and (not args.product_wrapper or args.fixture != "balance-helper"):
-        parser.error("--seed-prior-brain requires --product-wrapper and --fixture balance-helper")
+    if args.seed_prior_brain and (not args.product_wrapper or args.fixture not in ("balance-helper", "balance-helper-large")):
+        parser.error("--seed-prior-brain requires --product-wrapper and a balance-helper fixture")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(
         [str(binary), "mcp", "connect", "--help"],

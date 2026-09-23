@@ -4,6 +4,14 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
+Brain can now include a rechecked complete prior source file up to 2 KiB in
+the next task brief. The whole Brain field remains capped at 4 KiB; when two
+previews would exceed it, the lower-priority preview is withheld first.
+The focused regression covers a 2,000-byte source, total brief bound, and
+stale-source withholding. This removes the former 256-byte limit that made
+many ordinary prior reads only path hints. Live outcome evidence for larger
+source files is still needed.
+
 The task-start validation preview now suggests `cargo test` for a Rust source
 candidate with a current root `Cargo.toml`, or `go test ./...` for a Go source
 candidate with a current root `go.mod`. These are unverified selectors and
