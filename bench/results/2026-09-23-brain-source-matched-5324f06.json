@@ -1,0 +1,16 @@
+{
+  "schema": "again.brain-single-agent-e2e.v1",
+  "recordedAtUtc": "2026-09-23T22:09:42.573388+00:00",
+  "binarySha256": "03577730900bf224129241d3c250fbce8ad54579ab2a33495469ea14abb6673e",
+  "classification": {
+    "type": "pass",
+    "code": "brain_event_handoff_passed"
+  },
+  "capturedCompletedEvents": 4,
+  "nextTaskReceivedCurrentEdit": true,
+  "nextTaskReceivedUnverifiedTestHint": true,
+  "staleEditWithheld": true,
+  "sourceReadObservedAndStaleWithheld": true,
+  "interactiveTaskStartReceivedBrain": true,
+  "clearRemovedEvents": true
+}

@@ -12,7 +12,12 @@ unmatched output, missing source files, large files, and unsupported selectors
 remain plain command metadata. The later task still rechecks current bytes
 before presenting a source preview. This extends read observation to the
 `sed` shape seen in the live calculator trace without assuming that the
-client's session cwd was the effective command cwd.
+client’s session cwd was the effective command cwd.
+The [clean-source release handoff gate](../bench/results/2026-09-23-brain-source-matched-5324f06.json)
+passes at `5324f06` with a relative `sed` read, later-task handoff,
+stale-source withholding, interactive brief delivery, and Brain clear. The
+202 passing library tests include mismatched output and composed-command
+refusal.
 
 ## 2026-09-23 materialized repository memory
 
