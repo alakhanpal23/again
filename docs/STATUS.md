@@ -36,6 +36,12 @@ indexed unittest preview, but the validation hint recognized only a different
 preview origin. The indexed path now records its origin and can suggest
 `python3 -m unittest discover -s tests` as an unverified selector. The agent
 must still execute it; a test hint never grants a cached test result.
+The [clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-indexed-validation-hint-v1.json)
+passed at `eb12c17fa027556e88ce6f56cf6c9a7cf1dbf2ba`. In one follow-up
+[live pair](../bench/results/2026-09-23-codex-running-balance-hint-baseline-first-v1.json),
+the wrapper ran `python3` on its first validation attempt, passed the edit
+oracle, and completed in 16.20 seconds versus 20.15 seconds baseline. This is
+still one local diagnostic, not a qualified general speed claim.
 
 ## 2026-09-23 prebrief launch checkpoint
 
