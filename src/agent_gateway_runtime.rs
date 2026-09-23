@@ -1241,6 +1241,33 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 _ => {}
             }
         }
+        // When the source inventory exceeds the bounded task index, broad
+        // repository proofs traverse far more input than the provider call.
+        // Return a fresh result without admitting a source fact or result
+        // reference. The task brief already exposes the incomplete inventory.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && self
+                .context_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| {
+                    coordinator.source_inventory_overflow()
+                        && coordinator.active_identity_for_call(&call).is_some()
+                })
+            && RepositoryOperationV1::from_call(&call).is_some_and(|operation| {
+                matches!(
+                    operation,
+                    RepositoryOperationV1::Search
+                        | RepositoryOperationV1::List
+                        | RepositoryOperationV1::Tree
+                        | RepositoryOperationV1::Glob
+                        | RepositoryOperationV1::References
+                        | RepositoryOperationV1::Manifest
+                        | RepositoryOperationV1::GitStatus
+                )
+            })
+        {
+            return self.execute_direct(&epoch, call, secrets, true);
+        }
         if self.reuse_mode == GatewayReuseModeV1::Automatic
             && self.direct_repository_operation(&epoch, &call).is_some()
             && self

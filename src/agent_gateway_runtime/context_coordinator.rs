@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -67,6 +68,7 @@ pub(super) struct LocalContextCoordinatorV1 {
     workspace_id: String,
     observed_workspace: SharedObservedWorkspaceV1,
     code_index: Mutex<CodeIntelligenceIndexV1>,
+    source_inventory_overflow: AtomicBool,
     active: Mutex<BTreeMap<String, ActiveContextV1>>,
     current: Mutex<BTreeMap<String, String>>,
     acknowledged: Mutex<BTreeMap<String, u64>>,
@@ -92,10 +94,15 @@ impl LocalContextCoordinatorV1 {
                 CodeIntelligenceIndexV1::new(CodeIntelligenceLimitsV1::default())
                     .expect("default code-intelligence limits are valid"),
             ),
+            source_inventory_overflow: AtomicBool::new(false),
             active: Mutex::new(BTreeMap::new()),
             current: Mutex::new(BTreeMap::new()),
             acknowledged: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    pub(super) fn source_inventory_overflow(&self) -> bool {
+        self.source_inventory_overflow.load(Ordering::Acquire)
     }
 
     fn recipient_key(recipient: &ReasoningTransportRecipientV1) -> String {
@@ -844,6 +851,10 @@ impl LocalContextCoordinatorV1 {
             &self.workspace,
             &CodeIntelligenceLimitsV1::default(),
             Duration::from_millis(50),
+        );
+        self.source_inventory_overflow.store(
+            index_preflight_refusal == Some("index_preflight_file_budget_exceeded"),
+            Ordering::Release,
         );
         let explicit_previews = if include_source_previews {
             self.explicit_task_source_previews(task.task.definition.prompt())

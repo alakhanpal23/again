@@ -465,6 +465,18 @@ Git status. All 41 requests per case still executed the provider with zero
 exact hits. Warm search was 69.74 ms versus 63.40 ms direct; the remaining
 proof/reference check has not become a repeated-call speed win. The probe
 records a clean source SHA but does not independently bind binary bytes to it.
+The [10,000-file split-manifest control](../bench/results/2026-09-23-gateway-task-reuse-value-split-manifest-10k-release-v1.json)
+still measured cold task-bound search/tree/Git status at 3.11/3.39/3.76
+seconds. An [overflow direct-route trial](../bench/results/2026-09-23-gateway-task-reuse-value-overflow-direct-10k-trial-v1.json)
+measured 0.47/0.30/0.03 seconds on the same fixture and release build mode.
+Warm p50 search/tree/Git status in the trial was 478/296/26 ms, close to its
+direct controls of 486/298/26 ms. All six calls in each case executed the
+provider, with zero exact hits. The route applies only after task-start's
+source inventory reports more than 4,096 files; broad tool outputs then do
+not publish shared facts or retrievable result IDs. Narrow source reads and
+stats remain source backed. The authenticated 4,097-file test covers fresh
+search results after mutation; the local trial remains source dirty and needs
+a clean-source release gate.
 
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The

@@ -2634,6 +2634,43 @@ mod tests {
         assert_eq!(brief["sourcePreviews"][0]["path"], "src/module_0001.py");
         assert_eq!(brief["sourcePreviews"][0]["text"], "value = 1\n");
         assert_eq!(brief["sourcePreviews"][0]["complete"], true);
+        let search = agent.tool(
+            "repo.search",
+            json!({ "path": "src", "pattern": "value = 4096", "maxResults": 2 }),
+        );
+        assert!(search["result"].get("_meta").is_none());
+        assert_eq!(
+            search["result"]["structuredContent"]["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let tree = agent.tool("repo.tree", json!({ "path": "src", "maxResults": 2 }));
+        assert!(tree["result"].get("_meta").is_none());
+        fs::write(
+            workspace.path().join("src/module_4096.py"),
+            b"changed = 4096\n",
+        )
+        .unwrap();
+        let changed = agent.tool(
+            "repo.search",
+            json!({ "path": "src", "pattern": "value = 4096", "maxResults": 2 }),
+        );
+        assert_eq!(
+            changed["result"]["structuredContent"]["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.requested, 3, "{stats:?}");
+        assert_eq!(stats.executed, 3, "{stats:?}");
+        assert_eq!(stats.exact_hits, 0, "{stats:?}");
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();

@@ -32,6 +32,12 @@ workspace epoch. Repository and Git result proofs continue to share one
 manifest. Indexing a 1,000-file task previously put its witnesses into every
 later result-proof freshness sweep. The split leaves source-backed task facts
 in the durable ledger and keeps their independent revalidation path.
+When task-start's bounded source inventory proves more than 4,096 files,
+broad `repo.*` calls and `git.status` now execute directly. Their fresh output
+has no cache hit or shared-fact authority; the task brief already declares
+its index incomplete. Narrow `repo.read` and `repo.stat` keep their source-backed
+paths, and smaller workspaces keep broad result admission. A later complete
+change signal can safely restore broad exact reuse without this cold penalty.
 
 The intended lanes are:
 
@@ -89,6 +95,13 @@ and Git status from 398.29 to 328.37 ms. Warm p50 search was 62.80 versus
 hashes and matching harness/fixture, but the source was dirty during the
 trial; run a clean-source release gate and broader workloads before treating
 this as a product-wide win.
+
+On a separate 10,000-file release trial, the overflow direct policy reduced
+cold task-bound search from 3.11 to 0.47 seconds, tree from 3.39 to 0.30
+seconds, and Git status from 3.76 to 0.03 seconds. Every request in both
+variants physically executed its provider; the change removes failed-value
+admission work rather than claiming avoided provider calls. The direct lane
+does not publish a full-result reference for these broad calls.
 
 The integration boundary also matters: the daemon sees calls routed to its
 MCP tools. Native shell/tool calls are outside its authority and cannot be
