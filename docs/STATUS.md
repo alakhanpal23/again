@@ -4,16 +4,19 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 direct context architecture checkpoint
 
-Schema v15 separates direct task observations from leased cache results. Task-bound `repo.stat` and `repo.read` of files up to 8 KiB publish
+Schema v15 separates direct task observations from leased cache results.
+Task-bound `repo.stat` and `repo.read` of files up to 8 KiB publish
 source-backed facts without acquiring a cache lease or granting a result
-reference. Larger reads retain the lease path and its concurrent join. Repeated
-direct calls execute the built-in provider and return fresh output; the observation can only support shared
-context. A second provider observation checks the initial fact admission,
+reference. Larger reads retain the lease path and its concurrent join.
+Repeated direct calls execute the built-in provider and return fresh output;
+the observation can only support shared context. A second provider observation
+checks the initial fact admission,
 and the source recipe reexecutes the built-in tool during task-start or delta
-revalidation. The [clean-source authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-provider-receipt-v1.json)
-passed at `b0d25ec297b1d784b27235a2e05adc9d00a9c823`, including peer fact
-visibility, unrelated-edit preservation, relevant-edit retirement, and refusal
-to grant cache retrieval from the direct observation. Local daemon library
+revalidation. The [clean-source authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-direct-small-read-v1.json)
+passed at `69d4ffde3959bc4c4e65d15e34ab4e07f3c97165`, including peer facts
+from direct stat and small read, unrelated-edit preservation, relevant-edit
+retirement, and refusal to grant cache retrieval from either direct observation.
+Local daemon library
 tests passed 193 with two ignored; the Python product harness tests passed 27.
 
 The [1,000-file local value probe](../bench/results/2026-09-23-direct-context-stat-value-provider-v3.json)
@@ -26,8 +29,7 @@ execute-only; warm p50 was 0.473 versus 0.266 ms. The previous exact first
 small-read path took about 60 ms on this fixture. These runs used a local
 dirty source and do not establish a task-level gain. Large reads and broad
 search/tree paths remain coupled to costly exact-result proof, and the paired
-Codex fixtures have not shown a
-validated completion or token-cost win. Wider direct admission, corruption
+Codex fixtures have not shown a validated completion or token-cost win. Wider direct admission, corruption
 recovery, balanced repeat-heavy agent cohorts, and exact-SHA hosted gates
 remain open.
 

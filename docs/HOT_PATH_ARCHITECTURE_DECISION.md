@@ -22,7 +22,7 @@ the built-in provider, checks a second matching observation, and records a
 source recipe and task fact. Its durable result has a separate `direct_observation`
 origin and cannot satisfy a cache hit, join, or full-result reference. A warm
 repeat still executes the provider and returns its fresh output. The
-authenticated release-binary gate at `b0d25ec` passed two-client sharing,
+authenticated release-binary gate at `69d4ffd` passed two-client sharing,
 unrelated-edit preservation, relevant-edit retirement, and this authority
 separation. Larger task-bound reads still enter the exact-result path on
 their first call.

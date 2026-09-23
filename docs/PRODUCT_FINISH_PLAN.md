@@ -81,7 +81,7 @@ before changing default routing.
   context. Task-bound `repo.stat` and `repo.read` of files up to 8 KiB now have
   this direct-observation path, with
   a separate durable origin that grants no cache or retrieval authority. The
-  clean-source authenticated release-binary gate at `b0d25ec` passed peer
+  clean-source authenticated release-binary gate at `69d4ffd` passed peer
   visibility and edit invalidation. Extend the route to other built-ins only
   after a complete cheap observation is proven. The authenticated one-file
   and 1,000-file probes in `bench/results` still show slower warm repository
