@@ -588,14 +588,25 @@ impl LocalContextCoordinatorV1 {
                 "guidance": "inspect_existing_task_history"
             }),
         };
-        self.refresh_current_sources(call, &identity)?;
+        let freshness_issue = match self.refresh_current_sources(call, &identity) {
+            Ok(()) => None,
+            Err(error)
+                if matches!(
+                    error.to_string().as_str(),
+                    "context_freshness_capacity_exceeded" | "context_freshness_unavailable"
+                ) =>
+            {
+                Some(error.to_string())
+            }
+            Err(error) => return Err(error),
+        };
         let snapshot = self
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .context_task_snapshot_v1(&identity)?;
         let cursor = snapshot.cursor();
-        let (code_brief, source_previews) = {
+        let (mut code_brief, mut source_previews) = {
             let mut index = self
                 .code_index
                 .lock()
@@ -672,6 +683,15 @@ impl LocalContextCoordinatorV1 {
                 ),
             }
         };
+        if freshness_issue.is_some() {
+            code_brief = json!({
+                "schemaVersion": 1,
+                "candidates": [],
+                "incomplete": true,
+                "unknowns": [{ "kind": "context_freshness_unverified" }]
+            });
+            source_previews.clear();
+        }
         let delivery_key = Self::delivery_key(&identity);
         let acknowledged = self
             .acknowledged
@@ -679,7 +699,18 @@ impl LocalContextCoordinatorV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .get(&delivery_key)
             .copied();
-        let (presentation, context, omitted_bytes) = if let Some(after) = acknowledged {
+        let (presentation, context, omitted_bytes) = if let Some(reason) = freshness_issue.as_ref()
+        {
+            let mut context = serde_json::to_value(&snapshot)?;
+            let object = context
+                .as_object_mut()
+                .ok_or_else(|| anyhow!("context_task_corrupt"))?;
+            object.insert("current_facts".to_owned(), json!([]));
+            object.insert("result_references".to_owned(), json!([]));
+            object.insert("incomplete".to_owned(), json!(true));
+            object.insert("unknowns".to_owned(), json!([{ "kind": reason }]));
+            ("full", context, 0)
+        } else if let Some(after) = acknowledged {
             let delta = self
                 .store
                 .lock()
@@ -725,6 +756,10 @@ impl LocalContextCoordinatorV1 {
             "coordination": coordination,
             "cursor": cursor.sequence(),
             "context": context,
+            "contextFreshness": match freshness_issue.as_ref() {
+                Some(reason) => json!({ "status": "incomplete", "reason": reason }),
+                None => json!({ "status": "current" }),
+            },
             "relevantCode": code_brief,
             "sourcePreviews": source_previews,
             "validationPreview": {
@@ -734,6 +769,11 @@ impl LocalContextCoordinatorV1 {
             },
             "compulsoryPlan": false
         });
+        if freshness_issue.is_some() {
+            return Ok(ContextOperationResultV1::exact(task_start_result_v1(
+                structured,
+            )));
+        }
         Ok(ContextOperationResultV1::delivered(
             task_start_result_v1(structured),
             Box::new(ContextDeliveryCompletionV1 {
@@ -1629,6 +1669,7 @@ fn task_start_result_v1(structured: Value) -> Value {
         "coordination": structured["coordination"],
         "cursor": structured["cursor"],
         "context": structured["context"],
+        "contextFreshness": structured["contextFreshness"],
         "sourcePreviews": structured["sourcePreviews"],
         "relevantCode": {
             "candidates": candidates,

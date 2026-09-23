@@ -2395,6 +2395,77 @@ mod tests {
     }
 
     #[test]
+    fn task_start_returns_incomplete_brief_when_source_scan_exceeds_bound() {
+        let workspace = tempfile::tempdir().unwrap();
+        for index in 0..=256 {
+            fs::write(
+                workspace.path().join(format!("source-{index:03}.txt")),
+                format!("source {index}\n"),
+            )
+            .unwrap();
+        }
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("freshness-capacity-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let arguments = json!({ "taskId": "bounded-freshness", "task": "inspect sources" });
+        let start = agent.tool("task.start", arguments.clone());
+        assert!(start.get("error").is_none(), "{start}");
+        for index in 0..=256 {
+            let read = agent.tool(
+                "repo.read",
+                json!({ "path": format!("source-{index:03}.txt") }),
+            );
+            assert!(
+                read["result"]["_meta"]["again"]["resultId"].is_string(),
+                "{index}: {read}"
+            );
+        }
+        fs::write(workspace.path().join("source-000.txt"), b"changed\n").unwrap();
+        let mut peer = LocalMcpClientV1::connect(workspace.path());
+        let bounded = peer.tool("task.start", arguments);
+        assert!(bounded.get("error").is_none(), "{bounded}");
+        let brief = &bounded["result"]["structuredContent"];
+        assert_eq!(brief["presentation"], "full");
+        assert_eq!(brief["contextFreshness"]["status"], "incomplete");
+        assert_eq!(
+            brief["contextFreshness"]["reason"],
+            "context_freshness_capacity_exceeded"
+        );
+        assert_eq!(brief["context"]["incomplete"], true);
+        assert!(
+            brief["context"]["current_facts"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            brief["context"]["result_references"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            brief["relevantCode"]["candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let again = peer.tool(
+            "task.start",
+            json!({ "taskId": "bounded-freshness", "task": "inspect sources" }),
+        );
+        assert_eq!(again["result"]["structuredContent"]["presentation"], "full");
+        peer.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn retrieval_revalidates_unobserved_edit_without_a_new_tool_read() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();

@@ -258,6 +258,12 @@ peer fact/retrieval, preservation after an unrelated edit, and retirement after
 an unobserved relevant edit. This focused gate does not replace the legacy
 cancellation, lease, or corruption scenarios, and it does not prove task-level
 speed or quality.
+Task start now returns an explicitly incomplete full brief when current source
+revalidation exceeds its 256-source bound or its workspace observation is
+unavailable. The brief omits unchecked verified facts, result references, code
+candidates, and source previews; incomplete delivery grants no compact-context
+acknowledgment. A 257-source authenticated service test covers the bound. The
+context delta operation still reports a typed freshness refusal in this case.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

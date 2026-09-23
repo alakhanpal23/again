@@ -99,9 +99,10 @@ has a persisted proof and an `explain` reason.
   quota exhaustion, and two agents publishing at the same time.
 - Qualify the new source-recipe reobservation across every built-in repository
   and Git tool, relevant and irrelevant edits, daemon restart, quota limits,
-  concurrent mutation, and large task ledgers. Make task-start return a
-  bounded incomplete brief when freshness cannot finish instead of an error;
-  retain atomic, scope-bound cross-task retirement.
+  concurrent mutation, and large task ledgers. Task-start now returns an
+  incomplete brief at the 256-source scan bound; extend this behavior to
+  context delta and prove it with a release-binary ledger above the bound.
+  Retain atomic, scope-bound cross-task retirement.
 - Keep task-start local and bounded. An unavailable index returns an explicit
   incomplete brief quickly; validation preview never declares a test skippable
   without a qualified execution profile.
