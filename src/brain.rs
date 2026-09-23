@@ -292,15 +292,19 @@ pub fn repository_brief_v1(
 /// Select task-relevant Brain observations once for both MCP task.start and
 /// noninteractive launchers. The source preview and code index are already
 /// bounded by task.start; this adds at most two current file observations.
+pub struct BrainTaskQueryV1<'a> {
+    pub task_text: &'a str,
+    pub repository_id: &'a str,
+    pub workspace_id: &'a str,
+    pub authorization_scope_digest: &'a str,
+}
+
 pub fn repository_brief_for_task_v1(
     store: &Store,
     workspace: &Path,
     source_previews: &Value,
     relevant_code: &Value,
-    task_text: &str,
-    repository_id: &str,
-    workspace_id: &str,
-    authorization_scope_digest: &str,
+    query: BrainTaskQueryV1<'_>,
 ) -> anyhow::Result<Option<Value>> {
     let already_previewed: Vec<String> = source_previews
         .as_array()
@@ -332,9 +336,13 @@ pub fn repository_brief_for_task_v1(
             break;
         }
     }
-    let task_tokens = meaningful_task_tokens_v1(task_text);
+    let task_tokens = meaningful_task_tokens_v1(query.task_text);
     let mut historical = store
-        .brain_files_with_task_prompts_v1(repository_id, workspace_id, authorization_scope_digest)?
+        .brain_files_with_task_prompts_v1(
+            query.repository_id,
+            query.workspace_id,
+            query.authorization_scope_digest,
+        )?
         .into_iter()
         .filter_map(|entry| {
             if seen.contains(&entry.observation.path) {
@@ -373,7 +381,7 @@ pub fn repository_brief_for_task_v1(
         workspace,
         &selected,
         &already_previewed,
-        authorization_scope_digest,
+        query.authorization_scope_digest,
     )?;
     if let Some(files) = brain["recentCurrentFiles"].as_array_mut() {
         for file in files {
@@ -607,6 +615,15 @@ pub(crate) fn current_ms_v1() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task_query<'a>(task_text: &'a str, scope: &'a str) -> BrainTaskQueryV1<'a> {
+        BrainTaskQueryV1 {
+            task_text,
+            repository_id: "repository",
+            workspace_id: "workspace",
+            authorization_scope_digest: scope,
+        }
+    }
 
     #[test]
     fn codex_run_observation_counts_completed_work_and_valid_usage() {
@@ -943,7 +960,7 @@ mod tests {
         let brief = repository_brief_for_task_v1(
             &store, &workspace, &Value::Array(Vec::new()),
             &serde_json::json!({"candidates":candidates.iter().map(|path| serde_json::json!({"locator":{"path":path}})).collect::<Vec<_>>() }),
-            "Edit both values", "repository", "workspace", &scope,
+            task_query("Edit both values", &scope),
         ).unwrap().unwrap();
         assert_eq!(
             brief["recentCurrentFiles"][0]["currentCompletePreview"],
@@ -1025,10 +1042,7 @@ mod tests {
             &workspace,
             &Value::Array(Vec::new()),
             &serde_json::json!({"candidates":[]}),
-            "Improve ledger balance rendering",
-            "repository",
-            "workspace",
-            &scope,
+            task_query("Improve ledger balance rendering", &scope),
         )
         .unwrap()
         .unwrap();
@@ -1044,10 +1058,7 @@ mod tests {
             &workspace,
             &Value::Array(Vec::new()),
             &serde_json::json!({"candidates":[]}),
-            "Improve widget rendering",
-            "repository",
-            "workspace",
-            &scope,
+            task_query("Improve widget rendering", &scope),
         )
         .unwrap();
         assert!(other.is_none());
@@ -1061,10 +1072,7 @@ mod tests {
             &workspace,
             &Value::Array(Vec::new()),
             &serde_json::json!({"candidates":[]}),
-            "Improve ledger balance rendering",
-            "repository",
-            "workspace",
-            &scope,
+            task_query("Improve ledger balance rendering", &scope),
         )
         .unwrap();
         assert!(stale.is_none());
@@ -1134,10 +1142,7 @@ mod tests {
             &workspace,
             &Value::Array(Vec::new()),
             &serde_json::json!({"candidates":[]}),
-            "Fix ledger balance calculation",
-            "repository",
-            "workspace",
-            &scope,
+            task_query("Fix ledger balance calculation", &scope),
         )
         .unwrap()
         .unwrap();
