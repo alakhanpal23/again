@@ -11,6 +11,12 @@ the configured deadline. The previous fixed 250 ms interval could issue about
 still working. The new schedule issues at most 19 in that interval, with up to
 2 seconds of added handoff detection delay after the initial retries. This is
 control-plane call reduction; it does not change repository result-cache hits.
+The clean-source release-binary launcher gates passed for
+[Codex](../bench/results/2026-09-23-codex-launch-peer-backoff-release-v1.json)
+and [Claude](../bench/results/2026-09-23-claude-launch-peer-backoff-release-v1.json)
+at `78a1de9c19e79416b626eed12529c907f24fde36`; they cover leader/follower
+handoff, fresh source after takeover, lease retirement, and the one-second
+fallback. These fake-client gates do not measure live model completion time.
 A metadata-only proof variant for `repo.tree` and `repo.glob` was tested locally
 and discarded: it saved 17–31 ms on cold 1,000-file calls, did not improve warm
 calls, and added a separate proof schema. The existing direct route remains
