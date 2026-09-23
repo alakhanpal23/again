@@ -4,12 +4,23 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 native Codex hook observation (opt-in)
 
+The observer now also matches completed native `apply_patch` calls. It accepts
+the documented local tool only after the live response reports exit code zero
+and names a changed path that appears in the patch input. It stores a current
+digest for a bounded edited file or retires the prior file observation when
+the file was deleted or cannot be read. The first isolated live patch probe
+reported a Codex `file_change` but lacked the Brain event; three subsequent
+installed-hook repetitions captured the native edit. This intermittent miss
+still needs diagnosis before patch capture is a release claim.
+
 `again brain hook-setup --workspace <path>` now previews a project Codex hook
 change, `--apply` installs the observation-only handler, and `--remove`
 restores an unchanged prior `hooks.json` byte for byte. Setup keeps unrelated
 handlers, refuses symlinked configuration and user edits made after install,
-and records ownership in a private snapshot. A live isolated Codex run passed
-preview, apply, asynchronous read capture, and remove. This closes the manual
+and records ownership in a private snapshot. A
+[clean-source release-binary Codex run](../bench/results/2026-09-23-brain-hook-setup-release-39327e8.json)
+passed preview, apply, asynchronous read capture, preservation of an unrelated
+handler, and byte-for-byte removal. This closes the manual
 configuration step for opt-in interactive observation; the primary MCP setup
 flow remains separate.
 

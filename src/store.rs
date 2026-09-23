@@ -5358,6 +5358,17 @@ impl Store {
                     ],
                 )?;
             }
+            if event.kind == "file_change"
+                && event.source_digest.is_none()
+                && let Some(path) = &event.path
+            {
+                transaction.execute(
+                    "DELETE FROM brain_files_v1
+                     WHERE path = ?1 AND authorization_scope_digest = ?2
+                       AND observed_ms <= ?3",
+                    params![path, event.authorization_scope_digest, event.created_ms],
+                )?;
+            }
             if event.kind == "test"
                 && event.exit_code == Some(0)
                 && let (Some(hint), Some(digest)) = (&event.command_hint, &event.command_digest)

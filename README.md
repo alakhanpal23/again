@@ -10,7 +10,7 @@ Again helps one coding agent start with a verified repository brief, carry usefu
 
 - `again codex --workspace <path> --task-id <id> --task <text> -- [codex flags]` — launch Codex with bounded current source previews, relevant Brain history, and a validation suggestion. Completed tool calls and run usage are recorded locally.
 - `again brain show|clear --workspace <path>` — inspect or clear bounded activity, source observations, test hints, and Codex run summaries. Brain history is guidance; tests still run.
-- `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Completed interactive Bash calls can then update Brain without hand editing Codex settings.
+- `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Completed interactive Bash calls and successful native patches can then update Brain without hand editing Codex settings.
 - `again brain observe-codex-hook` — the observer's stdin adapter. It emits no hook output and never changes a tool call.
 
 For interactive Codex sessions, run the hook setup command once in that

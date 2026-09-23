@@ -224,11 +224,10 @@ pub fn codex_completed_events_v1(
     }
 }
 
-/// Convert a completed Codex PostToolUse Bash envelope into the same bounded
-/// observation used by the noninteractive launcher. A plain response string
-/// can prove an exact source read, but not the command's exit status.
+/// Convert a completed Codex PostToolUse envelope into bounded observations.
+/// A plain Bash response can prove an exact source read, but not exit status.
 pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<BrainEventV1>> {
-    if value["hook_event_name"] != "PostToolUse" || value["tool_name"] != "Bash" {
+    if value["hook_event_name"] != "PostToolUse" {
         return None;
     }
     let session_id = value["session_id"].as_str()?;
@@ -241,6 +240,14 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
         || command.is_empty()
         || command.len() > 64 * 1024
     {
+        return None;
+    }
+    if value["tool_name"] == "apply_patch" {
+        return Some(codex_post_patch_events_v1(
+            value, workspace, session_id, event_id, command,
+        ));
+    }
+    if value["tool_name"] != "Bash" {
         return None;
     }
     let response = &value["tool_response"];
@@ -299,6 +306,87 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
         }
     }
     Some(events)
+}
+
+fn codex_post_patch_events_v1(
+    value: &Value,
+    workspace: &Path,
+    session_id: &str,
+    event_id: &str,
+    patch: &str,
+) -> Vec<BrainEventV1> {
+    let Some(response) = value["tool_response"].as_str() else {
+        return Vec::new();
+    };
+    if response.len() > 1024 * 1024
+        || !response.starts_with("Exit code: 0\n")
+        || !response.contains("\nOutput:\nSuccess. Updated the following files:\n")
+    {
+        return Vec::new();
+    }
+    let mut events = Vec::new();
+    let scope = Some(local_brain_scope_digest_v1(workspace));
+    let created_ms = current_ms_v1();
+    for line in response
+        .lines()
+        .skip_while(|line| *line != "Success. Updated the following files:")
+        .skip(1)
+    {
+        if events.len() == 32 {
+            break;
+        }
+        let Some((change, path)) = line.split_once(' ') else {
+            continue;
+        };
+        let directive = match change {
+            "M" => "*** Update File: ",
+            "A" => "*** Add File: ",
+            "D" => "*** Delete File: ",
+            _ => continue,
+        };
+        if !safe_patch_path_v1(path)
+            || !patch
+                .lines()
+                .any(|line| line.strip_prefix(directive) == Some(path))
+        {
+            continue;
+        }
+        let source_digest = if change == "D" {
+            None
+        } else {
+            workspace_file_v1(workspace, path)
+                .filter(|(relative, absolute)| {
+                    relative == path
+                        && fs::metadata(absolute)
+                            .is_ok_and(|meta| meta.len() <= MAX_OBSERVED_FILE_BYTES_V1)
+                })
+                .and_then(|(_, absolute)| fs::read(absolute).ok())
+                .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
+        };
+        events.push(BrainEventV1 {
+            session_id: session_id.to_owned(),
+            event_id: event_id.to_owned(),
+            task_id: session_id.to_owned(),
+            kind: "file_change".to_owned(),
+            path: Some(path.to_owned()),
+            source_digest,
+            command_digest: None,
+            command_hint: None,
+            exit_code: None,
+            created_ms,
+            authorization_scope_digest: scope.clone(),
+        });
+    }
+    events
+}
+
+fn safe_patch_path_v1(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && !path.starts_with(".git/")
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
 pub fn codex_display_text_v1(value: &Value) -> Option<&str> {
@@ -757,6 +845,69 @@ mod tests {
                 dir.path()
             )
             .is_none()
+        );
+    }
+
+    #[test]
+    fn completed_patch_hook_updates_and_retires_file_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("helper.py"), "value = 1\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let seed = serde_json::json!({"type":"item.completed","item":{
+            "id":"seed","type":"file_change","status":"completed",
+            "changes":[{"path":"helper.py"}]}});
+        for event in codex_completed_events_v1(&seed, &workspace, "old", "old") {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        fs::write(workspace.join("helper.py"), "value = 2\n").unwrap();
+        let mut patch = serde_json::json!({
+            "hook_event_name":"PostToolUse","tool_name":"apply_patch",
+            "session_id":"interactive","tool_use_id":"edit-1",
+            "tool_input":{"command":"*** Begin Patch\n*** Update File: helper.py\n@@\n-value = 1\n+value = 2\n*** End Patch"},
+            "tool_response":"Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nM helper.py\n"
+        });
+        let events = codex_post_tool_event_v1(&patch, &workspace).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "file_change");
+        store.record_brain_event_v1(&events[0]).unwrap();
+        let files = store.recent_brain_files_v1(8).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].source_digest,
+            blake3::hash(b"value = 2\n").to_hex().to_string()
+        );
+
+        patch["tool_use_id"] = "failed".into();
+        patch["tool_response"] = "Exit code: 1\nOutput:\nPatch failed\n".into();
+        assert!(
+            codex_post_tool_event_v1(&patch, &workspace)
+                .unwrap()
+                .is_empty()
+        );
+
+        fs::remove_file(workspace.join("helper.py")).unwrap();
+        patch["tool_use_id"] = "delete".into();
+        patch["tool_input"]["command"] =
+            "*** Begin Patch\n*** Delete File: helper.py\n*** End Patch".into();
+        patch["tool_response"] = "Exit code: 0\nWall time: 0 seconds\nOutput:\nSuccess. Updated the following files:\nD helper.py\n".into();
+        let events = codex_post_tool_event_v1(&patch, &workspace).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].source_digest.is_none());
+        store.record_brain_event_v1(&events[0]).unwrap();
+        assert!(store.recent_brain_files_v1(8).unwrap().is_empty());
+
+        patch["tool_use_id"] = "traversal".into();
+        patch["tool_input"]["command"] =
+            "*** Begin Patch\n*** Update File: ../outside.py\n*** End Patch".into();
+        patch["tool_response"] =
+            "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nM ../outside.py\n"
+                .into();
+        assert!(
+            codex_post_tool_event_v1(&patch, &workspace)
+                .unwrap()
+                .is_empty()
         );
     }
 

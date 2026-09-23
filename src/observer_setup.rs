@@ -142,8 +142,8 @@ pub fn configure_codex_brain_hook_v1(
             .is_some_and(|hooks| !hooks.is_empty())
     });
     let handler = json!({
-        "matcher":"^Bash$",
-        "hooks":[{"type":"command","command":command,"async":true,"timeout":5}]
+        "matcher":"^(Bash|apply_patch)$",
+        "hooks":[{"type":"command","command":command,"async":true,"timeout":30}]
     });
     groups.push(handler.clone());
     let rendered = serde_json::to_string_pretty(&document)? + "\n";
@@ -289,6 +289,7 @@ mod tests {
         let groups = document["hooks"]["PostToolUse"].as_array().unwrap();
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0]["hooks"][0]["command"], "other");
+        assert_eq!(groups[1]["matcher"], "^(Bash|apply_patch)$");
         assert_eq!(groups[1]["hooks"][0]["async"], true);
         assert!(
             !configure_codex_brain_hook_v1(dir.path(), &executable, true, false)
