@@ -4,6 +4,17 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
+The task-start validation preview now suggests `cargo test` for a Rust source
+candidate with a current root `Cargo.toml`, or `go test ./...` for a Go source
+candidate with a current root `go.mod`. These are unverified selectors and
+still require execution. A release-binary `task.start` probe on the Rust
+fixture returned the expected selector. The [two-order Rust diagnostic](../bench/results/2026-09-23-rust-validation-5134e43/summary.json)
+accepted both baseline and Again patches and validations. Again made only an
+edit and `cargo test` call in each run; baseline made additional source and
+repository inspection calls. Paired elapsed ratios were 0.240 and 0.487, with
+one unusually slow baseline run. This narrow diagnostic shows the new brief
+did not break that workflow; it is not broad validation or Go outcome evidence.
+
 The [returning-task cohort](../bench/results/2026-09-23-returning-cohort-e466f8a/summary.json)
 uses a ledger repair whose faulty helper is outside the initial two source
 previews. A prior completed `sed` read of that helper is seeded through the

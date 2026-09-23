@@ -1,0 +1,173 @@
+{
+  "accepted": true,
+  "againBinarySha256": "e6da6075139b583f03f7d0f2cc53f6c31d995ed247a61a4382271eb733b10ee8",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "rust-calculator",
+  "fixtureSha256": "278331edd9e3eccb173a99680f89d9d62b3d81239bfb8067112e5382700cd845",
+  "harnessSha256": "255db9381f8e2e8e1eede671ce130f8c2f2a71023de555d031263f7ae523eb55",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 24763.964,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'cat src/lib.rs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg --files -g AGENTS.md -g '\"'!target'\"'\"",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 24763.964,
+      "eventCount": 15,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 9229.185,
+      "oracle": {
+        "after_snapshot_sha256": "bb755b09d07e947fae84f12490cfb58f574aa87021b6dea09a603a5f06a0b3d4",
+        "changed_paths": [
+          "src/lib.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 54.245,
+        "test_output_sha256": "649790e091b70c1175d52944ff287dc6d7ec9701a70fbf17874b7fad9c2e005a",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3584,
+      "rawEventFile": "again-rust-validation-5134e43-baseline-first-baseline.jsonl",
+      "rawEventSha256": "4d72d1980db10e5955672f3f00fb6bad44279183c2395c8e355fb8f9212f5e96",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 58880,
+        "input_tokens": 64189,
+        "output_tokens": 363,
+        "reasoning_output_tokens": 28
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 12066.698,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 12066.698,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 6133.961,
+      "oracle": {
+        "after_snapshot_sha256": "bb755b09d07e947fae84f12490cfb58f574aa87021b6dea09a603a5f06a0b3d4",
+        "changed_paths": [
+          "src/lib.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 51.53,
+        "test_output_sha256": "649790e091b70c1175d52944ff287dc6d7ec9701a70fbf17874b7fad9c2e005a",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 2293,
+      "rawEventFile": "again-rust-validation-5134e43-baseline-first-product.jsonl",
+      "rawEventSha256": "ba10bfe585d2f81101b897b3607986aa0dc12240d876c62921b10e735ccd57b3",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48747,
+        "output_tokens": 247,
+        "reasoning_output_tokens": 23
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "566d536704de23746ec36d54e67f231689818c547d3a1de7c92b26fdb2640530",
+  "recordedAtUtc": "2026-09-23T22:50:28.182404+00:00",
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "5134e43b6ff9f0f9f4c5a16188d151c760999b7d"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}
