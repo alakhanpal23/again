@@ -68,6 +68,9 @@ product still needs repeat-heavy parallel-agent cohorts.
 
 Gateway stats now count `direct_observations_published` separately from
 `provider_calls_avoided`; direct facts never increment the avoided-call count.
+The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-direct-metrics-v1.json)
+passed at clean source `81e0a857da3654f0ac51a4c6dd0d7944cca9dc85` and checked two
+direct observations against one genuinely avoided provider execution.
 
 Current hosted evidence checkpoint: source commit
 `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted
