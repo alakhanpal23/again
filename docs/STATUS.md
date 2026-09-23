@@ -9,8 +9,12 @@ the next task brief. The whole Brain field remains capped at 4 KiB; when two
 previews would exceed it, the lower-priority preview is withheld first.
 The focused regression covers a 2,000-byte source, total brief bound, and
 stale-source withholding. This removes the former 256-byte limit that made
-many ordinary prior reads only path hints. Live outcome evidence for larger
-source files is still needed.
+many ordinary prior reads only path hints. In the [two-order live ablation](../bench/results/2026-09-23-large-brain-ablation-d105b04/summary.json)
+on a 1,697-byte helper, both seeded and cold Again runs passed the exact
+patch and unittest oracle. The seeded runs edited and tested without a read;
+both cold runs searched and read the helper first. Seeded/cold completion
+ratios were 0.626 and 0.529. This is evidence for one synthetic larger file,
+not a diverse returning-task cohort.
 
 The task-start validation preview now suggests `cargo test` for a Rust source
 candidate with a current root `Cargo.toml`, or `go test ./...` for a Go source

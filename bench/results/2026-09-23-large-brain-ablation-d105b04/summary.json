@@ -1,0 +1,12 @@
+{
+  "acceptedPairs": 2,
+  "medianSeededOverColdElapsedRatio": 0.5773922509655078,
+  "schema": "again.large-brain-ablation-result.v1",
+  "scope": "One 1697-byte helper fixture, both orders, no decoy files; diagnostic only",
+  "seededOverColdElapsedRatios": [
+    0.6256441167214162,
+    0.5291403852095994
+  ],
+  "sourceCommit": "d105b04",
+  "totalPairs": 2
+}
