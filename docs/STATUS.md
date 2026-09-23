@@ -44,6 +44,10 @@ Both returned 24 candidates; the faster brief no longer reported parse-time
 exhaustion. These are local synthetic task-start measurements with an unverified
 source-to-binary binding, not a coding-task speed result. The index still
 revalidates all admitted files and can remain expensive on larger repositories.
+The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-batched-index-v1.json)
+passed against clean source `8f8cbf2fe9c01e39b0ee7faf49010a0aa3079262` after the
+batch change, covering shared direct facts, exact in-flight work avoidance,
+invalidation, scoped retrieval, corruption refusal, and lease recovery.
 
 Current hosted evidence checkpoint: source commit
 `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted
