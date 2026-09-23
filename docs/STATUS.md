@@ -56,9 +56,19 @@ was 24.44 versus 24.53 seconds and 24.28 versus 25.61 seconds. See
 [baseline-first](../bench/results/2026-09-23-codex-parallel-pair-delayed-baseline-first-v1.json)
 and [reverse](../bench/results/2026-09-23-codex-parallel-pair-delayed-again-first-v1.json).
 The launcher now waits up to 30 seconds on an exact peer task, then refreshes
-verified source/context and takes over the lease when available; this
-production behavior still needs the release-binary launcher gate and a live
-repeat on the final binary.
+verified source/context and takes over the lease when available. The
+[release-binary launcher gate](../bench/results/2026-09-23-codex-launch-peer-wait-release-v1.json)
+at clean source `63c5730` passed a leader/follower handoff: the follower stayed
+idle during the lease and received the leader's edited source in its fresh
+brief. Two live release-binary parallel pairs then passed the edit oracle in
+both orders with one source edit. The default wrapper used no model-initiated
+MCP calls, 2/5 shell calls versus 14/13 baseline, and 80,942/97,871 input
+tokens versus 224,695/242,154 baseline. First edit was 6.87/5.87 seconds
+versus 13.05/12.55; completion was 23.81/31.95 versus 23.46/32.43.
+See [baseline-first](../bench/results/2026-09-23-codex-parallel-pair-wrapper-wait-baseline-first-v1.json)
+and [reverse](../bench/results/2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1.json).
+This is still a small local two-agent fixture; it does not prove repeat-heavy
+performance across repositories or a general completion-time gain.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real

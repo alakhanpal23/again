@@ -196,9 +196,11 @@ has a persisted proof and an `explain` reason.
   an exact duplicate follower until the leader exited cut tokens by more than
   half in both local orders while preserving the accepted repair. The launcher
   now waits up to a bounded 30 seconds and refreshes its brief before taking
-  over. Verify that default on a clean release binary with two live agents;
-  include a source mutation during the wait and a leader that outlives the
-  wait bound. Keep independent subtasks parallel.
+  over. A clean release-binary launcher gate verified a source mutation during
+  the wait, and both treatment orders of the live two-agent fixture used the
+  default wait with accepted repairs and lower input tokens. The launcher gate
+  now also tests a leader outliving a one-second wait. Expand this beyond the
+  one calculator fixture and keep independent subtasks parallel.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference

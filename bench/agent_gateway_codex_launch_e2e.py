@@ -58,10 +58,11 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                          "--task-id", "repair", "--task", task]
         processes: list[subprocess.Popen[bytes]] = []
 
-        def launch(name: str, wait_ready: bool = True) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
+        def launch(name: str, wait_ready: bool = True,
+                   invocation_command: list[str] | None = None) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
             ready, release = root / f"{name}.ready", root / f"{name}.release"
             invocation = environment | {"FAKE_READY": str(ready), "FAKE_RELEASE": str(release)}
-            process = subprocess.Popen(command, cwd=workspace, env=invocation,
+            process = subprocess.Popen(invocation_command or command, cwd=workspace, env=invocation,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             processes.append(process)
             if wait_ready:
@@ -100,6 +101,22 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(follower.wait(timeout=10) == 0, "follower launcher failed")
             require(brief()["coordination"]["peerActive"] is False,
                     "follower lease remained active after follower exit")
+            slow_leader, _, slow_leader_release = launch("slow-leader")
+            fallback_command = command[:-2] + ["--peer-wait-seconds", "1"] + command[-2:]
+            slow_follower, slow_follower_ready, slow_follower_release = launch(
+                "slow-follower", invocation_command=fallback_command
+            )
+            slow_follower_argv = json.loads(slow_follower_ready.read_text())
+            require("active peer leader" in slow_follower_argv[-1],
+                    "bounded wait did not launch with peer guidance")
+            require(brief()["coordination"]["peerActive"] is True,
+                    "bounded follower unexpectedly replaced its active leader")
+            slow_follower_release.touch()
+            require(slow_follower.wait(timeout=10) == 0, "bounded follower failed")
+            slow_leader_release.touch()
+            require(slow_leader.wait(timeout=10) == 0, "slow leader failed")
+            require(brief()["coordination"]["peerActive"] is False,
+                    "slow leader lease remained active after exit")
             return {
                 "schema": "again.codex-launch-e2e.v1",
                 "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -112,6 +129,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "followerWaitedForLeader": True,
                 "followerClaimedAfterLeader": True,
                 "followerReceivedFreshEditedSource": True,
+                "boundedWaitFallbackReportedPeer": True,
                 "leaderRetiredAfterExit": True,
             }
         finally:
