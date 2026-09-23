@@ -31,6 +31,11 @@ exist. A newer test in another language no longer hides a relevant earlier
 command. Failed commands never become test hints. These are only suggestions:
 the launcher still requires the agent to run validation, and the manifest
 existence check does not prove that an old test result is current.
+The 201 library tests and no-default-features check pass. The
+[clean-source release launcher gate](../bench/results/2026-09-23-brain-multilang-e937d3d.json)
+passes at `e937d3d`; the language-selection and stale-manifest behavior are
+covered by focused unit tests, while the launcher gate exercises the existing
+Python handoff path.
 
 ## 2026-09-23 single-agent Again Brain first slice
 
