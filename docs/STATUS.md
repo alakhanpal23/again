@@ -7,17 +7,25 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 The `again brain observe-codex-hook` stdin adapter can now record completed
 interactive Codex Bash calls into the same repository Brain as the `again codex`
 launcher. The adapter retains a command digest, not command text or output.
-When a hook response contains an explicit integer `exit_code` and exact plain
-`output`, the existing source-byte matcher can also record a verified `cat` or
-bounded `sed` read; an explicit zero exit can yield a recognized successful
-test hint. Unknown response shapes remain command metadata only. The adapter
+The live Codex 0.156.1 probe showed `tool_response` is a plain output string
+for Bash, without an exit code. The existing source-byte matcher can record a
+verified `cat` or bounded `sed` read from that string, while leaving exit
+status unknown. An explicit zero exit in a structured response can yield a
+recognized successful test hint. Unknown response shapes remain command
+metadata only. The adapter
 is idempotent for a repeated `tool_use_id`, bounded to 1 MiB input, and emits
 no model-visible hook output. It is not installed by `again setup`; opt-in
-`PostToolUse` configuration and a live Codex hook-payload qualification remain.
+`PostToolUse` configuration and broader live hook qualification remain.
 The launcher remains the currently qualified automatic capture path.
 An interactive read without a lifecycle task can now be nominated on a later
 task by matching words in its path. The file is still rechecked against its
 stored digest and authorization scope before any preview is shown.
+The [live opt-in hook probe](../bench/results/2026-09-23-native-hook-e2e-09a7bb5/summary.json)
+ran Codex against an isolated repository with a `PostToolUse` observer. It
+captured the plain-string response, stored two bounded event rows and one
+verified file observation, and retained no command text. This qualifies the
+basic live read path; broader interactive tasks and automatic installation are
+still open.
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 

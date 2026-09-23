@@ -1,0 +1,27 @@
+{
+  "codexExitCode": 0,
+  "hookPayload": {
+    "keys": [
+      "cwd",
+      "hook_event_name",
+      "model",
+      "permission_mode",
+      "session_id",
+      "tool_input",
+      "tool_name",
+      "tool_response",
+      "tool_use_id",
+      "transcript_path",
+      "turn_id"
+    ],
+    "tool_name": "Bash",
+    "response_type": "str"
+  },
+  "brainEventCount": 2,
+  "brainFileObservationCount": 1,
+  "observedPaths": [
+    "helper.py"
+  ],
+  "plainCommandRetained": false,
+  "sourcePreviewCandidate": true
+}

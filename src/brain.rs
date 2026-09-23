@@ -225,9 +225,8 @@ pub fn codex_completed_events_v1(
 }
 
 /// Convert a completed Codex PostToolUse Bash envelope into the same bounded
-/// observation used by the noninteractive launcher. Hook output is only
-/// trusted for a test hint or source match when it exposes an explicit exit
-/// code and a plain, unmodified output string.
+/// observation used by the noninteractive launcher. A plain response string
+/// can prove an exact source read, but not the command's exit status.
 pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<BrainEventV1>> {
     if value["hook_event_name"] != "PostToolUse" || value["tool_name"] != "Bash" {
         return None;
@@ -248,8 +247,9 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
     let exit_code = response["exit_code"]
         .as_i64()
         .and_then(|code| i32::try_from(code).ok());
-    let output = response["output"]
+    let output = response
         .as_str()
+        .or_else(|| response["output"].as_str())
         .filter(|s| s.len() <= 1024 * 1024);
     let item = serde_json::json!({
         "id": event_id,
@@ -265,6 +265,8 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
         session_id,
     );
     if events.is_empty() {
+        let created_ms = current_ms_v1();
+        let authorization_scope_digest = Some(local_brain_scope_digest_v1(workspace));
         events.push(BrainEventV1 {
             session_id: session_id.to_owned(),
             event_id: event_id.to_owned(),
@@ -275,9 +277,26 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
             command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
             command_hint: None,
             exit_code: None,
-            created_ms: current_ms_v1(),
-            authorization_scope_digest: Some(local_brain_scope_digest_v1(workspace)),
+            created_ms,
+            authorization_scope_digest: authorization_scope_digest.clone(),
         });
+        if exit_code.is_none()
+            && let Some((relative, bytes)) = matching_source_read_v1(&item, workspace, command)
+        {
+            events.push(BrainEventV1 {
+                session_id: session_id.to_owned(),
+                event_id: event_id.to_owned(),
+                task_id: session_id.to_owned(),
+                kind: "command".to_owned(),
+                path: Some(relative),
+                source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                command_hint: None,
+                exit_code: None,
+                created_ms,
+                authorization_scope_digest,
+            });
+        }
     }
     Some(events)
 }
@@ -697,6 +716,22 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].path.as_deref(), Some("helper.py"));
         assert_eq!(events[1].task_id, "session");
+
+        let mut live_shape = read.clone();
+        live_shape["tool_use_id"] = "live".into();
+        live_shape["tool_response"] = "value = 1\n".into();
+        let events = codex_post_tool_event_v1(&live_shape, dir.path()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].path.as_deref(), Some("helper.py"));
+        assert_eq!(events[1].exit_code, None);
+
+        let mut failed = read.clone();
+        failed["tool_use_id"] = "failed".into();
+        failed["tool_response"]["exit_code"] = 1.into();
+        assert_eq!(
+            codex_post_tool_event_v1(&failed, dir.path()).unwrap().len(),
+            1
+        );
 
         let mut mismatch = read.clone();
         mismatch["tool_use_id"] = "mismatch".into();
@@ -1189,7 +1224,7 @@ mod tests {
             "hook_event_name":"PostToolUse", "tool_name":"Bash",
             "session_id":"interactive", "tool_use_id":"read",
             "tool_input":{"command":"cat src/ledger_helper.py"},
-            "tool_response":{"exit_code":0,"output":"value = 10\n"}
+            "tool_response":"value = 10\n"
         });
         for event in codex_post_tool_event_v1(&hook, &workspace).unwrap() {
             store.record_brain_event_v1(&event).unwrap();

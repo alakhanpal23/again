@@ -5331,7 +5331,7 @@ impl Store {
         }
         if inserted == 1 {
             if (event.kind == "file_change"
-                || (event.kind == "command" && event.exit_code == Some(0)))
+                || (event.kind == "command" && matches!(event.exit_code, None | Some(0))))
                 && let (Some(path), Some(digest)) = (&event.path, &event.source_digest)
             {
                 transaction.execute(
