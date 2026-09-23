@@ -37,7 +37,9 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
+const MAX_BRAIN_EVENTS_V1: i64 = 10_000;
+const MAX_BRAIN_EVENT_AGE_MS_V1: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
 const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
 const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
@@ -69,6 +71,22 @@ pub struct CleanupReport {
     pub events: u64,
     pub gateway_events: u64,
     pub artifacts: u64,
+}
+
+/// Bounded metadata observed from a coding client's completed tool event.
+/// Native client output is never authority for a cache hit or verified fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainEventV1 {
+    pub session_id: String,
+    pub event_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub path: Option<String>,
+    pub source_digest: Option<String>,
+    pub command_digest: Option<String>,
+    pub command_hint: Option<String>,
+    pub exit_code: Option<i32>,
+    pub created_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1919,6 +1937,30 @@ impl Store {
                     ON gateway_results(binding_digest)
                     WHERE status = 'ready' AND origin = 'direct_observation';
                 PRAGMA user_version = 15;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 16 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_events_v1 (
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    kind TEXT NOT NULL CHECK(kind IN ('file_change', 'command', 'test')),
+                    path TEXT NOT NULL CHECK(length(path) <= 512),
+                    source_digest TEXT CHECK(source_digest IS NULL OR length(source_digest) = 64),
+                    command_digest TEXT CHECK(command_digest IS NULL OR length(command_digest) = 64),
+                    command_hint TEXT CHECK(command_hint IS NULL OR length(command_hint) BETWEEN 1 AND 256),
+                    exit_code INTEGER,
+                    created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+                    PRIMARY KEY(session_id, event_id, kind, path)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_events_recent_idx ON brain_events_v1(created_ms DESC);
+                CREATE INDEX IF NOT EXISTS brain_events_task_idx ON brain_events_v1(task_id, created_ms DESC);
+                PRAGMA user_version = 16;
                 COMMIT;
                 "#,
             )?;
@@ -5067,6 +5109,122 @@ impl Store {
             result_references,
             inflight_work,
         ))
+    }
+
+    pub fn record_brain_event_v1(&self, event: &BrainEventV1) -> Result<()> {
+        for value in [&event.session_id, &event.event_id, &event.task_id] {
+            if value.is_empty() || value.len() > 128 {
+                bail!("brain_event_invalid_identity");
+            }
+        }
+        if !matches!(event.kind.as_str(), "file_change" | "command" | "test")
+            || event.created_ms < 0
+            || event.path.as_ref().is_some_and(|path| {
+                path.is_empty()
+                    || path.len() > 512
+                    || !Path::new(path)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+            || [event.source_digest.as_ref(), event.command_digest.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || event.command_hint.as_ref().is_some_and(|hint| {
+                hint.is_empty() || hint.len() > 256 || screen_sensitive_text_v1(hint).is_err()
+            })
+        {
+            bail!("brain_event_invalid_metadata");
+        }
+        let path = event.path.as_deref().unwrap_or("");
+        self.conn.execute(
+            "INSERT OR IGNORE INTO brain_events_v1 (
+                session_id, event_id, task_id, kind, path, source_digest,
+                command_digest, command_hint, exit_code, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                event.session_id,
+                event.event_id,
+                event.task_id,
+                event.kind,
+                path,
+                event.source_digest,
+                event.command_digest,
+                event.command_hint,
+                event.exit_code,
+                event.created_ms
+            ],
+        )?;
+        let stored: BrainEventV1 = self.conn.query_row(
+            "SELECT session_id, event_id, task_id, kind, path, source_digest,
+                    command_digest, command_hint, exit_code, created_ms
+             FROM brain_events_v1
+             WHERE session_id = ?1 AND event_id = ?2 AND kind = ?3 AND path = ?4",
+            params![event.session_id, event.event_id, event.kind, path],
+            |row| {
+                let path: String = row.get(4)?;
+                Ok(BrainEventV1 {
+                    session_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    path: (!path.is_empty()).then_some(path),
+                    source_digest: row.get(5)?,
+                    command_digest: row.get(6)?,
+                    command_hint: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    created_ms: row.get(9)?,
+                })
+            },
+        )?;
+        if &stored != event {
+            bail!("brain_event_id_collision");
+        }
+        self.conn.execute(
+            "DELETE FROM brain_events_v1 WHERE created_ms < ?1",
+            [now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1)],
+        )?;
+        self.conn.execute(
+            "DELETE FROM brain_events_v1 WHERE (session_id, event_id, kind, path) IN (
+                SELECT session_id, event_id, kind, path FROM brain_events_v1
+                ORDER BY created_ms DESC LIMIT -1 OFFSET ?1
+            )",
+            [MAX_BRAIN_EVENTS_V1],
+        )?;
+        Ok(())
+    }
+
+    pub fn recent_brain_events_v1(&self, limit: usize) -> Result<Vec<BrainEventV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_event_limit_invalid");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, event_id, task_id, kind, path, source_digest,
+                    command_digest, command_hint, exit_code, created_ms
+             FROM brain_events_v1 ORDER BY created_ms DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            let path: String = row.get(4)?;
+            Ok(BrainEventV1 {
+                session_id: row.get(0)?,
+                event_id: row.get(1)?,
+                task_id: row.get(2)?,
+                kind: row.get(3)?,
+                path: (!path.is_empty()).then_some(path),
+                source_digest: row.get(5)?,
+                command_digest: row.get(6)?,
+                command_hint: row.get(7)?,
+                exit_code: row.get(8)?,
+                created_ms: row.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn clear_brain_events_v1(&self) -> Result<u64> {
+        Ok(self.conn.execute("DELETE FROM brain_events_v1", [])? as u64)
     }
 
     pub fn context_delta_after_v1(
@@ -10427,6 +10585,10 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
                 "retired_event_sequence" | "retirement_reason"
             )
             | ("context_ledger_leases_v1", "lease_id" | "completed_ms")
+            | (
+                "brain_events_v1",
+                "source_digest" | "command_digest" | "command_hint" | "exit_code"
+            )
             | ("context_tasks_v1", "definition_digest")
             | (
                 "context_task_transitions_v1",
@@ -10875,6 +11037,21 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "response_envelope_digest",
                 "bytes_omitted",
                 "recorded_ms",
+            ],
+        ),
+        (
+            "brain_events_v1",
+            &[
+                "session_id",
+                "event_id",
+                "task_id",
+                "kind",
+                "path",
+                "source_digest",
+                "command_digest",
+                "command_hint",
+                "exit_code",
+                "created_ms",
             ],
         ),
     ];

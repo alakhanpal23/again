@@ -58,6 +58,15 @@ again reference -- rg --no-ignore --sort=path needle src
 
 `again codex` starts or joins the authenticated workspace daemon, registers the exact durable task, and supplies up to two complete source previews and bounded current shared findings before calling `codex exec`. It preserves Codex's normal user configuration and approval policy, pins the Again MCP connection for this invocation, and forwards explicit Codex flags after `--`. An elected launcher holds and renews the leader lease for the process lifetime. A follower waits up to 30 seconds by default; if the leader exits, it claims the task and refreshes source and context before launching Codex. Use `--peer-wait-seconds 0` to launch a collaborating follower immediately, or set a bounded wait up to 300 seconds. A still-active peer is reported in the follower brief. Blocked dependencies and terminal tasks stop the launch. `again mcp brief --workspace <path> --task-id <id> --task <text>` prints a preview without claiming a lease for other launchers. Keep task text free of secrets. These commands require a daemon-enabled Unix build and an installed Codex CLI; this launch path has local diagnostic evidence but is not yet a qualified default workflow.
 
+The launcher now consumes Codex `--json` events, rendering text for normal
+invocations and preserving raw JSONL when `--json` is explicitly passed. A
+local Again Brain records completed command metadata and file edit digests;
+matching prior edits and an unverified successful-test hint can appear in
+later task briefs. `again brain show --workspace <path>` inspects the metadata,
+and `again brain clear --workspace <path>` removes it. This does not intercept
+or cache native shell calls, and a prior test hint never permits skipping a
+new validation run.
+
 `again claude` uses the same brief, peer wait, and lease lifecycle for Claude Code's noninteractive print mode. It passes a workspace-bound Again MCP server through Claude Code's documented [`--mcp-config`](https://code.claude.com/docs/en/cli-reference) flag and forwards explicit Claude flags after `--`. The local release gate checks the generated arguments with a fake Claude executable; no Claude Code binary is installed on this host, so a live Claude task and token result remain unverified.
 
 The explicit `again run` path requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry. MCP context and prebrief use the authenticated local daemon.

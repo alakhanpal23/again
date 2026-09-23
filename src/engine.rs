@@ -74,6 +74,9 @@ enum CommandName {
     Claude(ClaudeArgs),
     /// Inspect, export, delete, or prune durable local tasks.
     Task(TaskArgs),
+    #[cfg(feature = "daemon")]
+    /// Inspect or clear the local Again Brain's observed agent activity.
+    Brain(BrainArgs),
     #[cfg(feature = "hook")]
     #[command(hide = true)]
     Hook(HookArgs),
@@ -228,6 +231,30 @@ struct ClaudeArgs {
     /// Additional Claude Code print-mode flags after `--`.
     #[arg(last = true, num_args = 0..)]
     claude_args: Vec<OsString>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct BrainArgs {
+    #[command(subcommand)]
+    command: BrainCommand,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Subcommand)]
+enum BrainCommand {
+    /// Show bounded completed activity metadata from this repository.
+    Show {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u8).range(1..=128))]
+        limit: u8,
+    },
+    /// Clear retained activity metadata for this repository.
+    Clear {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -752,6 +779,8 @@ pub fn run_cli() -> Result<i32> {
         #[cfg(feature = "daemon")]
         CommandName::Claude(args) => claude_launch(args),
         CommandName::Task(args) => task_cli(args),
+        #[cfg(feature = "daemon")]
+        CommandName::Brain(args) => brain_cli(args),
         #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         #[cfg(feature = "hook")]
@@ -1358,6 +1387,28 @@ fn mcp_brief(args: McpBriefArgs) -> Result<i32> {
     Ok(0)
 }
 
+#[cfg(feature = "daemon")]
+fn brain_cli(args: BrainArgs) -> Result<i32> {
+    match args.command {
+        BrainCommand::Show { workspace, limit } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let store = Store::open_for_workspace(&workspace)?;
+            let events = store.recent_brain_events_v1(limit as usize)?;
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+        BrainCommand::Clear { workspace } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let store = Store::open_for_workspace(&workspace)?;
+            let removed = store.clear_brain_events_v1()?;
+            println!(
+                "Cleared {removed} Again Brain events for {}",
+                workspace.display()
+            );
+        }
+    }
+    Ok(0)
+}
+
 #[cfg(all(feature = "daemon", unix))]
 fn codex_launch(args: CodexArgs) -> Result<i32> {
     let mut session = verified_task_brief_v1(&args.brief, true)?;
@@ -1371,8 +1422,9 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         Duration::from_secs(args.peer_wait_seconds),
     )?;
     validate_agent_launch_task_v1(&session.brief)?;
-    let prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let workspace = &session.workspace;
+    append_repository_brain_v1(&mut prompt, workspace, &args.brief.task);
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let bridge_args = [
         "mcp",
@@ -1382,8 +1434,13 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
             .to_str()
             .ok_or_else(|| anyhow!("workspace path is not UTF-8"))?,
     ];
-    let child = Command::new("codex")
-        .arg("exec")
+    let raw_json = args.codex_args.iter().any(|arg| arg == "--json");
+    let mut command = Command::new("codex");
+    command.arg("exec");
+    if !raw_json {
+        command.arg("--json");
+    }
+    let mut child = command
         .args(&args.codex_args)
         .arg("-C")
         .arg(workspace)
@@ -1399,9 +1456,54 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         ))
         .arg(prompt)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .context("launch Codex with authenticated task brief")?;
-    run_agent_child_v1(session, child, "Codex")
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Codex event stream was unavailable"))?;
+    let brain_workspace = session.workspace.clone();
+    let brain_task_id = session.brief["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("task brief omitted task ID"))?
+        .to_owned();
+    let brain_session_id = uuid::Uuid::new_v4().to_string();
+    let event_reader = thread::spawn(move || -> Result<()> {
+        let brain_store = Store::open_for_workspace(&brain_workspace).ok();
+        let mut output = io::stdout().lock();
+        for line in BufReader::new(stdout).lines() {
+            let line = line?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&line);
+            if raw_json {
+                writeln!(output, "{line}")?;
+            } else if let Ok(ref value) = parsed {
+                if let Some(display) = crate::brain::codex_display_text_v1(value) {
+                    write!(output, "{display}")?;
+                    if !display.ends_with('\n') {
+                        writeln!(output)?;
+                    }
+                }
+            } else {
+                writeln!(output, "{line}")?;
+            }
+            output.flush()?;
+            if let (Some(store), Ok(value)) = (&brain_store, parsed) {
+                for event in crate::brain::codex_completed_events_v1(
+                    &value,
+                    &brain_workspace,
+                    &brain_session_id,
+                    &brain_task_id,
+                ) {
+                    if let Err(error) = store.record_brain_event_v1(&event) {
+                        eprintln!("Again Brain: could not record a completed event: {error:#}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    });
+    run_agent_child_v1(session, child, "Codex", Some(event_reader))
 }
 
 #[cfg(all(feature = "daemon", unix))]
@@ -1417,9 +1519,10 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
         Duration::from_secs(args.peer_wait_seconds),
     )?;
     validate_agent_launch_task_v1(&session.brief)?;
-    let prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let workspace = &session.workspace;
+    append_repository_brain_v1(&mut prompt, workspace, &args.brief.task);
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "again": {
@@ -1438,7 +1541,7 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
         .stdin(Stdio::null())
         .spawn()
         .context("launch Claude Code with authenticated task brief")?;
-    run_agent_child_v1(session, child, "Claude Code")
+    run_agent_child_v1(session, child, "Claude Code", None)
 }
 
 #[cfg(all(feature = "daemon", unix))]
@@ -1446,6 +1549,7 @@ fn run_agent_child_v1(
     mut session: TaskBriefSessionV1,
     mut child: std::process::Child,
     client_name: &str,
+    event_reader: Option<thread::JoinHandle<Result<()>>>,
 ) -> Result<i32> {
     let lease_id = session.brief["coordination"]["leaseId"]
         .as_str()
@@ -1454,6 +1558,21 @@ fn run_agent_child_v1(
     let mut next_heartbeat = Instant::now() + Duration::from_secs(60);
     loop {
         if let Some(status) = child.try_wait()? {
+            if let Some(reader) = event_reader {
+                // A descendant may retain stdout after the direct child exits.
+                // Do not hang the launcher indefinitely on that descriptor.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !reader.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if reader.is_finished() {
+                    reader
+                        .join()
+                        .map_err(|_| anyhow!("Codex event reader panicked"))??;
+                } else {
+                    eprintln!("Again Brain: event stream remained open after {client_name} exited");
+                }
+            }
             return Ok(status.code().unwrap_or(1));
         }
         if Instant::now() >= next_heartbeat {
@@ -1634,21 +1753,27 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
         let shared = serde_json::json!({
             "cursor": brief["cursor"],
             "currentFacts": context["current_facts"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "suggestions": context["suggestions"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
             "explicitUnknowns": context["explicit_unknowns"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
             "resultReferences": context["result_references"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
         });
         let serialized = serde_json::to_string(&shared)?;
-        let has_shared_items = ["currentFacts", "explicitUnknowns", "resultReferences"]
-            .iter()
-            .any(|key| {
-                shared[*key]
-                    .as_array()
-                    .is_some_and(|items| !items.is_empty())
-            });
+        let has_shared_items = [
+            "currentFacts",
+            "suggestions",
+            "explicitUnknowns",
+            "resultReferences",
+        ]
+        .iter()
+        .any(|key| {
+            shared[*key]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        });
         if has_shared_items && serialized.len() <= 4096 {
             prompt.push_str("\nSHARED_CONTEXT ");
             prompt.push_str(&serialized);
-            prompt.push_str("\nShared facts were source checked at launch; recheck after relevant edits. Explicit unknowns still need investigation. Retrieve referenced results through MCP in your own session if needed.");
+            prompt.push_str("\nShared facts were source checked at launch; recheck after relevant edits. Suggestions are unverified agent statements. Explicit unknowns still need investigation. Retrieve referenced results through MCP in your own session if needed.");
         } else if has_shared_items {
             prompt.push_str("\nSHARED_CONTEXT omitted due to size; call task.start in your own MCP session if needed.");
         }
@@ -1656,6 +1781,28 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
         prompt.push_str("\nSHARED_CONTEXT freshness incomplete; call task.start in your own MCP session before relying on earlier findings.");
     }
     Ok(prompt)
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, task: &str) {
+    let Ok(store) = Store::open_for_workspace(workspace) else {
+        return;
+    };
+    let Ok(brief) = crate::brain::repository_brief_v1(&store, workspace, task) else {
+        return;
+    };
+    let has_files = brief["recentCurrentFiles"]
+        .as_array()
+        .is_some_and(|files| !files.is_empty());
+    let has_test = brief["previousSuccessfulTestCommand"].as_str().is_some();
+    if (has_files || has_test)
+        && let Ok(serialized) = serde_json::to_string(&brief)
+        && serialized.len() <= 1024
+    {
+        prompt.push_str("\nAGAIN_BRAIN ");
+        prompt.push_str(&serialized);
+        prompt.push_str("\nThis is observed repository history, not a current test result. Recheck relevance and run required validation.");
+    }
 }
 
 #[cfg(all(feature = "daemon", not(unix)))]

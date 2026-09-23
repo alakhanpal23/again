@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Exercise Codex event capture and current cross-task brain hints in isolation."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import pathlib
+import subprocess
+import tempfile
+
+
+def run(binary: pathlib.Path) -> dict[str, object]:
+    with tempfile.TemporaryDirectory(prefix="again-brain-e2e-") as temporary:
+        root = pathlib.Path(temporary).resolve()
+        workspace = root / "repo"
+        workspace.mkdir()
+        (workspace / "a.py").write_text("value = 1\n")
+        subprocess.run(["git", "init", "-q", str(workspace)], check=True)
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        fake_client = fake_bin / "codex"
+        fake_client.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, sys\n"
+            "argv = sys.argv[1:]\n"
+            "workspace = pathlib.Path(argv[argv.index('-C') + 1])\n"
+            "with open(os.environ['FAKE_LOG'], 'a') as out: out.write(json.dumps(argv) + '\\n')\n"
+            "if 'first task' in argv[-1]:\n"
+            "    path = workspace / 'a.py'\n"
+            "    path.write_text('value = 2\\n')\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'test_1','type':'command_execution','command':\"/bin/zsh -lc 'python3 -m unittest discover -s tests'\",'aggregated_output':'OK\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'last','type':'agent_message','text':'Done'}}), flush=True)\n"
+        )
+        fake_client.chmod(0o700)
+        home = root / "home"
+        home.mkdir()
+        environment = os.environ.copy()
+        environment.update(
+            HOME=str(home),
+            AGAIN_HOME=str(root / "state"),
+            FAKE_LOG=str(root / "calls.jsonl"),
+            PATH=str(fake_bin) + os.pathsep + environment["PATH"],
+        )
+
+        def launch(task_id: str, task: str) -> None:
+            command = [
+                str(binary), "codex", "--workspace", str(workspace),
+                "--task-id", task_id, "--task", task, "--", "--ephemeral",
+            ]
+            result = subprocess.run(
+                command, cwd=workspace, env=environment,
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"launcher failed: {result.stderr}")
+            if "Done" not in result.stdout:
+                raise RuntimeError("structured output did not render the agent message")
+
+        def events() -> list[dict[str, object]]:
+            result = subprocess.run(
+                [str(binary), "brain", "show", "--workspace", str(workspace)],
+                cwd=workspace, env=environment, capture_output=True,
+                text=True, timeout=10, check=True,
+            )
+            return json.loads(result.stdout)
+
+        try:
+            launch("first", "Repair a.py first task")
+            observed = events()
+            if len(observed) != 2 or {row["kind"] for row in observed} != {"file_change", "test"}:
+                raise RuntimeError("completed edit and test were not retained")
+            if "aggregated_output" in json.dumps(observed):
+                raise RuntimeError("raw tool output entered the brain store")
+
+            launch("second", "Improve a.py second task")
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if "--json" not in calls[0]:
+                raise RuntimeError("launcher did not enable structured events")
+            if "AGAIN_BRAIN" not in calls[1][-1] or "a.py" not in calls[1][-1]:
+                raise RuntimeError("second task did not receive current edit history")
+            if "python3 -m unittest discover -s tests" not in calls[1][-1]:
+                raise RuntimeError("second task did not receive the test hint")
+
+            (workspace / "a.py").write_text("value = 3\n")
+            launch("third", "Inspect a.py third task")
+            calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
+            if '"recentCurrentFiles":[]' not in calls[2][-1]:
+                raise RuntimeError("stale edit history remained current")
+
+            subprocess.run(
+                [str(binary), "brain", "clear", "--workspace", str(workspace)],
+                cwd=workspace, env=environment, capture_output=True,
+                text=True, timeout=10, check=True,
+            )
+            if events():
+                raise RuntimeError("brain clear retained activity")
+            return {
+                "schema": "again.brain-single-agent-e2e.v1",
+                "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+                "classification": {"type": "pass", "code": "brain_event_handoff_passed"},
+                "capturedCompletedEvents": len(observed),
+                "nextTaskReceivedCurrentEdit": True,
+                "nextTaskReceivedUnverifiedTestHint": True,
+                "staleEditWithheld": True,
+                "clearRemovedEvents": True,
+            }
+        finally:
+            subprocess.run(
+                [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
+                cwd=workspace, env=environment, capture_output=True, timeout=10,
+            )
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", required=True, type=pathlib.Path)
+    parser.add_argument("--output", type=pathlib.Path)
+    args = parser.parse_args()
+    report = run(args.binary.resolve())
+    serialized = json.dumps(report, indent=2) + "\n"
+    if args.output:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(serialized)
+    print(serialized, end="")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

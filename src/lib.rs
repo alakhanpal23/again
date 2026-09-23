@@ -6,6 +6,7 @@ pub mod agent_gateway_service;
 #[path = "agent_gateway_service_unsupported.rs"]
 pub mod agent_gateway_service;
 pub mod agent_gateway_setup;
+pub mod brain;
 pub mod code_intelligence;
 pub mod effect;
 pub mod engine;

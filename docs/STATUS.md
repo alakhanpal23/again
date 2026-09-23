@@ -2,6 +2,30 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 single-agent Again Brain first slice
+
+`again codex` now requests Codex's structured event stream by default. Its
+launcher renders completed agent messages and command output, and records
+bounded metadata for completed commands and file edits in the workspace's
+local SQLite store. It stores no raw command text or output. A small whitelist
+recognizes successful Python test commands as unverified future hints. File
+edit records carry a post-edit digest and enter a later task's brief only
+after the current file still matches. `again brain show` and `again brain
+clear` inspect and remove this retained activity. Existing same-task
+suggestions now appear in the launcher prebrief with an explicit unverified
+label.
+
+The focused parser, migration, and store tests pass. A
+[local fake-client gate](../bench/results/2026-09-23-brain-single-agent-local-v1.json)
+confirmed automatic event capture, a current edit/test hint in the next task's
+launch prompt, stale-edit withholding after mutation, and user-initiated
+clear. This is a first implementation slice: the
+brain does not yet verify arbitrary shell output, retain full agent knowledge,
+intercept a call before execution, reuse tests, cover Claude events, or show
+a measured single-agent completion-time gain. The new structured-output
+renderer still needs qualification against a real interactive Codex task and
+the existing clean-source launcher gates.
+
 ## 2026-09-23 four-platform native beta checkpoint
 
 [Native qualification run 35919913635](https://github.com/alakhanpal23/again/actions/runs/35919913635)
