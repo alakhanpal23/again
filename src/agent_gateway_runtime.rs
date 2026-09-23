@@ -93,6 +93,7 @@ const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
 // Below this size, exact admission costs more than simply reading the file.
 // Larger reads retain the lease path so concurrent callers can avoid work.
 const DIRECT_CONTEXT_READ_BYTES_V1: u64 = 8 * 1024;
+const MAX_DIRECT_SEARCH_MATCH_FACTS_V1: usize = 2;
 const INTERNAL_REASONING_CONTEXT_TOKEN_V1: &str = "__again_internal_reasoning_context_v1";
 
 struct RuntimeReasoningContextV1 {
@@ -624,6 +625,165 @@ impl GatewayControlledProviderV1 {
             }],
         })
         .ok()
+    }
+
+    fn admit_bounded_search_matches(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: &ProviderCall,
+        value: &Value,
+    ) {
+        let Some(coordinator) = self.context_coordinator.as_ref() else {
+            return;
+        };
+        let descriptor = self.inner.descriptor();
+        if descriptor.id != REPOSITORY_PROVIDER_ID_V1
+            || descriptor.implementation != REPOSITORY_PROVIDER_IMPLEMENTATION_V1
+        {
+            return;
+        }
+        let (Some(pattern), Some(matches)) = (
+            call.arguments.get("pattern").and_then(Value::as_str),
+            value["structuredContent"]["matches"].as_array(),
+        ) else {
+            return;
+        };
+        let mut seen_paths = std::collections::BTreeSet::new();
+        for found in matches {
+            if seen_paths.len() >= MAX_DIRECT_SEARCH_MATCH_FACTS_V1 {
+                break;
+            }
+            let (Some(path), Some(line), Some(snippet), Some(truncated)) = (
+                found["path"].as_str(),
+                found["line"].as_u64(),
+                found["text"].as_str(),
+                found["lineTruncated"].as_bool(),
+            ) else {
+                continue;
+            };
+            let relative = Path::new(path);
+            if path.is_empty()
+                || path.len() > 480
+                || line == 0
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                || !seen_paths.insert(path)
+            {
+                continue;
+            }
+            let Ok(bytes) = epoch.read_repository_file(relative, DIRECT_CONTEXT_READ_BYTES_V1)
+            else {
+                continue;
+            };
+            let Ok(content) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Some(actual) = usize::try_from(line - 1)
+                .ok()
+                .and_then(|index| content.lines().nth(index))
+            else {
+                continue;
+            };
+            if !actual.contains(pattern)
+                || if truncated {
+                    !actual.starts_with(snippet) || actual.len() <= snippet.len()
+                } else {
+                    actual != snippet
+                }
+            {
+                continue;
+            }
+            if epoch
+                .read_repository_file(relative, DIRECT_CONTEXT_READ_BYTES_V1)
+                .ok()
+                .as_deref()
+                != Some(bytes.as_slice())
+            {
+                continue;
+            }
+            let content_digest = blake3::hash(&bytes).to_hex().to_string();
+            let mut request_hasher = blake3::Hasher::new();
+            request_hasher.update(b"again.context.direct-search-match-request.v1\0");
+            request_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+            request_hasher.update(call.translation.canonical_digest());
+            request_hasher.update(path.as_bytes());
+            request_hasher.update(&line.to_le_bytes());
+            let request_digest = request_hasher.finalize().to_hex().to_string();
+            let mut state_hasher = blake3::Hasher::new();
+            state_hasher.update(b"again.context.direct-search-match-state.v1\0");
+            state_hasher.update(request_digest.as_bytes());
+            state_hasher.update(content_digest.as_bytes());
+            let state_digest = state_hasher.finalize().to_hex().to_string();
+            let mut key_hasher = blake3::Hasher::new();
+            key_hasher.update(b"again.context.direct-search-match-dependency.v1\0");
+            key_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+            key_hasher.update(path.as_bytes());
+            let now = now_millis_i64_v1();
+            let Ok(binding) = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+                request_digest,
+                state_digest: state_digest.clone(),
+                policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+                operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+                freshness: GatewayFreshnessEvidenceV1 {
+                    snapshot_digest: state_digest,
+                    observed_at_ms: now,
+                    valid_until_ms: now.saturating_add(60_000),
+                },
+                dependencies: vec![GatewayDependencyV1 {
+                    key_digest: key_hasher.finalize().to_hex().to_string(),
+                    value_digest: content_digest.clone(),
+                }],
+            }) else {
+                continue;
+            };
+            let recipe = json!({
+                "schema": "again.context.direct-search-match-recipe.v1",
+                "path": path,
+                "pattern": pattern,
+                "line": line,
+                "text": snippet,
+                "lineTruncated": truncated,
+            });
+            let proof = json!({
+                "schema": "again.gateway-direct-observation-proof.v1",
+                "requestDigest": binding.request_digest(),
+                "stateDigest": binding.state_digest(),
+                "policyDigest": binding.policy_digest(),
+                "authority": {"semantic": false, "mutationReplay": false,
+                              "externalWriteReplay": false, "cacheHit": false}
+            });
+            if coordinator.observe_dependencies(call, &binding).is_err() {
+                continue;
+            }
+            let observation_id = (|| {
+                let mut store = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let stored = store.insert_result(
+                    &crate::store::direct_observation_request_key_v1(&binding),
+                    &canonical_json_bytes_v1(found),
+                    b"",
+                    0,
+                    0,
+                    POLICY_VERSION_V1,
+                    &serde_json::to_string(&proof)?,
+                )?;
+                store.publish_gateway_direct_observation_v1(&binding, &stored.id)
+            })();
+            if let Ok(observation_id) = observation_id {
+                let locator = format!("repo.search:{path}:{line}");
+                let _ = coordinator.admit_direct_observation_with_locator(
+                    call,
+                    &binding,
+                    &serde_json::to_vec(&recipe).expect("search match recipe serializes"),
+                    &content_digest,
+                    &observation_id,
+                    &locator,
+                );
+            }
+        }
     }
 
     fn large_git_status_index(&self) -> bool {
@@ -1271,8 +1431,9 @@ impl ToolExecution for GatewayControlledProviderV1 {
         }
         // When the source inventory exceeds the bounded task index, broad
         // repository proofs traverse far more input than the provider call.
-        // Return a fresh result without admitting a source fact or result
-        // reference. The task brief already exposes the incomplete inventory.
+        // Return a fresh result without a full-result reference. A search may
+        // separately admit at most two file-backed match facts; no fact claims
+        // the complete search result or the absence of other matches.
         if self.reuse_mode == GatewayReuseModeV1::Automatic
             && self
                 .context_coordinator
@@ -1294,7 +1455,13 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     ) && self.broad_input_overflow(&call))
             })
         {
-            return self.execute_direct(&epoch, call, secrets, true);
+            let observed = self.execute_direct(&epoch, call.clone(), secrets, true);
+            if call.translation.namespaced_tool_name() == "repo.search"
+                && let Ok(value) = &observed
+            {
+                self.admit_bounded_search_matches(&epoch, &call, value);
+            }
+            return observed;
         }
         if self.reuse_mode == GatewayReuseModeV1::Automatic
             && self.direct_repository_operation(&epoch, &call).is_some()

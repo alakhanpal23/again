@@ -2634,6 +2634,14 @@ mod tests {
         assert_eq!(brief["sourcePreviews"][0]["path"], "src/module_0001.py");
         assert_eq!(brief["sourcePreviews"][0]["text"], "value = 1\n");
         assert_eq!(brief["sourcePreviews"][0]["complete"], true);
+        let mut peer = LocalMcpClientV1::connect(workspace.path());
+        let peer_start = peer.tool(
+            "task.start",
+            json!({ "taskId": "large-index-preview", "task": "Edit `src/module_0001.py` safely" }),
+        );
+        let peer_cursor = peer_start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
         let search = agent.tool(
             "repo.search",
             json!({ "path": "src", "pattern": "value = 4096", "maxResults": 2 }),
@@ -2646,6 +2654,21 @@ mod tests {
                 .len(),
             1
         );
+        let shared = peer.tool(
+            "context.delta",
+            json!({ "taskId": "large-index-preview", "afterCursor": peer_cursor, "limit": 64 }),
+        );
+        assert!(
+            shared["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "verified_fact_admission"),
+            "peer missed verified search match: {shared}"
+        );
+        let admitted_cursor = shared["result"]["structuredContent"]["delta"]["cursor"]
+            .as_u64()
+            .unwrap();
         let tree = agent.tool("repo.tree", json!({ "path": "src", "maxResults": 2 }));
         assert!(tree["result"].get("_meta").is_none());
         fs::write(
@@ -2664,6 +2687,18 @@ mod tests {
                 .len(),
             0
         );
+        let retired = peer.tool(
+            "context.delta",
+            json!({ "taskId": "large-index-preview", "afterCursor": admitted_cursor, "limit": 64 }),
+        );
+        assert!(
+            retired["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation"),
+            "peer retained a changed search match: {retired}"
+        );
         let stats = Store::open_for_workspace(workspace.path())
             .unwrap()
             .gateway_stats()
@@ -2671,6 +2706,7 @@ mod tests {
         assert_eq!(stats.requested, 3, "{stats:?}");
         assert_eq!(stats.executed, 3, "{stats:?}");
         assert_eq!(stats.exact_hits, 0, "{stats:?}");
+        peer.stream.shutdown(std::net::Shutdown::Both).unwrap();
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();

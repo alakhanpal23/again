@@ -98,9 +98,12 @@ before changing default routing.
   tools with overflowing requested subtrees and Git status directly. Smaller
   subtrees retain in-flight joins. The 10k-file trial cut their multi-second
   first-call admission while retaining fresh provider execution. This route
-  deliberately withholds a shared fact and result ID for those broad calls;
-  qualify real task outcomes and add a complete cheap change signal before
-  promising exact reuse for them on large repositories.
+  withholds a full-result ID for broad calls. Overflowing searches can now
+  admit at most two file-backed matches as task facts, with source-recipe
+  revalidation and relevant-edit retirement; absence and complete search
+  output are still unknown. Qualify peer delivery and task outcomes on a clean
+  release, then add a complete cheap change signal before promising exact
+  reuse for full broad results on large repositories.
 - Remove the measured warm direct-call authority-check overhead with a shared
   invalidation generation or equivalent fast proof that remains correct across
   connections, restarts, and separate store handles. Preserve the cross-task

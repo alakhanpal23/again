@@ -371,6 +371,36 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     previews[0].get("text") == "value = 1\n" and
                     previews[0].get("complete") is True,
                     "explicit source preview was missing from bounded brief")
+            code_peer = Client(binary, workspace, environment)
+            clients.append(code_peer)
+            peer_code_task = structured(code_peer.tool("task.start", {
+                "taskId": "large-code-task",
+                "task": "Edit `large-code/module_0001.py` safely",
+            }), "large code peer task.start")
+            peer_code_cursor = peer_code_task.get("cursor")
+            require(isinstance(peer_code_cursor, int), "large code peer cursor missing")
+            direct_search = code_agent.tool("repo.search", {
+                "path": "large-code", "pattern": "value = 4096", "maxResults": 2,
+            })
+            direct_search_content = structured(direct_search, "overflow direct search")
+            require(result_id(direct_search["result"]) is None and
+                    len(direct_search_content.get("matches", [])) == 1,
+                    "overflow search claimed a full result or missed its match")
+            shared_match = structured(code_peer.tool("context.delta", {
+                "taskId": "large-code-task", "afterCursor": peer_code_cursor, "limit": 64,
+            }), "large code peer match delta")
+            require(any(event.get("kind") == "verified_fact_admission"
+                        for event in shared_match.get("delta", {}).get("events", [])),
+                    "peer missed the file-backed search match")
+            match_cursor = shared_match.get("delta", {}).get("cursor")
+            require(isinstance(match_cursor, int), "match delta cursor missing")
+            (large_code / "module_4096.py").write_text("changed = 4096\n")
+            retired_match = structured(code_peer.tool("context.delta", {
+                "taskId": "large-code-task", "afterCursor": match_cursor, "limit": 64,
+            }), "large code peer invalidation delta")
+            require(any(event.get("kind") == "invalidation"
+                        for event in retired_match.get("delta", {}).get("events", [])),
+                    "peer retained a changed search match")
             cancel_text = "CANCEL_SOURCE\n" + "x" * 8192
             (workspace / "cancel.txt").write_text(cancel_text)
             cancel_owner = Client(binary, workspace, environment)
@@ -539,7 +569,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused", "inflight_follower_cancelled", "lease_owner_crash_recovered"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "overflow_search_match_shared_and_retired", "recipient_cancel_scoped", "corrupt_result_refused", "inflight_follower_cancelled", "lease_owner_crash_recovered"],
                 "duplicate_read_events": dict(event_counts),
                 "direct_observation_stats": {
                     "published": direct_stats["direct_observations_published"],

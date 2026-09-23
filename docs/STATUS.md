@@ -473,11 +473,16 @@ Warm p50 search/tree/Git status in the trial was 478/296/26 ms, close to its
 direct controls of 486/298/26 ms. All six calls in each case executed the
 provider, with zero exact hits. The route applies only after task-start's
 source inventory reports more than 4,096 files and the requested subtree also
-exceeds that bound; Git status uses the workspace bound. Broad tool outputs then do
-not publish shared facts or retrievable result IDs. Narrow source reads and
-stats remain source backed. The authenticated 4,097-file test covers fresh
-search results after mutation; the local trial remains source dirty and needs
-a clean-source release gate.
+exceeds that bound; Git status uses the workspace bound. A broad direct
+search now separately admits up to two verified matches from files no larger
+than 8 KiB, with file-specific source recipes. It does not publish a
+retrievable full-search result or claim that other matches are absent. Other
+broad direct calls publish no fact. Narrow source reads and stats remain
+source backed. The authenticated 4,097-file test covers a peer receiving a
+verified match and its invalidation after mutation. The
+[10k-file match-fact trial](../bench/results/2026-09-23-gateway-task-reuse-value-match-facts-10k-trial-v1.json)
+measured cold/warm task-bound search at 0.505/0.489 seconds, with six physical
+provider executions and zero exact hits; a clean-source release run remains.
 The [clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-scoped-overflow-release-v1.json)
 at `d0ee560` passed the full task source lifecycle. In particular, a
 concurrent search of a bounded `lease/` subtree in the same large workspace

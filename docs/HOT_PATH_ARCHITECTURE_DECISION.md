@@ -35,10 +35,14 @@ in the durable ledger and keeps their independent revalidation path.
 When task-start's bounded source inventory proves more than 4,096 files,
 `git.status` and broad `repo.*` calls whose requested subtree also exceeds
 that bound execute directly. A bounded search in a smaller subtree can still
-coalesce with a peer. Their fresh output
-has no cache hit or shared-fact authority; the task brief already declares
-its index incomplete. Narrow `repo.read` and `repo.stat` keep their source-backed
-paths, and smaller workspaces keep broad result admission. A later complete
+coalesce with a peer. An overflowing search may separately verify and share
+up to two returned matches from files no larger than 8 KiB. Each match has a
+file-specific recipe that rechecks its path, content digest, line, and snippet;
+it proves only that match. The complete search output has no cache hit or
+retrievable result authority. Other broad direct calls publish no fact. The
+task brief still declares its index incomplete. Narrow `repo.read` and
+`repo.stat` keep their source-backed paths, and smaller workspaces keep broad
+result admission. A later complete
 change signal can safely restore broad exact reuse without this cold penalty.
 
 The intended lanes are:

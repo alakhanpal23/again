@@ -47,6 +47,7 @@ const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1: usize = 256;
+const MAX_DIRECT_SEARCH_MATCH_SOURCE_BYTES_V1: u64 = 8 * 1024;
 const MAX_CONTEXT_FRESHNESS_SOURCES_V1: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -352,6 +353,25 @@ impl LocalContextCoordinatorV1 {
         repository_digest: &str,
         observation_id: &str,
     ) -> Result<()> {
+        self.admit_direct_observation_with_locator(
+            call,
+            binding,
+            recipe_json,
+            repository_digest,
+            observation_id,
+            &source_locator_v1(call),
+        )
+    }
+
+    pub(super) fn admit_direct_observation_with_locator(
+        &self,
+        call: &ProviderCall,
+        binding: &crate::store::ValidatedGatewayReadV1,
+        recipe_json: &[u8],
+        repository_digest: &str,
+        observation_id: &str,
+        locator: &str,
+    ) -> Result<()> {
         let Some(identity) = self.active_identity_for_call(call) else {
             return Ok(());
         };
@@ -359,12 +379,8 @@ impl LocalContextCoordinatorV1 {
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let source = store.context_verified_observation_v1(
-            &identity,
-            binding,
-            observation_id,
-            &source_locator_v1(call),
-        )?;
+        let source =
+            store.context_verified_observation_v1(&identity, binding, observation_id, locator)?;
         store.admit_context_source_recipe_v1(
             &identity,
             binding,
@@ -523,6 +539,10 @@ impl LocalContextCoordinatorV1 {
         let current = match recipe {
             Some((expected_digest, plan_json)) => {
                 if let Ok(recipe) = serde_json::from_slice::<Value>(&plan_json)
+                    && recipe["schema"] == "again.context.direct-search-match-recipe.v1"
+                {
+                    direct_search_match_current_v1(observed, &recipe, &expected_digest)
+                } else if let Ok(recipe) = serde_json::from_slice::<Value>(&plan_json)
                     && (recipe["schema"] == "again.context.direct-stat-recipe.v1"
                         || recipe["schema"] == "again.context.direct-repository-recipe.v1")
                 {
@@ -2100,6 +2120,62 @@ fn bounded_string_array_v1(
                 .ok_or_else(|| anyhow!("invalid_argument"))
         })
         .collect()
+}
+
+fn direct_search_match_current_v1(
+    observed: &SharedObservedWorkspaceV1,
+    recipe: &Value,
+    expected_digest: &str,
+) -> bool {
+    if recipe.as_object().is_none_or(|object| object.len() != 6) {
+        return false;
+    }
+    let (Some(path), Some(pattern), Some(line), Some(snippet), Some(truncated)) = (
+        recipe["path"].as_str(),
+        recipe["pattern"].as_str(),
+        recipe["line"].as_u64(),
+        recipe["text"].as_str(),
+        recipe["lineTruncated"].as_bool(),
+    ) else {
+        return false;
+    };
+    let relative = Path::new(path);
+    if path.is_empty()
+        || path.len() > 512
+        || pattern.is_empty()
+        || pattern.len() > 4096
+        || snippet.len() > 4096
+        || line == 0
+        || !relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return false;
+    }
+    let Ok(bytes) = observed
+        .execution_epoch
+        .read_repository_file(relative, MAX_DIRECT_SEARCH_MATCH_SOURCE_BYTES_V1)
+    else {
+        return false;
+    };
+    if blake3::hash(&bytes).to_hex().as_str() != expected_digest {
+        return false;
+    }
+    let Ok(content) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Some(actual) = usize::try_from(line - 1)
+        .ok()
+        .and_then(|index| content.lines().nth(index))
+    else {
+        return false;
+    };
+    actual.contains(pattern)
+        && if truncated {
+            actual.starts_with(snippet) && actual.len() > snippet.len()
+        } else {
+            actual == snippet
+        }
 }
 
 fn source_locator_v1(call: &ProviderCall) -> String {
