@@ -100,8 +100,8 @@ has a persisted proof and an `explain` reason.
 - Qualify the new source-recipe reobservation across every built-in repository
   and Git tool, relevant and irrelevant edits, daemon restart, quota limits,
   concurrent mutation, and large task ledgers. Task-start now returns an
-  incomplete brief at the 256-source scan bound; extend this behavior to
-  context delta and prove it with a release-binary ledger above the bound.
+  incomplete brief at the 256-source scan bound, and context delta withholds
+  events at the same bound; prove both with a release-binary ledger above it.
   Retain atomic, scope-bound cross-task retirement.
 - Keep task-start local and bounded. An unavailable index returns an explicit
   incomplete brief quickly; validation preview never declares a test skippable

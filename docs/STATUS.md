@@ -262,8 +262,9 @@ Task start now returns an explicitly incomplete full brief when current source
 revalidation exceeds its 256-source bound or its workspace observation is
 unavailable. The brief omits unchecked verified facts, result references, code
 candidates, and source previews; incomplete delivery grants no compact-context
-acknowledgment. A 257-source authenticated service test covers the bound. The
-context delta operation still reports a typed freshness refusal in this case.
+acknowledgment. Context delta likewise returns no unchecked events or compact
+acknowledgment at this bound. A 257-source authenticated service test covers
+both responses.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

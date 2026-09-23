@@ -2414,6 +2414,9 @@ mod tests {
         let arguments = json!({ "taskId": "bounded-freshness", "task": "inspect sources" });
         let start = agent.tool("task.start", arguments.clone());
         assert!(start.get("error").is_none(), "{start}");
+        let initial_cursor = start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
         for index in 0..=256 {
             let read = agent.tool(
                 "repo.read",
@@ -2425,6 +2428,19 @@ mod tests {
             );
         }
         fs::write(workspace.path().join("source-000.txt"), b"changed\n").unwrap();
+        let delta = agent.tool(
+            "context.delta",
+            json!({ "taskId": "bounded-freshness", "afterCursor": initial_cursor, "limit": 64 }),
+        );
+        assert!(delta.get("error").is_none(), "{delta}");
+        assert_eq!(
+            delta["result"]["structuredContent"]["presentation"],
+            "incomplete"
+        );
+        assert_eq!(
+            delta["result"]["structuredContent"]["delta"]["events"],
+            json!([])
+        );
         let mut peer = LocalMcpClientV1::connect(workspace.path());
         let bounded = peer.tool("task.start", arguments);
         assert!(bounded.get("error").is_none(), "{bounded}");

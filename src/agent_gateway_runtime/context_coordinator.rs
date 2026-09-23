@@ -952,7 +952,28 @@ impl LocalContextCoordinatorV1 {
         if !allowed {
             bail!("full_delivery_required");
         }
-        self.refresh_current_sources(call, &identity)?;
+        if let Err(error) = self.refresh_current_sources(call, &identity) {
+            let reason = error.to_string();
+            if matches!(
+                reason.as_str(),
+                "context_freshness_capacity_exceeded" | "context_freshness_unavailable"
+            ) {
+                return Ok(ContextOperationResultV1::exact(tool_result_v1(json!({
+                    "schemaVersion": 1,
+                    "operation": "context.delta",
+                    "presentation": "incomplete",
+                    "delta": {
+                        "after": after,
+                        "cursor": after,
+                        "has_more": true,
+                        "events": [],
+                        "incomplete": true,
+                        "unknowns": [{ "kind": reason }]
+                    }
+                }))));
+            }
+            return Err(error);
+        }
         let delta = self
             .store
             .lock()
