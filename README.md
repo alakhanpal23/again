@@ -10,15 +10,12 @@ Again helps one coding agent start with a verified repository brief, carry usefu
 
 - `again codex --workspace <path> --task-id <id> --task <text> -- [codex flags]` — launch Codex with bounded current source previews, relevant Brain history, and a validation suggestion. Completed tool calls and run usage are recorded locally.
 - `again brain show|clear --workspace <path>` — inspect or clear bounded activity, source observations, test hints, and Codex run summaries. Brain history is guidance; tests still run.
-- `again brain observe-codex-hook` — optional stdin adapter for Codex `PostToolUse` Bash events in interactive sessions. Configure a `PostToolUse` hook with matcher `^Bash$`, command `<absolute-path-to-again> brain observe-codex-hook`, and `async: true`. It emits no hook output. The launcher above remains the qualified automatic capture path.
+- `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Completed interactive Bash calls can then update Brain without hand editing Codex settings.
+- `again brain observe-codex-hook` — the observer's stdin adapter. It emits no hook output and never changes a tool call.
 
-For interactive observation, merge this handler into the repository's
-`.codex/hooks.json`, replacing the executable placeholder with the installed
-absolute path:
-
-```json
-{"hooks":{"PostToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/absolute/path/to/again brain observe-codex-hook","async":true,"timeout":5}]}]}}
-```
+For interactive Codex sessions, run the hook setup command once in that
+repository. Again preserves unrelated
+handlers and refuses to overwrite a hook file changed after installation.
 
 The observer does not rewrite or skip a tool call. Codex hook coverage and
 response shapes vary by tool; unrecognized responses contribute only command
@@ -59,6 +56,7 @@ Again's near-term goal is lower time and cost per correct, validated single-agen
 ```bash
 cargo install --locked --path . --features daemon
 again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill
+again brain hook-setup --workspace "$(pwd -P)" --apply
 again codex --workspace "$(pwd -P)" --task-id fix-example --task "Fix the failing example and run its tests" -- --ephemeral
 again brain show --workspace "$(pwd -P)"
 ```

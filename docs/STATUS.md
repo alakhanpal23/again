@@ -4,6 +4,15 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 native Codex hook observation (opt-in)
 
+`again brain hook-setup --workspace <path>` now previews a project Codex hook
+change, `--apply` installs the observation-only handler, and `--remove`
+restores an unchanged prior `hooks.json` byte for byte. Setup keeps unrelated
+handlers, refuses symlinked configuration and user edits made after install,
+and records ownership in a private snapshot. A live isolated Codex run passed
+preview, apply, asynchronous read capture, and remove. This closes the manual
+configuration step for opt-in interactive observation; the primary MCP setup
+flow remains separate.
+
 The `again brain observe-codex-hook` stdin adapter can now record completed
 interactive Codex Bash calls into the same repository Brain as the `again codex`
 launcher. The adapter retains a command digest, not command text or output.
@@ -14,8 +23,8 @@ status unknown. An explicit zero exit in a structured response can yield a
 recognized successful test hint. Unknown response shapes remain command
 metadata only. The adapter
 is idempotent for a repeated `tool_use_id`, bounded to 1 MiB input, and emits
-no model-visible hook output. It is not installed by `again setup`; opt-in
-`PostToolUse` configuration and broader live hook qualification remain.
+no model-visible hook output. It is not installed by `again setup`; broader
+live hook qualification remains.
 The launcher remains the currently qualified automatic capture path.
 An interactive read without a lifecycle task can now be nominated on a later
 task by matching words in its path. The file is still rechecked against its
@@ -24,8 +33,7 @@ The [live opt-in hook probe](../bench/results/2026-09-23-native-hook-e2e-09a7bb5
 ran Codex against an isolated repository with a `PostToolUse` observer. It
 captured the plain-string response, stored two bounded event rows and one
 verified file observation, and retained no command text. This qualifies the
-basic live read path; broader interactive tasks and automatic installation are
-still open.
+basic live read path; broader interactive tasks remain open.
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 

@@ -258,6 +258,15 @@ enum BrainCommand {
     /// Ingest one completed Codex PostToolUse event from stdin.
     #[command(hide = true)]
     ObserveCodexHook,
+    /// Configure repository-scoped observation of completed Codex Bash calls.
+    HookSetup {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, conflicts_with = "remove")]
+        apply: bool,
+        #[arg(long, conflicts_with = "apply")]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1388,6 +1397,22 @@ fn mcp_brief(args: McpBriefArgs) -> Result<i32> {
 #[cfg(feature = "daemon")]
 fn brain_cli(args: BrainArgs) -> Result<i32> {
     match args.command {
+        BrainCommand::HookSetup {
+            workspace,
+            apply,
+            remove,
+        } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let executable = fs::canonicalize(std::env::current_exe()?)?;
+            let change = crate::observer_setup::configure_codex_brain_hook_v1(
+                &workspace,
+                &executable,
+                apply,
+                remove,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&change)?);
+            return Ok(0);
+        }
         BrainCommand::ObserveCodexHook => {
             let mut input = Vec::new();
             io::stdin().take(1024 * 1024 + 1).read_to_end(&mut input)?;

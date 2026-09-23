@@ -72,7 +72,13 @@ well. It can select a prior file from a related task even when that file is
 outside the current code index candidates; it rechecks source bytes before
 presenting the file as current. Older unscoped observations are withheld from
 the brief after the scope-binding migration. The launcher consumes the
-task-start field without a second Brain lookup.
+task-start field without a second Brain lookup. An optional repository-scoped
+`again brain hook-setup --workspace <path> --apply` installs an observation-only
+Codex `PostToolUse` Bash hook for interactive sessions. It preserves unrelated
+hook handlers and an ownership snapshot permits restoring an unchanged prior
+configuration with `--remove`. The hook records bounded command metadata and
+source reads whose plain output exactly matches current file bytes; a response
+without exit status does not establish successful validation.
 `again brain show --workspace <path>` inspects the metadata and run summaries,
 and `again brain clear --workspace <path>` removes it. This does not intercept
 or cache native shell calls, and a prior test hint never permits skipping a

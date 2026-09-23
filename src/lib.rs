@@ -16,6 +16,8 @@ pub mod fingerprint;
 #[cfg(feature = "hook")]
 pub mod hook;
 pub mod mcp_gateway;
+#[cfg(feature = "daemon")]
+pub mod observer_setup;
 // Keep the disabled Linux pytest profile crate-private while its implementations
 // are built behind the frozen interfaces.
 #[cfg(feature = "linux-pytest")]
