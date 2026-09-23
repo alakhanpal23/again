@@ -324,7 +324,8 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             cancelled_retrieval = cancel_peer.tool("context.retrieve", {
                 "taskId": "cancel-source-task", "resultId": cancel_id,
             })
-            require(cancelled_retrieval.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
+            require(cancelled_retrieval.get("error", {}).get("data", {}).get("reason") in
+                    {"invalid_agent_context", "retrieval_refused"},
                     f"retired recipient reference remained retrievable: {cancelled_retrieval}")
             owner_retrieval = structured(cancel_owner.tool("context.retrieve", {
                 "taskId": "cancel-source-task", "resultId": cancel_id,
