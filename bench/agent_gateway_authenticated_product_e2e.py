@@ -220,13 +220,60 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             replacement_id = result_id(replacement["result"])
             require(tool_text(replacement["result"]) == "BETA_SOURCE\n" and replacement_id != original_id,
                     "edited source did not get a new exact result")
+
+            large = workspace / "large-ledger"
+            large.mkdir()
+            for index in range(257):
+                (large / f"source-{index:03}.txt").write_text(f"source {index}\n")
+            large_agent = Client(binary, workspace, environment)
+            clients.append(large_agent)
+            large_task = {"taskId": "large-ledger-task", "task": "inspect the large ledger"}
+            large_start = structured(large_agent.tool("task.start", large_task), "large task.start")
+            require(large_start.get("presentation") == "full", "large task initial brief missing")
+            large_cursor = large_start.get("cursor")
+            require(isinstance(large_cursor, int), "large task cursor missing")
+            first_large_id = None
+            for index in range(257):
+                read = large_agent.tool("repo.read", {"path": f"large-ledger/source-{index:03}.txt"})
+                structured(read, f"large read {index}")
+                admitted_id = result_id(read["result"])
+                require(admitted_id is not None, f"large source {index} was not admitted")
+                if index == 0:
+                    first_large_id = admitted_id
+            require(first_large_id is not None, "first large source ID missing")
+            (large / "source-000.txt").write_text("changed\n")
+            large_delta = structured(large_agent.tool("context.delta", {
+                "taskId": "large-ledger-task", "afterCursor": large_cursor, "limit": 64,
+            }), "large context.delta")
+            require(large_delta.get("presentation") == "incomplete" and
+                    large_delta.get("delta", {}).get("events") == [],
+                    "large delta exposed unchecked events")
+            large_peer = Client(binary, workspace, environment)
+            clients.append(large_peer)
+            large_brief = structured(large_peer.tool("task.start", large_task), "large peer task.start")
+            require(large_brief.get("presentation") == "full" and
+                    large_brief.get("contextFreshness", {}).get("reason") == "context_freshness_capacity_exceeded",
+                    "large brief did not explain the freshness bound")
+            require(large_brief.get("context", {}).get("current_facts") == [] and
+                    large_brief.get("context", {}).get("result_references") == [] and
+                    large_brief.get("relevantCode", {}).get("candidates") == [],
+                    "large brief exposed unchecked context")
+            repeated_brief = structured(large_peer.tool("task.start", large_task), "repeated large task.start")
+            require(repeated_brief.get("presentation") == "full",
+                    "incomplete brief incorrectly granted compact delivery")
+            stale_large = large_peer.tool("context.retrieve", {
+                "taskId": "large-ledger-task", "resultId": first_large_id,
+            })
+            require(stale_large.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
+                    "stale large-ledger source was retrievable")
             return {
                 "schema": SCHEMA,
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete"],
                 "duplicate_read_events": dict(event_counts),
+                "large_ledger_sources": 257,
                 "old_result_id": original_id,
                 "new_result_id": replacement_id,
             }
