@@ -249,6 +249,13 @@ ID; the harness still assumes the earlier storage route. This is a harness
 qualification gap, not passing release evidence. The harness must start
 authenticated tasks for shared-context and result-reference scenarios and
 check direct standalone behavior separately.
+The new authenticated [production-binary task harness](../bench/agent_gateway_authenticated_product_e2e.py)
+exercises that route with two daemon-connected clients. A local dirty-source
+diagnostic passed standalone direct execution, one physical execution for two
+simultaneous task-bound reads, peer fact/retrieval, preservation after an
+unrelated edit, and retirement after an unobserved relevant edit. Clean-source
+exact-SHA evidence is pending; this focused harness does not replace the
+legacy cancellation, lease, or corruption scenarios.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

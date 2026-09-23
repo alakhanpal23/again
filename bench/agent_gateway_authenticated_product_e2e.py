@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""Exercise source-backed task context through the production daemon binary."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import select
+import subprocess
+import tempfile
+import threading
+import time
+from collections import Counter
+from typing import Any
+
+from agent_gateway_product_e2e import GatewayEvents, inspect_clean_source, pin_binary, result_id
+
+
+PROTOCOL = "2025-06-18"
+SCHEMA = "again.authenticated-product-e2e.v1"
+
+
+def require(condition: bool, reason: str) -> None:
+    if not condition:
+        raise RuntimeError(reason)
+
+
+class Client:
+    def __init__(self, binary: pathlib.Path, workspace: pathlib.Path, environment: dict[str, str]):
+        self.process = subprocess.Popen(
+            [str(binary), "mcp", "connect", "--workspace", str(workspace)],
+            cwd=workspace,
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self.next_id = 0
+        self.request("initialize", {
+            "protocolVersion": PROTOCOL,
+            "capabilities": {},
+            "clientInfo": {"name": "again-authenticated-e2e", "version": "1"},
+        })
+
+    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        require(self.process.stdin is not None and self.process.stdout is not None, "client pipes missing")
+        self.next_id += 1
+        identifier = self.next_id
+        frame = json.dumps({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params}, separators=(",", ":"))
+        self.process.stdin.write(frame.encode() + b"\n")
+        self.process.stdin.flush()
+        ready, _, _ = select.select([self.process.stdout], [], [], 15)
+        require(bool(ready), f"{method} timed out")
+        line = self.process.stdout.readline()
+        require(bool(line), f"{method} ended without response")
+        response = json.loads(line)
+        require(response.get("id") == identifier, f"{method} response ID mismatch")
+        return response
+
+    def tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        return self.request("tools/call", {"name": name, "arguments": arguments})
+
+    def close(self) -> None:
+        if self.process.stdin is not None:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        for stream in (self.process.stdout, self.process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def structured(response: dict[str, Any], label: str) -> dict[str, Any]:
+    require("error" not in response, f"{label} failed: {response.get('error')}")
+    result = response.get("result")
+    require(isinstance(result, dict) and result.get("isError") is not True, f"{label} refused: {result}")
+    content = result.get("structuredContent")
+    require(isinstance(content, dict), f"{label} has no structured content")
+    return content
+
+
+def tool_text(result: dict[str, Any]) -> str | None:
+    content = result.get("content")
+    if isinstance(content, list) and content and isinstance(content[0], dict):
+        value = content[0].get("text")
+        return value if isinstance(value, str) else None
+    return None
+
+
+def start_daemon(binary: pathlib.Path, workspace: pathlib.Path, environment: dict[str, str]) -> subprocess.Popen[bytes]:
+    daemon = subprocess.Popen(
+        [str(binary), "mcp", "daemon", "serve", "--workspace", str(workspace)],
+        cwd=workspace, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    for _ in range(250):
+        status = subprocess.run(
+            [str(binary), "mcp", "daemon", "status", "--workspace", str(workspace)],
+            cwd=workspace, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+        if status.returncode == 0:
+            return daemon
+        if daemon.poll() is not None:
+            detail = daemon.stderr.read().decode(errors="replace") if daemon.stderr else ""
+            raise RuntimeError(f"daemon exited: {detail[:1000]}")
+        time.sleep(0.02)
+    raise RuntimeError("daemon readiness timed out")
+
+
+def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dict[str, Any]:
+    require(binary.is_absolute() and binary.resolve() == binary, "binary path must be canonical")
+    require(binary.is_file(), "binary missing")
+    with tempfile.TemporaryDirectory(prefix="again-authenticated-product-") as temporary:
+        root = pathlib.Path(temporary).resolve()
+        home = root / "home"
+        state = root / "state"
+        workspace = root / "workspace"
+        for path in (home, state, workspace):
+            path.mkdir(mode=0o700)
+        source = inspect_clean_source(source_root, source_sha, home)
+        pinned = pin_binary(binary, root / "pinned" / "again")
+        binary = pinned.executable_path
+        (workspace / "input.txt").write_text("ALPHA_SOURCE\n")
+        (workspace / "other.txt").write_text("unrelated\n")
+        environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "AGAIN_HOME": str(state)}
+        daemon = start_daemon(binary, workspace, environment)
+        clients: list[Client] = []
+        try:
+            solo = Client(binary, workspace, environment)
+            clients.append(solo)
+            standalone = solo.tool("repo.read", {"path": "input.txt"})
+            structured(standalone, "standalone read")
+            require(result_id(standalone["result"]) is None, "cheap standalone read unexpectedly stored a result")
+            require(tool_text(standalone["result"]) == "ALPHA_SOURCE\n", "standalone bytes differ")
+
+            first = Client(binary, workspace, environment)
+            second = Client(binary, workspace, environment)
+            clients.extend((first, second))
+            task_arguments = {"taskId": "shared-source-task", "task": "inspect input.txt"}
+            first_start = structured(first.tool("task.start", task_arguments), "first task.start")
+            second_start = structured(second.tool("task.start", task_arguments), "second task.start")
+            require(first_start.get("presentation") == "full", "first task brief missing")
+            require(second_start.get("presentation") == "full", "second task brief missing")
+            reader = GatewayEvents(state / "again.sqlite")
+            window_start = reader.begin()
+            barrier = threading.Barrier(3)
+            reads: list[dict[str, Any] | None] = [None, None]
+            failures: list[BaseException] = []
+
+            def read_once(index: int, client: Client) -> None:
+                try:
+                    barrier.wait(timeout=5)
+                    reads[index] = client.tool("repo.read", {"path": "input.txt"})
+                except BaseException as error:
+                    failures.append(error)
+
+            workers = [threading.Thread(target=read_once, args=(0, first)),
+                       threading.Thread(target=read_once, args=(1, second))]
+            for worker in workers:
+                worker.start()
+            barrier.wait(timeout=5)
+            for worker in workers:
+                worker.join(timeout=15)
+            require(not failures and all(not worker.is_alive() for worker in workers),
+                    f"concurrent reads failed: {failures}")
+            first_read = reads[0]
+            second_read = reads[1]
+            require(isinstance(first_read, dict) and isinstance(second_read, dict), "read response missing")
+            structured(first_read, "task-bound read")
+            structured(second_read, "peer task-bound read")
+            original_id = result_id(first_read["result"])
+            require(original_id is not None, "task-bound read has no result reference")
+            require(result_id(second_read["result"]) == original_id, "duplicate read did not share the exact result")
+            event_window = reader.end(window_start)
+            bindings = reader.bindings(event_window)
+            require(len(bindings) == 1, "duplicate read used different authority bindings")
+            event_counts = Counter(event["event_type"] for event in reader.events(bindings[0]["binding_digest"], event_window))
+            require(event_counts["requested"] == 2 and event_counts["executed"] == 1 and
+                    event_counts["completed"] == 1 and event_counts["exact_hit"] + event_counts["inflight_join"] == 1,
+                    f"duplicate read execution was not avoided: {dict(event_counts)}")
+            observer = Client(binary, workspace, environment)
+            clients.append(observer)
+            joined = structured(observer.tool("task.start", task_arguments), "joined task.start")
+            context = joined.get("context", {})
+            require(any(fact.get("sources", [{}])[0].get("locator") == "repo.read:input.txt"
+                        for fact in context.get("current_facts", [])), "peer did not receive verified source fact")
+            require(any(ref.get("result_id") == original_id for ref in context.get("result_references", [])),
+                    "peer did not receive result reference")
+            retrieved = structured(second.tool("context.retrieve", {
+                "taskId": "shared-source-task", "resultId": original_id,
+            }), "peer retrieval")
+            require(tool_text(retrieved.get("toolResult", {})) == "ALPHA_SOURCE\n",
+                    "peer retrieved wrong source bytes")
+
+            (workspace / "other.txt").write_text("changed unrelated\n")
+            unaffected_client = Client(binary, workspace, environment)
+            clients.append(unaffected_client)
+            unaffected = structured(unaffected_client.tool("task.start", task_arguments), "unrelated edit task.start")
+            require(any(ref.get("result_id") == original_id for ref in unaffected.get("context", {}).get("result_references", [])),
+                    "unrelated edit retired source reference")
+
+            (workspace / "input.txt").write_text("BETA_SOURCE\n")
+            invalidated_client = Client(binary, workspace, environment)
+            clients.append(invalidated_client)
+            invalidated = structured(invalidated_client.tool("task.start", task_arguments), "relevant edit task.start")
+            require(not any(ref.get("result_id") == original_id for ref in invalidated.get("context", {}).get("result_references", [])),
+                    "stale reference survived unobserved edit")
+            denied = second.tool("context.retrieve", {"taskId": "shared-source-task", "resultId": original_id})
+            require(denied.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
+                    "stale retrieval was not refused")
+            replacement = first.tool("repo.read", {"path": "input.txt"})
+            structured(replacement, "replacement read")
+            replacement_id = result_id(replacement["result"])
+            require(tool_text(replacement["result"]) == "BETA_SOURCE\n" and replacement_id != original_id,
+                    "edited source did not get a new exact result")
+            return {
+                "schema": SCHEMA,
+                "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
+                "source": source,
+                "binary_sha256": pinned.sha256,
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit"],
+                "duplicate_read_events": dict(event_counts),
+                "old_result_id": original_id,
+                "new_result_id": replacement_id,
+            }
+        finally:
+            for client in clients:
+                client.close()
+            if daemon.poll() is None:
+                subprocess.run([str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
+                               cwd=workspace, env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            daemon.wait(timeout=5)
+            if daemon.stderr:
+                daemon.stderr.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--again-binary", required=True, type=pathlib.Path)
+    parser.add_argument("--source-root", required=True, type=pathlib.Path)
+    parser.add_argument("--source-git-sha", required=True)
+    parser.add_argument("--output", required=True, type=pathlib.Path)
+    args = parser.parse_args()
+    require(args.output.is_absolute() and not args.output.exists(), "output must be a new absolute path")
+    report = run(args.again_binary, args.source_root, args.source_git_sha)
+    args.output.write_text(json.dumps(report, sort_keys=True, indent=2) + "\n")
+    print(json.dumps({"output": str(args.output), "classification": report["classification"]}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
