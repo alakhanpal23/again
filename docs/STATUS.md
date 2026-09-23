@@ -20,7 +20,12 @@ matched the raw Codex event stream exactly. It recorded one edit, one test
 command, and no source reread. The [authenticated release gate](../bench/results/2026-09-23-brain-run-summary-3c171dd/again-auth-product-76ed747-retry.json)
 passed on the second attempt. Its first attempt timed out waiting for the
 existing `follower_cancelled` audit event; that intermittent gate behavior
-remains to be diagnosed before production qualification.
+remains to be diagnosed before production qualification. After grouping Brain
+task-query identity, the strict all-target/all-feature Clippy gate and 210
+library tests passed. The current release binary also passed the
+[isolated Brain gate](../bench/results/2026-09-23-brain-run-summary-f99df83/again-brain-run-summary-f99df83.json)
+and [authenticated product gate](../bench/results/2026-09-23-brain-run-summary-f99df83/again-auth-product-f99df83.json)
+at clean source `f99df83`.
 
 Task matching now considers the Brain's bounded retained file set (at most
 10,000 observations over 90 days) instead of only its 64 newest files. The
