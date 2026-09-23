@@ -2,6 +2,18 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 source-matched native reads
+
+The Brain now recognizes single-file `cat` and bounded `sed -n 1,Np` reads,
+including relative paths, only when completed client output exactly matches
+bytes independently read from the named current workspace source file. It
+records a path and digest, not the arbitrary output. Shell composition,
+unmatched output, missing source files, large files, and unsupported selectors
+remain plain command metadata. The later task still rechecks current bytes
+before presenting a source preview. This extends read observation to the
+`sed` shape seen in the live calculator trace without assuming that the
+client's session cwd was the effective command cwd.
+
 ## 2026-09-23 materialized repository memory
 
 Again Brain now retains a bounded latest observation per edited file and per

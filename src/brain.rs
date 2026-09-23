@@ -95,11 +95,7 @@ pub fn codex_completed_events_v1(
                 created_ms,
             }];
             if exit_code == 0
-                && let Some(path) = observed_absolute_read_path_v1(command)
-                && let Some((relative, absolute)) = workspace_file_v1(workspace, path)
-                && source_code_path_v1(&relative)
-                && fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= 8 * 1024)
-                && let Ok(bytes) = fs::read(&absolute)
+                && let Some((relative, bytes)) = matching_source_read_v1(item, workspace, command)
             {
                 events.push(BrainEventV1 {
                     session_id: session_id.to_owned(),
@@ -274,40 +270,76 @@ fn known_test_command_v1(command: &str) -> Option<&'static str> {
     }
 }
 
-fn observed_absolute_read_path_v1(command: &str) -> Option<&str> {
-    let command = command.trim();
-    let command = command
-        .strip_prefix("/bin/zsh -lc '")
-        .and_then(|inner| inner.strip_suffix('\''))
-        .unwrap_or(command);
-    // Only a literal unquoted absolute operand can be attributed to this
-    // command without interpreting shell syntax or an unknown effective cwd.
-    let path = command.strip_prefix("cat ")?;
-    (!path.contains(char::is_whitespace)
-        && !path.chars().any(|character| {
-            matches!(
-                character,
-                ';' | '|'
-                    | '&'
-                    | '<'
-                    | '>'
-                    | '$'
-                    | '`'
-                    | '*'
-                    | '?'
-                    | '['
-                    | ']'
-                    | '{'
-                    | '}'
-                    | '('
-                    | ')'
-                    | '\\'
-                    | '\''
-                    | '"'
-            )
-        })
-        && Path::new(path).is_absolute())
-    .then_some(path)
+fn matching_source_read_v1(
+    item: &Value,
+    workspace: &Path,
+    command: &str,
+) -> Option<(String, Vec<u8>)> {
+    let outer = shell_words::split(command).ok()?;
+    let argv = if matches!(outer.as_slice(), [shell, flag, _]
+        if shell == "/bin/zsh" && flag == "-lc")
+    {
+        shell_words::split(&outer[2]).ok()?
+    } else {
+        outer
+    };
+    let (path, lines) = match argv.as_slice() {
+        [program, path] if program == "cat" => (path.as_str(), None),
+        [program, flag, range, path] if program == "sed" && flag == "-n" => {
+            let end = range
+                .strip_prefix("1,")?
+                .strip_suffix('p')?
+                .parse::<usize>()
+                .ok()?;
+            if !(1..=200).contains(&end) {
+                return None;
+            }
+            (path.as_str(), Some(end))
+        }
+        _ => return None,
+    };
+    // The client event omits effective cwd. Admit a relative operand only
+    // when its returned bytes match this workspace file exactly.
+    if path.chars().any(|character| {
+        matches!(
+            character,
+            ';' | '|'
+                | '&'
+                | '<'
+                | '>'
+                | '$'
+                | '`'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '('
+                | ')'
+                | '\\'
+        )
+    }) {
+        return None;
+    }
+    let (relative, absolute) = workspace_file_v1(workspace, path)?;
+    if !source_code_path_v1(&relative)
+        || !fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= 8 * 1024)
+    {
+        return None;
+    }
+    let bytes = fs::read(&absolute).ok()?;
+    let expected = if let Some(end) = lines {
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .take(end)
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>()
+    } else {
+        bytes.clone()
+    };
+    (item["aggregated_output"].as_str()?.as_bytes() == expected).then_some((relative, bytes))
 }
 
 fn source_code_path_v1(path: &str) -> bool {
@@ -491,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_source_read_adds_current_preview_without_replaying_command_output() {
+    fn matched_source_read_adds_current_preview_without_replaying_command_output() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path().join("workspace");
         fs::create_dir(&workspace).unwrap();
@@ -502,7 +534,7 @@ mod tests {
             "type":"item.completed",
             "item":{"id":"read_1","type":"command_execution",
                     "command":format!("cat {}", source.display()),
-                    "aggregated_output":"untrusted client output", "exit_code":0}
+                    "aggregated_output":"def helper():\n    return 42\n", "exit_code":0}
         });
         let observed = codex_completed_events_v1(&completed, &workspace, "session", "old-task");
         assert_eq!(observed.len(), 2);
@@ -510,7 +542,7 @@ mod tests {
         assert!(
             !serde_json::to_string(&observed)
                 .unwrap()
-                .contains("untrusted client output")
+                .contains("def helper")
         );
         for event in &observed {
             store.record_brain_event_v1(event).unwrap();
@@ -529,16 +561,27 @@ mod tests {
         let relative = serde_json::json!({
             "type":"item.completed",
             "item":{"id":"read_2","type":"command_execution",
-                    "command":"cat helper.py", "exit_code":0}
+                    "command":"cat helper.py", "aggregated_output":"wrong bytes", "exit_code":0}
         });
         assert_eq!(
             codex_completed_events_v1(&relative, &workspace, "session", "old-task").len(),
             1
         );
+        let sed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"read_4","type":"command_execution",
+                    "command":"/bin/zsh -lc \"sed -n '1,20p' helper.py\"",
+                    "aggregated_output":"def helper():\n    return 0\n", "exit_code":0}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&sed, &workspace, "session", "old-task").len(),
+            2
+        );
         let composed = serde_json::json!({
             "type":"item.completed",
             "item":{"id":"read_3","type":"command_execution",
-                    "command":format!("cat {};true", source.display()), "exit_code":0}
+                    "command":format!("cat {};true", source.display()),
+                    "aggregated_output":"def helper():\n    return 0\n", "exit_code":0}
         });
         assert_eq!(
             codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
