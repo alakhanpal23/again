@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Retain one real Codex baseline/Again editable pair and its raw events.
 
-This diagnostic uses the fixed public calculator fixture. It is not a balanced
-cohort or an acceleration qualification.
+These fixed public fixtures are diagnostics, not a balanced cohort or an
+acceleration qualification.
 """
 
 from __future__ import annotations
@@ -26,17 +26,67 @@ from agent_gateway_codex_live_probe_v1 import sha256, source_state
 
 MAX_EVENT_BYTES = 8 * 1024 * 1024
 TIMEOUT_SECONDS = 180
-AGAIN_INSTRUCTION = (
-    "Use Again MCP for repository reads and shared task context. Call task.start "
-    "with taskId calculator-fix, includeSourcePreviews=true, and task " + json.dumps(pair.PROMPT) + ". "
-    "Use complete digest-checked sourcePreviews in the task.start response. "
-    "Call repo.read only for relevant files without a complete preview, or when current bytes "
-    "are needed after an ambiguous edit. Then "
-)
+TASK_IDS = {"calculator": "calculator-fix", "running-balance": "running-balance-fix"}
+
+
+def configure_fixture(name: str) -> None:
+    if name == "calculator":
+        return
+    pair.TARGET = "src/running_balance.py"
+    pair.TEST = "tests/test_running_balance.py"
+    pair.BUGGY = (
+        "def balances(opening, changes):\n"
+        "    current = opening\n"
+        "    result = []\n"
+        "    for change in changes:\n"
+        "        result.append(current)\n"
+        "        current += change\n"
+        "    return result\n"
+    )
+    pair.FIXED = pair.BUGGY.replace(
+        "        result.append(current)\n        current += change\n",
+        "        current += change\n        result.append(current)\n",
+    )
+    pair.PROMPT = (
+        "Fix src/running_balance.py so balances(opening, changes) reports each "
+        "balance after applying that change. Keep the API and order. Do not edit "
+        "tests or other files. Run the existing test suite, then stop."
+    )
+    pair.FIXTURE = {
+        pair.TARGET: pair.BUGGY,
+        pair.TEST: (
+            "import importlib.util\n"
+            "import pathlib\n"
+            "import unittest\n\n"
+            "ROOT = pathlib.Path(__file__).parents[1]\n"
+            "SPEC = importlib.util.spec_from_file_location('running_balance', ROOT / 'src/running_balance.py')\n"
+            "module = importlib.util.module_from_spec(SPEC)\n"
+            "SPEC.loader.exec_module(module)\n\n"
+            "class BalanceTests(unittest.TestCase):\n"
+            "    def test_increases_and_decreases(self):\n"
+            "        self.assertEqual(module.balances(10, [3, -2, 5]), [13, 11, 16])\n"
+            "    def test_empty(self):\n"
+            "        self.assertEqual(module.balances(10, []), [])\n\n"
+            "if __name__ == '__main__':\n"
+            "    unittest.main()\n"
+        ),
+        "README.md": "# Again running balance editable benchmark fixture\n",
+    }
+
+
+def again_instruction(task_id: str) -> str:
+    return (
+        "Use Again MCP for repository reads and shared task context. Call task.start "
+        f"with taskId {task_id}, includeSourcePreviews=true, and task {json.dumps(pair.PROMPT)}. "
+        "Use complete digest-checked sourcePreviews in the task.start response. "
+        "Call repo.read only for relevant files without a complete preview, or when current bytes "
+        "are needed after an ambiguous edit. Then "
+    )
 
 
 def run_condition(
     condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
+    task_id: str,
     source_files: int = 0,
     task_start_only_surface: bool = False,
     compact_task_result: bool = False,
@@ -62,7 +112,7 @@ def run_condition(
         client = Client(binary, workspace, environment)
         try:
             brief = structured(client.tool("task.start", {
-                "taskId": "calculator-fix", "task": pair.PROMPT,
+                "taskId": task_id, "task": pair.PROMPT,
                 "includeSourcePreviews": True,
                 "previewOnly": True,
             }), "precomputed task brief")
@@ -92,7 +142,7 @@ def run_condition(
     if condition == "product":
         command = [
             str(binary), "codex", "--workspace", str(workspace),
-            "--task-id", "calculator-fix", "--task", pair.PROMPT, "--",
+            "--task-id", task_id, "--task", pair.PROMPT, "--",
             "--ephemeral", "--ignore-user-config", "--json",
             "--approve-for-me", "-m", model,
         ]
@@ -113,7 +163,7 @@ def run_condition(
             "-c", f"mcp_servers.again.args={json.dumps(server_args)}",
         ]
     if condition != "product":
-        command.append((AGAIN_INSTRUCTION if condition == "again" else initial_brief) + pair.PROMPT)
+        command.append((again_instruction(task_id) if condition == "again" else initial_brief) + pair.PROMPT)
     original = hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         started = time.monotonic()
@@ -208,6 +258,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, default="target/debug/again")
     parser.add_argument("--model", default="gpt-6-sol")
+    parser.add_argument("--fixture", choices=tuple(TASK_IDS), default="calculator")
     parser.add_argument("--source-files", type=int, default=0)
     parser.add_argument("--order", choices=("baseline-first", "again-first"), default="baseline-first")
     parser.add_argument("--prebrief", action="store_true",
@@ -222,6 +273,7 @@ def main() -> int:
                         help="diagnostic: shorten the text payload while preserving structuredContent")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    configure_fixture(args.fixture)
     if not 0 <= args.source_files <= 1000:
         parser.error("--source-files must be between 0 and 1000")
     if args.prebrief_with_mcp and not args.prebrief:
@@ -248,6 +300,7 @@ def main() -> int:
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
             result, raw = run_condition(
                 condition, pathlib.Path(temporary), binary, args.model,
+                TASK_IDS[args.fixture],
                 args.source_files, args.task_start_only_surface, args.compact_task_result,
                 args.prebrief_with_mcp,
             )
@@ -270,6 +323,7 @@ def main() -> int:
         "harnessSha256": sha256(pathlib.Path(__file__)),
         "source": source_state(root),
         "model": args.model,
+        "fixture": args.fixture,
         "sourceFiles": args.source_files,
         "approvalMode": "approve-for-me",
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),

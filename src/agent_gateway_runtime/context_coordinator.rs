@@ -970,7 +970,8 @@ impl LocalContextCoordinatorV1 {
                             "path": locator.path(),
                             "sourceDigest": locator.source_digest(),
                             "text": text,
-                            "complete": true
+                            "complete": true,
+                            "origin": "indexed_candidate"
                         }));
                         if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
                             break;
@@ -1971,8 +1972,10 @@ fn tool_result_v1(structured: Value) -> Value {
 
 fn validation_preview_v1(source_previews: &[Value]) -> Value {
     let unittest_candidate = source_previews.iter().any(|preview| {
-        preview["origin"] == "test_path_convention_candidate"
-            && preview["complete"] == true
+        matches!(
+            preview["origin"].as_str(),
+            Some("test_path_convention_candidate" | "indexed_candidate")
+        ) && preview["complete"] == true
             && preview["path"]
                 .as_str()
                 .is_some_and(|path| path.starts_with("tests/test_") && path.ends_with(".py"))
@@ -2310,6 +2313,16 @@ mod validation_preview_tests {
             "python3 -m unittest discover -s tests"
         );
         assert_eq!(result["selectors"][0]["verified"], false);
+        let indexed = json!({
+            "origin": "indexed_candidate",
+            "complete": true,
+            "path": "tests/test_balance.py",
+            "text": "import unittest\nclass BalanceTests(unittest.TestCase): pass\n"
+        });
+        assert_eq!(
+            validation_preview_v1(&[indexed])["selectors"][0]["command"],
+            "python3 -m unittest discover -s tests"
+        );
     }
 
     #[test]

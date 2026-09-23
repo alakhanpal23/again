@@ -22,6 +22,21 @@ and discarded: it saved 17–31 ms on cold 1,000-file calls, did not improve war
 calls, and added a separate proof schema. The existing direct route remains
 the simpler choice until a complete, cheaper change signal is available.
 
+## 2026-09-23 second live edit fixture
+
+The [baseline-first](../bench/results/2026-09-23-codex-running-balance-wrapper-baseline-first-v1.json)
+and [wrapper-first](../bench/results/2026-09-23-codex-running-balance-wrapper-again-first-v1.json)
+Codex pairs accepted the same running-balance repair. The wrapper reached first
+edit in 5.68/5.65 seconds versus 19.24/18.19 seconds baseline and completed in
+20.68/18.75 seconds versus 26.10/26.39 seconds. Input tokens were
+65,680/65,594 versus 101,534/115,688. These are two local dirty-source
+diagnostics on one additional fixture, not a general speed qualification.
+They exposed a post-edit validation detour: the wrapper had supplied a complete
+indexed unittest preview, but the validation hint recognized only a different
+preview origin. The indexed path now records its origin and can suggest
+`python3 -m unittest discover -s tests` as an unverified selector. The agent
+must still execute it; a test hint never grants a cached test result.
+
 ## 2026-09-23 prebrief launch checkpoint
 
 The daemon now supports `task.start` with `previewOnly=true`: it registers exact
