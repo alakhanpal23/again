@@ -43,6 +43,25 @@ the wrapper ran `python3` on its first validation attempt, passed the edit
 oracle, and completed in 16.20 seconds versus 20.15 seconds baseline. This is
 still one local diagnostic, not a qualified general speed claim.
 
+The second fixture now has two-agent, 1,000-file runs in both treatment orders:
+[default wait, baseline first](../bench/results/2026-09-23-codex-parallel-running-balance-baseline-first-v1.json)
+and [default wait, wrapper first](../bench/results/2026-09-23-codex-parallel-running-balance-again-first-v1.json).
+Each passed the exact patch oracle with one source edit. Again made 3/5 agent
+tool calls versus 14/13 baseline and used 81,316/98,430 input tokens versus
+256,318/232,622. First edit took 5.29/5.48 seconds versus 12.89/11.81.
+Completion was mixed: 22.71 versus 36.11 seconds, then 31.93 versus 28.16.
+The follower reran unittest validation after the leader exited. That work
+cannot be skipped without a qualified validation-result proof.
+
+A [five-second wait, baseline-first](../bench/results/2026-09-23-codex-parallel-running-balance-wait5-baseline-first-v1.json)
+and [reverse](../bench/results/2026-09-23-codex-parallel-running-balance-wait5-again-first-v1.json)
+trial also passed the oracle, but the follower joined while the leader was
+active and used about 151,000 input tokens in both orders. Again completed in
+34.91/31.72 seconds versus baseline 38.86/30.05. The 30-second default remains
+in place; shorter waiting did not produce a consistent completion-time gain
+and materially increased repeated investigation in this fixture. These are
+local task diagnostics, not a representative parallel-agent cohort.
+
 ## 2026-09-23 prebrief launch checkpoint
 
 The daemon now supports `task.start` with `previewOnly=true`: it registers exact

@@ -1,0 +1,150 @@
+{
+  "accepted": true,
+  "againBinarySha256": "a155b2c03c223d4c173424f2db6b8e92f76b0f2f0326bb743a7d81c0dd38a8fc",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "delayFollowerUntilLeaderExits": false,
+  "evidenceScope": "local_live_diagnostic_not_qualification",
+  "fixture": "running-balance",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc \"sed -n '1,200p' src/running_balance.py\"",
+            "/bin/zsh -lc \"rg --files -g 'AGENTS.md' -g 'pyproject.toml' -g 'pytest.ini' -g 'tox.ini' -g 'setup.cfg' -g 'test*'\"",
+            "/bin/zsh -lc 'git status --short'",
+            "/bin/zsh -lc \"sed -n '1,200p' tests/test_running_balance.py\"",
+            "/bin/zsh -lc 'rg --files'",
+            "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-running-balance-baseline-first-v1-baseline-first.jsonl",
+          "rawEventSha256": "3ee88a354fde53edd66f263b3699b58946859113e099477f66e263730aba3065",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 98816,
+            "input_tokens": 106805,
+            "output_tokens": 619,
+            "reasoning_output_tokens": 70
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/running_balance.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini' -g 'Makefile'\"",
+            "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/running_balance.py\"",
+            "/bin/zsh -lc \"sed -n '1,200p' tests/test_running_balance.py\"",
+            "/bin/zsh -lc 'ls -la && rg --files'",
+            "/bin/zsh -lc \"sed -n '1,80p' src/running_balance.py && git status --short && git diff -- src/running_balance.py\"",
+            "/bin/zsh -lc 'python -m unittest discover -s tests'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-running-balance-baseline-first-v1-baseline-second.jsonl",
+          "rawEventSha256": "eebfd371b5728f590e5843128970fd2b808214493446194826f475038c8fb62d",
+          "stderrSha256": "5a87b3e0815006815c649a72fe337f586a8dbc632d885b2e6a67c8757cd1601d",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 131328,
+            "input_tokens": 149513,
+            "output_tokens": 852,
+            "reasoning_output_tokens": 107
+          }
+        }
+      },
+      "condition": "baseline",
+      "elapsedMs": 36106.908,
+      "firstEditMs": 12893.034,
+      "followerDelayedUntilLeaderExit": false,
+      "oracle": {
+        "after_snapshot_sha256": "6aba3d53ba0d50b003be5441fe262814f039ff2ccdd8b0cf70352b82f97924f7",
+        "changed_paths": [
+          "src/running_balance.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 137.836,
+        "test_output_sha256": "2a50b4749107e50e3993c9a59df48e8d8cebd81e26a286e83bb83d7fe81b2d90",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": false,
+      "secondLaunchGapMs": 2.306,
+      "timedOut": false
+    },
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+            "/bin/zsh -lc 'git diff -- src/running_balance.py && git status --short'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-running-balance-baseline-first-v1-again-first.jsonl",
+          "rawEventSha256": "d2d3b8981a8a3044e59880dd550199e42b145d618f041abc8b2f2d924c77e05a",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 39424,
+            "input_tokens": 48952,
+            "output_tokens": 363,
+            "reasoning_output_tokens": 74
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-running-balance-baseline-first-v1-again-second.jsonl",
+          "rawEventSha256": "f73648b9990ce2e2e3f111befcb48202166e6602be2f96e3813a96643898ce3e",
+          "stderrSha256": "3dcc97f660c1d17b8111c523434184a12364b101b24ffa4e05b575384e9cc88d",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 27648,
+            "input_tokens": 32364,
+            "output_tokens": 175,
+            "reasoning_output_tokens": 55
+          }
+        }
+      },
+      "condition": "again",
+      "elapsedMs": 22712.128,
+      "firstEditMs": 5294.28,
+      "followerDelayedUntilLeaderExit": false,
+      "oracle": {
+        "after_snapshot_sha256": "6aba3d53ba0d50b003be5441fe262814f039ff2ccdd8b0cf70352b82f97924f7",
+        "changed_paths": [
+          "src/running_balance.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 110.347,
+        "test_output_sha256": "2a50b4749107e50e3993c9a59df48e8d8cebd81e26a286e83bb83d7fe81b2d90",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": true,
+      "secondLaunchGapMs": 192.202,
+      "timedOut": false
+    }
+  ],
+  "order": "baseline-first",
+  "promptSha256": "68640edd816dc58830feecc035d0aad882c3d0a8877713fbe787d9c1b4bbf5f4",
+  "schema": "again.codex-parallel-pair-diagnostic.v1",
+  "sourceFiles": 1000
+}

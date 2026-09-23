@@ -14,6 +14,7 @@ import tempfile
 import time
 
 import agent_gateway_editable_pair as pair
+from agent_gateway_codex_pair_diagnostic_v1 import TASK_IDS, configure_fixture
 
 
 TIMEOUT_SECONDS = 180
@@ -60,7 +61,8 @@ def summarize(events: list[dict]) -> dict[str, object]:
 
 def run_condition(condition: str, workspace: pathlib.Path, binary: pathlib.Path,
                   codex: pathlib.Path, model: str, source_files: int,
-                  output_stem: pathlib.Path, delay_follower: bool) -> dict[str, object]:
+                  output_stem: pathlib.Path, delay_follower: bool,
+                  task_id: str, peer_wait_seconds: int) -> dict[str, object]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
     background = workspace / "src" / "background"
@@ -83,7 +85,8 @@ def run_condition(condition: str, workspace: pathlib.Path, binary: pathlib.Path,
     base = [str(codex), "exec", "--ephemeral", "--ignore-user-config", "--json",
             "--approve-for-me", "-m", model, "-C", str(workspace), pair.PROMPT]
     treatment = [str(binary), "codex", "--workspace", str(workspace),
-                 "--task-id", "calculator-fix", "--task", pair.PROMPT, "--",
+                 "--task-id", task_id, "--task", pair.PROMPT,
+                 "--peer-wait-seconds", str(peer_wait_seconds), "--",
                  "--ephemeral", "--ignore-user-config", "--json", "--approve-for-me",
                  "-m", model]
     command = treatment if condition == "again" else base
@@ -105,7 +108,7 @@ def run_condition(condition: str, workspace: pathlib.Path, binary: pathlib.Path,
         launch("first")
         if condition == "again":
             brief_command = [str(binary), "mcp", "brief", "--workspace", str(workspace),
-                             "--task-id", "calculator-fix", "--task", pair.PROMPT]
+                             "--task-id", task_id, "--task", pair.PROMPT]
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 response = subprocess.run(brief_command, cwd=workspace, env=environment,
@@ -190,14 +193,19 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--model", default="gpt-6-sol")
+    parser.add_argument("--fixture", choices=tuple(TASK_IDS), default="calculator")
     parser.add_argument("--source-files", type=int, default=1000)
+    parser.add_argument("--peer-wait-seconds", type=int, default=30)
     parser.add_argument("--order", choices=("baseline-first", "again-first"), required=True)
     parser.add_argument("--delay-follower-until-leader-exits", action="store_true",
                         help="diagnostic only: delay the second Again launch until its peer exits")
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
+    configure_fixture(args.fixture)
     if not 0 <= args.source_files <= 1000:
         parser.error("--source-files must be between 0 and 1000")
+    if not 0 <= args.peer_wait_seconds <= 300:
+        parser.error("--peer-wait-seconds must be between 0 and 300")
     if args.output.exists():
         parser.error("--output must be a new path")
     binary = args.binary.resolve(strict=True)
@@ -211,7 +219,8 @@ def main() -> int:
             observations.append(run_condition(condition, pathlib.Path(temporary) / "repo",
                                               binary, codex, args.model, args.source_files,
                                               args.output.with_suffix(""),
-                                              args.delay_follower_until_leader_exits))
+                                              args.delay_follower_until_leader_exits,
+                                              TASK_IDS[args.fixture], args.peer_wait_seconds))
     accepted = all(
         item["oracle"]["passed"] and not item["timedOut"]
         and all(agent["exitCode"] == 0 and agent["eventsCaptured"] for agent in item["agents"].values())
@@ -223,7 +232,9 @@ def main() -> int:
         "accepted": accepted,
         "order": args.order,
         "model": args.model,
+        "fixture": args.fixture,
         "sourceFiles": args.source_files,
+        "peerWaitSeconds": args.peer_wait_seconds,
         "delayFollowerUntilLeaderExits": args.delay_follower_until_leader_exits,
         "againBinarySha256": sha256(binary),
         "codexBinarySha256": sha256(codex),
