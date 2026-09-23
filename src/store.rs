@@ -4361,10 +4361,13 @@ impl Store {
         ensure_current_context_recipient_v1(&transaction, identity)?;
         let event: Option<u64> = transaction
             .query_row(
-                "SELECT admission_event_sequence
-                 FROM context_ledger_result_references_v1
-                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
-                   AND result_id = ?4 AND retired_event_sequence IS NULL
+                "SELECT reference.admission_event_sequence
+                 FROM context_ledger_result_references_v1 AS reference
+                 JOIN gateway_results AS result
+                   ON result.gateway_result_id = reference.result_id AND result.status = 'ready'
+                 WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
+                   AND reference.task_id = ?3 AND reference.result_id = ?4
+                   AND reference.retired_event_sequence IS NULL
                  ORDER BY reference_version DESC LIMIT 1",
                 params![
                     identity.repository_id(),
@@ -5008,12 +5011,26 @@ impl Store {
         if observed_total != total_bytes {
             bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
-        let stdout = self.get_blob(&result.stdout_digest)?;
-        let stderr = self.get_blob(&result.stderr_digest)?;
-        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
-        {
+        let stdout = self.get_blob(&result.stdout_digest);
+        let stderr = self.get_blob(&result.stderr_digest);
+        let valid = matches!((&stdout, &stderr), (Ok(stdout), Ok(stderr))
+            if stdout.len() as u64 == result.stdout_bytes
+                && stderr.len() as u64 == result.stderr_bytes);
+        if !valid {
+            transaction.rollback()?;
+            let quarantine =
+                Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            quarantine_invalid_gateway_result_v1_tx(
+                &quarantine,
+                None,
+                gateway_result_id,
+                now_ms(),
+            )?;
+            quarantine.commit()?;
             bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
+        let stdout = stdout?;
+        let stderr = stderr?;
         transaction.commit()?;
         Ok(GatewayFullResultV1 {
             gateway_result_id: gateway_result_id.to_owned(),
@@ -8929,11 +8946,14 @@ fn load_current_context_results_v1(
 ) -> Result<Vec<ReasoningRetrievalIdentityV1>> {
     let rows = {
         let mut statement = transaction.prepare(
-            "SELECT admission_event_sequence, result_id, result_digest, total_bytes
-             FROM context_ledger_result_references_v1
-             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
-               AND retired_event_sequence IS NULL
-             ORDER BY result_id, reference_version DESC LIMIT ?4",
+            "SELECT reference.admission_event_sequence, reference.result_id,
+                    reference.result_digest, reference.total_bytes
+             FROM context_ledger_result_references_v1 AS reference
+             JOIN gateway_results AS result
+               ON result.gateway_result_id = reference.result_id AND result.status = 'ready'
+             WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
+               AND reference.task_id = ?3 AND reference.retired_event_sequence IS NULL
+             ORDER BY reference.result_id, reference.reference_version DESC LIMIT ?4",
         )?;
         statement
             .query_map(
