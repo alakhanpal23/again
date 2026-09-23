@@ -60,7 +60,9 @@ verified source/context and takes over the lease when available. The
 [release-binary launcher gate](../bench/results/2026-09-23-codex-launch-peer-wait-release-v1.json)
 at clean source `63c5730` passed a leader/follower handoff: the follower stayed
 idle during the lease and received the leader's edited source in its fresh
-brief. Two live release-binary parallel pairs then passed the edit oracle in
+brief. The [expanded release gate](../bench/results/2026-09-23-codex-launch-peer-wait-fallback-release-v1.json)
+at clean source `b207f2a` also passed the one-second timeout path: the follower
+launched with peer guidance while the leader remained active. Two live release-binary parallel pairs then passed the edit oracle in
 both orders with one source edit. The default wrapper used no model-initiated
 MCP calls, 2/5 shell calls versus 14/13 baseline, and 80,942/97,871 input
 tokens versus 224,695/242,154 baseline. First edit was 6.87/5.87 seconds
