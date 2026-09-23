@@ -1092,7 +1092,7 @@ impl LocalContextCoordinatorV1 {
             "relevantCode": code_brief,
             "sourcePreviews": source_previews,
             "againBrain": again_brain,
-            "validationPreview": validation_preview_v1(&source_previews),
+            "validationPreview": validation_preview_v1(&self.workspace, &source_previews, &code_brief),
             "compulsoryPlan": false
         });
         if freshness_issue.is_some() {
@@ -1993,7 +1993,11 @@ fn tool_result_v1(structured: Value) -> Value {
     })
 }
 
-fn validation_preview_v1(source_previews: &[Value]) -> Value {
+fn validation_preview_v1(
+    workspace: &Path,
+    source_previews: &[Value],
+    relevant_code: &Value,
+) -> Value {
     let unittest_candidate = source_previews.iter().any(|preview| {
         matches!(
             preview["origin"].as_str(),
@@ -2006,15 +2010,52 @@ fn validation_preview_v1(source_previews: &[Value]) -> Value {
                 text.contains("import unittest") && text.contains("unittest.TestCase")
             })
     });
-    if unittest_candidate {
+    let candidates = source_previews
+        .iter()
+        .filter_map(|preview| preview["path"].as_str())
+        .chain(
+            relevant_code["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|candidate| candidate["locator"]["path"].as_str()),
+        );
+    let mut rust_source = false;
+    let mut go_source = false;
+    for path in candidates.take(16) {
+        rust_source |= path.ends_with(".rs");
+        go_source |= path.ends_with(".go");
+    }
+    let (command, basis, reason) = if unittest_candidate {
+        (
+            Some("python3 -m unittest discover -s tests"),
+            "complete_test_preview",
+            "unverified unittest convention; run the command to validate",
+        )
+    } else if rust_source && workspace.join("Cargo.toml").is_file() {
+        (
+            Some("cargo test"),
+            "current_manifest_and_source_candidate",
+            "unverified Cargo convention; run the command to validate",
+        )
+    } else if go_source && workspace.join("go.mod").is_file() {
+        (
+            Some("go test ./..."),
+            "current_manifest_and_source_candidate",
+            "unverified Go convention; run the command to validate",
+        )
+    } else {
+        (None, "", "")
+    };
+    if let Some(command) = command {
         json!({
             "status": "execute_required",
             "selectors": [{
-                "command": "python3 -m unittest discover -s tests",
-                "basis": "complete_test_preview",
+                "command": command,
+                "basis": basis,
                 "verified": false
             }],
-            "reason": "unverified unittest convention; run the command to validate"
+            "reason": reason
         })
     } else {
         json!({
@@ -2324,13 +2365,14 @@ mod validation_preview_tests {
 
     #[test]
     fn complete_unittest_companion_suggests_execution_without_claiming_proof() {
+        let workspace = tempfile::tempdir().unwrap();
         let preview = json!({
             "origin": "test_path_convention_candidate",
             "complete": true,
             "path": "tests/test_calculator.py",
             "text": "import unittest\nclass CalculatorTests(unittest.TestCase): pass\n"
         });
-        let result = validation_preview_v1(&[preview]);
+        let result = validation_preview_v1(workspace.path(), &[preview], &json!({}));
         assert_eq!(result["status"], "execute_required");
         assert_eq!(
             result["selectors"][0]["command"],
@@ -2344,19 +2386,51 @@ mod validation_preview_tests {
             "text": "import unittest\nclass BalanceTests(unittest.TestCase): pass\n"
         });
         assert_eq!(
-            validation_preview_v1(&[indexed])["selectors"][0]["command"],
+            validation_preview_v1(workspace.path(), &[indexed], &json!({}))["selectors"][0]["command"],
             "python3 -m unittest discover -s tests"
         );
     }
 
     #[test]
     fn incomplete_or_non_unittest_preview_does_not_suggest_a_command() {
+        let workspace = tempfile::tempdir().unwrap();
         for preview in [
             json!({"origin":"test_path_convention_candidate","complete":false,"path":"tests/test_x.py","text":"import unittest\nclass X(unittest.TestCase): pass"}),
             json!({"origin":"test_path_convention_candidate","complete":true,"path":"tests/test_x.py","text":"def test_x(): pass"}),
             json!({"origin":"explicit_task_path","complete":true,"path":"tests/test_x.py","text":"import unittest\nclass X(unittest.TestCase): pass"}),
         ] {
-            assert_eq!(validation_preview_v1(&[preview])["selectors"], json!([]));
+            assert_eq!(
+                validation_preview_v1(workspace.path(), &[preview], &json!({}))["selectors"],
+                json!([])
+            );
         }
+    }
+
+    #[test]
+    fn manifest_and_source_candidate_suggest_test_without_claiming_proof() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rust = json!({"candidates":[{"locator":{"path":"src/lib.rs"}}]});
+        let go = json!({"candidates":[{"locator":{"path":"pkg/ledger.go"}}]});
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &rust)["selectors"],
+            json!([])
+        );
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='ledger'\n",
+        )
+        .unwrap();
+        let suggested = validation_preview_v1(workspace.path(), &[], &rust);
+        assert_eq!(suggested["selectors"][0]["command"], "cargo test");
+        assert_eq!(suggested["selectors"][0]["verified"], false);
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &go)["selectors"],
+            json!([])
+        );
+        std::fs::write(workspace.path().join("go.mod"), "module ledger\n").unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &go)["selectors"][0]["command"],
+            "go test ./..."
+        );
     }
 }
