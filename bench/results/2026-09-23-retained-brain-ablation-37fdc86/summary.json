@@ -1,0 +1,14 @@
+{
+  "acceptedPairs": 2,
+  "medianSeededOverColdElapsedRatio": 0.7956435251562148,
+  "priorBrainDecoys": 100,
+  "schema": "again.retained-brain-ablation-result.v1",
+  "scope": "One synthetic returning task, both orders; 100 newer unrelated Brain source reads",
+  "seededOverColdElapsedRatios": [
+    0.75181552385605,
+    0.8394715264563798
+  ],
+  "sourceCommit": "37fdc86",
+  "sourceFiles": 1000,
+  "totalPairs": 2
+}
