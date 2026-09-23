@@ -16,7 +16,13 @@ import time
 from collections import Counter
 from typing import Any
 
-from agent_gateway_product_e2e import GatewayEvents, inspect_clean_source, pin_binary, result_id
+from agent_gateway_product_e2e import (
+    GatewayEvents,
+    corrupt_copied_blob,
+    inspect_clean_source,
+    pin_binary,
+    result_id,
+)
 
 
 PROTOCOL = "2025-06-18"
@@ -300,18 +306,40 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     previews[0].get("text") == "value = 1\n" and
                     previews[0].get("complete") is True,
                     "explicit source preview was missing from bounded brief")
+            (workspace / "corruption.txt").write_text("TRUSTED_SOURCE\n")
+            corrupt_agent = Client(binary, workspace, environment)
+            clients.append(corrupt_agent)
+            corrupt_task = {"taskId": "corrupt-source-task", "task": "inspect corruption.txt"}
+            structured(corrupt_agent.tool("task.start", corrupt_task), "corrupt task.start")
+            corrupt_read = corrupt_agent.tool("repo.read", {"path": "corruption.txt"})
+            structured(corrupt_read, "corruption source read")
+            corrupt_id = result_id(corrupt_read["result"])
+            require(corrupt_id is not None, "corruption source was not admitted")
+            stdout_digest = reader.stdout_digest_for_result(corrupt_id)
+            corruption = corrupt_copied_blob(state, stdout_digest)
+            refused = corrupt_agent.tool("context.retrieve", {
+                "taskId": "corrupt-source-task", "resultId": corrupt_id,
+            })
+            require(refused.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
+                    "corrupted source bytes were retrievable")
+            reread = corrupt_agent.tool("repo.read", {"path": "corruption.txt"})
+            structured(reread, "read after corruption")
+            require(tool_text(reread["result"]) == "TRUSTED_SOURCE\n",
+                    "corruption recovery did not execute a clean source read")
             return {
                 "schema": SCHEMA,
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "corrupt_result_refused"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
                 "large_index_source_files": 4097,
                 "old_result_id": original_id,
                 "new_result_id": replacement_id,
+                "corrupted_result_id": corrupt_id,
+                "corruption": corruption,
             }
         finally:
             for client in clients:
