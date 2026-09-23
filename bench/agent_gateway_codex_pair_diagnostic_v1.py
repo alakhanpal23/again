@@ -233,7 +233,8 @@ def again_instruction(task_id: str) -> str:
     )
 
 
-def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path) -> dict[str, str]:
+def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
+                     decoy_count: int = 0) -> dict[str, str | int]:
     """Create a prior completed source read through the real Again launcher."""
     read_range = "1,200p" if len(pair.BUGGY) > 256 else "1,20p"
     with tempfile.TemporaryDirectory(prefix="again-prior-task-") as temporary:
@@ -267,8 +268,38 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path) -> dict[str,
     observations = json.loads(brain.stdout)["fileObservations"]
     if pair.TARGET not in {item["path"] for item in observations}:
         raise RuntimeError("prior Brain source read was not recorded")
+    if decoy_count:
+        for index in range(decoy_count):
+            if not (workspace / "src" / "background" / f"module_{index:04}.py").is_file():
+                raise RuntimeError("prior Brain decoy file is missing")
+        with tempfile.TemporaryDirectory(prefix="again-prior-decoys-") as temporary:
+            fake_bin = pathlib.Path(temporary)
+            fake_codex = fake_bin / "codex"
+            fake_codex.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, pathlib, sys\n"
+                "workspace = pathlib.Path(sys.argv[sys.argv.index('-C') + 1])\n"
+                f"for index in range({decoy_count}):\n"
+                "    path = f'src/background/module_{index:04}.py'\n"
+                "    content = (workspace / path).read_text()\n"
+                "    item = {'id':f'decoy_{index}', 'type':'command_execution', "
+                "'command':'cat ' + path, 'aggregated_output':content, 'exit_code':0, 'status':'completed'}\n"
+                "    print(json.dumps({'type':'item.completed', 'item':item}))\n"
+            )
+            fake_codex.chmod(0o700)
+            environment = os.environ.copy()
+            environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
+            result = subprocess.run(
+                [str(binary), "codex", "--workspace", str(workspace),
+                 "--task-id", "prior-background-investigation",
+                 "--task", "Inspect background module values", "--", "--ephemeral"],
+                cwd=workspace, env=environment, capture_output=True, text=True, timeout=60,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(f"could not seed unrelated Brain reads: {result.stderr[-1000:]}")
     return {"taskId": "prior-ledger-investigation", "path": pair.TARGET,
-            "sourceSha256": hashlib.sha256((workspace / pair.TARGET).read_bytes()).hexdigest()}
+            "sourceSha256": hashlib.sha256((workspace / pair.TARGET).read_bytes()).hexdigest(),
+            "decoyCount": decoy_count}
 
 
 def run_condition(
@@ -279,6 +310,7 @@ def run_condition(
     compact_task_result: bool = False,
     prebrief_with_mcp: bool = False,
     seed_brain: bool = False,
+    brain_decoys: int = 0,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -290,7 +322,7 @@ def run_condition(
                 f"value = {index}\n", encoding="utf-8"
             )
     before = pair.snapshot(workspace)
-    prior_brain = seed_prior_brain(binary, workspace) if seed_brain and condition == "product" else None
+    prior_brain = seed_prior_brain(binary, workspace, brain_decoys) if seed_brain and condition == "product" else None
     stats_before = pair.again_stats(binary, workspace)
     preparation_ms = 0.0
     initial_brief = ""

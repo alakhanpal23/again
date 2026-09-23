@@ -21,10 +21,13 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-6-sol")
     parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large"), default="balance-helper")
     parser.add_argument("--source-files", type=int, choices=(0, 1000), required=True)
+    parser.add_argument("--prior-brain-decoys", type=int, default=0)
     parser.add_argument("--order", choices=("cold-first", "seeded-first"), required=True)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     args = parser.parse_args()
     binary = args.binary.resolve(strict=True)
+    if not 0 <= args.prior_brain_decoys <= args.source_files:
+        parser.error("--prior-brain-decoys must fit within --source-files")
     root = pathlib.Path(__file__).resolve().parents[1]
     output = args.output.resolve()
     if output.is_relative_to(root):
@@ -38,7 +41,7 @@ def main() -> int:
             result, raw = pair_harness.run_condition(
                 condition, pathlib.Path(temporary), binary, args.model,
                 f"{args.fixture}-ablation", args.source_files,
-                seed_brain=True,
+                seed_brain=True, brain_decoys=args.prior_brain_decoys,
             )
         raw_path = output.with_name(output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -64,6 +67,7 @@ def main() -> int:
         "fixtureSha256": hashlib.sha256(fixture.canonical_bytes(fixture.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(fixture.PROMPT.encode()).hexdigest(),
         "sourceFiles": args.source_files,
+        "priorBrainDecoys": args.prior_brain_decoys,
         "order": list(order),
         "accepted": accepted,
         "seededOverColdElapsedRatio": seeded["elapsedMs"] / cold["elapsedMs"] if accepted else None,
