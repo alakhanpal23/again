@@ -314,8 +314,19 @@ or task-quality claim.
 The latest [clean-source release-binary gate](../bench/results/2026-09-23-auth-product-e2e-2dad98f.json)
 at `2dad98f` passed those task scenarios, including the 1,000-file named-file
 preview and 4,097-file fallback. It recorded one physical execution and one
-in-flight join for two duplicate authenticated reads. The cancellation,
-lease, and corruption cases still need migration into this harness.
+in-flight join for two duplicate authenticated reads.
+The expanded [authenticated lifecycle gate](../bench/results/2026-09-23-auth-product-e2e-lifecycle-v2.json)
+at `717c980` additionally passed recipient-scoped cancellation, corrupt blob
+refusal with a `result_corrupt` quarantine event, and killed-daemon lease
+recovery after the recorded expiry. The recovery had one `lease_expired`
+event and a completed second lease generation. The full locked Rust suite and
+strict all-target/all-feature Clippy passed locally. In-flight request
+cancellation remains covered only by the older standalone harness. The local
+beta aggregator now requires the authenticated report and binds its clean
+source and release-binary digests; its synthetic validator tests pass. The
+full packaged beta release decision remains unqualified because the current
+real-client speed cohort, complete product scenario, and signed packages are
+not yet passing evidence.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

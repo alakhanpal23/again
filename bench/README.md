@@ -119,8 +119,9 @@ before/after effect. The v5 recorded harness hash matches the current script.
 for the daemon/task-lifecycle local beta. It requires the ordered 12-step
 release-binary product scenario, a 100-client automatic-daemon chaos run,
 exactly four native package smokes, authenticated 14-asset release evidence,
-and outside-user paired Codex/Claude evidence. All inputs must bind to one
-source commit, and product/chaos/agent observations must bind to one binary.
+the authenticated task lifecycle gate, and balanced existing-user or
+controlled-agent Codex/Claude evidence. All inputs must bind to one source
+commit, and product/task/chaos/agent observations must bind to one binary.
 The output contains only compact digests and release decisions.
 
 The complete evidence schemas, beta chaos command, aggregation command, privacy

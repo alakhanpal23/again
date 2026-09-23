@@ -4,7 +4,7 @@
 This program does not manufacture product evidence.  It accepts retained,
 machine-readable observations from the black-box product scenario, the
 100-client chaos run, four native package jobs, signed-release verification,
-and an outside-user Codex/Claude comparison.  It validates their invariants,
+and an existing-user or controlled Codex/Claude comparison. It validates their invariants,
 binds every input to one source commit, and emits a compact release decision.
 """
 
@@ -23,11 +23,12 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 
-SCHEMA = "again.local-beta-gate.v1"
+SCHEMA = "again.local-beta-gate.v2"
 SCENARIO_SCHEMA = "again.local-beta-product-scenario.v1"
 NATIVE_SCHEMA = "again.local-beta-native-smoke.v1"
-REAL_AGENT_SCHEMA = "again.local-beta-real-agent-review.v1"
+REAL_AGENT_SCHEMA = "again.local-beta-real-agent-review.v2"
 CHAOS_SCHEMA = "again.agent-gateway-chaos-soak.v3"
+AUTHENTICATED_SCHEMA = "again.authenticated-product-e2e.v1"
 RELEASE_SCHEMA = "again.release-verification-summary.v2"
 MAX_INPUT_BYTES = 8 * 1024 * 1024
 MAX_OUTPUT_BYTES = 256 * 1024
@@ -84,6 +85,12 @@ ZERO_SAFETY_COUNTERS = (
     "silent_evictions",
     "unauthorized_retrievals",
 )
+AUTHENTICATED_SCENARIOS = frozenset((
+    "standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval",
+    "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete",
+    "mid_index_explicit_preview", "large_index_explicit_preview",
+    "recipient_cancel_scoped", "corrupt_result_refused", "lease_owner_crash_recovered",
+))
 FORBIDDEN_DIAGNOSTIC_KEYS = {
     "config_document",
     "context",
@@ -541,6 +548,56 @@ def validate_scenario(report: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def validate_authenticated(report: Mapping[str, Any]) -> dict[str, str]:
+    _require(report.get("schema") == AUTHENTICATED_SCHEMA,
+             "authenticated_schema", "authenticated task schema differs")
+    _require(_pass_classification(report.get("classification")),
+             "authenticated_nonpass", "authenticated task gate did not pass")
+    source = _mapping(report.get("source"), "authenticated_source")
+    source_sha = source.get("git_sha")
+    binary = report.get("binary_sha256")
+    _require(source.get("clean") is True and _source_sha(source_sha)
+             and _digest(source.get("git_sha256")) and _digest(binary),
+             "authenticated_identity", "authenticated task identity is invalid")
+    scenarios = report.get("scenarios")
+    _require(isinstance(scenarios, list) and all(isinstance(item, str) for item in scenarios)
+             and len(scenarios) == len(AUTHENTICATED_SCENARIOS)
+             and set(scenarios) == AUTHENTICATED_SCENARIOS,
+             "authenticated_scenarios", "authenticated task coverage is incomplete")
+    duplicate = _mapping(report.get("duplicate_read_events"), "authenticated_duplicate")
+    _require(_is_int(duplicate.get("exact_hit", 0), 0),
+             "authenticated_duplicate", "duplicate hit count is invalid")
+    _require(_is_int(duplicate.get("inflight_join", 0), 0),
+             "authenticated_duplicate", "duplicate join count is invalid")
+    _require(duplicate.get("requested") == 2 and duplicate.get("executed") == 1
+             and duplicate.get("completed") == 1
+             and duplicate.get("exact_hit", 0) + duplicate.get("inflight_join", 0) == 1,
+             "authenticated_duplicate", "duplicate task read was not physically avoided")
+    corruption = report.get("corruption_events")
+    _require(isinstance(corruption, list) and any(
+        isinstance(event, dict) and event.get("event_type") == "binding_quarantined"
+        and event.get("reason") == "result_corrupt" for event in corruption),
+        "authenticated_corruption", "corrupt task result was not quarantined")
+    old_lease = _mapping(report.get("old_lease"), "authenticated_lease")
+    new_lease = _mapping(report.get("new_lease"), "authenticated_lease")
+    recovery = _mapping(report.get("lease_recovery_events"), "authenticated_lease")
+    _require(old_lease.get("status") == "active"
+             and new_lease.get("status") == "completed"
+             and _is_int(old_lease.get("lifecycle_generation"), 1)
+             and _is_int(new_lease.get("lifecycle_generation"), 2)
+             and new_lease.get("lifecycle_generation") == old_lease["lifecycle_generation"] + 1
+             and recovery.get("lease_expired") == 1
+             and recovery.get("requested") == 1
+             and recovery.get("executed") == 1
+             and recovery.get("completed") == 1,
+             "authenticated_lease", "authenticated lease recovery is incomplete")
+    return {
+        "source_git_sha": str(source_sha),
+        "binary_sha256": str(binary),
+        "report_sha256": sha256(canonical_json(report)),
+    }
+
+
 def validate_native(report: Mapping[str, Any]) -> dict[str, str]:
     _require(report.get("schema") == NATIVE_SCHEMA, "native_schema", "native smoke schema differs")
     _require(_pass_classification(report.get("classification")), "native_nonpass", "native smoke did not pass")
@@ -622,20 +679,18 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
     binary = report.get("binary_sha256")
     _require(_source_sha(source) and _digest(binary), "agent_identity", "real-agent identity is invalid")
     _require(
-        report.get("outside_user") is True
+        report.get("cohort_source") in {"existing_users", "controlled_agents", "outside_users"}
         and report.get("deterministic_harness_only") is False,
-        "outside_user",
-        "outside-user real-agent evidence is absent",
+        "agent_cohort",
+        "real-client cohort evidence is absent",
     )
-    outside_user_count = report.get("outside_user_count")
     accepted_attempts = report.get("accepted_attempts")
     repository_count = report.get("repository_count")
     _require(
-        _is_int(outside_user_count, 5)
-        and _is_int(accepted_attempts, 50)
+        _is_int(accepted_attempts, 50)
         and _is_int(repository_count, 5),
         "agent_sample",
-        "real-agent evidence does not meet the outside-user sample threshold",
+        "real-agent evidence does not meet the paired sample threshold",
     )
     methodology = _mapping(report.get("methodology"), "agent_methodology")
     required_methodology = {
@@ -693,6 +748,15 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
             "agent_metrics",
             "real-agent metrics are incomplete or show a quality regression",
         )
+        _require(
+            int(enabled["duplicate_reads"]) * 10 <= int(baseline["duplicate_reads"]) * 7
+            and int(enabled["duplicate_investigations"]) * 10 <= int(baseline["duplicate_investigations"]) * 7
+            and int(enabled["first_correct_edit_ms"]) * 10 <= int(baseline["first_correct_edit_ms"]) * 7
+            and int(enabled["validated_completion_ms"]) * 10 <= int(baseline["validated_completion_ms"]) * 8
+            and int(enabled["cost_usd_micros"]) * 10 <= int(baseline["cost_usd_micros"]) * 8,
+            "agent_acceleration",
+            "real-agent cohort missed the task acceleration thresholds",
+        )
     _require(
         paired_run_count == accepted_attempts,
         "agent_sample",
@@ -701,6 +765,7 @@ def validate_real_agent(report: Mapping[str, Any]) -> dict[str, str]:
     return {
         "source_git_sha": str(source),
         "binary_sha256": str(binary),
+        "cohort_source": str(report["cohort_source"]),
         "report_sha256": sha256(canonical_json(report)),
     }
 
@@ -789,12 +854,14 @@ def validate_release(report: Mapping[str, Any]) -> dict[str, Any]:
 def build_gate(
     *,
     scenario: Mapping[str, Any],
+    authenticated: Mapping[str, Any],
     chaos: Mapping[str, Any],
     real_agent: Mapping[str, Any],
     release: Mapping[str, Any],
     native: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
     scenario_summary = validate_scenario(scenario)
+    authenticated_summary = validate_authenticated(authenticated)
     chaos_summary = validate_chaos(chaos)
     agent_summary = validate_real_agent(real_agent)
     release_summary = validate_release(release)
@@ -808,7 +875,7 @@ def build_gate(
     _require(
         all(
             item["source_git_sha"] == source
-            for item in [chaos_summary, agent_summary, release_summary, *native_summaries]
+            for item in [authenticated_summary, chaos_summary, agent_summary, release_summary, *native_summaries]
         ),
         "source_mismatch",
         "gate evidence does not bind to one source commit",
@@ -816,7 +883,8 @@ def build_gate(
     initial_binary = scenario_summary["initial_binary_sha256"]
     qualified_binary = scenario_summary["upgraded_binary_sha256"]
     _require(
-        chaos_summary["binary_sha256"] == qualified_binary
+        authenticated_summary["binary_sha256"] == qualified_binary
+        and chaos_summary["binary_sha256"] == qualified_binary
         and agent_summary["binary_sha256"] == qualified_binary,
         "binary_mismatch",
         "product, chaos, and real-agent evidence used different binaries",
@@ -844,14 +912,16 @@ def build_gate(
         },
         "coverage": {
             "product_scenario_steps": len(SCENARIO_STEPS),
+            "authenticated_task_scenarios": len(AUTHENTICATED_SCENARIOS),
             "native_targets": list(TARGETS),
             "release_asset_count": 14,
             "chaos_concurrent_clients": 100,
             "real_agent_clients": ["claude", "codex"],
-            "outside_user_evidence": True,
+            "real_agent_cohort": agent_summary["cohort_source"],
         },
         "evidence_sha256": {
             "scenario": scenario_summary["report_sha256"],
+            "authenticated": authenticated_summary["report_sha256"],
             "chaos": chaos_summary["report_sha256"],
             "real_agent": agent_summary["report_sha256"],
             "release": release_summary["report_sha256"],
@@ -871,6 +941,7 @@ def build_gate(
 def _arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario-evidence", required=True, type=pathlib.Path)
+    parser.add_argument("--authenticated-evidence", required=True, type=pathlib.Path)
     parser.add_argument("--chaos-evidence", required=True, type=pathlib.Path)
     parser.add_argument("--real-agent-evidence", required=True, type=pathlib.Path)
     parser.add_argument("--release-evidence", required=True, type=pathlib.Path)
@@ -891,6 +962,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _require(len(args.native_evidence) == 4, "native_matrix", "exactly four native evidence files are required")
         report = build_gate(
             scenario=read_json(args.scenario_evidence),
+            authenticated=read_json(args.authenticated_evidence),
             chaos=read_json(args.chaos_evidence),
             real_agent=read_json(args.real_agent_evidence),
             release=read_json(args.release_evidence),

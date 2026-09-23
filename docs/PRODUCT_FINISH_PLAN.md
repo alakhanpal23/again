@@ -47,10 +47,14 @@ tool name, model statement, result ID, or digest into reuse authority.
   testing exact reuse, shared facts, and retrieval; retain separate assertions
   that standalone cheap reads bypass storage. Bind the passing report to a
   clean source SHA and exact binary.
-- Extend the new daemon-backed task harness with the legacy cancellation,
-  lease recovery, and corruption cases, then wire its verified report into
-  the packaged beta gate. Keep the old standalone harness as historical
-  evidence until the replacement covers those scenarios.
+- The daemon-backed task harness now covers recipient-scoped cancellation,
+  corrupt-result refusal and quarantine, and a killed daemon's lease expiry
+  and recovery, alongside its shared-source and large-index scenarios. Its
+  clean-source release-binary report is
+  `bench/results/2026-09-23-auth-product-e2e-lifecycle-v2.json`. The beta
+  aggregator now requires this report; qualify in-flight request
+  cancellation separately. Keep the old standalone harness as historical
+  evidence for scenarios it still covers uniquely.
 
 **Exit evidence:** release-binary onboarding run for Codex and Claude; a real
 agent can call `task.start` and a repository tool through the installed server.
