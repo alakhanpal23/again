@@ -10,6 +10,19 @@ Again helps one coding agent start with a verified repository brief, carry usefu
 
 - `again codex --workspace <path> --task-id <id> --task <text> -- [codex flags]` — launch Codex with bounded current source previews, relevant Brain history, and a validation suggestion. Completed tool calls and run usage are recorded locally.
 - `again brain show|clear --workspace <path>` — inspect or clear bounded activity, source observations, test hints, and Codex run summaries. Brain history is guidance; tests still run.
+- `again brain observe-codex-hook` — optional stdin adapter for Codex `PostToolUse` Bash events in interactive sessions. Configure a `PostToolUse` hook with matcher `^Bash$`, command `<absolute-path-to-again> brain observe-codex-hook`, and `async: true`. It emits no hook output. The launcher above remains the qualified automatic capture path.
+
+For interactive observation, merge this handler into the repository's
+`.codex/hooks.json`, replacing the executable placeholder with the installed
+absolute path:
+
+```json
+{"hooks":{"PostToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"/absolute/path/to/again brain observe-codex-hook","async":true,"timeout":5}]}]}}
+```
+
+The observer does not rewrite or skip a tool call. Codex hook coverage and
+response shapes vary by tool; unrecognized responses contribute only command
+metadata. [Hook contract](https://learn.chatgpt.com/docs/hooks).
 - `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
 - `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
 - `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.

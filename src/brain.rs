@@ -224,6 +224,64 @@ pub fn codex_completed_events_v1(
     }
 }
 
+/// Convert a completed Codex PostToolUse Bash envelope into the same bounded
+/// observation used by the noninteractive launcher. Hook output is only
+/// trusted for a test hint or source match when it exposes an explicit exit
+/// code and a plain, unmodified output string.
+pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<BrainEventV1>> {
+    if value["hook_event_name"] != "PostToolUse" || value["tool_name"] != "Bash" {
+        return None;
+    }
+    let session_id = value["session_id"].as_str()?;
+    let event_id = value["tool_use_id"].as_str()?;
+    let command = value["tool_input"]["command"].as_str()?;
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || event_id.is_empty()
+        || event_id.len() > 128
+        || command.is_empty()
+        || command.len() > 64 * 1024
+    {
+        return None;
+    }
+    let response = &value["tool_response"];
+    let exit_code = response["exit_code"]
+        .as_i64()
+        .and_then(|code| i32::try_from(code).ok());
+    let output = response["output"]
+        .as_str()
+        .filter(|s| s.len() <= 1024 * 1024);
+    let item = serde_json::json!({
+        "id": event_id,
+        "type": "command_execution",
+        "command": command,
+        "exit_code": exit_code,
+        "aggregated_output": output,
+    });
+    let mut events = codex_completed_events_v1(
+        &serde_json::json!({"type":"item.completed", "item":item}),
+        workspace,
+        session_id,
+        session_id,
+    );
+    if events.is_empty() {
+        events.push(BrainEventV1 {
+            session_id: session_id.to_owned(),
+            event_id: event_id.to_owned(),
+            task_id: session_id.to_owned(),
+            kind: "command".to_owned(),
+            path: None,
+            source_digest: None,
+            command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+            command_hint: None,
+            exit_code: None,
+            created_ms: current_ms_v1(),
+            authorization_scope_digest: Some(local_brain_scope_digest_v1(workspace)),
+        });
+    }
+    Some(events)
+}
+
 pub fn codex_display_text_v1(value: &Value) -> Option<&str> {
     match (value["type"].as_str(), value["item"]["type"].as_str()) {
         (Some("item.completed"), Some("agent_message")) => value["item"]["text"].as_str(),
@@ -623,6 +681,48 @@ mod tests {
             workspace_id: "workspace",
             authorization_scope_digest: scope,
         }
+    }
+
+    #[test]
+    fn post_tool_hook_records_only_verified_completed_bash_work() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("helper.py"), "value = 1\n").unwrap();
+        let read = serde_json::json!({
+            "hook_event_name":"PostToolUse", "tool_name":"Bash",
+            "session_id":"session", "tool_use_id":"read",
+            "tool_input":{"command":"cat helper.py"},
+            "tool_response":{"exit_code":0,"output":"value = 1\n"}
+        });
+        let events = codex_post_tool_event_v1(&read, dir.path()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].path.as_deref(), Some("helper.py"));
+        assert_eq!(events[1].task_id, "session");
+
+        let mut mismatch = read.clone();
+        mismatch["tool_use_id"] = "mismatch".into();
+        mismatch["tool_response"]["output"] = "different\n".into();
+        assert_eq!(
+            codex_post_tool_event_v1(&mismatch, dir.path())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let mut incomplete = read.clone();
+        incomplete["tool_use_id"] = "incomplete".into();
+        incomplete["tool_response"] = serde_json::json!({"message":"unknown"});
+        let events = codex_post_tool_event_v1(&incomplete, dir.path()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].exit_code, None);
+        assert!(
+            codex_post_tool_event_v1(
+                &serde_json::json!({
+                    "hook_event_name":"PreToolUse", "tool_name":"Bash"
+                }),
+                dir.path()
+            )
+            .is_none()
+        );
     }
 
     #[test]

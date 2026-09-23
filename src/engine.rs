@@ -255,6 +255,9 @@ enum BrainCommand {
         #[arg(long)]
         workspace: Option<PathBuf>,
     },
+    /// Ingest one completed Codex PostToolUse event from stdin.
+    #[command(hide = true)]
+    ObserveCodexHook,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1385,6 +1388,33 @@ fn mcp_brief(args: McpBriefArgs) -> Result<i32> {
 #[cfg(feature = "daemon")]
 fn brain_cli(args: BrainArgs) -> Result<i32> {
     match args.command {
+        BrainCommand::ObserveCodexHook => {
+            let mut input = Vec::new();
+            io::stdin().take(1024 * 1024 + 1).read_to_end(&mut input)?;
+            if input.len() > 1024 * 1024 {
+                return Ok(0);
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&input) else {
+                return Ok(0);
+            };
+            let Some(cwd) = value["cwd"].as_str() else {
+                return Ok(0);
+            };
+            let Ok(cwd) = fs::canonicalize(cwd) else {
+                return Ok(0);
+            };
+            let Ok(workspace) = discover_workspace(&cwd) else {
+                return Ok(0);
+            };
+            if let Some(events) = crate::brain::codex_post_tool_event_v1(&value, &workspace) {
+                if let Ok(store) = Store::open_for_workspace(&workspace) {
+                    for event in events {
+                        let _ = store.record_brain_event_v1(&event);
+                    }
+                }
+            }
+            return Ok(0);
+        }
         BrainCommand::Show { workspace, limit } => {
             let workspace = resolve_mcp_workspace(workspace)?;
             let store = Store::open_for_workspace(&workspace)?;

@@ -2,6 +2,20 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 native Codex hook observation (opt-in)
+
+The `again brain observe-codex-hook` stdin adapter can now record completed
+interactive Codex Bash calls into the same repository Brain as the `again codex`
+launcher. The adapter retains a command digest, not command text or output.
+When a hook response contains an explicit integer `exit_code` and exact plain
+`output`, the existing source-byte matcher can also record a verified `cat` or
+bounded `sed` read; an explicit zero exit can yield a recognized successful
+test hint. Unknown response shapes remain command metadata only. The adapter
+is idempotent for a repeated `tool_use_id`, bounded to 1 MiB input, and emits
+no model-visible hook output. It is not installed by `again setup`; opt-in
+`PostToolUse` configuration and a live Codex hook-payload qualification remain.
+The launcher remains the currently qualified automatic capture path.
+
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
 Again Brain now retains one bounded outcome row per completed Codex launcher
