@@ -58,13 +58,14 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                          "--task-id", "repair", "--task", task]
         processes: list[subprocess.Popen[bytes]] = []
 
-        def launch(name: str) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
+        def launch(name: str, wait_ready: bool = True) -> tuple[subprocess.Popen[bytes], pathlib.Path, pathlib.Path]:
             ready, release = root / f"{name}.ready", root / f"{name}.release"
             invocation = environment | {"FAKE_READY": str(ready), "FAKE_RELEASE": str(release)}
             process = subprocess.Popen(command, cwd=workspace, env=invocation,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             processes.append(process)
-            wait_for(ready, process)
+            if wait_ready:
+                wait_for(ready, process)
             return process, ready, release
 
         def brief() -> dict[str, object]:
@@ -79,21 +80,26 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     "leader did not receive the verified lease brief")
             require(brief()["coordination"]["peerActive"] is True,
                     "first live launcher did not expose an active leader")
-            follower, follower_ready, follower_release = launch("follower")
-            follower_argv = json.loads(follower_ready.read_text())
-            require("active peer leader" in follower_argv[-1],
-                    "follower did not receive peer coordination guidance")
+            follower, follower_ready, follower_release = launch("follower", wait_ready=False)
+            time.sleep(0.5)
+            require(follower.poll() is None, "waiting follower exited before leader")
+            require(not follower_ready.exists(), "follower launched before the leader retired")
             require(brief()["coordination"]["peerActive"] is True,
                     "follower unexpectedly replaced the active leader")
+            (workspace / "a.py").write_text("value = 2\n")
             leader_release.touch()
             require(leader.wait(timeout=10) == 0, "leader launcher failed")
-            deadline = time.monotonic() + 5
-            while brief()["coordination"]["peerActive"] is True and time.monotonic() < deadline:
-                time.sleep(0.05)
-            require(brief()["coordination"]["peerActive"] is False,
-                    "leader lease remained active after leader exit")
+            wait_for(follower_ready, follower)
+            follower_argv = json.loads(follower_ready.read_text())
+            require("leader lease" in follower_argv[-1]
+                    and "value = 2" in follower_argv[-1],
+                    "follower did not claim and refresh after the leader's edit")
+            require(brief()["coordination"]["peerActive"] is True,
+                    "follower did not take over the leader lease")
             follower_release.touch()
             require(follower.wait(timeout=10) == 0, "follower launcher failed")
+            require(brief()["coordination"]["peerActive"] is False,
+                    "follower lease remained active after follower exit")
             return {
                 "schema": "again.codex-launch-e2e.v1",
                 "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -103,7 +109,9 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "leaderPromptSha256": hashlib.sha256(leader_argv[-1].encode()).hexdigest(),
                 "followerPromptSha256": hashlib.sha256(follower_argv[-1].encode()).hexdigest(),
                 "leaderVisibleDuringRun": True,
-                "followerReceivedPeerGuidance": True,
+                "followerWaitedForLeader": True,
+                "followerClaimedAfterLeader": True,
+                "followerReceivedFreshEditedSource": True,
                 "leaderRetiredAfterExit": True,
             }
         finally:

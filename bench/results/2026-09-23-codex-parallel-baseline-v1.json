@@ -1,0 +1,59 @@
+{
+  "oracle": {
+    "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+    "changed_paths": [
+      "src/calculator.py"
+    ],
+    "collateral_safe": true,
+    "exact_target": true,
+    "passed": true,
+    "test_elapsed_ms": 395.254,
+    "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+    "tests_passed": true
+  },
+  "outcomes": {
+    "first": {
+      "commands": [
+        "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'requirements*.txt'\"",
+        "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/calculator.py\"",
+        "/bin/zsh -lc \"sed -n '1,200p' tests/test_calculator.py\"",
+        "/bin/zsh -lc \"sed -n '1,160p' README.md && rg --files\"",
+        "/bin/zsh -lc 'python3 -B -m unittest discover -s tests -v'"
+      ],
+      "elapsedMs": 21586.638,
+      "exitCode": 0,
+      "fileChanges": 1,
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 82176,
+        "input_tokens": 90864,
+        "output_tokens": 544,
+        "reasoning_output_tokens": 54
+      }
+    },
+    "second": {
+      "commands": [
+        "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini'\"",
+        "/bin/zsh -lc \"git status --short && sed -n '1,240p' src/calculator.py\"",
+        "/bin/zsh -lc \"sed -n '1,240p' tests/test_calculator.py\"",
+        "/bin/zsh -lc \"sed -n '1,160p' README.md && rg --files -g 'AGENTS.md' -g '\"'!src/calculator.py'\"'\"",
+        "/bin/zsh -lc 'cat -n src/calculator.py && git status --short'",
+        "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+        "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'"
+      ],
+      "elapsedMs": 30423.497,
+      "exitCode": 0,
+      "fileChanges": 0,
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 120448,
+        "input_tokens": 132350,
+        "output_tokens": 949,
+        "reasoning_output_tokens": 184
+      }
+    }
+  },
+  "schema": "again.codex-parallel-baseline-diagnostic.v1"
+}

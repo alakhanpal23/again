@@ -37,6 +37,28 @@ passed the edit oracle with a 5.32-second first edit versus 15.27 seconds in
 baseline, and no model-initiated MCP call before editing. Its
 [diagnostic report](../bench/results/2026-09-23-codex-pair-held-lease-baseline-first-v1.json)
 is local dirty-source evidence; a live two-agent cohort remains open.
+Two formal live parallel Codex pairs on committed 1,000-file fixtures passed
+the edit oracle in both orders with one repair and a joining follower. Again
+used 3–4 shell calls plus 1–2 MCP calls versus 13 shell calls in each baseline
+pair, and reached first edit in 5.37/6.49 seconds versus 13.48/16.87 seconds.
+Validated completion was mixed: 29.66 versus 28.28 seconds in baseline-first
+order and 23.41 versus 33.79 seconds in reverse order. Input tokens were
+204,159 versus 225,779 and 150,351 versus 213,322. See the
+[baseline-first](../bench/results/2026-09-23-codex-parallel-pair-committed-baseline-first-v1.json)
+and [reverse](../bench/results/2026-09-23-codex-parallel-pair-committed-again-first-v1.json)
+reports. Earlier uncommitted-fixture diagnostics are retained but not used for
+comparison because `git status` treated every file as untracked.
+In a diagnostic that delayed the second Again launch until the leader exited,
+the follower used the fresh source preview, made no MCP call or file read, and
+only ran validation. Both orders passed; total input tokens were 80,996 and
+80,932 versus 197,810 and 214,874 in their concurrent baselines. Completion
+was 24.44 versus 24.53 seconds and 24.28 versus 25.61 seconds. See
+[baseline-first](../bench/results/2026-09-23-codex-parallel-pair-delayed-baseline-first-v1.json)
+and [reverse](../bench/results/2026-09-23-codex-parallel-pair-delayed-again-first-v1.json).
+The launcher now waits up to 30 seconds on an exact peer task, then refreshes
+verified source/context and takes over the lease when available; this
+production behavior still needs the release-binary launcher gate and a live
+repeat on the final binary.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real

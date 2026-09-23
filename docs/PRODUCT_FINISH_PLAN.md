@@ -190,6 +190,15 @@ has a persisted proof and an `explain` reason.
   the same 1,000-file fixture. These remain local diagnostics. Run a balanced
   repeat-heavy parallel cohort and a live peer-leader handoff, including
   mutation between prebrief and first edit.
+  A two-Codex committed-fixture diagnostic now covers both condition orders.
+  The first follower implementation joined but sometimes spent another model
+  turn and repeated inspections, so validated completion was mixed. Delaying
+  an exact duplicate follower until the leader exited cut tokens by more than
+  half in both local orders while preserving the accepted repair. The launcher
+  now waits up to a bounded 30 seconds and refreshes its brief before taking
+  over. Verify that default on a clean release binary with two live agents;
+  include a source mutation during the wait and a leader that outlives the
+  wait bound. Keep independent subtasks parallel.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference

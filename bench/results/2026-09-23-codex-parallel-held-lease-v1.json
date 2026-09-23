@@ -1,0 +1,55 @@
+{
+  "binarySha256": "339a222e72aeadf9a8e084509a417eee368ef3c6bdbaaa4a583720500df0c06c",
+  "leaderObservedBeforeFollower": true,
+  "oracle": {
+    "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+    "changed_paths": [
+      "src/calculator.py"
+    ],
+    "collateral_safe": true,
+    "exact_target": true,
+    "passed": true,
+    "test_elapsed_ms": 313.305,
+    "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+    "tests_passed": true
+  },
+  "outcomes": {
+    "follower": {
+      "commands": [
+        "/bin/zsh -lc 'git status --short -- src/calculator.py && cat src/calculator.py && shasum -a 256 src/calculator.py'",
+        "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+      ],
+      "elapsedMs": 24646.938,
+      "exitCode": 0,
+      "timedOut": false,
+      "tools": [
+        "task.start"
+      ],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 78592,
+        "input_tokens": 101680,
+        "output_tokens": 525,
+        "reasoning_output_tokens": 186
+      }
+    },
+    "leader": {
+      "commands": [
+        "/bin/zsh -lc 'cat src/calculator.py'",
+        "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+      ],
+      "elapsedMs": 15887.698,
+      "exitCode": 0,
+      "timedOut": false,
+      "tools": [],
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 55424,
+        "input_tokens": 64780,
+        "output_tokens": 356,
+        "reasoning_output_tokens": 89
+      }
+    }
+  },
+  "schema": "again.codex-parallel-held-lease-diagnostic.v1"
+}

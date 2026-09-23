@@ -206,6 +206,9 @@ struct McpBriefArgs {
 struct CodexArgs {
     #[command(flatten)]
     brief: McpBriefArgs,
+    /// Wait this many seconds for an exact-task leader before launching a follower.
+    #[arg(long, default_value_t = 30)]
+    peer_wait_seconds: u64,
     /// Additional codex exec flags after `--`.
     #[arg(last = true, num_args = 0..)]
     codex_args: Vec<OsString>,
@@ -1224,6 +1227,34 @@ struct TaskBriefSessionV1 {
     brief: serde_json::Value,
     stream: std::os::unix::net::UnixStream,
     reader: BufReader<std::os::unix::net::UnixStream>,
+    next_request_id: u64,
+}
+
+#[cfg(all(feature = "daemon", unix))]
+impl TaskBriefSessionV1 {
+    fn tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
+        let result = daemon_request_v1(
+            &mut self.stream,
+            &mut self.reader,
+            self.next_request_id,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task brief request ID overflow"))?;
+        if result["isError"] == true {
+            bail!(
+                "authenticated {name} request was refused: {}",
+                result["content"]
+            );
+        }
+        let structured = result["structuredContent"]
+            .as_object()
+            .ok_or_else(|| anyhow!("authenticated {name} response lacked structured content"))?;
+        Ok(serde_json::Value::Object(structured.clone()))
+    }
 }
 
 #[cfg(all(feature = "daemon", unix))]
@@ -1298,6 +1329,7 @@ fn verified_task_brief_v1(
         brief: serde_json::Value::Object(brief.clone()),
         stream,
         reader,
+        next_request_id: 3,
     })
 }
 
@@ -1311,6 +1343,15 @@ fn mcp_brief(args: McpBriefArgs) -> Result<i32> {
 #[cfg(all(feature = "daemon", unix))]
 fn codex_launch(args: CodexArgs) -> Result<i32> {
     let mut session = verified_task_brief_v1(&args.brief, true)?;
+    if args.peer_wait_seconds > 300 {
+        bail!("--peer-wait-seconds must be between 0 and 300");
+    }
+    validate_codex_launch_task_v1(&session.brief)?;
+    wait_for_peer_v1(
+        &mut session,
+        &args.brief,
+        Duration::from_secs(args.peer_wait_seconds),
+    )?;
     validate_codex_launch_task_v1(&session.brief)?;
     let prompt = codex_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let workspace = &session.workspace;
@@ -1347,41 +1388,121 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         .filter(|_| session.brief["coordination"]["status"] == "leader")
         .map(str::to_owned);
     let mut next_heartbeat = Instant::now() + Duration::from_secs(60);
-    let mut request_id = 3;
     loop {
         if let Some(status) = child.try_wait()? {
             return Ok(status.code().unwrap_or(1));
         }
         if Instant::now() >= next_heartbeat {
             if let Some(ref lease_id) = lease_id {
-                let heartbeat = daemon_request_v1(
-                    &mut session.stream,
-                    &mut session.reader,
-                    request_id,
-                    "tools/call",
+                let task_id = session.brief["taskId"].clone();
+                let heartbeat = session.tool(
+                    "context.publish",
                     serde_json::json!({
-                        "name": "context.publish",
-                        "arguments": {
-                            "taskId": session.brief["taskId"],
-                            "kind": "work_heartbeat",
-                            "leaseId": lease_id,
-                            "ttlMs": 300_000
-                        }
+                        "taskId": task_id,
+                        "kind": "work_heartbeat",
+                        "leaseId": lease_id,
+                        "ttlMs": 300_000
                     }),
                 );
-                if !heartbeat.as_ref().is_ok_and(|response| {
-                    response["isError"] != true
-                        && response["structuredContent"]["outcome"]["status"] == "renewed"
-                }) {
+                if !heartbeat
+                    .as_ref()
+                    .is_ok_and(|response| response["outcome"]["status"] == "renewed")
+                {
                     child.kill()?;
                     let _ = child.wait();
                     bail!("task lease heartbeat failed; stopped Codex before uncoordinated work");
                 }
-                request_id += 1;
             }
             next_heartbeat = Instant::now() + Duration::from_secs(60);
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn wait_for_peer_v1(
+    session: &mut TaskBriefSessionV1,
+    args: &McpBriefArgs,
+    max_wait: Duration,
+) -> Result<()> {
+    if session.brief["coordination"]["status"] != "join" || max_wait.is_zero() {
+        return Ok(());
+    }
+    eprintln!(
+        "Again: another agent leads this exact task; waiting up to {} seconds before launching Codex.",
+        max_wait.as_secs()
+    );
+    let task_id = session.brief["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("task brief omitted canonical task ID"))?
+        .to_owned();
+    let state_generation = session.brief["taskIntent"]["stateGeneration"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("task brief omitted state generation"))?;
+    let deadline = Instant::now() + max_wait;
+    loop {
+        let claim = session.tool(
+            "task.claim",
+            serde_json::json!({
+                "taskId": task_id,
+                "expectedStateGeneration": state_generation,
+                "ttlMs": 300_000
+            }),
+        )?;
+        match claim["outcome"]["status"].as_str() {
+            Some("leader") => {
+                let lease_id = claim["outcome"]["lease_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("task claim omitted leader lease ID"))?;
+                let mut refreshed = session.tool(
+                    "task.start",
+                    serde_json::json!({
+                        "taskId": args.task_id,
+                        "task": args.task,
+                        "includeSourcePreviews": true,
+                        "previewOnly": true
+                    }),
+                )?;
+                if refreshed["operation"] != "task.start"
+                    || refreshed["coordination"]["status"] != "preview"
+                {
+                    bail!("refreshed task brief had an unexpected operation");
+                }
+                refreshed["coordination"] = serde_json::json!({
+                    "status": "leader",
+                    "leaseId": lease_id,
+                    "stateGeneration": claim["outcome"]["state_generation"],
+                    "expiresAtMs": claim["outcome"]["expires_at_ms"]
+                });
+                session.brief = refreshed;
+                eprintln!("Again: peer lease ended; launching Codex with a fresh brief.");
+                return Ok(());
+            }
+            Some("join") => {
+                if Instant::now() >= deadline {
+                    let refreshed = session.tool(
+                        "task.start",
+                        serde_json::json!({
+                            "taskId": args.task_id,
+                            "task": args.task,
+                            "includeSourcePreviews": true,
+                            "previewOnly": true
+                        }),
+                    )?;
+                    if refreshed["operation"] == "task.start" {
+                        let mut refreshed = refreshed;
+                        refreshed["coordination"] = session.brief["coordination"].clone();
+                        session.brief = refreshed;
+                    }
+                    return Ok(());
+                }
+            }
+            Some("waiting" | "terminal") => {
+                bail!("task changed state while waiting for its peer leader");
+            }
+            _ => bail!("authenticated task claim had an unexpected outcome"),
+        }
+        thread::sleep(Duration::from_millis(250));
     }
 }
 

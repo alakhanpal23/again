@@ -1,0 +1,147 @@
+{
+  "accepted": true,
+  "againBinarySha256": "339a222e72aeadf9a8e084509a417eee368ef3c6bdbaaa4a583720500df0c06c",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "delayFollowerUntilLeaderExits": true,
+  "evidenceScope": "local_live_diagnostic_not_qualification",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'requirements*.txt'\"",
+            "/bin/zsh -lc 'git status --short && ls -la'",
+            "/bin/zsh -lc 'cat src/calculator.py && cat tests/test_calculator.py'",
+            "/bin/zsh -lc \"cat README.md && rg --files -g 'AGENTS.md' -g '\"'!src/calculator.py'\"'\"",
+            "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-delayed-baseline-first-v1-baseline-first.jsonl",
+          "rawEventSha256": "ab73706d0d13467cb4eb4a10f9b23d6b9620be4b289295256e2c944d0d934fa0",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 92800,
+            "input_tokens": 98652,
+            "output_tokens": 551,
+            "reasoning_output_tokens": 30
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini' -g 'Makefile'\"",
+            "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/calculator.py\"",
+            "/bin/zsh -lc \"sed -n '1,240p' tests/test_calculator.py\"",
+            "/bin/zsh -lc \"ls -la && rg --files -g 'AGENTS.md' -g '\"'!**/.git/**'\"'\"",
+            "/bin/zsh -lc \"git status --short && sed -n '1,40l' src/calculator.py && git diff -- src/calculator.py\"",
+            "/bin/zsh -lc 'python3 -B -m unittest discover -s tests -v'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-delayed-baseline-first-v1-baseline-second.jsonl",
+          "rawEventSha256": "a3009018fc76d84e0af131977bcf791dc9fe713451e35bb77d07dcf1ce95fc59",
+          "stderrSha256": "fad9a803fa452f4cdec92dc7175c5debb099cfcb0168b1d760df90aa583f1b6c",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 92928,
+            "input_tokens": 99158,
+            "output_tokens": 616,
+            "reasoning_output_tokens": 121
+          }
+        }
+      },
+      "condition": "baseline",
+      "elapsedMs": 24526.615,
+      "firstEditMs": 12241.411,
+      "followerDelayedUntilLeaderExit": false,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 198.869,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": false,
+      "secondLaunchGapMs": 2.088,
+      "timedOut": false
+    },
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc 'git diff -- src/calculator.py'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-delayed-baseline-first-v1-again-first.jsonl",
+          "rawEventSha256": "82ed3f72e18fa48fb2652a6697a8bffcf2db337192e9acabf83e20956fbaa201",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 43648,
+            "input_tokens": 48691,
+            "output_tokens": 357,
+            "reasoning_output_tokens": 71
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-delayed-baseline-first-v1-again-second.jsonl",
+          "rawEventSha256": "a0d8f0f72edd9cc9b40c1a328bea2931d286f92c795ddb9d7385baaca443f41e",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 27648,
+            "input_tokens": 32305,
+            "output_tokens": 254,
+            "reasoning_output_tokens": 81
+          }
+        }
+      },
+      "condition": "again",
+      "elapsedMs": 24443.371,
+      "firstEditMs": 5597.705,
+      "followerDelayedUntilLeaderExit": true,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 124.182,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": true,
+      "secondLaunchGapMs": 14056.672,
+      "timedOut": false
+    }
+  ],
+  "order": "baseline-first",
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "schema": "again.codex-parallel-pair-diagnostic.v1",
+  "sourceFiles": 1000
+}

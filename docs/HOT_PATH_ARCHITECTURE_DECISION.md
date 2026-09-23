@@ -95,7 +95,9 @@ calls in real tasks; server-side caching alone cannot.
    details through MCP. A standalone preview-only task start claims no lease.
    A launcher that runs the agent process must hold and renew an authenticated
    leader lease for that process lifetime, or a second fast launch cannot see
-   it. Keep the regular `task.start` path for clients without a prebrief
+   it. For an exact duplicate task, wait for the active leader for a bounded
+   interval and refresh source/context before a follower takes over; leave
+   independent tasks free to run concurrently. Keep the regular `task.start` path for clients without a prebrief
    launcher. Measure first edit, completion, tokens, and preparation together.
    Do not add a preview merely because it removes a call if it worsens
    validated completion time.
