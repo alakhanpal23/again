@@ -494,6 +494,20 @@ passed the same lifecycle scenarios at `eda4ab8`, with the same release binary
 SHA-256. Codex and fake-Claude launcher lease handoff gates also passed on the
 pre-rebase identical tree; the rebased daemon suite, formatting, and strict
 Clippy passed.
+The manifest now validates cached witnesses before observation and at the
+final mutation fence, without repeating the same check while assembling a
+cached plan. In one local debug scale comparison against the exact parent
+commit, warm 1,000-file observation fell from 89 to 55 ms and warm 10,000-file
+observation from 959 to 595 ms. This measures manifest work, not whole-task
+speed or exact cache hits. A cancellation arriving between durable follower
+acquisition and provider registration is now retained for that exact call
+attempt; a focused test confirms the follower is retired while the leader
+remains in flight. Daemon-only constructors and authenticated transport entry
+points are excluded from non-daemon builds, and the unused leader-owner field
+was removed. The [clean-source release gate](../bench/results/2026-09-23-auth-product-e2e-manifest-cancel-release-v1.json)
+at `e9e04c9` passed all 14 lifecycle scenarios with release binary SHA-256
+`0aeb4862981119a53ca10289b074c0236f930e75cd0e116226aeceec2a9c1023`.
+The full daemon suite, strict daemon Clippy, and strict non-daemon check passed.
 The [clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-scoped-overflow-release-v1.json)
 at `d0ee560` passed the full task source lifecycle. In particular, a
 concurrent search of a bounded `lease/` subtree in the same large workspace
