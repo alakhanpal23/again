@@ -322,7 +322,7 @@ def run_condition(
         str(codex), "exec", "--ephemeral", "--ignore-user-config", "--json",
         "--approve-for-me", "-m", model, "-C", str(workspace),
     ]
-    if condition == "product":
+    if condition in ("product", "product-cold"):
         command = [
             str(binary), "codex", "--workspace", str(workspace),
             "--task-id", task_id, "--task", pair.PROMPT, "--",
@@ -345,7 +345,7 @@ def run_condition(
             "-c", f"mcp_servers.again.command={json.dumps(server_command)}",
             "-c", f"mcp_servers.again.args={json.dumps(server_args)}",
         ]
-    if condition != "product":
+    if condition not in ("product", "product-cold"):
         command.append((again_instruction(task_id) if condition == "again" else initial_brief) + pair.PROMPT)
     original = hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
@@ -407,7 +407,7 @@ def run_condition(
     )
     stats_after = pair.again_stats(binary, workspace)
     stats = {key: stats_after[key] - stats_before[key] for key in stats_before}
-    if condition in ("again", "prebrief", "product"):
+    if condition in ("again", "prebrief", "product", "product-cold"):
         subprocess.run(
             [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
             capture_output=True, text=True, timeout=10
