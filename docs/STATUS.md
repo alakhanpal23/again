@@ -17,6 +17,11 @@ the originating edit and test beyond the 64 most recent events yet still
 finds their current materialized hints. The isolated Codex launcher gate also
 passes. This fixes the recent-event-window limitation; it does not yet prove
 that retained knowledge lowers real task time.
+At clean source `78db32774cdd44ff5d3d55730902b3e6087cbbf4`, the
+[release-binary Brain gate](../bench/results/2026-09-23-brain-materialized-e2e-78db327.json)
+and [Codex launcher gate](../bench/results/2026-09-23-brain-materialized-codex-launch-78db327.json)
+passed on the same binary. The materialized memory is repository-local; no
+cross-user company knowledge or qualified test-result reuse exists yet.
 
 ## 2026-09-23 single-agent Again Brain first slice
 
