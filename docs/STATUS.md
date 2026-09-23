@@ -458,6 +458,13 @@ and [fake-Claude launcher](../bench/results/2026-09-23-claude-launch-generic-pro
 gates passed on the clean-source release binary at `17510ad`. They cover
 source-backed task lifecycle, peer lease handoff, stale-source refresh, and
 both client launch arguments. They do not measure a live Claude coding task.
+A [40-sample clean-source release probe](../bench/results/2026-09-23-gateway-task-reuse-value-split-manifest-clean-release-v1.json)
+using the same binary bytes recorded cold automatic calls of 21.36 ms for
+128 KiB read, 294.67 ms for search, 239.76 ms for tree, and 313.22 ms for
+Git status. All 41 requests per case still executed the provider with zero
+exact hits. Warm search was 69.74 ms versus 63.40 ms direct; the remaining
+proof/reference check has not become a repeated-call speed win. The probe
+records a clean source SHA but does not independently bind binary bytes to it.
 
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
