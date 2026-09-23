@@ -488,6 +488,12 @@ at `5c88120` passed peer delivery and relevant-edit retirement for a match in
 the 4,097-file fixture, along with the existing task lifecycle scenarios. The
 report binds source SHA `5c88120c865a93eaa1f832fd004903853bcc08eb` to
 release binary SHA-256 `4be421877b75bf700c275e728f2ba97f49e5c04b5314d9b524ff13982e33feb9`.
+After rebasing onto `origin/main` at `6a8f88a`, the source tree remained
+identical. The [rebased clean-source release gate](../bench/results/2026-09-23-auth-product-e2e-search-match-rebased-release-v1.json)
+passed the same lifecycle scenarios at `eda4ab8`, with the same release binary
+SHA-256. Codex and fake-Claude launcher lease handoff gates also passed on the
+pre-rebase identical tree; the rebased daemon suite, formatting, and strict
+Clippy passed.
 The [clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-scoped-overflow-release-v1.json)
 at `d0ee560` passed the full task source lifecycle. In particular, a
 concurrent search of a bounded `lease/` subtree in the same large workspace
