@@ -127,7 +127,14 @@ has a persisted proof and an `explain` reason.
   calls and additional post-edit inspection. See
   `bench/results/2026-09-23-codex-1k-preview-pair-v1.json` and its raw JSONL
   events. The root-path and Git-status overflow defects from that trace have
-  focused regression coverage; rerun the live pair before claiming benefit.
+  focused regression coverage. A clean-source repeat on the fixed binary
+  removed both tool failures and passed the edit oracle, but still finished
+  in 46.7 seconds versus 20.7 seconds baseline, with 204k versus 107k input
+  tokens and zero exact hits. First edit was 19.1 versus 12.9 seconds. See
+  `bench/results/2026-09-23-codex-1k-preview-pair-fixed-v1.json`. The agent
+  read directory listings and README after editing to choose validation;
+  task-start supplied an explicit source preview but no proven test selector.
+  Measure the value of validation guidance and post-edit calls next.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
