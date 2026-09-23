@@ -206,14 +206,25 @@ still costs 0.13–0.41 seconds on the 1,000-file fixture, and warm direct calls
 do not avoid physical executions. Cheap direct source admission and broader
 task-level qualification remain open.
 
-A two-client authenticated test now covers a source disappearing during a
-repeated task-bound read. The failed fresh read atomically retires that task's
-verified fact and full-result reference, sends both clients an invalidation,
-and refuses the old reference. A restored read can admit a new verified result;
-the ledger also supports a later admission version if the same result ID is
-observed again. This retirement currently applies to the active task. Other
-tasks that admitted the same source need cross-task invalidation or retrieval
-freshness validation before source disappearance is safe across all tasks.
+A three-client authenticated test now covers a source disappearing during a
+repeated task-bound read. The failed fresh read atomically retires matching
+facts and full-result references in the active task and another task that
+admitted the same source, emits an invalidation in each task, and refuses the
+old references. The store matches old dependency keys and values within one
+repository and authorization scope, leaving unrelated references current. A
+restored read can admit a new verified result; the ledger also supports a
+later admission version if the same result ID is observed again. A failed
+retirement makes the observing tool call fail. Source changes that no task has
+observed still need retrieval-time freshness validation or a reliable change
+feed before all stored context can be treated as current.
+
+The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
+measured 40 warm calls per case on local dirty source. The current-reference
+check added 48 µs to small-read p50, 76 µs to search p50, and 53 µs to tree
+p50 versus execute-only; all three paths still executed 41 physical calls.
+This is a correctness guard with a measurable small-call cost, not evidence of
+faster repeated reads. Reducing that cost while preserving cross-connection
+and cross-process freshness remains open.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

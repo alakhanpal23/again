@@ -4138,6 +4138,40 @@ impl Store {
         Ok(version)
     }
 
+    /// A warm direct read may bypass context admission only while its own
+    /// task still holds a current, provenance-checked result reference.
+    pub fn context_result_reference_current_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<bool> {
+        validate_digest(gateway_result_id, "context result reference selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let event: Option<u64> = transaction
+            .query_row(
+                "SELECT admission_event_sequence
+                 FROM context_ledger_result_references_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND result_id = ?4 AND retired_event_sequence IS NULL
+                 ORDER BY reference_version DESC LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    gateway_result_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = match event {
+            Some(event) => context_event_provenance_current_v1(&transaction, identity, event)?,
+            None => false,
+        };
+        transaction.commit()?;
+        Ok(current)
+    }
+
     /// Narrow typed adapter for exact built-in observations. Callers choose
     /// only an identifier and scope; the statement/topic/value are derived by
     /// deterministic code, never copied from agent or model prose.
@@ -4548,42 +4582,111 @@ impl Store {
             &fields,
             now,
         )?;
-        let retired_facts = transaction.execute(
-            "UPDATE context_ledger_fact_versions_v1 AS fact
-             SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
-             WHERE fact.repository_id = ?2 AND fact.workspace_id = ?3 AND fact.task_id = ?4
-               AND fact.retired_event_sequence IS NULL
-               AND EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
-                          WHERE source.event_sequence = fact.admission_event_sequence
-                            AND source.result_id = ?5
-                            AND source.authorization_scope_digest = ?6)",
-            params![
-                sequence,
+        let mut retired_facts =
+            retire_context_source_facts_v1(&transaction, identity, sequence, gateway_result_id)?;
+        let mut retired_result_references =
+            retire_context_source_results_v1(&transaction, identity, sequence, gateway_result_id)?;
+        // Another task can admit the same source under a different result ID.
+        // Match its admitted dependency key and old value, within the same
+        // repository and authorization scope. A task that has already admitted
+        // a newer value remains current.
+        let affected_tasks = {
+            let mut statement = transaction.prepare(
+                "SELECT event.task_id, event.agent_id, event.session_id, event.turn_id,
+                        event.connection_generation, event.compaction_generation,
+                        event.lifecycle_generation
+                 FROM context_ledger_events_v1 AS event
+                 WHERE event.repository_id = ?1 AND event.workspace_id = ?2
+                   AND event.authorization_scope_digest = ?3 AND event.task_id != ?4
+                   AND (EXISTS(SELECT 1 FROM context_ledger_fact_versions_v1 AS fact
+                               WHERE fact.admission_event_sequence = event.sequence
+                                 AND fact.retired_event_sequence IS NULL)
+                        OR EXISTS(SELECT 1 FROM context_ledger_result_references_v1 AS reference
+                                  WHERE reference.admission_event_sequence = event.sequence
+                                    AND reference.retired_event_sequence IS NULL))
+                   AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                               WHERE source.event_sequence = event.sequence
+                                 AND source.result_id = ?5)
+                        OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                  JOIN result_dependencies AS changed
+                                    ON changed.gateway_result_id = ?5
+                                   AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                   AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                  WHERE dependency.event_sequence = event.sequence))
+                 ORDER BY event.task_id, event.sequence",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest(),
+                    identity.task_id(),
+                    gateway_result_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, u64>(6)?,
+                    ))
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut last_task = None::<String>;
+        for (task_id, agent_id, session_id, turn_id, connection, compaction, lifecycle) in
+            affected_tasks
+        {
+            if last_task.as_deref() == Some(&task_id) {
+                continue;
+            }
+            last_task = Some(task_id.clone());
+            let target = ContextLedgerIdentityV1::new(
                 identity.repository_id(),
                 identity.workspace_id(),
-                identity.task_id(),
+                &task_id,
+                identity.authorization_scope_digest(),
+                &agent_id,
+                &session_id,
+                &turn_id,
+                &connection,
+                compaction,
+                lifecycle,
+            )
+            .map_err(|refusal| anyhow!(refusal.code()))?;
+            enforce_context_quota_v1(&transaction, &target)?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"again.context.cross-task-source-invalidation.v1\0");
+            hash_field(&mut hasher, envelope_digest.as_bytes());
+            hash_field(&mut hasher, task_id.as_bytes());
+            let target_envelope = hasher.finalize().to_hex().to_string();
+            let target_digest =
+                context_event_canonical_digest_v1(&target, &fields, &serialized, &[]);
+            let target_sequence = insert_context_event_v1(
+                &transaction,
+                &target,
+                &target_envelope,
+                &target_digest,
+                &fields,
+                now,
+            )?;
+            retired_facts += retire_context_source_facts_v1(
+                &transaction,
+                &target,
+                target_sequence,
                 gateway_result_id,
-                identity.authorization_scope_digest()
-            ],
-        )? as u64;
-        let retired_result_references = transaction.execute(
-            "UPDATE context_ledger_result_references_v1 AS reference
-             SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
-             WHERE reference.repository_id = ?2 AND reference.workspace_id = ?3
-               AND reference.task_id = ?4 AND reference.retired_event_sequence IS NULL
-               AND EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
-                          WHERE source.event_sequence = reference.admission_event_sequence
-                            AND source.result_id = ?5
-                            AND source.authorization_scope_digest = ?6)",
-            params![
-                sequence,
-                identity.repository_id(),
-                identity.workspace_id(),
-                identity.task_id(),
+            )?;
+            retired_result_references += retire_context_source_results_v1(
+                &transaction,
+                &target,
+                target_sequence,
                 gateway_result_id,
-                identity.authorization_scope_digest()
-            ],
-        )? as u64;
+            )?;
+        }
         transaction.commit()?;
         Ok(ContextInvalidationReportV1 {
             sequence,
@@ -8301,6 +8404,76 @@ fn context_invalidation_counts_v1(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .context("read context invalidation counts")
+}
+
+fn retire_context_source_facts_v1(
+    transaction: &Transaction<'_>,
+    identity: &ContextLedgerIdentityV1,
+    sequence: u64,
+    source_result_id: &str,
+) -> Result<u64> {
+    let count = transaction.execute(
+        "UPDATE context_ledger_fact_versions_v1 AS fact
+         SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
+         WHERE fact.repository_id = ?2 AND fact.workspace_id = ?3 AND fact.task_id = ?4
+           AND fact.retired_event_sequence IS NULL
+           AND EXISTS(SELECT 1 FROM context_ledger_events_v1 AS event
+                      WHERE event.sequence = fact.admission_event_sequence
+                        AND event.authorization_scope_digest = ?5
+                        AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                                    WHERE source.event_sequence = event.sequence
+                                      AND source.result_id = ?6)
+                             OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                       JOIN result_dependencies AS changed
+                                         ON changed.gateway_result_id = ?6
+                                        AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                        AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                       WHERE dependency.event_sequence = event.sequence)))",
+        params![
+            sequence,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.task_id(),
+            identity.authorization_scope_digest(),
+            source_result_id
+        ],
+    )?;
+    Ok(count as u64)
+}
+
+fn retire_context_source_results_v1(
+    transaction: &Transaction<'_>,
+    identity: &ContextLedgerIdentityV1,
+    sequence: u64,
+    source_result_id: &str,
+) -> Result<u64> {
+    let count = transaction.execute(
+        "UPDATE context_ledger_result_references_v1 AS reference
+         SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
+         WHERE reference.repository_id = ?2 AND reference.workspace_id = ?3
+           AND reference.task_id = ?4 AND reference.retired_event_sequence IS NULL
+           AND EXISTS(SELECT 1 FROM context_ledger_events_v1 AS event
+                      WHERE event.sequence = reference.admission_event_sequence
+                        AND event.authorization_scope_digest = ?5
+                        AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                                    WHERE source.event_sequence = event.sequence
+                                      AND source.result_id = ?6)
+                             OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                       JOIN result_dependencies AS changed
+                                         ON changed.gateway_result_id = ?6
+                                        AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                        AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                       WHERE dependency.event_sequence = event.sequence)))",
+        params![
+            sequence,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.task_id(),
+            identity.authorization_scope_digest(),
+            source_result_id
+        ],
+    )?;
+    Ok(count as u64)
 }
 
 fn context_event_provenance_current_v1(
@@ -12139,6 +12312,161 @@ mod tests {
             .unwrap()
     }
 
+    fn context_test_admit_result(
+        store: &Store,
+        identity: &ContextLedgerIdentityV1,
+        binding: &ValidatedGatewayReadV1,
+        result_id: &str,
+        label: &str,
+    ) {
+        let source = store
+            .context_verified_observation_v1(identity, binding, result_id, "repo.read:input.txt")
+            .unwrap();
+        let fact = context_test_fact(store, identity, &format!("fact:{label}"), &source);
+        let fact_envelope = blake3::hash(format!("fact:{label}").as_bytes())
+            .to_hex()
+            .to_string();
+        store
+            .admit_context_fact_v1(
+                identity,
+                &fact_envelope,
+                1,
+                &fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        let full = store
+            .get_gateway_result(binding, result_id)
+            .unwrap()
+            .unwrap();
+        let retrieval = ReasoningRetrievalIdentityV1::new(
+            result_id,
+            result_id,
+            full.result.stdout_bytes + full.result.stderr_bytes,
+        )
+        .unwrap();
+        let reference_envelope = blake3::hash(format!("reference:{label}").as_bytes())
+            .to_hex()
+            .to_string();
+        store
+            .append_context_event_v1(
+                identity,
+                &reference_envelope,
+                &ContextLedgerEventInputV1::ResultReference {
+                    reference: retrieval,
+                    reference_version: 1,
+                    verified_sources: vec![source],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn unavailable_source_retires_matching_dependencies_across_tasks_only() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let first = context_test_identity("agent-a", 'a', '1', 1);
+        let second = ContextLedgerIdentityV1::new(
+            "repository",
+            "workspace",
+            "second-task",
+            &"a".repeat(64),
+            "agent-b",
+            "session-b",
+            "turn",
+            &"2".repeat(64),
+            0,
+            1,
+        )
+        .unwrap();
+        let unrelated = ContextLedgerIdentityV1::new(
+            "repository",
+            "workspace",
+            "unrelated-task",
+            &"a".repeat(64),
+            "agent-c",
+            "session-c",
+            "turn",
+            &"3".repeat(64),
+            0,
+            1,
+        )
+        .unwrap();
+        let other_scope = context_test_identity("agent-d", 'd', '4', 1);
+        for identity in [&first, &second, &unrelated, &other_scope] {
+            store.activate_context_recipient_v1(identity).unwrap();
+        }
+        let (first_binding, first_id) = context_test_gateway_result(
+            &mut store,
+            "source-first",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let (second_binding, second_id) = context_test_gateway_result(
+            &mut store,
+            "source-second",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let (unrelated_binding, unrelated_id) = context_test_gateway_result(
+            &mut store,
+            "source-unrelated",
+            &"e".repeat(64),
+            &"f".repeat(64),
+        );
+        let (scope_binding, scope_id) = context_test_gateway_result(
+            &mut store,
+            "source-other-scope",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        context_test_admit_result(&store, &first, &first_binding, &first_id, "first");
+        context_test_admit_result(&store, &second, &second_binding, &second_id, "second");
+        context_test_admit_result(
+            &store,
+            &unrelated,
+            &unrelated_binding,
+            &unrelated_id,
+            "unrelated",
+        );
+        context_test_admit_result(
+            &store,
+            &other_scope,
+            &scope_binding,
+            &scope_id,
+            "other-scope",
+        );
+        let cursor = store.context_task_snapshot_v1(&second).unwrap().cursor();
+        let retired = store
+            .invalidate_context_source_observation_v1(&first, &"9".repeat(64), &first_id)
+            .unwrap();
+        assert_eq!(retired.retired_facts, 2);
+        assert_eq!(retired.retired_result_references, 2);
+        assert!(store.retrieve_context_result_v1(&first, &first_id).is_err());
+        assert!(
+            store
+                .retrieve_context_result_v1(&second, &second_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .retrieve_context_result_v1(&unrelated, &unrelated_id)
+                .is_ok()
+        );
+        assert!(
+            store
+                .retrieve_context_result_v1(&other_scope, &scope_id)
+                .is_ok()
+        );
+        let delta = store.context_delta_after_v1(&second, cursor, 64).unwrap();
+        assert!(
+            delta
+                .events()
+                .iter()
+                .any(|event| event.kind() == ContextLedgerEventKindV1::Invalidation)
+        );
+    }
+
     #[test]
     fn unavailable_source_retirement_is_atomic_and_same_result_can_be_readmitted() {
         let temp = TempDir::new().unwrap();
@@ -12191,6 +12519,11 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(
+            store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
+        );
         let retired = store
             .invalidate_context_source_observation_v1(&identity, &"f".repeat(64), &result_id)
             .unwrap();
@@ -12200,6 +12533,11 @@ mod tests {
             store
                 .retrieve_context_result_v1(&identity, &result_id)
                 .is_err()
+        );
+        assert!(
+            !store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
         );
         assert_eq!(
             store
@@ -12232,6 +12570,11 @@ mod tests {
             store
                 .retrieve_context_result_v1(&identity, &result_id)
                 .is_ok()
+        );
+        assert!(
+            store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
         );
     }
 

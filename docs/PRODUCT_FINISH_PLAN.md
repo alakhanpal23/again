@@ -63,6 +63,10 @@ No manual editing of agent configuration is needed.
 - Measure shared-manifest traversal, result lookup, join latency, cold miss
   overhead, relevant and irrelevant mutation cost, and response bytes on
   1k/10k-file and large-output fixtures. Optimize the dominant measured path.
+- Remove the measured warm direct-call authority-check overhead with a shared
+  invalidation generation or equivalent fast proof that remains correct across
+  connections, restarts, and separate store handles. Preserve the cross-task
+  recovery test and compare against execute-only on cheap calls.
 - Keep mutations, credentials, communication, network freshness, interactive
   work, and unknown tools on the normal execution path. Add closed profiles for
   more deterministic actions only when complete observations are possible.
@@ -83,10 +87,10 @@ has a persisted proof and an `explain` reason.
 - Test full-before-compact delivery, exact recipient retrieval, disconnect,
   cancellation, compaction, restart, relevant/irrelevant edits, corrupt store,
   quota exhaustion, and two agents publishing at the same time.
-- Propagate source-change and source-unavailable retirement across every task
-  that admitted the affected observation, or validate source freshness before
-  retrieval. Fail closed if retirement cannot be committed, and prove that
-  unrelated tasks and sources retain their current facts.
+- Validate source freshness at retrieval or task start, or consume a reliable
+  change feed, so unobserved edits cannot leave a stored fact apparently
+  current. Extend cross-task retirement to every qualified source change path;
+  keep retirement atomic, scope-bound, and fail closed on commit failure.
 - Keep task-start local and bounded. An unavailable index returns an explicit
   incomplete brief quickly; validation preview never declares a test skippable
   without a qualified execution profile.

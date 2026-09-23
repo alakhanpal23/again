@@ -1058,12 +1058,29 @@ impl ToolExecution for GatewayControlledProviderV1 {
             }
         }
         let candidate_key = Self::recent_candidate_key(&call);
-        let candidate = self.recent_candidate(&candidate_key);
+        let mut candidate = self.recent_candidate(&candidate_key);
         let active_task_id = self
             .context_coordinator
             .as_ref()
             .and_then(|coordinator| coordinator.active_identity_for_call(&call))
             .map(|identity| identity.task_id().to_owned());
+        if let Some(remembered) = candidate.as_ref()
+            && remembered.task_id == active_task_id
+            && remembered.task_id.is_some()
+            && let Some(coordinator) = self.context_coordinator.as_ref()
+        {
+            match coordinator.result_reference_current(&call, &remembered.gateway_result_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.recent_candidates
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&candidate_key);
+                    candidate = None;
+                }
+                Err(_) => return Err(context_authority_failed_v1()),
+            }
+        }
         // After a task has received one source-backed built-in result, a
         // repeated repository call or large-index Git status can execute
         // through the trusted provider directly.
@@ -1094,13 +1111,19 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 return observed;
             }
             if let Some(coordinator) = self.context_coordinator.as_ref() {
-                let _ =
-                    coordinator.invalidate_source_observation(&call, &candidate.gateway_result_id);
+                if coordinator
+                    .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                    .is_err()
+                {
+                    return Err(context_authority_failed_v1());
+                }
             }
+            // A source change can retire references in other tasks too. Their
+            // in-memory shortcuts must re-enter admission on the next call.
             self.recent_candidates
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
-                .remove(&candidate_key);
+                .clear();
             let _ = self
                 .store
                 .lock()
@@ -2067,6 +2090,19 @@ fn provider_io_v1(error: impl std::fmt::Display) -> ProviderError {
                 "retryable": true
             }),
         ),
+    )
+}
+
+fn context_authority_failed_v1() -> ProviderError {
+    ProviderError::gateway_authored(
+        McpError::typed(
+            McpErrorCode::InternalError,
+            "verified context authority check failed",
+        )
+        .with_data(json!({
+            "reason": "context_authority_failed",
+            "retryable": true
+        })),
     )
 }
 

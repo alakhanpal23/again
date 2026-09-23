@@ -2197,6 +2197,7 @@ mod tests {
         let server = thread::spawn(move || daemon.serve());
         let mut agent = LocalMcpClientV1::connect(workspace.path());
         let mut peer = LocalMcpClientV1::connect(workspace.path());
+        let mut other_task_agent = LocalMcpClientV1::connect(workspace.path());
         let start = agent.tool(
             "task.start",
             json!({ "taskId": "deleted-source", "task": "inspect input.txt" }),
@@ -2225,6 +2226,22 @@ mod tests {
             shared["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
             "current\n"
         );
+        let other_start = other_task_agent.tool(
+            "task.start",
+            json!({ "taskId": "other-source-task", "task": "inspect the same file" }),
+        );
+        assert!(other_start.get("error").is_none(), "{other_start}");
+        let other_cursor = other_start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let other_read = other_task_agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let other_result_id = other_read["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Restore the first task's warm candidate after the second task read.
+        let warm = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(warm["result"]["content"][0]["text"], "current\n");
         fs::remove_file(workspace.path().join("input.txt")).unwrap();
         let missing = agent.tool("repo.read", json!({ "path": "input.txt" }));
         assert!(missing.get("error").is_some(), "{missing}");
@@ -2260,6 +2277,26 @@ mod tests {
             stale["error"]["data"]["reason"], "retrieval_refused",
             "{stale}"
         );
+        let other_delta = other_task_agent.tool(
+            "context.delta",
+            json!({ "taskId": "other-source-task", "afterCursor": other_cursor, "limit": 64 }),
+        );
+        assert!(
+            other_delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation"),
+            "other task missed source invalidation: {other_delta}"
+        );
+        let other_stale = other_task_agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "other-source-task", "resultId": other_result_id }),
+        );
+        assert_eq!(
+            other_stale["error"]["data"]["reason"], "retrieval_refused",
+            "{other_stale}"
+        );
         fs::write(workspace.path().join("input.txt"), b"current\n").unwrap();
         let restored = agent.tool("repo.read", json!({ "path": "input.txt" }));
         assert_eq!(restored["result"]["content"][0]["text"], "current\n");
@@ -2276,7 +2313,26 @@ mod tests {
             "current\n",
             "restored source did not regain a verified reference: {recovered}"
         );
+        let other_restored = other_task_agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let other_restored_id = other_restored["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap_or_else(|| {
+                panic!("other task did not admit restored result: {other_restored}")
+            });
+        let other_recovered = other_task_agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "other-source-task", "resultId": other_restored_id }),
+        );
+        assert_eq!(
+            other_recovered["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "current\n",
+            "other task did not regain a verified reference: {other_recovered}"
+        );
         peer.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        other_task_agent
+            .stream
+            .shutdown(std::net::Shutdown::Both)
+            .unwrap();
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();

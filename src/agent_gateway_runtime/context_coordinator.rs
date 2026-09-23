@@ -383,6 +383,20 @@ impl LocalContextCoordinatorV1 {
         Ok(())
     }
 
+    pub(super) fn result_reference_current(
+        &self,
+        call: &ProviderCall,
+        gateway_result_id: &str,
+    ) -> Result<bool> {
+        let Some(identity) = self.active_identity_for_call(call) else {
+            return Ok(false);
+        };
+        self.store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .context_result_reference_current_v1(&identity, gateway_result_id)
+    }
+
     fn task_start(self: &Arc<Self>, call: &ProviderCall) -> Result<ContextOperationResultV1> {
         require_keys_v1(
             &call.arguments,
