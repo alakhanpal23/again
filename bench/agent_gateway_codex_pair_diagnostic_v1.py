@@ -149,6 +149,7 @@ def main() -> int:
     parser.add_argument("--binary", type=pathlib.Path, default="target/debug/again")
     parser.add_argument("--model", default="gpt-6-sol")
     parser.add_argument("--source-files", type=int, default=0)
+    parser.add_argument("--order", choices=("baseline-first", "again-first"), default="baseline-first")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.source_files <= 1000:
@@ -161,7 +162,8 @@ def main() -> int:
     version = subprocess.run([str(codex), "--version"], capture_output=True, text=True, check=True).stdout.strip()
     observations = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    for condition in ("baseline", "again"):
+    order = ("baseline", "again") if args.order == "baseline-first" else ("again", "baseline")
+    for condition in order:
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
             result, raw = run_condition(
                 condition, pathlib.Path(temporary), binary, args.model, args.source_files
@@ -174,7 +176,7 @@ def main() -> int:
         result["exitCode"] == 0 and not result["timedOut"]
         and result["eventsCaptured"] and result["oracle"]["passed"]
         for result in observations
-    ) and observations[0]["againStatsDelta"]["requested"] == 0
+    ) and next(result for result in observations if result["condition"] == "baseline")["againStatsDelta"]["requested"] == 0
     report = {
         "schema": "again.codex-editable-pair-diagnostic.v1",
         "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -189,7 +191,7 @@ def main() -> int:
         "approvalMode": "approve-for-me",
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(pair.PROMPT.encode()).hexdigest(),
-        "order": ["baseline", "again"],
+        "order": list(order),
         "observations": observations,
         "accepted": accepted,
     }
