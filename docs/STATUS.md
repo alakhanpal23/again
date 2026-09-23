@@ -19,12 +19,26 @@ The focused parser, migration, and store tests pass. A
 [local fake-client gate](../bench/results/2026-09-23-brain-single-agent-local-v1.json)
 confirmed automatic event capture, a current edit/test hint in the next task's
 launch prompt, stale-edit withholding after mutation, and user-initiated
-clear. This is a first implementation slice: the
+clear. At clean source `a302cd5aee5fed4bce87a24b315c5507a1c6d2e5`, the
+same [release-binary Brain gate](../bench/results/2026-09-23-brain-release-e2e-a302cd5.json)
+passed. The existing release-binary launcher gates also passed for
+[Codex](../bench/results/2026-09-23-brain-codex-launch-a302cd5.json) and
+[Claude](../bench/results/2026-09-23-brain-claude-launch-a302cd5.json),
+including peer wait, edited-source refresh, and lease retirement. This is a
+first implementation slice: the
 brain does not yet verify arbitrary shell output, retain full agent knowledge,
 intercept a call before execution, reuse tests, cover Claude events, or show
 a measured single-agent completion-time gain. The new structured-output
-renderer still needs qualification against a real interactive Codex task and
-the existing clean-source launcher gates.
+renderer still needs qualification against a real Codex task; the fake-client
+gate only proves its completed message rendering.
+
+A [real Codex calculator pair](../bench/results/2026-09-23-brain-codex-live-a302cd5.json)
+then passed both patch and validation oracles through the release binary. The
+Again run made three agent actions versus six baseline, reached first edit in
+5.19 versus 16.86 seconds, and finished in 14.67 versus 23.61 seconds. The
+pair explicitly requested Codex JSONL, so it verifies real client event
+capture and the accepted edit, but not the launcher's new human-readable
+renderer. It is one unbalanced local diagnostic, not a general speed claim.
 
 ## 2026-09-23 four-platform native beta checkpoint
 
