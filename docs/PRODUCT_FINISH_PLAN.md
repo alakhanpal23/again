@@ -101,7 +101,8 @@ has a persisted proof and an `explain` reason.
   and Git tool, relevant and irrelevant edits, daemon restart, quota limits,
   concurrent mutation, and large task ledgers. Task-start now returns an
   incomplete brief at the 256-source scan bound, and context delta withholds
-  events at the same bound; prove both with a release-binary ledger above it.
+  events at the same bound. The 257-source release-binary gate now covers both;
+  qualify concurrent mutation and larger real task ledgers next.
   Retain atomic, scope-bound cross-task retirement.
 - Keep task-start local and bounded. An unavailable index returns an explicit
   incomplete brief quickly; validation preview never declares a test skippable

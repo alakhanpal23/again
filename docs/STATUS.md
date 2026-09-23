@@ -265,6 +265,12 @@ candidates, and source previews; incomplete delivery grants no compact-context
 acknowledgment. Context delta likewise returns no unchecked events or compact
 acknowledgment at this bound. A 257-source authenticated service test covers
 both responses.
+The expanded [clean-source release-binary run](../bench/results/2026-09-23-authenticated-product-e2e-large-ledger-release-v2.json)
+at `753c3ba5617b193822c09747382ce4e8d0530048` passed the same task
+scenarios plus a 257-source ledger: both task-start and delta withheld
+unchecked entries, the brief stayed full on retry, and targeted retrieval
+refused an edited source. This is bounded-behavior evidence, not a throughput
+or task-quality claim.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that
