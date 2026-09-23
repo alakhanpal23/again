@@ -68,6 +68,15 @@ The [clean-source release handoff gate](../bench/results/2026-09-23-brain-task-s
 passes at `3788b4b` for interactive `mcp brief` and launcher handoff. The
 custom-scope service test exercises withholding even when the local Brain
 contains a current file observation.
+A [baseline-first live Codex calculator pair](../bench/results/2026-09-23-brain-task-start-live-calculator-v1.json)
+then accepted and validated both patches. Again reached the first edit in
+4.82 versus 13.39 seconds, completed in 13.97 versus 22.01 seconds, and made
+4 versus 7 completed actions with 65,121 versus 97,892 input tokens. This
+fixture began cold, so it tests the shared task-start architecture and launch
+brief but does not isolate returning-task Brain value. The harness records a
+dirty source tree because its report was created during the run; the binary
+SHA-256 matches the clean-source release handoff gate. It is one local pair,
+not the balanced task-level qualification.
 
 ## 2026-09-23 single-agent Again Brain first slice
 
