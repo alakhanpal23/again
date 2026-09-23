@@ -1390,11 +1390,14 @@ fn brain_cli(args: BrainArgs) -> Result<i32> {
             let store = Store::open_for_workspace(&workspace)?;
             let events = store.recent_brain_events_v1(limit as usize)?;
             let files = store.recent_brain_files_v1(limit as usize)?;
+            let runs = store.recent_brain_runs_v1(limit as usize)?;
             let test_hint = store.brain_test_hint_v1()?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "recentEvents": events,
+                    "recentRuns": runs,
+                    "runAuthority": "client-observed activity and usage; task acceptance not verified",
                     "fileObservations": files,
                     "fileObservationsFreshness": "historical; not rechecked by this command",
                     "previousSuccessfulTestCommand": test_hint,
@@ -1475,8 +1478,13 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         .ok_or_else(|| anyhow!("task brief omitted task ID"))?
         .to_owned();
     let brain_session_id = uuid::Uuid::new_v4().to_string();
-    let event_reader = thread::spawn(move || -> Result<()> {
+    let brain_started_ms = crate::brain::current_ms_v1();
+    let reader_workspace = brain_workspace.clone();
+    let reader_task_id = brain_task_id.clone();
+    let reader_session_id = brain_session_id.clone();
+    let event_reader = thread::spawn(move || -> Result<crate::brain::CodexRunObservationV1> {
         let brain_store = Store::open_for_workspace(&brain_workspace).ok();
+        let mut observation = crate::brain::CodexRunObservationV1::default();
         let mut output = io::stdout().lock();
         for line in BufReader::new(stdout).lines() {
             let line = line?;
@@ -1494,22 +1502,37 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
                 writeln!(output, "{line}")?;
             }
             output.flush()?;
-            if let (Some(store), Ok(value)) = (&brain_store, parsed) {
-                for event in crate::brain::codex_completed_events_v1(
+            if let Ok(value) = parsed {
+                let events = crate::brain::codex_completed_events_v1(
                     &value,
                     &brain_workspace,
                     &brain_session_id,
                     &brain_task_id,
-                ) {
-                    if let Err(error) = store.record_brain_event_v1(&event) {
-                        eprintln!("Again Brain: could not record a completed event: {error:#}");
+                );
+                observation.observe(&value, &events);
+                if let Some(store) = &brain_store {
+                    for event in events {
+                        if let Err(error) = store.record_brain_event_v1(&event) {
+                            eprintln!("Again Brain: could not record a completed event: {error:#}");
+                        }
                     }
                 }
             }
         }
-        Ok(())
+        Ok(observation)
     });
-    run_agent_child_v1(session, child, "Codex", Some(event_reader))
+    run_agent_child_v1(
+        session,
+        child,
+        "Codex",
+        Some(CodexRunReaderV1 {
+            handle: event_reader,
+            workspace: reader_workspace,
+            task_id: reader_task_id,
+            session_id: reader_session_id,
+            started_ms: brain_started_ms,
+        }),
+    )
 }
 
 #[cfg(all(feature = "daemon", unix))]
@@ -1551,11 +1574,20 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
 }
 
 #[cfg(all(feature = "daemon", unix))]
+struct CodexRunReaderV1 {
+    handle: thread::JoinHandle<Result<crate::brain::CodexRunObservationV1>>,
+    workspace: PathBuf,
+    task_id: String,
+    session_id: String,
+    started_ms: i64,
+}
+
+#[cfg(all(feature = "daemon", unix))]
 fn run_agent_child_v1(
     mut session: TaskBriefSessionV1,
     mut child: std::process::Child,
     client_name: &str,
-    event_reader: Option<thread::JoinHandle<Result<()>>>,
+    event_reader: Option<CodexRunReaderV1>,
 ) -> Result<i32> {
     let lease_id = session.brief["coordination"]["leaseId"]
         .as_str()
@@ -1568,13 +1600,26 @@ fn run_agent_child_v1(
                 // A descendant may retain stdout after the direct child exits.
                 // Do not hang the launcher indefinitely on that descriptor.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                while !reader.is_finished() && Instant::now() < deadline {
+                while !reader.handle.is_finished() && Instant::now() < deadline {
                     thread::sleep(Duration::from_millis(10));
                 }
-                if reader.is_finished() {
-                    reader
+                if reader.handle.is_finished() {
+                    let observation = reader
+                        .handle
                         .join()
                         .map_err(|_| anyhow!("Codex event reader panicked"))??;
+                    let run = observation.into_run(
+                        reader.session_id,
+                        reader.task_id,
+                        &reader.workspace,
+                        reader.started_ms,
+                        status.code().unwrap_or(1),
+                    );
+                    if let Err(error) = Store::open_for_workspace(&reader.workspace)
+                        .and_then(|store| store.record_brain_run_v1(&run))
+                    {
+                        eprintln!("Again Brain: could not record the completed run: {error:#}");
+                    }
                 } else {
                     eprintln!("Again Brain: event stream remained open after {client_name} exited");
                 }

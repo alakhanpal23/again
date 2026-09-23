@@ -38,6 +38,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "    path.write_text('value = 2\\n')\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'test_1','type':'command_execution','command':\"/bin/zsh -lc 'python3 -m unittest discover -s tests'\",'aggregated_output':'OK\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
+            "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'cached_input_tokens':40,'output_tokens':12}}), flush=True)\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'last','type':'agent_message','text':'Done'}}), flush=True)\n"
         )
         fake_client.chmod(0o700)
@@ -89,6 +90,14 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 raise RuntimeError("latest file observations were not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
+            runs = snapshot["recentRuns"]
+            if len(runs) != 1 or any(runs[0].get(key) != value for key, value in {
+                "exit_code": 0, "turn_completed": True, "completed_commands": 2,
+                "completed_source_reads": 1, "completed_edits": 1,
+                "completed_mcp_calls": 0, "successful_tests": 1,
+                "input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 12,
+            }.items()):
+                raise RuntimeError("Codex run outcome or usage was not materialized")
             interactive = subprocess.run(
                 [str(binary), "mcp", "brief", "--workspace", str(workspace),
                  "--task-id", "interactive", "--task", "Inspect helper.py"],
@@ -134,7 +143,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 text=True, timeout=10, check=True,
             )
             cleared = brain()
-            if cleared["recentEvents"] or cleared["fileObservations"] or cleared["previousSuccessfulTestCommand"]:
+            if cleared["recentEvents"] or cleared["recentRuns"] or cleared["fileObservations"] or cleared["previousSuccessfulTestCommand"]:
                 raise RuntimeError("brain clear retained activity")
             return {
                 "schema": "again.brain-single-agent-e2e.v1",
@@ -142,6 +151,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                 "classification": {"type": "pass", "code": "brain_event_handoff_passed"},
                 "capturedCompletedEvents": len(observed),
+                "capturedRunOutcomeAndUsage": True,
                 "nextTaskReceivedCurrentEdit": True,
                 "nextTaskReceivedUnverifiedTestHint": True,
                 "staleEditWithheld": True,

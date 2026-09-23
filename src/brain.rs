@@ -7,11 +7,107 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::store::{BrainEventV1, Store};
+use crate::store::{BrainEventV1, BrainRunV1, Store};
 
 const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
 const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
 const MAX_BRAIN_BRIEF_BYTES_V1: usize = 4 * 1024;
+
+#[derive(Debug, Default)]
+pub struct CodexRunObservationV1 {
+    completed_commands: u32,
+    completed_source_reads: u32,
+    completed_edits: u32,
+    completed_mcp_calls: u32,
+    successful_tests: u32,
+    turn_completed: bool,
+    usage: Option<(i64, i64, i64)>,
+    usage_invalid: bool,
+}
+
+impl CodexRunObservationV1 {
+    pub fn observe(&mut self, value: &Value, events: &[BrainEventV1]) {
+        if value["type"] == "item.completed" {
+            match value["item"]["type"].as_str() {
+                Some("command_execution") if value["item"]["exit_code"].as_i64().is_some() => {
+                    self.completed_commands = self.completed_commands.saturating_add(1);
+                }
+                Some("file_change") if value["item"]["status"] == "completed" => {
+                    self.completed_edits = self.completed_edits.saturating_add(1);
+                }
+                Some("mcp_tool_call") if value["item"]["status"] == "completed" => {
+                    self.completed_mcp_calls = self.completed_mcp_calls.saturating_add(1);
+                }
+                _ => {}
+            }
+            self.completed_source_reads = self.completed_source_reads.saturating_add(
+                events
+                    .iter()
+                    .filter(|event| event.kind == "command" && event.path.is_some())
+                    .count() as u32,
+            );
+            self.successful_tests = self
+                .successful_tests
+                .saturating_add(events.iter().filter(|event| event.kind == "test").count() as u32);
+        }
+        if value["type"] == "turn.completed" {
+            self.turn_completed = true;
+            let parsed = (|| {
+                let usage = &value["usage"];
+                let input = i64::try_from(usage["input_tokens"].as_u64()?).ok()?;
+                let cached = i64::try_from(usage["cached_input_tokens"].as_u64()?).ok()?;
+                let output = i64::try_from(usage["output_tokens"].as_u64()?).ok()?;
+                (cached <= input).then_some((input, cached, output))
+            })();
+            if let Some((input, cached, output)) = parsed {
+                let prior = self.usage.unwrap_or((0, 0, 0));
+                self.usage = prior
+                    .0
+                    .checked_add(input)
+                    .zip(prior.1.checked_add(cached))
+                    .zip(prior.2.checked_add(output))
+                    .map(|((input, cached), output)| (input, cached, output));
+                if self.usage.is_none() {
+                    self.usage_invalid = true;
+                }
+            } else {
+                self.usage_invalid = true;
+            }
+        }
+    }
+
+    pub fn into_run(
+        self,
+        session_id: String,
+        task_id: String,
+        workspace: &Path,
+        started_ms: i64,
+        exit_code: i32,
+    ) -> BrainRunV1 {
+        let usage = if self.usage_invalid || !self.turn_completed {
+            None
+        } else {
+            self.usage
+        };
+        BrainRunV1 {
+            session_id,
+            task_id,
+            authorization_scope_digest: local_brain_scope_digest_v1(workspace),
+            started_ms,
+            completed_ms: current_ms_v1().max(started_ms),
+            exit_code,
+            turn_completed: self.turn_completed,
+            completed_commands: self.completed_commands,
+            completed_source_reads: self.completed_source_reads,
+            completed_edits: self.completed_edits,
+            completed_mcp_calls: self.completed_mcp_calls,
+            successful_tests: self.successful_tests,
+            input_tokens: usage.map(|value| value.0),
+            cached_input_tokens: usage.map(|value| value.1),
+            output_tokens: usage.map(|value| value.2),
+        }
+    }
+}
 
 /// The local Brain has one repository-owner scope until its records carry
 /// per-scope provenance. Do not present it through a custom MCP scope.
@@ -499,7 +595,7 @@ fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String
     }) && manifest.is_none_or(|manifest| workspace.join(manifest).is_file())
 }
 
-fn current_ms_v1() -> i64 {
+pub(crate) fn current_ms_v1() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -511,6 +607,82 @@ fn current_ms_v1() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_run_observation_counts_completed_work_and_valid_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("helper.py");
+        fs::write(&source, "value = 1\n").unwrap();
+        let mut observed = CodexRunObservationV1::default();
+        let read = serde_json::json!({"type":"item.completed","item":{
+            "id":"read","type":"command_execution","command":"cat helper.py",
+            "aggregated_output":"value = 1\n","exit_code":0,"status":"completed"}});
+        let events = codex_completed_events_v1(&read, dir.path(), "session", "task");
+        observed.observe(&read, &events);
+        let edit = serde_json::json!({"type":"item.completed","item":{
+            "id":"edit","type":"file_change","status":"completed","changes":[{"path":"helper.py"}]}});
+        observed.observe(
+            &edit,
+            &codex_completed_events_v1(&edit, dir.path(), "session", "task"),
+        );
+        let test = serde_json::json!({"type":"item.completed","item":{
+            "id":"test","type":"command_execution","command":"python3 -m pytest",
+            "exit_code":0,"status":"completed"}});
+        observed.observe(
+            &test,
+            &codex_completed_events_v1(&test, dir.path(), "session", "task"),
+        );
+        observed.observe(
+            &serde_json::json!({"type":"item.completed","item":{
+            "type":"mcp_tool_call","status":"completed"}}),
+            &[],
+        );
+        observed.observe(
+            &serde_json::json!({"type":"turn.completed","usage":{
+            "input_tokens":100,"cached_input_tokens":40,"output_tokens":12}}),
+            &[],
+        );
+        let run = observed.into_run(
+            "session".to_owned(),
+            "task".to_owned(),
+            dir.path(),
+            current_ms_v1(),
+            0,
+        );
+        assert!(run.turn_completed);
+        assert_eq!(
+            (
+                run.completed_commands,
+                run.completed_source_reads,
+                run.completed_edits,
+                run.completed_mcp_calls,
+                run.successful_tests
+            ),
+            (2, 1, 1, 1, 1)
+        );
+        assert_eq!(
+            (run.input_tokens, run.cached_input_tokens, run.output_tokens),
+            (Some(100), Some(40), Some(12))
+        );
+        let mut invalid = CodexRunObservationV1::default();
+        invalid.observe(
+            &serde_json::json!({"type":"turn.completed","usage":{
+            "input_tokens":5,"cached_input_tokens":6,"output_tokens":1}}),
+            &[],
+        );
+        let run = invalid.into_run(
+            "other-session".to_owned(),
+            "task".to_owned(),
+            dir.path(),
+            current_ms_v1(),
+            0,
+        );
+        assert!(run.turn_completed);
+        assert_eq!(
+            (run.input_tokens, run.cached_input_tokens, run.output_tokens),
+            (None, None, None)
+        );
+    }
 
     #[test]
     fn completed_codex_events_keep_only_bounded_metadata() {

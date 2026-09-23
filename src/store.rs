@@ -38,7 +38,7 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const MAX_BRAIN_EVENTS_V1: i64 = 10_000;
 const MAX_BRAIN_EVENT_AGE_MS_V1: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
@@ -98,6 +98,47 @@ pub struct BrainFileV1 {
     pub task_id: String,
     pub observed_ms: i64,
     pub authorization_scope_digest: Option<String>,
+}
+
+/// Outcome metadata from one Codex launcher session. Counts and usage come
+/// from the client's event stream; they do not prove task acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainRunV1 {
+    pub session_id: String,
+    pub task_id: String,
+    pub authorization_scope_digest: String,
+    pub started_ms: i64,
+    pub completed_ms: i64,
+    pub exit_code: i32,
+    pub turn_completed: bool,
+    pub completed_commands: u32,
+    pub completed_source_reads: u32,
+    pub completed_edits: u32,
+    pub completed_mcp_calls: u32,
+    pub successful_tests: u32,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+fn brain_run_from_row_v1(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrainRunV1> {
+    Ok(BrainRunV1 {
+        session_id: row.get(0)?,
+        task_id: row.get(1)?,
+        authorization_scope_digest: row.get(2)?,
+        started_ms: row.get(3)?,
+        completed_ms: row.get(4)?,
+        exit_code: row.get(5)?,
+        turn_completed: row.get(6)?,
+        completed_commands: row.get(7)?,
+        completed_source_reads: row.get(8)?,
+        completed_edits: row.get(9)?,
+        completed_mcp_calls: row.get(10)?,
+        successful_tests: row.get(11)?,
+        input_tokens: row.get(12)?,
+        cached_input_tokens: row.get(13)?,
+        output_tokens: row.get(14)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -2026,6 +2067,36 @@ impl Store {
                 CREATE INDEX brain_test_commands_scope_recent_idx
                     ON brain_test_commands_v1(authorization_scope_digest, observed_ms DESC);
                 PRAGMA user_version = 18;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 19 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_runs_v1 (
+                    session_id TEXT PRIMARY KEY CHECK(length(session_id) BETWEEN 1 AND 128),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    started_ms INTEGER NOT NULL CHECK(started_ms >= 0),
+                    completed_ms INTEGER NOT NULL CHECK(completed_ms >= started_ms),
+                    exit_code INTEGER NOT NULL,
+                    turn_completed INTEGER NOT NULL CHECK(turn_completed IN (0, 1)),
+                    completed_commands INTEGER NOT NULL CHECK(completed_commands >= 0),
+                    completed_source_reads INTEGER NOT NULL CHECK(completed_source_reads >= 0),
+                    completed_edits INTEGER NOT NULL CHECK(completed_edits >= 0),
+                    completed_mcp_calls INTEGER NOT NULL CHECK(completed_mcp_calls >= 0),
+                    successful_tests INTEGER NOT NULL CHECK(successful_tests >= 0),
+                    input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+                    cached_input_tokens INTEGER CHECK(cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+                    output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+                    CHECK(cached_input_tokens IS NULL OR input_tokens IS NOT NULL),
+                    CHECK(cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_runs_scope_recent_idx
+                    ON brain_runs_v1(authorization_scope_digest, completed_ms DESC);
+                PRAGMA user_version = 19;
                 COMMIT;
                 "#,
             )?;
@@ -5521,13 +5592,110 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn record_brain_run_v1(&self, run: &BrainRunV1) -> Result<()> {
+        if run.session_id.is_empty()
+            || run.session_id.len() > 128
+            || run.task_id.is_empty()
+            || run.task_id.len() > 128
+            || run.started_ms < 0
+            || run.completed_ms < run.started_ms
+            || run.completed_source_reads > run.completed_commands
+            || run.successful_tests > run.completed_commands
+            || run.input_tokens.is_some() != run.cached_input_tokens.is_some()
+            || run.input_tokens.is_some() != run.output_tokens.is_some()
+            || run.input_tokens.is_some_and(|tokens| tokens < 0)
+            || run
+                .cached_input_tokens
+                .is_some_and(|tokens| tokens < 0 || Some(tokens) > run.input_tokens)
+            || run.output_tokens.is_some_and(|tokens| tokens < 0)
+        {
+            bail!("brain_run_invalid_metadata");
+        }
+        validate_digest(
+            &run.authorization_scope_digest,
+            "brain run authorization scope",
+        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO brain_runs_v1 (
+                session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                exit_code, turn_completed, completed_commands, completed_source_reads,
+                completed_edits, completed_mcp_calls, successful_tests,
+                input_tokens, cached_input_tokens, output_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                run.session_id,
+                run.task_id,
+                run.authorization_scope_digest,
+                run.started_ms,
+                run.completed_ms,
+                run.exit_code,
+                run.turn_completed,
+                run.completed_commands,
+                run.completed_source_reads,
+                run.completed_edits,
+                run.completed_mcp_calls,
+                run.successful_tests,
+                run.input_tokens,
+                run.cached_input_tokens,
+                run.output_tokens
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                    exit_code, turn_completed, completed_commands, completed_source_reads,
+                    completed_edits, completed_mcp_calls, successful_tests,
+                    input_tokens, cached_input_tokens, output_tokens
+             FROM brain_runs_v1 WHERE session_id = ?1",
+            [&run.session_id],
+            brain_run_from_row_v1,
+        )?;
+        if &stored != run {
+            bail!("brain_run_session_collision");
+        }
+        if inserted == 1 {
+            let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+            transaction.execute(
+                "DELETE FROM brain_runs_v1 WHERE completed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_runs_v1 WHERE session_id IN (
+                    SELECT session_id FROM brain_runs_v1
+                    ORDER BY completed_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recent_brain_runs_v1(&self, limit: usize) -> Result<Vec<BrainRunV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_run_limit_invalid");
+        }
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                    exit_code, turn_completed, completed_commands, completed_source_reads,
+                    completed_edits, completed_mcp_calls, successful_tests,
+                    input_tokens, cached_input_tokens, output_tokens
+             FROM brain_runs_v1 WHERE completed_ms >= ?1
+             ORDER BY completed_ms DESC, session_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![cutoff, limit as i64], brain_run_from_row_v1)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn clear_brain_events_v1(&self) -> Result<u64> {
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let runs = transaction.execute("DELETE FROM brain_runs_v1", [])? as u64;
         let files = transaction.execute("DELETE FROM brain_files_v1", [])? as u64;
         let tests = transaction.execute("DELETE FROM brain_test_commands_v1", [])? as u64;
         let events = transaction.execute("DELETE FROM brain_events_v1", [])? as u64;
         transaction.commit()?;
-        Ok(files + tests + events)
+        Ok(runs + files + tests + events)
     }
 
     pub fn context_delta_after_v1(
@@ -10847,6 +11015,16 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "maintenance_mode"
             | "reconciled_ms"
             | "observed_ms"
+            | "started_ms"
+            | "turn_completed"
+            | "completed_commands"
+            | "completed_source_reads"
+            | "completed_edits"
+            | "completed_mcp_calls"
+            | "successful_tests"
+            | "input_tokens"
+            | "cached_input_tokens"
+            | "output_tokens"
     ) || (table == "gateway_events" && column == "id");
     let nullable = matches!(
         (table, column),
@@ -10899,6 +11077,10 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             )
             | ("brain_files_v1", "authorization_scope_digest")
             | ("brain_test_commands_v1", "authorization_scope_digest")
+            | (
+                "brain_runs_v1",
+                "input_tokens" | "cached_input_tokens" | "output_tokens"
+            )
             | ("context_tasks_v1", "definition_digest")
             | (
                 "context_task_transitions_v1",
@@ -11387,6 +11569,26 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "authorization_scope_digest",
             ],
         ),
+        (
+            "brain_runs_v1",
+            &[
+                "session_id",
+                "task_id",
+                "authorization_scope_digest",
+                "started_ms",
+                "completed_ms",
+                "exit_code",
+                "turn_completed",
+                "completed_commands",
+                "completed_source_reads",
+                "completed_edits",
+                "completed_mcp_calls",
+                "successful_tests",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+            ],
+        ),
     ];
     let mut table_info_statement = connection
         .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info(?1) ORDER BY cid")?;
@@ -11708,6 +11910,13 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             false,
             false,
         ),
+        (
+            "brain_runs_v1",
+            "brain_runs_scope_recent_idx",
+            &["authorization_scope_digest", "completed_ms"],
+            false,
+            false,
+        ),
     ];
     let mut index_signature_statement = connection.prepare(
         "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2 AND origin = 'c'",
@@ -11755,6 +11964,12 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let required_checks = [
+        ("brain_runs_v1", "CHECK(completed_ms >= started_ms)"),
+        ("brain_runs_v1", "CHECK(turn_completed IN (0, 1))"),
+        (
+            "brain_runs_v1",
+            "CHECK(cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens)",
+        ),
         (
             "gateway_context_source_recipes_v1",
             "CHECK(json_valid(plan_json)",
@@ -14620,6 +14835,63 @@ mod tests {
                 .unwrap()
                 .source_digest,
             "c".repeat(64)
+        );
+    }
+
+    #[test]
+    fn brain_run_summary_is_idempotent_bounded_and_clearable() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let run = BrainRunV1 {
+            session_id: "session".to_owned(),
+            task_id: "task".to_owned(),
+            authorization_scope_digest: "a".repeat(64),
+            started_ms: now_ms() - 100,
+            completed_ms: now_ms(),
+            exit_code: 0,
+            turn_completed: true,
+            completed_commands: 2,
+            completed_source_reads: 1,
+            completed_edits: 1,
+            completed_mcp_calls: 0,
+            successful_tests: 1,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(40),
+            output_tokens: Some(12),
+        };
+        store.record_brain_run_v1(&run).unwrap();
+        store.record_brain_run_v1(&run).unwrap();
+        assert_eq!(store.recent_brain_runs_v1(8).unwrap(), vec![run.clone()]);
+        let mut collision = run.clone();
+        collision.output_tokens = Some(13);
+        assert!(store.record_brain_run_v1(&collision).is_err());
+        let mut invalid = run.clone();
+        invalid.cached_input_tokens = Some(101);
+        assert!(store.record_brain_run_v1(&invalid).is_err());
+        assert_eq!(store.clear_brain_events_v1().unwrap(), 1);
+        assert!(store.recent_brain_runs_v1(8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_eighteen_brain_store_migrates_to_run_summaries() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .conn
+                .execute_batch("DROP TABLE brain_runs_v1; PRAGMA user_version = 18;")
+                .unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        assert!(store.recent_brain_runs_v1(8).unwrap().is_empty());
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
         );
     }
 

@@ -561,7 +561,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
         database = self.root / "again.sqlite"
         connection = sqlite3.connect(database)
         connection.executescript(
-            """
+            f"""
             CREATE TABLE gateway_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
@@ -576,7 +576,7 @@ class RealRepositoryGatewayCorpusTests(unittest.TestCase):
                 role TEXT,
                 status TEXT
             );
-            PRAGMA user_version=14;
+            PRAGMA user_version={corpus.EXPECTED_DATABASE_SCHEMA};
             """
         )
         now = int(corpus.time.time() * 1000)

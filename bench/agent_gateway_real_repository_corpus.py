@@ -45,7 +45,7 @@ except ImportError:  # pragma: no cover - non-POSIX environmental classification
 SCHEMA = "again.agent-gateway-real-repository-corpus.v2"
 HARNESS_VERSION = "1.2.0"
 MCP_PROTOCOL_VERSION = "2025-06-18"
-EXPECTED_DATABASE_SCHEMA = 15
+EXPECTED_DATABASE_SCHEMA = 19
 LANGUAGES = ("rust", "python", "go", "typescript")
 EXERCISED_TOOLS = (
     "git.blame",
