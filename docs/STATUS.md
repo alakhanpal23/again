@@ -64,6 +64,10 @@ Because Brain records do not yet carry an authorization scope, `task.start`
 exposes them only through the canonical local-workspace scope; a custom MCP
 scope gets no Brain field. This keeps repository history from crossing an
 unmodeled authorization boundary.
+The [clean-source release handoff gate](../bench/results/2026-09-23-brain-task-start-3788b4b.json)
+passes at `3788b4b` for interactive `mcp brief` and launcher handoff. The
+custom-scope service test exercises withholding even when the local Brain
+contains a current file observation.
 
 ## 2026-09-23 single-agent Again Brain first slice
 
