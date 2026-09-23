@@ -277,17 +277,27 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             large_code.mkdir()
             for index in range(1000):
                 (large_code / f"module_{index:04}.py").write_text(f"value = {index}\n")
+            (workspace / "tests").mkdir()
+            (workspace / "tests" / "test_module_0001.py").write_text(
+                "import unittest\n\nclass ModuleTests(unittest.TestCase):\n    pass\n"
+            )
             mid_agent = Client(binary, workspace, environment)
             clients.append(mid_agent)
             mid_task = structured(mid_agent.tool("task.start", {
                 "taskId": "mid-code-task",
-                "task": "Edit `large-code/module_0001.py` safely",
+                "task": "Edit `large-code/module_0001.py` safely and run tests",
                 "includeSourcePreviews": True,
             }), "mid code task.start")
             require(mid_task.get("relevantCode", {}).get("unknowns", [{}])[0].get("kind") ==
                     "index_skipped_for_complete_explicit_preview" and
                     mid_task.get("sourcePreviews", [{}])[0].get("text") == "value = 1\n",
                     "mid-sized explicit source preview route failed")
+            require(len(mid_task.get("sourcePreviews", [])) == 2 and
+                    mid_task["sourcePreviews"][1].get("path") == "tests/test_module_0001.py" and
+                    mid_task["sourcePreviews"][1].get("origin") == "test_path_convention_candidate" and
+                    mid_task["sourcePreviews"][1].get("relevance") == "unverified" and
+                    mid_task["sourcePreviews"][1].get("complete") is True,
+                    "bounded test candidate preview was missing or claimed verified relevance")
             for index in range(1000, 4097):
                 (large_code / f"module_{index:04}.py").write_text(f"value = {index}\n")
             code_agent = Client(binary, workspace, environment)

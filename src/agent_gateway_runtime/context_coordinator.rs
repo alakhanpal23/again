@@ -513,6 +513,40 @@ impl LocalContextCoordinatorV1 {
                 break;
             }
         }
+        if previews.len() < MAX_TASK_START_SOURCE_PREVIEWS_V1
+            && prompt.to_ascii_lowercase().contains("test")
+            && let Some(source) = previews.iter().find_map(|preview| {
+                preview["path"].as_str().and_then(|path| {
+                    let path = Path::new(path);
+                    (!path.starts_with("tests") && path.extension().is_some_and(|ext| ext == "py"))
+                        .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                        .flatten()
+                })
+            })
+        {
+            let candidate = format!("tests/test_{source}.py");
+            if seen.insert(candidate.clone())
+                && let Ok(bytes) = self
+                    .observed_workspace
+                    .execution_epoch
+                    .read_repository_file(
+                        Path::new(&candidate),
+                        MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1,
+                    )
+                && let Ok(text) = String::from_utf8(bytes.clone())
+            {
+                previews.push(json!({
+                    "path": candidate,
+                    "sourceDigest": StateDigestV1::from_domain_and_bytes(
+                        b"again.code-intelligence.source-bytes.v1", &bytes
+                    ).to_hex(),
+                    "text": text,
+                    "complete": true,
+                    "origin": "test_path_convention_candidate",
+                    "relevance": "unverified"
+                }));
+            }
+        }
         previews
     }
 
