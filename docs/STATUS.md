@@ -452,6 +452,12 @@ Warm p50 search was 62.80 versus 61.10 ms and tree 37.28 versus 28.85 ms.
 Both variants physically executed every warm call; this reduces proof cost,
 not provider work. The matched trial is local and source-dirty, so it is not
 the clean-source release qualification.
+The [authenticated product gate](../bench/results/2026-09-23-auth-product-e2e-split-manifest-release-v1.json)
+and [Codex](../bench/results/2026-09-23-codex-launch-generic-prompt-split-release-v1.json)
+and [fake-Claude launcher](../bench/results/2026-09-23-claude-launch-generic-prompt-split-release-v1.json)
+gates passed on the clean-source release binary at `17510ad`. They cover
+source-backed task lifecycle, peer lease handoff, stale-source refresh, and
+both client launch arguments. They do not measure a live Claude coding task.
 
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
