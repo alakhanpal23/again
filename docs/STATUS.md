@@ -76,8 +76,9 @@ also passed at clean source `45a5777` after the peer-wait launcher change.
 `again claude` now shares the authenticated prebrief, bounded peer wait,
 lease renewal, and current-source takeover path in Claude Code print mode.
 The launcher passes a workspace-bound MCP configuration through the documented
-CLI flag. A fake-client release gate covers its argument shape and lease
-lifecycle; a live Claude Code binary is unavailable on this host, so Claude
+CLI flag. The [clean-source fake-client release gate](../bench/results/2026-09-23-claude-launch-peer-wait-release-v1.json)
+at `18b3176` passed its argument shape, lease handoff, refreshed source, and
+bounded timeout path. A live Claude Code binary is unavailable on this host, so Claude
 quality, latency, and token cost remain unverified.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
