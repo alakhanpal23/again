@@ -53,7 +53,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "minLength": 1, "maxLength": MAX_PATTERN_BYTES_V1 },
-                    "path": bounded_path_schema(),
+                    "path": root_path_schema(),
                     "maxResults": result_limit_schema()
                 },
                 "required": ["pattern"],
@@ -64,7 +64,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
             "list",
             json!({
                 "type": "object",
-                "properties": { "path": bounded_path_schema(), "maxResults": result_limit_schema() },
+                "properties": { "path": root_path_schema(), "maxResults": result_limit_schema() },
                 "additionalProperties": false
             }),
         ),
@@ -73,7 +73,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": bounded_path_schema(),
+                    "path": root_path_schema(),
                     "maxDepth": { "type": "integer", "minimum": 0, "maximum": MAX_TREE_DEPTH_V1 },
                     "maxResults": result_limit_schema()
                 },
@@ -95,7 +95,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "minLength": 1, "maxLength": MAX_GLOB_BYTES_V1 },
-                    "path": bounded_path_schema(),
+                    "path": root_path_schema(),
                     "maxResults": result_limit_schema()
                 },
                 "required": ["pattern"],
@@ -108,7 +108,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
                 "type": "object",
                 "properties": {
                     "symbol": { "type": "string", "minLength": 1, "maxLength": 256 },
-                    "path": bounded_path_schema(),
+                    "path": root_path_schema(),
                     "maxResults": result_limit_schema()
                 },
                 "required": ["symbol"],
@@ -119,7 +119,7 @@ pub(super) fn repository_tool_definitions_v1() -> Vec<ProviderTool> {
             "manifest",
             json!({
                 "type": "object",
-                "properties": { "path": bounded_path_schema() },
+                "properties": { "path": root_path_schema() },
                 "additionalProperties": false
             }),
         ),
@@ -132,7 +132,7 @@ pub(super) fn git_tool_definitions_v1() -> Vec<ProviderTool> {
             "status",
             json!({
                 "type": "object",
-                "properties": { "path": bounded_path_schema(), "maxResults": result_limit_schema() },
+                "properties": { "path": root_path_schema(), "maxResults": result_limit_schema() },
                 "additionalProperties": false
             }),
         ),
@@ -141,7 +141,7 @@ pub(super) fn git_tool_definitions_v1() -> Vec<ProviderTool> {
             json!({
                 "type": "object",
                 "properties": {
-                    "path": bounded_path_schema(),
+                    "path": root_path_schema(),
                     "staged": { "type": "boolean", "default": false },
                     "revision": { "type": "string", "enum": ["HEAD"] },
                     "contextLines": { "type": "integer", "minimum": 0, "maximum": 20, "default": 3 }
@@ -191,14 +191,20 @@ pub(super) fn git_tool_definitions_v1() -> Vec<ProviderTool> {
 
 fn tool(name: &str, schema: Value) -> ProviderTool {
     let mut tool = ProviderTool::new(name, schema);
-    tool.description = Some(format!(
-        "Bounded, deterministic, read-only repository {name} operation"
-    ));
+    tool.description = Some(if name == "status" {
+        "Bounded, deterministic, read-only Git status; large results are truncated with a total count, so narrow path for more entries".to_owned()
+    } else {
+        format!("Bounded, deterministic, read-only repository {name} operation")
+    });
     tool
 }
 
 fn bounded_path_schema() -> Value {
     json!({ "type": "string", "minLength": 1, "maxLength": 4096, "default": "." })
+}
+
+fn root_path_schema() -> Value {
+    json!({ "type": "string", "minLength": 0, "maxLength": 4096, "default": "." })
 }
 
 fn result_limit_schema() -> Value {
@@ -838,18 +844,18 @@ fn git_status_v1(
             entry["originalPath"] = Value::String(original.to_owned());
         }
         entries.push(entry);
-        if entries.len() > maximum {
-            return Err(limit_error_v1("Git status result bound exceeded"));
-        }
         index += 1;
     }
+    let total_entries = entries.len();
     entries.sort_by(|left, right| {
         left["path"]
             .as_str()
             .cmp(&right["path"].as_str())
             .then_with(|| left["status"].as_str().cmp(&right["status"].as_str()))
     });
-    let rendered = entries
+    let truncated = entries.len() > maximum;
+    entries.truncate(maximum);
+    let mut rendered = entries
         .iter()
         .map(|entry| {
             format!(
@@ -860,9 +866,14 @@ fn git_status_v1(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    if truncated {
+        rendered.push_str(&format!(
+            "\n[truncated: showing {maximum} of {total_entries} status entries; narrow path or raise maxResults]"
+        ));
+    }
     Ok(tool_result_v1(
         rendered,
-        json!({ "schemaVersion": 1, "path": path_text, "entries": entries }),
+        json!({ "schemaVersion": 1, "path": path_text, "entries": entries, "truncated": truncated, "totalEntries": total_entries }),
     ))
 }
 
@@ -1380,9 +1391,10 @@ pub(super) fn argument_path_v1(arguments: &Value, default_dot: bool) -> Result<P
         .and_then(Value::as_str)
         .or(default_dot.then_some("."))
         .ok_or_else(|| anyhow!("path is required"))?;
-    if path.is_empty() || path.len() > 4096 || path.as_bytes().contains(&0) {
+    if (path.is_empty() && !default_dot) || path.len() > 4096 || path.as_bytes().contains(&0) {
         bail!("path is invalid");
     }
+    let path = if path.is_empty() { "." } else { path };
     let path = PathBuf::from(path);
     if path.is_absolute()
         || path.components().any(|component| {

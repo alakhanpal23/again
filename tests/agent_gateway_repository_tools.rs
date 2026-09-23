@@ -82,6 +82,53 @@ fn git(root: &Path, arguments: &[&str]) -> String {
 }
 
 #[test]
+fn root_paths_and_overflowing_git_status_remain_usable_and_fresh() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "tracked.txt", "tracked\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(workspace.path(), &["add", "tracked.txt"]);
+    for index in 0..230 {
+        write(
+            workspace.path(),
+            &format!("bulk/file-{index:03}.txt"),
+            "untracked\n",
+        );
+    }
+    write(workspace.path(), "focus/one.txt", "untracked\n");
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+
+    let listed = call(server.gateway(), 2, "repo.list", json!({ "path": "" }));
+    assert_eq!(
+        listed["result"]["structuredContent"]["path"], ".",
+        "{listed}"
+    );
+    let status = call(server.gateway(), 3, "git.status", json!({}));
+    let content = &status["result"]["structuredContent"];
+    assert_eq!(content["entries"].as_array().unwrap().len(), 200);
+    assert_eq!(content["totalEntries"], 232);
+    assert_eq!(content["truncated"], true);
+    assert!(
+        status["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("truncated")
+    );
+    let narrow = call(
+        server.gateway(),
+        4,
+        "git.status",
+        json!({ "path": "focus", "maxResults": 200 }),
+    );
+    assert_eq!(narrow["result"]["structuredContent"]["totalEntries"], 1);
+    assert_eq!(narrow["result"]["structuredContent"]["truncated"], false);
+
+    write(workspace.path(), "bulk/file-999.txt", "new\n");
+    let changed = call(server.gateway(), 5, "git.status", json!({ "path": "" }));
+    assert_eq!(changed["result"]["structuredContent"]["totalEntries"], 233);
+}
+
+#[test]
 fn repository_refusals_are_actionable_without_echoing_sensitive_paths() {
     let workspace = TempDir::new().unwrap();
     write(workspace.path(), "visible.txt", "public\n");

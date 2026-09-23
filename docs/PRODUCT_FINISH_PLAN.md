@@ -120,7 +120,14 @@ has a persisted proof and an `explain` reason.
   real accepted edits. It saves about two seconds on the local 1,000-file
   task-start diagnostic, but the broader candidate list is explicitly
   incomplete; retain the full-index route when no complete explicit preview
-  was requested.
+  was requested. The first live Codex pair on that fixture passed both edit
+  oracles and reached the first edit in 15.0 seconds with Again versus 18.3
+  seconds in the baseline, but finished in 60.4 versus 25.7 seconds and used
+  260k versus 124k input tokens. The Again trace shows two failed follow-up
+  calls and additional post-edit inspection. See
+  `bench/results/2026-09-23-codex-1k-preview-pair-v1.json` and its raw JSONL
+  events. The root-path and Git-status overflow defects from that trace have
+  focused regression coverage; rerun the live pair before claiming benefit.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
