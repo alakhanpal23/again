@@ -6,7 +6,27 @@ correct, validated coding task completed by Codex or Claude. Cache hits alone
 are not success. `STATUS.md` records what has actually passed; this plan does
 not grant reuse authority or supersede the closed profiles in `REUSE_SURFACE.md`.
 
-## Release contract
+The near-term release scope is now the [single-agent product plan](SINGLE_AGENT_PRODUCT_PLAN.md).
+The two-agent contract below is a later extension; it is not a prerequisite
+for proving that Again makes one agent faster and better.
+
+## Near-term release contract
+
+A supported local installation must let one agent:
+
+1. start a task with a bounded, current repository brief;
+2. inspect relevant knowledge retained from previous tasks, with source,
+   freshness, and uncertainty visible;
+3. produce a correct edit with less repeated investigation and context;
+4. select and run required validation, reusing a result only with qualified
+   proof; and
+5. complete faster and at lower total cost than the same agent without Again
+   on the frozen balanced task cohort.
+
+The [single-agent product plan](SINGLE_AGENT_PRODUCT_PLAN.md) defines the
+dependency order and gates for this contract.
+
+## Later two-agent release contract
 
 A supported local installation must let two agent sessions in one repository:
 

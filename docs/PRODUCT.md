@@ -9,12 +9,14 @@ This sentence is both the product pitch and the reuse boundary. The explicit pat
 ## Product outcome
 
 > Again helps coding agents start with verified repository understanding, avoid
-> repeating work, run only the validation that changed, and share exact
-> execution knowledge across agents.
+> repeating work, run the validation that matters, and carry current execution
+> knowledge into the next task.
 
 The product is optimized for lower time and lower total cost per successful
-coding task, not for cache-hit percentage. The complete end-state user loop,
-current implementation map, scorecard, and delivery order are frozen in
+coding task, not for cache-hit percentage. The current implementation priority
+is the [single-agent product plan](SINGLE_AGENT_PRODUCT_PLAN.md), including a
+durable repository knowledge base. The broader end-state user loop,
+implementation map, scorecard, and delivery order are in
 [the agent acceleration product](AGENT_ACCELERATION.md). That direction does
 not upgrade an experimental subsystem or broaden any shipping claim below. The
 profile-by-profile inventory of reads, code intelligence, validation, builds,
@@ -24,7 +26,13 @@ The latency-critical task experience and its proof gate are defined by the
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative local path.
+The first customer is a technical individual using one Codex or Claude agent
+locally on a repository where tasks repeatedly search or inspect the same
+material. The initial job is to speed a correct, validated coding task through
+better orientation, durable repository knowledge, and less repeated work
+without asking the developer to declare a build graph. The gateway provides
+exact execution memory where proof is economical; the explicit CLI remains
+the conservative local path.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
