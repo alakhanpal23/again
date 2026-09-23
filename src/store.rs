@@ -5450,7 +5450,7 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Recent repository observations with the attributed task's own prompt.
+    /// Retained repository observations with the attributed task's own prompt.
     /// The caller may use prompt similarity to nominate a path, but must
     /// independently recheck the source before presenting it as current.
     pub(crate) fn brain_files_with_task_prompts_v1(
@@ -5458,11 +5458,7 @@ impl Store {
         repository_id: &str,
         workspace_id: &str,
         authorization_scope_digest: &str,
-        limit: usize,
     ) -> Result<Vec<BrainTaskFileV1>> {
-        if limit == 0 || limit > 64 {
-            bail!("brain_task_file_limit_invalid");
-        }
         validate_task_selector_v1(repository_id)?;
         validate_task_selector_v1(workspace_id)?;
         validate_digest(authorization_scope_digest, "brain task authorization scope")?;
@@ -5485,7 +5481,7 @@ impl Store {
                 workspace_id,
                 authorization_scope_digest,
                 cutoff,
-                limit as i64
+                MAX_BRAIN_EVENTS_V1
             ],
             |row| {
                 Ok(BrainTaskFileV1 {

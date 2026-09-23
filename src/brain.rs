@@ -238,12 +238,7 @@ pub fn repository_brief_for_task_v1(
     }
     let task_tokens = meaningful_task_tokens_v1(task_text);
     let mut historical = store
-        .brain_files_with_task_prompts_v1(
-            repository_id,
-            workspace_id,
-            authorization_scope_digest,
-            64,
-        )?
+        .brain_files_with_task_prompts_v1(repository_id, workspace_id, authorization_scope_digest)?
         .into_iter()
         .filter_map(|entry| {
             if seen.contains(&entry.observation.path) {
@@ -901,5 +896,83 @@ mod tests {
         )
         .unwrap();
         assert!(stale.is_none());
+    }
+
+    #[test]
+    fn older_relevant_file_survives_more_than_sixty_four_newer_observations() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let old_task = crate::task_lifecycle::TaskDefinitionV1::new(
+            "Improve ledger balance calculation",
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        let decoy_task = crate::task_lifecycle::TaskDefinitionV1::new(
+            "Update widget tile style",
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        store
+            .start_task_v1("repository", "workspace", &scope, "ledger-task", &old_task)
+            .unwrap();
+        store
+            .start_task_v1(
+                "repository",
+                "workspace",
+                &scope,
+                "widget-task",
+                &decoy_task,
+            )
+            .unwrap();
+        let base = current_ms_v1() - 1_000;
+        for index in 0..1_000 {
+            let path = if index == 0 {
+                "src/ledger.py".to_owned()
+            } else {
+                format!("src/widget_{index:03}.py")
+            };
+            fs::write(workspace.join(&path), format!("value = {index}\n")).unwrap();
+            let completed = serde_json::json!({
+                "type":"item.completed",
+                "item":{"id":format!("edit_{index}"),"type":"file_change","status":"completed",
+                        "changes":[{"path":path}]}
+            });
+            let task_id = if index == 0 {
+                "ledger-task"
+            } else {
+                "widget-task"
+            };
+            for mut event in codex_completed_events_v1(&completed, &workspace, "session", task_id) {
+                event.created_ms = base + index;
+                store.record_brain_event_v1(&event).unwrap();
+            }
+        }
+        let lookup_started = std::time::Instant::now();
+        let brief = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[]}),
+            "Fix ledger balance calculation",
+            "repository",
+            "workspace",
+            &scope,
+        )
+        .unwrap()
+        .unwrap();
+        eprintln!(
+            "brain history lookup across 1000 observations: {:?}",
+            lookup_started.elapsed()
+        );
+        assert_eq!(brief["recentCurrentFiles"][0]["path"], "src/ledger.py");
     }
 }
