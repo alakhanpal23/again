@@ -331,6 +331,17 @@ impl SharedObservedWorkspaceV1 {
             manifest: Arc::new(Mutex::new(manifest)),
         })
     }
+
+    fn fork_manifest(&self) -> Result<Self> {
+        let manifest = self
+            .execution_epoch
+            .begin_observed_manifest(&gateway_workspace_limits_v1())
+            .map_err(|_| anyhow!("sealed observed manifest issuance failed"))?;
+        Ok(Self {
+            execution_epoch: Arc::clone(&self.execution_epoch),
+            manifest: Arc::new(Mutex::new(manifest)),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -1862,10 +1873,14 @@ impl ExperimentalMcpGatewayV1 {
     ) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        // Code-index observations can cover thousands of files. Keep their
+        // witness set out of the hot exact-result manifest while both planes
+        // retain the same workspace epoch and durable task ledger.
+        let context_workspace = observed_workspace.fork_manifest()?;
         let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
             &workspace,
             Arc::clone(&store),
-            observed_workspace.clone(),
+            context_workspace,
         ));
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let repository_controlled: Arc<dyn UpstreamProvider> =
@@ -2656,6 +2671,49 @@ mod product_tests {
         assert_ne!(first["result"], relevant["result"]);
         assert_eq!(relevant["result"]["content"][0]["text"], "second");
         assert_eq!(gateway.stats().unwrap().executed, 2);
+    }
+
+    #[test]
+    fn code_index_manifest_does_not_add_tool_proof_witnesses() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"content").unwrap();
+        let gateway_observed =
+            SharedObservedWorkspaceV1::begin(&fs::canonicalize(workspace.path()).unwrap()).unwrap();
+        let index_observed = gateway_observed.fork_manifest().unwrap();
+        assert!(Arc::ptr_eq(
+            &gateway_observed.execution_epoch,
+            &index_observed.execution_epoch
+        ));
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input.txt")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        index_observed
+            .manifest
+            .lock()
+            .unwrap()
+            .observe_repository(&plan)
+            .unwrap();
+        assert_eq!(
+            gateway_observed
+                .manifest
+                .lock()
+                .unwrap()
+                .accounting()
+                .observed_entries(),
+            0
+        );
+        assert!(
+            index_observed
+                .manifest
+                .lock()
+                .unwrap()
+                .accounting()
+                .observed_entries()
+                > 0
+        );
     }
 
     #[test]

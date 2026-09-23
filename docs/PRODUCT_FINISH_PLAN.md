@@ -88,7 +88,12 @@ before changing default routing.
   reuse despite fewer executions.
 - Measure shared-manifest traversal, result lookup, join latency, cold miss
   overhead, relevant and irrelevant mutation cost, and response bytes on
-  1k/10k-file and large-output fixtures. Optimize the dominant measured path.
+  1k/10k-file and large-output fixtures. The code index now uses a separate
+  observed manifest over the same workspace epoch, so its witnesses do not
+  add work to each repository/Git proof. The matched 1k-file release-binary
+  trial reduced cold admission while retaining full-result references and
+  source invalidation. Qualify this on clean source and additional workloads;
+  remaining broad first-call scans are still expensive.
 - Remove the measured warm direct-call authority-check overhead with a shared
   invalidation generation or equivalent fast proof that remains correct across
   connections, restarts, and separate store handles. Preserve the cross-task

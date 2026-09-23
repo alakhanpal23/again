@@ -304,6 +304,11 @@ fn schema_twelve_tasks_migrate_to_active_revision_one_with_history() {
         .unwrap()
         .execute_batch(
             "PRAGMA foreign_keys = OFF;
+             DROP INDEX gateway_results_ready_idx;
+             DROP INDEX gateway_results_direct_idx;
+             ALTER TABLE gateway_results DROP COLUMN origin;
+             CREATE UNIQUE INDEX gateway_results_ready_idx
+                 ON gateway_results(binding_digest) WHERE status = 'ready';
              DROP TABLE gateway_context_source_recipes_v1;
              DROP TABLE context_workspace_quota_v1;
              DROP TABLE context_task_transitions_v1;

@@ -440,6 +440,19 @@ the next route change must preserve that contract or explicitly withhold a
 shared fact. The report pins binary bytes and clean source, but its harness
 does not verify binary-to-source binding.
 
+A [matched 40-sample shared-manifest control](../bench/results/2026-09-23-gateway-task-reuse-value-shared-manifest-40-control-v1.json)
+and [split-manifest trial](../bench/results/2026-09-23-gateway-task-reuse-value-split-manifest-40-matched-v1.json)
+used separate release binaries on the same 1,000-file fixture. The code index
+now has an independent observed manifest over the same sealed workspace epoch;
+repository and Git tools still share their proof manifest and the task ledger
+still owns facts and invalidation. Cold automatic calls improved from
+135.70 to 27.28 ms for a 128 KiB read, 346.58 to 251.27 ms for search,
+395.63 to 223.07 ms for tree, and 398.29 to 328.37 ms for Git status.
+Warm p50 search was 62.80 versus 61.10 ms and tree 37.28 versus 28.85 ms.
+Both variants physically executed every warm call; this reduces proof cost,
+not provider work. The matched trial is local and source-dirty, so it is not
+the clean-source release qualification.
+
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
 [bounded-index follow-up](../bench/results/2026-09-23-gateway-task-reuse-value-10k-preflight-v2.json)

@@ -27,6 +27,12 @@ unrelated-edit preservation, relevant-edit retirement, and this authority
 separation. Larger task-bound reads still enter the exact-result path on
 their first call.
 
+The code index now has its own observed manifest, forked from the same sealed
+workspace epoch. Repository and Git result proofs continue to share one
+manifest. Indexing a 1,000-file task previously put its witnesses into every
+later result-proof freshness sweep. The split leaves source-backed task facts
+in the durable ledger and keeps their independent revalidation path.
+
 The intended lanes are:
 
 | Lane | When | Required behavior |
@@ -74,6 +80,15 @@ search fact is exercised by a mutation test that requires its old reference
 to retire and a changed result to be published. A broad default direct route
 would discard that behavior; a cost policy must say when it intentionally
 withholds shared context and measure the task outcome of that choice.
+
+A matched 40-sample local release-binary A/B at `11ca1f6` compared the shared
+manifest with the split-manifest trial. Cold 128 KiB read fell from 135.70 to
+27.28 ms, search from 346.58 to 251.27 ms, tree from 395.63 to 223.07 ms,
+and Git status from 398.29 to 328.37 ms. Warm p50 search was 62.80 versus
+61.10 ms and tree 37.28 versus 28.85 ms. The trials have separate binary
+hashes and matching harness/fixture, but the source was dirty during the
+trial; run a clean-source release gate and broader workloads before treating
+this as a product-wide win.
 
 The integration boundary also matters: the daemon sees calls routed to its
 MCP tools. Native shell/tool calls are outside its authority and cannot be
