@@ -235,8 +235,10 @@ tool-result digests matched the direct controls. All warm `repo.*` cases still
 executed each call; this is a task-start latency improvement, not redundant
 call avoidance or validated task completion. The current source also returns
 small explicit task-path previews when that fallback runs and previews were
-requested, with a focused authenticated service test. That preview behavior
-still needs clean-source release qualification.
+requested. The [clean-source release-binary task gate](../bench/results/2026-09-23-authenticated-product-e2e-large-index-release-v3.json)
+at `ca721c2` passed this behavior with 4,097 source files, alongside the
+earlier shared-context and 257-source ledger scenarios. No live agent outcome
+has been measured for this fallback.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference

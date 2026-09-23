@@ -1,0 +1,35 @@
+{
+  "binary_sha256": "402186a3e0bb28aec099983b44adf97b11c11fff39c3a6cfc13c08a98e238bf0",
+  "classification": {
+    "code": "task_source_lifecycle_passed",
+    "type": "pass"
+  },
+  "duplicate_read_events": {
+    "completed": 1,
+    "executed": 1,
+    "inflight_candidate": 1,
+    "inflight_join": 1,
+    "requested": 2
+  },
+  "large_index_source_files": 4097,
+  "large_ledger_sources": 257,
+  "new_result_id": "9c572a0847317919e4f6ade83ba1abf0d1891f147ba1b153afe505767326d39b",
+  "old_result_id": "051f0c887ccc278bbcd8537403d375990ceb6fdb149dd588208f6c4fd0e2dc48",
+  "scenarios": [
+    "standalone_direct",
+    "duplicate_read_avoided",
+    "peer_fact",
+    "peer_retrieval",
+    "unrelated_edit",
+    "unobserved_relevant_edit",
+    "large_ledger_incomplete",
+    "large_index_explicit_preview"
+  ],
+  "schema": "again.authenticated-product-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "ca721c295436e921e9b93e180a52e68839da6abd",
+    "git_sha256": "df86512a66f66c9001b08a030dd17cc26e4f33d64d41223578dafda43b7a2602",
+    "root": "/Users/arjun/.superset/projects/again"
+  }
+}
