@@ -95,7 +95,8 @@ before changing default routing.
   source invalidation. Qualify this on clean source and additional workloads;
   remaining broad first-call scans are still expensive.
 - Task-start's proven source-inventory overflow now routes broad repository
-  tools and Git status directly. The 10k-file trial cut their multi-second
+  tools with overflowing requested subtrees and Git status directly. Smaller
+  subtrees retain in-flight joins. The 10k-file trial cut their multi-second
   first-call admission while retaining fresh provider execution. This route
   deliberately withholds a shared fact and result ID for those broad calls;
   qualify real task outcomes and add a complete cheap change signal before

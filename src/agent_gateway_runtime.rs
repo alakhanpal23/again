@@ -45,6 +45,7 @@ use crate::agent_gateway_runtime::context_compiler::{
 use crate::agent_gateway_runtime::context_coordinator::{
     ContextProviderKindV1, LocalContextCoordinatorV1, LocalContextProviderV1,
 };
+use crate::code_intelligence::{CodeIntelligenceLimitsV1, index_preflight_refusal_v1};
 use crate::mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
     EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, GatewayLimits, McpError,
@@ -631,6 +632,33 @@ impl GatewayControlledProviderV1 {
             .is_some_and(|metadata| {
                 metadata.is_file() && metadata.len() >= STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1
             })
+    }
+
+    fn broad_input_overflow(&self, call: &ProviderCall) -> bool {
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return true;
+        };
+        if path.is_empty() || path == "." {
+            return true;
+        }
+        let relative = Path::new(path);
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+            || self
+                .observed_workspace
+                .execution_epoch
+                .classify_relative(relative)
+                .ok()
+                != Some(crate::workspace_authority::RepositoryNodeKindV1::Directory)
+        {
+            return false;
+        }
+        index_preflight_refusal_v1(
+            &self.workspace.join(relative),
+            &CodeIntelligenceLimitsV1::default(),
+            Duration::from_millis(50),
+        ) == Some("index_preflight_file_budget_exceeded")
     }
 
     fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
@@ -1254,16 +1282,16 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         && coordinator.active_identity_for_call(&call).is_some()
                 })
             && RepositoryOperationV1::from_call(&call).is_some_and(|operation| {
-                matches!(
-                    operation,
-                    RepositoryOperationV1::Search
-                        | RepositoryOperationV1::List
-                        | RepositoryOperationV1::Tree
-                        | RepositoryOperationV1::Glob
-                        | RepositoryOperationV1::References
-                        | RepositoryOperationV1::Manifest
-                        | RepositoryOperationV1::GitStatus
-                )
+                operation == RepositoryOperationV1::GitStatus
+                    || (matches!(
+                        operation,
+                        RepositoryOperationV1::Search
+                            | RepositoryOperationV1::List
+                            | RepositoryOperationV1::Tree
+                            | RepositoryOperationV1::Glob
+                            | RepositoryOperationV1::References
+                            | RepositoryOperationV1::Manifest
+                    ) && self.broad_input_overflow(&call))
             })
         {
             return self.execute_direct(&epoch, call, secrets, true);

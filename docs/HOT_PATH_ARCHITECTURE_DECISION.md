@@ -33,7 +33,9 @@ manifest. Indexing a 1,000-file task previously put its witnesses into every
 later result-proof freshness sweep. The split leaves source-backed task facts
 in the durable ledger and keeps their independent revalidation path.
 When task-start's bounded source inventory proves more than 4,096 files,
-broad `repo.*` calls and `git.status` now execute directly. Their fresh output
+`git.status` and broad `repo.*` calls whose requested subtree also exceeds
+that bound execute directly. A bounded search in a smaller subtree can still
+coalesce with a peer. Their fresh output
 has no cache hit or shared-fact authority; the task brief already declares
 its index incomplete. Narrow `repo.read` and `repo.stat` keep their source-backed
 paths, and smaller workspaces keep broad result admission. A later complete
