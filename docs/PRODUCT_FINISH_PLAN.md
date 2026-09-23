@@ -101,8 +101,9 @@ before changing default routing.
   withholds a full-result ID for broad calls. Overflowing searches can now
   admit at most two file-backed matches as task facts, with source-recipe
   revalidation and relevant-edit retirement; absence and complete search
-  output are still unknown. Qualify peer delivery and task outcomes on a clean
-  release, then add a complete cheap change signal before promising exact
+  output are still unknown. The clean-source release-binary lifecycle gate at
+  `5c88120` passed peer delivery and retirement. Qualify real task outcomes,
+  then add a complete cheap change signal before promising exact
   reuse for full broad results on large repositories.
 - Remove the measured warm direct-call authority-check overhead with a shared
   invalidation generation or equivalent fast proof that remains correct across

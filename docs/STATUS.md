@@ -482,7 +482,12 @@ source backed. The authenticated 4,097-file test covers a peer receiving a
 verified match and its invalidation after mutation. The
 [10k-file match-fact trial](../bench/results/2026-09-23-gateway-task-reuse-value-match-facts-10k-trial-v1.json)
 measured cold/warm task-bound search at 0.505/0.489 seconds, with six physical
-provider executions and zero exact hits; a clean-source release run remains.
+provider executions and zero exact hits. The
+[clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-search-match-release-v1.json)
+at `5c88120` passed peer delivery and relevant-edit retirement for a match in
+the 4,097-file fixture, along with the existing task lifecycle scenarios. The
+report binds source SHA `5c88120c865a93eaa1f832fd004903853bcc08eb` to
+release binary SHA-256 `4be421877b75bf700c275e728f2ba97f49e5c04b5314d9b524ff13982e33feb9`.
 The [clean-source authenticated release gate](../bench/results/2026-09-23-auth-product-e2e-scoped-overflow-release-v1.json)
 at `d0ee560` passed the full task source lifecycle. In particular, a
 concurrent search of a bounded `lease/` subtree in the same large workspace
