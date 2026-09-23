@@ -890,11 +890,7 @@ impl LocalContextCoordinatorV1 {
             },
             "relevantCode": code_brief,
             "sourcePreviews": source_previews,
-            "validationPreview": {
-                "status": "execute_required",
-                "selectors": [],
-                "reason": "no qualified validation profile supplied a proven selector"
-            },
+            "validationPreview": validation_preview_v1(&source_previews),
             "compulsoryPlan": false
         });
         if freshness_issue.is_some() {
@@ -1792,6 +1788,69 @@ fn tool_result_v1(structured: Value) -> Value {
         "content": [{ "type": "text", "text": text }],
         "structuredContent": structured
     })
+}
+
+fn validation_preview_v1(source_previews: &[Value]) -> Value {
+    let unittest_candidate = source_previews.iter().any(|preview| {
+        preview["origin"] == "test_path_convention_candidate"
+            && preview["complete"] == true
+            && preview["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("tests/test_") && path.ends_with(".py"))
+            && preview["text"].as_str().is_some_and(|text| {
+                text.contains("import unittest") && text.contains("unittest.TestCase")
+            })
+    });
+    if unittest_candidate {
+        json!({
+            "status": "execute_required",
+            "selectors": [{
+                "command": "python3 -m unittest discover -s tests",
+                "basis": "complete_test_preview",
+                "verified": false
+            }],
+            "reason": "unverified unittest convention; run the command to validate"
+        })
+    } else {
+        json!({
+            "status": "execute_required",
+            "selectors": [],
+            "reason": "no qualified validation profile supplied a proven selector"
+        })
+    }
+}
+
+#[cfg(test)]
+mod validation_preview_tests {
+    use super::*;
+
+    #[test]
+    fn complete_unittest_companion_suggests_execution_without_claiming_proof() {
+        let preview = json!({
+            "origin": "test_path_convention_candidate",
+            "complete": true,
+            "path": "tests/test_calculator.py",
+            "text": "import unittest\nclass CalculatorTests(unittest.TestCase): pass\n"
+        });
+        let result = validation_preview_v1(&[preview]);
+        assert_eq!(result["status"], "execute_required");
+        assert_eq!(
+            result["selectors"][0]["command"],
+            "python3 -m unittest discover -s tests"
+        );
+        assert_eq!(result["selectors"][0]["verified"], false);
+    }
+
+    #[test]
+    fn incomplete_or_non_unittest_preview_does_not_suggest_a_command() {
+        for preview in [
+            json!({"origin":"test_path_convention_candidate","complete":false,"path":"tests/test_x.py","text":"import unittest\nclass X(unittest.TestCase): pass"}),
+            json!({"origin":"test_path_convention_candidate","complete":true,"path":"tests/test_x.py","text":"def test_x(): pass"}),
+            json!({"origin":"explicit_task_path","complete":true,"path":"tests/test_x.py","text":"import unittest\nclass X(unittest.TestCase): pass"}),
+        ] {
+            assert_eq!(validation_preview_v1(&[preview])["selectors"], json!([]));
+        }
+    }
 }
 
 fn task_start_result_v1(structured: Value) -> Value {

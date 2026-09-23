@@ -281,6 +281,20 @@ baseline and used 150k versus 98k input tokens. It first tried unavailable
 `python`, then passed with `python3`. Together the two orders do not prove
 task-level acceleration on this fixture.
 
+The task-start brief now suggests `python3 -m unittest discover -s tests`
+when its complete but relevance-unverified Python test companion explicitly
+uses `unittest.TestCase`. The suggestion remains `execute_required` and
+`verified: false`; it grants no test reuse authority. A first local pair used
+a binary built without the `daemon` feature, so Codex could not discover
+Again, spent 54.7 seconds looking for an integration, and made no edit. The
+pair harness now refuses that binary before a model run. With a daemon-enabled
+debug binary, the [rerun](../bench/results/2026-09-23-codex-1k-validation-hint-daemon-pair-v1.json)
+passed both edit oracles. Again made one `task.start` call, no follow-up
+repository calls, and ran `python3` successfully; it finished in 21.9 seconds
+versus 28.2 seconds baseline. Input tokens were 123k versus 113k. This is one
+unbalanced, dirty-source diagnostic, so task-level speed and token gates
+remain open.
+
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference
 check added 48 µs to small-read p50, 76 µs to search p50, and 53 µs to tree

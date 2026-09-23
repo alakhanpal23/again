@@ -64,6 +64,10 @@ No manual editing of agent configuration is needed.
 
 ### 2. Finish exact work avoidance
 
+The [hot-path architecture decision](HOT_PATH_ARCHITECTURE_DECISION.md) defines
+the separate observation and work-avoidance lanes and the evidence required
+before changing default routing.
+
 - Capture actual Codex/Claude traces and rank repeated read-only call shapes by
   elapsed time, frequency, bytes, and pre-edit contribution. Add an adapter
   only after specifying canonical request, complete dependency and executable

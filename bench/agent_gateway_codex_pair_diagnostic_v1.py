@@ -155,6 +155,12 @@ def main() -> int:
     if not 0 <= args.source_files <= 1000:
         parser.error("--source-files must be between 0 and 1000")
     binary = args.binary.resolve(strict=True)
+    connector = subprocess.run(
+        [str(binary), "mcp", "connect", "--help"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if connector.returncode != 0:
+        parser.error("--binary must be built with the daemon feature (cargo build --features daemon)")
     root = pathlib.Path(__file__).resolve().parents[1]
     codex = pathlib.Path(subprocess.run(
         ["which", "codex"], capture_output=True, text=True, check=True

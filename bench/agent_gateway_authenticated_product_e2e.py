@@ -307,6 +307,11 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     mid_task["sourcePreviews"][1].get("relevance") == "unverified" and
                     mid_task["sourcePreviews"][1].get("complete") is True,
                     "bounded test candidate preview was missing or claimed verified relevance")
+            require(mid_task.get("validationPreview", {}).get("selectors") == [{
+                "command": "python3 -m unittest discover -s tests",
+                "basis": "complete_test_preview",
+                "verified": False,
+            }], "test preview did not suggest bounded execute-required validation")
             for index in range(1000, 4097):
                 (large_code / f"module_{index:04}.py").write_text(f"value = {index}\n")
             code_agent = Client(binary, workspace, environment)
