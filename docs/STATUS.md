@@ -4,6 +4,24 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
+Again Brain now retains one bounded outcome row per completed Codex launcher
+session. It counts completed commands, independently matched source reads,
+edits, MCP calls, and recognized successful tests; it also records exit code,
+whether Codex reported turn completion, and token usage when the event stream
+provides valid counters. Schema 19 bounds these rows to the same 90-day and
+10,000-record policy as Brain activity. `again brain show` exposes the rows,
+and `again brain clear` removes them. These are client-observed measurements,
+not accepted-task or validation proofs; raw command output is not stored.
+The [isolated launcher handoff](../bench/results/2026-09-23-brain-run-summary-3c171dd/again-brain-run-summary-76ed747.json)
+passed run capture, cross-task source freshness, and clear. In a
+[live calculator pair](../bench/results/2026-09-23-brain-run-summary-3c171dd/again-brain-live-run-3c171dd.json),
+both patches and validations passed, and the product run's stored token counts
+matched the raw Codex event stream exactly. It recorded one edit, one test
+command, and no source reread. The [authenticated release gate](../bench/results/2026-09-23-brain-run-summary-3c171dd/again-auth-product-76ed747-retry.json)
+passed on the second attempt. Its first attempt timed out waiting for the
+existing `follower_cancelled` audit event; that intermittent gate behavior
+remains to be diagnosed before production qualification.
+
 Task matching now considers the Brain's bounded retained file set (at most
 10,000 observations over 90 days) instead of only its 64 newest files. The
 same scope check, two-file brief limit, and fresh content-digest check still
