@@ -34,6 +34,7 @@ def run_case(
     tool: str,
     arguments: dict[str, object],
     execute_only: bool,
+    samples: int = SAMPLES,
 ) -> dict[str, object]:
     env = {"PATH": "/usr/bin:/bin", "HOME": str(state / "home"), "AGAIN_HOME": str(state)}
     state.mkdir(mode=0o700)
@@ -83,14 +84,14 @@ def run_case(
             "protocolVersion": "2025-06-18", "capabilities": {},
             "clientInfo": {"name": "task-reuse-value-probe", "version": "1"},
         })
-        started, _ = request(2, "tools/call", {
+        started, task_start_micros = request(2, "tools/call", {
             "name": "task.start", "arguments": {"taskId": "value-probe", "task": "Inspect this fixture"},
         })
         if started["result"].get("isError"):
             raise RuntimeError(f"task.start refused: {started['result']}")
         values: list[float] = []
         digests: list[str] = []
-        for index in range(SAMPLES + 1):
+        for index in range(samples + 1):
             result, elapsed = request(index + 3, "tools/call", {"name": tool, "arguments": arguments})
             if result["result"].get("isError"):
                 raise RuntimeError(f"{tool} refused: {result['result']}")
@@ -117,7 +118,8 @@ def run_case(
     return {
         "case": name,
         "mode": "execute-only" if execute_only else "automatic",
-        "samples": SAMPLES,
+        "samples": samples,
+        "taskStartMicros": round(task_start_micros, 3),
         "coldMicros": round(values[0], 3),
         "warmP50Micros": percentile(values[1:], 0.5),
         "warmP95Micros": percentile(values[1:], 0.95),
@@ -134,9 +136,12 @@ def main() -> int:
     parser.add_argument("--binary", type=pathlib.Path, default="target/debug/again")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--source-files", type=int, default=1000)
+    parser.add_argument("--samples", type=int, default=SAMPLES)
     args = parser.parse_args()
-    if not 1 <= args.source_files <= 1000:
-        parser.error("--source-files must be between 1 and 1000")
+    if not 1 <= args.source_files <= 10000:
+        parser.error("--source-files must be between 1 and 10000")
+    if not 3 <= args.samples <= 100:
+        parser.error("--samples must be between 3 and 100")
     root = pathlib.Path(__file__).resolve().parents[1]
     binary = args.binary.resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="again-task-value-probe-") as temporary:
@@ -166,7 +171,7 @@ def main() -> int:
         for name, tool, arguments in cases:
             for execute_only in (True, False):
                 state = base / f"state-{name}-{'direct' if execute_only else 'reuse'}"
-                observations.append(run_case(binary, workspace, state, name, tool, arguments, execute_only))
+                observations.append(run_case(binary, workspace, state, name, tool, arguments, execute_only, args.samples))
         pairs = []
         for index in range(0, len(observations), 2):
             direct, automatic = observations[index:index + 2]
