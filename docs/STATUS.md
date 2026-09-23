@@ -71,6 +71,8 @@ See [baseline-first](../bench/results/2026-09-23-codex-parallel-pair-wrapper-wai
 and [reverse](../bench/results/2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1.json).
 This is still a small local two-agent fixture; it does not prove repeat-heavy
 performance across repositories or a general completion-time gain.
+The [authenticated release-binary product lifecycle gate](../bench/results/2026-09-23-auth-product-e2e-peer-wait-v1.json)
+also passed at clean source `45a5777` after the peer-wait launcher change.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real
