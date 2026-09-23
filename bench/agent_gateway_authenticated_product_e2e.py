@@ -325,7 +325,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "taskId": "cancel-source-task", "resultId": cancel_id,
             })
             require(cancelled_retrieval.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
-                    "retired task reference remained retrievable")
+                    f"retired task reference remained retrievable: {cancelled_retrieval}")
             (workspace / "corruption.txt").write_text("TRUSTED_SOURCE\n")
             corrupt_agent = Client(binary, workspace, environment)
             clients.append(corrupt_agent)
