@@ -265,6 +265,15 @@ at `167de67` removed those two failures and again passed the edit oracle, but
 finished in 46.7 versus 20.7 seconds, used 204k versus 107k input tokens,
 and had zero exact hits. This is one unbalanced pair per build, not a cohort;
 it does not establish acceleration or redundant-call avoidance.
+The [test-companion live pair](../bench/results/2026-09-23-codex-1k-test-preview-pair-v1.json)
+at `2c7f3cb` passed both edit oracles. Again included an explicitly labeled,
+unverified `tests/test_calculator.py` preview beside the requested source
+preview; Codex then edited and ran the unittest suite with no follow-up
+repository calls or failed tools. Completion was 21.6 seconds versus 19.7
+seconds baseline, and input tokens were 122k versus 99k. This is a large
+reduction in follow-up calls on one fixture, but still misses the task-level
+speed and cost targets. The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-test-preview-v1.json)
+also passed the bounded test-candidate preview alongside its lifecycle cases.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference

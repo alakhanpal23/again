@@ -139,6 +139,17 @@ has a persisted proof and an `explain` reason.
   read directory listings and README after editing to choose validation;
   task-start supplied an explicit source preview but no proven test selector.
   Measure the value of validation guidance and post-edit calls next.
+  The bounded Python test-path candidate preview now fills the second preview
+  slot when the task requests tests and a matching `tests/test_<stem>.py`
+  exists. It is labeled unverified relevance and does not change the
+  execute-required validation policy. In one further live Codex pair, Again
+  used both previews, made zero follow-up repository calls, and finished in
+  21.6 seconds versus 19.7 seconds baseline with 122k versus 99k input
+  tokens. Both edits passed. See
+  `bench/results/2026-09-23-codex-1k-test-preview-pair-v1.json` and raw events.
+  This is still one unbalanced pair, and the task-level speed target remains
+  unmet; run a balanced repeat-heavy cohort before treating the change as a
+  reliable gain.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
