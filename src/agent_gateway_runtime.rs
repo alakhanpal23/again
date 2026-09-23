@@ -452,31 +452,39 @@ impl GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        let before = self.resolve(&call);
         let started = Instant::now();
         let observed = self.execute_direct(epoch, call.clone(), secrets, true);
         let Ok(value) = observed else {
-            let _ = self.resolve(&call);
             return observed;
         };
-        let after = self.resolve(&call);
-        let Some(resolved) = before else {
-            return Ok(value);
-        };
-        if after
-            .as_ref()
-            .map(|current| current.binding.binding_digest())
-            != Some(resolved.binding.binding_digest())
-        {
+        let verification =
+            self.inner
+                .execute_with_epoch(epoch, call.clone(), EphemeralSecrets::empty());
+        if !matches!(&verification, Ok(confirmed) if confirmed == &value) {
             return Ok(value);
         }
-        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let bytes = canonical_json_bytes_v1(&value);
+        let Some(binding) = self.direct_stat_binding(&call, &bytes) else {
+            return Ok(value);
+        };
+        let Some(coordinator) = self.context_coordinator.as_ref() else {
+            return Ok(value);
+        };
+        if coordinator.observe_dependencies(&call, &binding).is_err() {
+            return Ok(value);
+        }
+        let output_digest = blake3::hash(&bytes).to_hex().to_string();
+        let recipe = json!({
+            "schema": "again.context.direct-stat-recipe.v1",
+            "arguments": call.arguments,
+            "outputDigest": output_digest,
+        });
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
         let proof = json!({
             "schema": "again.gateway-direct-observation-proof.v1",
-            "requestDigest": resolved.binding.request_digest(),
-            "stateDigest": resolved.binding.state_digest(),
-            "policyDigest": resolved.binding.policy_digest(),
+            "requestDigest": binding.request_digest(),
+            "stateDigest": binding.state_digest(),
+            "policyDigest": binding.policy_digest(),
             "authority": {"semantic": false, "mutationReplay": false,
                           "externalWriteReplay": false, "cacheHit": false}
         });
@@ -486,7 +494,7 @@ impl GatewayControlledProviderV1 {
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             let stored = store.insert_result(
-                &crate::store::direct_observation_request_key_v1(&resolved.binding),
+                &crate::store::direct_observation_request_key_v1(&binding),
                 &bytes,
                 b"",
                 0,
@@ -494,20 +502,71 @@ impl GatewayControlledProviderV1 {
                 POLICY_VERSION_V1,
                 &serde_json::to_string(&proof)?,
             )?;
-            store.publish_gateway_direct_observation_v1(&resolved.binding, &stored.id)
+            store.publish_gateway_direct_observation_v1(&binding, &stored.id)
         })();
-        if let (Ok(observation_id), Some(coordinator)) =
-            (observation_id, self.context_coordinator.as_ref())
-        {
-            let _ = coordinator.admit_direct_observation(
-                &call,
-                &resolved.binding,
-                &resolved.observation_plan,
-                &resolved.repository_digest,
-                &observation_id,
-            );
+        if let Ok(observation_id) = observation_id {
+            if coordinator
+                .admit_direct_observation(
+                    &call,
+                    &binding,
+                    &serde_json::to_vec(&recipe).expect("direct recipe serializes"),
+                    &output_digest,
+                    &observation_id,
+                )
+                .is_ok()
+            {
+                self.remember_candidate(&call, &binding, &observation_id);
+            }
         }
         Ok(value)
+    }
+
+    fn direct_stat_binding(
+        &self,
+        call: &ProviderCall,
+        provider_bytes: &[u8],
+    ) -> Option<ValidatedGatewayReadV1> {
+        if RepositoryOperationV1::from_call(call) != Some(RepositoryOperationV1::Stat) {
+            return None;
+        }
+        let descriptor = self.inner.descriptor();
+        if descriptor.id != REPOSITORY_PROVIDER_ID_V1
+            || descriptor.implementation != REPOSITORY_PROVIDER_IMPLEMENTATION_V1
+        {
+            return None;
+        }
+        let mut request_hasher = blake3::Hasher::new();
+        request_hasher.update(b"again.context.direct-stat-request.v1\0");
+        request_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+        request_hasher.update(call.translation.canonical_digest());
+        request_hasher.update(descriptor.version.as_bytes());
+        let request_digest = request_hasher.finalize().to_hex().to_string();
+        let output_digest = blake3::hash(provider_bytes).to_hex().to_string();
+        let mut state_hasher = blake3::Hasher::new();
+        state_hasher.update(b"again.context.direct-stat-state.v1\0");
+        state_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+        state_hasher.update(output_digest.as_bytes());
+        let state_digest = state_hasher.finalize().to_hex().to_string();
+        let mut key_hasher = blake3::Hasher::new();
+        key_hasher.update(b"again.context.direct-stat-dependency.v1\0");
+        key_hasher.update(request_digest.as_bytes());
+        let now = now_millis_i64_v1();
+        ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest,
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now,
+                valid_until_ms: now.saturating_add(60_000),
+            },
+            dependencies: vec![GatewayDependencyV1 {
+                key_digest: key_hasher.finalize().to_hex().to_string(),
+                value_digest: output_digest,
+            }],
+        })
+        .ok()
     }
 
     fn large_git_status_index(&self) -> bool {
@@ -1133,6 +1192,70 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 .as_ref()
                 .is_some_and(|coordinator| coordinator.active_identity_for_call(&call).is_some())
         {
+            let key = Self::recent_candidate_key(&call);
+            if let Some(candidate) = self.recent_candidate(&key)
+                && let Some(coordinator) = self.context_coordinator.as_ref()
+                && coordinator
+                    .active_identity_for_call(&call)
+                    .is_some_and(|identity| {
+                        candidate.task_id.as_deref() == Some(identity.task_id())
+                    })
+            {
+                match coordinator.direct_observation_current(
+                    &call,
+                    &candidate.binding,
+                    &candidate.gateway_result_id,
+                ) {
+                    Ok(true) => {
+                        let fresh = self.inner.execute_with_epoch(&epoch, call.clone(), secrets);
+                        if matches!(&fresh, Ok(value) if candidate.matches_fresh_provider_result(value))
+                        {
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_direct_execution(true);
+                            return fresh;
+                        }
+                        if coordinator
+                            .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                            .is_err()
+                        {
+                            return Err(context_authority_failed_v1());
+                        }
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                        if let Err(error) = fresh {
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_direct_execution(true);
+                            return Err(error);
+                        }
+                    }
+                    Ok(false) => {
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                    }
+                    Err(_) => {
+                        if coordinator
+                            .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                            .is_err()
+                        {
+                            return Err(context_authority_failed_v1());
+                        }
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                    }
+                }
+            }
             return self.execute_direct_with_context(&epoch, call, secrets);
         }
         let candidate_key = Self::recent_candidate_key(&call);

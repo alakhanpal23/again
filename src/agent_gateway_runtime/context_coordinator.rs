@@ -341,7 +341,7 @@ impl LocalContextCoordinatorV1 {
         &self,
         call: &ProviderCall,
         binding: &crate::store::ValidatedGatewayReadV1,
-        observation_plan: &RepositoryObservationPlanV1,
+        recipe_json: &[u8],
         repository_digest: &str,
         observation_id: &str,
     ) -> Result<()> {
@@ -363,7 +363,7 @@ impl LocalContextCoordinatorV1 {
             binding,
             observation_id,
             repository_digest,
-            &serde_json::to_vec(observation_plan)?,
+            recipe_json,
         )?;
         let fact_id = bounded_digest_id_v1("direct-fact", binding.request_digest());
         for _ in 0..3 {
@@ -405,6 +405,26 @@ impl LocalContextCoordinatorV1 {
             }
         }
         bail!("direct context fact admission did not converge")
+    }
+
+    pub(super) fn direct_observation_current(
+        &self,
+        call: &ProviderCall,
+        binding: &crate::store::ValidatedGatewayReadV1,
+        observation_id: &str,
+    ) -> Result<bool> {
+        let Some(identity) = self.active_identity_for_call(call) else {
+            return Ok(false);
+        };
+        let fact_id = bounded_digest_id_v1("direct-fact", binding.request_digest());
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        Ok(store
+            .context_direct_fact_admission_v1(&identity, &fact_id, observation_id)?
+            .is_none()
+            && store.get_gateway_result(binding, observation_id)?.is_some())
     }
 
     pub(super) fn observe_dependencies(
@@ -495,14 +515,35 @@ impl LocalContextCoordinatorV1 {
             .context_source_recipe_v1(identity, gateway_result_id)?;
         let current = match recipe {
             Some((expected_digest, plan_json)) => {
-                match serde_json::from_slice::<RepositoryObservationPlanV1>(&plan_json) {
-                    Ok(plan) => observed
-                        .manifest
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .observe_repository(&plan)
-                        .is_ok_and(|repository| repository.digest().to_hex() == expected_digest),
-                    Err(_) => false,
+                if let Ok(recipe) = serde_json::from_slice::<Value>(&plan_json)
+                    && recipe["schema"] == "again.context.direct-stat-recipe.v1"
+                {
+                    recipe.as_object().is_some_and(|object| object.len() == 3)
+                        && recipe["arguments"].is_object()
+                        && recipe["outputDigest"] == expected_digest
+                        && crate::agent_gateway_runtime::repository_tools::execute_repository_tool_v1(
+                            &observed.execution_epoch,
+                            "stat",
+                            &recipe["arguments"],
+                        )
+                        .ok()
+                        .is_some_and(|value| {
+                            blake3::hash(&super::canonical_json_bytes_v1(&value))
+                                .to_hex()
+                                .as_str() == expected_digest
+                        })
+                } else {
+                    match serde_json::from_slice::<RepositoryObservationPlanV1>(&plan_json) {
+                        Ok(plan) => observed
+                            .manifest
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .observe_repository(&plan)
+                            .is_ok_and(|repository| {
+                                repository.digest().to_hex() == expected_digest
+                            }),
+                        Err(_) => false,
+                    }
                 }
             }
             None => false,

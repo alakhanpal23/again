@@ -176,6 +176,7 @@ def main() -> int:
         ], cwd=workspace, check=True)
         cases = [
             ("read-small", "repo.read", {"path": "small.txt"}),
+            ("stat-small", "repo.stat", {"path": "small.txt"}),
             ("read-large", "repo.read", {"path": "large.txt"}),
             (f"search-{args.source_files}", "repo.search", {"path": "src", "pattern": "needle", "maxResults": 200}),
             (f"tree-{args.source_files}", "repo.tree", {"path": "src", "maxResults": 200}),

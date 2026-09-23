@@ -227,6 +227,9 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             unaffected = structured(unaffected_client.tool("task.start", task_arguments), "unrelated edit task.start")
             require(any(ref.get("result_id") == original_id for ref in unaffected.get("context", {}).get("result_references", [])),
                     "unrelated edit retired source reference")
+            require(any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
+                        for fact in unaffected.get("context", {}).get("current_facts", [])),
+                    "unrelated edit retired direct stat fact")
 
             (workspace / "input.txt").write_text("BETA_SOURCE\n")
             invalidated_client = Client(binary, workspace, environment)
@@ -234,6 +237,9 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             invalidated = structured(invalidated_client.tool("task.start", task_arguments), "relevant edit task.start")
             require(not any(ref.get("result_id") == original_id for ref in invalidated.get("context", {}).get("result_references", [])),
                     "stale reference survived unobserved edit")
+            require(not any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
+                            for fact in invalidated.get("context", {}).get("current_facts", [])),
+                    "stale direct stat fact survived unobserved edit")
             denied = second.tool("context.retrieve", {"taskId": "shared-source-task", "resultId": original_id})
             require(denied.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
                     "stale retrieval was not refused")
