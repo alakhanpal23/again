@@ -14,6 +14,10 @@ coordination is needed. A daemon regression test confirms that a second
 authenticated client can immediately become leader after a preview-only start.
 The CLI was smoke-tested with a private temporary repository, a fake Codex
 executable that captured arguments, and a second authenticated MCP client.
+The same smoke passed on the release binary built from clean source
+`6d25a2f`, and the [authenticated release-binary product gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-v1.json)
+passed at that source. The retained gate covers the existing task/source
+lifecycle; the new CLI smoke is currently local terminal evidence.
 
 Two live Codex pairs using preview-only prebrief and the full Again MCP
 connection passed the exact edit oracle in both treatment orders. In the
