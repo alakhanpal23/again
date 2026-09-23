@@ -4,6 +4,13 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
+The authenticated release-binary product gate had an outdated read-only
+SQLite schema pin (15 versus the product's 18). Its verifier and unit fixture
+now pin schema 18. All 18 harness unit tests pass, and the
+[clean-source authenticated product gate](../bench/results/2026-09-23-auth-product-63ca04a.json)
+passes `task_source_lifecycle_passed` on the release binary. This restores
+the end-to-end gate for the current task-start and Brain changes.
+
 Brain can now include a rechecked complete prior source file up to 2 KiB in
 the next task brief. The whole Brain field remains capped at 4 KiB; when two
 previews would exceed it, the lower-priority preview is withheld first.
