@@ -211,6 +211,14 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             structured(direct_read, "direct context read")
             require(result_id(direct_read["result"]) is None and tool_text(direct_read["result"]) == "SMALL_SOURCE\n",
                     "small read did not take the direct context lane")
+            direct_stats = json.loads(subprocess.run(
+                [str(binary), "stats", "--json"], cwd=workspace, env=environment,
+                capture_output=True, text=True, timeout=10, check=True,
+            ).stdout)
+            require(direct_stats["direct_observations_published"] == 2,
+                    "direct observations were not counted separately")
+            require(direct_stats["provider_calls_avoided"] == 1,
+                    "direct observations incorrectly counted as avoided calls")
             observer = Client(binary, workspace, environment)
             clients.append(observer)
             joined = structured(observer.tool("task.start", task_arguments), "joined task.start")
@@ -533,6 +541,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "binary_sha256": pinned.sha256,
                 "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused", "inflight_follower_cancelled", "lease_owner_crash_recovered"],
                 "duplicate_read_events": dict(event_counts),
+                "direct_observation_stats": {
+                    "published": direct_stats["direct_observations_published"],
+                    "provider_calls_avoided": direct_stats["provider_calls_avoided"],
+                },
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
                 "large_index_source_files": 4097,
