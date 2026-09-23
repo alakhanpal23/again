@@ -7,6 +7,7 @@ import argparse
 import datetime as dt
 import hashlib
 import json
+import math
 import pathlib
 import statistics
 import subprocess
@@ -101,6 +102,11 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str) -> dict:
             "againUsage": product_usage,
         })
     median_ratio = statistics.median(ratios) if ratios else None
+    p95_ratio = sorted(ratios)[math.ceil(0.95 * len(ratios)) - 1] if ratios else None
+    baseline_usage = {key: sum(pair["baselineUsage"][key] for pair in pairs if pair["baselineUsage"])
+                      for key in ("uncachedInput", "cachedInput", "output")}
+    again_usage = {key: sum(pair["againUsage"][key] for pair in pairs if pair["againUsage"])
+                   for key in ("uncachedInput", "cachedInput", "output")}
     return {
         "schema": "again.single-agent-cold-cohort-result.v1",
         "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -111,7 +117,11 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str) -> dict:
         "acceptedPairs": sum(pair["accepted"] for pair in pairs),
         "totalPairs": len(pairs),
         "pairedMedianElapsedRatio": median_ratio,
+        "pairedP95ElapsedRatio": p95_ratio,
         "pairedMedianElapsedTargetMet": median_ratio is not None and median_ratio <= 0.8,
+        "baselineUsageTotals": baseline_usage,
+        "againUsageTotals": again_usage,
+        "allUsageVectorsComplete": all(pair["baselineUsage"] and pair["againUsage"] for pair in pairs),
         "pairs": pairs,
     }
 
