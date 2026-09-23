@@ -45,6 +45,7 @@ const TASK_COORDINATION_LEASE_TTL_MS_V1: u64 = 5 * 60_000;
 const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
+const MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1: usize = 256;
 const MAX_CONTEXT_FRESHNESS_SOURCES_V1: usize = 256;
 
 #[derive(Clone, Copy)]
@@ -663,6 +664,22 @@ impl LocalContextCoordinatorV1 {
             &CodeIntelligenceLimitsV1::default(),
             Duration::from_millis(50),
         );
+        let explicit_previews = if include_source_previews {
+            self.explicit_task_source_previews(task.task.definition.prompt())
+        } else {
+            Vec::new()
+        };
+        let large_enough_for_preview_fast_path = !explicit_previews.is_empty()
+            && index_preflight_refusal.is_none()
+            && index_preflight_refusal_v1(
+                &self.workspace,
+                &CodeIntelligenceLimitsV1 {
+                    max_files: MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1,
+                    ..CodeIntelligenceLimitsV1::default()
+                },
+                Duration::from_millis(50),
+            )
+            .is_some();
         let (mut code_brief, mut source_previews) = if let Some(reason) = index_preflight_refusal {
             (
                 json!({
@@ -671,11 +688,17 @@ impl LocalContextCoordinatorV1 {
                     "incomplete": true,
                     "unknowns": [{ "kind": reason }]
                 }),
-                if include_source_previews {
-                    self.explicit_task_source_previews(task.task.definition.prompt())
-                } else {
-                    Vec::new()
-                },
+                explicit_previews,
+            )
+        } else if large_enough_for_preview_fast_path {
+            (
+                json!({
+                    "schemaVersion": 1,
+                    "candidates": [],
+                    "incomplete": true,
+                    "unknowns": [{ "kind": "index_skipped_for_complete_explicit_preview" }]
+                }),
+                explicit_previews,
             )
         } else {
             let mut index = self

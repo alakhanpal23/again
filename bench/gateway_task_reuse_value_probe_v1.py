@@ -35,6 +35,8 @@ def run_case(
     arguments: dict[str, object],
     execute_only: bool,
     samples: int = SAMPLES,
+    task_text: str = "Inspect this fixture",
+    include_source_previews: bool = False,
 ) -> dict[str, object]:
     env = {"PATH": "/usr/bin:/bin", "HOME": str(state / "home"), "AGAIN_HOME": str(state)}
     state.mkdir(mode=0o700)
@@ -85,7 +87,10 @@ def run_case(
             "clientInfo": {"name": "task-reuse-value-probe", "version": "1"},
         })
         started, task_start_micros = request(2, "tools/call", {
-            "name": "task.start", "arguments": {"taskId": "value-probe", "task": "Inspect this fixture"},
+            "name": "task.start", "arguments": {
+                "taskId": "value-probe", "task": task_text,
+                "includeSourcePreviews": include_source_previews,
+            },
         })
         if started["result"].get("isError"):
             raise RuntimeError(f"task.start refused: {started['result']}")
@@ -126,6 +131,7 @@ def run_case(
         "editBriefIncomplete": code_brief["incomplete"],
         "editBriefUnknownKinds": [item["kind"] for item in code_brief["unknowns"]],
         "editBriefCandidateCount": len(code_brief["candidates"]),
+        "sourcePreviewCount": len(task_start["sourcePreviews"]),
         "coldMicros": round(values[0], 3),
         "warmP50Micros": percentile(values[1:], 0.5),
         "warmP95Micros": percentile(values[1:], 0.95),
@@ -143,6 +149,8 @@ def main() -> int:
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("--source-files", type=int, default=1000)
     parser.add_argument("--samples", type=int, default=SAMPLES)
+    parser.add_argument("--task-text", default="Inspect this fixture")
+    parser.add_argument("--include-source-previews", action="store_true")
     args = parser.parse_args()
     if not 1 <= args.source_files <= 10000:
         parser.error("--source-files must be between 1 and 10000")
@@ -177,7 +185,10 @@ def main() -> int:
         for name, tool, arguments in cases:
             for execute_only in (True, False):
                 state = base / f"state-{name}-{'direct' if execute_only else 'reuse'}"
-                observations.append(run_case(binary, workspace, state, name, tool, arguments, execute_only, args.samples))
+                observations.append(run_case(
+                    binary, workspace, state, name, tool, arguments, execute_only,
+                    args.samples, args.task_text, args.include_source_previews,
+                ))
         pairs = []
         for index in range(0, len(observations), 2):
             direct, automatic = observations[index:index + 2]
@@ -198,6 +209,8 @@ def main() -> int:
         "harnessSha256": sha256(pathlib.Path(__file__)),
         "source": source_state(root),
         "sourceFiles": args.source_files,
+        "taskText": args.task_text,
+        "includeSourcePreviews": args.include_source_previews,
         "observations": observations,
         "pairs": pairs,
     }
