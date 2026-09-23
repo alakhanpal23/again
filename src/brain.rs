@@ -102,39 +102,44 @@ pub fn codex_display_text_v1(value: &Value) -> Option<&str> {
 
 /// Current, bounded hints from prior tasks in the same local workspace.
 /// These are observed history and test suggestions, never cache authority.
-pub fn repository_brief_v1(store: &Store, workspace: &Path, task: &str) -> anyhow::Result<Value> {
+pub fn repository_brief_v1(
+    store: &Store,
+    workspace: &Path,
+    candidate_paths: &[String],
+) -> anyhow::Result<Value> {
     let mut recent_files = Vec::new();
-    let mut test_hint = None;
-    let task_lower = task.to_ascii_lowercase();
-    for event in store.recent_brain_events_v1(64)? {
-        if event.kind == "test" && event.exit_code == Some(0) && test_hint.is_none() {
-            test_hint = event.command_hint;
-        } else if event.kind == "file_change"
-            && recent_files.len() < 2
-            && let (Some(path), Some(digest)) = (event.path, event.source_digest)
-            && let Some((relative, absolute)) = workspace_file_v1(workspace, &path)
-            && relative == path
+    let test_hint = store.brain_test_hint_v1()?.filter(|hint| {
+        // Current admission recognizes only Python commands. A monorepo's
+        // latest successful test is not automatically relevant to another
+        // language or an unresolved task.
+        hint.starts_with("python3 ")
+            && candidate_paths.iter().any(|path| {
+                matches!(
+                    Path::new(path)
+                        .extension()
+                        .and_then(|extension| extension.to_str()),
+                    Some("py" | "pyi")
+                )
+            })
+    });
+    for path in candidate_paths.iter().take(16) {
+        if recent_files.len() == 2 {
+            break;
+        }
+        if let Ok(Some(observation)) = store.brain_file_v1(path)
+            && let Some((relative, absolute)) = workspace_file_v1(workspace, path)
+            && relative == *path
             && fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= MAX_OBSERVED_FILE_BYTES_V1)
-            && fs::read(&absolute)
-                .is_ok_and(|bytes| blake3::hash(&bytes).to_hex().as_str() == digest)
-            && {
-                let path_lower = path.to_ascii_lowercase();
-                let stem = Path::new(&path)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                task_lower.contains(&path_lower) || (stem.len() >= 4 && task_lower.contains(&stem))
-            }
+            && fs::read(&absolute).is_ok_and(|bytes| {
+                blake3::hash(&bytes).to_hex().as_str() == observation.source_digest
+            })
         {
             recent_files.push(serde_json::json!({
                 "path": path,
-                "currentDigest": digest,
+                "currentDigest": observation.source_digest,
+                "observedTaskId": observation.task_id,
                 "observation": "edited in a prior Again task; file content rechecked now",
             }));
-        }
-        if recent_files.len() == 2 && test_hint.is_some() {
-            break;
         }
     }
     Ok(serde_json::json!({
@@ -244,10 +249,48 @@ mod tests {
             store.record_brain_event_v1(&event).unwrap();
         }
         assert_eq!(store.recent_brain_events_v1(8).unwrap().len(), 1);
-        let brief = repository_brief_v1(&store, &workspace, "Repair balances.py").unwrap();
+        let test = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"test_1","type":"command_execution",
+                    "command":"python3 -m unittest discover -s tests", "exit_code":0}
+        });
+        for event in codex_completed_events_v1(&test, &workspace, "session", "old-task") {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        for index in 0..80 {
+            let command = BrainEventV1 {
+                session_id: "session".to_owned(),
+                event_id: format!("unrelated_{index}"),
+                task_id: "old-task".to_owned(),
+                kind: "command".to_owned(),
+                path: None,
+                source_digest: None,
+                command_digest: Some(blake3::hash(b"unrelated command").to_hex().to_string()),
+                command_hint: None,
+                exit_code: Some(0),
+                created_ms: current_ms_v1() + index,
+            };
+            store.record_brain_event_v1(&command).unwrap();
+        }
+        assert!(
+            store
+                .recent_brain_events_v1(64)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind == "command")
+        );
+        let candidates = ["balances.py".to_owned()];
+        let brief = repository_brief_v1(&store, &workspace, &candidates).unwrap();
         assert_eq!(brief["recentCurrentFiles"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            brief["previousSuccessfulTestCommand"],
+            "python3 -m unittest discover -s tests"
+        );
+        let unrelated =
+            repository_brief_v1(&store, &workspace, &["src/main.rs".to_owned()]).unwrap();
+        assert!(unrelated["previousSuccessfulTestCommand"].is_null());
         fs::write(workspace.join("balances.py"), "value = 2\n").unwrap();
-        let stale = repository_brief_v1(&store, &workspace, "Repair balances.py").unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &candidates).unwrap();
         assert!(stale["recentCurrentFiles"].as_array().unwrap().is_empty());
     }
 }

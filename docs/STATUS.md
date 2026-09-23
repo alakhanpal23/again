@@ -2,6 +2,22 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 materialized repository memory
+
+Again Brain now retains a bounded latest observation per edited file and per
+recognized successful test command, separate from its bounded raw event
+timeline. A later task looks up files selected by the current source preview
+and code relevance candidates, then rechecks the current bytes before showing
+the history. The latest test command remains an unverified suggestion and
+never authorizes a test skip. Event recording updates the materialized rows
+atomically. `again brain show` exposes both event history and materialized
+observations, labeling the latter as historical until a task brief rechecks
+them; `again brain clear` clears both stores. The focused test pushes
+the originating edit and test beyond the 64 most recent events yet still
+finds their current materialized hints. The isolated Codex launcher gate also
+passes. This fixes the recent-event-window limitation; it does not yet prove
+that retained knowledge lowers real task time.
+
 ## 2026-09-23 single-agent Again Brain first slice
 
 `again codex` now requests Codex's structured event stream by default. Its

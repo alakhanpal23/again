@@ -1,5 +1,6 @@
 //! Local SQLite index and content-addressed output store.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,7 +38,7 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const MAX_BRAIN_EVENTS_V1: i64 = 10_000;
 const MAX_BRAIN_EVENT_AGE_MS_V1: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
@@ -87,6 +88,14 @@ pub struct BrainEventV1 {
     pub command_hint: Option<String>,
     pub exit_code: Option<i32>,
     pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainFileV1 {
+    pub path: String,
+    pub source_digest: String,
+    pub task_id: String,
+    pub observed_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -983,6 +992,7 @@ pub struct Store {
     blobs: PathBuf,
     conn: Connection,
     file_digest_writes_since_prune: u16,
+    brain_writes_since_prune: Cell<u16>,
 }
 
 impl Store {
@@ -1047,6 +1057,7 @@ impl Store {
             blobs,
             conn,
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
+            brain_writes_since_prune: Cell::new(0),
         };
         store.migrate()?;
         store.verify_gateway_schema_current()?;
@@ -1961,6 +1972,33 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS brain_events_recent_idx ON brain_events_v1(created_ms DESC);
                 CREATE INDEX IF NOT EXISTS brain_events_task_idx ON brain_events_v1(task_id, created_ms DESC);
                 PRAGMA user_version = 16;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 17 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_files_v1 (
+                    path TEXT PRIMARY KEY CHECK(length(path) BETWEEN 1 AND 512),
+                    source_digest TEXT NOT NULL CHECK(length(source_digest) = 64),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                    observed_ms INTEGER NOT NULL CHECK(observed_ms >= 0)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_files_recent_idx
+                    ON brain_files_v1(observed_ms DESC);
+                CREATE TABLE IF NOT EXISTS brain_test_commands_v1 (
+                    command_hint TEXT PRIMARY KEY CHECK(length(command_hint) BETWEEN 1 AND 256),
+                    command_digest TEXT NOT NULL CHECK(length(command_digest) = 64),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    observed_ms INTEGER NOT NULL CHECK(observed_ms >= 0)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_test_commands_recent_idx
+                    ON brain_test_commands_v1(observed_ms DESC);
+                PRAGMA user_version = 17;
                 COMMIT;
                 "#,
             )?;
@@ -5139,7 +5177,8 @@ impl Store {
             bail!("brain_event_invalid_metadata");
         }
         let path = event.path.as_deref().unwrap_or("");
-        self.conn.execute(
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
             "INSERT OR IGNORE INTO brain_events_v1 (
                 session_id, event_id, task_id, kind, path, source_digest,
                 command_digest, command_hint, exit_code, created_ms
@@ -5157,7 +5196,7 @@ impl Store {
                 event.created_ms
             ],
         )?;
-        let stored: BrainEventV1 = self.conn.query_row(
+        let stored: BrainEventV1 = transaction.query_row(
             "SELECT session_id, event_id, task_id, kind, path, source_digest,
                     command_digest, command_hint, exit_code, created_ms
              FROM brain_events_v1
@@ -5182,17 +5221,84 @@ impl Store {
         if &stored != event {
             bail!("brain_event_id_collision");
         }
-        self.conn.execute(
-            "DELETE FROM brain_events_v1 WHERE created_ms < ?1",
-            [now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1)],
-        )?;
-        self.conn.execute(
-            "DELETE FROM brain_events_v1 WHERE (session_id, event_id, kind, path) IN (
-                SELECT session_id, event_id, kind, path FROM brain_events_v1
-                ORDER BY created_ms DESC LIMIT -1 OFFSET ?1
-            )",
-            [MAX_BRAIN_EVENTS_V1],
-        )?;
+        if inserted == 1 {
+            if event.kind == "file_change"
+                && let (Some(path), Some(digest)) = (&event.path, &event.source_digest)
+            {
+                transaction.execute(
+                    "INSERT INTO brain_files_v1 (
+                        path, source_digest, task_id, session_id, event_id, observed_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(path) DO UPDATE SET
+                        source_digest = excluded.source_digest,
+                        task_id = excluded.task_id,
+                        session_id = excluded.session_id,
+                        event_id = excluded.event_id,
+                        observed_ms = excluded.observed_ms
+                     WHERE excluded.observed_ms >= brain_files_v1.observed_ms",
+                    params![
+                        path,
+                        digest,
+                        event.task_id,
+                        event.session_id,
+                        event.event_id,
+                        event.created_ms
+                    ],
+                )?;
+            }
+            if event.kind == "test"
+                && event.exit_code == Some(0)
+                && let (Some(hint), Some(digest)) = (&event.command_hint, &event.command_digest)
+            {
+                transaction.execute(
+                    "INSERT INTO brain_test_commands_v1 (
+                        command_hint, command_digest, task_id, observed_ms
+                     ) VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(command_hint) DO UPDATE SET
+                        command_digest = excluded.command_digest,
+                        task_id = excluded.task_id,
+                        observed_ms = excluded.observed_ms
+                     WHERE excluded.observed_ms >= brain_test_commands_v1.observed_ms",
+                    params![hint, digest, event.task_id, event.created_ms],
+                )?;
+            }
+        }
+        let prune = self.brain_writes_since_prune.get() >= 127;
+        if prune {
+            let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+            transaction.execute(
+                "DELETE FROM brain_events_v1 WHERE created_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_events_v1 WHERE (session_id, event_id, kind, path) IN (
+                    SELECT session_id, event_id, kind, path FROM brain_events_v1
+                    ORDER BY created_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_files_v1 WHERE observed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_test_commands_v1 WHERE observed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_files_v1 WHERE path IN (
+                    SELECT path FROM brain_files_v1
+                    ORDER BY observed_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+        }
+        transaction.commit()?;
+        self.brain_writes_since_prune.set(if prune {
+            0
+        } else {
+            self.brain_writes_since_prune.get() + 1
+        });
         Ok(())
     }
 
@@ -5223,8 +5329,75 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn brain_file_v1(&self, path: &str) -> Result<Option<BrainFileV1>> {
+        if path.is_empty()
+            || path.len() > 512
+            || !Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("brain_file_invalid_path");
+        }
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        self.conn
+            .query_row(
+                "SELECT path, source_digest, task_id, observed_ms
+                 FROM brain_files_v1 WHERE path = ?1 AND observed_ms >= ?2",
+                params![path, cutoff],
+                |row| {
+                    Ok(BrainFileV1 {
+                        path: row.get(0)?,
+                        source_digest: row.get(1)?,
+                        task_id: row.get(2)?,
+                        observed_ms: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn brain_test_hint_v1(&self) -> Result<Option<String>> {
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        self.conn
+            .query_row(
+                "SELECT command_hint FROM brain_test_commands_v1
+                 WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT 1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn recent_brain_files_v1(&self, limit: usize) -> Result<Vec<BrainFileV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_file_limit_invalid");
+        }
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT path, source_digest, task_id, observed_ms
+             FROM brain_files_v1 WHERE observed_ms >= ?1
+             ORDER BY observed_ms DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![cutoff, limit as i64], |row| {
+            Ok(BrainFileV1 {
+                path: row.get(0)?,
+                source_digest: row.get(1)?,
+                task_id: row.get(2)?,
+                observed_ms: row.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     pub fn clear_brain_events_v1(&self) -> Result<u64> {
-        Ok(self.conn.execute("DELETE FROM brain_events_v1", [])? as u64)
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let files = transaction.execute("DELETE FROM brain_files_v1", [])? as u64;
+        let tests = transaction.execute("DELETE FROM brain_test_commands_v1", [])? as u64;
+        let events = transaction.execute("DELETE FROM brain_events_v1", [])? as u64;
+        transaction.commit()?;
+        Ok(files + tests + events)
     }
 
     pub fn context_delta_after_v1(
@@ -10543,6 +10716,7 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "workspace_state_bytes"
             | "maintenance_mode"
             | "reconciled_ms"
+            | "observed_ms"
     ) || (table == "gateway_events" && column == "id");
     let nullable = matches!(
         (table, column),
@@ -11054,6 +11228,21 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "created_ms",
             ],
         ),
+        (
+            "brain_files_v1",
+            &[
+                "path",
+                "source_digest",
+                "task_id",
+                "session_id",
+                "event_id",
+                "observed_ms",
+            ],
+        ),
+        (
+            "brain_test_commands_v1",
+            &["command_hint", "command_digest", "task_id", "observed_ms"],
+        ),
     ];
     let mut table_info_statement = connection
         .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info(?1) ORDER BY cid")?;
@@ -11330,6 +11519,34 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "task_id",
                 "through_sequence",
             ],
+            false,
+            false,
+        ),
+        (
+            "brain_events_v1",
+            "brain_events_recent_idx",
+            &["created_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_events_v1",
+            "brain_events_task_idx",
+            &["task_id", "created_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_files_v1",
+            "brain_files_recent_idx",
+            &["observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_test_commands_v1",
+            "brain_test_commands_recent_idx",
+            &["observed_ms"],
             false,
             false,
         ),

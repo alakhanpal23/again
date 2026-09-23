@@ -1394,14 +1394,25 @@ fn brain_cli(args: BrainArgs) -> Result<i32> {
             let workspace = resolve_mcp_workspace(workspace)?;
             let store = Store::open_for_workspace(&workspace)?;
             let events = store.recent_brain_events_v1(limit as usize)?;
-            println!("{}", serde_json::to_string_pretty(&events)?);
+            let files = store.recent_brain_files_v1(limit as usize)?;
+            let test_hint = store.brain_test_hint_v1()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "recentEvents": events,
+                    "fileObservations": files,
+                    "fileObservationsFreshness": "historical; not rechecked by this command",
+                    "previousSuccessfulTestCommand": test_hint,
+                    "testCommandAuthority": "unverified suggestion; run required validation"
+                }))?
+            );
         }
         BrainCommand::Clear { workspace } => {
             let workspace = resolve_mcp_workspace(workspace)?;
             let store = Store::open_for_workspace(&workspace)?;
             let removed = store.clear_brain_events_v1()?;
             println!(
-                "Cleared {removed} Again Brain events for {}",
+                "Cleared {removed} Again Brain records for {}",
                 workspace.display()
             );
         }
@@ -1424,7 +1435,7 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
     validate_agent_launch_task_v1(&session.brief)?;
     let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let workspace = &session.workspace;
-    append_repository_brain_v1(&mut prompt, workspace, &args.brief.task);
+    append_repository_brain_v1(&mut prompt, workspace, &session.brief);
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let bridge_args = [
         "mcp",
@@ -1522,7 +1533,7 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
     let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let workspace = &session.workspace;
-    append_repository_brain_v1(&mut prompt, workspace, &args.brief.task);
+    append_repository_brain_v1(&mut prompt, workspace, &session.brief);
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "again": {
@@ -1784,19 +1795,41 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
 }
 
 #[cfg(all(feature = "daemon", unix))]
-fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, task: &str) {
+fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, brief: &serde_json::Value) {
     let Ok(store) = Store::open_for_workspace(workspace) else {
         return;
     };
-    let Ok(brief) = crate::brain::repository_brief_v1(&store, workspace, task) else {
+    let mut paths = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let sources = brief["sourcePreviews"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|preview| preview["path"].as_str())
+        .chain(
+            brief["relevantCode"]["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|candidate| candidate["locator"]["path"].as_str()),
+        );
+    for path in sources {
+        if seen.insert(path.to_owned()) {
+            paths.push(path.to_owned());
+        }
+        if paths.len() == 16 {
+            break;
+        }
+    }
+    let Ok(brain) = crate::brain::repository_brief_v1(&store, workspace, &paths) else {
         return;
     };
-    let has_files = brief["recentCurrentFiles"]
+    let has_files = brain["recentCurrentFiles"]
         .as_array()
         .is_some_and(|files| !files.is_empty());
-    let has_test = brief["previousSuccessfulTestCommand"].as_str().is_some();
+    let has_test = brain["previousSuccessfulTestCommand"].as_str().is_some();
     if (has_files || has_test)
-        && let Ok(serialized) = serde_json::to_string(&brief)
+        && let Ok(serialized) = serde_json::to_string(&brain)
         && serialized.len() <= 1024
     {
         prompt.push_str("\nAGAIN_BRAIN ");

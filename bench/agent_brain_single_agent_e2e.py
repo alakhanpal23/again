@@ -61,7 +61,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             if "Done" not in result.stdout:
                 raise RuntimeError("structured output did not render the agent message")
 
-        def events() -> list[dict[str, object]]:
+        def brain() -> dict[str, object]:
             result = subprocess.run(
                 [str(binary), "brain", "show", "--workspace", str(workspace)],
                 cwd=workspace, env=environment, capture_output=True,
@@ -71,9 +71,12 @@ def run(binary: pathlib.Path) -> dict[str, object]:
 
         try:
             launch("first", "Repair a.py first task")
-            observed = events()
+            snapshot = brain()
+            observed = snapshot["recentEvents"]
             if len(observed) != 2 or {row["kind"] for row in observed} != {"file_change", "test"}:
                 raise RuntimeError("completed edit and test were not retained")
+            if len(snapshot["fileObservations"]) != 1:
+                raise RuntimeError("latest file observation was not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
 
@@ -97,7 +100,8 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 cwd=workspace, env=environment, capture_output=True,
                 text=True, timeout=10, check=True,
             )
-            if events():
+            cleared = brain()
+            if cleared["recentEvents"] or cleared["fileObservations"] or cleared["previousSuccessfulTestCommand"]:
                 raise RuntimeError("brain clear retained activity")
             return {
                 "schema": "again.brain-single-agent-e2e.v1",
