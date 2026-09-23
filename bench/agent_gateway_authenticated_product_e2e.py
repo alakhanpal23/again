@@ -200,12 +200,19 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(event_counts["requested"] == 2 and event_counts["executed"] == 1 and
                     event_counts["completed"] == 1 and event_counts["exact_hit"] + event_counts["inflight_join"] == 1,
                     f"duplicate read execution was not avoided: {dict(event_counts)}")
+            direct_stat = first.tool("repo.stat", {"path": "input.txt"})
+            structured(direct_stat, "direct context stat")
+            require(result_id(direct_stat["result"]) is None,
+                    "direct context observation unexpectedly granted cache retrieval")
             observer = Client(binary, workspace, environment)
             clients.append(observer)
             joined = structured(observer.tool("task.start", task_arguments), "joined task.start")
             context = joined.get("context", {})
             require(any(fact.get("sources", [{}])[0].get("locator") == "repo.read:input.txt"
                         for fact in context.get("current_facts", [])), "peer did not receive verified source fact")
+            require(any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
+                        for fact in context.get("current_facts", [])),
+                    "peer did not receive direct source-backed fact")
             require(any(ref.get("result_id") == original_id for ref in context.get("result_references", [])),
                     "peer did not receive result reference")
             retrieved = structured(second.tool("context.retrieve", {

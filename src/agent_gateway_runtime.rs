@@ -446,6 +446,70 @@ impl GatewayControlledProviderV1 {
         self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
+    fn execute_direct_with_context(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        let before = self.resolve(&call);
+        let started = Instant::now();
+        let observed = self.execute_direct(epoch, call.clone(), secrets, true);
+        let Ok(value) = observed else {
+            let _ = self.resolve(&call);
+            return observed;
+        };
+        let after = self.resolve(&call);
+        let Some(resolved) = before else {
+            return Ok(value);
+        };
+        if after
+            .as_ref()
+            .map(|current| current.binding.binding_digest())
+            != Some(resolved.binding.binding_digest())
+        {
+            return Ok(value);
+        }
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let bytes = canonical_json_bytes_v1(&value);
+        let proof = json!({
+            "schema": "again.gateway-direct-observation-proof.v1",
+            "requestDigest": resolved.binding.request_digest(),
+            "stateDigest": resolved.binding.state_digest(),
+            "policyDigest": resolved.binding.policy_digest(),
+            "authority": {"semantic": false, "mutationReplay": false,
+                          "externalWriteReplay": false, "cacheHit": false}
+        });
+        let observation_id = (|| {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let stored = store.insert_result(
+                &crate::store::direct_observation_request_key_v1(&resolved.binding),
+                &bytes,
+                b"",
+                0,
+                duration_ms,
+                POLICY_VERSION_V1,
+                &serde_json::to_string(&proof)?,
+            )?;
+            store.publish_gateway_direct_observation_v1(&resolved.binding, &stored.id)
+        })();
+        if let (Ok(observation_id), Some(coordinator)) =
+            (observation_id, self.context_coordinator.as_ref())
+        {
+            let _ = coordinator.admit_direct_observation(
+                &call,
+                &resolved.binding,
+                &resolved.observation_plan,
+                &resolved.repository_digest,
+                &observation_id,
+            );
+        }
+        Ok(value)
+    }
+
     fn large_git_status_index(&self) -> bool {
         fs::symlink_metadata(self.workspace.join(".git/index"))
             .ok()
@@ -1061,6 +1125,15 @@ impl ToolExecution for GatewayControlledProviderV1 {
                 }
                 _ => {}
             }
+        }
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && RepositoryOperationV1::from_call(&call) == Some(RepositoryOperationV1::Stat)
+            && self
+                .context_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| coordinator.active_identity_for_call(&call).is_some())
+        {
+            return self.execute_direct_with_context(&epoch, call, secrets);
         }
         let candidate_key = Self::recent_candidate_key(&call);
         let mut candidate = self.recent_candidate(&candidate_key);

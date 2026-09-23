@@ -37,7 +37,7 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
 const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
 const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
@@ -1903,6 +1903,24 @@ impl Store {
                 "#,
             )?;
         }
+        if version < 15 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE gateway_results ADD COLUMN origin TEXT NOT NULL DEFAULT 'leased'
+                    CHECK(origin IN ('leased', 'direct_observation'));
+                DROP INDEX gateway_results_ready_idx;
+                CREATE UNIQUE INDEX gateway_results_ready_idx
+                    ON gateway_results(binding_digest)
+                    WHERE status = 'ready' AND origin = 'leased';
+                CREATE UNIQUE INDEX gateway_results_direct_idx
+                    ON gateway_results(binding_digest)
+                    WHERE status = 'ready' AND origin = 'direct_observation';
+                PRAGMA user_version = 15;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -2230,16 +2248,19 @@ impl Store {
         if dependencies != binding.input.dependencies {
             return Ok(None);
         }
-        let lease_id = transaction
+        let (lease_id, origin) = transaction
             .query_row(
-                "SELECT lease_id FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
+                "SELECT lease_id, origin FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
                 [gateway_result_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .optional()?;
-        let Some(lease_id) = lease_id else {
+            ?;
+        if origin == "direct_observation" {
+            return Ok((lease_id == "direct_observation").then_some(result));
+        }
+        if origin != "leased" {
             return Ok(None);
-        };
+        }
         let Some(lease) = gateway_lease_row_v1(transaction, &lease_id)? else {
             return Ok(None);
         };
@@ -2280,7 +2301,7 @@ impl Store {
 
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| row.get::<_, String>(0),
             )
@@ -2595,7 +2616,7 @@ impl Store {
         }
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| row.get::<_, String>(0),
             )
@@ -4349,6 +4370,70 @@ impl Store {
         Ok(version)
     }
 
+    /// Determine whether a direct observation already backs the current task
+    /// fact, and allocate the next version after retirement or source change.
+    /// The caller still admits under the ledger's uniqueness checks and must
+    /// retry if a separate store handle wins the race.
+    pub fn context_direct_fact_admission_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        fact_id: &str,
+        source_result_id: &str,
+    ) -> Result<Option<u64>> {
+        validate_digest(source_result_id, "direct context source")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let current: Option<(u64, u64)> = transaction
+            .query_row(
+                "SELECT fact.fact_version, fact.admission_event_sequence
+             FROM context_ledger_fact_versions_v1 AS fact
+             WHERE fact.repository_id = ?1 AND fact.workspace_id = ?2
+               AND fact.task_id = ?3 AND fact.fact_id = ?4
+               AND fact.retired_event_sequence IS NULL
+             ORDER BY fact.fact_version DESC LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    fact_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((_, event)) = current {
+            let same_source: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM context_ledger_event_sources_v1
+                 WHERE event_sequence = ?1 AND result_id = ?2)",
+                params![event, source_result_id],
+                |row| row.get(0),
+            )?;
+            if same_source && context_event_provenance_current_v1(&transaction, identity, event)? {
+                transaction.commit()?;
+                return Ok(None);
+            }
+        }
+        let maximum: Option<u64> = transaction.query_row(
+            "SELECT MAX(fact_version) FROM context_ledger_fact_versions_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3 AND fact_id = ?4",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                fact_id
+            ],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        let next = maximum
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("direct context fact version overflow"))?;
+        if next > i64::MAX as u64 {
+            bail!("direct context fact version exhausted");
+        }
+        Ok(Some(next))
+    }
+
     /// A warm direct read may bypass context admission only while its own
     /// task still holds a current, provenance-checked result reference.
     pub fn context_result_reference_current_v1(
@@ -4364,7 +4449,8 @@ impl Store {
                 "SELECT reference.admission_event_sequence
                  FROM context_ledger_result_references_v1 AS reference
                  JOIN gateway_results AS result
-                   ON result.gateway_result_id = reference.result_id AND result.status = 'ready'
+                   ON result.gateway_result_id = reference.result_id
+                  AND result.status = 'ready' AND result.origin = 'leased'
                  WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
                    AND reference.task_id = ?3 AND reference.result_id = ?4
                    AND reference.retired_event_sequence IS NULL
@@ -4545,6 +4631,23 @@ impl Store {
         }
         enforce_context_quota_v1(&transaction, identity)?;
         let dependencies = verify_context_sources_v1(&transaction, identity, sources, now)?;
+        if matches!(
+            input,
+            ContextLedgerEventInputV1::CompletedObservation { .. }
+                | ContextLedgerEventInputV1::ResultReference { .. }
+        ) {
+            for source in sources {
+                let leased: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM gateway_results
+                     WHERE gateway_result_id = ?1 AND status = 'ready' AND origin = 'leased')",
+                    [source.source().result_id()],
+                    |row| row.get(0),
+                )?;
+                if !leased {
+                    bail!("direct context observation cannot grant retrieval authority");
+                }
+            }
+        }
         let sequence = insert_context_event_v1(
             &transaction,
             identity,
@@ -5643,7 +5746,7 @@ impl Store {
         }
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id, lease_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id, lease_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -6108,6 +6211,88 @@ impl Store {
             stderr,
             dependencies,
         }))
+    }
+
+    /// Publish one freshly executed built-in read as context evidence without
+    /// acquiring a cache lease. A direct observation can back a task fact, but
+    /// its origin is never eligible for an exact hit or an in-flight join.
+    pub fn publish_gateway_direct_observation_v1(
+        &self,
+        binding: &ValidatedGatewayReadV1,
+        result_id: &str,
+    ) -> Result<String> {
+        let now = now_ms();
+        if !freshness_is_current(binding, now) {
+            bail!(GatewayRefusalReason::FreshnessExpired.as_str());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result = load_visible_result_tx(&transaction, result_id)?
+            .ok_or_else(|| anyhow!(GatewayRefusalReason::ResultNotFound.as_str()))?;
+        if result.request_key != direct_observation_request_key_v1(binding)
+            || gateway_policy_digest(&result.policy_version) != binding.policy_digest()
+            || !source_result_blobs_valid_v1(self, &result)
+        {
+            bail!(GatewayRefusalReason::BindingMismatch.as_str());
+        }
+        let dependencies = binding.dependencies();
+        let gateway_result_id = direct_observation_content_digest_v1(binding, &result);
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT gateway_result_id FROM gateway_results
+                 WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'direct_observation'",
+                [binding.binding_digest()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != gateway_result_id {
+                bail!("direct context observation conflicts with prior publication");
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let proof_digest = blake3::hash(result.proof_json.as_bytes())
+            .to_hex()
+            .to_string();
+        transaction.execute(
+            "INSERT INTO gateway_results (gateway_result_id, request_digest, state_digest,
+             policy_digest, binding_digest, result_id, stdout_digest, stderr_digest,
+             stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version,
+             proof_digest, lease_id, status, created_ms, updated_ms, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     'direct_observation', 'ready', ?15, ?15, 'direct_observation')",
+            params![
+                gateway_result_id,
+                binding.request_digest(),
+                binding.state_digest(),
+                binding.policy_digest(),
+                binding.binding_digest(),
+                result.id,
+                result.stdout_digest,
+                result.stderr_digest,
+                result.stdout_bytes,
+                result.stderr_bytes,
+                result.exit_code,
+                result.duration_ms,
+                result.policy_version,
+                proof_digest,
+                now,
+            ],
+        )?;
+        for (ordinal, dependency) in dependencies.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO result_dependencies (gateway_result_id, ordinal,
+                 dependency_key_digest, dependency_value_digest) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    gateway_result_id,
+                    i64::try_from(ordinal)?,
+                    dependency.key_digest,
+                    dependency.value_digest,
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(gateway_result_id)
     }
 
     /// Record a provider execution that bypassed coordinator authority. A
@@ -8949,8 +9134,9 @@ fn load_current_context_results_v1(
             "SELECT reference.admission_event_sequence, reference.result_id,
                     reference.result_digest, reference.total_bytes
              FROM context_ledger_result_references_v1 AS reference
-             JOIN gateway_results AS result
-               ON result.gateway_result_id = reference.result_id AND result.status = 'ready'
+                 JOIN gateway_results AS result
+                   ON result.gateway_result_id = reference.result_id
+                  AND result.status = 'ready' AND result.origin = 'leased'
              WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
                AND reference.task_id = ?3 AND reference.retired_event_sequence IS NULL
              ORDER BY reference.result_id, reference.reference_version DESC LIMIT ?4",
@@ -9641,6 +9827,43 @@ fn gateway_result_content_digest(
     hasher.finalize().to_hex().to_string()
 }
 
+fn direct_observation_content_digest_v1(
+    binding: &ValidatedGatewayReadV1,
+    result: &StoredResult,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.direct-observation.v1\0");
+    for value in [
+        binding.binding_digest(),
+        binding.request_digest(),
+        binding.state_digest(),
+        binding.policy_digest(),
+        result.stdout_digest.as_str(),
+        result.stderr_digest.as_str(),
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&result.stdout_bytes.to_le_bytes());
+    hasher.update(&result.stderr_bytes.to_le_bytes());
+    hasher.update(&result.exit_code.to_le_bytes());
+    hasher.update(&result.duration_ms.to_le_bytes());
+    hash_field(&mut hasher, result.policy_version.as_bytes());
+    hash_field(&mut hasher, result.proof_json.as_bytes());
+    hasher.update(&(binding.dependencies().len() as u64).to_le_bytes());
+    for dependency in binding.dependencies() {
+        hash_field(&mut hasher, dependency.key_digest.as_bytes());
+        hash_field(&mut hasher, dependency.value_digest.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn direct_observation_request_key_v1(binding: &ValidatedGatewayReadV1) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.direct-observation-request.v1\0");
+    hash_field(&mut hasher, binding.binding_digest().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn delivery_token_digest_v2(token: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"again.gateway.retrieval-token.v2\0");
@@ -9843,7 +10066,7 @@ fn load_gateway_result_snapshot_v1(
 ) -> Result<Option<StoredResult>> {
     let snapshot = transaction
         .query_row(
-            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
+            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest, origin FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
             [gateway_result_id],
             |row| {
                 Ok((
@@ -9860,6 +10083,7 @@ fn load_gateway_result_snapshot_v1(
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             },
         )
@@ -9878,6 +10102,7 @@ fn load_gateway_result_snapshot_v1(
         state_digest,
         policy_digest,
         binding_digest,
+        origin,
     )) = snapshot
     else {
         return Ok(None);
@@ -9892,7 +10117,12 @@ fn load_gateway_result_snapshot_v1(
     let Some(result) = load_visible_result_tx(transaction, &result_id)? else {
         bail!("gateway result source is missing or quarantined");
     };
-    if result.request_key != request_digest
+    if result.request_key
+        != if origin == "direct_observation" {
+            direct_observation_request_key_v1(binding)
+        } else {
+            request_digest.clone()
+        }
         || result.stdout_digest != stdout_digest
         || result.stderr_digest != stderr_digest
         || result.stdout_bytes != stdout_bytes
@@ -9905,6 +10135,15 @@ fn load_gateway_result_snapshot_v1(
         bail!("gateway result source metadata drifted after publication");
     }
     let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
+    if origin == "direct_observation" {
+        if direct_observation_content_digest_v1(binding, &result) != gateway_result_id {
+            bail!("direct context observation content address mismatch");
+        }
+        return Ok(Some(result));
+    }
+    if origin != "leased" {
+        bail!("gateway result origin is invalid");
+    }
     let synthetic_lease = GatewayLeaseRowV1 {
         lease_id: String::new(),
         call_id: String::new(),
@@ -10214,6 +10453,7 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "quarantine_reason",
                 "created_ms",
                 "updated_ms",
+                "origin",
             ],
         ),
         (
@@ -10635,6 +10875,13 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ),
         (
             "gateway_results",
+            "gateway_results_direct_idx",
+            &["binding_digest"],
+            true,
+            true,
+        ),
+        (
+            "gateway_results",
             "gateway_results_result_idx",
             &["result_id"],
             false,
@@ -10892,6 +11139,25 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             bail!("Again gateway schema index {index} has an unexpected key shape");
         }
     }
+    for (index, predicate) in [
+        (
+            "gateway_results_ready_idx",
+            "WHERE status = 'ready' AND origin = 'leased'",
+        ),
+        (
+            "gateway_results_direct_idx",
+            "WHERE status = 'ready' AND origin = 'direct_observation'",
+        ),
+    ] {
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get(0),
+        )?;
+        if !sql.contains(predicate) {
+            bail!("Again gateway schema index {index} has an unexpected admission predicate");
+        }
+    }
     let required_checks = [
         (
             "gateway_context_source_recipes_v1",
@@ -10926,6 +11192,10 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ("gateway_results", "CHECK(stdout_bytes >= 0)"),
         ("gateway_results", "CHECK(stderr_bytes >= 0)"),
         ("gateway_results", "CHECK(duration_ms >= 0)"),
+        (
+            "gateway_results",
+            "CHECK(origin IN ('leased', 'direct_observation'))",
+        ),
         (
             "gateway_results",
             "CHECK(status IN ('ready', 'quarantined'))",
@@ -12503,6 +12773,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn restore_pre_v15_gateway_result_shape(store: &Store) {
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX gateway_results_direct_idx;
+             DROP INDEX gateway_results_ready_idx;
+             ALTER TABLE gateway_results DROP COLUMN origin;
+             CREATE UNIQUE INDEX gateway_results_ready_idx
+               ON gateway_results(binding_digest) WHERE status = 'ready';",
+            )
+            .unwrap();
+    }
+
     fn context_test_identity(
         agent: &str,
         authorization: char,
@@ -12578,6 +12861,107 @@ mod tests {
             other => panic!("expected context test completion, got {other:?}"),
         };
         (binding, gateway_result_id)
+    }
+
+    #[test]
+    fn direct_observation_backs_context_but_never_becomes_a_cache_candidate() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let identity = context_test_identity("agent-a", 'a', '1', 1);
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let state_digest = blake3::hash(b"direct-state").to_hex().to_string();
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: blake3::hash(b"direct-request").to_hex().to_string(),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest("context-ledger-test-v1"),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now_ms(),
+                valid_until_ms: now_ms() + 60_000,
+            },
+            dependencies: vec![GatewayDependencyV1 {
+                key_digest: "b".repeat(64),
+                value_digest: "c".repeat(64),
+            }],
+        })
+        .unwrap();
+        let result = store
+            .insert_result(
+                &direct_observation_request_key_v1(&binding),
+                b"direct bytes",
+                b"",
+                0,
+                1,
+                "context-ledger-test-v1",
+                "{}",
+            )
+            .unwrap();
+        let direct_id = store
+            .publish_gateway_direct_observation_v1(&binding, &result.id)
+            .unwrap();
+        assert_eq!(
+            store
+                .publish_gateway_direct_observation_v1(&binding, &result.id)
+                .unwrap(),
+            direct_id,
+        );
+        let source = store
+            .context_verified_observation_v1(&identity, &binding, &direct_id, "repo.read:input.txt")
+            .unwrap();
+        let fact = context_test_fact(&store, &identity, "fact:direct", &source);
+        store
+            .admit_context_fact_v1(
+                &identity,
+                &"d".repeat(64),
+                1,
+                &fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        let forged_reference =
+            ReasoningRetrievalIdentityV1::new(&direct_id, &direct_id, b"direct bytes".len() as u64)
+                .unwrap();
+        assert!(
+            store
+                .append_context_event_v1(
+                    &identity,
+                    &"e".repeat(64),
+                    &ContextLedgerEventInputV1::ResultReference {
+                        reference: forged_reference,
+                        reference_version: 1,
+                        verified_sources: vec![source.clone()],
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .context_task_snapshot_v1(&identity)
+                .unwrap()
+                .current_facts()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_gateway_result(&binding, &direct_id)
+                .unwrap()
+                .unwrap()
+                .stdout,
+            b"direct bytes"
+        );
+        assert!(matches!(
+            store
+                .acquire_gateway_call(&binding, "direct-test-owner")
+                .unwrap(),
+            GatewayCallAcquisition::Leader { .. }
+        ));
+        store.conn.execute(
+            "UPDATE gateway_results SET stdout_bytes = stdout_bytes + 1 WHERE gateway_result_id = ?1",
+            [&direct_id],
+        ).unwrap();
+        assert!(store.get_gateway_result(&binding, &direct_id).is_err());
     }
 
     fn context_test_fact(
@@ -13676,6 +14060,7 @@ mod tests {
     fn source_recipe_schema_migrates_from_thirteen_and_is_required_at_fourteen() {
         let temp = TempDir::new().unwrap();
         let store = Store::open(temp.path().join("state")).unwrap();
+        restore_pre_v15_gateway_result_shape(&store);
         store
             .conn
             .execute_batch(
@@ -13702,6 +14087,7 @@ mod tests {
         set_private_dir(temp.path()).unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
+            restore_pre_v15_gateway_result_shape(&store);
             store
                 .conn
                 .execute(
@@ -13761,6 +14147,7 @@ mod tests {
         set_private_dir(temp.path()).unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
+            restore_pre_v15_gateway_result_shape(&store);
             store
                 .conn
                 .execute_batch(

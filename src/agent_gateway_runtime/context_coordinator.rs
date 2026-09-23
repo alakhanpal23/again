@@ -337,6 +337,76 @@ impl LocalContextCoordinatorV1 {
         Ok(())
     }
 
+    pub(super) fn admit_direct_observation(
+        &self,
+        call: &ProviderCall,
+        binding: &crate::store::ValidatedGatewayReadV1,
+        observation_plan: &RepositoryObservationPlanV1,
+        repository_digest: &str,
+        observation_id: &str,
+    ) -> Result<()> {
+        let Some(identity) = self.active_identity_for_call(call) else {
+            return Ok(());
+        };
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let source = store.context_verified_observation_v1(
+            &identity,
+            binding,
+            observation_id,
+            &source_locator_v1(call),
+        )?;
+        store.admit_context_source_recipe_v1(
+            &identity,
+            binding,
+            observation_id,
+            repository_digest,
+            &serde_json::to_vec(observation_plan)?,
+        )?;
+        let fact_id = bounded_digest_id_v1("direct-fact", binding.request_digest());
+        for _ in 0..3 {
+            let Some(version) =
+                store.context_direct_fact_admission_v1(&identity, &fact_id, observation_id)?
+            else {
+                return Ok(());
+            };
+            let fact = store.context_fact_from_verified_observations_v1(
+                &identity,
+                &fact_id,
+                true,
+                std::slice::from_ref(&source),
+            )?;
+            let material = format!("{observation_id}:{version}");
+            let envelope = event_digest_v1(
+                b"again.context.direct-fact-envelope.v1\0",
+                &identity,
+                material.as_bytes(),
+            );
+            match store.admit_context_fact_v1(
+                &identity,
+                &envelope,
+                version,
+                &fact,
+                std::slice::from_ref(&source),
+            ) {
+                Ok(_) => return Ok(()),
+                Err(error) => {
+                    if store.context_direct_fact_admission_v1(
+                        &identity,
+                        &fact_id,
+                        observation_id,
+                    )? == Some(version)
+                    {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+        bail!("direct context fact admission did not converge")
+    }
+
     pub(super) fn observe_dependencies(
         &self,
         call: &ProviderCall,
