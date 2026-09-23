@@ -104,23 +104,24 @@ This lowers four different costs:
 - developer wait time between task receipt and a correct result.
 
 Today Again can measure exact provider calls avoided and explicit output bytes
-omitted. The public MCP path has no authenticated recipient issuer, so it has
-zero delivery-confirmed token savings. Model spend and task cost must not be
-claimed until a live agent/API run records provider usage and comparable task
-outcomes.
+omitted. Its same-user daemon authenticates recipients and confirms compact
+context delivery; ordinary stdio does not issue that authority. Local live
+Codex pairs record provider-reported token use, but they do not isolate compact
+delivery from the prebrief and other routing changes. Total task-cost and
+product-wide speed claims remain unqualified.
 
 ## Current product map
 
 | Product layer | Available now | Next missing product step |
 |---|---|---|
-| Repository identity and observation | Descriptor-retained workspace epochs, dependency-bound built-in tools, exact invalidation | Share one sealed fresh manifest across eligible tools and measure cold/warm task impact |
-| Tool execution memory | 13 default MCP repository/Git tools, exact hits, in-flight joins, recovery, quarantine | Outside-user evidence and reviewed upstream-provider configuration |
+| Repository identity and observation | Descriptor-retained workspace epochs, shared sealed manifests, dependency-bound built-in tools, exact invalidation | Make complete broad-call freshness cheaper than execution and qualify cold/warm task impact |
+| Tool execution memory | 13 default MCP repository/Git tools, exact hits, in-flight joins, recovery, quarantine; direct execution for calls whose proof is too costly | Broader repeat-heavy task evidence and reviewed upstream-provider configuration |
 | Local exact command memory | Audited macOS read subset through `run`, `reference`, `show`, and local SQLite/CAS | Broader signed profile distribution without weakening fail-closed admission |
-| Repository understanding | Internal typed facts, invalidations, source references, and reasoning-brief compiler | Admit facts from live verified observations and expose a bounded task-start brief |
-| Context delivery | Internal authenticated receipt/grant composition and explicit same-context `reference` | Transport-authenticated recipient identity and public compact/delta delivery |
+| Repository understanding | Live source-backed facts, invalidations, source references, bounded code index, and task-start brief | Broader real-task relevance and latency qualification |
+| Context delivery | Same-user authenticated recipients, task-scoped retrieval, delivery-confirmed compact context, and public delta tools | Cross-user recipient issuance and isolated token-cost attribution |
 | Validation selection and reuse | EffectIR, snapshot, isolation, tracer, candidate, and promotion foundations | First real execute-only pytest slice, then shadow-backed reuse |
 | Cross-agent/team knowledge | Local shared store and manually provisioned encrypted team foundation | Safe product onboarding, deployed service, and cross-machine equivalence evidence |
-| Economics | Provider-call, result, byte, latency, and dormant token fields | Paired live-agent task measurements with quality and actual usage/cost |
+| Economics | Local paired Codex task outcomes, provider calls, latency, and reported tokens on two edit fixtures | Diverse balanced cohorts, live Claude results, and total metered cost |
 
 ## Product scorecard
 
