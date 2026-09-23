@@ -5521,8 +5521,9 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// Retained repository observations with the attributed task's own prompt.
-    /// The caller may use prompt similarity to nominate a path, but must
+    /// Retained repository observations with an optional attributed prompt.
+    /// Interactive hooks have no lifecycle task, so their prompt is empty.
+    /// The caller may use prompt or path similarity to nominate a path, but must
     /// independently recheck the source before presenting it as current.
     pub(crate) fn brain_files_with_task_prompts_v1(
         &self,
@@ -5537,12 +5538,13 @@ impl Store {
         let mut statement = self.conn.prepare(
             "SELECT file.path, file.source_digest, file.task_id, file.observed_ms,
                     file.authorization_scope_digest,
-                    substr(task.prompt_text, 1, 1024)
+                    COALESCE(substr(task.prompt_text, 1, 1024), '')
              FROM brain_files_v1 AS file
-             JOIN context_tasks_v1 AS task ON task.canonical_task_id = file.task_id
-             WHERE task.repository_id = ?1 AND task.workspace_id = ?2
-               AND task.authorization_scope_digest = ?3
-               AND file.authorization_scope_digest = ?3
+             LEFT JOIN context_tasks_v1 AS task
+               ON task.canonical_task_id = file.task_id
+              AND task.repository_id = ?1 AND task.workspace_id = ?2
+              AND task.authorization_scope_digest = ?3
+             WHERE file.authorization_scope_digest = ?3
                AND file.observed_ms >= ?4
              ORDER BY file.observed_ms DESC LIMIT ?5",
         )?;

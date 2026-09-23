@@ -448,7 +448,7 @@ pub fn repository_brief_for_task_v1(
                 .is_some_and(|path| history_paths.iter().any(|prior| prior == path))
             {
                 file["selection"] =
-                    Value::String("prior task and path overlap; source rechecked".to_owned());
+                    Value::String("prior task or path overlap; source rechecked".to_owned());
             }
         }
     }
@@ -1176,6 +1176,42 @@ mod tests {
         )
         .unwrap();
         assert!(stale.is_none());
+    }
+
+    #[test]
+    fn interactive_hook_read_can_be_nominated_by_path_without_a_task_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(workspace.join("src/ledger_helper.py"), "value = 10\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let hook = serde_json::json!({
+            "hook_event_name":"PostToolUse", "tool_name":"Bash",
+            "session_id":"interactive", "tool_use_id":"read",
+            "tool_input":{"command":"cat src/ledger_helper.py"},
+            "tool_response":{"exit_code":0,"output":"value = 10\n"}
+        });
+        for event in codex_post_tool_event_v1(&hook, &workspace).unwrap() {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let brief = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[]}),
+            task_query("Fix ledger helper output", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            brief["recentCurrentFiles"][0]["path"],
+            "src/ledger_helper.py"
+        );
+        assert_eq!(
+            brief["recentCurrentFiles"][0]["currentCompletePreview"],
+            "value = 10\n"
+        );
     }
 
     #[test]

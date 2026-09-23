@@ -15,6 +15,9 @@ is idempotent for a repeated `tool_use_id`, bounded to 1 MiB input, and emits
 no model-visible hook output. It is not installed by `again setup`; opt-in
 `PostToolUse` configuration and a live Codex hook-payload qualification remain.
 The launcher remains the currently qualified automatic capture path.
+An interactive read without a lifecycle task can now be nominated on a later
+task by matching words in its path. The file is still rechecked against its
+stored digest and authorization scope before any preview is shown.
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
