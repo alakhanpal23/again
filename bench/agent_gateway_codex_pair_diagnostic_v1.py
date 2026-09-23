@@ -34,9 +34,19 @@ AGAIN_INSTRUCTION = (
 
 
 def run_condition(
-    condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str
+    condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
+    source_files: int = 0,
 ) -> tuple[dict[str, object], bytes]:
-    before = pair.create_fixture(workspace)
+    pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
+    pair.create_fixture(workspace)
+    if source_files:
+        background = workspace / "src" / "background"
+        background.mkdir()
+        for index in range(source_files):
+            (background / f"module_{index:04}.py").write_text(
+                f"value = {index}\n", encoding="utf-8"
+            )
+    before = pair.snapshot(workspace)
     stats_before = pair.again_stats(binary, workspace)
     codex = pathlib.Path(subprocess.run(
         ["which", "codex"], capture_output=True, text=True, check=True
@@ -138,8 +148,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=pathlib.Path, default="target/debug/again")
     parser.add_argument("--model", default="gpt-6-sol")
+    parser.add_argument("--source-files", type=int, default=0)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
+    if not 0 <= args.source_files <= 1000:
+        parser.error("--source-files must be between 0 and 1000")
     binary = args.binary.resolve(strict=True)
     root = pathlib.Path(__file__).resolve().parents[1]
     codex = pathlib.Path(subprocess.run(
@@ -150,7 +163,9 @@ def main() -> int:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     for condition in ("baseline", "again"):
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
-            result, raw = run_condition(condition, pathlib.Path(temporary), binary, args.model)
+            result, raw = run_condition(
+                condition, pathlib.Path(temporary), binary, args.model, args.source_files
+            )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
         result["rawEventFile"] = raw_path.name
@@ -170,6 +185,7 @@ def main() -> int:
         "harnessSha256": sha256(pathlib.Path(__file__)),
         "source": source_state(root),
         "model": args.model,
+        "sourceFiles": args.source_files,
         "approvalMode": "approve-for-me",
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(pair.PROMPT.encode()).hexdigest(),
