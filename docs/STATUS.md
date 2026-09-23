@@ -249,13 +249,15 @@ ID; the harness still assumes the earlier storage route. This is a harness
 qualification gap, not passing release evidence. The harness must start
 authenticated tasks for shared-context and result-reference scenarios and
 check direct standalone behavior separately.
-The new authenticated [production-binary task harness](../bench/agent_gateway_authenticated_product_e2e.py)
-exercises that route with two daemon-connected clients. A local dirty-source
-diagnostic passed standalone direct execution, one physical execution for two
-simultaneous task-bound reads, peer fact/retrieval, preservation after an
-unrelated edit, and retirement after an unobserved relevant edit. Clean-source
-exact-SHA evidence is pending; this focused harness does not replace the
-legacy cancellation, lease, or corruption scenarios.
+The new authenticated [task harness](../bench/agent_gateway_authenticated_product_e2e.py)
+exercises that route with two daemon-connected clients. Its retained
+[clean-source release-binary run](../bench/results/2026-09-23-authenticated-product-e2e-release-v1.json)
+at `a7c4e3f9a9325d08aaf229bb0b966a8fd0581047` passed standalone direct
+execution, one physical execution and one join for two simultaneous task reads,
+peer fact/retrieval, preservation after an unrelated edit, and retirement after
+an unobserved relevant edit. This focused gate does not replace the legacy
+cancellation, lease, or corruption scenarios, and it does not prove task-level
+speed or quality.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that

@@ -1,0 +1,31 @@
+{
+  "binary_sha256": "23148e246e2f114f2dfa66e7bc4bb8e3cc77084234aa4c7d5d05b4d08729c5c4",
+  "classification": {
+    "code": "task_source_lifecycle_passed",
+    "type": "pass"
+  },
+  "duplicate_read_events": {
+    "completed": 1,
+    "executed": 1,
+    "inflight_candidate": 1,
+    "inflight_join": 1,
+    "requested": 2
+  },
+  "new_result_id": "d58f9d7ba91f920706d92db10fa9a39a338ab0e6e24100da1e76b2b3a20155f3",
+  "old_result_id": "4884c3d13ee305bd9f88caf74d28b25e44a0162d5198726f67a120f36884b5fc",
+  "scenarios": [
+    "standalone_direct",
+    "duplicate_read_avoided",
+    "peer_fact",
+    "peer_retrieval",
+    "unrelated_edit",
+    "unobserved_relevant_edit"
+  ],
+  "schema": "again.authenticated-product-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "a7c4e3f9a9325d08aaf229bb0b966a8fd0581047",
+    "git_sha256": "41e9a47ca8d0b671700ebec306944b9917488dd470dc2c7a6e94442d8e944c98",
+    "root": "/Users/arjun/.superset/projects/again"
+  }
+}
