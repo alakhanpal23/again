@@ -173,6 +173,12 @@ has a persisted proof and an `explain` reason.
   `bench/results/2026-09-23-codex-1k-test-preview-reverse-v1.json`.
   These two opposing orders still show no task-level acceleration; move the
   controlled evaluation to repeat-heavy and parallel-agent tasks.
+  Two current-binary Codex pairs after the index-batch change again passed
+  both edit oracles and avoided follow-up repository reads, but reached the
+  first edit later than baseline in both orders. A one-tool diagnostic MCP
+  surface did not improve the result. Measure the content and model-turn cost
+  of the task-start brief before changing production tool discovery, and run
+  the repeat-heavy parallel cohort rather than extrapolating from this edit.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference

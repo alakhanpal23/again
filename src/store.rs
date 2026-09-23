@@ -134,6 +134,7 @@ pub struct StoreStats {
     pub estimated_execution_ms_saved: u64,
     pub requested: u64,
     pub executed: u64,
+    pub direct_observations_published: u64,
     pub exact_hits: u64,
     pub coverage_hits: u64,
     pub inflight_joins: u64,
@@ -744,6 +745,7 @@ impl GatewayAgentContext {
 pub struct GatewayStats {
     pub requested: u64,
     pub executed: u64,
+    pub direct_observations_published: u64,
     pub exact_hits: u64,
     pub coverage_hits: u64,
     pub inflight_joins: u64,
@@ -6291,6 +6293,16 @@ impl Store {
                 ],
             )?;
         }
+        record_gateway_event_v1_tx(
+            &transaction,
+            None,
+            None,
+            Some(&gateway_result_id),
+            "direct_observation_published",
+            None,
+            0,
+            now,
+        )?;
         transaction.commit()?;
         Ok(gateway_result_id)
     }
@@ -6818,6 +6830,7 @@ impl Store {
             match event_type.as_str() {
                 "requested" => stats.requested += count,
                 "executed" => stats.executed += count,
+                "direct_observation_published" => stats.direct_observations_published += count,
                 "exact_hit" => stats.exact_hits += count,
                 "coverage_hit" => stats.coverage_hits += count,
                 "inflight_join" => stats.inflight_joins += count,
@@ -7225,6 +7238,7 @@ impl Store {
         let gateway = self.gateway_stats()?;
         stats.requested = gateway.requested;
         stats.executed = gateway.executed;
+        stats.direct_observations_published = gateway.direct_observations_published;
         stats.exact_hits = gateway.exact_hits;
         stats.coverage_hits = gateway.coverage_hits;
         stats.inflight_joins = gateway.inflight_joins;
@@ -12906,6 +12920,11 @@ mod tests {
                 .unwrap(),
             direct_id,
         );
+        let stats = store.gateway_stats().unwrap();
+        assert_eq!(stats.direct_observations_published, 1);
+        assert_eq!(stats.provider_calls_avoided, 0);
+        assert_eq!(stats.exact_hits, 0);
+        assert_eq!(store.stats().unwrap().direct_observations_published, 1);
         let source = store
             .context_verified_observation_v1(&identity, &binding, &direct_id, "repo.read:input.txt")
             .unwrap();

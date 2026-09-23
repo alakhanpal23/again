@@ -15,6 +15,7 @@ import os
 import pathlib
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -36,6 +37,7 @@ AGAIN_INSTRUCTION = (
 def run_condition(
     condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
     source_files: int = 0,
+    task_start_only_surface: bool = False,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -56,9 +58,16 @@ def run_condition(
         "--approve-for-me", "-m", model, "-C", str(workspace),
     ]
     if condition == "again":
+        if task_start_only_surface:
+            bridge = pathlib.Path(__file__).with_name("agent_gateway_codex_task_start_surface_v1.py").resolve()
+            server_command = sys.executable
+            server_args = [str(bridge), "--binary", str(binary), "--workspace", str(workspace)]
+        else:
+            server_command = str(binary)
+            server_args = ["mcp", "connect", "--workspace", str(workspace)]
         command += [
-            "-c", f'mcp_servers.again.command="{binary}"',
-            "-c", f'mcp_servers.again.args=["mcp","connect","--workspace","{workspace}"]',
+            "-c", f"mcp_servers.again.command={json.dumps(server_command)}",
+            "-c", f"mcp_servers.again.args={json.dumps(server_args)}",
         ]
     command.append((AGAIN_INSTRUCTION if condition == "again" else "") + pair.PROMPT)
     original = hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest()
@@ -150,6 +159,8 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-6-sol")
     parser.add_argument("--source-files", type=int, default=0)
     parser.add_argument("--order", choices=("baseline-first", "again-first"), default="baseline-first")
+    parser.add_argument("--task-start-only-surface", action="store_true",
+                        help="diagnostic: advertise only task.start while forwarding through the authenticated daemon")
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if not 0 <= args.source_files <= 1000:
@@ -172,7 +183,8 @@ def main() -> int:
     for condition in order:
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
             result, raw = run_condition(
-                condition, pathlib.Path(temporary), binary, args.model, args.source_files
+                condition, pathlib.Path(temporary), binary, args.model,
+                args.source_files, args.task_start_only_surface,
             )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -198,6 +210,7 @@ def main() -> int:
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(pair.PROMPT.encode()).hexdigest(),
         "order": list(order),
+        "surface": "task-start-only-diagnostic" if args.task_start_only_surface else "full",
         "observations": observations,
         "accepted": accepted,
     }

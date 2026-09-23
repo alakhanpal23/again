@@ -49,6 +49,26 @@ passed against clean source `8f8cbf2fe9c01e39b0ee7faf49010a0aa3079262` after the
 batch change, covering shared direct facts, exact in-flight work avoidance,
 invalidation, scoped retrieval, corruption refusal, and lease recovery.
 
+Two further live Codex pairs on the 1,000-file edit fixture passed the exact
+edit oracle in both orders, but Again reached the first edit later in both:
+14.1 versus 11.1 seconds in the [baseline-first pair](../bench/results/2026-09-23-codex-pair-batched-index-baseline-first-v1.json)
+and 18.3 versus 12.0 seconds in the [reverse pair](../bench/results/2026-09-23-codex-pair-batched-index-again-first-v1.json).
+Again made one `task.start` call, no follow-up repository calls, and one
+successful validation call; baseline made several shell inspection calls.
+The Again input-token counts were about 123k in both orders, above the
+baseline's 97k and 114k. These are small local diagnostics on dirty source,
+not a qualified cost estimate. A diagnostic proxy advertised only `task.start`
+instead of the full 22-tool, 17.3 KiB MCP surface. Its
+[baseline-first](../bench/results/2026-09-23-codex-pair-minimal-surface-baseline-first-v1.json)
+and [reverse](../bench/results/2026-09-23-codex-pair-minimal-surface-again-first-v1.json)
+pairs also passed but did not improve first-edit time or input tokens. A
+schema-only reduction is therefore not a demonstrated fix for this workload.
+The next client experiment must isolate brief content and model turns, and the
+product still needs repeat-heavy parallel-agent cohorts.
+
+Gateway stats now count `direct_observations_published` separately from
+`provider_calls_avoided`; direct facts never increment the avoided-call count.
+
 Current hosted evidence checkpoint: source commit
 `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted
 [`CI run 33145078831`](https://github.com/alakhanpal23/again/actions/runs/33145078831)
