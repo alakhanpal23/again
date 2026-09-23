@@ -65,6 +65,16 @@ longer and used more input tokens. Those pairs are too small to assign all
 model time to one component. They do rule out calling the present behavior a
 general task-level acceleration win.
 
+The clean-source `ed4bb55` release-binary diagnostic repeated the task-bound
+comparison with the launcher changes present. First-call admission was
+14.31 ms versus 0.44 ms direct for a small read, 138.34 versus 1.07 ms for a
+128 KiB read, 356.48 versus 76.87 ms for search, and 480.39 versus 29.13 ms
+for tree. Every warm call still executed the provider. The source-backed
+search fact is exercised by a mutation test that requires its old reference
+to retire and a changed result to be published. A broad default direct route
+would discard that behavior; a cost policy must say when it intentionally
+withholds shared context and measure the task outcome of that choice.
+
 The integration boundary also matters: the daemon sees calls routed to its
 MCP tools. Native shell/tool calls are outside its authority and cannot be
 deduplicated transparently. Client setup and brief quality must reduce those

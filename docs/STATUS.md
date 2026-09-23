@@ -426,6 +426,20 @@ sources per task and withhold unchecked context above that bound. Concurrent mut
 reobservation and delivery, wider workload performance, and hosted
 qualification remain open.
 
+The [clean-source release-binary follow-up](../bench/results/2026-09-23-gateway-task-reuse-value-release-shared-launchers-v1.json)
+at `ed4bb55` used the `daemon` feature and five warm samples per case on a
+1,000-file fixture. Automatic/direct cold calls took 14.31/0.44 ms for a
+small read, 138.34/1.07 ms for a 128 KiB read, 356.48/76.87 ms for search,
+and 480.39/29.13 ms for tree. Warm calls executed the provider on every
+request, with zero exact hits; warm p50 was 0.35/0.19 ms for small read,
+0.76/0.41 ms for large read, 63.00/66.52 ms for search, and 35.44/28.81 ms
+for tree. The one-fixture, five-sample measurements show cold admission is
+still the major task-bound cost. A blanket bypass of task-bound search would
+remove its source-backed fact and the tested relevant-edit retirement path;
+the next route change must preserve that contract or explicitly withhold a
+shared fact. The report pins binary bytes and clean source, but its harness
+does not verify binary-to-source binding.
+
 A [10,000-file task-bound diagnostic baseline](../bench/results/2026-09-23-gateway-task-reuse-value-10k-baseline-v1.json)
 measured task-start median 4,254 ms across ten isolated daemon cases. The
 [bounded-index follow-up](../bench/results/2026-09-23-gateway-task-reuse-value-10k-preflight-v2.json)
