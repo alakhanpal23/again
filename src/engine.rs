@@ -1801,6 +1801,14 @@ fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, brief: &ser
     };
     let mut paths = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
+    let already_previewed: Vec<String> = brief["sourcePreviews"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(2)
+        .filter(|preview| preview["complete"] == true)
+        .filter_map(|preview| preview["path"].as_str().map(str::to_owned))
+        .collect();
     let sources = brief["sourcePreviews"]
         .as_array()
         .into_iter()
@@ -1821,7 +1829,9 @@ fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, brief: &ser
             break;
         }
     }
-    let Ok(brain) = crate::brain::repository_brief_v1(&store, workspace, &paths) else {
+    let Ok(brain) =
+        crate::brain::repository_brief_v1(&store, workspace, &paths, &already_previewed)
+    else {
         return;
     };
     let has_files = brain["recentCurrentFiles"]
@@ -1834,7 +1844,7 @@ fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, brief: &ser
     {
         prompt.push_str("\nAGAIN_BRAIN ");
         prompt.push_str(&serialized);
-        prompt.push_str("\nThis is observed repository history, not a current test result. Recheck relevance and run required validation.");
+        prompt.push_str("\nComplete Brain previews were rechecked against current file bytes at launch; use them without rereading until an edit. Other history is guidance only. Run required validation.");
     }
 }
 

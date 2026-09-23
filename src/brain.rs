@@ -67,7 +67,7 @@ pub fn codex_completed_events_v1(
                 .then(|| known_test_command_v1(command))
                 .flatten()
                 .map(str::to_owned);
-            vec![BrainEventV1 {
+            let mut events = vec![BrainEventV1 {
                 session_id: session_id.to_owned(),
                 event_id: event_id.to_owned(),
                 task_id: task_id.to_owned(),
@@ -83,7 +83,28 @@ pub fn codex_completed_events_v1(
                 command_hint,
                 exit_code: Some(exit_code),
                 created_ms,
-            }]
+            }];
+            if exit_code == 0
+                && let Some(path) = observed_absolute_read_path_v1(command)
+                && let Some((relative, absolute)) = workspace_file_v1(workspace, path)
+                && source_code_path_v1(&relative)
+                && fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= 8 * 1024)
+                && let Ok(bytes) = fs::read(&absolute)
+            {
+                events.push(BrainEventV1 {
+                    session_id: session_id.to_owned(),
+                    event_id: event_id.to_owned(),
+                    task_id: task_id.to_owned(),
+                    kind: "command".to_owned(),
+                    path: Some(relative),
+                    source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                    command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                    command_hint: None,
+                    exit_code: Some(exit_code),
+                    created_ms,
+                });
+            }
+            events
         }
         _ => Vec::new(),
     }
@@ -106,6 +127,7 @@ pub fn repository_brief_v1(
     store: &Store,
     workspace: &Path,
     candidate_paths: &[String],
+    already_previewed_paths: &[String],
 ) -> anyhow::Result<Value> {
     let mut recent_files = Vec::new();
     let test_hint = store
@@ -120,15 +142,28 @@ pub fn repository_brief_v1(
             && let Some((relative, absolute)) = workspace_file_v1(workspace, path)
             && relative == *path
             && fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= MAX_OBSERVED_FILE_BYTES_V1)
-            && fs::read(&absolute).is_ok_and(|bytes| {
-                blake3::hash(&bytes).to_hex().as_str() == observation.source_digest
-            })
+            && let Ok(bytes) = fs::read(&absolute)
+            && blake3::hash(&bytes).to_hex().as_str() == observation.source_digest
         {
+            let preview = if !recent_files
+                .iter()
+                .any(|file: &Value| file["currentCompletePreview"].as_str().is_some())
+                && !already_previewed_paths.contains(path)
+                && source_code_path_v1(path)
+                && bytes.len() <= 256
+                && let Ok(text) = String::from_utf8(bytes.clone())
+                && crate::task_lifecycle::screen_sensitive_text_v1(&text).is_ok()
+            {
+                Some(text)
+            } else {
+                None
+            };
             recent_files.push(serde_json::json!({
                 "path": path,
                 "currentDigest": observation.source_digest,
                 "observedTaskId": observation.task_id,
-                "observation": "edited in a prior Again task; file content rechecked now",
+                "observation": "observed after a prior read or edit; file content rechecked now",
+                "currentCompletePreview": preview,
             }));
         }
     }
@@ -176,6 +211,51 @@ fn known_test_command_v1(command: &str) -> Option<&'static str> {
         "go test ./..." => Some("go test ./..."),
         _ => None,
     }
+}
+
+fn observed_absolute_read_path_v1(command: &str) -> Option<&str> {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("/bin/zsh -lc '")
+        .and_then(|inner| inner.strip_suffix('\''))
+        .unwrap_or(command);
+    // Only a literal unquoted absolute operand can be attributed to this
+    // command without interpreting shell syntax or an unknown effective cwd.
+    let path = command.strip_prefix("cat ")?;
+    (!path.contains(char::is_whitespace)
+        && !path.chars().any(|character| {
+            matches!(
+                character,
+                ';' | '|'
+                    | '&'
+                    | '<'
+                    | '>'
+                    | '$'
+                    | '`'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '('
+                    | ')'
+                    | '\\'
+                    | '\''
+                    | '"'
+            )
+        })
+        && Path::new(path).is_absolute())
+    .then_some(path)
+}
+
+fn source_code_path_v1(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str()),
+        Some("py" | "pyi" | "rs" | "go" | "js" | "jsx" | "ts" | "tsx")
+    )
 }
 
 fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String]) -> bool {
@@ -288,17 +368,17 @@ mod tests {
                 .all(|event| event.kind == "command")
         );
         let candidates = ["balances.py".to_owned()];
-        let brief = repository_brief_v1(&store, &workspace, &candidates).unwrap();
+        let brief = repository_brief_v1(&store, &workspace, &candidates, &[]).unwrap();
         assert_eq!(brief["recentCurrentFiles"].as_array().unwrap().len(), 1);
         assert_eq!(
             brief["previousSuccessfulTestCommand"],
             "python3 -m unittest discover -s tests"
         );
         let unrelated =
-            repository_brief_v1(&store, &workspace, &["src/main.rs".to_owned()]).unwrap();
+            repository_brief_v1(&store, &workspace, &["src/main.rs".to_owned()], &[]).unwrap();
         assert!(unrelated["previousSuccessfulTestCommand"].is_null());
         fs::write(workspace.join("balances.py"), "value = 2\n").unwrap();
-        let stale = repository_brief_v1(&store, &workspace, &candidates).unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &candidates, &[]).unwrap();
         assert!(stale["recentCurrentFiles"].as_array().unwrap().is_empty());
     }
 
@@ -330,12 +410,13 @@ mod tests {
             event.created_ms += index as i64;
             store.record_brain_event_v1(&event).unwrap();
         }
-        let rust = repository_brief_v1(&store, &workspace, &["src/lib.rs".to_owned()]).unwrap();
+        let rust =
+            repository_brief_v1(&store, &workspace, &["src/lib.rs".to_owned()], &[]).unwrap();
         assert_eq!(rust["previousSuccessfulTestCommand"], "cargo test");
-        let go = repository_brief_v1(&store, &workspace, &["main.go".to_owned()]).unwrap();
+        let go = repository_brief_v1(&store, &workspace, &["main.go".to_owned()], &[]).unwrap();
         assert_eq!(go["previousSuccessfulTestCommand"], "go test ./...");
         fs::remove_file(workspace.join("go.mod")).unwrap();
-        let stale = repository_brief_v1(&store, &workspace, &["main.go".to_owned()]).unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &["main.go".to_owned()], &[]).unwrap();
         assert!(stale["previousSuccessfulTestCommand"].is_null());
         let failed = serde_json::json!({
             "type":"item.completed",
@@ -345,6 +426,62 @@ mod tests {
         assert_eq!(
             codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,
             None
+        );
+    }
+
+    #[test]
+    fn absolute_source_read_adds_current_preview_without_replaying_command_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let source = workspace.join("helper.py");
+        fs::write(&source, "def helper():\n    return 42\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"read_1","type":"command_execution",
+                    "command":format!("cat {}", source.display()),
+                    "aggregated_output":"untrusted client output", "exit_code":0}
+        });
+        let observed = codex_completed_events_v1(&completed, &workspace, "session", "old-task");
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[1].path.as_deref(), Some("helper.py"));
+        assert!(
+            !serde_json::to_string(&observed)
+                .unwrap()
+                .contains("untrusted client output")
+        );
+        for event in &observed {
+            store.record_brain_event_v1(event).unwrap();
+        }
+        let paths = ["helper.py".to_owned()];
+        let brief = repository_brief_v1(&store, &workspace, &paths, &[]).unwrap();
+        assert_eq!(
+            brief["recentCurrentFiles"][0]["currentCompletePreview"],
+            "def helper():\n    return 42\n"
+        );
+        let previewed = repository_brief_v1(&store, &workspace, &paths, &paths).unwrap();
+        assert!(previewed["recentCurrentFiles"][0]["currentCompletePreview"].is_null());
+        fs::write(&source, "def helper():\n    return 0\n").unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &paths, &[]).unwrap();
+        assert!(stale["recentCurrentFiles"].as_array().unwrap().is_empty());
+        let relative = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"read_2","type":"command_execution",
+                    "command":"cat helper.py", "exit_code":0}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&relative, &workspace, "session", "old-task").len(),
+            1
+        );
+        let composed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"read_3","type":"command_execution",
+                    "command":format!("cat {};true", source.display()), "exit_code":0}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
+            1
         );
     }
 }

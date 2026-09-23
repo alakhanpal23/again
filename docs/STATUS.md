@@ -37,6 +37,18 @@ passes at `e937d3d`; the language-selection and stale-manifest behavior are
 covered by focused unit tests, while the launcher gate exercises the existing
 Python handoff path.
 
+Completed Codex `cat` commands with one literal absolute source-file operand
+now produce a second, source-checked observation. The Brain retains only the
+path and digest, then rechecks file bytes on a later task. For a relevant file
+that the ordinary prebrief did not already preview, it can include one complete
+source preview up to 256 bytes; changed content withholds the old observation.
+This covers a narrow common read shape and avoids storing arbitrary client
+output. Relative paths and composed shell commands do not enter this path
+because the event stream does not prove their effective working directory or
+shell semantics. The 202 library tests pass, including preview suppression
+when a file was already supplied by the prebrief, mutation withholding, and
+absence of raw command output in the stored event.
+
 ## 2026-09-23 single-agent Again Brain first slice
 
 `again codex` now requests Codex's structured event stream by default. Its

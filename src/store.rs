@@ -5222,7 +5222,8 @@ impl Store {
             bail!("brain_event_id_collision");
         }
         if inserted == 1 {
-            if event.kind == "file_change"
+            if (event.kind == "file_change"
+                || (event.kind == "command" && event.exit_code == Some(0)))
                 && let (Some(path), Some(digest)) = (&event.path, &event.source_digest)
             {
                 transaction.execute(
