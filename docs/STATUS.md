@@ -9,9 +9,11 @@ the documented local tool only after the live response reports exit code zero
 and names a changed path that appears in the patch input. It stores a current
 digest for a bounded edited file or retires the prior file observation when
 the file was deleted or cannot be read. The first isolated live patch probe
-reported a Codex `file_change` but lacked the Brain event; three subsequent
-installed-hook repetitions captured the native edit. This intermittent miss
-still needs diagnosis before patch capture is a release claim.
+reported a Codex `file_change` but lacked the Brain event with the original
+five-second asynchronous timeout. After increasing that timeout to 30 seconds,
+the [clean-source release-binary patch probe](../bench/results/2026-09-23-brain-patch-release-40506ff.json)
+captured the native edit and current file observation in three of three runs.
+This narrow result does not yet qualify all interactive edit paths.
 
 `again brain hook-setup --workspace <path>` now previews a project Codex hook
 change, `--apply` installs the observation-only handler, and `--remove`
