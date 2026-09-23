@@ -2,6 +2,21 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 four-platform native beta checkpoint
+
+[Native qualification run 35919913635](https://github.com/alakhanpal23/again/actions/runs/35919913635)
+completed successfully at exact source `56d9d3e4e2e1f0b349ab126d422a617b04dd1658`.
+The [matrix summary](../bench/results/2026-09-23-native-beta-matrix-56d9d3e-summary.json)
+binds four native reports: [macOS arm64](../bench/results/2026-09-23-again-v0.1.0-beta.1-aarch64-apple-darwin.native-smoke.json),
+[macOS x86_64](../bench/results/2026-09-23-again-v0.1.0-beta.1-x86_64-apple-darwin.native-smoke.json),
+[Linux arm64](../bench/results/2026-09-23-again-v0.1.0-beta.1-aarch64-unknown-linux-gnu.native-smoke.json),
+and [Linux x86_64](../bench/results/2026-09-23-again-v0.1.0-beta.1-x86_64-unknown-linux-gnu.native-smoke.json).
+Every package passed installation, removal, daemon startup, authenticated MCP,
+tool catalog, client setup plan, and doctor checks. The downloaded archive
+SHA-256 values match all four reports. This qualifies that exact source for
+the native package smoke matrix; it is not a published release, live-agent
+quality result, or Linux pytest execution qualification.
+
 ## 2026-09-23 peer-wait call budget
 
 The Codex and Claude launchers now retry an active peer's `task.claim` with
