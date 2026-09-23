@@ -80,6 +80,8 @@ CLI flag. The [clean-source fake-client release gate](../bench/results/2026-09-2
 at `18b3176` passed its argument shape, lease handoff, refreshed source, and
 bounded timeout path. A live Claude Code binary is unavailable on this host, so Claude
 quality, latency, and token cost remain unverified.
+The same shared-client harness passed again for Codex at clean source
+`3951310` in its [release report](../bench/results/2026-09-23-codex-launch-shared-client-release-v1.json).
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real
