@@ -666,16 +666,19 @@ impl LocalContextCoordinatorV1 {
         }
         if previews.len() < MAX_TASK_START_SOURCE_PREVIEWS_V1
             && prompt.to_ascii_lowercase().contains("test")
-            && let Some(source) = previews.iter().find_map(|preview| {
+            && let Some((source, extension)) = previews.iter().find_map(|preview| {
                 preview["path"].as_str().and_then(|path| {
                     let path = Path::new(path);
-                    (!path.starts_with("tests") && path.extension().is_some_and(|ext| ext == "py"))
-                        .then(|| path.file_stem()?.to_str().map(str::to_owned))
+                    let extension = path.extension()?.to_str()?;
+                    (!path.starts_with("tests") && matches!(extension, "py" | "js" | "mjs" | "cjs"))
+                        .then(|| {
+                            Some((path.file_stem()?.to_str()?.to_owned(), extension.to_owned()))
+                        })
                         .flatten()
                 })
             })
         {
-            let candidate = format!("tests/test_{source}.py");
+            let candidate = format!("tests/test_{source}.{extension}");
             if seen.insert(candidate.clone())
                 && let Ok(bytes) = self
                     .observed_workspace
@@ -2012,6 +2015,29 @@ fn validation_preview_v1(
                 text.contains("import unittest") && text.contains("unittest.TestCase")
             })
     });
+    let node_test_candidate = source_previews.iter().find_map(|preview| {
+        let path = preview["path"].as_str()?;
+        (matches!(
+            preview["origin"].as_str(),
+            Some("test_path_convention_candidate" | "indexed_candidate")
+        ) && preview["complete"] == true
+            && path.starts_with("tests/test_")
+            && path.len() <= 256
+            && path.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/')
+            })
+            && Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+            && matches!(
+                Path::new(path).extension().and_then(|ext| ext.to_str()),
+                Some("js" | "mjs" | "cjs")
+            )
+            && preview["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("node:test")))
+        .then(|| format!("node --test {path}"))
+    });
     let candidates = source_previews
         .iter()
         .filter_map(|preview| preview["path"].as_str())
@@ -2033,6 +2059,12 @@ fn validation_preview_v1(
             Some("python3 -m unittest discover -s tests"),
             "complete_test_preview",
             "unverified unittest convention; run the command to validate",
+        )
+    } else if let Some(command) = node_test_candidate.as_deref() {
+        (
+            Some(command),
+            "complete_node_test_preview",
+            "unverified Node test convention; run the command to validate",
         )
     } else if rust_source && workspace.join("Cargo.toml").is_file() {
         (
@@ -2406,6 +2438,37 @@ mod validation_preview_tests {
                 json!([])
             );
         }
+    }
+
+    #[test]
+    fn complete_node_test_preview_suggests_exact_required_execution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preview = json!({
+            "origin":"test_path_convention_candidate",
+            "complete":true,
+            "path":"tests/test_calculator.mjs",
+            "text":"import test from 'node:test';\ntest('sum', () => {});\n"
+        });
+        let result = validation_preview_v1(workspace.path(), &[preview.clone()], &json!({}));
+        assert_eq!(result["status"], "execute_required");
+        assert_eq!(
+            result["selectors"][0]["command"],
+            "node --test tests/test_calculator.mjs"
+        );
+        assert_eq!(result["selectors"][0]["verified"], false);
+
+        let mut incomplete = preview.clone();
+        incomplete["complete"] = json!(false);
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[incomplete], &json!({}))["selectors"],
+            json!([])
+        );
+        let mut unsafe_path = preview;
+        unsafe_path["path"] = json!("tests/test_x;touch_bad.mjs");
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[unsafe_path], &json!({}))["selectors"],
+            json!([])
+        );
     }
 
     #[test]

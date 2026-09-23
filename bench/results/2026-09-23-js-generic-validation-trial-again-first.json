@@ -1,0 +1,191 @@
+{
+  "accepted": true,
+  "againBinarySha256": "55b47c4a86a5be9780fd24e11c5d0c9a144e0b9a37c979ccd83dc68f696687ad",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-calculator-generic-validation",
+  "fixtureSha256": "3fa31097163d233f39092b75f0ee8c8a794ee30f743da985c3d7c853a971de36",
+  "harnessSha256": "b7144c7d70626586f46ce7f213455ddb221a6f02cb9e15ab5a532cea95d3d867",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "1fcfc8111be861aaece0f59d013bc516b13711db5027c8dac8ea3a68c654d87d",
+        "cached_input_tokens": 43648,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790207200840,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48621,
+        "output_tokens": 259,
+        "session_id": "9025f5b1-77c6-4d9c-8e8f-3679008ef7e0",
+        "started_ms": 1790207191133,
+        "successful_tests": 1,
+        "task_id": "js-calculator-generic-validation-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 9941.898,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 9941.898,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 4754.261,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 166.424,
+        "test_output_sha256": "81ba327f8bc2e8176ebfd4ef96657063b3e8d01ff36cda2c100410a4032f4b11",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1842,
+      "rawEventFile": "2026-09-23-js-generic-validation-trial-again-first-product.jsonl",
+      "rawEventSha256": "e3ef05e11619e5b080ad9d8ea5e6e9db35e374e827a19289c3583dd8d52cb63f",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48621,
+        "output_tokens": 259,
+        "reasoning_output_tokens": 18
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 22287.161,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'package.json' -g 'src/calculator.mjs' -g '*test*' -g '*spec*'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short && cat src/calculator.mjs && cat package.json'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat tests/test_calculator.mjs && cat README.md'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 22287.161,
+      "eventCount": 16,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 16364.816,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 73.296,
+        "test_output_sha256": "16a8fa3c78b2ec573ea2d83015446147c330feb494db0454c6be61427b3cd3ee",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 4216,
+      "rawEventFile": "2026-09-23-js-generic-validation-trial-again-first-baseline.jsonl",
+      "rawEventSha256": "9fc2b9f3551d1f09b4364e96e4c8a5f197471b12fe6814d2be7cfb9f688b0f1f",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 71040,
+        "input_tokens": 81457,
+        "output_tokens": 726,
+        "reasoning_output_tokens": 46
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "4f18180bd05b0bca9e0798ee214e6557f651770b8af1fa6b9904f39ab4ea97a7",
+  "recordedAtUtc": "2026-09-23T23:47:04.453643+00:00",
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "9795cfc2ebac5f6397306ba9f353ad775be31e6a"
+  },
+  "sourceFiles": 1000,
+  "surface": "product-wrapper"
+}

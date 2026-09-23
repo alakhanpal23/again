@@ -72,7 +72,11 @@ well. It can select a prior file from a related task even when that file is
 outside the current code index candidates; it rechecks source bytes before
 presenting the file as current. Older unscoped observations are withheld from
 the brief after the scope-binding migration. The launcher consumes the
-task-start field without a second Brain lookup. An optional repository-scoped
+task-start field without a second Brain lookup. When a task requests tests,
+task start can preview a complete matching Python unittest or JavaScript Node
+test file and suggest an execution-required command. Rust and Go source
+candidates can also receive manifest-backed, unverified test suggestions.
+An optional repository-scoped
 `again brain hook-setup --workspace <path> --apply` installs an observation-only
 Codex `PostToolUse` Bash and `apply_patch` hook for interactive sessions. It preserves unrelated
 hook handlers and an ownership snapshot permits restoring an unchanged prior

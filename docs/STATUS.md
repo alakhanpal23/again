@@ -2,6 +2,26 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 Node test guidance for source-adjacent validation
+
+Task start can now fill the second complete preview with a matching
+`tests/test_<source>.js|mjs|cjs` file when a task names a JavaScript source and
+requests tests. A preview containing `node:test` yields an exact `node --test`
+selector marked unverified and execution-required. The selector accepts only
+bounded, simple relative test paths; no prior green result authorizes a skip.
+An isolated 1,000-source-file `mcp brief` probe returned the explicit source,
+the matching test preview, and the selector even while the full code index was
+incomplete.
+
+The [baseline-first](../bench/results/2026-09-23-js-generic-validation-trial-baseline-first.json)
+and [Again-first](../bench/results/2026-09-23-js-generic-validation-trial-again-first.json)
+editable diagnostics use a JavaScript repair whose prompt asks for the existing
+tests without naming a command. All four patches and validations passed. Again
+made an edit and test call in each run; baseline made five to seven completed
+actions. Paired completion ratios were 0.604 and 0.446. These are unbalanced
+debug-binary synthetic trials; clean-source release evidence and a diverse
+accepted-task cohort remain open.
+
 ## 2026-09-23 native Codex hook observation (opt-in)
 
 The observer now also matches completed native `apply_patch` calls. It accepts

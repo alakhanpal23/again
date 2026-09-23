@@ -32,6 +32,7 @@ TASK_IDS = {
     "running-balance": "running-balance-fix",
     "rust-calculator": "rust-calculator-fix",
     "js-calculator": "js-calculator-fix",
+    "js-calculator-generic-validation": "js-calculator-generic-validation-fix",
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
     "balance-helper-large": "balance-helper-large-fix",
@@ -73,7 +74,7 @@ def configure_fixture(name: str) -> None:
             "README.md": "# Calculator fixture\nRun `cargo test`.\n",
         }
         return
-    if name == "js-calculator":
+    if name in ("js-calculator", "js-calculator-generic-validation"):
         pair.TARGET_ORACLE_MODE = "behavior"
         node = shutil.which("node")
         if not node:
@@ -90,7 +91,11 @@ def configure_fixture(name: str) -> None:
         pair.PROMPT = (
             "Fix the off-by-one defect in src/calculator.mjs so total(values) returns the sum. "
             "Preserve the exported API. Do not edit tests or other files. "
-            "Run node --test tests/test_calculator.mjs, then stop."
+            + (
+                "Run the existing tests, then stop."
+                if name == "js-calculator-generic-validation"
+                else "Run node --test tests/test_calculator.mjs, then stop."
+            )
         )
         pair.FIXTURE = {
             pair.TARGET: pair.BUGGY,
