@@ -38,7 +38,7 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const MAX_BRAIN_EVENTS_V1: i64 = 10_000;
 const MAX_BRAIN_EVENT_AGE_MS_V1: i64 = 90 * 24 * 60 * 60 * 1_000;
 const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
@@ -88,6 +88,7 @@ pub struct BrainEventV1 {
     pub command_hint: Option<String>,
     pub exit_code: Option<i32>,
     pub created_ms: i64,
+    pub authorization_scope_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -96,6 +97,13 @@ pub struct BrainFileV1 {
     pub source_digest: String,
     pub task_id: String,
     pub observed_ms: i64,
+    pub authorization_scope_digest: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BrainTaskFileV1 {
+    pub observation: BrainFileV1,
+    pub task_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1999,6 +2007,25 @@ impl Store {
                 CREATE INDEX IF NOT EXISTS brain_test_commands_recent_idx
                     ON brain_test_commands_v1(observed_ms DESC);
                 PRAGMA user_version = 17;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 18 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE brain_events_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                ALTER TABLE brain_files_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                ALTER TABLE brain_test_commands_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                CREATE INDEX brain_files_scope_recent_idx
+                    ON brain_files_v1(authorization_scope_digest, observed_ms DESC);
+                CREATE INDEX brain_test_commands_scope_recent_idx
+                    ON brain_test_commands_v1(authorization_scope_digest, observed_ms DESC);
+                PRAGMA user_version = 18;
                 COMMIT;
                 "#,
             )?;
@@ -5170,6 +5197,12 @@ impl Store {
                 .any(|digest| {
                     digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
                 })
+            || event
+                .authorization_scope_digest
+                .as_ref()
+                .is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
             || event.command_hint.as_ref().is_some_and(|hint| {
                 hint.is_empty() || hint.len() > 256 || screen_sensitive_text_v1(hint).is_err()
             })
@@ -5181,8 +5214,9 @@ impl Store {
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO brain_events_v1 (
                 session_id, event_id, task_id, kind, path, source_digest,
-                command_digest, command_hint, exit_code, created_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                command_digest, command_hint, exit_code, created_ms,
+                authorization_scope_digest
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 event.session_id,
                 event.event_id,
@@ -5193,12 +5227,14 @@ impl Store {
                 event.command_digest,
                 event.command_hint,
                 event.exit_code,
-                event.created_ms
+                event.created_ms,
+                event.authorization_scope_digest
             ],
         )?;
         let stored: BrainEventV1 = transaction.query_row(
             "SELECT session_id, event_id, task_id, kind, path, source_digest,
-                    command_digest, command_hint, exit_code, created_ms
+                    command_digest, command_hint, exit_code, created_ms,
+                    authorization_scope_digest
              FROM brain_events_v1
              WHERE session_id = ?1 AND event_id = ?2 AND kind = ?3 AND path = ?4",
             params![event.session_id, event.event_id, event.kind, path],
@@ -5215,6 +5251,7 @@ impl Store {
                     command_hint: row.get(7)?,
                     exit_code: row.get(8)?,
                     created_ms: row.get(9)?,
+                    authorization_scope_digest: row.get(10)?,
                 })
             },
         )?;
@@ -5228,14 +5265,16 @@ impl Store {
             {
                 transaction.execute(
                     "INSERT INTO brain_files_v1 (
-                        path, source_digest, task_id, session_id, event_id, observed_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                        path, source_digest, task_id, session_id, event_id, observed_ms,
+                        authorization_scope_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                      ON CONFLICT(path) DO UPDATE SET
                         source_digest = excluded.source_digest,
                         task_id = excluded.task_id,
                         session_id = excluded.session_id,
                         event_id = excluded.event_id,
-                        observed_ms = excluded.observed_ms
+                        observed_ms = excluded.observed_ms,
+                        authorization_scope_digest = excluded.authorization_scope_digest
                      WHERE excluded.observed_ms >= brain_files_v1.observed_ms",
                     params![
                         path,
@@ -5243,7 +5282,8 @@ impl Store {
                         event.task_id,
                         event.session_id,
                         event.event_id,
-                        event.created_ms
+                        event.created_ms,
+                        event.authorization_scope_digest
                     ],
                 )?;
             }
@@ -5253,14 +5293,22 @@ impl Store {
             {
                 transaction.execute(
                     "INSERT INTO brain_test_commands_v1 (
-                        command_hint, command_digest, task_id, observed_ms
-                     ) VALUES (?1, ?2, ?3, ?4)
+                        command_hint, command_digest, task_id, observed_ms,
+                        authorization_scope_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(command_hint) DO UPDATE SET
                         command_digest = excluded.command_digest,
                         task_id = excluded.task_id,
-                        observed_ms = excluded.observed_ms
+                        observed_ms = excluded.observed_ms,
+                        authorization_scope_digest = excluded.authorization_scope_digest
                      WHERE excluded.observed_ms >= brain_test_commands_v1.observed_ms",
-                    params![hint, digest, event.task_id, event.created_ms],
+                    params![
+                        hint,
+                        digest,
+                        event.task_id,
+                        event.created_ms,
+                        event.authorization_scope_digest
+                    ],
                 )?;
             }
         }
@@ -5309,7 +5357,8 @@ impl Store {
         }
         let mut statement = self.conn.prepare(
             "SELECT session_id, event_id, task_id, kind, path, source_digest,
-                    command_digest, command_hint, exit_code, created_ms
+                    command_digest, command_hint, exit_code, created_ms,
+                    authorization_scope_digest
              FROM brain_events_v1 ORDER BY created_ms DESC LIMIT ?1",
         )?;
         let rows = statement.query_map([limit as i64], |row| {
@@ -5325,12 +5374,17 @@ impl Store {
                 command_hint: row.get(7)?,
                 exit_code: row.get(8)?,
                 created_ms: row.get(9)?,
+                authorization_scope_digest: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn brain_file_v1(&self, path: &str) -> Result<Option<BrainFileV1>> {
+    pub fn brain_file_v1(
+        &self,
+        path: &str,
+        authorization_scope_digest: &str,
+    ) -> Result<Option<BrainFileV1>> {
         if path.is_empty()
             || path.len() > 512
             || !Path::new(path)
@@ -5339,18 +5393,21 @@ impl Store {
         {
             bail!("brain_file_invalid_path");
         }
+        validate_digest(authorization_scope_digest, "brain file authorization scope")?;
         let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
         self.conn
             .query_row(
-                "SELECT path, source_digest, task_id, observed_ms
-                 FROM brain_files_v1 WHERE path = ?1 AND observed_ms >= ?2",
-                params![path, cutoff],
+                "SELECT path, source_digest, task_id, observed_ms, authorization_scope_digest
+                 FROM brain_files_v1 WHERE path = ?1 AND observed_ms >= ?2
+                   AND authorization_scope_digest = ?3",
+                params![path, cutoff, authorization_scope_digest],
                 |row| {
                     Ok(BrainFileV1 {
                         path: row.get(0)?,
                         source_digest: row.get(1)?,
                         task_id: row.get(2)?,
                         observed_ms: row.get(3)?,
+                        authorization_scope_digest: row.get(4)?,
                     })
                 },
             )
@@ -5358,21 +5415,92 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn brain_test_hints_v1(&self, limit: usize) -> Result<Vec<String>> {
+    pub fn brain_test_hints_v1(
+        &self,
+        authorization_scope_digest: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
         if limit == 0 || limit > 32 {
             bail!("brain_test_hint_limit_invalid");
         }
+        validate_digest(authorization_scope_digest, "brain test authorization scope")?;
         let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
         let mut statement = self.conn.prepare(
             "SELECT command_hint FROM brain_test_commands_v1
-             WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT ?2",
+             WHERE observed_ms >= ?1 AND authorization_scope_digest = ?2
+             ORDER BY observed_ms DESC LIMIT ?3",
         )?;
-        let rows = statement.query_map(params![cutoff, limit as i64], |row| row.get(0))?;
+        let rows = statement.query_map(
+            params![cutoff, authorization_scope_digest, limit as i64],
+            |row| row.get(0),
+        )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn brain_test_hint_v1(&self) -> Result<Option<String>> {
-        Ok(self.brain_test_hints_v1(1)?.into_iter().next())
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        self.conn
+            .query_row(
+                "SELECT command_hint FROM brain_test_commands_v1
+             WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT 1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Recent repository observations with the attributed task's own prompt.
+    /// The caller may use prompt similarity to nominate a path, but must
+    /// independently recheck the source before presenting it as current.
+    pub(crate) fn brain_files_with_task_prompts_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+        limit: usize,
+    ) -> Result<Vec<BrainTaskFileV1>> {
+        if limit == 0 || limit > 64 {
+            bail!("brain_task_file_limit_invalid");
+        }
+        validate_task_selector_v1(repository_id)?;
+        validate_task_selector_v1(workspace_id)?;
+        validate_digest(authorization_scope_digest, "brain task authorization scope")?;
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT file.path, file.source_digest, file.task_id, file.observed_ms,
+                    file.authorization_scope_digest,
+                    substr(task.prompt_text, 1, 1024)
+             FROM brain_files_v1 AS file
+             JOIN context_tasks_v1 AS task ON task.canonical_task_id = file.task_id
+             WHERE task.repository_id = ?1 AND task.workspace_id = ?2
+               AND task.authorization_scope_digest = ?3
+               AND file.authorization_scope_digest = ?3
+               AND file.observed_ms >= ?4
+             ORDER BY file.observed_ms DESC LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                cutoff,
+                limit as i64
+            ],
+            |row| {
+                Ok(BrainTaskFileV1 {
+                    observation: BrainFileV1 {
+                        path: row.get(0)?,
+                        source_digest: row.get(1)?,
+                        task_id: row.get(2)?,
+                        observed_ms: row.get(3)?,
+                        authorization_scope_digest: row.get(4)?,
+                    },
+                    task_prompt: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn recent_brain_files_v1(&self, limit: usize) -> Result<Vec<BrainFileV1>> {
@@ -5381,7 +5509,7 @@ impl Store {
         }
         let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
         let mut statement = self.conn.prepare(
-            "SELECT path, source_digest, task_id, observed_ms
+            "SELECT path, source_digest, task_id, observed_ms, authorization_scope_digest
              FROM brain_files_v1 WHERE observed_ms >= ?1
              ORDER BY observed_ms DESC LIMIT ?2",
         )?;
@@ -5391,6 +5519,7 @@ impl Store {
                 source_digest: row.get(1)?,
                 task_id: row.get(2)?,
                 observed_ms: row.get(3)?,
+                authorization_scope_digest: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -10766,8 +10895,14 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | ("context_ledger_leases_v1", "lease_id" | "completed_ms")
             | (
                 "brain_events_v1",
-                "source_digest" | "command_digest" | "command_hint" | "exit_code"
+                "source_digest"
+                    | "command_digest"
+                    | "command_hint"
+                    | "exit_code"
+                    | "authorization_scope_digest"
             )
+            | ("brain_files_v1", "authorization_scope_digest")
+            | ("brain_test_commands_v1", "authorization_scope_digest")
             | ("context_tasks_v1", "definition_digest")
             | (
                 "context_task_transitions_v1",
@@ -11231,6 +11366,7 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "command_hint",
                 "exit_code",
                 "created_ms",
+                "authorization_scope_digest",
             ],
         ),
         (
@@ -11242,11 +11378,18 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "session_id",
                 "event_id",
                 "observed_ms",
+                "authorization_scope_digest",
             ],
         ),
         (
             "brain_test_commands_v1",
-            &["command_hint", "command_digest", "task_id", "observed_ms"],
+            &[
+                "command_hint",
+                "command_digest",
+                "task_id",
+                "observed_ms",
+                "authorization_scope_digest",
+            ],
         ),
     ];
     let mut table_info_statement = connection
@@ -11549,9 +11692,23 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             false,
         ),
         (
+            "brain_files_v1",
+            "brain_files_scope_recent_idx",
+            &["authorization_scope_digest", "observed_ms"],
+            false,
+            false,
+        ),
+        (
             "brain_test_commands_v1",
             "brain_test_commands_recent_idx",
             &["observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_test_commands_v1",
+            "brain_test_commands_scope_recent_idx",
+            &["authorization_scope_digest", "observed_ms"],
             false,
             false,
         ),
@@ -14359,6 +14516,9 @@ mod tests {
                 .conn
                 .execute_batch(
                     "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
                      DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
@@ -14398,6 +14558,73 @@ mod tests {
         let stats = reopened.stats().unwrap();
         assert_eq!(stats.full_replays, 1);
         assert_eq!(stats.estimated_execution_ms_saved, 0);
+    }
+
+    #[test]
+    fn version_seventeen_brain_history_migrates_without_granting_unknown_scope() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let scope = "a".repeat(64);
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .record_brain_event_v1(&BrainEventV1 {
+                    session_id: "session".to_owned(),
+                    event_id: "old".to_owned(),
+                    task_id: "task".to_owned(),
+                    kind: "file_change".to_owned(),
+                    path: Some("src/file.py".to_owned()),
+                    source_digest: Some("b".repeat(64)),
+                    command_digest: None,
+                    command_hint: None,
+                    exit_code: None,
+                    created_ms: now_ms(),
+                    authorization_scope_digest: Some(scope.clone()),
+                })
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP INDEX brain_files_scope_recent_idx;
+                 DROP INDEX brain_test_commands_scope_recent_idx;
+                 ALTER TABLE brain_events_v1 DROP COLUMN authorization_scope_digest;
+                 ALTER TABLE brain_files_v1 DROP COLUMN authorization_scope_digest;
+                 ALTER TABLE brain_test_commands_v1 DROP COLUMN authorization_scope_digest;
+                 PRAGMA user_version = 17;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(store.recent_brain_files_v1(8).unwrap().len(), 1);
+        assert!(
+            store
+                .brain_file_v1("src/file.py", &scope)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .record_brain_event_v1(&BrainEventV1 {
+                session_id: "session".to_owned(),
+                event_id: "new".to_owned(),
+                task_id: "task".to_owned(),
+                kind: "file_change".to_owned(),
+                path: Some("src/file.py".to_owned()),
+                source_digest: Some("c".repeat(64)),
+                command_digest: None,
+                command_hint: None,
+                exit_code: None,
+                created_ms: now_ms() + 1,
+                authorization_scope_digest: Some(scope.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .brain_file_v1("src/file.py", &scope)
+                .unwrap()
+                .unwrap()
+                .source_digest,
+            "c".repeat(64)
+        );
     }
 
     #[test]
@@ -14512,7 +14739,11 @@ mod tests {
         store
             .conn
             .execute_batch(
-                "DROP TABLE gateway_context_source_recipes_v1; PRAGMA user_version = 13;",
+                "DROP TABLE gateway_context_source_recipes_v1;
+                 DROP TABLE brain_test_commands_v1;
+                 DROP TABLE brain_files_v1;
+                 DROP TABLE brain_events_v1;
+                 PRAGMA user_version = 13;",
             )
             .unwrap();
         drop(store);
@@ -14547,6 +14778,9 @@ mod tests {
                 .conn
                 .execute_batch(
                     "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
                      DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
@@ -14601,6 +14835,9 @@ mod tests {
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
                      DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
                      DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;

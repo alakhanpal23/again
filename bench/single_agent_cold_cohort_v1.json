@@ -1,0 +1,44 @@
+{
+  "schema": "again.single-agent-cold-cohort.v1",
+  "model": "gpt-6-sol",
+  "purpose": "Diagnostic cold-task coverage before the full cold-and-returning release cohort",
+  "orders": ["baseline-first", "again-first"],
+  "agentSettings": ["--ephemeral", "--ignore-user-config", "--json", "--approve-for-me"],
+  "cases": [
+    {
+      "fixture": "calculator",
+      "sourceFiles": 0,
+      "fixtureSha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+      "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+      "oracle": "exact patch and Python unittest"
+    },
+    {
+      "fixture": "running-balance",
+      "sourceFiles": 1000,
+      "fixtureSha256": "e2e46ad5abe9a94ae43e1494a5887f5c534e8ba5af76934145d945e19e210565",
+      "promptSha256": "68640edd816dc58830feecc035d0aad882c3d0a8877713fbe787d9c1b4bbf5f4",
+      "oracle": "exact patch and Python unittest"
+    },
+    {
+      "fixture": "rust-calculator",
+      "sourceFiles": 0,
+      "fixtureSha256": "278331edd9e3eccb173a99680f89d9d62b3d81239bfb8067112e5382700cd845",
+      "promptSha256": "566d536704de23746ec36d54e67f231689818c547d3a1de7c92b26fdb2640530",
+      "oracle": "target-only behavior and Cargo tests"
+    },
+    {
+      "fixture": "js-calculator",
+      "sourceFiles": 1000,
+      "fixtureSha256": "3fa31097163d233f39092b75f0ee8c8a794ee30f743da985c3d7c853a971de36",
+      "promptSha256": "7a02429cdec105fe7f0f6f42495a17a710679e417d361fc09e3648459da10720",
+      "oracle": "target-only behavior and Node tests"
+    },
+    {
+      "fixture": "greeting-feature",
+      "sourceFiles": 0,
+      "fixtureSha256": "56ae0dc9be81ab387c3ed66b8ab213fa6aef0108790bd1108b143fcbcd58094b",
+      "promptSha256": "0d4ba13d9402d8a7785ff4755e8c7e30c81c5e1ee3adbc00969ad8122eaed426",
+      "oracle": "target-only behavior and Python unittest"
+    }
+  ]
+}

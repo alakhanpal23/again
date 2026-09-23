@@ -1491,6 +1491,9 @@ mod tests {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_millis() as i64,
+                authorization_scope_digest: Some(crate::brain::local_brain_scope_digest_v1(
+                    workspace.path(),
+                )),
             })
             .unwrap();
         let daemon = GatewayDaemonV1::bind(

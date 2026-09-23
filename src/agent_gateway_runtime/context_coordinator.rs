@@ -1055,6 +1055,10 @@ impl LocalContextCoordinatorV1 {
                 &self.workspace,
                 &Value::Array(source_previews.clone()),
                 &code_brief,
+                prompt,
+                &self.repository_id,
+                &self.workspace_id,
+                identity.authorization_scope_digest(),
             )
             .ok()
             .flatten()

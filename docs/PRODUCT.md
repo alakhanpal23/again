@@ -65,7 +65,11 @@ independently observed short absolute source reads. Matching prior files and
 an unverified successful-test hint can appear in later task briefs. The same
 bounded `againBrain` field is included in authenticated `task.start` for the
 canonical local-workspace scope, giving interactive agents this history as
-well. The launcher consumes that field without a second Brain lookup.
+well. It can select a prior file from a related task even when that file is
+outside the current code index candidates; it rechecks source bytes before
+presenting the file as current. Older unscoped observations are withheld from
+the brief after the scope-binding migration. The launcher consumes the
+task-start field without a second Brain lookup.
 `again brain show --workspace <path>` inspects the metadata,
 and `again brain clear --workspace <path>` removes it. This does not intercept
 or cache native shell calls, and a prior test hint never permits skipping a

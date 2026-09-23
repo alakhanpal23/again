@@ -2,6 +2,27 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 scoped cross-task Brain and cold cohort preparation
+
+Brain observations now carry the local authorization-scope digest. Schema 18
+migrates older rows with unknown scope but withholds them from scoped task
+briefs until a new observation establishes provenance. The task-start lookup
+can nominate up to two files from related earlier task prompts even if the
+current code index did not select them. Prompt overlap only selects paths;
+each nominated source must still pass a fresh content-digest check, and a
+short complete preview is included only when it was not already supplied.
+The old prompt text is not copied into the brief. Unit and fake-client gates
+cover a history-selected file outside the initial two previews, stale-source
+withholding, cross-scope isolation, and the version-17 migration.
+
+The [frozen cold diagnostic cohort](../bench/single_agent_cold_cohort_v1.json)
+adds Rust and JavaScript repairs and a Python feature edit to the two existing
+Python repairs. Each fixed fixture fails its validation before the reference
+change and passes its acceptance oracle afterward. The runner uses both
+treatment orders for every case. This tranche still lacks returning-task
+outcome evidence and metered dollar-cost qualification, so it is not the
+single-agent release gate.
+
 ## 2026-09-23 source-matched native reads
 
 The Brain now recognizes single-file `cat` and bounded `sed -n 1,Np` reads,

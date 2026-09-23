@@ -20,6 +20,8 @@ def run(binary: pathlib.Path) -> dict[str, object]:
         workspace.mkdir()
         (workspace / "a.py").write_text("value = 1\n")
         (workspace / "helper.py").write_text("def helper():\n    return 42\n")
+        (workspace / "ledger.py").write_text("def ledger_balance():\n    return 10\n")
+        (workspace / "balance.py").write_text("def render_balance():\n    return '10'\n")
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         fake_bin = root / "bin"
         fake_bin.mkdir()
@@ -78,7 +80,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             return {item["path"] for item in json.loads(payload)["recentCurrentFiles"]}
 
         try:
-            launch("first", "Repair a.py first task")
+            launch("first", "Repair ledger balance formatting in a.py first task")
             snapshot = brain()
             observed = snapshot["recentEvents"]
             if len(observed) != 4 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
@@ -114,12 +116,14 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             if "a.py" in brain_files_in_prompt(calls[2][-1]):
                 raise RuntimeError("stale edit history remained current")
 
-            launch("fourth", "Inspect helper.py fourth task")
+            launch("fourth", "Improve ledger balance rendering fourth task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
             if "helper.py" not in brain_files_in_prompt(calls[3][-1]):
                 raise RuntimeError("current read observation was not in the next task")
+            if "FILE helper.py DIGEST" in calls[3][-1]:
+                raise RuntimeError("history-selected file was already in the initial source preview")
             (workspace / "helper.py").write_text("def helper():\n    return 0\n")
-            launch("fifth", "Inspect helper.py fifth task")
+            launch("fifth", "Improve ledger balance rendering fifth task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
             if "helper.py" in brain_files_in_prompt(calls[4][-1]):
                 raise RuntimeError("stale read observation remained current")
@@ -143,6 +147,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "staleEditWithheld": True,
                 "sourceReadObservedAndStaleWithheld": True,
                 "interactiveTaskStartReceivedBrain": True,
+                "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,
             }
         finally:
