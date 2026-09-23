@@ -382,8 +382,11 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             lease_dir.mkdir()
             marker = b"TOKEN_LEASE_RECOVERY\nTOKEN_FOLLOWER_CANCEL\n"
             for index in range(56):
+                prefix = marker if index == 0 else b"bounded fixture\n"
+                remaining = 256 * 1024 - len(prefix)
+                filler = b"bounded fixture\n"
                 (lease_dir / f"payload-{index:03}.txt").write_bytes(
-                    (marker if index == 0 else b"bounded fixture\n") + b"x" * (256 * 1024 - (len(marker) if index == 0 else len(b"bounded fixture\n")))
+                    prefix + (filler * (remaining // len(filler) + 1))[:remaining]
                 )
             cancel_leader = Client(binary, workspace, environment)
             cancel_follower = Client(binary, workspace, environment)
@@ -405,10 +408,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
 
             leader_worker = threading.Thread(target=inflight_search, args=(cancel_leader, leader_outcome))
             leader_worker.start()
-            follower_worker = threading.Thread(target=inflight_search, args=(cancel_follower, follower_outcome))
-            follower_worker.start()
             inflight_binding = reader.wait_for_binding(inflight_start, 5)
             reader.wait_for_event(inflight_binding, inflight_start, "executed", 5)
+            follower_worker = threading.Thread(target=inflight_search, args=(cancel_follower, follower_outcome))
+            follower_worker.start()
             reader.wait_for_event(inflight_binding, inflight_start, "inflight_candidate", 5)
             cancel_follower.cancel(cancel_follower.next_id)
             follower_worker.join(timeout=15)
