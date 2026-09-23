@@ -23,6 +23,15 @@ and [Codex launcher gate](../bench/results/2026-09-23-brain-materialized-codex-l
 passed on the same binary. The materialized memory is repository-local; no
 cross-user company knowledge or qualified test-result reuse exists yet.
 
+The Brain's observed validation hints now retain and select among exact
+successful Python, Rust (`cargo test`), and Go (`go test ./...`) commands.
+A later task receives the newest command matching a candidate source language;
+Rust and Go suggestions also require the corresponding root manifest to still
+exist. A newer test in another language no longer hides a relevant earlier
+command. Failed commands never become test hints. These are only suggestions:
+the launcher still requires the agent to run validation, and the manifest
+existence check does not prove that an old test result is current.
+
 ## 2026-09-23 single-agent Again Brain first slice
 
 `again codex` now requests Codex's structured event stream by default. Its

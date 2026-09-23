@@ -5357,17 +5357,21 @@ impl Store {
             .map_err(Into::into)
     }
 
-    pub fn brain_test_hint_v1(&self) -> Result<Option<String>> {
+    pub fn brain_test_hints_v1(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 || limit > 32 {
+            bail!("brain_test_hint_limit_invalid");
+        }
         let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
-        self.conn
-            .query_row(
-                "SELECT command_hint FROM brain_test_commands_v1
-                 WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT 1",
-                [cutoff],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(Into::into)
+        let mut statement = self.conn.prepare(
+            "SELECT command_hint FROM brain_test_commands_v1
+             WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![cutoff, limit as i64], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn brain_test_hint_v1(&self) -> Result<Option<String>> {
+        Ok(self.brain_test_hints_v1(1)?.into_iter().next())
     }
 
     pub fn recent_brain_files_v1(&self, limit: usize) -> Result<Vec<BrainFileV1>> {

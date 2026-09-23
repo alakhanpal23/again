@@ -108,20 +108,10 @@ pub fn repository_brief_v1(
     candidate_paths: &[String],
 ) -> anyhow::Result<Value> {
     let mut recent_files = Vec::new();
-    let test_hint = store.brain_test_hint_v1()?.filter(|hint| {
-        // Current admission recognizes only Python commands. A monorepo's
-        // latest successful test is not automatically relevant to another
-        // language or an unresolved task.
-        hint.starts_with("python3 ")
-            && candidate_paths.iter().any(|path| {
-                matches!(
-                    Path::new(path)
-                        .extension()
-                        .and_then(|extension| extension.to_str()),
-                    Some("py" | "pyi")
-                )
-            })
-    });
+    let test_hint = store
+        .brain_test_hints_v1(16)?
+        .into_iter()
+        .find(|hint| test_hint_relevant_v1(hint, workspace, candidate_paths));
     for path in candidate_paths.iter().take(16) {
         if recent_files.len() == 2 {
             break;
@@ -175,14 +165,32 @@ fn workspace_file_v1(workspace: &Path, path: &str) -> Option<(String, PathBuf)> 
 
 fn known_test_command_v1(command: &str) -> Option<&'static str> {
     let command = command.trim();
+    let command = command
+        .strip_prefix("/bin/zsh -lc '")
+        .and_then(|inner| inner.strip_suffix('\''))
+        .unwrap_or(command);
     match command {
-        "python3 -m unittest discover -s tests"
-        | "/bin/zsh -lc 'python3 -m unittest discover -s tests'" => {
-            Some("python3 -m unittest discover -s tests")
-        }
-        "python3 -m pytest" | "/bin/zsh -lc 'python3 -m pytest'" => Some("python3 -m pytest"),
+        "python3 -m unittest discover -s tests" => Some("python3 -m unittest discover -s tests"),
+        "python3 -m pytest" => Some("python3 -m pytest"),
+        "cargo test" => Some("cargo test"),
+        "go test ./..." => Some("go test ./..."),
         _ => None,
     }
+}
+
+fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String]) -> bool {
+    let (extensions, manifest): (&[&str], Option<&str>) = match hint {
+        "python3 -m unittest discover -s tests" | "python3 -m pytest" => (&["py", "pyi"], None),
+        "cargo test" => (&["rs"], Some("Cargo.toml")),
+        "go test ./..." => (&["go"], Some("go.mod")),
+        _ => return false,
+    };
+    candidate_paths.iter().any(|path| {
+        Path::new(path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extensions.contains(&extension))
+    }) && manifest.is_none_or(|manifest| workspace.join(manifest).is_file())
 }
 
 fn current_ms_v1() -> i64 {
@@ -292,5 +300,51 @@ mod tests {
         fs::write(workspace.join("balances.py"), "value = 2\n").unwrap();
         let stale = repository_brief_v1(&store, &workspace, &candidates).unwrap();
         assert!(stale["recentCurrentFiles"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn repository_brain_selects_relevant_observed_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            workspace.join("Cargo.toml"),
+            "[package]\nname = \"sample\"\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("go.mod"), "module example.com/sample\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        for (index, command) in ["cargo test", "go test ./...", "python3 -m pytest"]
+            .iter()
+            .enumerate()
+        {
+            let completed = serde_json::json!({
+                "type":"item.completed",
+                "item":{"id":format!("test_{index}"),"type":"command_execution",
+                        "command":command,"exit_code":0}
+            });
+            let mut event =
+                codex_completed_events_v1(&completed, &workspace, "session", "old-task")
+                    .pop()
+                    .unwrap();
+            event.created_ms += index as i64;
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        let rust = repository_brief_v1(&store, &workspace, &["src/lib.rs".to_owned()]).unwrap();
+        assert_eq!(rust["previousSuccessfulTestCommand"], "cargo test");
+        let go = repository_brief_v1(&store, &workspace, &["main.go".to_owned()]).unwrap();
+        assert_eq!(go["previousSuccessfulTestCommand"], "go test ./...");
+        fs::remove_file(workspace.join("go.mod")).unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &["main.go".to_owned()]).unwrap();
+        assert!(stale["previousSuccessfulTestCommand"].is_null());
+        let failed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"failed","type":"command_execution",
+                    "command":"cargo test","exit_code":1}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,
+            None
+        );
     }
 }
