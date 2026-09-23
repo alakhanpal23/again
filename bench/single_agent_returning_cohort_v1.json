@@ -1,0 +1,25 @@
+{
+  "schema": "again.single-agent-returning-cohort.v1",
+  "model": "gpt-6-sol",
+  "purpose": "Diagnostic returning-task pairs with a verified prior helper read; not the full release cohort",
+  "orders": ["baseline-first", "again-first"],
+  "agentSettings": ["--ephemeral", "--ignore-user-config", "--json", "--approve-for-me"],
+  "cases": [
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 0,
+      "returningTask": true,
+      "fixtureSha256": "4cd4c5f773e24628861f2be424535ec0601175a378742c6e6bf0e81f20412233",
+      "promptSha256": "fc8bf774397770ce4a10b61c8d9cec74cb2e0bcd39700793947039882e99a0aa",
+      "oracle": "exact helper edit and Python unittest"
+    },
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 1000,
+      "returningTask": true,
+      "fixtureSha256": "4cd4c5f773e24628861f2be424535ec0601175a378742c6e6bf0e81f20412233",
+      "promptSha256": "fc8bf774397770ce4a10b61c8d9cec74cb2e0bcd39700793947039882e99a0aa",
+      "oracle": "exact helper edit and Python unittest"
+    }
+  ]
+}

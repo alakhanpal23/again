@@ -33,6 +33,7 @@ TASK_IDS = {
     "rust-calculator": "rust-calculator-fix",
     "js-calculator": "js-calculator-fix",
     "greeting-feature": "greeting-feature",
+    "balance-helper": "balance-helper-fix",
 }
 
 
@@ -140,6 +141,39 @@ def configure_fixture(name: str) -> None:
             "README.md": "# Greeting feature fixture\nRun `python3 -m unittest discover -s tests`.\n",
         }
         return
+    if name == "balance-helper":
+        pair.TARGET = "src/util.py"
+        pair.TEST = "tests/test_ledger.py"
+        pair.BUGGY = "def adjust_total(value):\n    return value + 1\n"
+        pair.FIXED = "def adjust_total(value):\n    return value\n"
+        pair.PROMPT = (
+            "Fix the off-by-one total reported by src/ledger.py. Keep ledger.py's "
+            "delegation to its helper and correct the underlying implementation. "
+            "Do not edit tests or unrelated files. Run the existing unittest suite, then stop."
+        )
+        pair.FIXTURE = {
+            "src/ledger.py": (
+                "from util import adjust_total\n\n"
+                "def total(values):\n"
+                "    return adjust_total(sum(values))\n"
+            ),
+            pair.TARGET: pair.BUGGY,
+            pair.TEST: (
+                "import pathlib\nimport sys\nimport unittest\n\n"
+                "ROOT = pathlib.Path(__file__).parents[1]\n"
+                "sys.path.insert(0, str(ROOT / 'src'))\n"
+                "from ledger import total\n\n"
+                "class LedgerTests(unittest.TestCase):\n"
+                "    def test_sum(self):\n"
+                "        self.assertEqual(total([1, 2, 3]), 6)\n"
+                "    def test_empty(self):\n"
+                "        self.assertEqual(total([]), 0)\n"
+                "    def test_negative(self):\n"
+                "        self.assertEqual(total([-2, 5, -1]), 2)\n"
+            ),
+            "README.md": "# Ledger fixture\nRun `python3 -m unittest discover -s tests`.\n",
+        }
+        return
     if name != "running-balance":
         raise RuntimeError(f"unknown fixture: {name}")
     pair.TARGET = "src/running_balance.py"
@@ -194,6 +228,43 @@ def again_instruction(task_id: str) -> str:
     )
 
 
+def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path) -> dict[str, str]:
+    """Create a prior completed source read through the real Again launcher."""
+    with tempfile.TemporaryDirectory(prefix="again-prior-task-") as temporary:
+        fake_bin = pathlib.Path(temporary)
+        fake_codex = fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"target = {pair.TARGET!r}\n"
+            "workspace = pathlib.Path(sys.argv[sys.argv.index('-C') + 1])\n"
+            "content = (workspace / target).read_text()\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
+            "'command':\"sed -n '1,20p' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}))\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'done','type':'agent_message','text':'Done'}}))\n"
+        )
+        fake_codex.chmod(0o700)
+        environment = os.environ.copy()
+        environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
+        result = subprocess.run(
+            [str(binary), "codex", "--workspace", str(workspace),
+             "--task-id", "prior-ledger-investigation",
+             "--task", "Investigate ledger balance helper behavior", "--", "--ephemeral"],
+            cwd=workspace, env=environment, capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"could not seed prior Brain task: {result.stderr[-1000:]}")
+    brain = subprocess.run(
+        [str(binary), "brain", "show", "--workspace", str(workspace)],
+        cwd=workspace, capture_output=True, text=True, check=True, timeout=10,
+    )
+    observations = json.loads(brain.stdout)["fileObservations"]
+    if pair.TARGET not in {item["path"] for item in observations}:
+        raise RuntimeError("prior Brain source read was not recorded")
+    return {"taskId": "prior-ledger-investigation", "path": pair.TARGET,
+            "sourceSha256": hashlib.sha256((workspace / pair.TARGET).read_bytes()).hexdigest()}
+
+
 def run_condition(
     condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
     task_id: str,
@@ -201,6 +272,7 @@ def run_condition(
     task_start_only_surface: bool = False,
     compact_task_result: bool = False,
     prebrief_with_mcp: bool = False,
+    seed_brain: bool = False,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -212,6 +284,7 @@ def run_condition(
                 f"value = {index}\n", encoding="utf-8"
             )
     before = pair.snapshot(workspace)
+    prior_brain = seed_prior_brain(binary, workspace) if seed_brain and condition == "product" else None
     stats_before = pair.again_stats(binary, workspace)
     preparation_ms = 0.0
     initial_brief = ""
@@ -360,6 +433,7 @@ def run_condition(
         "usage": usage,
         "oracle": oracle,
         "againStatsDelta": stats,
+        "priorBrain": prior_brain,
     }
     return result, raw
 
@@ -375,6 +449,8 @@ def main() -> int:
                         help="diagnostic: prepare the verified task brief before launching Codex")
     parser.add_argument("--product-wrapper", action="store_true",
                         help="diagnostic: launch through the production again codex command")
+    parser.add_argument("--seed-prior-brain", action="store_true",
+                        help="seed a verified prior source read for the balance-helper returning task")
     parser.add_argument("--prebrief-with-mcp", action="store_true",
                         help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
@@ -390,6 +466,8 @@ def main() -> int:
         parser.error("--prebrief-with-mcp requires --prebrief")
     if args.product_wrapper and (args.prebrief or args.prebrief_with_mcp):
         parser.error("--product-wrapper cannot be combined with diagnostic prebrief modes")
+    if args.seed_prior_brain and (not args.product_wrapper or args.fixture != "balance-helper"):
+        parser.error("--seed-prior-brain requires --product-wrapper and --fixture balance-helper")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(
         [str(binary), "mcp", "connect", "--help"],
@@ -412,7 +490,7 @@ def main() -> int:
                 condition, pathlib.Path(temporary), binary, args.model,
                 TASK_IDS[args.fixture],
                 args.source_files, args.task_start_only_surface, args.compact_task_result,
-                args.prebrief_with_mcp,
+                args.prebrief_with_mcp, args.seed_prior_brain,
             )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -446,6 +524,7 @@ def main() -> int:
         "compactTaskResult": args.compact_task_result,
         "prebrief": args.prebrief,
         "prebriefWithMcp": args.prebrief_with_mcp,
+        "returningTask": args.seed_prior_brain,
         "observations": observations,
         "accepted": accepted,
     }

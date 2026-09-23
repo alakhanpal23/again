@@ -27,7 +27,10 @@ def sha256(path: pathlib.Path) -> str:
 
 
 def verify_manifest(manifest: dict) -> None:
-    if manifest.get("schema") != "again.single-agent-cold-cohort.v1":
+    if manifest.get("schema") not in {
+        "again.single-agent-cold-cohort.v1",
+        "again.single-agent-returning-cohort.v1",
+    }:
         raise RuntimeError("unexpected cohort schema")
     if manifest.get("orders") != ["baseline-first", "again-first"]:
         raise RuntimeError("cohort must contain both treatment orders")
@@ -50,12 +53,19 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         or report.get("harnessSha256") != sha256(PAIR_HARNESS)
         or report.get("model") != model
         or report.get("surface") != "product-wrapper"
+        or report.get("returningTask") is not bool(case.get("returningTask", False))
         or report.get("source", {}).get("dirty") is not False
         or report.get("order") != (["baseline", "product"] if order == "baseline-first" else ["product", "baseline"])
     ):
         raise RuntimeError(f"pair result does not match frozen case {case['fixture']} {order}")
     if len(report.get("observations", [])) != 2:
         raise RuntimeError("pair omitted an observation")
+    if case.get("returningTask"):
+        observations = {item["condition"]: item for item in report["observations"]}
+        if observations["product"].get("priorBrain", {}).get("path") != "src/util.py":
+            raise RuntimeError("returning task lacked its verified prior Brain read")
+        if observations["baseline"].get("priorBrain") is not None:
+            raise RuntimeError("baseline was seeded with Again Brain")
     for observation in report["observations"]:
         raw = output_dir / observation["rawEventFile"]
         if not raw.is_file() or sha256(raw) != observation["rawEventSha256"]:
@@ -77,7 +87,8 @@ def usage_vector(observation: dict) -> dict[str, int] | None:
     return {"uncachedInput": total - cached, "cachedInput": cached, "output": output}
 
 
-def summarize(manifest: dict, reports: list[dict], binary_hash: str) -> dict:
+def summarize(manifest: dict, reports: list[dict], binary_hash: str,
+              manifest_path: pathlib.Path = MANIFEST) -> dict:
     pairs = []
     ratios = []
     for report in reports:
@@ -108,12 +119,12 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str) -> dict:
     again_usage = {key: sum(pair["againUsage"][key] for pair in pairs if pair["againUsage"])
                    for key in ("uncachedInput", "cachedInput", "output")}
     return {
-        "schema": "again.single-agent-cold-cohort-result.v1",
+        "schema": manifest["schema"].replace("cohort.v1", "cohort-result.v1"),
         "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "manifestSha256": sha256(MANIFEST),
+        "manifestSha256": sha256(manifest_path),
         "binarySha256": binary_hash,
         "model": manifest["model"],
-        "evidenceScope": "cold local tasks only; returning tasks and cost qualification remain open",
+        "evidenceScope": manifest["purpose"],
         "acceptedPairs": sum(pair["accepted"] for pair in pairs),
         "totalPairs": len(pairs),
         "pairedMedianElapsedRatio": median_ratio,
@@ -129,15 +140,17 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
+    parser.add_argument("--manifest", type=pathlib.Path, default=MANIFEST)
     parser.add_argument("--output-dir", required=True, type=pathlib.Path)
     parser.add_argument("--plan-only", action="store_true")
     args = parser.parse_args()
-    manifest = json.loads(MANIFEST.read_text())
+    manifest_path = args.manifest.resolve(strict=True)
+    manifest = json.loads(manifest_path.read_text())
     verify_manifest(manifest)
     binary = args.binary.resolve(strict=True)
     binary_hash = sha256(binary)
     if args.plan_only:
-        print(json.dumps({"manifestSha256": sha256(MANIFEST), "binarySha256": binary_hash,
+        print(json.dumps({"manifestSha256": sha256(manifest_path), "binarySha256": binary_hash,
                           "pairs": len(manifest["cases"]) * len(manifest["orders"])}, indent=2))
         return 0
     status = subprocess.run(["git", "status", "--porcelain"], cwd=ROOT,
@@ -156,6 +169,8 @@ def main() -> int:
                            "--model", manifest["model"], "--fixture", case["fixture"],
                            "--source-files", str(case["sourceFiles"]), "--order", order,
                            "--product-wrapper", "--output", str(output)]
+                if case.get("returningTask"):
+                    command.append("--seed-prior-brain")
                 result = subprocess.run(command, cwd=ROOT, timeout=420, capture_output=True, text=True)
                 if not output.exists():
                     raise RuntimeError(f"pair harness failed without a report: {case['fixture']} {order}: {result.stderr[-1000:]}")
@@ -164,7 +179,7 @@ def main() -> int:
             reports.append(report)
             print(json.dumps({"fixture": case["fixture"], "order": order,
                               "accepted": report["accepted"], "report": str(output)}), flush=True)
-    summary = summarize(manifest, reports, binary_hash)
+    summary = summarize(manifest, reports, binary_hash, manifest_path)
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"acceptedPairs": summary["acceptedPairs"], "totalPairs": summary["totalPairs"],
                       "pairedMedianElapsedRatio": summary["pairedMedianElapsedRatio"]}))
