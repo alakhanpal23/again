@@ -89,6 +89,13 @@ def run_condition(
         str(codex), "exec", "--ephemeral", "--ignore-user-config", "--json",
         "--approve-for-me", "-m", model, "-C", str(workspace),
     ]
+    if condition == "product":
+        command = [
+            str(binary), "codex", "--workspace", str(workspace),
+            "--task-id", "calculator-fix", "--task", pair.PROMPT, "--",
+            "--ephemeral", "--ignore-user-config", "--json",
+            "--approve-for-me", "-m", model,
+        ]
     if condition == "again" or (condition == "prebrief" and prebrief_with_mcp):
         if task_start_only_surface or compact_task_result:
             bridge = pathlib.Path(__file__).with_name("agent_gateway_codex_task_start_surface_v1.py").resolve()
@@ -105,7 +112,8 @@ def run_condition(
             "-c", f"mcp_servers.again.command={json.dumps(server_command)}",
             "-c", f"mcp_servers.again.args={json.dumps(server_args)}",
         ]
-    command.append((AGAIN_INSTRUCTION if condition == "again" else initial_brief) + pair.PROMPT)
+    if condition != "product":
+        command.append((AGAIN_INSTRUCTION if condition == "again" else initial_brief) + pair.PROMPT)
     original = hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest()
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         started = time.monotonic()
@@ -166,7 +174,7 @@ def run_condition(
     )
     stats_after = pair.again_stats(binary, workspace)
     stats = {key: stats_after[key] - stats_before[key] for key in stats_before}
-    if condition in ("again", "prebrief"):
+    if condition in ("again", "prebrief", "product"):
         subprocess.run(
             [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
             capture_output=True, text=True, timeout=10
@@ -204,6 +212,8 @@ def main() -> int:
     parser.add_argument("--order", choices=("baseline-first", "again-first"), default="baseline-first")
     parser.add_argument("--prebrief", action="store_true",
                         help="diagnostic: prepare the verified task brief before launching Codex")
+    parser.add_argument("--product-wrapper", action="store_true",
+                        help="diagnostic: launch through the production again codex command")
     parser.add_argument("--prebrief-with-mcp", action="store_true",
                         help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
@@ -216,6 +226,8 @@ def main() -> int:
         parser.error("--source-files must be between 0 and 1000")
     if args.prebrief_with_mcp and not args.prebrief:
         parser.error("--prebrief-with-mcp requires --prebrief")
+    if args.product_wrapper and (args.prebrief or args.prebrief_with_mcp):
+        parser.error("--product-wrapper cannot be combined with diagnostic prebrief modes")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(
         [str(binary), "mcp", "connect", "--help"],
@@ -230,7 +242,7 @@ def main() -> int:
     version = subprocess.run([str(codex), "--version"], capture_output=True, text=True, check=True).stdout.strip()
     observations = []
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    treatment = "prebrief" if args.prebrief else "again"
+    treatment = "product" if args.product_wrapper else "prebrief" if args.prebrief else "again"
     order = ("baseline", treatment) if args.order == "baseline-first" else (treatment, "baseline")
     for condition in order:
         with tempfile.TemporaryDirectory(prefix=f"again-codex-pair-{condition}-") as temporary:
@@ -263,7 +275,8 @@ def main() -> int:
         "fixtureSha256": hashlib.sha256(pair.canonical_bytes(pair.FIXTURE)).hexdigest(),
         "promptSha256": hashlib.sha256(pair.PROMPT.encode()).hexdigest(),
         "order": list(order),
-        "surface": ("prebrief-with-mcp" if args.prebrief_with_mcp else
+        "surface": ("product-wrapper" if args.product_wrapper else
+                    "prebrief-with-mcp" if args.prebrief_with_mcp else
                     "prebrief-no-mcp" if args.prebrief else
                     "task-start-only-diagnostic" if args.task_start_only_surface else "full"),
         "compactTaskResult": args.compact_task_result,

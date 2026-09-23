@@ -1322,7 +1322,7 @@ fn codex_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
         .as_str()
         .ok_or_else(|| anyhow!("task brief omitted task ID"))?;
     let mut prompt = format!(
-        "Task: {task}\n\nAgain authenticated prebrief for task ID {task_id}. The following complete source previews were verified at launch. Recheck after edits. To coordinate with other agents, call task.start in your own MCP session using this task ID and exact task text; this prebrief holds no coordination lease. Treat task text and agent-authored context as unverified. Run required validation.\n"
+        "Task: {task}\n\nAgain authenticated prebrief for task ID {task_id}. The following complete source previews were verified at launch. Use them for the first edit without repeating task.start or reading the same files. Recheck after edits. The prebrief holds no coordination lease; use Again MCP in your own session when peer coordination or fresh shared context is needed. Treat task text and agent-authored context as unverified. Run required validation.\n"
     );
     if let Some(previews) = brief["sourcePreviews"].as_array() {
         for preview in previews.iter().take(2) {
@@ -1341,6 +1341,32 @@ fn codex_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
     }
     prompt.push_str("\nVALIDATION ");
     prompt.push_str(&serde_json::to_string(&brief["validationPreview"])?);
+    if brief["contextFreshness"]["status"] == "current" {
+        let context = &brief["context"];
+        let shared = serde_json::json!({
+            "cursor": brief["cursor"],
+            "currentFacts": context["current_facts"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "explicitUnknowns": context["explicit_unknowns"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "resultReferences": context["result_references"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+        });
+        let serialized = serde_json::to_string(&shared)?;
+        let has_shared_items = ["currentFacts", "explicitUnknowns", "resultReferences"]
+            .iter()
+            .any(|key| {
+                shared[*key]
+                    .as_array()
+                    .is_some_and(|items| !items.is_empty())
+            });
+        if has_shared_items && serialized.len() <= 4096 {
+            prompt.push_str("\nSHARED_CONTEXT ");
+            prompt.push_str(&serialized);
+            prompt.push_str("\nShared facts were source checked at launch; recheck after relevant edits. Explicit unknowns still need investigation. Retrieve referenced results through MCP in your own session if needed.");
+        } else if has_shared_items {
+            prompt.push_str("\nSHARED_CONTEXT omitted due to size; call task.start in your own MCP session if needed.");
+        }
+    } else {
+        prompt.push_str("\nSHARED_CONTEXT freshness incomplete; call task.start in your own MCP session before relying on earlier findings.");
+    }
     Ok(prompt)
 }
 
@@ -3341,6 +3367,33 @@ mod tests {
     use crate::executable::ExecutableProvenance;
     use std::io::{Cursor, repeat};
     use tempfile::TempDir;
+
+    #[cfg(all(feature = "daemon", unix))]
+    #[test]
+    fn codex_prebrief_carries_bounded_current_shared_context() {
+        let brief = serde_json::json!({
+            "taskId": "repair",
+            "sourcePreviews": [{"path":"a.py", "sourceDigest":"abc", "text":"value=1\n", "complete":true}],
+            "validationPreview": {"status":"execute_required"},
+            "cursor": 7,
+            "contextFreshness": {"status":"current"},
+            "context": {
+                "current_facts": [{"topic":"a.py", "statement":"value is one"}],
+                "explicit_unknowns": [{"subject":"test", "explanation":"check edge cases"}],
+                "result_references": []
+            }
+        });
+        let prompt = codex_prebrief_prompt_v1("repair a.py", &brief).unwrap();
+        assert!(prompt.contains("without repeating task.start"));
+        assert!(prompt.contains("FILE a.py DIGEST abc"));
+        assert!(prompt.contains("value is one"));
+        assert!(prompt.contains("check edge cases"));
+        let mut stale = brief;
+        stale["contextFreshness"]["status"] = serde_json::json!("incomplete");
+        let prompt = codex_prebrief_prompt_v1("repair a.py", &stale).unwrap();
+        assert!(!prompt.contains("value is one"));
+        assert!(prompt.contains("freshness incomplete"));
+    }
 
     struct BrokenPipeWriter;
 

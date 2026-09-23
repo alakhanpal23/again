@@ -12,6 +12,11 @@ initial `codex exec` prompt while keeping the ordinary Again MCP connection
 available. The agent can claim the lease from its own connection when shared
 coordination is needed. A daemon regression test confirms that a second
 authenticated client can immediately become leader after a preview-only start.
+The launch prompt also carries a bounded current snapshot of source-backed
+facts, explicit unknowns, and result references. It omits that snapshot when
+freshness is incomplete or the selected fields exceed 4 KiB, directing the
+agent back to MCP. An isolated two-client CLI smoke confirmed that an unknown
+published by one client appeared in the next client's launch prompt.
 The CLI was smoke-tested with a private temporary repository, a fake Codex
 executable that captured arguments, and a second authenticated MCP client.
 The same smoke passed on the release binary built from clean source
@@ -32,6 +37,23 @@ speed or cost claim. A compact `task.start` text response and a one-tool MCP
 surface did not improve the same workload. The next gate is clean-source
 release-binary verification of the new CLI and balanced repeat-heavy parallel
 agent cohorts, including shared context after an agent claims its own task.
+
+The first actual `again codex` wrapper pairs also passed the edit oracle but
+Codex redundantly called `task.start` before editing, erasing much of the
+latency gain ([baseline-first](../bench/results/2026-09-23-codex-pair-product-wrapper-baseline-first-v1.json),
+[reverse](../bench/results/2026-09-23-codex-pair-product-wrapper-again-first-v1.json)).
+The launch prompt now says explicitly that its verified previews are sufficient
+for the first edit and that MCP is available when fresh or peer context is
+needed. The next two actual-wrapper pairs made no MCP calls before the edit,
+passed the same oracle, and reached first edit in 5.31 versus 13.17 seconds
+([baseline first](../bench/results/2026-09-23-codex-pair-product-wrapper-guided-baseline-first-v1.json))
+and 5.51 versus 12.86 seconds
+([wrapper first](../bench/results/2026-09-23-codex-pair-product-wrapper-guided-again-first-v1.json)).
+Completion was 14.20 versus 20.88 seconds and 14.34 versus 19.26 seconds;
+input tokens were 48,494 versus 97,698 and 48,437 versus 87,632. The
+wrapper's daemon preparation is included in elapsed and first-edit time.
+These are local dirty-source diagnostics on one fixture, not product-wide
+performance qualification.
 
 ## 2026-09-23 direct context architecture checkpoint
 
