@@ -343,15 +343,22 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(corrupt_id is not None, "corruption source was not admitted")
             stdout_digest = reader.stdout_digest_for_result(corrupt_id)
             corruption = corrupt_copied_blob(state, stdout_digest)
+            corruption_start = reader.begin()
             refused = corrupt_agent.tool("context.retrieve", {
                 "taskId": "corrupt-source-task", "resultId": corrupt_id,
             })
             require(refused.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
                     "corrupted source bytes were retrievable")
+            corruption_events = reader.result_events(corrupt_id, reader.end(corruption_start))
+            require(any(event["event_type"] == "binding_quarantined" and
+                        event["reason"] == "result_corrupt" for event in corruption_events),
+                    f"corrupt evidence was not quarantined: {corruption_events}")
             reread = corrupt_agent.tool("repo.read", {"path": "corruption.txt"})
             structured(reread, "read after corruption")
             require(tool_text(reread["result"]) == "TRUSTED_SOURCE\n",
                     "corruption recovery did not execute a clean source read")
+            require(result_id(reread["result"]) != corrupt_id,
+                    "corrupted result reference was returned after quarantine")
             lease_dir = workspace / "lease"
             lease_dir.mkdir()
             marker = b"TOKEN_LEASE_RECOVERY\n"
@@ -428,6 +435,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "new_result_id": replacement_id,
                 "corrupted_result_id": corrupt_id,
                 "corruption": corruption,
+                "corruption_events": corruption_events,
                 "cancelled_result_id": cancel_id,
                 "lease_recovery_events": dict(recovery_events),
                 "old_lease": old_lease,
