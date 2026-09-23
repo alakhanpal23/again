@@ -100,7 +100,9 @@ execute-only; warm p50 was 0.473 versus 0.266 ms. The previous exact first
 small-read path took about 60 ms on this fixture. These runs used a local
 dirty source and do not establish a task-level gain. Large reads and broad
 search/tree paths remain coupled to costly exact-result proof, and the paired
-Codex fixtures have not shown a validated completion or token-cost win. Wider direct admission, corruption
+Codex MCP-only fixtures at this point had not shown a validated completion or
+token-cost win. Later prebrief wrapper pairs above did on one local fixture.
+Wider direct admission, corruption
 recovery, balanced repeat-heavy agent cohorts, and exact-SHA hosted gates
 remain open.
 

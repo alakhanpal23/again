@@ -179,6 +179,16 @@ has a persisted proof and an `explain` reason.
   surface did not improve the result. Measure the content and model-turn cost
   of the task-start brief before changing production tool discovery, and run
   the repeat-heavy parallel cohort rather than extrapolating from this edit.
+  A preview-only daemon task start and `again codex` now put complete source
+  previews and bounded current shared findings into the initial prompt without
+  claiming a lease. The agent's own MCP connection remains available, and an
+  observed peer leader prompts an authenticated join before duplicated work.
+  The first wrapper prompt induced a redundant `task.start` and regressed
+  latency; the corrected prompt avoided that call in both live treatment
+  orders and passed the edit oracle with faster first edit and completion on
+  the same 1,000-file fixture. These remain local diagnostics. Run a balanced
+  repeat-heavy parallel cohort and a live peer-leader handoff, including
+  mutation between prebrief and first edit.
 
 **Exit evidence:** the paired real-client flow satisfies all six release
 contract steps. No stale fact is presented as current and no context reference
