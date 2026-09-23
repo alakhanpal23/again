@@ -1,13 +1,15 @@
 # Again
 
-Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
+Again helps one coding agent start with a verified repository brief, carry useful source knowledge into later tasks, and avoid repeated investigation. Its local Again Brain records completed Codex activity and rechecks source bytes before presenting prior reads or edits as current.
 
 ![Again system design: a command is classified, its scoped observation and stored proof are verified, then the result is reused or executed](docs/system-design.svg)
 
-*Pre-alpha architecture: a cache hit is returned only after current inputs, runtime, proof, and stored streams pass validation.*
+*Pre-alpha: the single-agent workflow has local task evidence; broad production qualification and proof-based test reuse remain open.*
 
 ## Current product
 
+- `again codex --workspace <path> --task-id <id> --task <text> -- [codex flags]` — launch Codex with bounded current source previews, relevant Brain history, and a validation suggestion. Completed tool calls and run usage are recorded locally.
+- `again brain show|clear --workspace <path>` — inspect or clear bounded activity, source observations, test hints, and Codex run summaries. Brain history is guidance; tests still run.
 - `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
 - `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
 - `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.
@@ -19,9 +21,7 @@ Again is a repository-aware execution memory and tool-call control plane for cod
 
 ## Product direction
 
-Again gives coding agents persistent, verified repository understanding and execution memory so they can move from task to correct code with less rediscovery, fewer tool calls, and less repeated validation.
-
-The target outcome is to help coding agents start with verified repository understanding, avoid repeating work, run only validation affected by a change, and share exact execution knowledge across agents.
+Again's near-term goal is lower time and cost per correct, validated single-agent coding task. The Brain should keep repository knowledge current across tasks, while measured tool and run activity shows whether investigation was actually avoided. Proof-based test reuse and team sharing are later gates.
 
 ## Technical Foundation
 
@@ -37,7 +37,7 @@ The target outcome is to help coding agents start with verified repository under
 
 **Do not depend on Again for correctness-sensitive workloads** until documented gates are green. Unknown means Again refuses the call; the caller must rerun the original unchanged.
 
-**Evidence checkpoint:** Source commit `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted CI on 2026-08-27. Gates 1–2 retained; Gates 3+ open until outside-user evidence exists.
+**Evidence checkpoint:** See [current implementation status](docs/STATUS.md) and its retained single-agent cohorts, Brain ablations, and release-binary gates. Broad accepted-task, cost, and validation-reuse qualification remains open.
 
 **100K-case gate:** Passed with stock-Linux lane retaining required typed non-qualifying capability result.
 
@@ -46,7 +46,8 @@ The target outcome is to help coding agents start with verified repository under
 ```bash
 cargo install --locked --path . --features daemon
 again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill
-again run -- cat path/to/file
+again codex --workspace "$(pwd -P)" --task-id fix-example --task "Fix the failing example and run its tests" -- --ephemeral
+again brain show --workspace "$(pwd -P)"
 ```
 
 ## License
