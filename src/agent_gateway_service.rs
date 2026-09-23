@@ -1742,6 +1742,10 @@ mod tests {
             preview["result"]["structuredContent"]["coordination"]["status"],
             "preview"
         );
+        assert_eq!(
+            preview["result"]["structuredContent"]["coordination"]["peerActive"],
+            false
+        );
         assert!(
             preview["result"]["structuredContent"]["coordination"]
                 .get("leaseId")
@@ -1758,6 +1762,16 @@ mod tests {
             claimed["result"]["structuredContent"]["coordination"]["status"],
             "leader"
         );
+        let mut observer = LocalMcpClientV1::connect(workspace.path());
+        let peer_preview = observer.tool(
+            "task.start",
+            json!({ "taskId": "edit-source", "task": "edit source.py", "previewOnly": true }),
+        );
+        assert_eq!(
+            peer_preview["result"]["structuredContent"]["coordination"]["peerActive"],
+            true
+        );
+        observer.stream.shutdown(std::net::Shutdown::Both).unwrap();
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();

@@ -17,6 +17,16 @@ facts, explicit unknowns, and result references. It omits that snapshot when
 freshness is incomplete or the selected fields exceed 4 KiB, directing the
 agent back to MCP. An isolated two-client CLI smoke confirmed that an unknown
 published by one client appeared in the next client's launch prompt.
+Preview-only task start now reads the current scoped task lease without
+claiming it. If another leader is active, the launch prompt asks the agent to
+join and inspect peer findings in its own authenticated MCP session before
+duplicating work. This is an advisory point-in-time observation; the later
+claim remains authoritative. A daemon regression test covers both an
+available lease and an observed peer leader.
+The [post-change live baseline-first pair](../bench/results/2026-09-23-codex-pair-product-wrapper-peer-preview-baseline-first-v1.json)
+passed both edit oracles; the wrapper made no MCP calls before editing and
+reached first edit in 4.85 seconds versus 14.29 seconds for baseline. This
+single local pair does not qualify parallel-leader behavior with live agents.
 The CLI was smoke-tested with a private temporary repository, a fake Codex
 executable that captured arguments, and a second authenticated MCP client.
 The same smoke passed on the release binary built from clean source

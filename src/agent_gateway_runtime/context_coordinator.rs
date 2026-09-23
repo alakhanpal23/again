@@ -749,10 +749,18 @@ impl LocalContextCoordinatorV1 {
             &authorization_scope_digest,
         )?;
         let coordination = if preview_only {
+            let peer = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .preview_task_leader_v1(&identity)?;
             json!({
                 "status": "preview",
                 "stateGeneration": task.task.state_generation,
-                "guidance": "claim_from_agent_session_before_coordinated_work"
+                "guidance": "claim_from_agent_session_before_coordinated_work",
+                "peerActive": peer.is_some(),
+                "peerLeaderAgentId": peer.as_ref().map(|item| item.0.as_str()),
+                "peerLeaseExpiresAtMs": peer.as_ref().map(|item| item.1)
             })
         } else {
             let outcome = self

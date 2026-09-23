@@ -3410,6 +3410,36 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Advisory lease observation for a preview-only launch. This grants no
+    /// ownership; a later task claim must still perform its authenticated CAS.
+    pub fn preview_task_leader_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+    ) -> Result<Option<(String, i64)>> {
+        validate_context_identity_v1(identity)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let leader = transaction
+            .query_row(
+                "SELECT leader_agent_id, expires_ms FROM context_ledger_leases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND authorization_scope_digest = ?4 AND status = 'active'
+                   AND expires_ms > ?5
+                 LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    now_ms()
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(leader)
+    }
+
     pub fn claim_task_v1(
         &self,
         identity: &ContextLedgerIdentityV1,
