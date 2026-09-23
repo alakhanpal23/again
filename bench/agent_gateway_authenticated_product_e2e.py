@@ -142,7 +142,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
         source = inspect_clean_source(source_root, source_sha, home)
         pinned = pin_binary(binary, root / "pinned" / "again")
         binary = pinned.executable_path
-        (workspace / "input.txt").write_text("ALPHA_SOURCE\n")
+        initial_text = "ALPHA_SOURCE\n" + "x" * 8192
+        changed_text = "BETA_SOURCE\n" + "x" * 8192
+        (workspace / "input.txt").write_text(initial_text)
+        (workspace / "small.txt").write_text("SMALL_SOURCE\n")
         (workspace / "other.txt").write_text("unrelated\n")
         environment = {"PATH": "/usr/bin:/bin", "HOME": str(home), "AGAIN_HOME": str(state)}
         daemon = start_daemon(binary, workspace, environment)
@@ -153,7 +156,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             standalone = solo.tool("repo.read", {"path": "input.txt"})
             structured(standalone, "standalone read")
             require(result_id(standalone["result"]) is None, "cheap standalone read unexpectedly stored a result")
-            require(tool_text(standalone["result"]) == "ALPHA_SOURCE\n", "standalone bytes differ")
+            require(tool_text(standalone["result"]) == initial_text, "standalone bytes differ")
 
             first = Client(binary, workspace, environment)
             second = Client(binary, workspace, environment)
@@ -204,6 +207,10 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             structured(direct_stat, "direct context stat")
             require(result_id(direct_stat["result"]) is None,
                     "direct context observation unexpectedly granted cache retrieval")
+            direct_read = first.tool("repo.read", {"path": "small.txt"})
+            structured(direct_read, "direct context read")
+            require(result_id(direct_read["result"]) is None and tool_text(direct_read["result"]) == "SMALL_SOURCE\n",
+                    "small read did not take the direct context lane")
             observer = Client(binary, workspace, environment)
             clients.append(observer)
             joined = structured(observer.tool("task.start", task_arguments), "joined task.start")
@@ -213,12 +220,15 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
                         for fact in context.get("current_facts", [])),
                     "peer did not receive direct source-backed fact")
+            require(any(fact.get("sources", [{}])[0].get("locator") == "repo.read:small.txt"
+                        for fact in context.get("current_facts", [])),
+                    "peer did not receive direct small-read fact")
             require(any(ref.get("result_id") == original_id for ref in context.get("result_references", [])),
                     "peer did not receive result reference")
             retrieved = structured(second.tool("context.retrieve", {
                 "taskId": "shared-source-task", "resultId": original_id,
             }), "peer retrieval")
-            require(tool_text(retrieved.get("toolResult", {})) == "ALPHA_SOURCE\n",
+            require(tool_text(retrieved.get("toolResult", {})) == initial_text,
                     "peer retrieved wrong source bytes")
 
             (workspace / "other.txt").write_text("changed unrelated\n")
@@ -230,8 +240,12 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
                         for fact in unaffected.get("context", {}).get("current_facts", [])),
                     "unrelated edit retired direct stat fact")
+            require(any(fact.get("sources", [{}])[0].get("locator") == "repo.read:small.txt"
+                        for fact in unaffected.get("context", {}).get("current_facts", [])),
+                    "unrelated edit retired direct read fact")
 
-            (workspace / "input.txt").write_text("BETA_SOURCE\n")
+            (workspace / "input.txt").write_text(changed_text)
+            (workspace / "small.txt").write_text("OTHER_SOURCE\n")
             invalidated_client = Client(binary, workspace, environment)
             clients.append(invalidated_client)
             invalidated = structured(invalidated_client.tool("task.start", task_arguments), "relevant edit task.start")
@@ -240,13 +254,16 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             require(not any(fact.get("sources", [{}])[0].get("locator") == "repo.stat:input.txt"
                             for fact in invalidated.get("context", {}).get("current_facts", [])),
                     "stale direct stat fact survived unobserved edit")
+            require(not any(fact.get("sources", [{}])[0].get("locator") == "repo.read:small.txt"
+                            for fact in invalidated.get("context", {}).get("current_facts", [])),
+                    "stale direct read fact survived unobserved edit")
             denied = second.tool("context.retrieve", {"taskId": "shared-source-task", "resultId": original_id})
             require(denied.get("error", {}).get("data", {}).get("reason") == "retrieval_refused",
                     "stale retrieval was not refused")
             replacement = first.tool("repo.read", {"path": "input.txt"})
             structured(replacement, "replacement read")
             replacement_id = result_id(replacement["result"])
-            require(tool_text(replacement["result"]) == "BETA_SOURCE\n" and replacement_id != original_id,
+            require(tool_text(replacement["result"]) == changed_text and replacement_id != original_id,
                     "edited source did not get a new exact result")
 
             large = workspace / "large-ledger"

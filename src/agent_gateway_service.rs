@@ -1255,6 +1255,12 @@ mod tests {
     use std::process::Command;
     use std::sync::Barrier;
 
+    // Retrieval and lease tests use a read whose cost makes exact admission
+    // eligible. Small files take the direct context lane.
+    fn leased_read_fixture_v1(prefix: &str) -> String {
+        format!("{prefix}{}", "x".repeat(8192))
+    }
+
     struct LocalMcpClientV1 {
         stream: UnixStream,
         reader: BufReader<UnixStream>,
@@ -1454,7 +1460,11 @@ mod tests {
     #[test]
     fn two_authenticated_clients_share_facts_work_retrieval_and_mutation_deltas() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("first\n"),
+        )
+        .unwrap();
         fs::create_dir(workspace.path().join("src")).unwrap();
         fs::write(
             workspace.path().join("src/lib.rs"),
@@ -1583,7 +1593,7 @@ mod tests {
         );
         assert_eq!(
             retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "first\n"
+            leased_read_fixture_v1("first\n")
         );
         let cross_task = agent_b.tool(
             "context.retrieve",
@@ -1603,9 +1613,16 @@ mod tests {
             "compact"
         );
 
-        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("second\n"),
+        )
+        .unwrap();
         let reread = agent_b.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(reread["result"]["content"][0]["text"], "second\n");
+        assert_eq!(
+            reread["result"]["content"][0]["text"],
+            leased_read_fixture_v1("second\n")
+        );
         let delta = agent_b.tool(
             "context.delta",
             json!({ "taskId": "shared-task", "afterCursor": cursor, "limit": 64 }),
@@ -1849,7 +1866,11 @@ mod tests {
     #[test]
     fn paired_agents_converge_and_invalidate_as_one_local_product() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"first\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("first\n"),
+        )
+        .unwrap();
         fs::write(workspace.path().join("unrelated.txt"), b"stable\n").unwrap();
         fs::create_dir(workspace.path().join("src")).unwrap();
         fs::write(
@@ -1966,7 +1987,7 @@ mod tests {
         );
         assert_eq!(
             retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "first\n"
+            leased_read_fixture_v1("first\n")
         );
         for compact in [
             agent_a.tool(
@@ -1990,7 +2011,10 @@ mod tests {
         )
         .unwrap();
         let preserved = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(preserved["result"]["content"][0]["text"], "first\n");
+        assert_eq!(
+            preserved["result"]["content"][0]["text"],
+            leased_read_fixture_v1("first\n")
+        );
         assert!(preserved["result"].get("_meta").is_none());
         let after_irrelevant = Store::open_for_workspace(workspace.path())
             .unwrap()
@@ -2012,9 +2036,16 @@ mod tests {
             "an unrelated content edit invalidated the exact read"
         );
 
-        fs::write(workspace.path().join("input.txt"), b"second\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("second\n"),
+        )
+        .unwrap();
         let changed = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(changed["result"]["content"][0]["text"], "second\n");
+        assert_eq!(
+            changed["result"]["content"][0]["text"],
+            leased_read_fixture_v1("second\n")
+        );
         let changed_result_id = changed["result"]["_meta"]["again"]["resultId"]
             .as_str()
             .unwrap()
@@ -2064,12 +2095,15 @@ mod tests {
         );
         assert_eq!(
             current_retrieval["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "second\n"
+            leased_read_fixture_v1("second\n")
         );
 
         fs::write(workspace.path().join("unrelated.txt"), b"changed twice\n").unwrap();
         let warm = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(warm["result"]["content"][0]["text"], "second\n");
+        assert_eq!(
+            warm["result"]["content"][0]["text"],
+            leased_read_fixture_v1("second\n")
+        );
         assert!(warm["result"].get("_meta").is_none());
         let final_stats = Store::open_for_workspace(workspace.path())
             .unwrap()
@@ -2189,7 +2223,11 @@ mod tests {
     #[test]
     fn deleted_task_source_retires_its_verified_fact_and_reference() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"current\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("current\n"),
+        )
+        .unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
             AuthorizationScopeId::new("deleted-task-source-scope").unwrap(),
@@ -2225,7 +2263,7 @@ mod tests {
         );
         assert_eq!(
             shared["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "current\n"
+            leased_read_fixture_v1("current\n")
         );
         let other_start = other_task_agent.tool(
             "task.start",
@@ -2242,7 +2280,10 @@ mod tests {
             .to_owned();
         // Restore the first task's warm candidate after the second task read.
         let warm = agent.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(warm["result"]["content"][0]["text"], "current\n");
+        assert_eq!(
+            warm["result"]["content"][0]["text"],
+            leased_read_fixture_v1("current\n")
+        );
         fs::remove_file(workspace.path().join("input.txt")).unwrap();
         let missing = agent.tool("repo.read", json!({ "path": "input.txt" }));
         assert!(missing.get("error").is_some(), "{missing}");
@@ -2298,9 +2339,16 @@ mod tests {
             other_stale["error"]["data"]["reason"], "retrieval_refused",
             "{other_stale}"
         );
-        fs::write(workspace.path().join("input.txt"), b"current\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("current\n"),
+        )
+        .unwrap();
         let restored = agent.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(restored["result"]["content"][0]["text"], "current\n");
+        assert_eq!(
+            restored["result"]["content"][0]["text"],
+            leased_read_fixture_v1("current\n")
+        );
         let restored_result_id = restored["result"]["_meta"]["again"]["resultId"]
             .as_str()
             .unwrap();
@@ -2311,7 +2359,7 @@ mod tests {
         );
         assert_eq!(
             recovered["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "current\n",
+            leased_read_fixture_v1("current\n"),
             "restored source did not regain a verified reference: {recovered}"
         );
         let other_restored = other_task_agent.tool("repo.read", json!({ "path": "input.txt" }));
@@ -2326,7 +2374,7 @@ mod tests {
         );
         assert_eq!(
             other_recovered["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "current\n",
+            leased_read_fixture_v1("current\n"),
             "other task did not regain a verified reference: {other_recovered}"
         );
         peer.stream.shutdown(std::net::Shutdown::Both).unwrap();
@@ -2342,7 +2390,11 @@ mod tests {
     #[test]
     fn task_start_revalidates_unobserved_edit_after_daemon_restart() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("before\n"),
+        )
+        .unwrap();
         let scope = AuthorizationScopeId::new("restart-freshness-scope").unwrap();
         let daemon = GatewayDaemonV1::bind(workspace.path(), scope.clone()).unwrap();
         let server = thread::spawn(move || daemon.serve());
@@ -2361,7 +2413,11 @@ mod tests {
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();
 
-        fs::write(workspace.path().join("input.txt"), b"after\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("after\n"),
+        )
+        .unwrap();
         let daemon = GatewayDaemonV1::bind(workspace.path(), scope).unwrap();
         let server = thread::spawn(move || daemon.serve());
         let mut resumed = LocalMcpClientV1::connect(workspace.path());
@@ -2388,7 +2444,10 @@ mod tests {
             "{stale}"
         );
         let refreshed = resumed.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(refreshed["result"]["content"][0]["text"], "after\n");
+        assert_eq!(
+            refreshed["result"]["content"][0]["text"],
+            leased_read_fixture_v1("after\n")
+        );
         resumed.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();
@@ -2423,7 +2482,8 @@ mod tests {
                 json!({ "path": format!("source-{index:03}.txt") }),
             );
             assert!(
-                read["result"]["_meta"]["again"]["resultId"].is_string(),
+                read["result"].get("_meta").is_none()
+                    && read["result"]["content"][0]["text"].is_string(),
                 "{index}: {read}"
             );
         }
@@ -2564,7 +2624,11 @@ mod tests {
     #[test]
     fn retrieval_revalidates_unobserved_edit_without_a_new_tool_read() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"before\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("before\n"),
+        )
+        .unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
             AuthorizationScopeId::new("retrieval-freshness-scope").unwrap(),
@@ -2591,14 +2655,18 @@ mod tests {
         );
         assert_eq!(
             available["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "before\n"
+            leased_read_fixture_v1("before\n")
         );
         let search = agent.tool("repo.search", json!({ "path": ".", "pattern": "before" }));
         let search_id = search["result"]["_meta"]["again"]["resultId"]
             .as_str()
             .unwrap()
             .to_owned();
-        fs::write(workspace.path().join("input.txt"), b"after\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("after\n"),
+        )
+        .unwrap();
         let stale = agent.tool(
             "context.retrieve",
             json!({ "taskId": "retrieval-freshness", "resultId": old_id }),
@@ -2635,7 +2703,11 @@ mod tests {
     #[test]
     fn task_start_preserves_fact_after_unrelated_unobserved_edit() {
         let workspace = tempfile::tempdir().unwrap();
-        fs::write(workspace.path().join("input.txt"), b"stable\n").unwrap();
+        fs::write(
+            workspace.path().join("input.txt"),
+            leased_read_fixture_v1("stable\n"),
+        )
+        .unwrap();
         fs::write(workspace.path().join("other.txt"), b"before\n").unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
@@ -2666,7 +2738,7 @@ mod tests {
         );
         assert_eq!(
             retrieved["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
-            "stable\n",
+            leased_read_fixture_v1("stable\n"),
             "unrelated edit retired the source: {retrieved}"
         );
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();

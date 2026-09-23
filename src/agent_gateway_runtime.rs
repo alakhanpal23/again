@@ -16,7 +16,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -89,6 +89,9 @@ const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_secs(2);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
 const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
+// Below this size, exact admission costs more than simply reading the file.
+// Larger reads retain the lease path so concurrent callers can avoid work.
+const DIRECT_CONTEXT_READ_BYTES_V1: u64 = 8 * 1024;
 const INTERNAL_REASONING_CONTEXT_TOKEN_V1: &str = "__again_internal_reasoning_context_v1";
 
 struct RuntimeReasoningContextV1 {
@@ -464,7 +467,12 @@ impl GatewayControlledProviderV1 {
             return Ok(value);
         }
         let bytes = canonical_json_bytes_v1(&value);
-        let Some(binding) = self.direct_stat_binding(&call, &bytes) else {
+        if RepositoryOperationV1::from_call(&call) == Some(RepositoryOperationV1::Read)
+            && bytes.len() > (DIRECT_CONTEXT_READ_BYTES_V1 as usize + 4096)
+        {
+            return Ok(value);
+        }
+        let Some(binding) = self.direct_repository_binding(&call, &bytes) else {
             return Ok(value);
         };
         let Some(coordinator) = self.context_coordinator.as_ref() else {
@@ -475,7 +483,8 @@ impl GatewayControlledProviderV1 {
         }
         let output_digest = blake3::hash(&bytes).to_hex().to_string();
         let recipe = json!({
-            "schema": "again.context.direct-stat-recipe.v1",
+            "schema": "again.context.direct-repository-recipe.v1",
+            "tool": call.translation.namespaced_tool_name(),
             "arguments": call.arguments,
             "outputDigest": output_digest,
         });
@@ -521,12 +530,47 @@ impl GatewayControlledProviderV1 {
         Ok(value)
     }
 
-    fn direct_stat_binding(
+    fn direct_repository_operation(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: &ProviderCall,
+    ) -> Option<RepositoryOperationV1> {
+        let operation = RepositoryOperationV1::from_call(call)?;
+        if operation == RepositoryOperationV1::Stat {
+            return Some(operation);
+        }
+        if operation != RepositoryOperationV1::Read {
+            return None;
+        }
+        let relative = Path::new(call.arguments.get("path")?.as_str()?);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        if epoch.classify_relative(relative).ok()?
+            != crate::workspace_authority::RepositoryNodeKindV1::Regular
+        {
+            return None;
+        }
+        let size = fs::symlink_metadata(self.workspace.join(relative))
+            .ok()?
+            .len();
+        (size <= DIRECT_CONTEXT_READ_BYTES_V1).then_some(operation)
+    }
+
+    fn direct_repository_binding(
         &self,
         call: &ProviderCall,
         provider_bytes: &[u8],
     ) -> Option<ValidatedGatewayReadV1> {
-        if RepositoryOperationV1::from_call(call) != Some(RepositoryOperationV1::Stat) {
+        let operation = RepositoryOperationV1::from_call(call)?;
+        if !matches!(
+            operation,
+            RepositoryOperationV1::Stat | RepositoryOperationV1::Read
+        ) {
             return None;
         }
         let descriptor = self.inner.descriptor();
@@ -536,19 +580,20 @@ impl GatewayControlledProviderV1 {
             return None;
         }
         let mut request_hasher = blake3::Hasher::new();
-        request_hasher.update(b"again.context.direct-stat-request.v1\0");
+        request_hasher.update(b"again.context.direct-repository-request.v1\0");
         request_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+        request_hasher.update(call.translation.namespaced_tool_name().as_bytes());
         request_hasher.update(call.translation.canonical_digest());
         request_hasher.update(descriptor.version.as_bytes());
         let request_digest = request_hasher.finalize().to_hex().to_string();
         let output_digest = blake3::hash(provider_bytes).to_hex().to_string();
         let mut state_hasher = blake3::Hasher::new();
-        state_hasher.update(b"again.context.direct-stat-state.v1\0");
+        state_hasher.update(b"again.context.direct-repository-state.v1\0");
         state_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
         state_hasher.update(output_digest.as_bytes());
         let state_digest = state_hasher.finalize().to_hex().to_string();
         let mut key_hasher = blake3::Hasher::new();
-        key_hasher.update(b"again.context.direct-stat-dependency.v1\0");
+        key_hasher.update(b"again.context.direct-repository-dependency.v1\0");
         key_hasher.update(request_digest.as_bytes());
         let now = now_millis_i64_v1();
         ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
@@ -1186,7 +1231,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
             }
         }
         if self.reuse_mode == GatewayReuseModeV1::Automatic
-            && RepositoryOperationV1::from_call(&call) == Some(RepositoryOperationV1::Stat)
+            && self.direct_repository_operation(&epoch, &call).is_some()
             && self
                 .context_coordinator
                 .as_ref()

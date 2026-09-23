@@ -78,7 +78,8 @@ before changing default routing.
 - Decouple verified task facts from cache hits. A direct built-in read should
   still be able to publish source-backed context and invalidate stale facts;
   the active-task cache can then refuse slow hit paths without losing shared
-  context. Task-bound `repo.stat` now has this direct-observation path, with
+  context. Task-bound `repo.stat` and `repo.read` of files up to 8 KiB now have
+  this direct-observation path, with
   a separate durable origin that grants no cache or retrieval authority. The
   clean-source authenticated release-binary gate at `b0d25ec` passed peer
   visibility and edit invalidation. Extend the route to other built-ins only

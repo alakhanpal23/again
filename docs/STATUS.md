@@ -4,12 +4,12 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 direct context architecture checkpoint
 
-Schema v15 separates direct task observations from leased cache results. A
-task-bound `repo.stat` now publishes a source-backed fact without acquiring a
-cache lease or granting a result reference. Repeated calls execute the built-in
-provider and return fresh output; the observation can only support shared
+Schema v15 separates direct task observations from leased cache results. Task-bound `repo.stat` and `repo.read` of files up to 8 KiB publish
+source-backed facts without acquiring a cache lease or granting a result
+reference. Larger reads retain the lease path and its concurrent join. Repeated
+direct calls execute the built-in provider and return fresh output; the observation can only support shared
 context. A second provider observation checks the initial fact admission,
-and the source recipe reexecutes `repo.stat` during task-start or delta
+and the source recipe reexecutes the built-in tool during task-start or delta
 revalidation. The [clean-source authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-provider-receipt-v1.json)
 passed at `b0d25ec297b1d784b27235a2e05adc9d00a9c823`, including peer fact
 visibility, unrelated-edit preservation, relevant-edit retirement, and refusal
@@ -20,8 +20,13 @@ The [1,000-file local value probe](../bench/results/2026-09-23-direct-context-st
 measured `repo.stat` warm p50 at 0.347 ms through the direct context lane versus
 0.171 ms execute-only; cold p50 was 11.493 ms versus 0.400 ms. These are
 per-call dirty-source diagnostics, not task-level acceleration evidence.
-First task-bound `repo.read` and broad search/tree paths remain coupled to
-costly exact-result proof, and the paired Codex fixtures have not shown a
+The [small-read value probe](../bench/results/2026-09-23-direct-context-small-read-value-v1.json)
+measured cold small read at 16.153 ms through direct context versus 1.048 ms
+execute-only; warm p50 was 0.473 versus 0.266 ms. The previous exact first
+small-read path took about 60 ms on this fixture. These runs used a local
+dirty source and do not establish a task-level gain. Large reads and broad
+search/tree paths remain coupled to costly exact-result proof, and the paired
+Codex fixtures have not shown a
 validated completion or token-cost win. Wider direct admission, corruption
 recovery, balanced repeat-heavy agent cohorts, and exact-SHA hosted gates
 remain open.

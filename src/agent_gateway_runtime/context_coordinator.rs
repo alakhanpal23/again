@@ -516,21 +516,34 @@ impl LocalContextCoordinatorV1 {
         let current = match recipe {
             Some((expected_digest, plan_json)) => {
                 if let Ok(recipe) = serde_json::from_slice::<Value>(&plan_json)
-                    && recipe["schema"] == "again.context.direct-stat-recipe.v1"
+                    && (recipe["schema"] == "again.context.direct-stat-recipe.v1"
+                        || recipe["schema"] == "again.context.direct-repository-recipe.v1")
                 {
-                    recipe.as_object().is_some_and(|object| object.len() == 3)
+                    let legacy_stat = recipe["schema"] == "again.context.direct-stat-recipe.v1";
+                    let tool = if legacy_stat {
+                        Some("stat")
+                    } else {
+                        match recipe["tool"].as_str() {
+                            Some("repo.stat") => Some("stat"),
+                            Some("repo.read") => Some("read"),
+                            _ => None,
+                        }
+                    };
+                    recipe.as_object().is_some_and(|object| object.len() == if legacy_stat { 3 } else { 4 })
                         && recipe["arguments"].is_object()
                         && recipe["outputDigest"] == expected_digest
-                        && crate::agent_gateway_runtime::repository_tools::execute_repository_tool_v1(
-                            &observed.execution_epoch,
-                            "stat",
-                            &recipe["arguments"],
-                        )
-                        .ok()
-                        .is_some_and(|value| {
-                            blake3::hash(&super::canonical_json_bytes_v1(&value))
-                                .to_hex()
-                                .as_str() == expected_digest
+                        && tool.is_some_and(|tool| {
+                            crate::agent_gateway_runtime::repository_tools::execute_repository_tool_v1(
+                                &observed.execution_epoch,
+                                tool,
+                                &recipe["arguments"],
+                            )
+                            .ok()
+                            .is_some_and(|value| {
+                                blake3::hash(&super::canonical_json_bytes_v1(&value))
+                                    .to_hex()
+                                    .as_str() == expected_digest
+                            })
                         })
                 } else {
                     match serde_json::from_slice::<RepositoryObservationPlanV1>(&plan_json) {
