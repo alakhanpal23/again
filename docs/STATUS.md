@@ -33,6 +33,17 @@ are not yet qualified. Rust was nearly neutral and one JavaScript and one
 feature pair regressed; those traces led to a trial prompt change that directs
 the agent to use the edit result and validation before repeating a read or
 diff. The trial needs its own paired outcome evidence before it is kept.
+At clean source `1a91d3d`, the same frozen
+[cold cohort trial](../bench/results/2026-09-23-cold-cohort-postedit-1a91d3d/summary.json)
+again accepted all 10 patches and validations. Again executed only the edit
+and test actions in each task. Its paired median completion ratio improved to
+0.5909; aggregate uncached input, cached input, and output tokens fell from
+74,510/716,800/5,272 baseline to 57,871/428,416/2,526. The nearest-rank
+p95 paired ratio was 1.148: reverse-order Rust and JavaScript tasks finished
+slower despite fewer actions and tokens. This is a promising cold-task
+diagnostic with a tail risk, not a returning-task or full release
+qualification. The post-edit guidance remains in the default prompt pending
+broader task evidence.
 
 ## 2026-09-23 source-matched native reads
 
