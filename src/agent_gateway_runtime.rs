@@ -13,7 +13,7 @@ mod context_coordinator;
 mod repository_tools;
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufReader};
 use std::path::{Component, Path, PathBuf};
@@ -90,6 +90,7 @@ const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_secs(2);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
 const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
+const MAX_PENDING_GATEWAY_CANCELLATIONS_V1: usize = 256;
 // Below this size, exact admission costs more than simply reading the file.
 // Larger reads retain the lease path so concurrent callers can avoid work.
 const DIRECT_CONTEXT_READ_BYTES_V1: u64 = 8 * 1024;
@@ -279,7 +280,6 @@ struct ResolvedRequestV1 {
 enum ActiveCoordinatorV1 {
     Leader {
         lease_id: String,
-        owner: String,
         cancelled: Arc<AtomicBool>,
     },
     Follower {
@@ -307,6 +307,7 @@ pub(crate) struct GatewayControlledProviderV1 {
     store: Arc<Mutex<Store>>,
     context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
+    pending_cancellations: Mutex<VecDeque<(String, u64)>>,
     pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
     reuse_mode: GatewayReuseModeV1,
@@ -418,6 +419,7 @@ impl GatewayControlledProviderV1 {
             store,
             context_coordinator,
             active: Mutex::new(BTreeMap::new()),
+            pending_cancellations: Mutex::new(VecDeque::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
             recent_candidates: Mutex::new(BTreeMap::new()),
             reuse_mode,
@@ -932,13 +934,53 @@ impl GatewayControlledProviderV1 {
         active: ActiveCoordinatorV1,
     ) -> ActiveRegistrationV1<'_> {
         let key = (logical_call_id.to_owned(), physical_attempt_id);
-        self.active
+        let mut registered = self
+            .active
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(key.clone(), active);
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut pending = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let was_cancelled = if let Some(index) = pending.iter().position(|item| item == &key) {
+            pending.remove(index);
+            true
+        } else {
+            false
+        };
+        registered.insert(key.clone(), active.clone());
+        drop(pending);
+        drop(registered);
+        if was_cancelled {
+            self.cancel_active_coordinator(&active);
+        }
         ActiveRegistrationV1 {
             provider: self,
             key,
+        }
+    }
+
+    fn cancel_active_coordinator(&self, active: &ActiveCoordinatorV1) {
+        match active {
+            ActiveCoordinatorV1::Leader {
+                lease_id,
+                cancelled,
+            } => {
+                cancelled.store(true, Ordering::Release);
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .fail_gateway_call(lease_id, GatewayFailureReason::Cancelled);
+            }
+            ActiveCoordinatorV1::Follower { call_id, cancelled } => {
+                cancelled.store(true, Ordering::Release);
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .cancel_gateway_follower(call_id);
+            }
         }
     }
 
@@ -1031,10 +1073,12 @@ impl GatewayControlledProviderV1 {
             physical_attempt_id,
             ActiveCoordinatorV1::Leader {
                 lease_id: lease_id.clone(),
-                owner: owner.clone(),
                 cancelled: Arc::clone(&cancelled),
             },
         );
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_provider_error_v1());
+        }
         let verification_call = call.clone();
         let started = Instant::now();
         let heartbeat_failed = Arc::new(AtomicBool::new(false));
@@ -1335,39 +1379,30 @@ impl StructuredResultCapture for GatewayControlledProviderV1 {
 
 impl ToolCancellation for GatewayControlledProviderV1 {
     fn cancel(&self, cancellation: ProviderCancellation) -> Result<(), ProviderError> {
-        let active = self
+        let key = (
+            cancellation.logical_call_id.as_str().to_owned(),
+            cancellation.physical_attempt_id.get(),
+        );
+        let registered = self
             .active
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&(
-                cancellation.logical_call_id.as_str().to_owned(),
-                cancellation.physical_attempt_id.get(),
-            ))
-            .cloned();
-        if let Some(active) = active {
-            match active {
-                ActiveCoordinatorV1::Leader {
-                    lease_id,
-                    owner,
-                    cancelled,
-                } => {
-                    cancelled.store(true, Ordering::Release);
-                    let _ = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .fail_gateway_call(&lease_id, GatewayFailureReason::Cancelled);
-                    let _ = owner;
+            .unwrap_or_else(|poison| poison.into_inner());
+        let active = registered.get(&key).cloned();
+        if active.is_none() {
+            let mut pending = self
+                .pending_cancellations
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !pending.contains(&key) {
+                if pending.len() >= MAX_PENDING_GATEWAY_CANCELLATIONS_V1 {
+                    pending.pop_front();
                 }
-                ActiveCoordinatorV1::Follower { call_id, cancelled } => {
-                    cancelled.store(true, Ordering::Release);
-                    let _ = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .cancel_gateway_follower(&call_id);
-                }
+                pending.push_back(key);
             }
+        }
+        drop(registered);
+        if let Some(active) = active.as_ref() {
+            self.cancel_active_coordinator(active);
         }
         self.inner.cancel(cancellation)
     }
@@ -2051,6 +2086,7 @@ impl ExperimentalMcpGatewayV1 {
     /// store. Each connection still receives its own gateway and lifecycle,
     /// while cold connection storms avoid concurrently reopening/migrating the
     /// same SQLite authority.
+    #[cfg(feature = "daemon")]
     pub(crate) fn build_with_shared_store_v1(
         workspace: &Path,
         store: Arc<Mutex<Store>>,
@@ -2058,6 +2094,7 @@ impl ExperimentalMcpGatewayV1 {
         Self::build_with_shared_store_mode_v1(workspace, store, GatewayReuseModeV1::Automatic)
     }
 
+    #[cfg(feature = "daemon")]
     pub(crate) fn build_with_shared_store_execute_only_v1(
         workspace: &Path,
         store: Arc<Mutex<Store>>,
@@ -3111,5 +3148,95 @@ mod product_tests {
             .unwrap();
         assert_eq!(stats.executed, 2);
         assert_eq!(stats.inflight_joins, 0);
+    }
+
+    #[test]
+    fn cancellation_before_follower_registration_retires_only_the_follower() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
+        let controlled = GatewayControlledProviderV1::new(
+            Arc::new(SlowRepositoryProviderV1 {
+                executions: AtomicUsize::new(0),
+            }),
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+        )
+        .unwrap();
+        let state_digest = blake3::hash(b"pending-follower-state").to_hex().to_string();
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: blake3::hash(b"pending-follower-request")
+                .to_hex()
+                .to_string(),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now_millis_i64_v1(),
+                valid_until_ms: now_millis_i64_v1() + 60_000,
+            },
+            dependencies: Vec::new(),
+        })
+        .unwrap();
+        let leader_lease = match store
+            .lock()
+            .unwrap()
+            .acquire_gateway_call(&binding, "pending-leader")
+            .unwrap()
+        {
+            GatewayCallAcquisition::Leader { lease_id, .. } => lease_id,
+            other => panic!("expected leader: {other:?}"),
+        };
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .start_gateway_execution(&leader_lease, "pending-leader")
+                .unwrap(),
+            GatewayExecutionStart::Started
+        );
+        let follower_call = match store
+            .lock()
+            .unwrap()
+            .acquire_gateway_call(&binding, "pending-follower")
+            .unwrap()
+        {
+            GatewayCallAcquisition::Follower { call_id, .. } => call_id,
+            other => panic!("expected follower: {other:?}"),
+        };
+        let key = ("pending-follower".to_owned(), 1);
+        controlled
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .push_back(key.clone());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _registration = controlled.remember_active(
+            &key.0,
+            key.1,
+            ActiveCoordinatorV1::Follower {
+                call_id: follower_call.clone(),
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(controlled.pending_cancellations.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .cancel_gateway_follower(&follower_call)
+                .unwrap(),
+            crate::store::GatewayFollowerCancellation::AlreadyCancelled
+        );
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .observe_gateway_call(&binding)
+                .unwrap(),
+            GatewayCallObservation::Inflight { .. }
+        ));
     }
 }

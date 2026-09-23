@@ -3149,6 +3149,7 @@ impl McpGateway {
     /// Serve a transport whose peer and workspace were authenticated by the
     /// same-user local daemon. This boundary is crate-private so ordinary MCP
     /// input cannot mint recipient identity.
+    #[cfg(any(feature = "daemon", test))]
     pub(crate) fn serve_stdio_for_local_recipient_v1<R: BufRead, W: Write + Send>(
         &self,
         reader: &mut R,
