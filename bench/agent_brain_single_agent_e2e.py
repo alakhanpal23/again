@@ -88,6 +88,17 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 raise RuntimeError("latest file observations were not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
+            interactive = subprocess.run(
+                [str(binary), "mcp", "brief", "--workspace", str(workspace),
+                 "--task-id", "interactive", "--task", "Inspect helper.py"],
+                cwd=workspace, env=environment, capture_output=True,
+                text=True, timeout=20, check=True,
+            )
+            interactive_brain = json.loads(interactive.stdout).get("againBrain")
+            if not interactive_brain or "helper.py" not in {
+                item["path"] for item in interactive_brain["recentCurrentFiles"]
+            }:
+                raise RuntimeError("interactive task brief did not receive current Brain history")
 
             launch("second", "Improve a.py second task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
@@ -132,6 +143,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "nextTaskReceivedUnverifiedTestHint": True,
                 "staleEditWithheld": True,
                 "sourceReadObservedAndStaleWithheld": True,
+                "interactiveTaskStartReceivedBrain": True,
                 "clearRemovedEvents": True,
             }
         finally:

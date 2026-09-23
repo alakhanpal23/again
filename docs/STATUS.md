@@ -52,6 +52,19 @@ The [clean-source release launcher gate](../bench/results/2026-09-23-brain-read-
 passes at `31b1f06` with an observed absolute source read, next-task
 handoff, stale-read withholding, edit/test handoff, and Brain clear.
 
+The Brain brief is now calculated inside authenticated `task.start` and
+included in both its structured result and bounded text summary. Interactive
+agents using the MCP tool can receive the same current history as an `again
+codex` launch. The launcher reads that field instead of reopening the store
+and repeating the relevance/freshness work. The installed Codex skill tells
+agents how to use current complete previews and treat prior test commands as
+suggestions. A fake-client end-to-end gate exercises both entry points; live
+interactive task-level speed remains to be measured.
+Because Brain records do not yet carry an authorization scope, `task.start`
+exposes them only through the canonical local-workspace scope; a custom MCP
+scope gets no Brain field. This keeps repository history from crossing an
+unmodeled authorization boundary.
+
 ## 2026-09-23 single-agent Again Brain first slice
 
 `again codex` now requests Codex's structured event stream by default. Its

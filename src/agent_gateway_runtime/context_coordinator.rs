@@ -1043,6 +1043,24 @@ impl LocalContextCoordinatorV1 {
         } else {
             ("full", serde_json::to_value(&snapshot)?, 0)
         };
+        let again_brain = if call.authorization_scope.as_str()
+            == crate::brain::local_brain_scope_v1(&self.workspace)
+        {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            crate::brain::repository_brief_for_task_v1(
+                &store,
+                &self.workspace,
+                &Value::Array(source_previews.clone()),
+                &code_brief,
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
         let structured = json!({
             "schemaVersion": 1,
             "operation": "task.start",
@@ -1069,6 +1087,7 @@ impl LocalContextCoordinatorV1 {
             },
             "relevantCode": code_brief,
             "sourcePreviews": source_previews,
+            "againBrain": again_brain,
             "validationPreview": validation_preview_v1(&source_previews),
             "compulsoryPlan": false
         });
@@ -2028,6 +2047,7 @@ fn task_start_result_v1(structured: Value) -> Value {
         "context": structured["context"],
         "contextFreshness": structured["contextFreshness"],
         "sourcePreviews": structured["sourcePreviews"],
+        "againBrain": structured["againBrain"],
         "relevantCode": {
             "candidates": candidates,
             "incomplete": structured["relevantCode"]["incomplete"],

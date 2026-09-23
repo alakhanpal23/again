@@ -11,6 +11,16 @@ use crate::store::{BrainEventV1, Store};
 
 const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
 
+/// The local Brain has one repository-owner scope until its records carry
+/// per-scope provenance. Do not present it through a custom MCP scope.
+pub fn local_brain_scope_v1(workspace: &Path) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.local-mcp-authorization-scope.v1\0");
+    hasher.update(workspace.as_os_str().as_encoded_bytes());
+    let digest = hasher.finalize().to_hex();
+    format!("local-workspace:{}", &digest[..24])
+}
+
 pub fn codex_completed_events_v1(
     value: &Value,
     workspace: &Path,
@@ -172,6 +182,57 @@ pub fn repository_brief_v1(
         "previousSuccessfulTestCommand": test_hint,
         "testCommandAuthority": "unverified suggestion; run required validation",
     }))
+}
+
+/// Select task-relevant Brain observations once for both MCP task.start and
+/// noninteractive launchers. The source preview and code index are already
+/// bounded by task.start; this adds at most two current file observations.
+pub fn repository_brief_for_task_v1(
+    store: &Store,
+    workspace: &Path,
+    source_previews: &Value,
+    relevant_code: &Value,
+) -> anyhow::Result<Option<Value>> {
+    let already_previewed: Vec<String> = source_previews
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(2)
+        .filter(|preview| preview["complete"] == true)
+        .filter_map(|preview| preview["path"].as_str().map(str::to_owned))
+        .collect();
+    let mut paths = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let sources = source_previews
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|preview| preview["path"].as_str())
+        .chain(
+            relevant_code["candidates"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|candidate| candidate["locator"]["path"].as_str()),
+        );
+    for path in sources {
+        if seen.insert(path.to_owned()) {
+            paths.push(path.to_owned());
+        }
+        if paths.len() == 16 {
+            break;
+        }
+    }
+    let brain = repository_brief_v1(store, workspace, &paths, &already_previewed)?;
+    let has_files = brain["recentCurrentFiles"]
+        .as_array()
+        .is_some_and(|files| !files.is_empty());
+    let has_test = brain["previousSuccessfulTestCommand"].as_str().is_some();
+    if (has_files || has_test) && serde_json::to_vec(&brain)?.len() <= 1024 {
+        Ok(Some(brain))
+    } else {
+        Ok(None)
+    }
 }
 
 fn workspace_file_v1(workspace: &Path, path: &str) -> Option<(String, PathBuf)> {

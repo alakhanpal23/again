@@ -1471,6 +1471,28 @@ mod tests {
             b"pub fn shared_symbol() -> usize { 1 }\n",
         )
         .unwrap();
+        let brain_store = Store::open_for_workspace(workspace.path()).unwrap();
+        brain_store
+            .record_brain_event_v1(&crate::store::BrainEventV1 {
+                session_id: "prior-session".to_owned(),
+                event_id: "prior-edit".to_owned(),
+                task_id: "prior-task".to_owned(),
+                kind: "file_change".to_owned(),
+                path: Some("src/lib.rs".to_owned()),
+                source_digest: Some(
+                    blake3::hash(&fs::read(workspace.path().join("src/lib.rs")).unwrap())
+                        .to_hex()
+                        .to_string(),
+                ),
+                command_digest: None,
+                command_hint: None,
+                exit_code: None,
+                created_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            })
+            .unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
             AuthorizationScopeId::new("same-user-test-scope").unwrap(),
@@ -1487,6 +1509,7 @@ mod tests {
             first_start["result"]["structuredContent"]["presentation"],
             "full"
         );
+        assert!(first_start["result"]["structuredContent"]["againBrain"].is_null());
         let previews = first_start["result"]["structuredContent"]["sourcePreviews"]
             .as_array()
             .unwrap();

@@ -1137,14 +1137,9 @@ fn local_mcp_authorization_scope_v1(
     if let Some(scope) = explicit {
         return Ok(crate::mcp_gateway::AuthorizationScopeId::new(scope)?);
     }
-    let mut hasher = Hasher::new();
-    hasher.update(b"again.local-mcp-authorization-scope.v1\0");
-    hasher.update(workspace.as_os_str().as_encoded_bytes());
-    let digest = hasher.finalize().to_hex();
-    Ok(crate::mcp_gateway::AuthorizationScopeId::new(format!(
-        "local-workspace:{}",
-        &digest[..24]
-    ))?)
+    Ok(crate::mcp_gateway::AuthorizationScopeId::new(
+        crate::brain::local_brain_scope_v1(workspace),
+    )?)
 }
 
 #[cfg(feature = "daemon")]
@@ -1435,7 +1430,7 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
     validate_agent_launch_task_v1(&session.brief)?;
     let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let workspace = &session.workspace;
-    append_repository_brain_v1(&mut prompt, workspace, &session.brief);
+    append_repository_brain_v1(&mut prompt, &session.brief);
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let bridge_args = [
         "mcp",
@@ -1533,7 +1528,7 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
     let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
     let executable = fs::canonicalize(std::env::current_exe()?)?;
     let workspace = &session.workspace;
-    append_repository_brain_v1(&mut prompt, workspace, &session.brief);
+    append_repository_brain_v1(&mut prompt, &session.brief);
     let mcp_config = serde_json::json!({
         "mcpServers": {
             "again": {
@@ -1795,52 +1790,9 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
 }
 
 #[cfg(all(feature = "daemon", unix))]
-fn append_repository_brain_v1(prompt: &mut String, workspace: &Path, brief: &serde_json::Value) {
-    let Ok(store) = Store::open_for_workspace(workspace) else {
-        return;
-    };
-    let mut paths = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let already_previewed: Vec<String> = brief["sourcePreviews"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(2)
-        .filter(|preview| preview["complete"] == true)
-        .filter_map(|preview| preview["path"].as_str().map(str::to_owned))
-        .collect();
-    let sources = brief["sourcePreviews"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|preview| preview["path"].as_str())
-        .chain(
-            brief["relevantCode"]["candidates"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|candidate| candidate["locator"]["path"].as_str()),
-        );
-    for path in sources {
-        if seen.insert(path.to_owned()) {
-            paths.push(path.to_owned());
-        }
-        if paths.len() == 16 {
-            break;
-        }
-    }
-    let Ok(brain) =
-        crate::brain::repository_brief_v1(&store, workspace, &paths, &already_previewed)
-    else {
-        return;
-    };
-    let has_files = brain["recentCurrentFiles"]
-        .as_array()
-        .is_some_and(|files| !files.is_empty());
-    let has_test = brain["previousSuccessfulTestCommand"].as_str().is_some();
-    if (has_files || has_test)
-        && let Ok(serialized) = serde_json::to_string(&brain)
-        && serialized.len() <= 1024
+fn append_repository_brain_v1(prompt: &mut String, brief: &serde_json::Value) {
+    if let Some(brain) = brief.get("againBrain").filter(|brain| !brain.is_null())
+        && let Ok(serialized) = serde_json::to_string(brain)
     {
         prompt.push_str("\nAGAIN_BRAIN ");
         prompt.push_str(&serialized);

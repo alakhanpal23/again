@@ -60,9 +60,13 @@ again reference -- rg --no-ignore --sort=path needle src
 
 The launcher now consumes Codex `--json` events, rendering text for normal
 invocations and preserving raw JSONL when `--json` is explicitly passed. A
-local Again Brain records completed command metadata and file edit digests;
-matching prior edits and an unverified successful-test hint can appear in
-later task briefs. `again brain show --workspace <path>` inspects the metadata,
+local Again Brain records completed command metadata, file edit digests, and
+independently observed short absolute source reads. Matching prior files and
+an unverified successful-test hint can appear in later task briefs. The same
+bounded `againBrain` field is included in authenticated `task.start` for the
+canonical local-workspace scope, giving interactive agents this history as
+well. The launcher consumes that field without a second Brain lookup.
+`again brain show --workspace <path>` inspects the metadata,
 and `again brain clear --workspace <path>` removes it. This does not intercept
 or cache native shell calls, and a prior test hint never permits skipping a
 new validation run.
