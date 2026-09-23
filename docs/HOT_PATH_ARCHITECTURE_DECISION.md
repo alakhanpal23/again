@@ -92,12 +92,13 @@ calls in real tasks; server-side caching alone cannot.
    observations, corruption quarantine, and full-result validation.
 5. Improve the client path: supply a verified preview before the first model
    turn when the launcher supports it, then let the agent inspect unresolved
-   details through MCP. A preview-only task start must not claim the agent's
-   coordination lease; the agent claims from its own authenticated session
-   when needed. Keep the regular `task.start` path for clients without a
-   prebrief launcher. Measure first edit, completion, tokens, and preparation
-   together. Do not add a preview merely because it removes a call if it
-   worsens validated completion time.
+   details through MCP. A standalone preview-only task start claims no lease.
+   A launcher that runs the agent process must hold and renew an authenticated
+   leader lease for that process lifetime, or a second fast launch cannot see
+   it. Keep the regular `task.start` path for clients without a prebrief
+   launcher. Measure first edit, completion, tokens, and preparation together.
+   Do not add a preview merely because it removes a call if it worsens
+   validated completion time.
 
 ## Acceptance gates
 

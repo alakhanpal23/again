@@ -7,10 +7,10 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 The daemon now supports `task.start` with `previewOnly=true`: it registers exact
 task intent and returns verified source previews without claiming a
 coordination lease. `again mcp brief` exposes that result through the
-authenticated daemon, and `again codex` supplies the verified previews in the
-initial `codex exec` prompt while keeping the ordinary Again MCP connection
-available. The agent can claim the lease from its own connection when shared
-coordination is needed. A daemon regression test confirms that a second
+authenticated daemon. `again codex` now uses a normal task start, holds and
+renews its elected leader lease while Codex runs, and supplies the verified
+previews in the initial `codex exec` prompt while keeping the ordinary Again
+MCP connection available. A daemon regression test confirms that a second
 authenticated client can immediately become leader after a preview-only start.
 The launch prompt also carries a bounded current snapshot of source-backed
 facts, explicit unknowns, and result references. It omits that snapshot when
@@ -27,6 +27,16 @@ The [post-change live baseline-first pair](../bench/results/2026-09-23-codex-pai
 passed both edit oracles; the wrapper made no MCP calls before editing and
 reached first edit in 4.85 seconds versus 14.29 seconds for baseline. This
 single local pair does not qualify parallel-leader behavior with live agents.
+The launcher subsequently changed to hold its own leader lease throughout
+`codex exec`, because a fast first launch without a lease left the next fast
+launch unable to see an active peer. An isolated two-process smoke observed
+the leader during the run and its retirement at exit. A new release-binary
+launcher gate exercises two concurrent fake Codex clients, the follower's
+peer guidance, and lease retirement. One further live baseline-first pair
+passed the edit oracle with a 5.32-second first edit versus 15.27 seconds in
+baseline, and no model-initiated MCP call before editing. Its
+[diagnostic report](../bench/results/2026-09-23-codex-pair-held-lease-baseline-first-v1.json)
+is local dirty-source evidence; a live two-agent cohort remains open.
 The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-peer-v1.json)
 passed at clean source `917959f` after the peer observation and blocked-task
 guard were added. Its product lifecycle assertions do not exercise a real
