@@ -2,6 +2,30 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 direct context architecture checkpoint
+
+Schema v15 separates direct task observations from leased cache results. A
+task-bound `repo.stat` now publishes a source-backed fact without acquiring a
+cache lease or granting a result reference. Repeated calls execute the built-in
+provider and return fresh output; the observation can only support shared
+context. A second provider observation checks the initial fact admission,
+and the source recipe reexecutes `repo.stat` during task-start or delta
+revalidation. The [clean-source authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-provider-receipt-v1.json)
+passed at `b0d25ec297b1d784b27235a2e05adc9d00a9c823`, including peer fact
+visibility, unrelated-edit preservation, relevant-edit retirement, and refusal
+to grant cache retrieval from the direct observation. Local daemon library
+tests passed 193 with two ignored; the Python product harness tests passed 27.
+
+The [1,000-file local value probe](../bench/results/2026-09-23-direct-context-stat-value-provider-v3.json)
+measured `repo.stat` warm p50 at 0.347 ms through the direct context lane versus
+0.171 ms execute-only; cold p50 was 11.493 ms versus 0.400 ms. These are
+per-call dirty-source diagnostics, not task-level acceleration evidence.
+First task-bound `repo.read` and broad search/tree paths remain coupled to
+costly exact-result proof, and the paired Codex fixtures have not shown a
+validated completion or token-cost win. Wider direct admission, corruption
+recovery, balanced repeat-heavy agent cohorts, and exact-SHA hosted gates
+remain open.
+
 Current hosted evidence checkpoint: source commit
 `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted
 [`CI run 33145078831`](https://github.com/alakhanpal23/again/actions/runs/33145078831)

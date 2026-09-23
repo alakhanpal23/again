@@ -78,8 +78,13 @@ before changing default routing.
 - Decouple verified task facts from cache hits. A direct built-in read should
   still be able to publish source-backed context and invalidate stale facts;
   the active-task cache can then refuse slow hit paths without losing shared
-  context. The authenticated one-file and 1,000-file probes in `bench/results`
-  currently show slower warm repository reuse despite fewer executions.
+  context. Task-bound `repo.stat` now has this direct-observation path, with
+  a separate durable origin that grants no cache or retrieval authority. The
+  clean-source authenticated release-binary gate at `b0d25ec` passed peer
+  visibility and edit invalidation. Extend the route to other built-ins only
+  after a complete cheap observation is proven. The authenticated one-file
+  and 1,000-file probes in `bench/results` still show slower warm repository
+  reuse despite fewer executions.
 - Measure shared-manifest traversal, result lookup, join latency, cold miss
   overhead, relevant and irrelevant mutation cost, and response bytes on
   1k/10k-file and large-output fixtures. Optimize the dominant measured path.

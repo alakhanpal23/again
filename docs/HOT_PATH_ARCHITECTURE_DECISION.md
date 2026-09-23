@@ -15,11 +15,22 @@ planes:
    save time. The result store owns canonical requests, leases, blobs, and hit
    evidence. A fact in the ledger is never by itself authority to skip a tool.
 
-The gateway selects a lane before doing cache lookup or source-tree proof:
+The gateway selects a lane before doing cache lookup or source-tree proof. The
+first shipped direct observation lane is task-bound `repo.stat`: it executes
+the built-in provider, checks a second matching observation, and records a
+source recipe and task fact. Its durable result has a separate `direct_observation`
+origin and cannot satisfy a cache hit, join, or full-result reference. A warm
+repeat still executes the provider and returns its fresh output. The
+authenticated release-binary gate at `b0d25ec` passed two-client sharing,
+unrelated-edit preservation, relevant-edit retirement, and this authority
+separation. Other task-bound repository reads still enter the exact-result
+path on their first call.
+
+The intended lanes are:
 
 | Lane | When | Required behavior |
 | --- | --- | --- |
-| Direct | Cheap reads, unsafe or unknown effects, or proof at least as costly as execution | Execute provider once. For an active task, separately admit a verified observation if its bounded proof is worthwhile; otherwise expose an explicit unknown. |
+| Direct | Cheap reads, unsafe or unknown effects, or proof at least as costly as execution | Execute provider. For an active task, separately admit a verified observation if its bounded proof is worthwhile; otherwise expose an explicit unknown. `repo.stat` currently performs a second observation before first fact admission. |
 | Coalesced | Identical concurrent deterministic calls with complete observations | One leader executes; followers join only through a valid lease and fresh proof. |
 | Exact | Expensive repeated deterministic calls with a cheaper complete freshness check | Return the stored result only after proof, blob validation, and recipient checks. |
 | Brief | `task.start` and `context.delta` | Return a bounded verified subset promptly; optional indexing must not hold the response. |
@@ -60,7 +71,8 @@ calls in real tasks; server-side caching alone cannot.
 
 ## Implementation order
 
-1. Add a direct-observation admission API. It accepts the executed built-in
+1. Add a direct-observation admission API. The `repo.stat` path is implemented;
+   extend it only to shapes with cheap complete observation. It accepts the executed built-in
    response, canonical call, bounded dependency observation, and before/after
    workspace state. It persists a source-backed fact without first acquiring a
    cache lease. A changed source or incomplete observation withholds the fact.
