@@ -1,0 +1,19 @@
+{
+  "acceptedPairs": 4,
+  "files": [
+    "again-brain-ablation-36adf59-large-cold.json",
+    "again-brain-ablation-36adf59-large-seeded.json",
+    "again-brain-ablation-36adf59-small-cold.json",
+    "again-brain-ablation-36adf59-small-seeded.json"
+  ],
+  "medianSeededOverColdElapsedRatio": 0.6610507534836518,
+  "ratios": [
+    0.7225093796246496,
+    0.8107082028404904,
+    0.5569005494435136,
+    0.5995921273426541
+  ],
+  "schema": "again.brain-ablation-cohort-result.v1",
+  "sourceCommit": "36adf59",
+  "totalPairs": 4
+}

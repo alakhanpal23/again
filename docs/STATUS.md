@@ -4,6 +4,27 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 scoped cross-task Brain and cold cohort preparation
 
+The [returning-task cohort](../bench/results/2026-09-23-returning-cohort-e466f8a/summary.json)
+uses a ledger repair whose faulty helper is outside the initial two source
+previews. A prior completed `sed` read of that helper is seeded through the
+real Again Codex launcher. Across both treatment orders and repositories with
+0 or 1,000 decoy files, all four baseline and Again outcomes passed the edit
+and validation oracle. Again's paired median completion ratio was 0.6018;
+its p95 paired ratio was 0.6692. Again made the edit and test calls in every
+pair while baseline made 4 to 8 calls. The comparison includes the whole
+Again launch brief, so it does not isolate the Brain entry's contribution.
+
+The [same-launcher Brain ablation](../bench/results/2026-09-23-brain-ablation-36adf59/summary.json)
+isolates that contribution for the same synthetic returning task. Both
+conditions use the real Again Codex launcher, workspace, fixture, task, and
+model; only one has the previously verified helper read. All four pairs
+passed the patch and test oracle. Seeded/cold completion ratios were
+0.557, 0.600, 0.723, and 0.811 (median 0.661). In each cold run, Codex
+searched for and read `src/util.py` before editing; in each seeded run it
+edited and tested directly. This directly demonstrates avoided investigation
+for that helper task. It does not yet establish the effect across diverse
+returning tasks or justify skipping tests.
+
 Brain observations now carry the local authorization-scope digest. Schema 18
 migrates older rows with unknown scope but withholds them from scoped task
 briefs until a new observation establishes provenance. The task-start lookup
@@ -19,9 +40,9 @@ The [frozen cold diagnostic cohort](../bench/single_agent_cold_cohort_v1.json)
 adds Rust and JavaScript repairs and a Python feature edit to the two existing
 Python repairs. Each fixed fixture fails its validation before the reference
 change and passes its acceptance oracle afterward. The runner uses both
-treatment orders for every case. This tranche still lacks returning-task
-outcome evidence and metered dollar-cost qualification, so it is not the
-single-agent release gate.
+treatment orders for every case. Returning-task evidence is now recorded
+above, while metered dollar cost and a broader accepted-task cohort remain
+release gates.
 At clean source `0d1008b`, the
 [release Brain gate](../bench/results/2026-09-23-brain-scoped-0d1008b.json)
 passed and the [cold cohort](../bench/results/2026-09-23-cold-cohort-0d1008b/summary.json)
@@ -32,7 +53,7 @@ cached input, and output tokens were all lower, but exact dollar-cost savings
 are not yet qualified. Rust was nearly neutral and one JavaScript and one
 feature pair regressed; those traces led to a trial prompt change that directs
 the agent to use the edit result and validation before repeating a read or
-diff. The trial needs its own paired outcome evidence before it is kept.
+diff. The trial's paired outcome evidence is recorded below.
 At clean source `1a91d3d`, the same frozen
 [cold cohort trial](../bench/results/2026-09-23-cold-cohort-postedit-1a91d3d/summary.json)
 again accepted all 10 patches and validations. Again executed only the edit
@@ -41,8 +62,8 @@ and test actions in each task. Its paired median completion ratio improved to
 74,510/716,800/5,272 baseline to 57,871/428,416/2,526. The nearest-rank
 p95 paired ratio was 1.148: reverse-order Rust and JavaScript tasks finished
 slower despite fewer actions and tokens. This is a promising cold-task
-diagnostic with a tail risk, not a returning-task or full release
-qualification. The post-edit guidance remains in the default prompt pending
+diagnostic with a tail risk, not full release qualification. The post-edit
+guidance remains in the default prompt pending
 broader task evidence.
 
 ## 2026-09-23 source-matched native reads
