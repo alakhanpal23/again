@@ -255,6 +255,16 @@ edit-quality parity and actual redundant-call displacement still unproven.
 The [clean-source release-binary task gate](../bench/results/2026-09-23-authenticated-product-e2e-mid-index-preview-release-v4.json)
 at `7a608ad` passed the 1,000-file named-preview route as well as the
 shared-context, 257-source freshness, and 4,097-file fallback scenarios.
+The [live Codex pair](../bench/results/2026-09-23-codex-1k-preview-pair-v1.json)
+on 1,000 files passed the edit oracle but finished in 60.4 seconds with Again
+versus 25.7 seconds baseline; the Again trace included invalid empty-root
+`repo.list` and an overflowing `git.status`. The gateway now accepts an empty
+optional root path and returns a bounded, explicitly truncated Git status
+with a total count. The [repeat pair](../bench/results/2026-09-23-codex-1k-preview-pair-fixed-v1.json)
+at `167de67` removed those two failures and again passed the edit oracle, but
+finished in 46.7 versus 20.7 seconds, used 204k versus 107k input tokens,
+and had zero exact hits. This is one unbalanced pair per build, not a cohort;
+it does not establish acceleration or redundant-call avoidance.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference
@@ -301,6 +311,11 @@ scenarios plus a 257-source ledger: both task-start and delta withheld
 unchecked entries, the brief stayed full on retry, and targeted retrieval
 refused an edited source. This is bounded-behavior evidence, not a throughput
 or task-quality claim.
+The latest [clean-source release-binary gate](../bench/results/2026-09-23-auth-product-e2e-2dad98f.json)
+at `2dad98f` passed those task scenarios, including the 1,000-file named-file
+preview and 4,097-file fallback. It recorded one physical execution and one
+in-flight join for two duplicate authenticated reads. The cancellation,
+lease, and corruption cases still need migration into this harness.
 
 The current local source also closes unrelated inherited file descriptors at
 macOS daemon startup. A 100-connector stress test exposed a retained pipe that
