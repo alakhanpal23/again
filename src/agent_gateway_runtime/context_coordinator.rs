@@ -4,7 +4,7 @@
 //! and result identifiers remain bounded selectors inside that live scope;
 //! neither a socket path nor a serialized identifier grants retrieval.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +19,7 @@ use crate::agent_gateway::context::{
 use crate::agent_gateway_runtime::SharedObservedWorkspaceV1;
 use crate::code_intelligence::{
     CodeIntelligenceIndexV1, CodeIntelligenceLimitsV1, CodeIntelligenceProviderV1,
-    EditBriefRequestV1,
+    EditBriefCandidateKindV1, EditBriefRequestV1,
 };
 use crate::mcp_gateway::{
     CapturedToolResult, EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, McpError,
@@ -34,6 +34,7 @@ use crate::task_lifecycle::{
     MAX_TASK_DEPENDENCIES_V1, MAX_TASK_LIST_ITEMS_V1, TaskClaimOutcomeV1, TaskDefinitionV1,
     TaskStateV1,
 };
+use crate::workspace_authority::StateDigestV1;
 
 const INTERNAL_COMPLETION_FIELD_V1: &str = "__again_context_completion_v1";
 const MAX_CONTEXT_DELTA_ITEMS_V1: usize = 64;
@@ -42,6 +43,8 @@ const MAX_ACTIVE_CONTEXT_TASKS_V1: usize = 64;
 const DEFAULT_CONTEXT_LEASE_TTL_MS_V1: u64 = 30_000;
 const TASK_COORDINATION_LEASE_TTL_MS_V1: u64 = 5 * 60_000;
 const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
+const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
+const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) enum ContextProviderKindV1 {
@@ -229,7 +232,21 @@ impl LocalContextCoordinatorV1 {
             gateway_result_id,
             &source_locator_v1(call),
         )?;
-        let fact_id = bounded_digest_id_v1("fact", binding.request_digest());
+        let admission_version =
+            store.context_result_admission_version_v1(&identity, gateway_result_id)?;
+        let envelope_material = if admission_version == 1 {
+            gateway_result_id.to_owned()
+        } else {
+            format!("{gateway_result_id}:{admission_version}")
+        };
+        let fact_id = if admission_version == 1 {
+            bounded_digest_id_v1("fact", binding.request_digest())
+        } else {
+            format!(
+                "{}:{admission_version}",
+                bounded_digest_id_v1("fact", binding.request_digest())
+            )
+        };
         let fact = store.context_fact_from_verified_observations_v1(
             &identity,
             &fact_id,
@@ -239,7 +256,7 @@ impl LocalContextCoordinatorV1 {
         let fact_envelope = event_digest_v1(
             b"again.context.verified-fact-envelope.v1\0",
             &identity,
-            gateway_result_id.as_bytes(),
+            envelope_material.as_bytes(),
         );
         let _ = store.admit_context_fact_v1(
             &identity,
@@ -260,7 +277,14 @@ impl LocalContextCoordinatorV1 {
         let retrieval =
             ReasoningRetrievalIdentityV1::new(gateway_result_id, gateway_result_id, total_bytes)
                 .map_err(|refusal| anyhow!(refusal.code()))?;
-        let observation_id = bounded_digest_id_v1("observation", binding.request_digest());
+        let observation_id = if admission_version == 1 {
+            bounded_digest_id_v1("observation", binding.request_digest())
+        } else {
+            format!(
+                "{}:{admission_version}",
+                bounded_digest_id_v1("observation", binding.request_digest())
+            )
+        };
         let observation = CompletedReasoningObservationV1::new(
             &observation_id,
             "verified repository tool observation",
@@ -272,7 +296,7 @@ impl LocalContextCoordinatorV1 {
         let observation_envelope = event_digest_v1(
             b"again.context.completed-observation-envelope.v1\0",
             &identity,
-            gateway_result_id.as_bytes(),
+            envelope_material.as_bytes(),
         );
         let _ = store.append_context_event_v1(
             &identity,
@@ -285,14 +309,14 @@ impl LocalContextCoordinatorV1 {
         let reference_envelope = event_digest_v1(
             b"again.context.result-reference-envelope.v1\0",
             &identity,
-            gateway_result_id.as_bytes(),
+            envelope_material.as_bytes(),
         );
         let _ = store.append_context_event_v1(
             &identity,
             &reference_envelope,
             &ContextLedgerEventInputV1::ResultReference {
                 reference: retrieval,
-                reference_version: 1,
+                reference_version: admission_version,
                 verified_sources: vec![source],
             },
         )?;
@@ -333,6 +357,32 @@ impl LocalContextCoordinatorV1 {
         Ok(())
     }
 
+    pub(super) fn invalidate_source_observation(
+        &self,
+        call: &ProviderCall,
+        gateway_result_id: &str,
+    ) -> Result<()> {
+        let Some(identity) = self.active_identity_for_call(call) else {
+            return Ok(());
+        };
+        let material = format!(
+            "{gateway_result_id}\0{}\0{}",
+            call.logical_call_id.as_str(),
+            call.physical_attempt_id.get()
+        );
+        let envelope = event_digest_v1(
+            b"again.context.source-observation-unavailable-envelope.v1\0",
+            &identity,
+            material.as_bytes(),
+        );
+        let _ = self
+            .store
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .invalidate_context_source_observation_v1(&identity, &envelope, gateway_result_id)?;
+        Ok(())
+    }
+
     fn task_start(self: &Arc<Self>, call: &ProviderCall) -> Result<ContextOperationResultV1> {
         require_keys_v1(
             &call.arguments,
@@ -343,9 +393,16 @@ impl LocalContextCoordinatorV1 {
                 "parentTaskId",
                 "dependencyTaskIds",
                 "supersedesTaskId",
+                "includeSourcePreviews",
             ],
         )?;
         let requested_task_id = bounded_string_v1(&call.arguments, "taskId", 128)?;
+        let include_source_previews = match call.arguments.get("includeSourcePreviews") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| anyhow!("includeSourcePreviews_must_be_boolean"))?,
+            None => false,
+        };
         let prompt = call
             .arguments
             .get("task")
@@ -457,7 +514,7 @@ impl LocalContextCoordinatorV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .context_task_snapshot_v1(&identity)?;
         let cursor = snapshot.cursor();
-        let code_brief = {
+        let (code_brief, source_previews) = {
             let mut index = self
                 .code_index
                 .lock()
@@ -477,14 +534,61 @@ impl LocalContextCoordinatorV1 {
                 .and_then(|request| request.with_maximum_candidates(24));
             match (status, request) {
                 (Ok(_), Some(request)) => {
-                    serde_json::to_value(index.compile_edit_brief_v1(&request, None))?
+                    let brief = index.compile_edit_brief_v1(&request, None);
+                    let mut previews = Vec::new();
+                    let mut seen = BTreeSet::new();
+                    for candidate in brief
+                        .candidates()
+                        .iter()
+                        .filter(|_| include_source_previews)
+                    {
+                        if candidate.kind() != EditBriefCandidateKindV1::File
+                            || !seen.insert(candidate.locator().path())
+                        {
+                            continue;
+                        }
+                        let locator = candidate.locator();
+                        let path = Path::new(locator.path());
+                        let Ok(bytes) = self
+                            .observed_workspace
+                            .execution_epoch
+                            .read_repository_file(path, MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1)
+                        else {
+                            continue;
+                        };
+                        if StateDigestV1::from_domain_and_bytes(
+                            b"again.code-intelligence.source-bytes.v1",
+                            &bytes,
+                        )
+                        .to_hex()
+                            != locator.source_digest()
+                        {
+                            continue;
+                        }
+                        let Ok(text) = String::from_utf8(bytes) else {
+                            continue;
+                        };
+                        previews.push(json!({
+                            "path": locator.path(),
+                            "sourceDigest": locator.source_digest(),
+                            "text": text,
+                            "complete": true
+                        }));
+                        if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
+                            break;
+                        }
+                    }
+                    (serde_json::to_value(brief)?, previews)
                 }
-                _ => json!({
-                    "schemaVersion": 1,
-                    "candidates": [],
-                    "incomplete": true,
-                    "unknowns": [{ "kind": "index_unavailable" }]
-                }),
+                _ => (
+                    json!({
+                        "schemaVersion": 1,
+                        "candidates": [],
+                        "incomplete": true,
+                        "unknowns": [{ "kind": "index_unavailable" }]
+                    }),
+                    Vec::new(),
+                ),
             }
         };
         let delivery_key = Self::delivery_key(&identity);
@@ -541,6 +645,7 @@ impl LocalContextCoordinatorV1 {
             "cursor": cursor.sequence(),
             "context": context,
             "relevantCode": code_brief,
+            "sourcePreviews": source_previews,
             "validationPreview": {
                 "status": "execute_required",
                 "selectors": [],
@@ -549,7 +654,7 @@ impl LocalContextCoordinatorV1 {
             "compulsoryPlan": false
         });
         Ok(ContextOperationResultV1::delivered(
-            tool_result_v1(structured),
+            task_start_result_v1(structured),
             Box::new(ContextDeliveryCompletionV1 {
                 coordinator: Arc::clone(self),
                 identity,
@@ -1125,7 +1230,7 @@ impl ToolDiscovery for LocalContextProviderV1 {
                 (
                     "start",
                     "Start immutable task with shared context",
-                    "Register an exact bounded task definition, converge aliases, enforce dependency readiness, and return shared context.",
+                    "Start a coding task with a stable task ID and exact task text. Converge exact duplicate intent, enforce dependency readiness, and return a bounded edit brief, shared findings, and coordination status. Set includeSourcePreviews=true to receive up to two digest-checked complete source previews when useful. Use complete previews before redundant reads. After editing, reread only when current bytes are needed and the edit result did not show them.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -1140,7 +1245,8 @@ impl ToolDiscovery for LocalContextProviderV1 {
                                 "type": "array", "maxItems": MAX_TASK_DEPENDENCIES_V1,
                                 "items": { "type": "string", "maxLength": 128 }
                             },
-                            "supersedesTaskId": { "type": "string", "maxLength": 128 }
+                            "supersedesTaskId": { "type": "string", "maxLength": 128 },
+                            "includeSourcePreviews": { "type": "boolean", "default": false }
                         },
                         "required": ["taskId"],
                         "additionalProperties": false
@@ -1281,9 +1387,16 @@ impl ToolDiscovery for LocalContextProviderV1 {
                 .map(|(name, input_schema)| ProviderTool {
                     name: name.to_owned(),
                     title: Some(format!("Shared context {name}")),
-                    description: Some(format!(
-                        "Bounded recipient-scoped context {name} operation."
-                    )),
+                    description: Some(
+                        match name {
+                            "delta" => "Read current task findings and invalidations after the last seen cursor before repeating another agent's investigation. Returned facts are source-bound; agent suggestions remain unverified.",
+                            "publish" => "Share a task-scoped suggestion, explicit unknown, or bounded work-lease update with other local agents. Agent-authored statements do not become verified facts.",
+                            "retrieve" => "Retrieve the complete exact result bytes for a reference in this authenticated task scope. A result ID alone does not grant access.",
+                            "cancel" => "Retire this recipient's active task context and compact delivery authority; optionally cancel a matching work lease.",
+                            _ => unreachable!("closed context tool list"),
+                        }
+                        .to_owned(),
+                    ),
                     input_schema,
                     output_schema: Some(output()),
                     annotations: Some(
@@ -1389,6 +1502,45 @@ fn tool_result_v1(structured: Value) -> Value {
     let text = serde_json::to_string(&structured).expect("context values serialize");
     json!({
         "content": [{ "type": "text", "text": text }],
+        "structuredContent": structured
+    })
+}
+
+fn task_start_result_v1(structured: Value) -> Value {
+    let candidates = structured["relevantCode"]["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(8)
+        .map(|candidate| {
+            json!({
+                "kind": candidate["kind"],
+                "name": candidate["name"],
+                "path": candidate["locator"]["path"],
+                "line": candidate["locator"]["startLine"],
+                "sourceDigest": candidate["locator"]["sourceDigest"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let summary = json!({
+        "schemaVersion": 1,
+        "operation": "task.start",
+        "taskId": structured["taskId"],
+        "presentation": structured["presentation"],
+        "coordination": structured["coordination"],
+        "cursor": structured["cursor"],
+        "context": structured["context"],
+        "sourcePreviews": structured["sourcePreviews"],
+        "relevantCode": {
+            "candidates": candidates,
+            "incomplete": structured["relevantCode"]["incomplete"],
+            "unknowns": structured["relevantCode"]["unknowns"]
+        },
+        "validationPreview": structured["validationPreview"],
+        "fullStructuredResultAvailable": true
+    });
+    json!({
+        "content": [{ "type": "text", "text": serde_json::to_string(&summary).expect("task-start summary serializes") }],
         "structuredContent": structured
     })
 }

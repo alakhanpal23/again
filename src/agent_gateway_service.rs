@@ -189,6 +189,11 @@ struct HandshakeBindingV1 {
     compatibility_digest: [u8; COMPATIBILITY_DIGEST_BYTES_V1],
 }
 
+struct GatewaySessionOptionsV1 {
+    authorization_scope: AuthorizationScopeId,
+    execute_only: bool,
+}
+
 struct ActiveConnectionGuardV1 {
     id: u64,
     active: Arc<AtomicUsize>,
@@ -230,6 +235,7 @@ pub struct GatewayDaemonV1 {
     last_activity: Arc<Mutex<Instant>>,
     idle_timeout: Duration,
     next_connection: AtomicU64,
+    execute_only: bool,
     _instance_lock: File,
 }
 
@@ -247,13 +253,35 @@ impl GatewayDaemonV1 {
         workspace: &Path,
         authorization_scope: AuthorizationScopeId,
     ) -> Result<Self, GatewayServiceError> {
-        Self::bind_with_idle_timeout_v1(workspace, authorization_scope, DAEMON_IDLE_TIMEOUT_V1)
+        Self::bind_with_options_v1(
+            workspace,
+            authorization_scope,
+            DAEMON_IDLE_TIMEOUT_V1,
+            false,
+        )
     }
 
+    pub(crate) fn bind_execute_only_v1(
+        workspace: &Path,
+        authorization_scope: AuthorizationScopeId,
+    ) -> Result<Self, GatewayServiceError> {
+        Self::bind_with_options_v1(workspace, authorization_scope, DAEMON_IDLE_TIMEOUT_V1, true)
+    }
+
+    #[cfg(test)]
     fn bind_with_idle_timeout_v1(
         workspace: &Path,
         authorization_scope: AuthorizationScopeId,
         idle_timeout: Duration,
+    ) -> Result<Self, GatewayServiceError> {
+        Self::bind_with_options_v1(workspace, authorization_scope, idle_timeout, false)
+    }
+
+    fn bind_with_options_v1(
+        workspace: &Path,
+        authorization_scope: AuthorizationScopeId,
+        idle_timeout: Duration,
+        execute_only: bool,
     ) -> Result<Self, GatewayServiceError> {
         ensure_supported_platform_v1()?;
         let workspace =
@@ -299,6 +327,7 @@ impl GatewayDaemonV1 {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             idle_timeout,
             next_connection: AtomicU64::new(1),
+            execute_only,
             _instance_lock: instance_lock,
         })
     }
@@ -382,7 +411,10 @@ impl GatewayDaemonV1 {
                         session_nonce: self.session_nonce,
                         compatibility_digest: self.compatibility_digest,
                     };
-                    let authorization_scope = self.authorization_scope.clone();
+                    let session_options = GatewaySessionOptionsV1 {
+                        authorization_scope: self.authorization_scope.clone(),
+                        execute_only: self.execute_only,
+                    };
                     let stop = Arc::clone(&self.stop);
                     let active = Arc::clone(&self.active);
                     let active_for_handler = Arc::clone(&self.active);
@@ -400,7 +432,7 @@ impl GatewayDaemonV1 {
                             &workspace,
                             store,
                             handshake,
-                            &authorization_scope,
+                            &session_options,
                             &stop,
                             &active_for_handler,
                         );
@@ -449,7 +481,7 @@ fn handle_connection_v1(
     workspace: &Path,
     store: Arc<Mutex<Store>>,
     handshake: HandshakeBindingV1,
-    authorization_scope: &AuthorizationScopeId,
+    session_options: &GatewaySessionOptionsV1,
     stop: &AtomicBool,
     active: &AtomicUsize,
 ) -> Result<(), GatewayServiceError> {
@@ -503,21 +535,24 @@ fn handle_connection_v1(
             // Finish all fallible per-session initialization before claiming
             // readiness. A client will receive a typed internal refusal, never
             // a successful handshake followed by unexplained EOF.
-            let gateway =
-                match ExperimentalMcpGatewayV1::build_with_shared_store_v1(workspace, store) {
-                    Ok(gateway) => gateway,
-                    Err(_) => {
-                        return write_response_v1(
-                            &mut stream,
-                            ResponseCodeV1::Internal,
-                            &serde_json::json!({
-                                "schemaVersion": 1,
-                                "status": "initialization_failed",
-                                "guidance": "retry with bounded backoff"
-                            }),
-                        );
-                    }
-                };
+            let gateway = match if session_options.execute_only {
+                ExperimentalMcpGatewayV1::build_with_shared_store_execute_only_v1(workspace, store)
+            } else {
+                ExperimentalMcpGatewayV1::build_with_shared_store_v1(workspace, store)
+            } {
+                Ok(gateway) => gateway,
+                Err(_) => {
+                    return write_response_v1(
+                        &mut stream,
+                        ResponseCodeV1::Internal,
+                        &serde_json::json!({
+                            "schemaVersion": 1,
+                            "status": "initialization_failed",
+                            "guidance": "retry with bounded backoff"
+                        }),
+                    );
+                }
+            };
             write_response_v1(
                 &mut stream,
                 ResponseCodeV1::Ready,
@@ -529,7 +564,12 @@ fn handle_connection_v1(
             let mut reader = BufReader::new(reader_stream);
             let recipient = AuthenticatedStdioRecipientV1::issue_for_local_daemon_v1();
             gateway
-                .serve_authenticated_io(&mut reader, &mut stream, authorization_scope, recipient)
+                .serve_authenticated_io(
+                    &mut reader,
+                    &mut stream,
+                    &session_options.authorization_scope,
+                    recipient,
+                )
                 .map_err(GatewayServiceError::Io)
         }
     }
@@ -1430,11 +1470,41 @@ mod tests {
         let mut agent_a = LocalMcpClientV1::connect(workspace.path());
         let first_start = agent_a.tool(
             "task.start",
-            json!({ "taskId": "shared-task", "task": "update shared_symbol" }),
+            json!({ "taskId": "shared-task", "task": "update shared_symbol", "includeSourcePreviews": true }),
         );
         assert_eq!(
             first_start["result"]["structuredContent"]["presentation"],
             "full"
+        );
+        let previews = first_start["result"]["structuredContent"]["sourcePreviews"]
+            .as_array()
+            .unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0]["path"], "src/lib.rs");
+        assert_eq!(
+            previews[0]["text"],
+            "pub fn shared_symbol() -> usize { 1 }\n"
+        );
+        assert_eq!(previews[0]["complete"], true);
+        assert_eq!(
+            previews[0]["sourceDigest"],
+            crate::workspace_authority::StateDigestV1::from_domain_and_bytes(
+                b"again.code-intelligence.source-bytes.v1",
+                b"pub fn shared_symbol() -> usize { 1 }\n"
+            )
+            .to_hex()
+        );
+        let text = first_start["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let summary: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(summary["sourcePreviews"].as_array().unwrap(), previews);
+        assert_eq!(summary["fullStructuredResultAvailable"], true);
+        assert!(
+            text.len()
+                < serde_json::to_string(&first_start["result"]["structuredContent"])
+                    .unwrap()
+                    .len()
         );
         let read = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
         assert!(read.get("error").is_none(), "{read}");
@@ -1478,6 +1548,10 @@ mod tests {
         assert_eq!(
             shared["result"]["structuredContent"]["presentation"],
             "full"
+        );
+        assert_eq!(
+            shared["result"]["structuredContent"]["sourcePreviews"],
+            json!([])
         );
         let context = &shared["result"]["structuredContent"]["context"];
         assert!(!context["current_facts"].as_array().unwrap().is_empty());
@@ -1915,15 +1989,16 @@ mod tests {
         )
         .unwrap();
         let preserved = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(
-            preserved["result"]["_meta"]["again"]["resultId"],
-            initial_result_id
-        );
+        assert_eq!(preserved["result"]["content"][0]["text"], "first\n");
+        assert!(preserved["result"].get("_meta").is_none());
         let after_irrelevant = Store::open_for_workspace(workspace.path())
             .unwrap()
             .gateway_stats()
             .unwrap();
-        assert_eq!(after_irrelevant.executed, 1, "{after_irrelevant:?}");
+        // The repeated small read executes directly: fresh provider bytes are
+        // cheaper than proving a cache hit, while the original verified fact
+        // and reference remain available to the second agent.
+        assert_eq!(after_irrelevant.executed, 2, "{after_irrelevant:?}");
         let quiet = agent_a.tool(
             "context.delta",
             json!({ "taskId": "paired-gate", "afterCursor": admitted_cursor_a, "limit": 64 }),
@@ -1948,7 +2023,9 @@ mod tests {
             .unwrap()
             .gateway_stats()
             .unwrap();
-        assert_eq!(after_relevant.executed, 2, "{after_relevant:?}");
+        // Divergence first consumes one direct observation, then the full
+        // proof path executes once more to publish the changed source.
+        assert_eq!(after_relevant.executed, 4, "{after_relevant:?}");
         assert_eq!(
             after_relevant.false_hit_quarantines, 0,
             "{after_relevant:?}"
@@ -1991,19 +2068,216 @@ mod tests {
 
         fs::write(workspace.path().join("unrelated.txt"), b"changed twice\n").unwrap();
         let warm = agent_a.tool("repo.read", json!({ "path": "input.txt" }));
-        assert_eq!(
-            warm["result"]["_meta"]["again"]["resultId"],
-            changed_result_id
-        );
+        assert_eq!(warm["result"]["content"][0]["text"], "second\n");
+        assert!(warm["result"].get("_meta").is_none());
         let final_stats = Store::open_for_workspace(workspace.path())
             .unwrap()
             .gateway_stats()
             .unwrap();
-        assert_eq!(final_stats.executed, 2, "{final_stats:?}");
+        assert_eq!(final_stats.executed, 5, "{final_stats:?}");
         assert_eq!(final_stats.false_hit_quarantines, 0, "{final_stats:?}");
 
         agent_b.stream.shutdown(std::net::Shutdown::Both).unwrap();
         agent_a.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn repeated_task_search_uses_fresh_output_and_rebuilds_context_after_mutation() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        fs::write(workspace.path().join("src/a.py"), b"needle = 1\n").unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("task-search-value-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "search-task", "task": "inspect needle references" }),
+        );
+        let cursor = start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let arguments = json!({ "path": "src", "pattern": "needle" });
+        let first = agent.tool("repo.search", arguments.clone());
+        let original_result_id = first["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let repeat = agent.tool("repo.search", arguments.clone());
+        assert_eq!(first["result"]["content"], repeat["result"]["content"]);
+        assert!(repeat["result"].get("_meta").is_none());
+        let stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.executed, 2, "{stats:?}");
+        assert_eq!(stats.exact_hits, 0, "{stats:?}");
+
+        fs::write(workspace.path().join("src/a.py"), b"other = 1\n").unwrap();
+        let changed = agent.tool("repo.search", arguments);
+        assert_eq!(
+            changed["result"]["structuredContent"]["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let changed_result_id = changed["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap();
+        assert_ne!(changed_result_id, original_result_id);
+        let delta = agent.tool(
+            "context.delta",
+            json!({ "taskId": "search-task", "afterCursor": cursor, "limit": 64 }),
+        );
+        assert!(
+            delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation")
+        );
+        let stale = agent.tool(
+            "context.retrieve",
+            json!({ "taskId": "search-task", "resultId": original_result_id }),
+        );
+        assert_eq!(stale["error"]["data"]["reason"], "retrieval_refused");
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn repeated_large_task_read_compares_the_stored_digest_without_reuse() {
+        let workspace = tempfile::tempdir().unwrap();
+        let content = "x".repeat(300_000);
+        fs::write(workspace.path().join("large.txt"), &content).unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("large-task-read-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "large-read", "task": "inspect large.txt" }),
+        );
+        assert!(start.get("error").is_none(), "{start}");
+        let first = agent.tool("repo.read", json!({ "path": "large.txt" }));
+        assert!(first["result"]["_meta"]["again"]["resultId"].is_string());
+        let repeat = agent.tool("repo.read", json!({ "path": "large.txt" }));
+        assert_eq!(repeat["result"]["content"][0]["text"], content);
+        assert!(repeat["result"].get("_meta").is_none());
+        let stats = Store::open_for_workspace(workspace.path())
+            .unwrap()
+            .gateway_stats()
+            .unwrap();
+        assert_eq!(stats.executed, 2, "{stats:?}");
+        assert_eq!(stats.exact_hits, 0, "{stats:?}");
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(workspace.path()).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn deleted_task_source_retires_its_verified_fact_and_reference() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"current\n").unwrap();
+        let daemon = GatewayDaemonV1::bind(
+            workspace.path(),
+            AuthorizationScopeId::new("deleted-task-source-scope").unwrap(),
+        )
+        .unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(workspace.path());
+        let mut peer = LocalMcpClientV1::connect(workspace.path());
+        let start = agent.tool(
+            "task.start",
+            json!({ "taskId": "deleted-source", "task": "inspect input.txt" }),
+        );
+        let peer_start = peer.tool(
+            "task.start",
+            json!({ "taskId": "deleted-source", "task": "inspect input.txt" }),
+        );
+        assert!(peer_start.get("error").is_none(), "{peer_start}");
+        let peer_cursor = peer_start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let cursor = start["result"]["structuredContent"]["cursor"]
+            .as_u64()
+            .unwrap();
+        let first = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        let result_id = first["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let shared = peer.tool(
+            "context.retrieve",
+            json!({ "taskId": "deleted-source", "resultId": result_id }),
+        );
+        assert_eq!(
+            shared["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "current\n"
+        );
+        fs::remove_file(workspace.path().join("input.txt")).unwrap();
+        let missing = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        assert!(missing.get("error").is_some(), "{missing}");
+        let delta = agent.tool(
+            "context.delta",
+            json!({ "taskId": "deleted-source", "afterCursor": cursor, "limit": 64 }),
+        );
+        assert!(
+            delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation"),
+            "deleted source remained current: {delta}"
+        );
+        let peer_delta = peer.tool(
+            "context.delta",
+            json!({ "taskId": "deleted-source", "afterCursor": peer_cursor, "limit": 64 }),
+        );
+        assert!(
+            peer_delta["result"]["structuredContent"]["delta"]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|event| event["kind"] == "invalidation"),
+            "peer missed deleted-source invalidation: {peer_delta}"
+        );
+        let stale = peer.tool(
+            "context.retrieve",
+            json!({ "taskId": "deleted-source", "resultId": result_id }),
+        );
+        assert_eq!(
+            stale["error"]["data"]["reason"], "retrieval_refused",
+            "{stale}"
+        );
+        fs::write(workspace.path().join("input.txt"), b"current\n").unwrap();
+        let restored = agent.tool("repo.read", json!({ "path": "input.txt" }));
+        assert_eq!(restored["result"]["content"][0]["text"], "current\n");
+        let restored_result_id = restored["result"]["_meta"]["again"]["resultId"]
+            .as_str()
+            .unwrap();
+        assert_ne!(restored_result_id, result_id);
+        let recovered = peer.tool(
+            "context.retrieve",
+            json!({ "taskId": "deleted-source", "resultId": restored_result_id }),
+        );
+        assert_eq!(
+            recovered["result"]["structuredContent"]["toolResult"]["content"][0]["text"],
+            "current\n",
+            "restored source did not regain a verified reference: {recovered}"
+        );
+        peer.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();
         server.join().unwrap().unwrap();
     }

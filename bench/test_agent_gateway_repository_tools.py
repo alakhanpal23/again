@@ -16,10 +16,6 @@ SPEC.loader.exec_module(HARNESS)
 
 
 class RepositoryToolsHarnessTests(unittest.TestCase):
-    def test_expected_catalog_includes_local_alpha_task_start_once(self):
-        self.assertEqual(len(HARNESS.EXPECTED_ADVERTISED_TOOLS), 14)
-        self.assertIn("again.task_start", HARNESS.EXPECTED_ADVERTISED_TOOLS)
-
     def test_strict_json_rejects_duplicates_malformed_utf8_and_bounds(self):
         self.assertEqual(HARNESS.strict_json_loads(b'{"a":1}'), {"a": 1})
         with self.assertRaises(HARNESS.HarnessError):

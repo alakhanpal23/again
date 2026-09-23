@@ -11,10 +11,6 @@ pub mod context_compiler;
 mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
-#[path = "agent_gateway_runtime/task_start.rs"]
-mod task_start;
-#[path = "agent_gateway_runtime/workspace_observation.rs"]
-mod workspace_observation;
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -61,12 +57,11 @@ use crate::mcp_gateway::{
     ToolExecution, UpstreamProvider, authorization_scope_digest_v1,
 };
 use crate::store::{
-    DependencyChangeInputV1, DependencyChangeReasonV1, GatewayCallAcquisition,
-    GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1, GatewayDependencyV1,
-    GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1, GatewayFullResultV1,
-    GatewayHeartbeat, GatewayOperationDispositionV1, GatewayReasoningContextQueryV1,
-    GatewayRouteProofObservationV1, GatewayServedRouteV1, GatewayStats, Store,
-    ValidatedGatewayReadV1, gateway_policy_digest,
+    GatewayCallAcquisition, GatewayCallObservation, GatewayCompletion, GatewayCoordinatorInputV1,
+    GatewayDependencyV1, GatewayExecutionStart, GatewayFailureReason, GatewayFreshnessEvidenceV1,
+    GatewayFullResultV1, GatewayHeartbeat, GatewayOperationDispositionV1,
+    GatewayReasoningContextQueryV1, GatewayRouteProofObservationV1, GatewayServedRouteV1,
+    GatewayStats, Store, ValidatedGatewayReadV1, gateway_policy_digest,
 };
 use crate::workspace_authority::{
     CompleteToolStateV1, EnvironmentObservationPlanV1, EnvironmentRelevanceProofV1,
@@ -76,15 +71,12 @@ use crate::workspace_authority::{
     TaskStateInputV1, TaskStateV1, WorkspaceAuthorityLimitsV1, WorkspaceExecutionEpochV1,
     issue_no_external_dependencies_v1, observe_environment_v1,
 };
-use workspace_observation::{ObservedWorkspaceRequestV1, WorkspaceObservationManagerV1};
 
 const POLICY_VERSION_V1: &str = "agent-gateway-exact-v1";
 const REPOSITORY_PROVIDER_ID_V1: &str = "repo";
 const REPOSITORY_PROVIDER_IMPLEMENTATION_V1: &str = "again.repository-provider-v1";
 const GIT_PROVIDER_ID_V1: &str = "git";
 const GIT_PROVIDER_IMPLEMENTATION_V1: &str = "again.git-provider-v1";
-const TASK_START_PROVIDER_ID_V1: &str = "again";
-const TASK_START_PROVIDER_IMPLEMENTATION_V1: &str = "again.task-start-provider-v1";
 const MAX_REPOSITORY_FILE_BYTES_V1: u64 = 4 * 1024 * 1024;
 const MAX_REPOSITORY_SCAN_BYTES_V1: u64 = 16 * 1024 * 1024;
 const MAX_REPOSITORY_ENTRIES_V1: usize = 20_000;
@@ -192,7 +184,7 @@ fn gateway_workspace_limits_v1() -> WorkspaceAuthorityLimitsV1 {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RepositoryOperationV1 {
     Read,
     Search,
@@ -207,8 +199,25 @@ enum RepositoryOperationV1 {
     GitLog,
     GitShow,
     GitBlame,
-    TaskStart,
 }
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GatewayReuseModeV1 {
+    Automatic,
+    #[cfg(test)]
+    ForceReuse,
+    ExecuteOnly,
+}
+
+// A 250-file authenticated probe measured git.status warm reuse at 53.65 ms
+// versus 14.89 ms direct. The index crossed 16 KiB at that scale. A standalone
+// probe confirmed that the default bypass is near direct latency, while the
+// one-file index retains a measured reuse win. This check can only disable
+// reuse, never authorize a cache hit.
+const STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1: u64 = 16 * 1024;
+// Bound retained provider values by serialized size (64 entries, 16 MiB total
+// serialized budget); larger results use digest comparison.
+const MAX_RECENT_PROVIDER_VALUE_BYTES_V1: u64 = 256 * 1024;
 
 impl RepositoryOperationV1 {
     fn from_call(call: &ProviderCall) -> Option<Self> {
@@ -232,17 +241,12 @@ impl RepositoryOperationV1 {
             "git.log" => Some(Self::GitLog),
             "git.show" => Some(Self::GitShow),
             "git.blame" => Some(Self::GitBlame),
-            "again.task_start" => Some(Self::TaskStart),
             _ => None,
         }
     }
 
     fn provider_boundary(self) -> (&'static str, &'static str) {
         match self {
-            Self::TaskStart => (
-                TASK_START_PROVIDER_ID_V1,
-                TASK_START_PROVIDER_IMPLEMENTATION_V1,
-            ),
             Self::GitStatus | Self::GitDiff | Self::GitLog | Self::GitShow | Self::GitBlame => {
                 (GIT_PROVIDER_ID_V1, GIT_PROVIDER_IMPLEMENTATION_V1)
             }
@@ -256,17 +260,13 @@ impl RepositoryOperationV1 {
     fn is_git(self) -> bool {
         self.provider_boundary().0 == GIT_PROVIDER_ID_V1
     }
-
-    const fn cache_tag(self) -> u8 {
-        self as u8
-    }
 }
 
 #[derive(Debug)]
 struct ResolvedRequestV1 {
     core_call: GatewayToolCallV1,
     binding: ValidatedGatewayReadV1,
-    operation: RepositoryOperationV1,
+    observation_plan: RepositoryObservationPlanV1,
 }
 
 #[derive(Clone)]
@@ -297,12 +297,36 @@ trait RepositoryEpochProviderV1: UpstreamProvider {
 pub(crate) struct GatewayControlledProviderV1 {
     inner: Arc<dyn RepositoryEpochProviderV1>,
     workspace: PathBuf,
-    observations: Arc<WorkspaceObservationManagerV1>,
+    observed_workspace: SharedObservedWorkspaceV1,
     store: Arc<Mutex<Store>>,
     context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
-    pending_reasoning: Mutex<BTreeMap<String, Box<dyn ReasoningContextCandidateV1>>>,
+    pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
+    reuse_mode: GatewayReuseModeV1,
+}
+
+#[derive(Clone)]
+struct SharedObservedWorkspaceV1 {
+    execution_epoch: Arc<WorkspaceExecutionEpochV1>,
+    manifest: Arc<Mutex<ObservedManifestV1>>,
+}
+
+impl SharedObservedWorkspaceV1 {
+    fn begin(workspace: &Path) -> Result<Self> {
+        let limits = gateway_workspace_limits_v1();
+        let execution_epoch = Arc::new(
+            WorkspaceExecutionEpochV1::begin(workspace, &limits)
+                .map_err(|_| anyhow!("descriptor-retained workspace issuance failed"))?,
+        );
+        let manifest = execution_epoch
+            .begin_observed_manifest(&limits)
+            .map_err(|_| anyhow!("sealed observed manifest issuance failed"))?;
+        Ok(Self {
+            execution_epoch,
+            manifest: Arc::new(Mutex::new(manifest)),
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -332,6 +356,19 @@ impl SharedObservedWorkspaceV1 {
 struct RecentGatewayCandidateV1 {
     binding: ValidatedGatewayReadV1,
     gateway_result_id: String,
+    task_id: Option<String>,
+    stdout_digest: String,
+    provider_value: Option<Arc<Value>>,
+}
+
+impl RecentGatewayCandidateV1 {
+    fn matches_fresh_provider_result(&self, value: &Value) -> bool {
+        if let Some(prior) = self.provider_value.as_deref() {
+            return prior == value;
+        }
+        let bytes = serde_json::to_vec(value).expect("JSON values are serializable");
+        blake3::hash(&bytes).to_hex().as_str() == self.stdout_digest
+    }
 }
 
 struct LoadedGatewayResultV1 {
@@ -360,17 +397,36 @@ impl GatewayControlledProviderV1 {
         inner: Arc<dyn RepositoryEpochProviderV1>,
         workspace: PathBuf,
         store: Arc<Mutex<Store>>,
-        observations: Arc<WorkspaceObservationManagerV1>,
+    ) -> Result<Self> {
+        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        Ok(Self::new_with_observed_workspace(
+            inner,
+            workspace,
+            observed_workspace,
+            store,
+            None,
+            GatewayReuseModeV1::ForceReuse,
+        ))
+    }
+
+    fn new_with_observed_workspace(
+        inner: Arc<dyn RepositoryEpochProviderV1>,
+        workspace: PathBuf,
+        observed_workspace: SharedObservedWorkspaceV1,
+        store: Arc<Mutex<Store>>,
+        context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
+        reuse_mode: GatewayReuseModeV1,
     ) -> Self {
         Self {
             inner,
             workspace,
-            observations,
+            observed_workspace,
             store,
             context_coordinator,
             active: Mutex::new(BTreeMap::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
             recent_candidates: Mutex::new(BTreeMap::new()),
+            reuse_mode,
         }
     }
 
@@ -389,77 +445,40 @@ impl GatewayControlledProviderV1 {
         self.inner.execute_with_epoch(epoch, call, secrets)
     }
 
-    fn resolve(
-        &self,
-        call: &ProviderCall,
-    ) -> Option<(ResolvedRequestV1, Arc<WorkspaceExecutionEpochV1>)> {
+    fn large_git_status_index(&self) -> bool {
+        fs::symlink_metadata(self.workspace.join(".git/index"))
+            .ok()
+            .is_some_and(|metadata| {
+                metadata.is_file() && metadata.len() >= STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1
+            })
+    }
+
+    fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
         let operation = RepositoryOperationV1::from_call(call)?;
         let descriptor = self.inner.descriptor();
         let (provider_id, implementation) = operation.provider_boundary();
         if descriptor.id != provider_id || descriptor.implementation != implementation {
             return None;
         }
-        let observed = self.observations.observe(&call.arguments, operation).ok()?;
-        let resolved = resolve_repository_request_v1(&observed, call, operation).ok()?;
-        if operation == RepositoryOperationV1::TaskStart
-            && self
-                .record_task_start_dependency_changes_v1(call, &resolved.binding)
-                .is_err()
-        {
-            return None;
-        }
-        Some((resolved, observed.execution_epoch))
-    }
-
-    fn record_task_start_dependency_changes_v1(
-        &self,
-        call: &ProviderCall,
-        current: &ValidatedGatewayReadV1,
-    ) -> Result<()> {
-        let Some(previous) = self.recent_candidate(&Self::recent_candidate_key(call)) else {
-            return Ok(());
-        };
-        if previous.binding.binding_digest() == current.binding_digest() {
-            return Ok(());
-        }
-        let prior = previous
-            .binding
-            .dependencies()
-            .iter()
-            .map(|dependency| (&dependency.key_digest, &dependency.value_digest))
-            .collect::<BTreeMap<_, _>>();
-        let scope_digest = authorization_scope_digest_v1(&call.authorization_scope);
-        let observation_epoch_digest = current.state_digest();
-        let reason = DependencyChangeReasonV1::new("repository_content")?;
-        let store = self
-            .store
+        let mut manifest = self
+            .observed_workspace
+            .manifest
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        for dependency in current.dependencies() {
-            let Some(prior_value) = prior.get(&dependency.key_digest) else {
-                continue;
-            };
-            if *prior_value == &dependency.value_digest {
-                continue;
-            }
-            store.record_dependency_change_v1(
-                &DependencyChangeInputV1 {
-                    scope_digest: scope_digest.clone(),
-                    observation_epoch_digest: observation_epoch_digest.to_owned(),
-                    dependency_key_digest: dependency.key_digest.clone(),
-                    prior_dependency_value_digest: (*prior_value).clone(),
-                    current_dependency_value_digest: dependency.value_digest.clone(),
-                    reason: reason.clone(),
-                },
-                task_start::MAX_DEPENDENCY_REPORT_RESULTS_V1,
-            )?;
+        let resolved = resolve_repository_request_v1(
+            &self.observed_workspace.execution_epoch,
+            &mut manifest,
+            call,
+            operation,
+        )
+        .ok()?;
+        drop(manifest);
+        if let Some(coordinator) = self.context_coordinator.as_ref() {
+            coordinator
+                .observe_dependencies(call, &resolved.binding)
+                .ok()?;
         }
-        Ok(())
-    }
-
-    fn fresh_direct_epoch(&self) -> Result<WorkspaceExecutionEpochV1, ProviderError> {
-        WorkspaceExecutionEpochV1::begin(&self.workspace, &gateway_workspace_limits_v1())
-            .map_err(|_| provider_io_v1(anyhow!("descriptor-retained workspace issuance failed")))
+        Some(resolved)
     }
 
     fn owner(call: &ProviderCall) -> String {
@@ -493,6 +512,25 @@ impl GatewayControlledProviderV1 {
         gateway_result_id: &str,
     ) {
         let key = Self::recent_candidate_key(call);
+        {
+            let recent = self
+                .recent_candidates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if recent.get(&key).is_some_and(|candidate| {
+                candidate.binding.binding_digest() == binding.binding_digest()
+                    && candidate.gateway_result_id == gateway_result_id
+            }) {
+                return;
+            }
+        }
+        let Some(loaded) = self
+            .load_stored_exact(binding, gateway_result_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
         let mut recent = self
             .recent_candidates
             .lock()
@@ -503,11 +541,21 @@ impl GatewayControlledProviderV1 {
         {
             recent.remove(&oldest_key);
         }
+        let provider_value = (loaded.full.result.stdout_bytes
+            <= MAX_RECENT_PROVIDER_VALUE_BYTES_V1)
+            .then(|| Arc::new(loaded.value));
         recent.insert(
             key,
             RecentGatewayCandidateV1 {
                 binding: binding.clone(),
                 gateway_result_id: gateway_result_id.to_owned(),
+                task_id: self
+                    .context_coordinator
+                    .as_ref()
+                    .and_then(|coordinator| coordinator.active_identity_for_call(call))
+                    .map(|identity| identity.task_id().to_owned()),
+                stdout_digest: loaded.full.result.stdout_digest,
+                provider_value,
             },
         );
     }
@@ -570,48 +618,15 @@ impl GatewayControlledProviderV1 {
         &self,
         resolved: &ResolvedRequestV1,
         call: &ProviderCall,
-        mut loaded: LoadedGatewayResultV1,
-        provider_call_avoided: bool,
+        loaded: LoadedGatewayResultV1,
     ) -> Value {
         let store = self
             .store
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let mut task_start_context = None;
-        let reasoning: Option<Box<dyn ReasoningContextCandidateV1>> =
-            if resolved.operation == RepositoryOperationV1::TaskStart {
-                match task_start::take_context_for_result_v1(
-                    &store,
-                    &self.workspace,
-                    resolved,
-                    call,
-                    &mut loaded,
-                    provider_call_avoided,
-                ) {
-                    Ok(Some(reasoning)) => {
-                        match task_start::compile_full_context_for_call_v1(reasoning, call) {
-                            Ok(context) => task_start_context = Some(context),
-                            Err(failure) => {
-                                task_start::attach_failure_v1(&mut loaded.value, failure);
-                            }
-                        }
-                        None
-                    }
-                    Ok(None) => None,
-                    Err(failure) => {
-                        task_start::attach_failure_v1(&mut loaded.value, failure);
-                        None
-                    }
-                }
-            } else {
-                reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
-                    .ok()
-                    .flatten()
-                    .map(|input| {
-                        Box::new(RuntimeReasoningContextV1 { input })
-                            as Box<dyn ReasoningContextCandidateV1>
-                    })
-            };
+        let reasoning = reasoning_context_for_result_v1(&store, &self.workspace, resolved, call)
+            .ok()
+            .flatten();
         drop(store);
         if let Some(coordinator) = self.context_coordinator.as_ref() {
             let _ = coordinator.admit_verified_result(
@@ -633,16 +648,12 @@ impl GatewayControlledProviderV1 {
             pending.insert(token.clone(), reasoning);
             Some(token)
         });
-        let mut value = attach_result_reference_v1(
+        attach_result_reference_v1(
             loaded.value,
             &loaded.full.gateway_result_id,
             &loaded.full.result,
             reasoning_token.as_deref(),
-        );
-        if let Some(context) = task_start_context {
-            task_start::attach_full_context_v1(&mut value, context);
-        }
-        value
+        )
     }
 
     fn load_exact(
@@ -650,11 +661,10 @@ impl GatewayControlledProviderV1 {
         resolved: &ResolvedRequestV1,
         gateway_result_id: &str,
         call: &ProviderCall,
-        provider_call_avoided: bool,
     ) -> Result<Option<Value>> {
         Ok(self
             .load_stored_exact(&resolved.binding, gateway_result_id)?
-            .map(|loaded| self.attach_loaded_exact(resolved, call, loaded, provider_call_avoided)))
+            .map(|loaded| self.attach_loaded_exact(resolved, call, loaded)))
     }
 
     fn execute_as_leader(
@@ -717,15 +727,12 @@ impl GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
-                    if resolved.operation == RepositoryOperationV1::TaskStart {
-                        return Err(task_start::unavailable_v1("heartbeat_failed"));
-                    }
                     return Ok(value);
                 }
                 let revalidated = self.resolve(&verification_call);
                 if revalidated
                     .as_ref()
-                    .map(|(request, _)| request.binding.binding_digest())
+                    .map(|request| request.binding.binding_digest())
                     != Some(resolved.binding.binding_digest())
                 {
                     let _ = self
@@ -733,9 +740,6 @@ impl GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
-                    if resolved.operation == RepositoryOperationV1::TaskStart {
-                        return Err(task_start::unavailable_v1("revalidation_failed"));
-                    }
                     return Ok(value);
                 }
                 if cancelled.load(Ordering::Acquire) {
@@ -777,17 +781,18 @@ impl GatewayControlledProviderV1 {
                     Ok::<_, anyhow::Error>((outcome, stored))
                 })();
                 match completion {
-                    Ok(GatewayCompletion::Completed {
-                        gateway_result_id, ..
-                    })
-                    | Ok(GatewayCompletion::AlreadyCompleted {
-                        gateway_result_id, ..
-                    }) => match self.load_exact(
-                        resolved,
-                        &gateway_result_id,
-                        &verification_call,
-                        false,
-                    ) {
+                    Ok((
+                        GatewayCompletion::Completed {
+                            gateway_result_id, ..
+                        },
+                        stored,
+                    ))
+                    | Ok((
+                        GatewayCompletion::AlreadyCompleted {
+                            gateway_result_id, ..
+                        },
+                        stored,
+                    )) => match self.load_exact(resolved, &gateway_result_id, &verification_call) {
                         Ok(Some(exact)) => {
                             // Dependency-proof registration controls only
                             // future reuse authority. The just-executed,
@@ -803,16 +808,35 @@ impl GatewayControlledProviderV1 {
                             }
                             Ok(exact)
                         }
-                        Ok(None) | Err(_)
-                            if resolved.operation == RepositoryOperationV1::TaskStart =>
-                        {
-                            Err(task_start::unavailable_v1("stored_result_unavailable"))
+                        Ok(None) | Err(_) => {
+                            // Completion already proved and committed this
+                            // exact stored result. If a contended immediate
+                            // reload is unavailable, preserve the durable
+                            // reference on the validated provider value instead
+                            // of returning one unreferenced duplicate response.
+                            if let Some(coordinator) = self.context_coordinator.as_ref() {
+                                let _ = coordinator.admit_verified_result(
+                                    &verification_call,
+                                    &resolved.binding,
+                                    &gateway_result_id,
+                                    stored.duration_ms,
+                                );
+                            }
+                            if self.register_result_dependency(resolved, &gateway_result_id) {
+                                self.remember_candidate(
+                                    &verification_call,
+                                    &resolved.binding,
+                                    &gateway_result_id,
+                                );
+                            }
+                            Ok(attach_result_reference_v1(
+                                value,
+                                &gateway_result_id,
+                                &stored,
+                                None,
+                            ))
                         }
-                        Ok(None) | Err(_) => Ok(value),
                     },
-                    Ok(_) | Err(_) if resolved.operation == RepositoryOperationV1::TaskStart => {
-                        Err(task_start::unavailable_v1("completion_failed"))
-                    }
                     Ok(_) | Err(_) => Ok(value),
                 }
             }
@@ -857,23 +881,25 @@ impl GatewayControlledProviderV1 {
                     if self
                         .resolve(call)
                         .as_ref()
-                        .map(|(request, _)| request.binding.binding_digest())
+                        .map(|request| request.binding.binding_digest())
                         != Some(resolved.binding.binding_digest())
                     {
                         break Ok(None);
                     }
-                    let loaded = self
-                        .load_exact(resolved, &gateway_result_id, call, true)
-                        .map_err(|_| {
-                            ProviderError::gateway_authored(
-                                McpError::typed(
-                                    McpErrorCode::InternalError,
-                                    "verified gateway result became unavailable",
+                    let dependency_registered =
+                        self.register_result_dependency(resolved, &gateway_result_id);
+                    let loaded =
+                        self.load_exact(resolved, &gateway_result_id, call)
+                            .map_err(|_| {
+                                ProviderError::gateway_authored(
+                                    McpError::typed(
+                                        McpErrorCode::InternalError,
+                                        "verified gateway result became unavailable",
+                                    )
+                                    .with_data(json!({ "reason": "verified_result_unavailable" })),
                                 )
-                                .with_data(json!({ "reason": "verified_result_unavailable" })),
-                            )
-                        });
-                    if matches!(loaded, Ok(Some(_))) {
+                            });
+                    if matches!(loaded, Ok(Some(_))) && dependency_registered {
                         self.remember_candidate(call, &resolved.binding, &gateway_result_id);
                         let _ = self
                             .store
@@ -947,7 +973,10 @@ impl StructuredResultCapture for GatewayControlledProviderV1 {
                     gateway_result_id,
                     result_digest,
                     streams,
-                    reasoning,
+                    reasoning.map(|input| {
+                        Box::new(RuntimeReasoningContextV1 { input })
+                            as Box<dyn ReasoningContextCandidateV1>
+                    }),
                 ))
             }
             None => Ok(CapturedToolResult::exact(exact)),
@@ -1001,31 +1030,97 @@ impl ToolExecution for GatewayControlledProviderV1 {
         call: ProviderCall,
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
-        let is_task_start = call.namespaced_tool_name == "again.task_start";
-        if is_task_start {
-            task_start::validate_arguments_v1(&call.arguments)?;
-        }
-        if call.effect != EffectClass::ReadOnly {
-            let epoch = self.fresh_direct_epoch()?;
+        let epoch = Arc::clone(&self.observed_workspace.execution_epoch);
+        if call.effect != EffectClass::ReadOnly
+            || self.reuse_mode == GatewayReuseModeV1::ExecuteOnly
+        {
             return self.execute_direct(&epoch, call, secrets, true);
         }
-        // Preload only a previously verified candidate. Reuse authority still
-        // comes later from a fresh descriptor-bound observation and the exact
-        // current coordinator proof. Loading first lets that observation be
-        // the final filesystem check instead of repeating the whole tree.
-        let preloaded = self
-            .recent_candidate(&Self::recent_candidate_key(&call))
-            .and_then(|candidate| {
-                self.load_stored_exact(&candidate.binding, &candidate.gateway_result_id)
-                    .ok()
-                    .flatten()
-                    .map(|loaded| (candidate, loaded))
-            });
-        let Some((resolved, epoch)) = self.resolve(&call) else {
-            if is_task_start {
-                return Err(task_start::unavailable_v1("workspace_validation_failed"));
+        // Exact proof for built-in repository tools inspects the same source
+        // or listing state as the provider. With no active task to receive a
+        // durable fact or result reference, lookup and storage add work. The
+        // task-bound path still stores proof and source-backed shared context.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && self
+                .context_coordinator
+                .as_ref()
+                .and_then(|coordinator| coordinator.active_identity_for_call(&call))
+                .is_none()
+        {
+            match RepositoryOperationV1::from_call(&call) {
+                Some(operation) if !operation.is_git() => {
+                    return self.execute_direct(&epoch, call, secrets, true);
+                }
+                Some(RepositoryOperationV1::GitStatus) if self.large_git_status_index() => {
+                    return self.execute_direct(&epoch, call, secrets, true);
+                }
+                _ => {}
             }
-            let epoch = self.fresh_direct_epoch()?;
+        }
+        let candidate_key = Self::recent_candidate_key(&call);
+        let candidate = self.recent_candidate(&candidate_key);
+        let active_task_id = self
+            .context_coordinator
+            .as_ref()
+            .and_then(|coordinator| coordinator.active_identity_for_call(&call))
+            .map(|identity| identity.task_id().to_owned());
+        // After a task has received one source-backed built-in result, a
+        // repeated repository call or large-index Git status can execute
+        // through the trusted provider directly.
+        // Returning its freshly executed value is cheaper than proving a
+        // cache hit, and an identical result leaves the admitted fact truthful.
+        // Divergence falls back to the full proof path to retire the old fact
+        // and publish the changed result. This path never serves cached bytes.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && RepositoryOperationV1::from_call(&call).is_some_and(|operation| {
+                !operation.is_git()
+                    || (operation == RepositoryOperationV1::GitStatus
+                        && self.large_git_status_index())
+            })
+            && let Some(candidate) = candidate.as_ref()
+            && candidate.task_id == active_task_id
+            && candidate.task_id.is_some()
+        {
+            let observed = self.inner.execute_with_epoch(&epoch, call.clone(), secrets);
+            // A bounded in-memory value makes the common comparison cheap.
+            // Larger values use the stored blob digest; neither branch serves
+            // cached bytes as a hit.
+            if matches!(&observed, Ok(value) if candidate.matches_fresh_provider_result(value)) {
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .record_gateway_direct_execution(true);
+                return observed;
+            }
+            if let Some(coordinator) = self.context_coordinator.as_ref() {
+                let _ =
+                    coordinator.invalidate_source_observation(&call, &candidate.gateway_result_id);
+            }
+            self.recent_candidates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .remove(&candidate_key);
+            let _ = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .record_gateway_direct_execution(observed.is_err());
+            if let Err(error) = observed {
+                let _ = self.resolve(&call);
+                return Err(error);
+            }
+        }
+        // Preload only a previously verified candidate for the actual cache
+        // route. The direct path above compares a fresh provider result with
+        // an in-memory digest and never serves cached bytes.
+        let preloaded = self.recent_candidate(&candidate_key).and_then(|candidate| {
+            self.load_stored_exact(&candidate.binding, &candidate.gateway_result_id)
+                .ok()
+                .flatten()
+                .map(|loaded| (candidate, loaded))
+        });
+        let Some(resolved) = self.resolve(&call) else {
             return self.execute_direct(&epoch, call, secrets, true);
         };
         let owner = Self::owner(&call);
@@ -1035,9 +1130,6 @@ impl ToolExecution for GatewayControlledProviderV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .acquire_gateway_call(&resolved.binding, &owner);
         let Ok(acquisition) = acquisition else {
-            if is_task_start {
-                return Err(task_start::unavailable_v1("coordination_failed"));
-            }
             return self.execute_direct(&epoch, call, secrets, true);
         };
         match acquisition {
@@ -1066,24 +1158,26 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         && candidate.binding.binding_digest() == resolved.binding.binding_digest()
                         && candidate.gateway_result_id == gateway_result_id
                     {
-                        let value = self.attach_loaded_exact(&resolved, &call, loaded, true);
-                        self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
-                        let _ = self
-                            .store
-                            .lock()
-                            .unwrap_or_else(|poison| poison.into_inner())
-                            .record_gateway_route_served(
-                                &call_id,
-                                &gateway_result_id,
-                                GatewayServedRouteV1::Exact,
-                            );
+                        let value = self.attach_loaded_exact(&resolved, &call, loaded);
+                        if self.register_result_dependency(&resolved, &gateway_result_id) {
+                            self.remember_candidate(&call, &resolved.binding, &gateway_result_id);
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_route_served(
+                                    &call_id,
+                                    &gateway_result_id,
+                                    GatewayServedRouteV1::Exact,
+                                );
+                        }
                         return Ok(value);
                     }
-                    let value = self.load_exact(&resolved, &gateway_result_id, &call, true);
+                    let value = self.load_exact(&resolved, &gateway_result_id, &call);
                     let revalidated = self.resolve(&call);
                     if revalidated
                         .as_ref()
-                        .map(|(request, _)| request.binding.binding_digest())
+                        .map(|request| request.binding.binding_digest())
                         == Some(resolved.binding.binding_digest())
                         && let Ok(Some(value)) = value
                     {
@@ -1102,11 +1196,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         return Ok(value);
                     }
                 }
-                if is_task_start {
-                    Err(task_start::unavailable_v1("exact_validation_failed"))
-                } else {
-                    self.execute_direct(&epoch, call, secrets, false)
-                }
+                self.execute_direct(&epoch, call, secrets, false)
             }
             GatewayCallAcquisition::Follower {
                 call_id, lease_id, ..
@@ -1174,11 +1264,7 @@ impl ToolExecution for GatewayControlledProviderV1 {
                     .lock()
                     .unwrap_or_else(|poison| poison.into_inner())
                     .cancel_gateway_follower(&call_id);
-                if is_task_start {
-                    Err(task_start::unavailable_v1("coordination_join_failed"))
-                } else {
-                    self.execute_direct(&epoch, call, secrets, false)
-                }
+                self.execute_direct(&epoch, call, secrets, false)
             }
             GatewayCallAcquisition::Leader {
                 lease_id,
@@ -1196,15 +1282,9 @@ impl ToolExecution for GatewayControlledProviderV1 {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .fail_gateway_call(&lease_id, GatewayFailureReason::Protocol);
-                    if is_task_start {
-                        return Err(task_start::unavailable_v1("execution_start_failed"));
-                    }
                     return self.execute_direct(&epoch, call, secrets, false);
                 }
                 self.execute_as_leader(&epoch, call, secrets, &resolved, lease_id, owner)
-            }
-            GatewayCallAcquisition::Refused { .. } if is_task_start => {
-                Err(task_start::unavailable_v1("coordination_refused"))
             }
             GatewayCallAcquisition::Refused { .. } => {
                 self.execute_direct(&epoch, call, secrets, true)
@@ -1401,7 +1481,6 @@ impl ToolExecution for GitProviderV1 {
 pub struct ExperimentalMcpGatewayV1 {
     gateway: McpGateway,
     store: Arc<Mutex<Store>>,
-    observations: Arc<WorkspaceObservationManagerV1>,
 }
 
 struct StoreDeliveryConfirmationSinkV1 {
@@ -1470,37 +1549,86 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
-        let observations = Arc::new(WorkspaceObservationManagerV1::begin(
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::Automatic)
+    }
+
+    /// Diagnostic control for measuring the exact same MCP and provider path
+    /// with cache lookup and storage bypassed. Stdio has no authenticated task
+    /// recipient, so this mode cannot silently weaken shared-context claims.
+    pub(crate) fn build_execute_only_v1(workspace: &Path) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
+        let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::ExecuteOnly)
+    }
+
+    #[cfg(test)]
+    fn build_force_reuse_v1(workspace: &Path) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
+        let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::ForceReuse)
+    }
+
+    /// Construct isolated MCP protocol state over one daemon-owned durable
+    /// store. Each connection still receives its own gateway and lifecycle,
+    /// while cold connection storms avoid concurrently reopening/migrating the
+    /// same SQLite authority.
+    pub(crate) fn build_with_shared_store_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+    ) -> Result<Self> {
+        Self::build_with_shared_store_mode_v1(workspace, store, GatewayReuseModeV1::Automatic)
+    }
+
+    pub(crate) fn build_with_shared_store_execute_only_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+    ) -> Result<Self> {
+        Self::build_with_shared_store_mode_v1(workspace, store, GatewayReuseModeV1::ExecuteOnly)
+    }
+
+    fn build_with_shared_store_mode_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+        reuse_mode: GatewayReuseModeV1,
+    ) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
+        let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
             &workspace,
-            gateway_workspace_limits_v1(),
-        )?);
+            Arc::clone(&store),
+            observed_workspace.clone(),
+        ));
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let repository_controlled: Arc<dyn UpstreamProvider> =
-            Arc::new(GatewayControlledProviderV1::new(
+            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
                 repository,
                 workspace.clone(),
+                observed_workspace.clone(),
                 Arc::clone(&store),
-                Arc::clone(&observations),
-            ));
-        let task_start = Arc::new(task_start::TaskStartProviderV1::new(&workspace)?);
-        let task_start_controlled: Arc<dyn UpstreamProvider> =
-            Arc::new(GatewayControlledProviderV1::new(
-                task_start,
-                workspace.clone(),
-                Arc::clone(&store),
-                Arc::clone(&observations),
+                Some(Arc::clone(&context_coordinator)),
+                reuse_mode,
             ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
-        let git_controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            git,
-            workspace,
-            Arc::clone(&store),
-            Arc::clone(&observations),
+        let git_controlled: Arc<dyn UpstreamProvider> =
+            Arc::new(GatewayControlledProviderV1::new_with_observed_workspace(
+                git,
+                workspace.clone(),
+                observed_workspace.clone(),
+                Arc::clone(&store),
+                Some(Arc::clone(&context_coordinator)),
+                reuse_mode,
+            ));
+        let task_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
+            ContextProviderKindV1::Task,
+            Arc::clone(&context_coordinator),
+        ));
+        let shared_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
+            ContextProviderKindV1::Context,
+            Arc::clone(&context_coordinator),
         ));
         let gateway = McpGateway::new(
             vec![
                 ProviderRegistration::trusted_annotations(repository_controlled),
-                ProviderRegistration::trusted_annotations(task_start_controlled),
                 ProviderRegistration::trusted_annotations(git_controlled),
                 ProviderRegistration::trusted_annotations(task_context),
                 ProviderRegistration::trusted_annotations(shared_context),
@@ -1509,12 +1637,9 @@ impl ExperimentalMcpGatewayV1 {
         )?
         .with_delivery_confirmation_sink(Arc::new(StoreDeliveryConfirmationSinkV1 {
             store: Arc::clone(&store),
-        }));
-        Ok(Self {
-            gateway,
-            store,
-            observations,
-        })
+        }))
+        .with_recipient_lifecycle_sink_v1(context_coordinator);
+        Ok(Self { gateway, store })
     }
 
     pub fn gateway(&self) -> &McpGateway {
@@ -1570,41 +1695,19 @@ impl ExperimentalMcpGatewayV1 {
     }
 }
 
-impl Drop for ExperimentalMcpGatewayV1 {
-    fn drop(&mut self) {
-        if std::env::var_os("AGAIN_HOT_REUSE_BENCHMARK_V1").as_deref()
-            != Some(std::ffi::OsStr::new("1"))
-        {
-            return;
-        }
-        let metrics = self.observations.metrics();
-        eprintln!(
-            "{}",
-            json!({
-                "schema": "again.hot-reuse-metrics.v1",
-                "sessionsCreated": metrics.sessions_created,
-                "sessionRotations": metrics.session_rotations,
-                "physicalContentHashes": metrics.physical_content_hashes,
-                "physicalDirectoryEnumerations": metrics.physical_directory_listings,
-                "contentHashesAvoided": metrics.content_hashes_avoided,
-                "directoryEnumerationsAvoided": metrics.directory_listings_avoided,
-                "resolverExecutions": metrics.resolver_executions,
-                "resolverCallsAvoided": metrics.resolver_calls_avoided,
-                "boundedLockRefusals": metrics.bounded_lock_refusals,
-            })
-        );
-    }
-}
-
 fn resolve_repository_request_v1(
-    observed: &ObservedWorkspaceRequestV1,
+    execution_epoch: &WorkspaceExecutionEpochV1,
+    observed_manifest: &mut ObservedManifestV1,
     call: &ProviderCall,
     operation: RepositoryOperationV1,
 ) -> Result<ResolvedRequestV1> {
     let limits = gateway_workspace_limits_v1();
-    let execution_epoch = &observed.execution_epoch;
     let workspace = execution_epoch.canonical_workspace();
-    let repository = &observed.repository_epoch;
+    let observation_plan =
+        repository_tools::observation_plan_v1(execution_epoch, &call.arguments, operation)?;
+    let repository = observed_manifest
+        .observe_repository(&observation_plan)
+        .map_err(|_| anyhow!("repository state is incomplete"))?;
     if operation.is_git()
         && !matches!(
             repository.git_state(),
@@ -1785,7 +1888,7 @@ fn resolve_repository_request_v1(
     Ok(ResolvedRequestV1 {
         core_call,
         binding,
-        operation,
+        observation_plan,
     })
 }
 
@@ -1976,6 +2079,7 @@ fn cancelled_provider_error_v1() -> ProviderError {
 
 #[cfg(test)]
 mod product_tests {
+    use std::process::Command;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -2068,16 +2172,6 @@ mod product_tests {
         context_with_scope(id, "shared-repository-scope")
     }
 
-    fn observation_manager(workspace: &Path) -> Arc<WorkspaceObservationManagerV1> {
-        Arc::new(
-            WorkspaceObservationManagerV1::begin(
-                &fs::canonicalize(workspace).unwrap(),
-                gateway_workspace_limits_v1(),
-            )
-            .unwrap(),
-        )
-    }
-
     fn context_with_scope(id: &str, scope: &str) -> GatewayRequestContext {
         GatewayRequestContext::new(
             AuthorizationScopeId::new(scope).unwrap(),
@@ -2095,6 +2189,100 @@ mod product_tests {
     }
 
     #[test]
+    fn diagnostic_execute_only_mode_preserves_results_without_reuse() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same\n").unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build_execute_only_v1(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let initialized = process(gateway.gateway(), "init", initialize);
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        let first = process(gateway.gateway(), "first", read);
+        let second = process(gateway.gateway(), "second", read);
+        assert_eq!(first["result"]["content"][0]["text"], "same\n");
+        assert_eq!(first["result"], second["result"]);
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.executed, 2);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
+    fn automatic_mode_executes_repository_reads_without_a_shared_task() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same\n").unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(gateway.gateway(), "init", initialize);
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        let first = process(gateway.gateway(), "first", read);
+        let second = process(gateway.gateway(), "second", read);
+        assert_eq!(first["result"], second["result"]);
+        assert_eq!(first["result"]["content"][0]["text"], "same\n");
+        let search = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repo.search","arguments":{"path":".","pattern":"same"}}}"#;
+        let first_search = process(gateway.gateway(), "first-search", search);
+        let second_search = process(gateway.gateway(), "second-search", search);
+        assert_eq!(first_search["result"], second_search["result"]);
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 4);
+        assert_eq!(stats.executed, 4);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
+    fn automatic_mode_executes_large_standalone_git_status_directly() {
+        let workspace = TempDir::new().unwrap();
+        let git = |arguments: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(workspace.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        for index in 0..250 {
+            fs::write(
+                workspace.path().join(format!("file_{index:04}.txt")),
+                b"x\n",
+            )
+            .unwrap();
+        }
+        git(&["add", "."]);
+        assert!(
+            fs::metadata(workspace.path().join(".git/index"))
+                .unwrap()
+                .len()
+                >= STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1
+        );
+        git(&[
+            "-c",
+            "user.name=Again Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(gateway.gateway(), "init", initialize);
+        let status = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.status","arguments":{}}}"#;
+        let first = process(gateway.gateway(), "first", status);
+        let second = process(gateway.gateway(), "second", status);
+        assert_eq!(first["result"], second["result"]);
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.executed, 2);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
     fn concurrent_sessions_execute_once_and_join_exact_inflight_call() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.txt"), b"same").unwrap();
@@ -2103,12 +2291,14 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            upstream.clone(),
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-            observation_manager(workspace.path()),
-        ));
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
+            GatewayControlledProviderV1::new(
+                upstream.clone(),
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],
@@ -2158,7 +2348,7 @@ mod product_tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.txt"), b"first").unwrap();
         fs::write(workspace.path().join("other.txt"), b"unrelated").unwrap();
-        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build_force_reuse_v1(workspace.path()).unwrap();
         let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
         process(gateway.gateway(), "init", initialize);
         let call = |id: u8| {
@@ -2259,12 +2449,14 @@ mod product_tests {
         let state = TempDir::new().unwrap();
         let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
         let repository = Arc::new(RepositoryProviderV1::new(workspace.path()).unwrap());
-        let controlled = Arc::new(GatewayControlledProviderV1::new(
-            repository,
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-            observation_manager(workspace.path()),
-        ));
+        let controlled = Arc::new(
+            GatewayControlledProviderV1::new(
+                repository,
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let registered: Arc<dyn UpstreamProvider> = controlled.clone();
         let gateway = McpGateway::new(
             vec![ProviderRegistration::trusted_annotations(registered)],
@@ -2323,12 +2515,14 @@ mod product_tests {
         let upstream = Arc::new(SlowRepositoryProviderV1 {
             executions: AtomicUsize::new(0),
         });
-        let controlled: Arc<dyn UpstreamProvider> = Arc::new(GatewayControlledProviderV1::new(
-            upstream.clone(),
-            fs::canonicalize(workspace.path()).unwrap(),
-            Arc::clone(&store),
-            observation_manager(workspace.path()),
-        ));
+        let controlled: Arc<dyn UpstreamProvider> = Arc::new(
+            GatewayControlledProviderV1::new(
+                upstream.clone(),
+                fs::canonicalize(workspace.path()).unwrap(),
+                Arc::clone(&store),
+            )
+            .unwrap(),
+        );
         let gateway = Arc::new(
             McpGateway::new(
                 vec![ProviderRegistration::trusted_annotations(controlled)],

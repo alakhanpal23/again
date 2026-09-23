@@ -1,0 +1,184 @@
+{
+  "accepted": true,
+  "againBinarySha256": "c6d8454a924459af7c5d2c14de4b74f931fa52540b62008fbbabf96a9fe4d874",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "codexVersion": "codex-cli 0.156.0",
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixtureSha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+  "harnessSha256": "6d0b1544df800945f0325e6abb237763d3ed06b068f176d2cefebb00c6ddfe60",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/calculator.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'tox.ini' -g 'setup.cfg'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,240p' tests/test_calculator.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,160p' README.md && rg --files\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 20789.784,
+      "eventCount": 20,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 12551.971,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 134.252,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "rawEventBytes": 5148,
+      "rawEventFile": "2026-09-23-codex-editable-pair-diagnostic-v3-baseline.jsonl",
+      "rawEventSha256": "c6adf0739b584b2e8595d96163589d07613215323adbefacfb2c20bd073361a2",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 91776,
+        "input_tokens": 97698,
+        "output_tokens": 558,
+        "reasoning_output_tokens": 44
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 5,
+        "exact_hits": 0,
+        "executed": 1,
+        "inflight_joins": 0,
+        "requested": 1
+      },
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": 9396,
+          "status": "completed",
+          "tool": "task.start",
+          "type": "mcp_tool_call"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "",
+          "resultBytes": 3004,
+          "status": "completed",
+          "tool": "repo.read",
+          "type": "mcp_tool_call"
+        },
+        {
+          "command": "/bin/zsh -lc 'PYTHONDONTWRITEBYTECODE=1 python3 -B -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "again",
+      "elapsedMs": 28106.647,
+      "eventCount": 14,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 14316.328,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 126.542,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "rawEventBytes": 15638,
+      "rawEventFile": "2026-09-23-codex-editable-pair-diagnostic-v3-again.jsonl",
+      "rawEventSha256": "1b4b223b359acc6e28a7e1b3e49e4ef0cdbe4379ea92dca05f48a65d87db3c71",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 138880,
+        "input_tokens": 157215,
+        "output_tokens": 643,
+        "reasoning_output_tokens": 218
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "again"
+  ],
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "recordedAtUtc": "2026-09-23T07:43:55.142624+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "dec67610df80c48108fb9e9d88d4d2efb569cddf"
+  }
+}

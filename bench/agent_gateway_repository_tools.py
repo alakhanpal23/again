@@ -9,7 +9,6 @@ import json
 import os
 import platform
 import queue
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -25,24 +24,6 @@ STORE_SCHEMA_VERSION = 10
 MAX_FRAME_BYTES = 2 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 DEFAULT_TIMEOUT_SECONDS = 15.0
-EXPECTED_ADVERTISED_TOOLS = frozenset(
-    {
-        "again.task_start",
-        "repo.read",
-        "repo.search",
-        "repo.list",
-        "repo.tree",
-        "repo.stat",
-        "repo.glob",
-        "repo.references",
-        "repo.manifest",
-        "git.status",
-        "git.diff",
-        "git.log",
-        "git.show",
-        "git.blame",
-    }
-)
 
 
 class HarnessError(RuntimeError):
@@ -266,15 +247,7 @@ class Response:
 
 
 class McpProcess:
-    def __init__(
-        self,
-        binary: Path,
-        workspace: Path,
-        state: Path,
-        name: str,
-        extra_environment: dict[str, str] | None = None,
-        authorization_scope: str = "repository-intelligence-e2e",
-    ):
+    def __init__(self, binary: Path, workspace: Path, state: Path, name: str):
         environment = {
             "AGAIN_HOME": str(state),
             "LANG": "C",
@@ -289,8 +262,6 @@ class McpProcess:
             "ALL_PROXY": "http://127.0.0.1:9",
             "NO_PROXY": "",
         }
-        if extra_environment:
-            environment.update(extra_environment)
         self.name = name
         self.process = subprocess.Popen(
             [
@@ -300,7 +271,7 @@ class McpProcess:
                 "--workspace",
                 str(workspace),
                 "--authorization-scope",
-                authorization_scope,
+                "repository-intelligence-e2e",
             ],
             cwd=workspace,
             env=environment,
@@ -402,7 +373,22 @@ class McpProcess:
         self.send({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
         tools = self.request(2, "tools/list", {})
         advertised = {entry["name"] for entry in tools.result["tools"]}
-        if advertised != EXPECTED_ADVERTISED_TOOLS:
+        expected = {
+            "repo.read",
+            "repo.search",
+            "repo.list",
+            "repo.tree",
+            "repo.stat",
+            "repo.glob",
+            "repo.references",
+            "repo.manifest",
+            "git.status",
+            "git.diff",
+            "git.log",
+            "git.show",
+            "git.blame",
+        }
+        if advertised != expected:
             raise HarnessError(f"unexpected MCP tool catalog: {sorted(advertised)}")
 
     def close(self) -> None:
@@ -420,10 +406,6 @@ class McpProcess:
                     self.process.wait(timeout=2)
         self._stdout_thread.join(timeout=1)
         self._stderr_thread.join(timeout=1)
-
-    @property
-    def stderr_text(self) -> str:
-        return self._stderr.decode("utf-8", "replace")
 
     def __enter__(self) -> "McpProcess":
         return self
@@ -523,100 +505,6 @@ def result_observation(result: dict[str, Any] | None) -> dict[str, Any] | None:
     return {key: value for key, value in result.items() if key != "_meta"}
 
 
-HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
-
-
-def task_start_observation(
-    response: Response, workspace: Path, scenario: str
-) -> dict[str, Any]:
-    """Validate the live task-start wire binding without treating it as authority."""
-
-    expect_success(response, scenario)
-    try:
-        again = response.result["_meta"]["again"]
-        context = again["reasoningContext"]
-        brief = context["brief"]
-        identity = brief["identity"]
-        metrics = context["metrics"]
-    except (KeyError, TypeError) as error:
-        raise HarnessError(f"{scenario} omitted its reasoning-context binding") from error
-    if again.get("maturity") != "local_alpha" or again.get("experimental") is not True:
-        raise HarnessError(f"{scenario} omitted its explicit local-alpha maturity")
-    if again.get("fullRetrievalAvailable") is not False:
-        raise HarnessError(f"{scenario} unexpectedly enabled bearer-style retrieval")
-    if context.get("presentation") != "full":
-        raise HarnessError(f"{scenario} was not delivered in full")
-    required_identity = {
-        "workspace_id",
-        "session_id",
-        "authorization_scope_digest",
-        "state_digest",
-        "dependency_digest",
-        "connection_generation",
-        "task_id",
-    }
-    if not required_identity.issubset(identity):
-        raise HarnessError(f"{scenario} omitted required identity fields")
-    if not str(identity["workspace_id"]).startswith("workspace:"):
-        raise HarnessError(f"{scenario} returned a malformed workspace identity")
-    if not str(identity["session_id"]).startswith("task-start-session-"):
-        raise HarnessError(f"{scenario} returned a malformed session identity")
-    for field in (
-        "authorization_scope_digest",
-        "state_digest",
-        "dependency_digest",
-        "connection_generation",
-        "task_id",
-    ):
-        if not HEX_DIGEST_RE.fullmatch(str(identity[field])):
-            raise HarnessError(f"{scenario} returned a malformed {field}")
-    authority = brief.get("authority")
-    if not isinstance(authority, dict) or not authority or any(
-        value is not False for value in authority.values()
-    ):
-        raise HarnessError(f"{scenario} unexpectedly granted authority")
-    if metrics.get("external_model_calls") != 0:
-        raise HarnessError(f"{scenario} unexpectedly invoked a model")
-    if metrics.get("false_hit_count") != 0:
-        raise HarnessError(f"{scenario} reported a false hit")
-    truncation = brief.get("truncation")
-    if not isinstance(truncation, dict) or truncation.get("complete_within_budget") is not True:
-        raise HarnessError(f"{scenario} truncated its edit brief")
-    current_facts = list(brief.get("task_specific_current_facts", [])) + list(
-        brief.get("relevant_repository_current_facts", [])
-    )
-    for fact in current_facts:
-        sources = fact.get("sources") if isinstance(fact, dict) else None
-        if not isinstance(sources, list) or not sources:
-            raise HarnessError(f"{scenario} returned a current fact without a source")
-        for source in sources:
-            locator = source.get("locator") if isinstance(source, dict) else None
-            if not isinstance(locator, str) or ":" not in locator:
-                raise HarnessError(f"{scenario} returned an unresolved source locator")
-            relative, _, line_text = locator.rpartition(":")
-            try:
-                line = int(line_text)
-            except ValueError as error:
-                raise HarnessError(f"{scenario} returned an invalid source line") from error
-            path = Path(relative)
-            if path.is_absolute() or ".." in path.parts or line < 1:
-                raise HarnessError(f"{scenario} returned an unsafe source locator")
-            target = workspace / path
-            if not target.is_file():
-                raise HarnessError(f"{scenario} returned a missing source locator")
-    return {
-        "resultId": response.result_id,
-        "workspaceId": identity["workspace_id"],
-        "sessionId": identity["session_id"],
-        "authorizationScopeDigest": identity["authorization_scope_digest"],
-        "taskId": identity["task_id"],
-        "providerCallsAvoided": metrics.get("provider_calls_avoided"),
-        "repositoryToolCallsDisplaced": metrics.get("repository_tool_calls_displaced"),
-        "currentFactCount": len(current_facts),
-        "responseHash": response.result_hash,
-    }
-
-
 def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[str, Any]:
     temporary = Path(tempfile.mkdtemp(prefix="again-repository-tools-e2e-"))
     false_hits = 0
@@ -664,108 +552,6 @@ def scenario_suite(binary: Path, source_sha: str, fixture_files: int) -> dict[st
                 "name": "independent_language_repositories",
                 "classification": "pass",
                 "repositories": language_evidence,
-            }
-        )
-        task_workspace = temporary / "task-start-repository"
-        task_workspace_other = temporary / "task-start-repository-other"
-        task_state = temporary / "task-start-state"
-        task_state.mkdir(mode=0o700)
-        create_fixture(task_workspace, 40)
-        create_fixture(task_workspace_other, 40)
-        task_arguments = {
-            "task": "change shared needle behavior",
-            "constraints": ["preserve exact output"],
-            "changedPaths": ["src/lib.rs"],
-            "validationIntent": "run focused tests",
-        }
-        with McpProcess(binary, task_workspace, task_state, "task-start") as task_process:
-            task_cold = task_process.call(30, "again.task_start", task_arguments)
-            task_warm = task_process.call(31, "again.task_start", task_arguments)
-            cold_observation = task_start_observation(
-                task_cold, task_workspace, "task-start cold"
-            )
-            warm_observation = task_start_observation(
-                task_warm, task_workspace, "task-start warm"
-            )
-            if task_cold.result_id != task_warm.result_id:
-                raise HarnessError("task-start warm call did not reuse its exact result")
-            if warm_observation["providerCallsAvoided"] != 1:
-                raise HarnessError("task-start warm call did not report provider avoidance")
-            if cold_observation["sessionId"] == warm_observation["sessionId"]:
-                raise HarnessError("task-start recipient session was not call-bound")
-
-            (task_workspace / "docs" / "irrelevant.txt").write_text(
-                "proven irrelevant task-start mutation\n", encoding="utf-8"
-            )
-            task_irrelevant = task_process.call(32, "again.task_start", task_arguments)
-            irrelevant_observation = task_start_observation(
-                task_irrelevant, task_workspace, "task-start irrelevant mutation"
-            )
-            if task_irrelevant.result_id != task_warm.result_id:
-                raise HarnessError("task-start invalidated a proven-irrelevant content change")
-
-            (task_workspace / "src" / "lib.rs").write_text(
-                "pub fn shared_needle() -> usize { 9 }\n", encoding="utf-8"
-            )
-            task_relevant = task_process.call(33, "again.task_start", task_arguments)
-            relevant_observation = task_start_observation(
-                task_relevant, task_workspace, "task-start relevant mutation"
-            )
-            if task_relevant.result_id == task_irrelevant.result_id:
-                raise HarnessError("task-start served a false hit after source mutation")
-            task_relevant_warm = task_process.call(34, "again.task_start", task_arguments)
-            relevant_warm_observation = task_start_observation(
-                task_relevant_warm, task_workspace, "task-start post-mutation warm"
-            )
-            if task_relevant_warm.result_id != task_relevant.result_id:
-                raise HarnessError("task-start did not reuse the current post-mutation result")
-            if relevant_warm_observation["providerCallsAvoided"] != 1:
-                raise HarnessError("task-start post-mutation warm call was not observable")
-
-        with McpProcess(
-            binary,
-            task_workspace,
-            task_state,
-            "task-start-other-scope",
-            authorization_scope="repository-intelligence-e2e-other",
-        ) as other_scope_process:
-            other_scope = other_scope_process.call(35, "again.task_start", task_arguments)
-            other_scope_observation = task_start_observation(
-                other_scope, task_workspace, "task-start other authorization scope"
-            )
-        if (
-            other_scope_observation["authorizationScopeDigest"]
-            == relevant_observation["authorizationScopeDigest"]
-            or other_scope.result_id == task_relevant.result_id
-        ):
-            raise HarnessError("task-start crossed authorization scopes")
-
-        with McpProcess(
-            binary, task_workspace_other, task_state, "task-start-other-workspace"
-        ) as other_workspace_process:
-            other_workspace = other_workspace_process.call(
-                36, "again.task_start", task_arguments
-            )
-            other_workspace_observation = task_start_observation(
-                other_workspace, task_workspace_other, "task-start other workspace"
-            )
-        if (
-            other_workspace_observation["workspaceId"]
-            == relevant_observation["workspaceId"]
-            or other_workspace.result_id == task_relevant.result_id
-        ):
-            raise HarnessError("task-start crossed workspace identities")
-        scenarios.append(
-            {
-                "name": "task_start_full_identity_hot_reuse_and_isolation",
-                "classification": "pass",
-                "cold": cold_observation,
-                "warm": warm_observation,
-                "irrelevantMutation": irrelevant_observation,
-                "relevantMutation": relevant_observation,
-                "postMutationWarm": relevant_warm_observation,
-                "otherAuthorizationScope": other_scope_observation,
-                "otherWorkspace": other_workspace_observation,
             }
         )
         left = McpProcess(binary, workspace, state, "e2e-left")

@@ -1,0 +1,66 @@
+{
+  "accepted": true,
+  "againBinarySha256": "94727ea22e32240fb45104ff552a9a5ed0d76e7a14db6c399418173c86850ae3",
+  "approvalMode": "approve-for-me",
+  "codexVersion": "codex-cli 0.156.0",
+  "evidenceScope": "local live-agent cross-session diagnostic only",
+  "fixtureSha256": "782ae95c218e75f8b1353e775736bd3c1a12aba615749fa56609c156cb6e98e6",
+  "fixtureUnchanged": true,
+  "harnessSha256": "d128ca82be74a2864c9963fb2e2ee14598168f7a66dcd04c7d19e728962c97cd",
+  "modelSessions": 2,
+  "recordedAtUtc": "2026-09-23T07:30:55.079330+00:00",
+  "schema": "again.codex-context-transfer-probe.v1",
+  "sessions": [
+    {
+      "exitCode": 0,
+      "suggestionReported": true,
+      "timedOut": false,
+      "tools": [
+        {
+          "error": null,
+          "server": "again",
+          "status": "completed",
+          "tool": "task.start"
+        },
+        {
+          "error": null,
+          "server": "again",
+          "status": "completed",
+          "tool": "repo.read"
+        },
+        {
+          "error": null,
+          "server": "again",
+          "status": "completed",
+          "tool": "context.publish"
+        }
+      ],
+      "unverifiedReported": false
+    },
+    {
+      "exitCode": 0,
+      "suggestionReported": true,
+      "timedOut": false,
+      "tools": [
+        {
+          "error": null,
+          "server": "again",
+          "status": "completed",
+          "tool": "task.start"
+        },
+        {
+          "error": null,
+          "server": "again",
+          "status": "completed",
+          "tool": "context.delta"
+        }
+      ],
+      "unverifiedReported": true
+    }
+  ],
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "6a8f88a4eec4bc63dde0bce7ab55404459a188c2"
+  }
+}

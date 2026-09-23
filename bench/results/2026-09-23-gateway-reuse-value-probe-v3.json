@@ -1,0 +1,184 @@
+{
+  "againBinarySha256": "748b4936e0bac9b611338dd543b896e718a09794b8d412a0ec669f8ff44069c6",
+  "evidenceScope": "local stdio diagnostic; not a live-agent task-speed result",
+  "harnessSha256": "fd49d611eee037197110bcaed07157a408e713ba0bde4f1092b3f3b152507a0b",
+  "host": {
+    "machine": "arm64",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "largeFixtureSha256": "05eb80c970509ee6769f59741a9b6a3d235f7e9510cdb7a2db113a24ee2dd98d",
+  "observations": [
+    {
+      "case": "stat-small",
+      "coldMicros": 413.792,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 40,
+      "warmMeanMicros": 275.268,
+      "warmP50Micros": 273.167,
+      "warmP95Micros": 339.958
+    },
+    {
+      "case": "stat-small",
+      "coldMicros": 26861.083,
+      "exactHits": 40,
+      "executed": 1,
+      "mode": "reuse",
+      "requested": 41,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 40,
+      "warmMeanMicros": 5134.639,
+      "warmP50Micros": 5122.292,
+      "warmP95Micros": 5368.708
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 384.417,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 40,
+      "warmMeanMicros": 243.062,
+      "warmP50Micros": 234.5,
+      "warmP95Micros": 292.5
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 19283.0,
+      "exactHits": 40,
+      "executed": 1,
+      "mode": "reuse",
+      "requested": 41,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 40,
+      "warmMeanMicros": 5459.885,
+      "warmP50Micros": 5414.958,
+      "warmP95Micros": 5886.084
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 5206.709,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 40,
+      "warmMeanMicros": 4918.536,
+      "warmP50Micros": 4913.292,
+      "warmP95Micros": 5058.875
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 33397.375,
+      "exactHits": 40,
+      "executed": 1,
+      "mode": "reuse",
+      "requested": 41,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 40,
+      "warmMeanMicros": 15737.78,
+      "warmP50Micros": 15731.5,
+      "warmP95Micros": 15922.583
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 61706.042,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 40,
+      "warmMeanMicros": 60749.194,
+      "warmP50Micros": 60136.666,
+      "warmP95Micros": 65682.416
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 244982.084,
+      "exactHits": 40,
+      "executed": 1,
+      "mode": "reuse",
+      "requested": 41,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 40,
+      "warmMeanMicros": 91955.5,
+      "warmP50Micros": 90026.75,
+      "warmP95Micros": 99063.5
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 33639.792,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 40,
+      "warmMeanMicros": 30033.383,
+      "warmP50Micros": 29784.583,
+      "warmP95Micros": 32164.875
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 216637.458,
+      "exactHits": 40,
+      "executed": 1,
+      "mode": "reuse",
+      "requested": 41,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 40,
+      "warmMeanMicros": 90701.846,
+      "warmP50Micros": 90065.625,
+      "warmP95Micros": 93755.167
+    }
+  ],
+  "pairs": [
+    {
+      "case": "stat-small",
+      "directWarmP50Micros": 273.167,
+      "reuseWarmP50Micros": 5122.292,
+      "warmP50DeltaMicros": -4849.125
+    },
+    {
+      "case": "read-small",
+      "directWarmP50Micros": 234.5,
+      "reuseWarmP50Micros": 5414.958,
+      "warmP50DeltaMicros": -5180.458
+    },
+    {
+      "case": "read-large",
+      "directWarmP50Micros": 4913.292,
+      "reuseWarmP50Micros": 15731.5,
+      "warmP50DeltaMicros": -10818.208
+    },
+    {
+      "case": "search-1000",
+      "directWarmP50Micros": 60136.666,
+      "reuseWarmP50Micros": 90026.75,
+      "warmP50DeltaMicros": -29890.084
+    },
+    {
+      "case": "tree-1000",
+      "directWarmP50Micros": 29784.583,
+      "reuseWarmP50Micros": 90065.625,
+      "warmP50DeltaMicros": -60281.042
+    }
+  ],
+  "recordedAtUtc": "2026-09-23T07:56:21.519137+00:00",
+  "schema": "again.gateway-reuse-value-probe.v1",
+  "smallFixtureSha256": "2e66e42b3e0b8334c261015ea9ecb5cb937485406bca0e9028d43797761aafbe",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "992528afc2c2e62bf3eaa9625118f64b91b8ebd7"
+  },
+  "sourceFiles": 1000
+}

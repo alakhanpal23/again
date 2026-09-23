@@ -126,6 +126,9 @@ struct McpServeArgs {
     /// Stable, non-secret local authorization-scope identifier.
     #[arg(long)]
     authorization_scope: Option<String>,
+    /// Diagnostic: execute every eligible tool without reuse or candidate storage.
+    #[arg(long, hide = true)]
+    execute_only: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -155,6 +158,9 @@ struct McpDaemonServeArgs {
     /// Stable, non-secret local authorization-scope identifier.
     #[arg(long)]
     authorization_scope: Option<String>,
+    /// Diagnostic: execute eligible tools without reuse or candidate storage.
+    #[arg(long, hide = true)]
+    execute_only: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -198,6 +204,9 @@ struct McpSetupArgs {
     /// Remove an exact Again-owned entry through the official client CLI.
     #[arg(long, conflicts_with_all = ["apply", "inspect"])]
     remove: bool,
+    /// Install or inspect the personal Codex skill alongside the MCP entry.
+    #[arg(long, conflicts_with = "remove")]
+    with_skill: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1017,7 +1026,11 @@ fn mcp_serve(args: McpServeArgs) -> Result<i32> {
     eprintln!(
         "Again MCP gateway is experimental; only bounded built-in repository reads are reuse-eligible."
     );
-    let gateway = ExperimentalMcpGatewayV1::build(&workspace)?;
+    let gateway = if args.execute_only {
+        ExperimentalMcpGatewayV1::build_execute_only_v1(&workspace)?
+    } else {
+        ExperimentalMcpGatewayV1::build(&workspace)?
+    };
     gateway.serve_stdio(&authorization_scope)?;
     Ok(0)
 }
@@ -1057,10 +1070,15 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
 
     match args.command {
         McpDaemonCommand::Serve(args) => {
+            close_inherited_daemon_fds_v1()?;
             let workspace = resolve_mcp_workspace(args.workspace)?;
             let authorization_scope =
                 local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
-            let daemon = GatewayDaemonV1::bind(&workspace, authorization_scope)?;
+            let daemon = if args.execute_only {
+                GatewayDaemonV1::bind_execute_only_v1(&workspace, authorization_scope)?
+            } else {
+                GatewayDaemonV1::bind(&workspace, authorization_scope)?
+            };
             install_termination_handler_v1()?;
             eprintln!(
                 "Again MCP daemon is experimental; socket peers are restricted to the current uid."
@@ -1080,6 +1098,32 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
             Ok(0)
         }
     }
+}
+
+#[cfg(all(feature = "daemon", target_os = "macos"))]
+fn close_inherited_daemon_fds_v1() -> Result<()> {
+    // Concurrent client launches can pass unrelated pipe descriptors to the
+    // elected daemon. Keeping a writer open prevents a client's output() from
+    // observing EOF after that client has exited.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid writable rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    for fd in 3..limit.rlim_cur.min(i32::MAX as u64) as i32 {
+        // SAFETY: closing an inherited descriptor in this freshly exec'd
+        // daemon is safe; EBADF means that descriptor was not open.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "daemon", unix, not(target_os = "macos")))]
+fn close_inherited_daemon_fds_v1() -> Result<()> {
+    Ok(())
 }
 
 #[cfg(feature = "daemon")]
@@ -1211,6 +1255,9 @@ fn mcp_connect(_args: McpConnectArgs) -> Result<i32> {
 }
 
 fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
+    if (args.apply || args.inspect) && !cfg!(all(feature = "daemon", unix)) {
+        bail!("MCP client setup requires an Again binary built with --features daemon on Unix");
+    }
     let client = match args.client {
         McpClientArg::Codex => AgentGatewayClientV1::Codex,
         McpClientArg::Claude => AgentGatewayClientV1::Claude,
@@ -1226,6 +1273,21 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         AgentGatewayClientV1::Claude => home.join(".claude.json"),
     };
     let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path, &args.workspace)?;
+    if args.with_skill && client != AgentGatewayClientV1::Codex {
+        bail!("--with-skill is currently supported only for Codex");
+    }
+    if args.with_skill && !args.apply && !args.inspect {
+        bail!("--with-skill requires --apply or --inspect");
+    }
+    let skill_dir = args
+        .with_skill
+        .then(|| codex_skill_dir(SetupScope::Global, None))
+        .transpose()?;
+    // Preflight ownership before the official client CLI can be changed.
+    let skill_plan = skill_dir
+        .as_deref()
+        .map(|directory| install_codex_skill(directory, true))
+        .transpose()?;
     let action = if args.apply {
         Some(ClientSetupActionV1::Apply)
     } else if args.inspect {
@@ -1237,8 +1299,38 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
     };
     if let Some(action) = action {
         let outcome = execute_client_setup_v1(&plan, action)?;
+        let skill_outcome = if args.apply {
+            if let Some(directory) = skill_dir.as_deref() {
+                match install_codex_skill(directory, false) {
+                    Ok(change) => Some(change),
+                    Err(error) => {
+                        if outcome.changed {
+                            execute_client_setup_v1(&plan, ClientSetupActionV1::Remove).context(
+                                "roll back newly added MCP entry after skill install failed",
+                            )?;
+                        }
+                        return Err(error).context("install Codex skill after MCP setup");
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            skill_plan
+        };
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            if let Some(skill) = skill_outcome {
+                print_pretty_json_v1(&serde_json::json!({
+                    "mcp": outcome,
+                    "codexSkill": {
+                        "path": skill.path,
+                        "current": args.apply || !skill.changed,
+                        "changed": args.apply && skill.changed
+                    }
+                }))?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            }
         } else {
             println!(
                 "{} MCP setup: action={}, before={:?}, after={:?}, changed={}, verified={}",
@@ -1249,6 +1341,14 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
                 outcome.changed,
                 outcome.verified
             );
+            if let Some(skill) = skill_outcome {
+                println!(
+                    "Codex skill: path={}, current={}, changed={}",
+                    skill.path.display(),
+                    args.apply || !skill.changed,
+                    args.apply && skill.changed
+                );
+            }
         }
     } else if args.json {
         println!("{}", plan.machine_readable_json()?);

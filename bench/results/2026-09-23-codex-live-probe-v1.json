@@ -1,0 +1,36 @@
+{
+  "accepted": true,
+  "againBinary": "/Users/arjun/.superset/projects/again/target/debug/again",
+  "againBinarySha256": "94727ea22e32240fb45104ff552a9a5ed0d76e7a14db6c399418173c86850ae3",
+  "approvalMode": "approve-for-me",
+  "codexVersion": "codex-cli 0.156.0",
+  "evidenceScope": "local live-agent integration diagnostic only",
+  "exitCode": 0,
+  "fixtureSha256": "064a5c74b0857768df84e7ac8420b7f28920e1ed4780a11e9d986af1402e1ec5",
+  "fixtureUnchanged": true,
+  "modelCallsMeasured": false,
+  "modelSessions": 1,
+  "readResultMarkerPresent": true,
+  "recordedAtUtc": "2026-09-23T07:26:40.400365+00:00",
+  "schema": "again.codex-live-mcp-probe.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "6a8f88a4eec4bc63dde0bce7ab55404459a188c2"
+  },
+  "timedOut": false,
+  "toolEvents": [
+    {
+      "error": null,
+      "server": "again",
+      "status": "completed",
+      "tool": "task.start"
+    },
+    {
+      "error": null,
+      "server": "again",
+      "status": "completed",
+      "tool": "repo.read"
+    }
+  ]
+}

@@ -24,18 +24,10 @@ it grants no Python, EffectIR, profile, execution, or reuse authority.
 
 ## Local vertical slice
 
-Candidate note: the current local-alpha successor adds one deterministic,
-full-only `again.task_start` route to the 13 repository/Git tools. Its edit
-brief exposes non-empty workspace, session, state, dependency, task, and
-authorization bindings; invokes no model; labels its maturity `local_alpha`;
-and grants no edit, test, tool, execution, retrieval, compact-delivery, or model
-authority. The older 13-tool checkpoint statements below remain historical
-evidence rather than the candidate's current tool count.
-
 | Capability | Status | Evidence / limitation |
 |---|---|---|
 | Durable task-intent coordination | implemented locally; live-agent qualification open | `task.start` stores exact agent-supplied prompt bytes as unverified local intent, converges different external task IDs for the same prompt within one repository/workspace/authorization scope, and refuses reuse of a task ID with conflicting prompt bytes. It automatically elects one bounded task leader, exposes owner-authenticated heartbeat/finish/cancel operations, retires leadership on recipient disconnect or cancellation, and preserves canonical identity across daemon restarts. Canonical tasks and aliases have separate hard limits; schema-open validation checks prompt bindings, canonical aliases, foreign keys, and capacity. Similar prompts deliberately remain distinct because semantic similarity grants no convergence authority. Durable stats expose task, alias, and exact-prompt convergence counts. |
-| Repository-aware MCP gateway | default CLI product; expanded local E2E/onboarding/chaos passed; not production-qualified | The gateway lists 13 bounded read-only repository/Git tools plus `task.start`, `context.delta`, `context.publish`, `context.retrieve`, and `context.cancel`. The five task/context tools require the same-user daemon transport; ordinary stdio cannot mint recipient authority. Canonical request translation, descriptor-retained workspace observation, exact dependency-bound reuse, cross-process SQLite/CAS coordination, bounded queues, session cancellation, serialized responses, lease recovery, corruption quarantine, and workspace-bound Codex/Claude setup are integrated. Git reuse binds bounded control state, HEAD, index, source dependencies, and the exact Git executable. Repository-local includes and external ignore/attribute dependencies cannot create reuse authority; nested worktree/submodule state bypasses reuse for affected status/diff queries; configured filters, diff commands, text converters, alternate-reference commands, and external worktrees are refused before Git starts. The local context ledger admits only exact built-in observations as verified facts, retains agent prose as unverified suggestions, exposes task-scoped exact retrieval, and invalidates facts and references through complete dependency edges. The same-user daemon proves full delivery only after complete response write and flush, then permits a compact reference solely for the exact recipient/scope/session/turn/connection/compaction/lifecycle tuple; cancellation, disconnect, compaction, partial write, and generation changes fall back to full. Durable metrics revalidate exact unquarantined result bytes and source receipts and count duplicate response envelopes once. The earlier retained [release E2E](../bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json), [onboarding smoke](../bench/results/2026-08-27-agent-gateway-onboarding-smoke-v2.json), and [chaos run](../bench/results/2026-08-27-agent-gateway-chaos-soak-v3.json) remain the immutable baseline. Expanded source `bd24946e613af656d35c6af653a6cf25adc8359d` passed hosted CI. Local hardening source `c530586f9dfddb0faef30f4ec919b8937d3a71a4` passed the prior complete test matrix plus release-binary product and repository harnesses. Current paired-agent evidence is local and test-only, not a retained hosted artifact or real-agent task-quality benchmark. Production/cross-user recipient authentication, upstream CLI configuration, task-quality qualification, hostile-binary network isolation, and production qualification remain absent. All Linux execution/reuse authority remains disabled. |
+| Repository-aware MCP gateway | default CLI product; expanded local E2E/onboarding/chaos passed; not production-qualified | The gateway lists 13 bounded read-only repository/Git tools, five task tools (`start`, `inspect`, `list`, `claim`, `transition`), and four context tools (`delta`, `publish`, `retrieve`, `cancel`). The task/context tools require the same-user daemon transport; ordinary stdio cannot mint recipient authority. Canonical request translation, descriptor-retained workspace observation, exact dependency-bound reuse, cross-process SQLite/CAS coordination, bounded queues, session cancellation, serialized responses, lease recovery, corruption quarantine, and workspace-bound Codex/Claude setup are integrated. Git reuse binds bounded control state, HEAD, index, source dependencies, and the exact Git executable. Repository-local includes and external ignore/attribute dependencies cannot create reuse authority; nested worktree/submodule state bypasses reuse for affected status/diff queries; configured filters, diff commands, text converters, alternate-reference commands, and external worktrees are refused before Git starts. The local context ledger admits only exact built-in observations as verified facts, retains agent prose as unverified suggestions, exposes task-scoped exact retrieval, and invalidates facts and references through complete dependency edges. The same-user daemon proves full delivery only after complete response write and flush, then permits a compact reference solely for the exact recipient/scope/session/turn/connection/compaction/lifecycle tuple; cancellation, disconnect, compaction, partial write, and generation changes fall back to full. Durable metrics revalidate exact unquarantined result bytes and source receipts and count duplicate response envelopes once. The earlier retained [release E2E](../bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json), [onboarding smoke](../bench/results/2026-08-27-agent-gateway-onboarding-smoke-v2.json), and [chaos run](../bench/results/2026-08-27-agent-gateway-chaos-soak-v3.json) remain the immutable baseline. Expanded source `bd24946e613af656d35c6af653a6cf25adc8359d` passed hosted CI. Local hardening source `c530586f9dfddb0faef30f4ec919b8937d3a71a4` passed the prior complete test matrix plus release-binary product and repository harnesses. Current paired-agent evidence is local and test-only, not a retained hosted artifact or real-agent task-quality benchmark. Production/cross-user recipient authentication, upstream CLI configuration, task-quality qualification, hostile-binary network isolation, and production qualification remain absent. All Linux execution/reuse authority remains disabled. |
 | Paired local multi-agent gate | deterministic daemon E2E and editable harness implemented; live agent cohort open | Two independent authenticated MCP clients start one task, receive full context before acknowledged compact context, converge two concurrent eligible repository reads to one physical execution plus one join or exact retrieval, share verified facts/source locators/full-result references, preserve the result after an unrelated mutation, and both receive invalidation after a relevant mutation. The gate requires the stale result reference to refuse, the changed result to execute once, and false-hit quarantines to remain zero. The separate editable paired harness uses independent identical Git fixtures, allows exactly one accepted source repair, rejects test/collateral edits, balances treatment order, retains first-edit through final-outcome timings, requires real durable Again activity in live treatments, and bounds runs, time, files, and captured output. Its retained 10-pair offline qualification passed, but deliberately grants no real-agent quality or acceleration claim. Pinned Codex/Claude cohorts and outside-user evidence remain open. |
 | Explicit local CLI | implemented MVP path | `again run -- <argv...>` observes actual cwd/streams/environment, enforces `strict-read-v0.5`, returns full streams, and executes audited TTY calls once uncached with inherited streams |
 | Explicit compact reference | implemented opt-in path | `again reference -- <argv...>` performs the same live request/runtime/executable/proof/blob validation, emits bounded content-addressed JSON on an existing hit, records actual bytes omitted, and never executes on a miss; context visibility remains the caller's explicit assertion |
@@ -130,6 +122,105 @@ real-agent task quality nor Again acceleration; those require explicitly
 authorized pinned live cohorts.
 
 ## Immediate product gates
+
+Current local setup probe: [Codex CLI 0.156.0](../bench/results/2026-09-22-codex-setup-local-probe-v1.json)
+passed combined MCP/skill apply, inspect, idempotent apply, and MCP removal in
+an isolated home with zero model calls. The source checkout was dirty and its
+binary-to-source binding was unverified, so this is integration diagnostic
+evidence only. A current installed Claude CLI was unavailable for the same
+probe; fake official-CLI contract tests pass for both clients.
+
+A separate [live Codex MCP probe](../bench/results/2026-09-23-codex-live-probe-v1.json)
+used Codex CLI 0.156.0 with its existing login in an isolated read-only
+fixture. It discovered and completed `task.start` and `repo.read`, returned the
+exact fixture content, and left the fixture unchanged. The default
+noninteractive `never` approval mode refused MCP calls; `--approve-for-me`
+allowed them. This single-session diagnostic does not establish repeated-work speed,
+validated task completion, or a release-binary source binding.
+A retained [live repeated-read probe](../bench/results/2026-09-23-codex-repeat-probe-v1.json)
+made two identical Codex `repo.read` calls and recorded two gateway requests,
+one physical provider execution, one exact hit, one avoided provider call, and
+zero false-hit quarantines. It demonstrates the exact repeated-call lane for
+this fixture, without establishing workload-wide time or cost savings.
+A retained [two-session Codex context probe](../bench/results/2026-09-23-codex-context-probe-v1.json)
+completed `task.start`, `repo.read`, and `context.publish` in one session, then
+`task.start` and `context.delta` in another. The second session saw the first
+session's suggestion explicitly as `unverified_suggestion`. This local
+diagnostic has a dirty source checkout and no independently verified
+source-to-binary binding; it is not concurrent-agent task-quality or release
+evidence.
+
+Five retained [Codex editable pair diagnostics](../bench/results/2026-09-23-codex-editable-pair-diagnostic-v5.json)
+each produced the exact calculator repair and passing tests in baseline and
+Again conditions. The source-preview implementation lets `task.start` return
+up to two complete digest-checked small files when requested, so the agent can
+skip separate pre-edit reads. Its text response now summarizes the edit brief
+while retaining complete structured output. In the latest single unbalanced
+pair, first accepted edit was 19.7 seconds baseline versus 17.9 seconds with
+Again, while validated completion was 31.1 versus 26.9 seconds. The preceding
+pair had the opposite completion ordering (23.4 versus 28.7 seconds), and
+reported input usage was higher with Again in both. The pairs used different
+binary revisions and prompts, so they are diagnostics, not a causal speed claim.
+Repeat-heavy balanced cohorts and total metered cost still need qualification.
+
+The [gateway reuse-value probe](../bench/results/2026-09-23-gateway-reuse-value-probe-v7.json)
+compares exact stdio MCP calls with an execute-only diagnostic mode over the
+same built-in provider. Before the default bypass, a 1,000-file fixture had
+warm p50 direct/reuse times of 0.23/5.41 ms for a small read, 4.91/15.73 ms
+for a 128 KiB read, 0.27/5.12 ms for stat, 29.78/90.07 ms for tree, and
+60.14/90.03 ms for a simple search. The default gateway now executes all
+eight `repo.*` tools directly when no authenticated task is active; task-bound
+calls retain result storage and source-backed shared context. A 1,000-file
+follow-up confirmed near-direct latency for read/stat/search/tree/list/glob/manifest.
+An adaptive live value model for task-bound and Git paths and broader
+host/workload qualification remain open.
+For standalone `git.status`, the default now executes directly when the
+on-disk index is at least 16 KiB. A [250-file probe](../bench/results/2026-09-23-gateway-reuse-value-probe-250-v8.json)
+measured 14.90 ms automatic versus 14.84 ms execute-only warm p50; the
+[one-file control](../bench/results/2026-09-23-gateway-reuse-value-probe-small-v8.json)
+kept reuse and measured 8.25 ms automatic versus 11.56 ms execute-only. This
+is a conservative local threshold for one Git operation, not a general
+adaptive policy or evidence of task-level acceleration.
+
+An [authenticated daemon probe](../bench/results/2026-09-23-gateway-task-reuse-value-probe-v2.json)
+now isolates that open task-bound path. With an active `task.start`, a repeated
+small `repo.read` on a 1,000-file fixture took 60.83 ms warm p50 through reuse
+versus 0.24 ms through execute-only; `git.status` took 193.24 ms versus
+15.34 ms. The [one-file control](../bench/results/2026-09-23-gateway-task-reuse-value-probe-small-v2.json)
+also showed slower repository reads, while Git status reuse was slightly faster.
+This is per-call diagnostic evidence on local dirty source, not a task-level
+result. The current gateway now seeds a task with one proven repository result,
+then executes repeated same-task `repo.*` calls directly when their fresh
+provider output matches that stored result. It returns the fresh output
+without a cache-result ID; divergence invokes the full proof path, which
+retires stale context and stores the changed result when proof completes.
+Large-index `git.status` uses
+the same warm path, while small-index Git status retains reuse. The
+[current 1,000-file probe](../bench/results/2026-09-23-gateway-task-reuse-value-probe-fast-v9.json)
+measured warm p50 of 0.25 ms for small read, 5.28 ms for 128 KiB read,
+64.01 ms for search, 28.93 ms for tree, and 27.27 ms for Git status; their
+execute-only controls were 0.24, 5.31, 64.23, 28.89, and 26.46 ms. The
+[one-file probe](../bench/results/2026-09-23-gateway-task-reuse-value-probe-fast-small-v9.json)
+kept the measured small-index Git reuse win. The first source-backed call
+still costs 0.13–0.41 seconds on the 1,000-file fixture, and warm direct calls
+do not avoid physical executions. Cheap direct source admission and broader
+task-level qualification remain open.
+
+A two-client authenticated test now covers a source disappearing during a
+repeated task-bound read. The failed fresh read atomically retires that task's
+verified fact and full-result reference, sends both clients an invalidation,
+and refuses the old reference. A restored read can admit a new verified result;
+the ledger also supports a later admission version if the same result ID is
+observed again. This retirement currently applies to the active task. Other
+tasks that admitted the same source need cross-task invalidation or retrieval
+freshness validation before source disappearance is safe across all tasks.
+
+The current local source also closes unrelated inherited file descriptors at
+macOS daemon startup. A 100-connector stress test exposed a retained pipe that
+could keep a completed client waiting for EOF; the focused test now completes
+in under one second. The locked all-features suite, strict all-target Clippy,
+formatting, and diff checks passed locally after this fix. This remains local
+evidence until an exact-SHA hosted run qualifies the committed source.
 
 - **Maintain evidence authority:** exact-SHA hosted CI and the provisioned Gate
   2 workflow are green at `3d1fb201507a43b830d5ce341b2253957634016d`.

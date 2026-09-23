@@ -660,18 +660,15 @@ impl CodeIntelligenceIndexV1 {
         let mut total_bytes = 0u64;
         let mut refresh_unknowns = discovery.unknowns;
 
+        let mut selected = Vec::new();
+        // Task orientation is optional. Leave bounded manifest capacity for
+        // subsequent direct repository tools in the same agent session.
+        let direct_tool_reserve = (authority_limits.max_plan_entries / 8).min(16);
+        let available_observations = manifest
+            .remaining_observation_slots_v1()
+            .saturating_sub(direct_tool_reserve);
+        let mut new_observations = 0usize;
         for discovered in &discovery.files {
-            if started.elapsed() > self.limits.max_parse_time {
-                push_unknown_v1(
-                    &mut refresh_unknowns,
-                    self.limits.max_unknowns,
-                    CodeIntelligenceUnknownV1::new(
-                        CodeIntelligenceUnknownKindV1::ParseTimeExceeded,
-                        None,
-                    ),
-                );
-                break;
-            }
             let path = &discovered.path;
             let Some(path_text) = path.to_str().map(str::to_owned) else {
                 push_unknown_v1(
@@ -710,54 +707,103 @@ impl CodeIntelligenceIndexV1 {
                 }
             };
 
+            if !manifest.has_content_observation_v1(path) {
+                if new_observations >= available_observations {
+                    push_unknown_v1(
+                        &mut refresh_unknowns,
+                        self.limits.max_unknowns,
+                        CodeIntelligenceUnknownV1::new(
+                            CodeIntelligenceUnknownKindV1::FileLimitExceeded,
+                            None,
+                        ),
+                    );
+                    break;
+                }
+                new_observations += 1;
+            }
+
+            selected.push((discovered, path_text));
+        }
+
+        // One manifest call validates a bounded group of source paths. The
+        // previous per-file calls repeatedly reobserved Git control state and
+        // made warm task starts scale poorly even when extraction was reused.
+        'batches: for batch in selected.chunks(64) {
+            if started.elapsed() > self.limits.max_parse_time {
+                push_unknown_v1(
+                    &mut refresh_unknowns,
+                    self.limits.max_unknowns,
+                    CodeIntelligenceUnknownV1::new(
+                        CodeIntelligenceUnknownKindV1::ParseTimeExceeded,
+                        None,
+                    ),
+                );
+                break;
+            }
             let plan = RepositoryObservationPlanV1::new(
-                vec![path.clone()],
+                batch.iter().map(|(file, _)| file.path.clone()).collect(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
             );
-            let before = manifest.observe_repository(&plan)?;
-            let observation_digest = exact_observation_digest_v1(
-                &before,
-                RepositoryObservationKindV1::ContentPath,
-                path,
-            )?;
-            if let Some(cached) = self.files.get(&path_text) {
-                if cached.file.locator.observation_digest == observation_digest.to_hex() {
+            let before = content_digests_v1(&manifest.observe_repository(&plan)?);
+            let mut timed_out = false;
+            for (discovered, path_text) in batch {
+                if started.elapsed() > self.limits.max_parse_time {
+                    push_unknown_v1(
+                        &mut refresh_unknowns,
+                        self.limits.max_unknowns,
+                        CodeIntelligenceUnknownV1::new(
+                            CodeIntelligenceUnknownKindV1::ParseTimeExceeded,
+                            None,
+                        ),
+                    );
+                    timed_out = true;
+                    break;
+                }
+                let path = &discovered.path;
+                let observation_digest = before.get(path).ok_or_else(|| {
+                    IncompleteToolStateV1::unknown(
+                        crate::workspace_authority::StateDimensionV1::RepositoryIndex,
+                        "resolve code-intelligence source observation",
+                    )
+                })?;
+                if let Some(cached) = self.files.get(path_text)
+                    && cached.file.locator.observation_digest == observation_digest.to_hex()
+                {
                     reused_files += 1;
-                    staged.insert(path_text, cached.clone());
+                    staged.insert(path_text.clone(), cached.clone());
                     continue;
                 }
-            }
 
-            let bytes = execution_epoch.read_repository_file(path, self.limits.max_file_bytes)?;
-            let after = manifest.observe_repository(&plan)?;
-            let after_digest = exact_observation_digest_v1(
-                &after,
-                RepositoryObservationKindV1::ContentPath,
-                path,
-            )?;
-            if observation_digest != after_digest {
+                let bytes =
+                    execution_epoch.read_repository_file(path, self.limits.max_file_bytes)?;
+                let source_digest = StateDigestV1::from_domain_and_bytes(
+                    b"again.code-intelligence.source-bytes.v1",
+                    &bytes,
+                )
+                .to_hex();
+                let indexed = extract::extract_file_v1(
+                    path,
+                    discovered.language,
+                    &bytes,
+                    &source_digest,
+                    &observation_digest.to_hex(),
+                    &self.limits,
+                );
+                staged.insert(path_text.clone(), indexed);
+                rebuilt_files += 1;
+            }
+            let after = content_digests_v1(&manifest.observe_repository(&plan)?);
+            if before != after {
                 return Err(IncompleteToolStateV1::unknown(
                     crate::workspace_authority::StateDimensionV1::RepositoryContent,
                     "fence code-intelligence source observation",
                 ));
             }
-            let source_digest = StateDigestV1::from_domain_and_bytes(
-                b"again.code-intelligence.source-bytes.v1",
-                &bytes,
-            )
-            .to_hex();
-            let indexed = extract::extract_file_v1(
-                path,
-                discovered.language,
-                &bytes,
-                &source_digest,
-                &observation_digest.to_hex(),
-                &self.limits,
-            );
-            staged.insert(path_text, indexed);
-            rebuilt_files += 1;
+            if timed_out {
+                break 'batches;
+            }
         }
 
         let final_inventory = manifest.observe_repository(&discovery.inventory_plan)?;
@@ -787,16 +833,27 @@ impl CodeIntelligenceIndexV1 {
                 .filter(|path| staged.contains_key(*path))
                 .count(),
         );
-        self.files = staged;
-        self.unknowns = refresh_unknowns;
-        self.rebuild_cross_file_indexes_v1();
-        self.generation = self.generation.checked_add(1).ok_or_else(|| {
-            IncompleteToolStateV1::unknown(
-                crate::workspace_authority::StateDimensionV1::RepositoryIndex,
-                "advance code-intelligence generation",
-            )
-        })?;
-        self.index_digest = self.compute_index_digest_v1();
+        // A warm task start still validates the complete observed inventory
+        // and every indexed file above. Once those exact observations match,
+        // rebuilding cross-file references and changing the index identity
+        // would only repeat work and invalidate otherwise stable briefs.
+        let unchanged = self.generation > 0
+            && rebuilt_files == 0
+            && removed_files == 0
+            && staged.len() == self.files.len()
+            && refresh_unknowns == self.unknowns;
+        if !unchanged {
+            self.files = staged;
+            self.unknowns = refresh_unknowns;
+            self.rebuild_cross_file_indexes_v1();
+            self.generation = self.generation.checked_add(1).ok_or_else(|| {
+                IncompleteToolStateV1::unknown(
+                    crate::workspace_authority::StateDimensionV1::RepositoryIndex,
+                    "advance code-intelligence generation",
+                )
+            })?;
+            self.index_digest = self.compute_index_digest_v1();
+        }
         Ok(CodeIntelligenceRefreshV1 {
             generation: self.generation,
             discovered_files: discovery.files.len(),
@@ -1147,6 +1204,18 @@ fn exact_observation_digest_v1(
 }
 
 #[allow(dead_code)]
+fn content_digests_v1(
+    repository: &crate::workspace_authority::RepositoryEpochV1,
+) -> BTreeMap<PathBuf, StateDigestV1> {
+    repository
+        .observations()
+        .iter()
+        .filter(|observation| observation.kind() == RepositoryObservationKindV1::ContentPath)
+        .map(|observation| (observation.path().to_path_buf(), observation.digest()))
+        .collect()
+}
+
+#[allow(dead_code)]
 fn inventory_digests_v1(
     repository: &crate::workspace_authority::RepositoryEpochV1,
 ) -> BTreeMap<PathBuf, StateDigestV1> {
@@ -1410,6 +1479,66 @@ mod tests {
             assert!(definition.locator().start_line() > 0);
             assert!(definition.locator().start_column_byte() > 0);
         }
+    }
+
+    #[test]
+    fn optional_index_capacity_returns_partial_brief_without_poisoning_shared_manifest() {
+        let temporary = fixture_workspace_v1();
+        let authority_limits = WorkspaceAuthorityLimitsV1 {
+            max_plan_entries: 12,
+            ..WorkspaceAuthorityLimitsV1::default()
+        };
+        let canonical = fs::canonicalize(temporary.path()).unwrap();
+        let epoch = WorkspaceExecutionEpochV1::begin(&canonical, &authority_limits).unwrap();
+        let mut manifest = epoch.begin_observed_manifest(&authority_limits).unwrap();
+        let mut index = CodeIntelligenceIndexV1::new(CodeIntelligenceLimitsV1::default()).unwrap();
+
+        let refresh = index
+            .refresh_from_manifest(&epoch, &mut manifest, &authority_limits)
+            .unwrap();
+        assert!(refresh.incomplete());
+        assert!(
+            index.snapshot().unknowns().iter().any(|unknown| {
+                unknown.kind() == CodeIntelligenceUnknownKindV1::FileLimitExceeded
+            })
+        );
+        let remaining = FIXTURES
+            .iter()
+            .map(|(path, _)| PathBuf::from(path))
+            .find(|path| !manifest.has_content_observation_v1(path))
+            .unwrap();
+        let direct_tool_plan =
+            RepositoryObservationPlanV1::new(vec![remaining], Vec::new(), Vec::new(), Vec::new());
+        manifest.observe_repository(&direct_tool_plan).unwrap();
+    }
+
+    #[test]
+    fn unchanged_refresh_keeps_cross_file_index_identity() {
+        let temporary = fixture_workspace_v1();
+        let authority_limits = WorkspaceAuthorityLimitsV1::default();
+        let (epoch, mut manifest, mut index, first) =
+            refresh_fixture_v1(&temporary, CodeIntelligenceLimitsV1::default());
+        let first_snapshot = index.snapshot();
+
+        let warm = index
+            .refresh_from_manifest(&epoch, &mut manifest, &authority_limits)
+            .unwrap();
+        assert_eq!(warm.rebuilt_files(), 0);
+        assert_eq!(warm.reused_files(), first.discovered_files());
+        assert_eq!(warm.generation(), first.generation());
+        assert_eq!(index.snapshot(), first_snapshot);
+
+        fs::write(
+            temporary.path().join("python/widget.py"),
+            "def changed_widget() -> None:\n    pass\n",
+        )
+        .unwrap();
+        let changed = index
+            .refresh_from_manifest(&epoch, &mut manifest, &authority_limits)
+            .unwrap();
+        assert_eq!(changed.rebuilt_files(), 1);
+        assert!(changed.generation() > warm.generation());
+        assert_ne!(index.snapshot(), first_snapshot);
     }
 
     #[test]

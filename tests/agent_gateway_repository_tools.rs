@@ -154,7 +154,10 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     assert_eq!(
         names,
         vec![
-            "again.task_start",
+            "context.cancel",
+            "context.delta",
+            "context.publish",
+            "context.retrieve",
             "git.blame",
             "git.diff",
             "git.log",
@@ -445,11 +448,11 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     );
 
     let stats = server.stats().unwrap();
-    // The two in-process repository retries must be exact hits. The external
-    // Git retry may conservatively execute on hosts where Git changes an
-    // observed index/executable binding while answering the first request;
-    // that is a safe miss, and its exact response equality is asserted above.
-    assert!((2..=3).contains(&stats.exact_hits), "{stats:?}");
+    // Standalone repo.search now executes directly because its source proof
+    // costs more than this bounded provider scan. The Git diff retry remains
+    // exact; another Git retry may conservatively execute on hosts where Git
+    // changes an observed index/executable binding while answering it.
+    assert!((1..=2).contains(&stats.exact_hits), "{stats:?}");
     assert_eq!(stats.executed + stats.exact_hits, 25, "{stats:?}");
 }
 

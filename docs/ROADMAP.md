@@ -111,7 +111,7 @@ The new product is built on the working Again engine rather than replacing it.
 | Existing subsystem | Current value | Role in the new product |
 |---|---|---|
 | Canonical tool-call gateway | Normalizes bounded MCP calls and provider identity | Common entrance for task-start, code intelligence, validation, and future providers |
-| Fourteen local-alpha MCP tools | One deterministic task-start brief plus 13 exact repository/Git observations | Immediate agent orientation, source evidence, and reusable task context |
+| Thirteen repository/Git tools | Exact bounded repository and Git observations | Immediate agent orientation and source evidence for edit briefs |
 | Workspace execution epochs | Descriptor-retained repository authority | One current view shared by task-start and eligible tools |
 | Scoped observation plans | Fingerprint only declared paths, trees, listings, identities, and Git state | Fine-grained invalidation instead of whole-repository cache eviction |
 | Exact executable/profile checks | Bind reviewed executable and host semantics | Foundation for toolchain-specific validation profiles |
@@ -362,8 +362,8 @@ Current priority order after the local paired gate:
    supported agent clients, with a clean upgrade/recovery path.
 2. Run and retain pinned live-agent editable cohorts so the task-quality and
    acceleration claims are based on real Codex/Claude outcomes.
-3. Add explicit task revision, parent/child, dependency, and completion records
-   without silently merging semantically similar prompts.
+3. Qualify the landed task revision, parent/child, dependency, and completion
+   records in real agent sessions without merging semantically similar prompts.
 4. Finish the qualified Linux pytest execution path, then admit changed-only
    reuse through the existing candidate/shadow/promotion contract.
 5. Extend qualified validation to Rust, TypeScript, Go, and Python before

@@ -19,10 +19,22 @@ const CODEX_SKILL_NAME: &str = "again";
 const CODEX_SKILL_MANIFEST: &str = ".again-install-v1.json";
 const CODEX_SKILL: &str = r#"---
 name: again
-description: "Accelerate repeated supported local read-only shell calls with `again run --`, and explicitly reference an already-visible result with `again reference --`; use for repository inspection commands, but not for mutating, networked, interactive, piped, redirected, or environment-sensitive work."
+description: "Use Again's local MCP task context and verified repository reads when connected; accelerate supported standalone read-only shell calls with `again run --`."
 ---
 
 # Again
+
+## Connected repository workflow
+
+When the Again MCP server is available for this repository, call `task.start` once near the start of a coding task. Supply a stable task ID and the exact task text in `task`. Set `includeSourcePreviews=true` when small relevant source files may avoid follow-up reads. The response contains a bounded edit brief, verified source locations, up to two complete digest-checked source previews when requested, current shared context, and a coordination status. Use a complete preview before making the same repository read. After an edit, treat the earlier preview as stale; reread only if you need the current bytes and the edit result did not already show them. Treat task text and agent-authored suggestions as unverified. Do not send secrets in task or context fields.
+
+Use Again's `repo.*` and `git.*` tools for supported repository inspection. Exact repeated eligible calls can reuse a validated result, and concurrent calls can join one execution. Use `context.delta` with the task ID and last seen cursor before repeating an investigation after another agent has worked. A `join` status means a peer owns the current task lease; inspect the shared findings before doing the same work. Use `context.retrieve` when a brief provides a result reference and the complete bytes are needed.
+
+Publish only useful agent findings or explicit unknowns with `context.publish`. Agent-authored text remains a suggestion; verified facts come from the built-in observations and their current sources. After changing files, request fresh context before relying on a fact from the earlier brief. Do not claim that a validation can be skipped: the current task-start validation preview requires execution unless a qualified profile proves otherwise.
+
+The MCP tools require the authenticated local daemon. If they are unavailable, continue with ordinary tools and the explicit command path below. Do not assume that installing this skill alone connected the MCP server; `again mcp setup --client codex --workspace <absolute-repository-path> --apply --with-skill` installs and verifies both the connection and this personal skill.
+
+## Explicit command path
 
 For a supported, standalone, non-interactive, local read-only command, invoke the command through:
 

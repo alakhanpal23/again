@@ -210,9 +210,6 @@ pub(super) fn observation_plan_v1(
     arguments: &Value,
     operation: RepositoryOperationV1,
 ) -> Result<RepositoryObservationPlanV1> {
-    if operation == RepositoryOperationV1::TaskStart {
-        return super::task_start::observation_plan_v1(epoch, arguments);
-    }
     if matches!(
         operation,
         RepositoryOperationV1::GitLog | RepositoryOperationV1::GitShow
@@ -1288,7 +1285,7 @@ fn optional_line_v1(
     })
 }
 
-pub(super) fn source_files_v1(
+fn source_files_v1(
     epoch: &WorkspaceExecutionEpochV1,
     relative: &Path,
 ) -> Result<Vec<crate::workspace_authority::RepositoryRegularFileV1>, ProviderError> {
@@ -1341,7 +1338,7 @@ fn refuse_nested_git_control_v1(epoch: &WorkspaceExecutionEpochV1, relative: &Pa
     Ok(())
 }
 
-pub(super) fn read_file_v1(
+fn read_file_v1(
     epoch: &WorkspaceExecutionEpochV1,
     relative: &Path,
 ) -> Result<Vec<u8>, ProviderError> {
