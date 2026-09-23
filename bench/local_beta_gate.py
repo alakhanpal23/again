@@ -89,7 +89,8 @@ AUTHENTICATED_SCENARIOS = frozenset((
     "standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval",
     "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete",
     "mid_index_explicit_preview", "large_index_explicit_preview",
-    "recipient_cancel_scoped", "corrupt_result_refused", "lease_owner_crash_recovered",
+    "recipient_cancel_scoped", "corrupt_result_refused",
+    "inflight_follower_cancelled", "lease_owner_crash_recovered",
 ))
 FORBIDDEN_DIAGNOSTIC_KEYS = {
     "config_document",
@@ -578,6 +579,13 @@ def validate_authenticated(report: Mapping[str, Any]) -> dict[str, str]:
         isinstance(event, dict) and event.get("event_type") == "binding_quarantined"
         and event.get("reason") == "result_corrupt" for event in corruption),
         "authenticated_corruption", "corrupt task result was not quarantined")
+    cancellation = _mapping(report.get("inflight_cancellation_events"), "authenticated_cancellation")
+    _require(cancellation.get("requested") == 2
+             and cancellation.get("executed") == 1
+             and cancellation.get("inflight_candidate") == 1
+             and cancellation.get("follower_cancelled") == 1
+             and cancellation.get("completed") == 1,
+             "authenticated_cancellation", "joined follower cancellation is incomplete")
     old_lease = _mapping(report.get("old_lease"), "authenticated_lease")
     new_lease = _mapping(report.get("new_lease"), "authenticated_lease")
     recovery = _mapping(report.get("lease_recovery_events"), "authenticated_lease")

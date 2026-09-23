@@ -70,6 +70,15 @@ class Client:
     def tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.request("tools/call", {"name": name, "arguments": arguments})
 
+    def cancel(self, request_id: int) -> None:
+        require(self.process.stdin is not None, "client stdin missing")
+        frame = json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": request_id},
+        }, separators=(",", ":"))
+        self.process.stdin.write(frame.encode() + b"\n")
+        self.process.stdin.flush()
+
     def close(self) -> None:
         if self.process.stdin is not None:
             self.process.stdin.close()
@@ -371,11 +380,54 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                     "corrupted result reference was returned after quarantine")
             lease_dir = workspace / "lease"
             lease_dir.mkdir()
-            marker = b"TOKEN_LEASE_RECOVERY\n"
+            marker = b"TOKEN_LEASE_RECOVERY\nTOKEN_FOLLOWER_CANCEL\n"
             for index in range(56):
                 (lease_dir / f"payload-{index:03}.txt").write_bytes(
                     (marker if index == 0 else b"bounded fixture\n") + b"x" * (256 * 1024 - (len(marker) if index == 0 else len(b"bounded fixture\n")))
                 )
+            cancel_leader = Client(binary, workspace, environment)
+            cancel_follower = Client(binary, workspace, environment)
+            clients.extend((cancel_leader, cancel_follower))
+            inflight_task = {"taskId": "inflight-cancel-task", "task": "search lease files"}
+            structured(cancel_leader.tool("task.start", inflight_task), "inflight leader task.start")
+            structured(cancel_follower.tool("task.start", inflight_task), "inflight follower task.start")
+            inflight_start = reader.begin()
+            leader_outcome: dict[str, Any] = {}
+            follower_outcome: dict[str, Any] = {}
+
+            def inflight_search(client: Client, outcome: dict[str, Any]) -> None:
+                try:
+                    outcome["response"] = client.tool("repo.search", {
+                        "path": "lease", "pattern": "TOKEN_FOLLOWER_CANCEL",
+                    })
+                except BaseException as error:
+                    outcome["error"] = str(error)
+
+            leader_worker = threading.Thread(target=inflight_search, args=(cancel_leader, leader_outcome))
+            leader_worker.start()
+            inflight_binding = reader.wait_for_binding(inflight_start, 5)
+            reader.wait_for_event(inflight_binding, inflight_start, "executed", 5)
+            follower_worker = threading.Thread(target=inflight_search, args=(cancel_follower, follower_outcome))
+            follower_worker.start()
+            reader.wait_for_event(inflight_binding, inflight_start, "inflight_candidate", 5)
+            cancel_follower.cancel(cancel_follower.next_id)
+            follower_worker.join(timeout=15)
+            leader_worker.join(timeout=15)
+            require(not follower_worker.is_alive() and not leader_worker.is_alive(),
+                    "in-flight cancellation did not terminate both requests")
+            require(follower_outcome.get("response", {}).get("error", {}).get("code") == -32800,
+                    f"joined follower was not canceled: {follower_outcome}")
+            leader_response = leader_outcome.get("response")
+            require(isinstance(leader_response, dict), f"leader response missing: {leader_outcome}")
+            structured(leader_response, "leader after follower cancellation")
+            require(result_id(leader_response["result"]) is not None,
+                    "follower cancellation invalidated the surviving leader")
+            reader.wait_for_event(inflight_binding, inflight_start, "follower_cancelled", 5)
+            inflight_events = Counter(event["event_type"] for event in reader.events(
+                inflight_binding, reader.end(inflight_start)))
+            require(inflight_events["executed"] == 1 and inflight_events["follower_cancelled"] == 1
+                    and inflight_events["completed"] == 1,
+                    f"in-flight cancellation events are incomplete: {dict(inflight_events)}")
             lease_agent = Client(binary, workspace, environment)
             clients.append(lease_agent)
             lease_task = {"taskId": "lease-recovery-task", "task": "search lease directory"}
@@ -436,7 +488,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
                 "source": source,
                 "binary_sha256": pinned.sha256,
-                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused", "lease_owner_crash_recovered"],
+                "scenarios": ["standalone_direct", "duplicate_read_avoided", "peer_fact", "peer_retrieval", "unrelated_edit", "unobserved_relevant_edit", "large_ledger_incomplete", "mid_index_explicit_preview", "large_index_explicit_preview", "recipient_cancel_scoped", "corrupt_result_refused", "inflight_follower_cancelled", "lease_owner_crash_recovered"],
                 "duplicate_read_events": dict(event_counts),
                 "large_ledger_sources": 257,
                 "mid_index_source_files": 1000,
@@ -448,6 +500,7 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
                 "corruption_events": corruption_events,
                 "cancelled_result_id": cancel_id,
                 "lease_recovery_events": dict(recovery_events),
+                "inflight_cancellation_events": dict(inflight_events),
                 "old_lease": old_lease,
                 "new_lease": new_lease,
             }

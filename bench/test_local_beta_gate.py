@@ -343,6 +343,9 @@ def authenticated_report() -> dict[str, object]:
         "scenarios": sorted(gate.AUTHENTICATED_SCENARIOS),
         "duplicate_read_events": {"requested": 2, "executed": 1, "completed": 1, "inflight_join": 1},
         "corruption_events": [{"event_type": "binding_quarantined", "reason": "result_corrupt"}],
+        "inflight_cancellation_events": {"requested": 2, "executed": 1,
+                                         "inflight_candidate": 1, "follower_cancelled": 1,
+                                         "completed": 1},
         "old_lease": {"status": "active", "lifecycle_generation": 1},
         "new_lease": {"status": "completed", "lifecycle_generation": 2},
         "lease_recovery_events": {"lease_expired": 1, "requested": 1, "executed": 1, "completed": 1},
@@ -448,6 +451,7 @@ class LocalBetaGateTests(unittest.TestCase):
             ("duplicate_read_events", {"requested": 2, "executed": 2, "completed": 2}),
             ("duplicate_read_events", {"requested": 2, "executed": 1, "completed": 1, "inflight_join": "one"}),
             ("corruption_events", []),
+            ("inflight_cancellation_events", {"requested": 2, "executed": 2}),
             ("lease_recovery_events", {"requested": 1, "executed": 1, "completed": 1}),
             ("scenarios", [{}]),
         ):
