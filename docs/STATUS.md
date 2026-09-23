@@ -54,6 +54,10 @@ input tokens were 48,494 versus 97,698 and 48,437 versus 87,632. The
 wrapper's daemon preparation is included in elapsed and first-edit time.
 These are local dirty-source diagnostics on one fixture, not product-wide
 performance qualification.
+The [authenticated release-binary gate](../bench/results/2026-09-23-auth-product-e2e-prebrief-context-v1.json)
+passed at clean source `d1095ed`; it retains the existing task/source lifecycle
+checks after the prompt change. The actual-wrapper live pairs are local
+diagnostics, and the release gate does not yet run Codex.
 
 ## 2026-09-23 direct context architecture checkpoint
 
