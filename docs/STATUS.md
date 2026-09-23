@@ -252,6 +252,9 @@ the [same-prompt no-preview control](../bench/results/2026-09-23-gateway-task-1k
 measured 2,162 ms and returned 24 index candidates. The opt-in fast route
 marks broader indexing incomplete. It is a conditional latency win, with
 edit-quality parity and actual redundant-call displacement still unproven.
+The [clean-source release-binary task gate](../bench/results/2026-09-23-authenticated-product-e2e-mid-index-preview-release-v4.json)
+at `7a608ad` passed the 1,000-file named-preview route as well as the
+shared-context, 257-source freshness, and 4,097-file fallback scenarios.
 
 The [one-file cross-task guard probe](../bench/results/2026-09-23-gateway-task-reuse-cross-task-guard-v1.json)
 measured 40 warm calls per case on local dirty source. The current-reference
