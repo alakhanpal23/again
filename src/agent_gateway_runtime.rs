@@ -347,29 +347,6 @@ impl SharedObservedWorkspaceV1 {
 }
 
 #[derive(Clone)]
-struct SharedObservedWorkspaceV1 {
-    execution_epoch: Arc<WorkspaceExecutionEpochV1>,
-    manifest: Arc<Mutex<ObservedManifestV1>>,
-}
-
-impl SharedObservedWorkspaceV1 {
-    fn begin(workspace: &Path) -> Result<Self> {
-        let limits = gateway_workspace_limits_v1();
-        let execution_epoch = Arc::new(
-            WorkspaceExecutionEpochV1::begin(workspace, &limits)
-                .map_err(|_| anyhow!("descriptor-retained workspace issuance failed"))?,
-        );
-        let manifest = execution_epoch
-            .begin_observed_manifest(&limits)
-            .map_err(|_| anyhow!("sealed observed manifest issuance failed"))?;
-        Ok(Self {
-            execution_epoch,
-            manifest: Arc::new(Mutex::new(manifest)),
-        })
-    }
-}
-
-#[derive(Clone)]
 struct RecentGatewayCandidateV1 {
     binding: ValidatedGatewayReadV1,
     gateway_result_id: String,
