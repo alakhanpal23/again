@@ -2,6 +2,20 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 peer-wait call budget
+
+The Codex and Claude launchers now retry an active peer's `task.claim` with
+bounded backoff: 250 ms, 500 ms, 1 second, then at most every 2 seconds until
+the configured deadline. The previous fixed 250 ms interval could issue about
+120 claim requests during the default 30-second wait even when the leader was
+still working. The new schedule issues at most 19 in that interval, with up to
+2 seconds of added handoff detection delay after the initial retries. This is
+control-plane call reduction; it does not change repository result-cache hits.
+A metadata-only proof variant for `repo.tree` and `repo.glob` was tested locally
+and discarded: it saved 17–31 ms on cold 1,000-file calls, did not improve warm
+calls, and added a separate proof schema. The existing direct route remains
+the simpler choice until a complete, cheaper change signal is available.
+
 ## 2026-09-23 prebrief launch checkpoint
 
 The daemon now supports `task.start` with `previewOnly=true`: it registers exact

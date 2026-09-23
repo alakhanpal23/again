@@ -1506,6 +1506,7 @@ fn wait_for_peer_v1(
         .as_u64()
         .ok_or_else(|| anyhow!("task brief omitted state generation"))?;
     let deadline = Instant::now() + max_wait;
+    let mut poll_delay = Duration::from_millis(250);
     loop {
         let claim = session.tool(
             "task.claim",
@@ -1570,7 +1571,12 @@ fn wait_for_peer_v1(
             }
             _ => bail!("authenticated task claim had an unexpected outcome"),
         }
-        thread::sleep(Duration::from_millis(250));
+        // A waiting launcher should not send four claim requests per second
+        // for the whole peer wait. Keep the first retry prompt, then bound
+        // daemon traffic while still noticing an early peer exit.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(poll_delay.min(remaining));
+        poll_delay = (poll_delay * 2).min(Duration::from_secs(2));
     }
 }
 
