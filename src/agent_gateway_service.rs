@@ -2903,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn git_result_revalidation_detects_unobserved_head_change() {
+    fn git_status_reflects_unobserved_head_change_with_or_without_admission() {
         let workspace = tempfile::tempdir().unwrap();
         let git = |arguments: &[&str]| {
             let status = Command::new("git")
@@ -2944,8 +2944,11 @@ mod tests {
         let status = agent.tool("git.status", json!({ "path": "." }));
         let result_id = status["result"]["_meta"]["again"]["resultId"]
             .as_str()
-            .unwrap_or_else(|| panic!("Git status was not admitted: {status}"))
-            .to_owned();
+            .map(str::to_owned);
+        assert_eq!(
+            status["result"]["structuredContent"]["entries"][0]["path"], "tracked.txt",
+            "{status}"
+        );
         git(&["add", "tracked.txt"]);
         git(&[
             "-c",
@@ -2956,13 +2959,21 @@ mod tests {
             "-qm",
             "second",
         ]);
-        let stale = agent.tool(
-            "context.retrieve",
-            json!({ "taskId": "git-head-freshness", "resultId": result_id }),
-        );
+        if let Some(result_id) = result_id {
+            let stale = agent.tool(
+                "context.retrieve",
+                json!({ "taskId": "git-head-freshness", "resultId": result_id }),
+            );
+            assert_eq!(
+                stale["error"]["data"]["reason"], "retrieval_refused",
+                "{stale}"
+            );
+        }
+        let fresh = agent.tool("git.status", json!({ "path": "." }));
         assert_eq!(
-            stale["error"]["data"]["reason"], "retrieval_refused",
-            "{stale}"
+            fresh["result"]["structuredContent"]["entries"],
+            json!([]),
+            "Git status retained the old worktree after HEAD changed: {fresh}"
         );
         agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
         stop_daemon_v1(workspace.path()).unwrap();

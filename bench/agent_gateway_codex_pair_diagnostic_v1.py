@@ -613,24 +613,29 @@ def run_condition(
     stats_after = pair.again_stats(binary, workspace)
     stats = {key: stats_after[key] - stats_before[key] for key in stats_before}
     brain_run = None
+    brain_run_error = None
     if condition in ("product", "product-cold"):
-        brain = subprocess.run(
-            [str(binary), "brain", "show", "--workspace", str(workspace)],
-            cwd=workspace, capture_output=True, text=True, check=True, timeout=10,
-        )
-        matching_runs = [run for run in json.loads(brain.stdout)["recentRuns"]
-                         if run["task_id"] == task_id]
-        if len(matching_runs) != 1:
-            raise RuntimeError("Codex launcher did not retain exactly one current Brain run")
-        brain_run = matching_runs[0]
-        if brain_run["exit_code"] != returncode or brain_run["turn_completed"] is not True:
-            raise RuntimeError("retained Brain run omitted the completed Codex outcome")
-        if turn_completed_count == 1 and usage is not None and any(brain_run[field] != usage[source] for field, source in (
+        try:
+            brain = subprocess.run(
+                [str(binary), "brain", "show", "--workspace", str(workspace)],
+                cwd=workspace, capture_output=True, text=True, check=True, timeout=10,
+            )
+            matching_runs = [run for run in json.loads(brain.stdout)["recentRuns"]
+                             if run["task_id"] == task_id]
+            if len(matching_runs) != 1:
+                brain_run_error = f"expected one current Brain run, found {len(matching_runs)}"
+            else:
+                brain_run = matching_runs[0]
+        except (subprocess.SubprocessError, json.JSONDecodeError, KeyError) as error:
+            brain_run_error = f"Brain inspection failed: {type(error).__name__}"
+        if brain_run is not None and (brain_run["exit_code"] != returncode or brain_run["turn_completed"] is not True):
+            brain_run_error = "retained Brain run omitted the completed Codex outcome"
+        if brain_run is not None and turn_completed_count == 1 and usage is not None and any(brain_run[field] != usage[source] for field, source in (
             ("input_tokens", "input_tokens"),
             ("cached_input_tokens", "cached_input_tokens"),
             ("output_tokens", "output_tokens"),
         )):
-            raise RuntimeError("retained Brain usage disagrees with the raw Codex event stream")
+            brain_run_error = "retained Brain usage disagrees with the raw Codex event stream"
     if condition in ("again", "prebrief", "product", "product-cold"):
         subprocess.run(
             [str(binary), "mcp", "daemon", "stop", "--workspace", str(workspace)],
@@ -661,6 +666,7 @@ def run_condition(
         "againStatsDelta": stats,
         "priorBrain": prior_brain,
         "brainRun": brain_run,
+        "brainRunError": brain_run_error,
     }
     return result, raw
 
@@ -735,6 +741,7 @@ def main() -> int:
     accepted = all(
         result["exitCode"] == 0 and not result["timedOut"]
         and result["eventsCaptured"] and result["oracle"]["passed"]
+        and result["brainRunError"] is None
         and result["agentValidationObserved"] is not False
         for result in observations
     ) and next(result for result in observations if result["condition"] == "baseline")["againStatsDelta"]["requested"] == 0
