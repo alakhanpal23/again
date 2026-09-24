@@ -272,7 +272,13 @@ fn hook_conflict_after_mcp_add_rolls_back_new_skill_and_entry() {
         &[("FAKE_INJECT_HOOK_CONFLICT", "1")],
     );
     assert!(!refused.status.success());
-    assert_eq!(fs::read_to_string(&fixture.state).unwrap(), "absent\n");
+    assert_eq!(
+        fs::read_to_string(&fixture.state).unwrap_or_default(),
+        "absent\n",
+        "stderr: {}; log: {}",
+        String::from_utf8_lossy(&refused.stderr),
+        fs::read_to_string(&fixture.log).unwrap_or_default()
+    );
     assert!(
         !fixture
             .temporary

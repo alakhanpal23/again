@@ -2927,6 +2927,7 @@ mod tests {
             "-qm",
             "first",
         ]);
+        fs::write(workspace.path().join("pending.txt"), b"untracked\n").unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
             AuthorizationScopeId::new("git-head-freshness-scope").unwrap(),
