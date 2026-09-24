@@ -239,9 +239,25 @@ def again_instruction(task_id: str) -> str:
 
 
 def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
-                     decoy_count: int = 0) -> dict[str, str | int]:
-    """Create a prior completed source read through the real Again launcher."""
+                     decoy_count: int = 0, search: bool = False) -> dict[str, str | int]:
+    """Create prior checked source observations through the real Again launcher."""
     read_range = "1,200p" if len(pair.BUGGY) > 256 else "1,20p"
+    if search:
+        event_script = (
+            "output = ''\n"
+            "for path in ('src/ledger.py', target):\n"
+            "    for number, line in enumerate((workspace / path).read_text().splitlines(), 1):\n"
+            "        if 'adjust_total' in line:\n"
+            "            output += f'{path}:{number}:{line}\\n'\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'prior_search','type':'command_execution',"
+            "'command':'rg -n -F adjust_total src','aggregated_output':output,'exit_code':0,'status':'completed'}}))\n"
+        )
+    else:
+        event_script = (
+            "content = (workspace / target).read_text()\n"
+            "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
+            f"'command':\"sed -n '{read_range}' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}}}))\n"
+        )
     with tempfile.TemporaryDirectory(prefix="again-prior-task-") as temporary:
         fake_bin = pathlib.Path(temporary)
         fake_codex = fake_bin / "codex"
@@ -250,10 +266,8 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
             "import json, pathlib, sys\n"
             f"target = {pair.TARGET!r}\n"
             "workspace = pathlib.Path(sys.argv[sys.argv.index('-C') + 1])\n"
-            "content = (workspace / target).read_text()\n"
-            "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
-            f"'command':\"sed -n '{read_range}' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}}}))\n"
-            "print(json.dumps({'type':'item.completed','item':{'id':'done','type':'agent_message','text':'Done'}}))\n"
+            + event_script
+            + "print(json.dumps({'type':'item.completed','item':{'id':'done','type':'agent_message','text':'Done'}}))\n"
         )
         fake_codex.chmod(0o700)
         environment = os.environ.copy()
@@ -304,7 +318,7 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
                 raise RuntimeError(f"could not seed unrelated Brain reads: {result.stderr[-1000:]}")
     return {"taskId": "prior-ledger-investigation", "path": pair.TARGET,
             "sourceSha256": hashlib.sha256((workspace / pair.TARGET).read_bytes()).hexdigest(),
-            "decoyCount": decoy_count}
+            "decoyCount": decoy_count, "mode": "search" if search else "read"}
 
 
 def run_condition(
@@ -316,6 +330,7 @@ def run_condition(
     prebrief_with_mcp: bool = False,
     seed_brain: bool = False,
     brain_decoys: int = 0,
+    seed_brain_search: bool = False,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -327,7 +342,7 @@ def run_condition(
                 f"value = {index}\n", encoding="utf-8"
             )
     before = pair.snapshot(workspace)
-    prior_brain = seed_prior_brain(binary, workspace, brain_decoys) if seed_brain and condition == "product" else None
+    prior_brain = seed_prior_brain(binary, workspace, brain_decoys, seed_brain_search) if seed_brain and condition == "product" else None
     stats_before = pair.again_stats(binary, workspace)
     preparation_ms = 0.0
     initial_brief = ""
@@ -516,6 +531,8 @@ def main() -> int:
                         help="diagnostic: launch through the production again codex command")
     parser.add_argument("--seed-prior-brain", action="store_true",
                         help="seed a verified prior source read for a balance-helper returning task")
+    parser.add_argument("--seed-prior-brain-search", action="store_true",
+                        help="seed verified prior source matches for a balance-helper returning task")
     parser.add_argument("--prebrief-with-mcp", action="store_true",
                         help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
@@ -531,8 +548,10 @@ def main() -> int:
         parser.error("--prebrief-with-mcp requires --prebrief")
     if args.product_wrapper and (args.prebrief or args.prebrief_with_mcp):
         parser.error("--product-wrapper cannot be combined with diagnostic prebrief modes")
-    if args.seed_prior_brain and (not args.product_wrapper or args.fixture not in ("balance-helper", "balance-helper-large")):
-        parser.error("--seed-prior-brain requires --product-wrapper and a balance-helper fixture")
+    if args.seed_prior_brain and args.seed_prior_brain_search:
+        parser.error("select only one prior Brain seed mode")
+    if (args.seed_prior_brain or args.seed_prior_brain_search) and (not args.product_wrapper or args.fixture not in ("balance-helper", "balance-helper-large")):
+        parser.error("prior Brain seeding requires --product-wrapper and a balance-helper fixture")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(
         [str(binary), "mcp", "connect", "--help"],
@@ -556,7 +575,8 @@ def main() -> int:
                 condition, pathlib.Path(temporary), binary, args.model,
                 TASK_IDS[args.fixture],
                 args.source_files, args.task_start_only_surface, args.compact_task_result,
-                args.prebrief_with_mcp, args.seed_prior_brain,
+                args.prebrief_with_mcp, args.seed_prior_brain or args.seed_prior_brain_search,
+                seed_brain_search=args.seed_prior_brain_search,
             )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -590,7 +610,7 @@ def main() -> int:
         "compactTaskResult": args.compact_task_result,
         "prebrief": args.prebrief,
         "prebriefWithMcp": args.prebrief_with_mcp,
-        "returningTask": args.seed_prior_brain,
+        "returningTask": args.seed_prior_brain or args.seed_prior_brain_search,
         "observations": observations,
         "accepted": accepted,
     }

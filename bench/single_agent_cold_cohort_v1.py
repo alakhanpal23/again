@@ -66,6 +66,8 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         observations = {item["condition"]: item for item in report["observations"]}
         if observations["product"].get("priorBrain", {}).get("path") != "src/util.py":
             raise RuntimeError("returning task lacked its verified prior Brain read")
+        if observations["product"].get("priorBrain", {}).get("mode") != case.get("priorBrainMode", "read"):
+            raise RuntimeError("returning task used the wrong prior Brain observation mode")
         if observations["baseline"].get("priorBrain") is not None:
             raise RuntimeError("baseline was seeded with Again Brain")
     for observation in report["observations"]:
@@ -174,7 +176,9 @@ def main() -> int:
                            "--model", manifest["model"], "--fixture", case["fixture"],
                            "--source-files", str(case["sourceFiles"]), "--order", order,
                            "--product-wrapper", "--output", str(output)]
-                if case.get("returningTask"):
+                if case.get("priorBrainMode") == "search":
+                    command.append("--seed-prior-brain-search")
+                elif case.get("returningTask"):
                     command.append("--seed-prior-brain")
                 result = subprocess.run(command, cwd=ROOT, timeout=420, capture_output=True, text=True)
                 if not output.exists():
