@@ -1,0 +1,42 @@
+{
+  "accepted": true,
+  "afterManifestChangeBrainHint": null,
+  "afterManifestChangeSelector": null,
+  "afterTestBrainHint": "pnpm test",
+  "afterTestSelector": {
+    "basis": "current_package_test_script",
+    "command": "pnpm test",
+    "source": {
+      "digest": "aa0ff1ec938f951cdba314518013193241c0af59d30c25f1517a491da1daabd1",
+      "path": "package.json",
+      "testScript": "vitest run"
+    },
+    "verified": false,
+    "workingDirectory": "."
+  },
+  "beforeTestBrainHint": null,
+  "beforeTestSelector": {
+    "basis": "current_package_test_script",
+    "command": "pnpm test",
+    "source": {
+      "digest": "aa0ff1ec938f951cdba314518013193241c0af59d30c25f1517a491da1daabd1",
+      "path": "package.json",
+      "testScript": "vitest run"
+    },
+    "verified": false,
+    "workingDirectory": "."
+  },
+  "binarySha256": "28977dadd795e4749e90268128bcce4973ea77c7f3b8945a6fcb7177f17bd27e",
+  "evidenceScope": "fixed fake-Codex completed test event; no test execution or reuse claim",
+  "fixtureSha256": "0b99ff29c1339c59f004f5f38cf242443aaea2cc4d4c482f76a42ffe3e4cb0c1",
+  "launcherExitCode": 0,
+  "recordedAtUtc": "2026-09-24T04:53:06.216102+00:00",
+  "schema": "again.package-test-brain-gate.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "3b5182941b6ebd39094eb085f281ba89a49834b1",
+    "dirty": false,
+    "head": "3b5182941b6ebd39094eb085f281ba89a49834b1"
+  }
+}
