@@ -1,0 +1,49 @@
+{
+  "acceptedPairs": 1,
+  "apiEquivalentCostRatio": 0.9709825077652444,
+  "baselineApiEquivalentUsd": "0.0538296",
+  "baselineCommands": 6,
+  "fixture": "historical-python-triple",
+  "limitations": [
+    "one historical repair fixture; not a diverse release cohort",
+    "API-equivalent estimate, not billed Codex charges"
+  ],
+  "model": "gpt-6-sol",
+  "pairedMedianElapsedRatio": 0.9771207293321772,
+  "pairs": [
+    {
+      "baselineApiEquivalentUsd": "0.0538296",
+      "baselineCommands": 6,
+      "baselineElapsedMs": 37528.469,
+      "baselineFirstEditMs": 25880.116,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "productApiEquivalentUsd": "0.0522676",
+      "productCommands": 4,
+      "productElapsedMs": 36669.845,
+      "productFirstEditMs": 26959.228,
+      "productToBaselineElapsedRatio": 0.9771207293321772,
+      "report": "again-bounded-search-baseline-first-2263b20.json"
+    }
+  ],
+  "productApiEquivalentUsd": "0.0522676",
+  "productCommands": 4,
+  "rateCard": {
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "contextClass": "short, at most 272K input tokens per request",
+    "model": "gpt-6-sol",
+    "schema": "again.api-rate-card.v1",
+    "serviceTier": "standard",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "cacheWriteInput": "2.50",
+      "cachedInput": "0.20",
+      "output": "10.00",
+      "uncachedInput": "2.00"
+    }
+  },
+  "schema": "again.product-pair-summary.v1",
+  "sourceSha": "2263b20966aa2f929040990acb2df9127adf526f"
+}

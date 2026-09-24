@@ -607,7 +607,6 @@ pub fn repository_brief_for_task_v1(
         .as_array()
         .into_iter()
         .flatten()
-        .filter(|preview| preview["complete"] == true)
         .filter_map(|preview| preview["path"].as_str())
         .collect();
     if let Some(files) = brain["recentCurrentFiles"].as_array_mut() {
@@ -2310,18 +2309,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(duplicated["recentCurrentFiles"][0]["currentPartialPreview"]["text"].is_string());
-        let complete = serde_json::json!([{"path":"src/ledger.py","complete":true}]);
-        let fully_previewed = repository_brief_for_task_v1(
-            &store,
-            &workspace,
-            &complete,
-            &serde_json::json!({"candidates":[]}),
-            task_query("Fix ledger balance calculation", &scope),
-        )
-        .unwrap()
-        .unwrap();
-        assert!(fully_previewed["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
+        assert!(duplicated["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
 
         fs::write(
             workspace.join("src/ledger.py"),

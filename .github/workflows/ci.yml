@@ -298,6 +298,8 @@ jobs:
         run: python3 -B -m unittest bench/test_real_repository_corpus.py
       - name: Verify retained Brain ablation summaries
         run: python3 -B -m unittest bench/test_summarize_brain_ablation_v1.py
+      - name: Verify retained baseline and product task outcomes
+        run: python3 -B -m unittest bench/test_summarize_product_pairs_v1.py
       - name: Test the Linux supervisor qualification harness
         if: runner.os == 'Linux'
         run: scripts/test_linux_supervisor_qualification.sh
