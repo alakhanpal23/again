@@ -446,6 +446,10 @@ pub fn repository_brief_v1(
         .brain_test_hints_v1(authorization_scope_digest, 16)?
         .into_iter()
         .find(|hint| test_hint_relevant_v1(hint, workspace, candidate_paths));
+    let test_scope = test_hint
+        .as_deref()
+        .and_then(filtered_cargo_test_v1)
+        .map(|_| "filtered test only; other required validation remains unverified");
     for path in candidate_paths.iter().take(16) {
         if recent_files.len() == 2 {
             break;
@@ -483,6 +487,7 @@ pub fn repository_brief_v1(
         "recentCurrentFiles": recent_files,
         "previousSuccessfulTestCommand": test_hint,
         "testCommandAuthority": "unverified suggestion; run required validation",
+        "testCommandScope": test_scope,
     }))
 }
 
@@ -1570,6 +1575,10 @@ mod tests {
         assert_eq!(
             brief["testCommandAuthority"],
             "unverified suggestion; run required validation"
+        );
+        assert_eq!(
+            brief["testCommandScope"],
+            "filtered test only; other required validation remains unverified"
         );
         assert!(test_hint_relevant_v1(
             events[0].command_hint.as_deref().unwrap(),
