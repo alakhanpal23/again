@@ -18,6 +18,8 @@
       "coldElapsedMs": 37703.557,
       "coldFirstEditMs": 29724.032,
       "coldInvestigationCommands": 7,
+      "coldNonValidationMs": 35613.291,
+      "coldRequiredValidationMs": 2090.266,
       "coldSuccessfulTests": 1,
       "order": [
         "product-cold",
@@ -28,6 +30,8 @@
       "seededElapsedMs": 40272.652,
       "seededFirstEditMs": 31096.921,
       "seededInvestigationCommands": 3,
+      "seededNonValidationMs": 38171.927,
+      "seededRequiredValidationMs": 2100.725,
       "seededSuccessfulTests": 1,
       "seededToColdElapsedRatio": 1.068139327013629,
       "sourceSha": "065d8c2275d928570a5a16bcb8aebb243e728ccc"
@@ -37,6 +41,8 @@
       "coldElapsedMs": 40059.61,
       "coldFirstEditMs": 27359.719,
       "coldInvestigationCommands": 2,
+      "coldNonValidationMs": 37742.988,
+      "coldRequiredValidationMs": 2316.622,
       "coldSuccessfulTests": 1,
       "order": [
         "product",
@@ -47,6 +53,8 @@
       "seededElapsedMs": 35554.888,
       "seededFirstEditMs": 24148.452,
       "seededInvestigationCommands": 2,
+      "seededNonValidationMs": 33339.911,
+      "seededRequiredValidationMs": 2214.977,
       "seededSuccessfulTests": 1,
       "seededToColdElapsedRatio": 0.8875495293139398,
       "sourceSha": "065d8c2275d928570a5a16bcb8aebb243e728ccc"

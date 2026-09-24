@@ -39,6 +39,38 @@ def investigation_commands(path: pathlib.Path, expected_sha: str,
     return count
 
 
+def validation_duration_ms(item: dict, path: pathlib.Path,
+                           test_command: str) -> float:
+    """Measure the required agent-run test from captured start/completion events."""
+    test_ids = set()
+    for line in path.read_bytes().splitlines():
+        event = json.loads(line)
+        action = event.get("item", {})
+        if (event.get("type") == "item.completed"
+                and action.get("type") == "command_execution"
+                and action.get("exit_code") == 0
+                and test_command in action.get("command", "")):
+            test_ids.add(action.get("id"))
+    if not test_ids or None in test_ids:
+        raise RuntimeError(f"required test has no captured item ID: {path}")
+    started = {}
+    completed = {}
+    for event in item.get("eventTimeline", []):
+        event_id = event.get("itemId")
+        if event_id not in test_ids:
+            continue
+        if event.get("event") == "item.started":
+            started[event_id] = event.get("elapsedMs")
+        elif event.get("event") == "item.completed":
+            completed[event_id] = event.get("elapsedMs")
+    if set(started) != test_ids or set(completed) != test_ids:
+        raise RuntimeError(f"required test lacks start/completion timing: {path}")
+    durations = [completed[event_id] - started[event_id] for event_id in test_ids]
+    if any(duration < 0 for duration in durations):
+        raise RuntimeError(f"required test timing is reversed: {path}")
+    return round(sum(durations), 3)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", type=pathlib.Path, action="append", required=True)
@@ -90,9 +122,10 @@ def main() -> int:
             by_condition[condition] = (
                 item,
                 investigation_commands(raw_path, item["rawEventSha256"], args.test_command),
+                validation_duration_ms(item, raw_path, args.test_command),
             )
-        cold, cold_investigations = by_condition["product-cold"]
-        seeded, seeded_investigations = by_condition["product"]
+        cold, cold_investigations, cold_validation_ms = by_condition["product-cold"]
+        seeded, seeded_investigations, seeded_validation_ms = by_condition["product"]
         if cold.get("priorBrain") is not None or seeded.get("priorBrain") is None:
             raise RuntimeError("missing cold/seeded Brain contrast")
         cold_pair_cost = cost(cold["usage"], rates)
@@ -110,6 +143,10 @@ def main() -> int:
             "seededFirstEditMs": seeded["firstEditMs"],
             "coldInvestigationCommands": cold_investigations,
             "seededInvestigationCommands": seeded_investigations,
+            "coldRequiredValidationMs": cold_validation_ms,
+            "seededRequiredValidationMs": seeded_validation_ms,
+            "coldNonValidationMs": round(cold["elapsedMs"] - cold_validation_ms, 3),
+            "seededNonValidationMs": round(seeded["elapsedMs"] - seeded_validation_ms, 3),
             "coldSuccessfulTests": cold["brainRun"]["successful_tests"],
             "seededSuccessfulTests": seeded["brainRun"]["successful_tests"],
             "coldApiEquivalentUsd": str(cold_pair_cost),
