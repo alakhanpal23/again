@@ -13,6 +13,7 @@ const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
 const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
 const MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1: usize = 5 * 1024;
 const MAX_BRAIN_BRIEF_BYTES_V1: usize = 8 * 1024;
+const MAX_TEST_SELECTOR_SCAN_BYTES_V1: u64 = 256 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct CodexRunObservationV1 {
@@ -748,32 +749,47 @@ fn known_test_command_v1(command: &str) -> Option<String> {
         | "pnpm test"
         | "yarn test"
         | "bun test" => Some(command.to_owned()),
-        _ => command
+        _ if command
             .strip_prefix("node --test ")
-            .filter(|path| safe_node_test_path_v1(path))
-            .map(|_| command.to_owned()),
+            .is_some_and(safe_node_test_path_v1) =>
+        {
+            Some(command.to_owned())
+        }
+        _ if filtered_cargo_test_v1(command).is_some() => Some(command.to_owned()),
+        _ => None,
     }
 }
 
-// Count a completed, successful filtered Cargo test without promoting its
-// selector into a cross-task validation hint. The filter may no longer exist
-// after source changes, so only the existing exact commands can be suggested.
+// A filtered Cargo test can be remembered as a suggestion only if the current
+// task's candidate source still contains the selected test or module name.
 fn observed_cargo_test_v1(command: &str) -> bool {
+    cargo_test_selector_v1(command).is_some()
+}
+
+fn filtered_cargo_test_v1(command: &str) -> Option<String> {
+    cargo_test_selector_v1(command)
+        .flatten()
+        .filter(|selector| {
+            selector
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+}
+
+fn cargo_test_selector_v1(command: &str) -> Option<Option<String>> {
     let command = command.trim();
     let command = command
         .strip_prefix("/bin/zsh -lc '")
         .and_then(|inner| inner.strip_suffix('\''))
         .unwrap_or(command);
-    let Ok(parts) = shell_words::split(command) else {
-        return false;
-    };
+    let parts = shell_words::split(command).ok()?;
     let [cargo, test, flags @ ..] = parts.as_slice() else {
-        return false;
+        return None;
     };
     if cargo != "cargo" || test != "test" {
-        return false;
+        return None;
     }
-    let mut selectors = 0;
+    let mut selector = None;
     for flag in flags {
         if matches!(flag.as_str(), "--locked" | "--lib" | "--quiet") {
             continue;
@@ -783,12 +799,13 @@ fn observed_cargo_test_v1(command: &str) -> bool {
             || !flag
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+            || selector.is_some()
         {
-            return false;
+            return None;
         }
-        selectors += 1;
+        selector = Some(flag.clone());
     }
-    selectors <= 1
+    Some(selector)
 }
 
 fn safe_node_test_path_v1(path: &str) -> bool {
@@ -1041,6 +1058,37 @@ fn source_code_path_v1(path: &str) -> bool {
 }
 
 fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String]) -> bool {
+    if let Some(selector) = filtered_cargo_test_v1(hint) {
+        if !workspace.join("Cargo.toml").is_file() {
+            return false;
+        }
+        return candidate_paths.iter().take(4).any(|path| {
+            let Some((relative, absolute)) = workspace_file_v1(workspace, path) else {
+                return false;
+            };
+            if relative != *path || !path.ends_with(".rs") {
+                return false;
+            }
+            if !fs::metadata(&absolute)
+                .is_ok_and(|metadata| metadata.len() <= MAX_TEST_SELECTOR_SCAN_BYTES_V1)
+            {
+                return false;
+            }
+            let Ok(bytes) = fs::read(&absolute) else {
+                return false;
+            };
+            if bytes.len() > MAX_TEST_SELECTOR_SCAN_BYTES_V1 as usize {
+                return false;
+            }
+            let tokens = bytes
+                .split(|byte| !byte.is_ascii_alphanumeric() && *byte != b'_')
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>();
+            tokens
+                .windows(2)
+                .any(|pair| matches!(pair[0], b"fn" | b"mod") && pair[1] == selector.as_bytes())
+        });
+    }
     if matches!(hint, "npm test" | "pnpm test" | "yarn test" | "bun test") {
         return candidate_paths
             .iter()
@@ -1484,8 +1532,19 @@ mod tests {
     }
 
     #[test]
-    fn filtered_cargo_test_counts_as_validation_without_becoming_a_reuse_hint() {
+    fn filtered_cargo_test_is_only_a_current_source_checked_validation_hint() {
         let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(
+            dir.path().join("src/lib.rs"),
+            "#[cfg(test)] mod historical_search_oracle { #[test] fn bounded() {} }\n",
+        )
+        .unwrap();
         let completed = serde_json::json!({
             "type":"item.completed",
             "item":{"id":"cargo-filter","type":"command_execution",
@@ -1495,7 +1554,36 @@ mod tests {
         let events = codex_completed_events_v1(&completed, dir.path(), "session", "task");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "test");
-        assert_eq!(events[0].command_hint, None);
+        assert_eq!(
+            events[0].command_hint.as_deref(),
+            Some("cargo test --locked --lib historical_search_oracle")
+        );
+        let store = Store::open(dir.path().join("state")).unwrap();
+        store.record_brain_event_v1(&events[0]).unwrap();
+        let scope = local_brain_scope_digest_v1(dir.path());
+        let candidates = ["src/lib.rs".to_owned()];
+        let brief = repository_brief_v1(&store, dir.path(), &candidates, &[], &scope).unwrap();
+        assert_eq!(
+            brief["previousSuccessfulTestCommand"],
+            "cargo test --locked --lib historical_search_oracle"
+        );
+        assert_eq!(
+            brief["testCommandAuthority"],
+            "unverified suggestion; run required validation"
+        );
+        assert!(test_hint_relevant_v1(
+            events[0].command_hint.as_deref().unwrap(),
+            dir.path(),
+            &candidates
+        ));
+        fs::write(dir.path().join("src/lib.rs"), "pub fn unrelated() {}\n").unwrap();
+        let stale = repository_brief_v1(&store, dir.path(), &candidates, &[], &scope).unwrap();
+        assert!(stale["previousSuccessfulTestCommand"].is_null());
+        assert!(!test_hint_relevant_v1(
+            events[0].command_hint.as_deref().unwrap(),
+            dir.path(),
+            &candidates
+        ));
         let mut run = CodexRunObservationV1::default();
         run.observe(&completed, &events);
         assert_eq!(
@@ -1516,6 +1604,10 @@ mod tests {
         ] {
             assert!(!observed_cargo_test_v1(command));
         }
+        assert!(observed_cargo_test_v1(
+            "cargo test --locked --lib first::second"
+        ));
+        assert!(known_test_command_v1("cargo test --locked --lib first::second").is_none());
         let failed = serde_json::json!({
             "type":"item.completed",
             "item":{"id":"cargo-failed","type":"command_execution",
