@@ -1,0 +1,14 @@
+{
+  "schema": "again.api-rate-card.v1",
+  "model": "gpt-6-sol",
+  "serviceTier": "standard",
+  "contextClass": "short, at most 272K input tokens per request",
+  "capturedAtUtc": "2026-09-24T03:50:00Z",
+  "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+  "usdPerMillionTokens": {
+    "uncachedInput": "2.00",
+    "cachedInput": "0.20",
+    "cacheWriteInput": "2.50",
+    "output": "10.00"
+  }
+}

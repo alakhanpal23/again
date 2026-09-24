@@ -13,6 +13,12 @@ actions. Aggregate uncached input, cached input, and output tokens were lower.
 This meets the cohort's 20% median time target with equal accepted outcomes,
 but the tail result, metered dollar cost, diverse real tasks, and proof-based
 validation reuse remain release gates.
+Using a frozen [GPT-6 Sol Standard short-context API rate card](https://developers.openai.com/api/docs/models/gpt-6-sol),
+the [API-equivalent token estimate](../bench/results/2026-09-23-cold-cohort-bound-ffffc94/api-equivalent-cost.json)
+is $0.364704 baseline versus $0.237858 Again across 10 accepted tasks per
+condition, a ratio of 0.652. This is an estimate from complete reported token
+counters. It is not an observed Codex invoice and assumes every request uses
+the stated short-context Standard rate without other charges.
 
 Again now embeds the Git source SHA and whether its source checkout was clean
 at build time. `again build-info` reports both. The paired Codex harness
