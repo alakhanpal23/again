@@ -1,0 +1,37 @@
+{
+  "schema": "again.real-repository-cohort-manifest.v1",
+  "model": "gpt-6-sol",
+  "rateCard": "rate_card_gpt6sol_standard_short_2026-09-23.json",
+  "cases": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "repository": "https://github.com/pypa/packaging.git",
+      "parent": "b097450461523502ada842f98274449ad74ff1ff",
+      "fix": "4e79787a31c99348649bb0dafee2a5078d3595be",
+      "fixtureSha256": "0fead1a8702c291a98f9f31088317b5335fffbd4157f654307f3397e7a4b8bf9",
+      "promptSha256": "c013f20b192a2f2b628757ad1f1378b5998bcea715e33e5aeb6a4b096b682283",
+      "priorPromptSha256": "f67212f1960b3315abc265b88ad7a1731d235b7bd363a10be9fec9e9e4d8a071",
+      "validationSelector": "python3 -m unittest discover -s tests -p test_again_oracle.py"
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "repository": "https://github.com/sdispater/tomlkit.git",
+      "parent": "7ab7469addd60e03ca3bfbb1287642e8d771e1c0",
+      "fix": "4b38becd75405e0f38ef3e47e9839eb407591c8a",
+      "fixtureSha256": "214de42803845701c4838e872143dae1221faccd8fe4cd9dedc31f10e1383102",
+      "promptSha256": "f5577df62b3685d780aa2c19b1070fdf04bd8ce34593e4a7d3e60f06fbcb79ab",
+      "priorPromptSha256": "86d82bc7f37a6779a49bd69558da1786375e38556248ef59f3b9d9ac18467619",
+      "validationSelector": "python3 -m unittest discover -s tests -p test_again_oracle.py"
+    }
+  ],
+  "modes": ["cold", "returning"],
+  "orders": ["baseline-first", "again-first"],
+  "qualification": {
+    "requireEveryPairedTaskAccepted": true,
+    "requireAgentTestExecution": true,
+    "requireProductBrainRun": true,
+    "includePriorTaskTimeAndTokens": true,
+    "maximumMedianTimeRatio": 0.8,
+    "maximumMedianApiEquivalentCostRatio": 0.8
+  }
+}

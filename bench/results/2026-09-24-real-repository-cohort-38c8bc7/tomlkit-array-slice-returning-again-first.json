@@ -1,0 +1,339 @@
+{
+  "schema": "again.real-repository-pair.v1",
+  "identity": {
+    "manifestSha256": "ed16ffdd86ef5ec5abc258752e5be5033a9b8c2a938d1fa4e73ea28304d92647",
+    "source": {
+      "head": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+      "dirty": false,
+      "buildSourceSha": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "0d3ce3972d892dba8a983a522f4d4e9427544f6ea9aadaf3387876377a2460fb",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "tomlkit-array-slice",
+  "mode": "returning",
+  "order": "again-first",
+  "observations": [
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 11800.176,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 11800.176,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5999.952,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 5999.965,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8326.208,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8326.226,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 10954.694,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 5999.968,
+      "rawEventBytes": 1853,
+      "rawEventSha256": "eb63465be51ab15cb72d94cdde3c78ab3d39f28ee243f005203df90650703542",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 9,
+      "completedActions": [
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 51710,
+        "cached_input_tokens": 45824,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 367,
+        "reasoning_output_tokens": 37
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 74.473,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 8412.642,
+        "usage": {
+          "input_tokens": 34161,
+          "cached_input_tokens": 28544,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 213,
+          "reasoning_output_tokens": 16
+        },
+        "completedCommands": 1,
+        "brainObserved": true,
+        "rawEventSha256": "8919cc79ab919968af41c8da3c5bede2194c3ce7a8b9ab34aedfed488603e67e",
+        "rawEventBytes": 1246
+      },
+      "brainRun": {
+        "authorization_scope_digest": "59660fdafb4eb5f11bdc15f3646f5b2cb3372acf4881fe61dfa33211721557cb",
+        "cached_input_tokens": 45824,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790285880745,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 51710,
+        "output_tokens": 367,
+        "session_id": "91b4cff2-7baf-4960-a42d-a12e2779d70c",
+        "started_ms": 1790285868976,
+        "successful_tests": 0,
+        "task_id": "tomlkit-array-slice-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    },
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 20768.68,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 20768.68,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5189.708,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5189.734,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5214.346,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5214.36,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8989.345,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8989.356,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8989.371,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8989.421,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13974.18,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 13999.807,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 18136.122,
+          "event": "item.started",
+          "itemId": "item_7",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 18136.141,
+          "event": "item.completed",
+          "itemId": "item_7",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 20027.124,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 13974.187,
+      "rawEventBytes": 18585,
+      "rawEventSha256": "43e7fee75b1269fb75890236b58d1a068e2cb0ec337433ab18b09fade6bc4b52",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 18,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"class Array|def __setitem__|slice\" tomlkit/items.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'git status --short && rg -n \"slice|array\" tests/test_again_oracle.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat tests/test_again_oracle.py && rg -n \"class _CustomList|_CustomList\" tomlkit/items.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1377,1690p' tomlkit/items.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 92717,
+        "cached_input_tokens": 83456,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 582,
+        "reasoning_output_tokens": 53
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 78.654,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 8703.402,
+        "usage": {
+          "input_tokens": 31377,
+          "cached_input_tokens": 27264,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 202,
+          "reasoning_output_tokens": 9
+        },
+        "completedCommands": 1,
+        "brainObserved": false,
+        "rawEventSha256": "1629aebcf2b1a36e7a5eb9600c89db80745600a5d94249669707ef27a2f3760b",
+        "rawEventBytes": 1225
+      },
+      "brainRun": null,
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T21:38:30.893616+00:00"
+}

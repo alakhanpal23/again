@@ -1,0 +1,13 @@
+{
+  "manifestSha256": "ed16ffdd86ef5ec5abc258752e5be5033a9b8c2a938d1fa4e73ea28304d92647",
+  "source": {
+    "head": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+    "dirty": false,
+    "buildSourceSha": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  },
+  "binarySha256": "0d3ce3972d892dba8a983a522f4d4e9427544f6ea9aadaf3387876377a2460fb",
+  "model": "gpt-6-sol",
+  "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+}

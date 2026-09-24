@@ -2,6 +2,12 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-24 real-repository cold and returning cohort
+
+The [frozen manifest](../bench/real_repository_cohort_v1.json) pinned historical upstream bug fixes in Packaging and Tomlkit, their parent source commits, archive digests, prompts, and independent regression oracles. A release binary built from clean `38c8bc7` ran each bug cold and returning in both baseline-first and Again-first order. Returning tasks first completed a real agent source investigation in both conditions; that preparation time and token usage were included in the result. The [retained cohort](../bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) contains all eight pair reports and 24 hashed raw repair and prior-task traces. All eight pairs passed the independent repair oracle and agent-run test gate, and Again retained the completed Brain run.
+
+The paired median Again/baseline lifecycle ratios were **0.801** for time and **0.884** for API-equivalent token cost. The frozen gate required both to be at most **0.800**, so the cohort **did not qualify**. The aggregate cost estimate was $0.392450 versus $0.431449 (ratio 0.910), under the pinned model rate card rather than measured charges. Cold-task time median was 0.801; returning-task time median was 0.858 including prior investigation. Returning Packaging repairs did not save end-to-end time in either order, while returning Tomlkit repairs did. Two repositories and two bug types are insufficient for a product-wide speed or cost claim; expand the frozen task diversity and investigate preparation overhead before claiming the result generalizes.
+
 ## 2026-09-24 bounded search pipeline observation
 
 Brain now recognizes a completed `rg -n` search followed by an exact trailing `| head -N` with `N` from 1 to 1000. It independently verifies each reported source line and records only positive file and hit-line observations; truncation never proves search completeness or absence. Other pipelines and shell composition remain command metadata only. The focused regression and [clean release launcher gate](../bench/results/2026-09-24-brain-bounded-search-head-e2e-5ea693b.json) cover a regex search with `head`, a later source-anchored brief, and edit invalidation. Task-level call avoidance and speed from this added coverage remain unmeasured.
