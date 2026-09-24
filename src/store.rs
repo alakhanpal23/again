@@ -84,6 +84,7 @@ pub struct BrainEventV1 {
     pub kind: String,
     pub path: Option<String>,
     pub source_digest: Option<String>,
+    /// A paired range is a verified read; a start without an end is a verified search hit.
     pub read_start_line: Option<u32>,
     pub read_end_line: Option<u32>,
     pub command_digest: Option<String>,
@@ -97,6 +98,7 @@ pub struct BrainEventV1 {
 pub struct BrainFileV1 {
     pub path: String,
     pub source_digest: String,
+    /// Paired lines represent a read; a lone start line represents a search hit.
     pub read_start_line: Option<u32>,
     pub read_end_line: Option<u32>,
     pub task_id: String,
@@ -5271,6 +5273,13 @@ impl Store {
     pub fn record_brain_event_v1(&self, event: &BrainEventV1) -> Result<()> {
         let valid_read_range = match (event.read_start_line, event.read_end_line) {
             (None, None) => true,
+            (Some(hit), None) => {
+                event.kind == "command"
+                    && event.path.is_some()
+                    && event.source_digest.is_some()
+                    && matches!(event.exit_code, None | Some(0))
+                    && (1..=8192).contains(&hit)
+            }
             (Some(start), Some(end)) => {
                 event.kind == "command"
                     && event.path.is_some()
@@ -5388,11 +5397,13 @@ impl Store {
                         authorization_scope_digest = excluded.authorization_scope_digest,
                         read_start_line = CASE
                             WHEN excluded.source_digest = brain_files_v1.source_digest
-                            THEN COALESCE(excluded.read_start_line, brain_files_v1.read_start_line)
+                                 AND excluded.read_start_line IS NULL
+                            THEN brain_files_v1.read_start_line
                             ELSE excluded.read_start_line END,
                         read_end_line = CASE
                             WHEN excluded.source_digest = brain_files_v1.source_digest
-                            THEN COALESCE(excluded.read_end_line, brain_files_v1.read_end_line)
+                                 AND excluded.read_start_line IS NULL
+                            THEN brain_files_v1.read_end_line
                             ELSE excluded.read_end_line END
                      WHERE excluded.observed_ms >= brain_files_v1.observed_ms",
                     params![
@@ -15046,20 +15057,26 @@ mod tests {
         );
         let mut invalid = event.clone();
         invalid.event_id = "invalid".to_owned();
-        invalid.read_end_line = None;
+        invalid.read_end_line = Some(29);
         assert!(store.record_brain_event_v1(&invalid).is_err());
         event.event_id = "search".to_owned();
         event.created_ms += 1;
-        event.read_start_line = None;
+        event.read_start_line = Some(50);
         event.read_end_line = None;
         store.record_brain_event_v1(&event).unwrap();
+        let searched = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
         assert_eq!(
-            store
-                .brain_file_v1("src/file.rs", &scope)
-                .unwrap()
-                .unwrap()
-                .read_start_line,
-            Some(30)
+            (searched.read_start_line, searched.read_end_line),
+            (Some(50), None)
+        );
+        event.event_id = "metadata-only".to_owned();
+        event.created_ms += 1;
+        event.read_start_line = None;
+        store.record_brain_event_v1(&event).unwrap();
+        let retained = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!(
+            (retained.read_start_line, retained.read_end_line),
+            (Some(50), None)
         );
         event.event_id = "edit".to_owned();
         event.created_ms += 1;

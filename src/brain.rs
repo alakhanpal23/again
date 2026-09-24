@@ -224,7 +224,9 @@ pub fn codex_completed_events_v1(
                 }
             }
             if exit_code == 0 {
-                for (relative, bytes) in matching_source_search_v1(item, workspace, command) {
+                for (relative, bytes, hit_line) in
+                    matching_source_search_v1(item, workspace, command)
+                {
                     events.push(BrainEventV1 {
                         session_id: session_id.to_owned(),
                         event_id: event_id.to_owned(),
@@ -232,7 +234,7 @@ pub fn codex_completed_events_v1(
                         kind: "command".to_owned(),
                         path: Some(relative),
                         source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
-                        read_start_line: None,
+                        read_start_line: Some(hit_line),
                         read_end_line: None,
                         command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                         command_hint: None,
@@ -333,7 +335,8 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
             }
         }
         if exit_code.is_none() {
-            for (relative, bytes) in matching_source_search_v1(&item, workspace, command) {
+            for (relative, bytes, hit_line) in matching_source_search_v1(&item, workspace, command)
+            {
                 events.push(BrainEventV1 {
                     session_id: session_id.to_owned(),
                     event_id: event_id.to_owned(),
@@ -341,7 +344,7 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
                     kind: "command".to_owned(),
                     path: Some(relative),
                     source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
-                    read_start_line: None,
+                    read_start_line: Some(hit_line),
                     read_end_line: None,
                     command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                     command_hint: None,
@@ -498,6 +501,7 @@ pub fn repository_brief_v1(
                 "observation": "observed after a prior read, search, or edit; file content rechecked now",
                 "observedReadRange": observation.read_start_line.zip(observation.read_end_line)
                     .map(|(start, end)| serde_json::json!({"startLine": start, "endLine": end})),
+                "observedSearchHitLine": observation.read_start_line.filter(|_| observation.read_end_line.is_none()),
                 "currentCompletePreview": preview,
             }));
         }
@@ -668,10 +672,15 @@ pub fn repository_brief_for_task_v1(
                         MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1,
                     )
                 });
+            let prior_search_hit = file["observedSearchHitLine"].as_u64().and_then(|line| {
+                prior_search_excerpt_v1(&text, line as usize, MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1)
+            });
             let (excerpt, start_line, end_line, origin) = if let Some((excerpt, start, end)) =
                 prior_range
             {
                 (excerpt, start, Some(end), "verified_prior_read_range")
+            } else if let Some((excerpt, start, end)) = prior_search_hit {
+                (excerpt, start, Some(end), "verified_prior_search_hit")
             } else {
                 let (excerpt, start, end) =
                     crate::agent_gateway_runtime::context_coordinator::source_excerpt_with_budget_v1(
@@ -736,6 +745,34 @@ fn prior_read_excerpt_v1(
         .take(end_line - start_line + 1)
         .collect::<String>();
     (!excerpt.is_empty() && excerpt.len() <= budget).then_some((excerpt, start_line, end_line))
+}
+
+fn prior_search_excerpt_v1(
+    text: &str,
+    hit_line: usize,
+    budget: usize,
+) -> Option<(String, usize, usize)> {
+    if !(1..=8192).contains(&hit_line) {
+        return None;
+    }
+    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
+    let hit = hit_line - 1;
+    let first = *lines.get(hit)?;
+    if first.len() > budget {
+        return None;
+    }
+    let mut start = hit;
+    let mut end = hit + 1;
+    let mut used = first.len();
+    while end < lines.len() && end - hit < 80 && used + lines[end].len() <= budget {
+        used += lines[end].len();
+        end += 1;
+    }
+    while start > 0 && hit - start < 16 && used + lines[start - 1].len() <= budget {
+        start -= 1;
+        used += lines[start].len();
+    }
+    Some((lines[start..end].concat(), start + 1, end))
 }
 
 fn meaningful_task_tokens_v1(text: &str) -> std::collections::BTreeSet<String> {
@@ -1077,7 +1114,7 @@ fn matching_source_search_v1(
     item: &Value,
     workspace: &Path,
     command: &str,
-) -> Vec<(String, Vec<u8>)> {
+) -> Vec<(String, Vec<u8>, u32)> {
     let Some(output) = item["aggregated_output"]
         .as_str()
         .filter(|output| output.len() <= 1024 * 1024)
@@ -1207,7 +1244,7 @@ fn matching_source_search_v1(
         };
         if !operands.iter().any(|(_, root)| absolute.starts_with(root))
             || !source_code_path_v1(&relative)
-            || files.iter().any(|(selected, _)| selected == &relative)
+            || files.iter().any(|(selected, _, _)| selected == &relative)
             || !fs::metadata(&absolute)
                 .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_SEARCH_OBSERVED_FILE_BYTES_V1)
         {
@@ -1225,7 +1262,7 @@ fn matching_source_search_v1(
                 |expression| expression.is_match(reported),
             )
         {
-            files.push((relative, bytes));
+            files.push((relative, bytes, line_number as u32));
         }
     }
     files
@@ -2254,6 +2291,51 @@ mod tests {
             codex_completed_events_v1(&regex_search, &workspace, "session", "old-task");
         assert_eq!(regex_events.len(), 2);
         assert_eq!(regex_events[1].path.as_deref(), Some("src/large.rs"));
+        assert_eq!(regex_events[1].read_start_line, Some(1501));
+        assert_eq!(regex_events[1].read_end_line, None);
+        for event in &regex_events {
+            store.record_brain_event_v1(event).unwrap();
+        }
+        let large_brief = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[{"locator":{"path":"src/large.rs"}}]}),
+            task_query("Fix sanitize line", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        let hit = &large_brief["recentCurrentFiles"][0];
+        assert_eq!(hit["observedSearchHitLine"], 1501);
+        assert_eq!(
+            hit["currentPartialPreview"]["origin"],
+            "verified_prior_search_hit"
+        );
+        assert!(
+            hit["currentPartialPreview"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fn sanitize_line_v1()")
+        );
+        fs::write(
+            workspace.join("src/large.rs"),
+            format!("{large_source}// changed\n"),
+        )
+        .unwrap();
+        let stale_large = repository_brief_v1(
+            &store,
+            &workspace,
+            &["src/large.rs".to_owned()],
+            &[],
+            &scope,
+        )
+        .unwrap();
+        assert!(
+            stale_large["recentCurrentFiles"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
         let mut composed_search = regex_search;
         composed_search["item"]["command"] =
             "rg -n 'sanitize.*line|unrelated' src && touch src/large.rs".into();

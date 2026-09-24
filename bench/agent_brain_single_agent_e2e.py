@@ -132,6 +132,15 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 item["path"] for item in search_brain.get("recentCurrentFiles", [])
             }:
                 raise RuntimeError("large regex search source was not in the next task brief")
+            search_file = next(
+                item for item in search_brain["recentCurrentFiles"]
+                if item["path"] == "src/search.rs"
+            )
+            excerpt = search_file.get("currentPartialPreview") or {}
+            if (search_file.get("observedSearchHitLine") != 1501
+                    or excerpt.get("origin") != "verified_prior_search_hit"
+                    or "fn sanitize_line_v1()" not in excerpt.get("text", "")):
+                raise RuntimeError("verified regex hit did not anchor the next source preview")
             with (workspace / "src/search.rs").open("a") as source:
                 source.write("// changed after search\n")
             stale_search_brief = subprocess.run(
@@ -193,6 +202,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "staleEditWithheld": True,
                 "compoundSourceReadsObservedAndStaleWithheld": True,
                 "largeRegexSearchObservedAndStaleWithheld": True,
+                "largeRegexSearchHitAnchoredPreview": True,
                 "interactiveTaskStartReceivedBrain": True,
                 "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,
