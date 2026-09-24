@@ -1,66 +1,97 @@
 # Again
 
-Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
+**Start with the right files. Remember the work. Pick up where you left off.**
 
-![Again system design: a command is classified, its scoped observation and stored proof are verified, then the result is reused or executed](docs/system-design.svg)
+Again prepares a short, source-checked brief before a Codex task, records the work Codex completes, and brings relevant findings into the next task. Your agent keeps using its normal shell, editor, and test tools.
 
-*Pre-alpha architecture: a cache hit is returned only after current inputs, runtime, proof, and stored streams pass validation.*
-
-## Current product
-
-- `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
-- `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
-- `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.
-- `again mcp setup --client codex|claude --workspace <path>` — print an exact dry-run plan. Add `--apply`, `--inspect`, or `--remove`; changes use only the official client CLI and are verified afterward.
-- `again mcp daemon status|stop --workspace <path>` — inspect or drain the local workspace daemon. New sessions fail with upgrade guidance when the executable or protocol differs.
-- `again task list|inspect|export|delete|prune` — manage durable workspace tasks. Export creates a new private `0600` file; deletion requires `--yes`, and pruning requires an explicit `--dry-run` or `--apply`. Terminal history is retained until one of these explicit deletion operations succeeds.
-- `again setup --codex` — install the instruction-only personal Codex skill.
-- `again explain [id]` / `again show <id>` — inspect the latest decision or retrieve exact stored output.
-
-## Product direction
-
-Again gives coding agents persistent, verified repository understanding and execution memory so they can move from task to correct code with less rediscovery, fewer tool calls, and less repeated validation.
-
-The target outcome is to help coding agents start with verified repository understanding, avoid repeating work, run only validation affected by a change, and share exact execution knowledge across agents.
-
-## Technical Foundation
-
-- **EffectIR schema** + **13 repository/Git tools** for exact bounded observations
-- **SQLite coordination + CAS** for durable metadata, leases, events, immutable streams
-- **Strict executable/profile checks** (macOS `strict-read-v0.5`: reviewed Apple tool BLAKE3 + `SystemVersion.plist`)
-- **Scoped observation plans** that fingerprint only declared paths, trees, listings, identities, and Git state
-- **v0 universal tool policy** separating exact reads, deterministic commands, freshness reads, mutations, credentials, communication, deployment, payment
-
-## Status
-
-**Pre-alpha.** Scoped validation is sampled and path-based; concurrent mutation after validation, transient global-resource changes, same-user/root pathname races, and unauthenticated same-user metadata-store writes remain outside the current boundary.
-
-**Do not depend on Again for correctness-sensitive workloads** until documented gates are green. Unknown means Again refuses the call; the caller must rerun the original unchanged.
-
-**Evidence checkpoint:** Source commit `bd24946e613af656d35c6af653a6cf25adc8359d` passed exact-SHA hosted CI on 2026-08-27. Gates 1–2 retained; Gates 3+ open until outside-user evidence exists.
-
-**100K-case gate:** Passed with stock-Linux lane retaining required typed non-qualifying capability result.
-
-## Quickstart
-
-```bash
-cargo install --locked --path . --features daemon
-again setup --codex
-again mcp setup --client codex --workspace "$(pwd -P)" --apply
-again run -- cat path/to/file
+```text
+Your task → verified file previews + test hint → Codex edits and tests
+                                                     ↓
+Next task ← current findings from the local Brain ← completed tool events
 ```
 
-## License
+## Get started
 
-Apache-2.0.
+Install Rust 1.88 or newer and the [Codex CLI](https://developers.openai.com/codex/cli), then sign in to Codex. Build Again from the current development branch on macOS or Linux:
 
-## Roadmap
+```bash
+git clone --branch productize/beta-task-lifecycle --single-branch \
+  https://github.com/alakhanpal23/again.git
+cd again
+cargo install --locked --path . --features daemon
+```
 
-- [Agent acceleration](docs/AGENT_ACCELERATION.md) — complete user loop and product scorecard
-- [Product contract](docs/PRODUCT.md) — shipping promise and current boundary
-- [Straight-to-code](docs/STRAIGHT_TO_CODE.md) — edit-brief fast path and editable task evaluation
-- [Reuse surface](docs/REUSE_SURFACE.md) — action-family and validation-profile inventory
-- [Architecture](docs/ARCHITECTURE.md) — authority transitions and current/target component boundaries
-- [Status](docs/STATUS.md) — what is implemented
-- [Evidence](docs/EVIDENCE.md) — what has been measured
-- [Development workstreams](docs/DEVELOPMENT_WORKSTREAMS.md) — terminal ownership and merge discipline
+Launch a task from any Git repository:
+
+```bash
+cd /path/to/your/project
+again codex --workspace "$(pwd -P)" \
+  --task-id fix-issue-123 \
+  --task "Fix issue 123 and run the relevant tests" -- --ephemeral
+```
+
+Use a new task ID for each task. Arguments after `--` go to `codex exec`. Again uses your existing Codex sign-in and stores its Brain locally; it needs no Again account or hosted service.
+
+After the run, inspect what Again retained:
+
+```bash
+again brain show --workspace "$(pwd -P)"
+```
+
+## What Again does
+
+| Capability | What you get |
+| --- | --- |
+| Task brief | Likely files, up to two verified source previews, and a suggested project test command before Codex starts. |
+| Repository Brain | Bounded records of completed reads, searches, edits, tests, run outcomes, and token usage. |
+| Returning-task context | Relevant earlier findings, shown only after Again checks that their source bytes are still current. |
+| Multi-file search memory | Verified file and hit-line observations from supported completed `rg` searches. |
+| Exact command reuse | An optional `again run` path for eligible commands whose request, executable, environment, and source inputs still match. |
+
+Again suggests tests but does not treat an earlier passing test as validation for a new edit. The normal `again codex` flow observes native tool events; it does not intercept or replace Codex's shell calls.
+
+## How the Brain works
+
+```mermaid
+flowchart LR
+  A[Your task] --> B[Again brief]
+  R[Current repository] --> B
+  M[(Local Brain)] --> B
+  B --> C[Codex edits and tests]
+  C --> E[Completed tool events]
+  E --> V[Verify and store observations]
+  R --> V
+  V --> M
+  M --> N[Next task]
+  N --> B
+```
+
+The launcher uses a local same-user daemon to bind the task to its workspace. It builds the brief from current source files and stored observations. Completed Codex JSON events are checked before bounded results are written to SQLite and content-addressed storage. BLAKE3 source digests let Again withhold old file observations when the repository changes. If a successful Codex run cannot be captured, the launcher reports the capture failure.
+
+The CLI and daemon are written in Rust 2024 with `clap`, `tokio`, `rusqlite`, and BLAKE3. The optional MCP gateway supplies workspace-bound context and narrowly proven repository-tool reuse. See the [development architecture](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/ARCHITECTURE.md) for the complete authority model.
+
+## Interactive Codex
+
+To make Again available in an interactive Codex session, set up the workspace-bound MCP entry, instruction skill, and observation hook:
+
+```bash
+again mcp setup --client codex --workspace "$(pwd -P)" \
+  --apply --with-skill --with-brain-hook
+again doctor
+```
+
+Review and trust the project hook in Codex `/hooks` to enable interactive event capture. The `again codex` launcher captures its own event stream without this hook.
+
+## More commands
+
+```bash
+again brain show --workspace "$(pwd -P)"   # inspect local run history
+again brain clear --workspace "$(pwd -P)"  # clear that history
+again doctor                               # check the local integration
+```
+
+To update a source install, pull the checkout and rerun `cargo install --locked --path . --features daemon`. To run the development tests, use `cargo test --locked --features daemon`.
+
+The [roadmap](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/ROADMAP.md) covers planned work. [Status](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/STATUS.md) and [evidence](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/EVIDENCE.md) record implementation and benchmark details for the current development build.
+
+Apache-2.0 licensed.
