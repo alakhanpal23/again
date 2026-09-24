@@ -38,7 +38,7 @@ The first economic buyer is the same developer. The later buyer is an engineerin
 
 ## Onboarding contract
 
-The packaged target is:
+The packaged command below is a future target; no Homebrew package or GitHub release has been published. The current user path is the [source install](../README.md#install-and-run): `cargo install --locked --path . --features daemon` from a cloned checkout. The target workflow is:
 
 ```bash
 brew install again

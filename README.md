@@ -1,90 +1,102 @@
 # Again
 
-**A repository Brain for one coding agent.** Again starts a task with a short, source-checked brief and carries useful investigation into later tasks. It observes completed Codex tool events, records bounded local history, and rechecks source bytes before presenting an earlier read or search as current. The agent keeps using its normal editor and shell tools and runs tests after changing code.
+**A repository Brain for a coding agent.** Again gives Codex a short, source-checked starting brief, observes what the agent actually did, and carries useful work into the next task. The agent keeps its normal shell and editor tools. Again does not silently skip validation.
 
-Again is an experimental local developer tool. The key question is whether the brief and Brain reduce **time and API-equivalent cost per correct, validated task** across real repositories. See [Qualification](#qualification) for the measured boundary.
+**Availability:** usable today as a local, source-installed beta on macOS and Linux. The native beta passed install and smoke checks on four platform targets, but no GitHub release or Homebrew package is published. Again is **not yet production-qualified** for a general speed or cost claim. See the [product update](docs/PRODUCT_UPDATE.md).
 
-## When to use it
+## Install and run
 
-Use Again when you work repeatedly in the same repository with Codex: bug fixes, small features, and follow-up tasks that tend to revisit the same files or test commands. The clearest opportunity is a returning task whose prior source investigation is still current. Again can also help a cold task by pointing to likely files and a project test command before the first edit.
+You need Git, Rust **1.88 or newer**, the [Codex CLI](https://developers.openai.com/codex/cli) installed and signed in, and access to this repository. The daemon-enabled build is required for `again codex`.
 
 ```bash
+git clone --branch productize/beta-task-lifecycle --single-branch \
+  https://github.com/alakhanpal23/again.git
+cd again
 cargo install --locked --path . --features daemon
-cd /path/to/your/repository
+again --version
+```
+
+From the repository you want to work on:
+
+```bash
+cd /path/to/your/project
 again codex --workspace "$(pwd -P)" --task-id fix-issue-123 \
   --task "Fix issue 123 and run the relevant tests" -- --ephemeral
 again brain show --workspace "$(pwd -P)"
 ```
 
-The `--` separates Again options from Codex options. Use a distinct task ID for each task. The launcher requires the Codex CLI and your existing Codex authentication. It does not require a hosted Again service.
+Choose a new task ID for each task. The final `--` separates Again options from options passed to `codex exec`. Again uses your existing Codex login and local repository files; it needs no Again account or hosted service. The current beta lives on the linked development branch while its [pull request](https://github.com/alakhanpal23/again/pull/5) is open. Run `git pull` and reinstall to update it. [Release downloads](https://github.com/alakhanpal23/again/releases) are not available yet.
 
-## What the agent receives
+For an interactive Codex session, you can add the workspace-bound MCP entry, instruction skill, and observation hook:
 
-1. **Current task brief.** Again identifies likely source files and provides up to two bounded, digest-checked previews. A small preview may be complete; a large file gets a labelled excerpt and may require a wider read.
-2. **Repository Brain.** A previous completed read, search, edit, or test can become a compact hint. Before reusing source content in the next brief, Again checks the current file bytes. An agent-authored finding remains a suggestion, not a verified source fact.
-3. **Validation guidance.** Again can suggest a relevant project test command. The suggestion does not certify the edit; run validation for the new change.
-4. **Observed outcome.** The launcher records completed command, edit, and test events plus a compact run and token summary locally. `again brain show` lets you inspect that history.
+```bash
+again mcp setup --client codex --workspace "$(pwd -P)" \
+  --apply --with-skill --with-brain-hook
+again doctor
+```
 
-The normal `again codex` path does not intercept native shell calls or silently skip tests. Exact output reuse is available separately through `again run` for eligible commands with a fresh proof; cheap ordinary reads often cost less to execute directly.
+Review and trust the project hook in Codex `/hooks` before relying on interactive capture. The `again codex` launcher captures its own event stream and does not require that hook. The setup command changes local Codex configuration; run it separately for each repository you want bound to Again.
 
-If Codex finishes but its completed Brain capture fails, the launcher reports the capture error and exits nonzero. The agent's edits and test output remain in the repository and terminal; inspect them before retrying the task. A failed Codex process keeps its own exit status and also reports any capture problem.
+## What it helps with
 
-## System design
+| Situation | Again's current contribution |
+| --- | --- |
+| First task in a repository | Ranks likely files, shows up to two small verified previews, and suggests a project test command. |
+| Follow-up task | Selects relevant prior investigation from Brain and checks source bytes again before showing a read or search result. |
+| Multi-file search | Retains bounded, independently verified file and hit-line observations from supported completed `rg` commands. |
+| Review of a completed run | `again brain show` displays bounded command, edit, test, run, and token summaries. Capture failures are reported by the launcher. |
+| Repeated eligible command | Explicit `again run` can reuse exact output only when its request, executable, environment, and source proof remain valid. |
+
+Brain hints can save investigation, but they do not prove that the agent avoided a call. Prior successful-test metadata is a hint; run tests for the new edit. `again brain clear --workspace "$(pwd -P)"` removes retained local Brain activity.
+
+## How it works
 
 ```mermaid
 flowchart LR
-  U[Developer task] --> L[again codex launcher]
-  L --> B[Task brief builder]
-  R[Current repository files and manifests] --> B
-  M[(Local Brain: SQLite metadata + content addressed bytes)] --> B
-  B --> C[Codex with native tools]
-  C --> E[Completed JSON tool events]
-  E --> V[Bounded parser and source verification]
-  V --> M
-  C --> T[Edit and run tests]
-  T --> E
-  M --> N[Next task brief]
-  R --> N
+  A[Developer task] --> L[again codex launcher]
+  L --> D[Local same-user daemon and task lifecycle]
+  W[Current Git workspace and manifests] --> B[Brief builder]
+  D --> B
+  M[(SQLite metadata + content-addressed blobs)] --> B
+  B --> P[Source-checked brief and test hint]
+  P --> C[Codex native shell and editor tools]
+  C --> J[Completed Codex JSON events]
+  J --> O[Bounded observation and verification]
+  W --> O
+  O --> M
+  M --> N[Later task]
+  N --> B
+  C --> T[Run tests after edits]
+  T --> J
 ```
 
-The local workspace daemon supplies task lifecycle and MCP context. The Brain stores bounded observations and recent run summaries. Source digests guard reuse of earlier file content; stale observations are withheld. Storage can help the agent avoid investigation, but it cannot prove that a test still passes after a new edit.
+The brief is a ranked suggestion backed by current repository bytes. For large files it labels excerpts as partial; the agent may need a wider read. The launcher streams Codex output, records completed events and token usage, and makes a successful Codex exit with incomplete Brain capture visible as an error. It does not intercept ordinary native shell calls, automatically replay them, or treat earlier test results as valid after a new edit.
 
-## Technology
+The optional local MCP gateway and explicit `again run` path have stricter exact-reuse rules. Reuse requires a fresh dependency and execution-profile check; an unknown or changed input cannot authorize a hit. The broader Linux execution and team service designs in the [architecture document](docs/ARCHITECTURE.md) are separate development work, not part of the default Codex workflow.
 
-| Layer | Implementation |
+| Component | Technology and role |
 | --- | --- |
-| CLI and local daemon | Rust 2024, minimum Rust 1.88; `clap`, `tokio`, JSON-RPC/MCP |
-| Persistent state | Bundled SQLite via `rusqlite`, content addressed blobs, BLAKE3 digests |
-| Agent integration | Codex CLI JSON event stream; optional repository-scoped `PostToolUse` hook for interactive sessions |
-| Repository context | Bounded source previews, Git and manifest checks, source-checked Brain observations |
-| Validation and benchmarks | Rust tests and Python 3 paired live-agent harnesses with independent edit oracles |
+| CLI and local daemon | Rust 2024, `clap`, `tokio`; workspace-bound task lifecycle and MCP/JSON-RPC context. |
+| Repository Brain | Bundled SQLite via `rusqlite`, content-addressed blobs, BLAKE3 source digests; bounded observations and run summaries. |
+| Agent connection | Codex CLI JSON event stream for `again codex`; optional observation-only Codex `PostToolUse` hook for interactive sessions. |
+| Validation | Project test suggestions require execution; source-bound Rust and Python harnesses test capture and paired agent outcomes. |
 
-The optional MCP setup for interactive Codex is:
+Read the [full architecture](docs/ARCHITECTURE.md) and [product contract](docs/PRODUCT.md) for authority boundaries and other experimental components.
 
-```bash
-again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
-```
+## Measured results
 
-Review and trust the project hook in Codex `/hooks` after installing it. The `again codex` launcher captures its own event stream without the hook. See [product contract](docs/PRODUCT.md) for command behavior and safety boundaries.
+The frozen live-agent evaluation used historical fixes in Packaging, Tomlkit, Camelcase, and Again. Each task ran cold and returning in both treatment orders; returning-task preparation time and tokens were charged. Independent repair oracles and agent-run tests determined acceptance.
 
-## Qualification
+| Frozen cohort | Accepted paired outcomes | Median Again / baseline time | Median API-equivalent cost | Result |
+| --- | ---: | ---: | ---: | --- |
+| [2 repositories, 8 pairs](bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) | 8/8 | 0.801 | 0.884 | Failed the frozen ≤0.800 time and cost gate |
+| [4 repositories, 16 pairs](bench/results/2026-09-24-diverse-real-cohort-bb44f50/summary.json) | 14/16 | 0.849* | 0.903* | Failed acceptance and both speed/cost gates |
 
-The [expanded frozen cohort](bench/diverse_real_cohort_v2.json) tested historical bugs in Packaging, Camelcase, Again, and Tomlkit across Python, JavaScript, and Rust. Each bug was run cold and returning in both baseline-first and Again-first order. Returning tasks included a **real prior agent investigation in both conditions**; its time and tokens were charged to the task lifecycle. The source-bound release binary and prompts were frozen at `bb44f50` before the run.
+\*Accepted pairs only. The two excluded pairs had different failure modes: a baseline Camelcase repair failed validation; an Again Rust repair passed its test but lost its Brain run. The capture fault was fixed and replayed against the raw Rust event stream [after the frozen cohort](bench/results/2026-09-24-codex-run-capture-d8fc30a/capture.json). That repair does not change the cohort outcome. The [trace audit](bench/results/2026-09-24-diverse-real-cohort-bb44f50/audit.json) verifies all 48 raw event streams and token counts.
 
-| Cohort | Planned pairs | Accepted pairs | Median Again / baseline time | Median API-equivalent cost | Frozen gate |
-| --- | ---: | ---: | ---: | ---: | --- |
-| [Initial two-repository run](bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) | 8 | 8 | 0.801 | 0.884 | Failed |
-| [Expanded four-repository run](bench/results/2026-09-24-diverse-real-cohort-bb44f50/summary.json) | 16 | 14 | 0.849* | 0.903* | Failed |
+These samples show useful starting briefs and some faster individual tasks, with regressions elsewhere. They do **not** establish that Again makes completed coding work generally faster or cheaper. API-equivalent cost uses a frozen token rate card, not a billed Codex amount. A broader, quality-gated task cohort is still required. See the [product update](docs/PRODUCT_UPDATE.md) for the next gate.
 
-\*The expanded medians include only the 14 accepted pairs and **cannot establish a speed or cost win**. One baseline Camelcase repair failed its test. One correct Again Rust repair passed its test but the launcher failed to retain the completed Brain run; a multi-file search exposed an overly strict run-summary bound, subsequently fixed and covered by a [source-bound regression gate](bench/results/2026-09-24-multi-file-brain-run-gate-3bbdfa5.json). The accepted Rust pairs also showed a time regression in one cold order and the returning order. The original gate required **every pair accepted** and both medians at or below **0.800**. Neither cohort met that gate. API-equivalent cost applies a frozen model rate card to observed tokens; it is not a Codex bill. The [audit](bench/results/2026-09-24-diverse-real-cohort-bb44f50/audit.json) verifies all 48 raw traces and lists every pair and task-level outcome.
-
-The most promising use case in this sample was the small Camelcase repair, where Again sped up both cold orders. Packaging gains were modest. Tomlkit cold runs were slower on the expanded repeat, while its returning runs were faster. Four bugs and 16 pairs remain too small and varied to prove a product-wide effect. See [implementation status](docs/STATUS.md) for the failure analysis and remaining qualification work.
-
-The [trace-by-trace audit](bench/results/2026-09-24-diverse-real-cohort-bb44f50/audit.json) checks the 48 repair and prior-investigation JSONL streams against recorded actions and token usage. Including both failed legs, baseline took 626.2 seconds, executed 116 tools, used 1,991,827 input and 21,275 output tokens, and cost an estimated $1.0832. Again took 583.7 seconds, executed 81 tools, used 1,883,519 input and 19,475 output tokens, and cost an estimated $1.0150. These unequal-quality totals are descriptive; they do not pass the frozen acceptance, speed, or cost gates. The audit contains all 16 paired observations and the per-task distributions. The exact [macOS arm64 release binary](bench/results/2026-09-24-diverse-real-cohort-bb44f50/again-bb44f50-macos-arm64.gz) was rebuilt from the frozen source commit and matches the recorded binary SHA-256.
-
-The requested qualification of **at least 20 distinct tasks in eight repositories has not been run**. The current four-task result must not be presented as that benchmark or as a product-wide speed or cost claim.
-
-Run the frozen evaluation from a clean checkout with a source-bound release binary:
+To rerun the frozen diverse benchmark from a clean checkout with Codex available:
 
 ```bash
 cargo build --locked --release --features daemon
@@ -93,14 +105,12 @@ python3 bench/diverse_real_cohort_v2.py \
   --output-dir /tmp/again-diverse-real-cohort
 ```
 
-The retained reports include source and binary hashes, independent edit-oracle outcomes, agent-run test checks, prior-task usage, and raw Codex JSONL. Historical diagnostics outside this cohort do not upgrade the measured claim.
+For development checks:
 
-## Boundaries and project map
+```bash
+cargo test --locked --features daemon
+```
 
-- Brain observations are local to the workspace. Previous reads are presented only while their source is current; command metadata can be incomplete for unrecognized shell forms.
-- Again does not broadly cache the agent's native tools. Explicit command reuse and the MCP gateway have narrower proof and eligibility rules.
-- Test suggestions require execution. Proof-based test skipping and broad cross-repository task acceleration remain open gates.
+## Project status
 
-See [architecture](docs/ARCHITECTURE.md) for the full authority model, [status](docs/STATUS.md) for verified implementation, [evidence](docs/EVIDENCE.md) for retained results, and [product plan](docs/SINGLE_AGENT_PRODUCT_PLAN.md) for remaining work.
-
-Apache-2.0 licensed.
+The local single-agent loop is implemented and installable from source. Published packages, broad accepted-task performance evidence, cross-user recipient authentication, and production operations are open work. The [implementation status](docs/STATUS.md) separates tested code from planned work; the [product update](docs/PRODUCT_UPDATE.md) gives a short current readout. Apache-2.0 licensed.
