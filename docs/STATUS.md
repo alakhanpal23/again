@@ -4,6 +4,16 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 release binary source binding
 
+The [source-bound frozen cold cohort](../bench/results/2026-09-23-cold-cohort-bound-ffffc94/summary.json)
+accepted all 10 pairs across five synthetic tasks and both treatment orders.
+The embedded clean build SHA matched the clean source SHA before every pair.
+Again's paired median completion ratio was 0.604; p95 was 1.076 because one
+Rust pair completed 7.6% slower despite an earlier first edit and two fewer
+actions. Aggregate uncached input, cached input, and output tokens were lower.
+This meets the cohort's 20% median time target with equal accepted outcomes,
+but the tail result, metered dollar cost, diverse real tasks, and proof-based
+validation reuse remain release gates.
+
 Again now embeds the Git source SHA and whether its source checkout was clean
 at build time. `again build-info` reports both. The paired Codex harness
 captures that identity before writing trace files and marks binary/source
