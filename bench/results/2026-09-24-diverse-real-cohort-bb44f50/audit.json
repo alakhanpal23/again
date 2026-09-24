@@ -4,6 +4,8 @@
   "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
   "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
   "verifiedRawTraces": 48,
+  "retainedBinaryArchive": "again-bb44f50-macos-arm64.gz",
+  "retainedBinaryArchiveSha256": "0d47f5aab6a1e6b11cf6e5a7ca600985d550dff42e20898a5d20126c2804d448",
   "plannedPairs": 16,
   "acceptedPairs": 14,
   "qualificationPassed": false,
@@ -13,30 +15,124 @@
     "baseline": "1.0832392",
     "product": "1.0149720"
   },
+  "totalsIncludingFailures": {
+    "baseline": {
+      "elapsedMs": 626155.701,
+      "executedTools": {
+        "command_execution": 100,
+        "file_change": 16
+      },
+      "tokens": {
+        "input_tokens": 1991827,
+        "cached_input_tokens": 1729536,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 21275,
+        "reasoning_output_tokens": 7452
+      },
+      "apiEquivalentUsd": "1.0832392"
+    },
+    "product": {
+      "elapsedMs": 583680.237,
+      "executedTools": {
+        "command_execution": 65,
+        "file_change": 16
+      },
+      "tokens": {
+        "input_tokens": 1883519,
+        "cached_input_tokens": 1637120,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 19475,
+        "reasoning_output_tokens": 7293
+      },
+      "apiEquivalentUsd": "1.0149720"
+    }
+  },
   "taskSummaries": {
     "packaging-empty-platforms": {
       "acceptedPairs": 4,
       "plannedPairs": 4,
       "medianTimeRatioAcceptedOnly": 0.9019819777137229,
-      "medianCostRatioAcceptedOnly": 0.9049726726715612
+      "medianCostRatioAcceptedOnly": 0.9049726726715612,
+      "timeRatiosAllPairs": [
+        0.9305278457903845,
+        0.8959391430450677,
+        0.763127634262458,
+        0.9080248123823781
+      ],
+      "costRatiosAllPairs": [
+        0.9417730568889797,
+        0.778396012386772,
+        0.9902110813037849,
+        0.8681722884541428
+      ],
+      "failedPairs": []
     },
     "camelcase-number-separator": {
       "acceptedPairs": 3,
       "plannedPairs": 4,
       "medianTimeRatioAcceptedOnly": 0.5838050462088015,
-      "medianCostRatioAcceptedOnly": 0.727494809448538
+      "medianCostRatioAcceptedOnly": 0.727494809448538,
+      "timeRatiosAllPairs": [
+        0.6810146604739655,
+        0.5838050462088015,
+        1.2340109075553725,
+        0.5796628738295908
+      ],
+      "costRatiosAllPairs": [
+        0.8171626297577854,
+        0.38794270093242933,
+        1.4315659410546209,
+        0.727494809448538
+      ],
+      "failedPairs": [
+        {
+          "mode": "returning",
+          "order": "baseline-first"
+        }
+      ]
     },
     "historical-search-unlocated": {
       "acceptedPairs": 3,
       "plannedPairs": 4,
       "medianTimeRatioAcceptedOnly": 1.217788394070015,
-      "medianCostRatioAcceptedOnly": 0.9439284354777312
+      "medianCostRatioAcceptedOnly": 0.9439284354777312,
+      "timeRatiosAllPairs": [
+        0.7981343081754642,
+        1.217788394070015,
+        1.3054812864980307,
+        1.3091493637441884
+      ],
+      "costRatiosAllPairs": [
+        0.7699499984926332,
+        0.9439284354777312,
+        1.0244563631056627,
+        1.597252149942733
+      ],
+      "failedPairs": [
+        {
+          "mode": "returning",
+          "order": "again-first"
+        }
+      ]
     },
     "tomlkit-array-slice": {
       "acceptedPairs": 4,
       "plannedPairs": 4,
       "medianTimeRatioAcceptedOnly": 0.965856669902461,
-      "medianCostRatioAcceptedOnly": 0.9344675448804258
+      "medianCostRatioAcceptedOnly": 0.9344675448804258,
+      "timeRatiosAllPairs": [
+        1.314597769949806,
+        1.1295936720805224,
+        0.8021196677243996,
+        0.6932418857059476
+      ],
+      "costRatiosAllPairs": [
+        0.9209674347743287,
+        1.574055621983083,
+        0.9479676549865229,
+        0.8851852608775623
+      ],
+      "failedPairs": []
     }
   },
   "pairs": [
@@ -53,7 +149,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 89459,
+            "cached_input_tokens": 81280,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 655,
+            "reasoning_output_tokens": 53
+          }
         },
         "product": {
           "elapsedMs": 18620.789,
@@ -61,7 +168,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 88398,
+            "cached_input_tokens": 80768,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 547,
+            "reasoning_output_tokens": 70
+          }
         }
       },
       "timeRatioDiagnostic": 0.9305278457903845,
@@ -80,7 +198,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 3
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 2,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 80598,
+            "cached_input_tokens": 71040,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 428,
+            "reasoning_output_tokens": 44
+          }
         },
         "baseline": {
           "elapsedMs": 19991.273,
@@ -88,7 +217,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 6
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 104339,
+            "cached_input_tokens": 92288,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 575,
+            "reasoning_output_tokens": 59
+          }
         }
       },
       "timeRatioDiagnostic": 0.8959391430450677,
@@ -107,7 +247,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 5
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 122981,
+            "cached_input_tokens": 105344,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 822,
+            "reasoning_output_tokens": 62
+          }
         },
         "product": {
           "elapsedMs": 25215.973,
@@ -115,7 +266,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 123265,
+            "cached_input_tokens": 105344,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 702,
+            "reasoning_output_tokens": 78
+          }
         }
       },
       "timeRatioDiagnostic": 0.763127634262458,
@@ -134,7 +296,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 124467,
+            "cached_input_tokens": 111360,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 750,
+            "reasoning_output_tokens": 71
+          }
         },
         "baseline": {
           "elapsedMs": 29093.216,
@@ -142,7 +315,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 8
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 122838,
+            "cached_input_tokens": 105216,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 820,
+            "reasoning_output_tokens": 57
+          }
         }
       },
       "timeRatioDiagnostic": 0.9080248123823781,
@@ -161,7 +345,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 8
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 7,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 90368,
+            "cached_input_tokens": 81920,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1585,
+            "reasoning_output_tokens": 952
+          }
         },
         "product": {
           "elapsedMs": 28308.762,
@@ -169,7 +364,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 3
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 2,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 72705,
+            "cached_input_tokens": 64896,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1155,
+            "reasoning_output_tokens": 720
+          }
         }
       },
       "timeRatioDiagnostic": 0.6810146604739655,
@@ -188,7 +394,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 93080,
+            "cached_input_tokens": 84480,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1177,
+            "reasoning_output_tokens": 694
+          }
         },
         "baseline": {
           "elapsedMs": 57046.708,
@@ -196,7 +413,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 5
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 106911,
+            "cached_input_tokens": 65024,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2145,
+            "reasoning_output_tokens": 1506
+          }
         }
       },
       "timeRatioDiagnostic": 0.5838050462088015,
@@ -215,7 +443,18 @@
           "oraclePassed": false,
           "agentTestObserved": false,
           "brainRunError": null,
-          "completedActions": 5
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 101957,
+            "cached_input_tokens": 89600,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1240,
+            "reasoning_output_tokens": 604
+          }
         },
         "product": {
           "elapsedMs": 41195.787,
@@ -223,7 +462,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 128885,
+            "cached_input_tokens": 107264,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1409,
+            "reasoning_output_tokens": 761
+          }
         }
       },
       "timeRatioDiagnostic": 1.2340109075553725,
@@ -242,7 +492,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 3
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 108677,
+            "cached_input_tokens": 95360,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1302,
+            "reasoning_output_tokens": 674
+          }
         },
         "baseline": {
           "elapsedMs": 62428.378,
@@ -250,7 +511,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 8
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 137505,
+            "cached_input_tokens": 120448,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2252,
+            "reasoning_output_tokens": 925
+          }
         }
       },
       "timeRatioDiagnostic": 0.5796628738295908,
@@ -269,7 +541,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 10
+          "completedActions": 10,
+          "executedToolsIncludingPrior": {
+            "command_execution": 9,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 161463,
+            "cached_input_tokens": 140416,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2270,
+            "reasoning_output_tokens": 935
+          }
         },
         "product": {
           "elapsedMs": 54227.34,
@@ -277,7 +560,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 11
+          "completedActions": 11,
+          "executedToolsIncludingPrior": {
+            "command_execution": 10,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 140160,
+            "cached_input_tokens": 127744,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2113,
+            "reasoning_output_tokens": 747
+          }
         }
       },
       "timeRatioDiagnostic": 0.7981343081754642,
@@ -296,7 +590,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 6
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 157507,
+            "cached_input_tokens": 145152,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2561,
+            "reasoning_output_tokens": 950
+          }
         },
         "baseline": {
           "elapsedMs": 53664.687,
@@ -304,7 +609,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 7
+          "completedActions": 7,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 185244,
+            "cached_input_tokens": 170880,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2116,
+            "reasoning_output_tokens": 769
+          }
         }
       },
       "timeRatioDiagnostic": 1.217788394070015,
@@ -323,7 +639,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 11
+          "completedActions": 11,
+          "executedToolsIncludingPrior": {
+            "command_execution": 12,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 164235,
+            "cached_input_tokens": 133760,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2193,
+            "reasoning_output_tokens": 663
+          }
         },
         "product": {
           "elapsedMs": 77175.991,
@@ -331,7 +658,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 9
+          "completedActions": 9,
+          "executedToolsIncludingPrior": {
+            "command_execution": 9,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 211474,
+            "cached_input_tokens": 187136,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2621,
+            "reasoning_output_tokens": 1212
+          }
         }
       },
       "timeRatioDiagnostic": 1.3054812864980307,
@@ -350,7 +688,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": "expected one current Brain run, found 0",
-          "completedActions": 6
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 192030,
+            "cached_input_tokens": 154624,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2591,
+            "reasoning_output_tokens": 1056
+          }
         },
         "baseline": {
           "elapsedMs": 58795.848,
@@ -358,7 +707,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 6
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 180019,
+            "cached_input_tokens": 165504,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2029,
+            "reasoning_output_tokens": 686
+          }
         }
       },
       "timeRatioDiagnostic": 1.3091493637441884,
@@ -377,7 +737,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 87973,
+            "cached_input_tokens": 76032,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 502,
+            "reasoning_output_tokens": 37
+          }
         },
         "product": {
           "elapsedMs": 21345.404,
@@ -385,7 +756,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 94224,
+            "cached_input_tokens": 84992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 516,
+            "reasoning_output_tokens": 39
+          }
         }
       },
       "timeRatioDiagnostic": 1.314597769949806,
@@ -404,7 +786,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 96653,
+            "cached_input_tokens": 78720,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 526,
+            "reasoning_output_tokens": 60
+          }
         },
         "baseline": {
           "elapsedMs": 16537.505,
@@ -412,7 +805,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 4
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 87970,
+            "cached_input_tokens": 80128,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 442,
+            "reasoning_output_tokens": 35
+          }
         }
       },
       "timeRatioDiagnostic": 1.1295936720805224,
@@ -431,7 +835,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 8
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 123082,
+            "cached_input_tokens": 110080,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 763,
+            "reasoning_output_tokens": 54
+          }
         },
         "product": {
           "elapsedMs": 22435.701,
@@ -439,7 +854,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 2
+          "completedActions": 2,
+          "executedToolsIncludingPrior": {
+            "file_change": 1,
+            "command_execution": 2
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 85745,
+            "cached_input_tokens": 68992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 545,
+            "reasoning_output_tokens": 69
+          }
         }
       },
       "timeRatioDiagnostic": 0.8021196677243996,
@@ -458,7 +884,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 2
+          "completedActions": 2,
+          "executedToolsIncludingPrior": {
+            "file_change": 1,
+            "command_execution": 2
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 85651,
+            "cached_input_tokens": 69248,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 532,
+            "reasoning_output_tokens": 48
+          }
         },
         "baseline": {
           "elapsedMs": 29324.763,
@@ -466,7 +903,18 @@
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
-          "completedActions": 8
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 125483,
+            "cached_input_tokens": 111616,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 866,
+            "reasoning_output_tokens": 55
+          }
         }
       },
       "timeRatioDiagnostic": 0.6932418857059476,

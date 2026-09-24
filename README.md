@@ -78,6 +78,10 @@ The [expanded frozen cohort](bench/diverse_real_cohort_v2.json) tested historica
 
 The most promising use case in this sample was the small Camelcase repair, where Again sped up both cold orders. Packaging gains were modest. Tomlkit cold runs were slower on the expanded repeat, while its returning runs were faster. Four bugs and 16 pairs remain too small and varied to prove a product-wide effect. See [implementation status](docs/STATUS.md) for the failure analysis and remaining qualification work.
 
+The [trace-by-trace audit](bench/results/2026-09-24-diverse-real-cohort-bb44f50/audit.json) checks the 48 repair and prior-investigation JSONL streams against recorded actions and token usage. Including both failed legs, baseline took 626.2 seconds, executed 116 tools, used 1,991,827 input and 21,275 output tokens, and cost an estimated $1.0832. Again took 583.7 seconds, executed 81 tools, used 1,883,519 input and 19,475 output tokens, and cost an estimated $1.0150. These unequal-quality totals are descriptive; they do not pass the frozen acceptance, speed, or cost gates. The audit contains all 16 paired observations and the per-task distributions. The exact [macOS arm64 release binary](bench/results/2026-09-24-diverse-real-cohort-bb44f50/again-bb44f50-macos-arm64.gz) was rebuilt from the frozen source commit and matches the recorded binary SHA-256.
+
+The requested qualification of **at least 20 distinct tasks in eight repositories has not been run**. The current four-task result must not be presented as that benchmark or as a product-wide speed or cost claim.
+
 Run the frozen evaluation from a clean checkout with a source-bound release binary:
 
 ```bash
