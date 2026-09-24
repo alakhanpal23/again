@@ -2,6 +2,10 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 live multi-root search observation
+
+The [clean-source live alternation gate](../bench/results/2026-09-23-live-search-multiroot-bound-ee60b2f/alternation-summary.json) passed with Codex 0.156.1 and a release binary bound to `ee60b2f`. Codex executed `rg -n 'balance|value' src tests 2>/dev/null`. Again checked the cited lines against current files, stored observations for a source and test file, surfaced them in a later brief, and withheld the edited source observation after its bytes changed. The [literal-search regression gate](../bench/results/2026-09-23-live-search-multiroot-bound-ee60b2f/literal-summary.json) also passed. Filtered Codex event traces are retained beside both reports. These gates show live capture of two common shell-search shapes, not search completeness, automatic command avoidance, or a task-speed improvement.
+
 ## 2026-09-23 live Codex search hook and trust boundary
 
 The [clean-source live Codex search gate](../bench/results/2026-09-23-live-search-hook-bound-5e093de/summary.json) passed on a release binary bound to `5e093de`. Codex 0.156.1 completed a real `rg -n -F balance src` shell call in an isolated repository. The project `PostToolUse` observer stored a source-checked `src/ledger.py` observation, a later task brief surfaced that file, and a brief after a source edit withheld it. The gate removed the hook configuration afterward. A [filtered Codex event trace](../bench/results/2026-09-23-live-search-hook-bound-5e093de/trace-filtered.jsonl) is retained with a verified hash; unrelated error events were omitted because they can contain user config paths. This establishes one live search-capture and stale-source path, not broad command coverage or a task-speed gain.
