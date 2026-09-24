@@ -39,6 +39,7 @@ TASK_IDS = {
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
     "balance-helper-large": "balance-helper-large-fix",
+    "balance-helper-excerpt": "balance-helper-excerpt-fix",
     "historical-search": "historical-search-output-fix",
 }
 
@@ -249,13 +250,17 @@ def configure_fixture(name: str) -> None:
             "README.md": "# Greeting feature fixture\nRun `python3 -m unittest discover -s tests`.\n",
         }
         return
-    if name in ("balance-helper", "balance-helper-large"):
+    if name in ("balance-helper", "balance-helper-large", "balance-helper-excerpt"):
         pair.TARGET = "src/util.py"
         pair.TEST = "tests/test_ledger.py"
         pair.BUGGY = "def adjust_total(value):\n    return value + 1\n"
         pair.FIXED = "def adjust_total(value):\n    return value\n"
         if name == "balance-helper-large":
             context = "# Ledger totals use this helper at the final boundary.\n" * 30
+            pair.BUGGY += "\n" + context
+            pair.FIXED += "\n" + context
+        if name == "balance-helper-excerpt":
+            context = "# Ledger totals use this helper at the final boundary.\n" * 160
             pair.BUGGY += "\n" + context
             pair.FIXED += "\n" + context
         pair.PROMPT = (
@@ -705,7 +710,7 @@ def main() -> int:
         parser.error("--product-wrapper cannot be combined with diagnostic prebrief modes")
     if args.seed_prior_brain and args.seed_prior_brain_search:
         parser.error("select only one prior Brain seed mode")
-    if (args.seed_prior_brain or args.seed_prior_brain_search) and (not args.product_wrapper or args.fixture not in ("balance-helper", "balance-helper-large")):
+    if (args.seed_prior_brain or args.seed_prior_brain_search) and (not args.product_wrapper or args.fixture not in ("balance-helper", "balance-helper-large", "balance-helper-excerpt")):
         parser.error("prior Brain seeding requires --product-wrapper and a balance-helper fixture")
     binary = args.binary.resolve(strict=True)
     connector = subprocess.run(

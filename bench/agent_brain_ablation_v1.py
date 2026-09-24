@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--model", default="gpt-6-sol")
-    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large"), default="balance-helper")
+    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large", "balance-helper-excerpt"), default="balance-helper")
     parser.add_argument("--source-files", type=int, choices=(0, 1000), required=True)
     parser.add_argument("--prior-brain-decoys", type=int, default=0)
     parser.add_argument("--order", choices=("cold-first", "seeded-first"), required=True)
