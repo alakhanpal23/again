@@ -1,0 +1,333 @@
+{
+  "schema": "again.diverse-real-pair.v2",
+  "identity": {
+    "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+    "source": {
+      "head": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "dirty": false,
+      "buildSourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "camelcase-number-separator",
+  "mode": "cold",
+  "order": "again-first",
+  "observations": [
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 33304.156,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 33304.156,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4531.026,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4531.073,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12338.922,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12338.948,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 26088.506,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 26113.741,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 28641.707,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 28641.731,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 32554.451,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 26113.748,
+      "rawEventBytes": 8682,
+      "rawEventSha256": "6fc363d402d0f4170adac86760bc34a982ca1cfd93b38c0cf67d5e267c763032",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 14,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat index.js'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"[0-9]|number|numeric\" test.js'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 93080,
+        "cached_input_tokens": 84480,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1177,
+        "reasoning_output_tokens": 694
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 78.846,
+        "test_output_sha256": "6c9792ddb291b79ca19a69f544da4c2f912b82794a178948a27da8fc859f6dc2",
+        "after_snapshot_sha256": "f15a4f77d43f36d0cd342f0462b3d8bccf3533685fc5d0cd6ce4f3c0a4432109"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": {
+        "authorization_scope_digest": "e8a7e81eb66c0714f44ad4883fa2cc49a81b53ea0d68bd42ed313d01011afb99",
+        "cached_input_tokens": 84480,
+        "completed_commands": 3,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790287136795,
+        "completed_source_reads": 2,
+        "exit_code": 0,
+        "input_tokens": 93080,
+        "output_tokens": 1177,
+        "session_id": "a61fe07e-5da6-4336-b5cb-9804f5e31b80",
+        "started_ms": 1790287103726,
+        "successful_tests": 1,
+        "task_id": "camelcase-number-separator-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    },
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 57046.708,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 57046.708,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4804.814,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4804.86,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 30555.319,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 30555.332,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 33078.752,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 33078.781,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 50627.291,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 50648.536,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 53191.2,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 53191.218,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 56237.056,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 50648.544,
+      "rawEventBytes": 10391,
+      "rawEventSha256": "8e4a90125a03f3b791329c978df48af6a0afadba17ec428a4572b943e77189ef",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 16,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"pwd && rg -n \\\"camelCase|PascalCase|camel|pascal\\\" index.js && sed -n '1,240p' index.js\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"b2b|numeric|number|pascalCase|2bar|2b|foo1\" tests package.json | head -100'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat tests/test_again_oracle.mjs && cat package.json && git status --short'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 106911,
+        "cached_input_tokens": 65024,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 2145,
+        "reasoning_output_tokens": 1506
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 80.946,
+        "test_output_sha256": "c0273af9b3d932044b266352e12b0af6aff3caa3bd71b9a74304571d307f2738",
+        "after_snapshot_sha256": "971d4f87e0d1355eee86f46b44bbf859aa9bec791068e5baf378e572c50a7ed1"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": null,
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T21:59:54.379820+00:00"
+}

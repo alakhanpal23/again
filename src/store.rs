@@ -5684,7 +5684,10 @@ impl Store {
             || run.task_id.len() > 128
             || run.started_ms < 0
             || run.completed_ms < run.started_ms
-            || run.completed_source_reads > run.completed_commands
+            // One completed shell search can independently verify up to four
+            // source files. Count those file observations without discarding
+            // the whole run summary when more than one came from a command.
+            || run.completed_source_reads > run.completed_commands.saturating_mul(4)
             || run.successful_tests > run.completed_commands
             || run.input_tokens.is_some() != run.cached_input_tokens.is_some()
             || run.input_tokens.is_some() != run.output_tokens.is_some()
@@ -14973,7 +14976,17 @@ mod tests {
         let mut invalid = run.clone();
         invalid.cached_input_tokens = Some(101);
         assert!(store.record_brain_run_v1(&invalid).is_err());
-        assert_eq!(store.clear_brain_events_v1().unwrap(), 1);
+        let mut multi_file_search = run.clone();
+        multi_file_search.session_id = "multi-file-search".to_owned();
+        multi_file_search.completed_commands = 1;
+        multi_file_search.completed_source_reads = 4;
+        multi_file_search.successful_tests = 0;
+        store.record_brain_run_v1(&multi_file_search).unwrap();
+        let mut impossible = multi_file_search.clone();
+        impossible.session_id = "too-many-source-files".to_owned();
+        impossible.completed_source_reads = 5;
+        assert!(store.record_brain_run_v1(&impossible).is_err());
+        assert_eq!(store.clear_brain_events_v1().unwrap(), 2);
         assert!(store.recent_brain_runs_v1(8).unwrap().is_empty());
     }
 

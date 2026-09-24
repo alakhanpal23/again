@@ -1,0 +1,399 @@
+{
+  "schema": "again.diverse-real-pair.v2",
+  "identity": {
+    "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+    "source": {
+      "head": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "dirty": false,
+      "buildSourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "camelcase-number-separator",
+  "mode": "returning",
+  "order": "again-first",
+  "observations": [
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 27489.99,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 27489.99,
+      "eventTimeline": [
+        {
+          "elapsedMs": 12600.509,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12600.539,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 21360.275,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 21381.364,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 23732.757,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 23782.927,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 26567.76,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 21381.371,
+      "rawEventBytes": 3315,
+      "rawEventSha256": "6c04e195e5a0519e9ff75ad66f101a166ff67278fcfdab2b8ba6315594475c70",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 11,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '80,180p' index.js\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 75117,
+        "cached_input_tokens": 67072,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1064,
+        "reasoning_output_tokens": 652
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 127.903,
+        "test_output_sha256": "dc5bcd7a16f527ee5bcae6ae230784f4ed05911d3b00bcf90bafa00301dead4f",
+        "after_snapshot_sha256": "f15a4f77d43f36d0cd342f0462b3d8bccf3533685fc5d0cd6ce4f3c0a4432109"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 8697.423,
+        "usage": {
+          "input_tokens": 33560,
+          "cached_input_tokens": 28288,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 238,
+          "reasoning_output_tokens": 22
+        },
+        "completedCommands": 1,
+        "brainObserved": true,
+        "rawEventSha256": "4d34c31cc16cfe515a195bb291be7e9819b4c06207e5c64223c488c0b81a5581",
+        "rawEventBytes": 1937
+      },
+      "brainRun": {
+        "authorization_scope_digest": "777b44f58ff15d06d117907d62ee6a1193ddb441bd85d2e310bf0c716a9db77c",
+        "cached_input_tokens": 67072,
+        "completed_commands": 2,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790287306307,
+        "completed_source_reads": 1,
+        "exit_code": 0,
+        "input_tokens": 75117,
+        "output_tokens": 1064,
+        "session_id": "c5c04a11-8968-4d2f-9ec6-6bdd31db5716",
+        "started_ms": 1790287278883,
+        "successful_tests": 1,
+        "task_id": "camelcase-number-separator-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    },
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 51463.765,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 51463.765,
+      "eventTimeline": [
+        {
+          "elapsedMs": 12356.57,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12356.591,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12356.601,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12356.608,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12377.685,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12377.694,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17386.72,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17386.731,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17386.748,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17386.776,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17408.619,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17408.645,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 43552.716,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 43577.922,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 46698.033,
+          "event": "item.started",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 46740.397,
+          "event": "item.completed",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 50740.299,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 43577.934,
+      "rawEventBytes": 10258,
+      "rawEventSha256": "ce402b9c9bcca72a468ef316e7144bd0321c24e076299b2d0f25844009b87d99",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 22,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg --files -g 'AGENTS.md' -g 'index.js' -g 'tests/test_again_oracle.mjs'\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg -n 'camelCase|PascalCase|pascalCase|camel' index.js\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat index.js'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'ls -la'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 106017,
+        "cached_input_tokens": 93184,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1976,
+        "reasoning_output_tokens": 913
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 74.547,
+        "test_output_sha256": "21186edc11f0e0fb3a5486b36e1a1d64fe51c3fabdbabb935450acd76be34fe8",
+        "after_snapshot_sha256": "83385d4256d4cb90a01741a4f5dd6ca2fad66f88c7ba71bf159083feabe712e6"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 10964.613,
+        "usage": {
+          "input_tokens": 31488,
+          "cached_input_tokens": 27264,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 276,
+          "reasoning_output_tokens": 12
+        },
+        "completedCommands": 1,
+        "brainObserved": false,
+        "rawEventSha256": "2a0202aab4cbaa39cd7bfd11d5d8f522b6eecb3fedef3fa86c2c0e5c8d79098b",
+        "rawEventBytes": 1944
+      },
+      "brainRun": null,
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T22:02:49.365373+00:00"
+}

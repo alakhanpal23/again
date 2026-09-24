@@ -27,6 +27,8 @@ def run(binary: pathlib.Path) -> dict[str, object]:
         (workspace / "helper.py").write_text("def helper():\n    return 42\n")
         (workspace / "ledger.py").write_text("def ledger_balance():\n    return 10\n")
         (workspace / "balance.py").write_text("def render_balance():\n    return '10'\n")
+        for index in range(4):
+            (workspace / f"multi_{index}.py").write_text("needle\n")
         (workspace / "src").mkdir()
         (workspace / "src/search.rs").write_text(
             "// preceding source\n" * 1500 + "fn sanitize_line_v1() {}\n"
@@ -51,6 +53,11 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'test_1','type':'command_execution','command':\"/bin/zsh -lc 'python3 -m unittest discover -s tests'\",'aggregated_output':'OK\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
             "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':100,'cached_input_tokens':40,'output_tokens':12}}), flush=True)\n"
+            "if 'multi-file task' in argv[-1]:\n"
+            "    command = \"rg -n 'needle' multi_0.py multi_1.py multi_2.py multi_3.py\"\n"
+            "    output = ''.join(f'multi_{index}.py:1:needle\\n' for index in range(4))\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'multi_search','type':'command_execution','command':command,'aggregated_output':output,'exit_code':0,'status':'completed'}}), flush=True)\n"
+            "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':50,'cached_input_tokens':20,'output_tokens':5}}), flush=True)\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'last','type':'agent_message','text':'Done'}}), flush=True)\n"
         )
         fake_client.chmod(0o700)
@@ -182,6 +189,12 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             if "ledger.py" in brain_files_in_prompt(calls[4][-1]):
                 raise RuntimeError("stale read observation remained current")
 
+            launch("multi-source", "Inspect four files multi-file task")
+            multi = next((run for run in brain()["recentRuns"]
+                          if run["task_id"] == "multi-source"), None)
+            if multi is None or multi["completed_commands"] != 1 or multi["completed_source_reads"] != 4:
+                raise RuntimeError("multi-file search dropped the completed Brain run")
+
             subprocess.run(
                 [str(binary), "brain", "clear", "--workspace", str(workspace)],
                 cwd=workspace, env=environment, capture_output=True,
@@ -205,6 +218,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "largeRegexSearchHitAnchoredPreview": True,
                 "boundedSearchPipelineObserved": True,
                 "interactiveTaskStartReceivedBrain": True,
+                "multiFileSearchRetainedRun": True,
                 "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,
             }

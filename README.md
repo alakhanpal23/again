@@ -67,28 +67,27 @@ Review and trust the project hook in Codex `/hooks` after installing it. The `ag
 
 ## Qualification
 
-The [source-bound September 24 cohort](bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) used pinned historical bugs in [Packaging](https://github.com/pypa/packaging) and [Tomlkit](https://github.com/sdispater/tomlkit). All **8/8 paired tasks** were accepted: each agent repaired the bug, passed the independent oracle, and ran the specified test. The release binary and evaluation source both bind to `38c8bc7`.
+The [expanded frozen cohort](bench/diverse_real_cohort_v2.json) tested historical bugs in Packaging, Camelcase, Again, and Tomlkit across Python, JavaScript, and Rust. Each bug was run cold and returning in both baseline-first and Again-first order. Returning tasks included a **real prior agent investigation in both conditions**; its time and tokens were charged to the task lifecycle. The source-bound release binary and prompts were frozen at `bb44f50` before the run.
 
-| Task state | Pairs | Median Again / baseline time | Median API-equivalent cost |
-| --- | ---: | ---: | ---: |
-| Cold | 4 | 0.801 | 0.884 |
-| Returning, including prior investigation | 4 | 0.858 | 0.840 |
-| All pairs | 8 | **0.801** | **0.884** |
+| Cohort | Planned pairs | Accepted pairs | Median Again / baseline time | Median API-equivalent cost | Frozen gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| [Initial two-repository run](bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) | 8 | 8 | 0.801 | 0.884 | Failed |
+| [Expanded four-repository run](bench/results/2026-09-24-diverse-real-cohort-bb44f50/summary.json) | 16 | 14 | 0.849* | 0.903* | Failed |
 
-The frozen gate required both medians to be at most **0.800**, with every pair accepted. **Again did not qualify.** The total API-equivalent estimate across all eight tasks was $0.39245 for Again and $0.43145 for baseline, a 0.910 aggregate ratio. Returning packaging tasks showed little or no end-to-end time gain after charging for history creation; returning tomlkit tasks improved. With two repositories and two bug types, this is a bounded qualification exercise, not evidence of a product-wide effect or an actual billing reduction.
+\*The expanded medians include only the 14 accepted pairs and **cannot establish a speed or cost win**. One baseline Camelcase repair failed its test. One correct Again Rust repair passed its test but the launcher failed to retain the completed Brain run; a multi-file search exposed an overly strict run-summary bound, subsequently fixed and covered by a regression gate. The accepted Rust pairs also showed a time regression in one cold order and the returning order. The original gate required **every pair accepted** and both medians at or below **0.800**. Neither cohort met that gate. API-equivalent cost applies a frozen model rate card to observed tokens; it is not a Codex bill.
 
-The real-repository cohort freezes two public upstream bug fixes, their parent commits, independent regression oracles, task prompts, and a pricing assumption. It runs cold and returning tasks in both baseline-first and Again-first order. For returning tasks, **both** conditions perform a real prior agent investigation, and its wall time and tokens count in the lifecycle total. A pair is accepted only when both agents complete the repair, pass the independent oracle, and run the prescribed test; the Again run must retain its Brain outcome. An accepted-only speed ratio cannot establish qualification if any planned pair fails.
+The most promising use case in this sample was the small Camelcase repair, where Again sped up both cold orders. Packaging gains were modest. Tomlkit cold runs were slower on the expanded repeat, while its returning runs were faster. Four bugs and 16 pairs remain too small and varied to prove a product-wide effect. See [implementation status](docs/STATUS.md) for the failure analysis and remaining qualification work.
 
 Run the frozen evaluation from a clean checkout with a source-bound release binary:
 
 ```bash
 cargo build --locked --release --features daemon
-python3 bench/real_repository_cohort_v1.py \
+python3 bench/diverse_real_cohort_v2.py \
   --binary target/release/again \
-  --output-dir /tmp/again-real-repository-cohort
+  --output-dir /tmp/again-diverse-real-cohort
 ```
 
-Reports include raw Codex JSONL, source and binary hashes, per-task outcomes, prior-task cost, and API-equivalent token estimates. That estimate uses a frozen rate card and is not a Codex bill. Historical one-repository repairs and synthetic tasks in [implementation status](docs/STATUS.md) remain useful diagnostics, but do not establish a product-wide speed or cost claim.
+The retained reports include source and binary hashes, independent edit-oracle outcomes, agent-run test checks, prior-task usage, and raw Codex JSONL. Historical diagnostics outside this cohort do not upgrade the measured claim.
 
 ## Boundaries and project map
 
