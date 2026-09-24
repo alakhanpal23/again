@@ -24,6 +24,10 @@ case "$2" in
       mkdir -p "$HOME/.agents/skills/again"
       printf 'user instructions\n' > "$HOME/.agents/skills/again/SKILL.md"
     fi
+    if [ "${FAKE_INJECT_HOOK_CONFLICT:-0}" = 1 ]; then
+      mkdir -p "$EXPECTED_WORKSPACE/.codex"
+      printf 'invalid json\n' > "$EXPECTED_WORKSPACE/.codex/hooks.json"
+    fi
     ;;
   get)
     if [ "${3:-}" = --help ]; then
@@ -184,6 +188,101 @@ fn codex_apply_and_inspect_can_manage_mcp_and_personal_skill_together() {
     let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
     assert_eq!(repeated["mcp"]["changed"], false);
     assert_eq!(repeated["codexSkill"]["changed"], false);
+}
+
+#[test]
+fn codex_setup_can_install_and_inspect_the_brain_hook_in_one_flow() {
+    let fixture = Fixture::new();
+    let hooks = fixture.workspace.join(".codex/hooks.json");
+    fs::create_dir(hooks.parent().unwrap()).unwrap();
+    let original = "{\"hooks\":{\"PostToolUse\":[{\"matcher\":\"^Bash$\",\"hooks\":[{\"type\":\"command\",\"command\":\"other\"}]}]}}\n";
+    fs::write(&hooks, original).unwrap();
+    let mut arguments = fixture.setup_args("--inspect");
+    arguments.push("--with-brain-hook".to_owned());
+    let preview = fixture.run(&string_args(&arguments), &[]);
+    assert!(preview.status.success(), "{:?}", preview.stderr);
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["codexBrainHook"]["current"], false);
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), original);
+
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.extend(["--with-skill".to_owned(), "--with-brain-hook".to_owned()]);
+    let applied = fixture.run(&string_args(&arguments), &[]);
+    assert!(applied.status.success(), "{:?}", applied.stderr);
+    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["codexSkill"]["current"], true);
+    assert_eq!(applied["codexBrainHook"]["current"], true);
+    assert_eq!(applied["codexBrainHook"]["changed"], true);
+    let installed: Value = serde_json::from_slice(&fs::read(&hooks).unwrap()).unwrap();
+    assert_eq!(
+        installed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        "other"
+    );
+    assert!(
+        installed["hooks"]["PostToolUse"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("brain observe-codex-hook")
+    );
+
+    let mut arguments = fixture.setup_args("--inspect");
+    arguments.push("--with-brain-hook".to_owned());
+    let inspected = fixture.run(&string_args(&arguments), &[]);
+    assert!(inspected.status.success(), "{:?}", inspected.stderr);
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["codexBrainHook"]["current"], true);
+    assert_eq!(inspected["codexBrainHook"]["changed"], false);
+
+    let removed = fixture.run(
+        &[
+            "brain",
+            "hook-setup",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--remove",
+        ],
+        &[],
+    );
+    assert!(removed.status.success(), "{:?}", removed.stderr);
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), original);
+}
+
+#[test]
+fn conflicting_brain_hook_refuses_before_mcp_mutation() {
+    let fixture = Fixture::new();
+    let hooks = fixture.workspace.join(".codex/hooks.json");
+    fs::create_dir(hooks.parent().unwrap()).unwrap();
+    fs::write(&hooks, "invalid json").unwrap();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-brain-hook".to_owned());
+    let refused = fixture.run(&string_args(&arguments), &[]);
+    assert!(!refused.status.success());
+    assert!(!fixture.state.exists());
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), "invalid json");
+}
+
+#[test]
+fn hook_conflict_after_mcp_add_rolls_back_new_skill_and_entry() {
+    let fixture = Fixture::new();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.extend(["--with-skill".to_owned(), "--with-brain-hook".to_owned()]);
+    let refused = fixture.run(
+        &string_args(&arguments),
+        &[("FAKE_INJECT_HOOK_CONFLICT", "1")],
+    );
+    assert!(!refused.status.success());
+    assert_eq!(fs::read_to_string(&fixture.state).unwrap(), "absent\n");
+    assert!(
+        !fixture
+            .temporary
+            .path()
+            .join("home/.agents/skills/again/SKILL.md")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join(".codex/hooks.json")).unwrap(),
+        "invalid json\n"
+    );
 }
 
 #[test]

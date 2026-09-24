@@ -32,7 +32,7 @@ Use Again's `repo.*` and `git.*` tools for supported repository inspection. Exac
 
 Publish only useful agent findings or explicit unknowns with `context.publish`. Agent-authored text remains a suggestion; verified facts come from the built-in observations and their current sources. After changing files, request fresh context before relying on a fact from the earlier brief. Do not claim that a validation can be skipped: the current task-start validation preview requires execution unless a qualified profile proves otherwise.
 
-The MCP tools require the authenticated local daemon. If they are unavailable, continue with ordinary tools and the explicit command path below. Do not assume that installing this skill alone connected the MCP server; `again mcp setup --client codex --workspace <absolute-repository-path> --apply --with-skill` installs and verifies both the connection and this personal skill.
+The MCP tools require the authenticated local daemon. If they are unavailable, continue with ordinary tools and the explicit command path below. Do not assume that installing this skill alone connected the MCP server; `again mcp setup --client codex --workspace <absolute-repository-path> --apply --with-skill --with-brain-hook` installs and verifies the connection, this personal skill, and the project Brain observer.
 
 ## Explicit command path
 

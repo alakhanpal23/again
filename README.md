@@ -14,8 +14,8 @@ Again helps one coding agent start with a verified repository brief, carry usefu
 - `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Completed interactive Bash calls and successful native patches can then update Brain without hand editing Codex settings.
 - `again brain observe-codex-hook` — the observer's stdin adapter. It emits no hook output and never changes a tool call.
 
-For interactive Codex sessions, run the hook setup command once in that
-repository. Again preserves unrelated
+For interactive Codex sessions, add `--with-brain-hook` to the MCP setup
+command, or run the standalone hook setup command in that repository. Again preserves unrelated
 handlers and refuses to overwrite a hook file changed after installation.
 
 The observer does not rewrite or skip a tool call. Codex hook coverage and
@@ -24,7 +24,7 @@ metadata. [Hook contract](https://learn.chatgpt.com/docs/hooks).
 - `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
 - `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
 - `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.
-- `again mcp setup --client codex|claude --workspace <path>` — print an exact dry-run plan. Add `--apply`, `--inspect`, or `--remove`; changes use only the official client CLI and are verified afterward. For Codex, add `--with-skill` to `--apply` or `--inspect` to manage the personal skill in the same flow.
+- `again mcp setup --client codex|claude --workspace <path>` — print an exact dry-run plan. Add `--apply`, `--inspect`, or `--remove`; MCP changes use only the official client CLI and are verified afterward. For Codex, add `--with-skill` and `--with-brain-hook` to `--apply` or `--inspect` to manage the personal skill and project Brain observer in the same flow.
 - `again mcp daemon status|stop --workspace <path>` — inspect or drain the local workspace daemon. New sessions fail with upgrade guidance when the executable or protocol differs.
 - `again task list|inspect|export|delete|prune` — manage durable workspace tasks. Export creates a new private `0600` file; deletion requires `--yes`, and pruning requires an explicit `--dry-run` or `--apply`. Terminal history is retained until one of these explicit deletion operations succeeds.
 - `again setup --codex` — install the instruction-only personal Codex skill.
@@ -56,8 +56,7 @@ Again's near-term goal is lower time and cost per correct, validated single-agen
 
 ```bash
 cargo install --locked --path . --features daemon
-again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill
-again brain hook-setup --workspace "$(pwd -P)" --apply
+again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
 again codex --workspace "$(pwd -P)" --task-id fix-example --task "Fix the failing example and run its tests" -- --ephemeral
 again brain show --workspace "$(pwd -P)"
 ```

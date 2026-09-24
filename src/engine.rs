@@ -299,6 +299,9 @@ struct McpSetupArgs {
     /// Install or inspect the personal Codex skill alongside the MCP entry.
     #[arg(long, conflicts_with = "remove")]
     with_skill: bool,
+    /// Install or inspect the project Codex Brain observer alongside the MCP entry.
+    #[arg(long, conflicts_with = "remove")]
+    with_brain_hook: bool,
 }
 
 #[derive(Debug, Args)]
@@ -2062,6 +2065,12 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
     if args.with_skill && !args.apply && !args.inspect {
         bail!("--with-skill requires --apply or --inspect");
     }
+    if args.with_brain_hook && client != AgentGatewayClientV1::Codex {
+        bail!("--with-brain-hook is currently supported only for Codex");
+    }
+    if args.with_brain_hook && !args.apply && !args.inspect {
+        bail!("--with-brain-hook requires --apply or --inspect");
+    }
     let skill_dir = args
         .with_skill
         .then(|| codex_skill_dir(SetupScope::Global, None))
@@ -2071,6 +2080,19 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         .as_deref()
         .map(|directory| install_codex_skill(directory, true))
         .transpose()?;
+    let skill_was_absent = skill_dir
+        .as_ref()
+        .is_some_and(|directory| !directory.join("SKILL.md").exists());
+    let hook_plan = if args.with_brain_hook {
+        Some(crate::observer_setup::configure_codex_brain_hook_v1(
+            &plan.workspace,
+            &plan.stdio.command,
+            false,
+            false,
+        )?)
+    } else {
+        None
+    };
     let action = if args.apply {
         Some(ClientSetupActionV1::Apply)
     } else if args.inspect {
@@ -2101,16 +2123,55 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         } else {
             skill_plan
         };
+        let hook_outcome = if args.apply {
+            if args.with_brain_hook {
+                match crate::observer_setup::configure_codex_brain_hook_v1(
+                    &plan.workspace,
+                    &plan.stdio.command,
+                    true,
+                    false,
+                ) {
+                    Ok(change) => Some(change),
+                    Err(error) => {
+                        if skill_was_absent
+                            && skill_outcome.as_ref().is_some_and(|skill| skill.changed)
+                        {
+                            if let Some(directory) = skill_dir.as_deref() {
+                                remove_codex_skill(directory, false)
+                                    .context("roll back newly installed Codex skill")?;
+                            }
+                        }
+                        if outcome.changed {
+                            execute_client_setup_v1(&plan, ClientSetupActionV1::Remove)
+                                .context("roll back newly added MCP entry")?;
+                        }
+                        return Err(error).context("install Codex Brain observer after MCP setup");
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            hook_plan
+        };
         if args.json {
-            if let Some(skill) = skill_outcome {
-                print_pretty_json_v1(&serde_json::json!({
-                    "mcp": outcome,
-                    "codexSkill": {
+            if skill_outcome.is_some() || hook_outcome.is_some() {
+                let mut combined = serde_json::json!({"mcp": outcome});
+                if let Some(skill) = skill_outcome {
+                    combined["codexSkill"] = serde_json::json!({
                         "path": skill.path,
                         "current": args.apply || !skill.changed,
                         "changed": args.apply && skill.changed
-                    }
-                }))?;
+                    });
+                }
+                if let Some(hook) = hook_outcome {
+                    combined["codexBrainHook"] = serde_json::json!({
+                        "path": hook.path,
+                        "current": args.apply || (hook.installed && !hook.changed),
+                        "changed": args.apply && hook.changed
+                    });
+                }
+                print_pretty_json_v1(&combined)?;
             } else {
                 println!("{}", serde_json::to_string_pretty(&outcome)?);
             }
@@ -2130,6 +2191,14 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
                     skill.path.display(),
                     args.apply || !skill.changed,
                     args.apply && skill.changed
+                );
+            }
+            if let Some(hook) = hook_outcome {
+                println!(
+                    "Codex Brain hook: path={}, current={}, changed={}",
+                    hook.path.display(),
+                    args.apply || (hook.installed && !hook.changed),
+                    args.apply && hook.changed
                 );
             }
         }

@@ -42,7 +42,7 @@ The packaged target is:
 
 ```bash
 brew install again
-again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill
+again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
 # Start a new Codex session; it can now invoke:
 # Call the Again task.start MCP tool for a bounded shared edit brief.
 # Or prepare verified source previews before a noninteractive Codex run:
@@ -54,7 +54,7 @@ again run -- rg --no-ignore --sort=path needle src
 again reference -- rg --no-ignore --sort=path needle src
 ```
 
-`--apply --with-skill` verifies the Codex MCP entry through the official client CLI and installs the instruction-only personal skill at `$HOME/.agents/skills/again` in one flow. `--inspect --with-skill` checks both. `again setup --codex --project` remains available for an explicitly project-scoped skill; scoped `--remove` reverses an unchanged owned install. The skill guides task start, shared context, verified repository tools, explicit `again run --`, and context-safe `again reference --`. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
+`--apply --with-skill --with-brain-hook` verifies the Codex MCP entry through the official client CLI, installs the instruction-only personal skill at `$HOME/.agents/skills/again`, and installs the project Codex Brain observer. `--inspect` with either flag checks the corresponding installation without changing it. `again setup --codex --project` remains available for an explicitly project-scoped skill; `again brain hook-setup --remove` restores an unchanged prior hook file. The skill guides task start, shared context, verified repository tools, explicit `again run --`, and context-safe `again reference --`. `again doctor` reports both skill scopes and duplicate installation.
 
 `again codex` starts or joins the authenticated workspace daemon, registers the exact durable task, and supplies up to two complete source previews and bounded current shared findings before calling `codex exec`. It preserves Codex's normal user configuration and approval policy, pins the Again MCP connection for this invocation, and forwards explicit Codex flags after `--`. An elected launcher holds and renews the leader lease for the process lifetime. A follower waits up to 30 seconds by default; if the leader exits, it claims the task and refreshes source and context before launching Codex. Use `--peer-wait-seconds 0` to launch a collaborating follower immediately, or set a bounded wait up to 300 seconds. A still-active peer is reported in the follower brief. Blocked dependencies and terminal tasks stop the launch. `again mcp brief --workspace <path> --task-id <id> --task <text>` prints a preview without claiming a lease for other launchers. Keep task text free of secrets. These commands require a daemon-enabled Unix build and an installed Codex CLI; this launch path has local diagnostic evidence but is not yet a qualified default workflow.
 

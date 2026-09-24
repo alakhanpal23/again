@@ -2,6 +2,10 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 combined Codex onboarding
+
+`again mcp setup --client codex --workspace <path> --apply --with-skill --with-brain-hook` now installs the verified MCP entry, personal skill, and project Codex Brain observer in one command. The matching `--inspect` reports whether each requested part is current without changing files. Hook ownership checks run before MCP mutation, and a hook failure after MCP installation removes a newly added MCP entry and a newly installed skill. An existing skill is preserved on rollback. The standalone `again brain hook-setup --remove` still restores the unchanged prior hook file. Focused CLI integration tests cover install, inspect, repeated install, existing handlers, removal, and conflicting hooks. This is onboarding consolidation; it does not expand the observer's tool coverage or establish an end-to-end speed gain.
+
 ## 2026-09-23 release binary source binding
 
 The [source-bound returning cohort](../bench/results/2026-09-23-returning-cohort-bound-e3f0067/summary.json)
