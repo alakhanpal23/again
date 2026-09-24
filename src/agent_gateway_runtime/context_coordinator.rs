@@ -78,19 +78,20 @@ pub(crate) fn source_excerpt_with_budget_v1(
             terms.push(word);
         }
     }
-    let anchor = terms
-        .iter()
-        .find_map(|term| {
-            let mut offset = 0;
-            for line in text.split_inclusive('\n') {
-                if (line.contains("fn ") || line.contains("def ") || line.contains("function "))
-                    && let Some(position) = line.find(term)
-                {
-                    return Some(offset + position);
+    let anchor = preferred_declaration_anchor_v1(text, prompt)
+        .or_else(|| {
+            terms.iter().find_map(|term| {
+                let mut offset = 0;
+                for line in text.split_inclusive('\n') {
+                    if (line.contains("fn ") || line.contains("def ") || line.contains("function "))
+                        && let Some(position) = line.find(term)
+                    {
+                        return Some(offset + position);
+                    }
+                    offset += line.len();
                 }
-                offset += line.len();
-            }
-            None
+                None
+            })
         })
         .or_else(|| terms.iter().find_map(|term| text.find(term)))
         .unwrap_or(0);
@@ -115,6 +116,69 @@ pub(crate) fn source_excerpt_with_budget_v1(
     let start_line = text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
     let end_line = text[..end].bytes().filter(|byte| *byte == b'\n').count() + 1;
     (text[start..end].to_owned(), start_line, Some(end_line))
+}
+
+fn preferred_declaration_anchor_v1(text: &str, prompt: &str) -> Option<usize> {
+    let mut prompt_terms = Vec::new();
+    for part in prompt.split(|character: char| !character.is_ascii_alphanumeric()) {
+        if part.len() >= 4 && prompt_terms.len() < 32 {
+            let term = part.to_ascii_lowercase();
+            if !prompt_terms.contains(&term) {
+                prompt_terms.push(term);
+            }
+        }
+    }
+    let mut best = None;
+    let mut offset = 0;
+    let mut test_attribute = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        let declaration = if trimmed.starts_with("fn ") {
+            Some((0, 3))
+        } else if trimmed.starts_with("def ") {
+            Some((0, 4))
+        } else if trimmed.starts_with("function ") {
+            Some((0, 9))
+        } else if trimmed.starts_with("pub ")
+            || trimmed.starts_with("pub(")
+            || trimmed.starts_with("async ")
+            || trimmed.starts_with("unsafe ")
+        {
+            trimmed.find(" fn ").map(|index| (index + 1, index + 4))
+        } else {
+            None
+        };
+        if let Some((keyword_start, name_start)) = declaration {
+            let name = trimmed[name_start..]
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .next()
+                .unwrap_or_default();
+            if !test_attribute && !name.starts_with("test_") && !name.contains("oracle") {
+                let name_parts = name
+                    .split('_')
+                    .filter(|part| part.len() >= 4)
+                    .map(str::to_ascii_lowercase)
+                    .collect::<Vec<_>>();
+                let score = prompt_terms
+                    .iter()
+                    .filter_map(|term| {
+                        name_parts.iter().find_map(|part| {
+                            (part == term
+                                || (part.len().min(term.len()) >= 6
+                                    && (part.starts_with(term) || term.starts_with(part))))
+                            .then_some(part.len().min(term.len()))
+                        })
+                    })
+                    .sum::<usize>();
+                if score > best.map_or(0, |(prior, _)| prior) {
+                    best = Some((score, offset + line.len() - trimmed.len() + keyword_start));
+                }
+            }
+        }
+        test_attribute = trimmed.starts_with("#[test]") || trimmed.starts_with("#[tokio::test]");
+        offset += line.len();
+    }
+    best.map(|(_, anchor)| anchor)
 }
 const MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1: usize = 256;
 const MAX_DIRECT_SEARCH_MATCH_SOURCE_BYTES_V1: u64 = 8 * 1024;
@@ -2577,6 +2641,25 @@ mod validation_preview_tests {
         assert!(long.contains("fn repository_search_v1()"));
         assert!(long.contains("final_marker"));
         assert!(long.len() <= 5 * 1024);
+    }
+
+    #[test]
+    fn source_excerpt_prefers_relevant_implementation_over_matching_oracle_tests() {
+        let source = format!(
+            "{}fn python_imports_v1() {{}}\n{}fn sanitize_line_v1() {{\n    let implementation = true;\n}}\n{}#[test]\nfn closing_triple_quote_at_line_end() {{}}\n#[test]\nfn triple_marker_inside_regular_string() {{}}\n",
+            "// prelude\n".repeat(100),
+            "// unrelated\n".repeat(80),
+            "// middle\n".repeat(700),
+        );
+        let (excerpt, start, _) = source_excerpt_with_budget_v1(
+            &source,
+            "Fix the Python code index sanitizer: triple-quote markers at line boundaries",
+            5 * 1024,
+        );
+        assert!(excerpt.contains("fn sanitize_line_v1"));
+        assert!(excerpt.contains("let implementation = true"));
+        assert!(!excerpt.contains("fn closing_triple_quote_at_line_end"));
+        assert!(start > 100);
     }
 
     #[test]
