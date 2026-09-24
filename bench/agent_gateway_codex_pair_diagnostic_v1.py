@@ -47,6 +47,7 @@ TASK_IDS = {
     "historical-python-triple": "historical-python-triple-fix",
     "packaging-empty-platforms": "packaging-empty-platforms-fix",
     "tomlkit-array-slice": "tomlkit-array-slice-fix",
+    "camelcase-number-separator": "camelcase-number-separator-fix",
 }
 
 DEFAULT_CREATE_FIXTURE = pair.create_fixture

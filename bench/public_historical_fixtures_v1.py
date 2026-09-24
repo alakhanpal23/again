@@ -12,6 +12,44 @@ import external_historical_fixture_v1 as external
 
 
 CASES = {
+    "camelcase-number-separator": {
+        "name": "camelcase",
+        "url": "https://github.com/sindresorhus/camelcase.git",
+        "parent": "c9fa59df2e32611c5c71d0f219f661fa8e1dfdf8",
+        "fix": "e7dccc901ce645138a52dd5945e245773b4684c5",
+        "archive": "2e5cdf65814e52ee44add2c7766eecbe0d90f5f795f2a74ec0be06c8ff0edbb7",
+        "target": "index.js",
+        "test": "tests/test_again_oracle.mjs",
+        "prompt": (
+            "Fix camelCase so a digit-plus-letter segment before an underscore or hyphen "
+            "stays intact: b2b_registration_request should become b2bRegistrationRequest, "
+            "including PascalCase. Preserve normal numeric camelization. Edit only index.js. "
+            "Run node --test tests/test_again_oracle.mjs after editing, then stop."
+        ),
+        "prior_task": (
+            "Inspect the existing number and separator post-processing in index.js. Run "
+            "rg -n 'NUMBERS_AND_IDENTIFIER|SEPARATORS_AND_IDENTIFIER' index.js and report "
+            "the matching lines. Do not edit files or run tests."
+        ),
+        "oracle": '''import test from 'node:test';
+import assert from 'node:assert/strict';
+import camelCase from '../index.js';
+
+test('number before underscore remains part of the word', () => {
+  assert.equal(camelCase('b2b_registration_request'), 'b2bRegistrationRequest');
+  assert.equal(camelCase('b2b_registration_b2b_request'), 'b2bRegistrationB2bRequest');
+});
+test('number before hyphen remains part of the word', () => {
+  assert.equal(camelCase('b2b-registration-request'), 'b2bRegistrationRequest');
+});
+test('PascalCase and ordinary controls', () => {
+  assert.equal(camelCase('b2b_registration_request', {pascalCase: true}), 'B2bRegistrationRequest');
+  assert.equal(camelCase('foo-bar'), 'fooBar');
+  assert.equal(camelCase('foo2bar'), 'foo2Bar');
+});
+''',
+        "failures": ("number before underscore", "number before hyphen", "PascalCase and ordinary controls"),
+    },
     "packaging-empty-platforms": {
         "name": "packaging",
         "url": "https://github.com/pypa/packaging.git",
@@ -106,9 +144,10 @@ class AgainArraySliceOracle(unittest.TestCase):
 
 def configure(name: str) -> None:
     case = CASES[name]
-    python = shutil.which("python3")
-    if python is None:
-        raise RuntimeError("public Python fixture requires python3")
+    is_node = name == "camelcase-number-separator"
+    executable = shutil.which("node" if is_node else "python3")
+    if executable is None:
+        raise RuntimeError("public fixture requires its language runtime")
     checkout = external.source_checkout(case["name"], case["url"], case["parent"])
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, 512)
     pair.TARGET_ORACLE_MODE = "behavior"
@@ -121,8 +160,9 @@ def configure(name: str) -> None:
                                  f"{case['fix']}:{case['target']}"],
                                 capture_output=True, check=True, timeout=20).stdout.decode()
     pair.PROMPT = case["prompt"]
-    pair.TEST_COMMAND = (python, "-m", "unittest", "discover", "-s", "tests",
-                         "-p", "test_again_oracle.py")
+    pair.TEST_COMMAND = ((executable, "--test", case["test"]) if is_node else
+                         (executable, "-m", "unittest", "discover", "-s", "tests",
+                          "-p", "test_again_oracle.py"))
     pair.FIXTURE = {
         "upstream": case["url"], "parentGitSha": case["parent"],
         "fixGitSha": case["fix"], "archiveSha256": case["archive"],
