@@ -12,6 +12,11 @@ import pathlib
 import subprocess
 import tempfile
 
+from agent_gateway_codex_live_probe_v1 import source_state
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
 
 def run(binary: pathlib.Path) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="again-brain-e2e-") as temporary:
@@ -28,12 +33,14 @@ def run(binary: pathlib.Path) -> dict[str, object]:
         fake_client = fake_bin / "codex"
         fake_client.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, os, pathlib, sys\n"
+            "import json, os, pathlib, subprocess, sys\n"
             "argv = sys.argv[1:]\n"
             "workspace = pathlib.Path(argv[argv.index('-C') + 1])\n"
             "with open(os.environ['FAKE_LOG'], 'a') as out: out.write(json.dumps(argv) + '\\n')\n"
             "if 'first task' in argv[-1]:\n"
-            "    print(json.dumps({'type':'item.completed','item':{'id':'read_1','type':'command_execution','command':\"sed -n '1,20p' helper.py\",'aggregated_output':'def helper():\\n    return 42\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
+            "    command = 'cat helper.py && cat ledger.py && git status --short'\n"
+            "    read = subprocess.run(['/bin/sh', '-c', command], cwd=workspace, capture_output=True, text=True, check=True)\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'read_1','type':'command_execution','command':command,'aggregated_output':read.stdout,'exit_code':read.returncode,'status':'completed'}}), flush=True)\n"
             "    path = workspace / 'a.py'\n"
             "    path.write_text('value = 2\\n')\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
@@ -84,16 +91,16 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             launch("first", "Repair ledger balance formatting in a.py first task")
             snapshot = brain()
             observed = snapshot["recentEvents"]
-            if len(observed) != 4 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
-                raise RuntimeError("completed read, edit, and test were not retained")
-            if {item["path"] for item in snapshot["fileObservations"]} != {"a.py", "helper.py"}:
+            if len(observed) != 5 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
+                raise RuntimeError("completed compound reads, edit, and test were not retained")
+            if {item["path"] for item in snapshot["fileObservations"]} != {"a.py", "helper.py", "ledger.py"}:
                 raise RuntimeError("latest file observations were not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
             runs = snapshot["recentRuns"]
             if len(runs) != 1 or any(runs[0].get(key) != value for key, value in {
                 "exit_code": 0, "turn_completed": True, "completed_commands": 2,
-                "completed_source_reads": 1, "completed_edits": 1,
+                "completed_source_reads": 2, "completed_edits": 1,
                 "completed_mcp_calls": 0, "successful_tests": 1,
                 "input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 12,
             }.items()):
@@ -155,7 +162,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "nextTaskReceivedCurrentEdit": True,
                 "nextTaskReceivedUnverifiedTestHint": True,
                 "staleEditWithheld": True,
-                "sourceReadObservedAndStaleWithheld": True,
+                "compoundSourceReadsObservedAndStaleWithheld": True,
                 "interactiveTaskStartReceivedBrain": True,
                 "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,
@@ -172,7 +179,12 @@ def main() -> int:
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--output", type=pathlib.Path)
     args = parser.parse_args()
-    report = run(args.binary.resolve())
+    binary = args.binary.resolve(strict=True)
+    source = source_state(ROOT, binary)
+    if source["binarySourceBindingVerified"] is not True:
+        raise RuntimeError(f"gate requires a clean source-bound binary: {source}")
+    report = run(binary)
+    report["source"] = source
     serialized = json.dumps(report, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
