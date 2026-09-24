@@ -13,7 +13,7 @@ const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
 const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
 const MAX_BRAIN_BRIEF_BYTES_V1: usize = 4 * 1024;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CodexRunObservationV1 {
     completed_commands: u32,
     completed_source_reads: u32,
