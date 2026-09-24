@@ -2698,7 +2698,15 @@ mod tests {
             .as_u64()
             .unwrap();
         let tree = agent.tool("repo.tree", json!({ "path": "src", "maxResults": 2 }));
-        assert!(tree["result"].get("_meta").is_none());
+        assert!(tree.get("error").is_none(), "{tree}");
+        assert_eq!(tree["result"]["structuredContent"]["truncated"], true);
+        assert_eq!(
+            tree["result"]["structuredContent"]["entries"],
+            json!([
+                { "path": "src/module_0000.py", "kind": "file", "depth": 1, "bytes": 10 },
+                { "path": "src/module_0001.py", "kind": "file", "depth": 1, "bytes": 10 }
+            ])
+        );
         fs::write(
             workspace.path().join("src/module_4096.py"),
             b"changed = 4096\n",

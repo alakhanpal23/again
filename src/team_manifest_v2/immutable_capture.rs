@@ -2724,13 +2724,16 @@ mod tests {
 
     impl CaptureHooks for WaitForChildMarker {
         fn after_child_started(&self, _prepared: &PreparedSnapshot, run: u8) {
-            let deadline = Instant::now() + Duration::from_secs(2);
+            // Hosted runners can delay a newly spawned shell while unrelated
+            // tests compile or traverse large trees. This deadline waits only
+            // for the test marker; the injected execution timeout stays exact.
+            let deadline = Instant::now() + Duration::from_secs(10);
             while execution_count(&self.counter) < usize::from(run) {
                 assert!(
                     Instant::now() < deadline,
                     "child {run} never crossed its execution marker"
                 );
-                thread::yield_now();
+                thread::sleep(Duration::from_millis(5));
             }
         }
 
@@ -3617,7 +3620,7 @@ mod tests {
             "#!/bin/sh\nprintf x >> '{}'\nprintf parent-\n( /bin/sleep 0.025; printf descendant ) &\nwait\n",
             counter.display()
         );
-        let captured = boundary_attempt(&body, &NoCaptureHooks, Duration::from_secs(2)).unwrap();
+        let captured = boundary_attempt(&body, &NoCaptureHooks, Duration::from_secs(10)).unwrap();
         assert_eq!(captured.stdout, b"parent-descendant");
         assert_eq!(execution_count(&counter), 2);
     }
@@ -3635,7 +3638,7 @@ mod tests {
         );
         let hooks = WaitForChildMarker {
             counter: counter.clone(),
-            first_timeout: Duration::from_secs(2),
+            first_timeout: Duration::from_secs(10),
             second_timeout: Duration::from_millis(25),
         };
         let failure = boundary_attempt(&body, &hooks, EXECUTION_TIMEOUT).unwrap_err();
