@@ -1458,6 +1458,92 @@ mod tests {
     }
 
     #[test]
+    fn current_brain_preview_skips_index_and_stale_observation_does_not() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::create_dir(workspace.path().join("src")).unwrap();
+        let source = workspace.path().join("src/ledger.py");
+        fs::write(
+            &source,
+            b"def balance_helper(value):\n    return value + 1\n",
+        )
+        .unwrap();
+        let root = fs::canonicalize(workspace.path()).unwrap();
+        let scope = AuthorizationScopeId::new(crate::brain::local_brain_scope_v1(&root)).unwrap();
+        let daemon = GatewayDaemonV1::bind(&root, scope).unwrap();
+        let server = thread::spawn(move || daemon.serve());
+        let mut agent = LocalMcpClientV1::connect(&root);
+        let prior = agent.tool(
+            "task.start",
+            json!({ "taskId": "prior-ledger", "task": "Investigate ledger balance helper behavior" }),
+        );
+        let prior_task_id = prior["result"]["structuredContent"]["taskId"]
+            .as_str()
+            .unwrap();
+        Store::open_for_workspace(&root)
+            .unwrap()
+            .record_brain_event_v1(&crate::store::BrainEventV1 {
+                session_id: "prior-ledger-session".to_owned(),
+                event_id: "prior-ledger-read".to_owned(),
+                task_id: prior_task_id.to_owned(),
+                kind: "command".to_owned(),
+                path: Some("src/ledger.py".to_owned()),
+                source_digest: Some(
+                    blake3::hash(&fs::read(&source).unwrap())
+                        .to_hex()
+                        .to_string(),
+                ),
+                read_start_line: None,
+                read_end_line: None,
+                command_digest: Some("a".repeat(64)),
+                command_hint: None,
+                exit_code: Some(0),
+                created_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+                authorization_scope_digest: Some(crate::brain::local_brain_scope_digest_v1(&root)),
+            })
+            .unwrap();
+        let returning = agent.tool(
+            "task.start",
+            json!({ "taskId": "returning-ledger", "task": "Fix ledger balance helper behavior", "includeSourcePreviews": true }),
+        );
+        let brief = &returning["result"]["structuredContent"];
+        assert_eq!(
+            brief["relevantCode"]["unknowns"][0]["kind"],
+            "index_skipped_for_current_brain_preview"
+        );
+        assert_eq!(
+            brief["againBrain"]["recentCurrentFiles"][0]["path"],
+            "src/ledger.py"
+        );
+        assert!(
+            brief["againBrain"]["recentCurrentFiles"][0]["currentCompletePreview"]
+                .as_str()
+                .unwrap()
+                .contains("balance_helper")
+        );
+        assert_eq!(brief["sourcePreviews"], json!([]));
+
+        fs::write(
+            &source,
+            b"def balance_helper(value):\n    return value + 2\n",
+        )
+        .unwrap();
+        let changed = agent.tool(
+            "task.start",
+            json!({ "taskId": "changed-ledger", "task": "Fix ledger balance helper behavior", "includeSourcePreviews": true }),
+        );
+        assert_ne!(
+            changed["result"]["structuredContent"]["relevantCode"]["unknowns"][0]["kind"],
+            "index_skipped_for_current_brain_preview"
+        );
+        agent.stream.shutdown(std::net::Shutdown::Both).unwrap();
+        stop_daemon_v1(&root).unwrap();
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
     fn two_authenticated_clients_share_facts_work_retrieval_and_mutation_deltas() {
         let workspace = tempfile::tempdir().unwrap();
         fs::write(

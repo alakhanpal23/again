@@ -1026,6 +1026,41 @@ impl LocalContextCoordinatorV1 {
         } else {
             Vec::new()
         };
+        let early_brain = if include_source_previews
+            && explicit_previews.is_empty()
+            && freshness_issue.is_none()
+            && call.authorization_scope.as_str()
+                == crate::brain::local_brain_scope_v1(&self.workspace)
+        {
+            let store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            crate::brain::repository_brief_for_task_v1(
+                &store,
+                &self.workspace,
+                &Value::Array(Vec::new()),
+                &json!({ "candidates": [] }),
+                crate::brain::BrainTaskQueryV1 {
+                    task_text: prompt,
+                    repository_id: &self.repository_id,
+                    workspace_id: &self.workspace_id,
+                    authorization_scope_digest: identity.authorization_scope_digest(),
+                },
+            )
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let brain_has_current_preview = early_brain.as_ref().is_some_and(|brain| {
+            brain["recentCurrentFiles"].as_array().is_some_and(|files| {
+                files.iter().any(|file| {
+                    file["currentCompletePreview"].as_str().is_some()
+                        || file["currentPartialPreview"]["text"].as_str().is_some()
+                })
+            })
+        });
         let large_enough_for_preview_fast_path = !explicit_previews.is_empty()
             && index_preflight_refusal.is_none()
             && index_preflight_refusal_v1(
@@ -1037,7 +1072,17 @@ impl LocalContextCoordinatorV1 {
                 Duration::from_millis(50),
             )
             .is_some();
-        let (mut code_brief, mut source_previews) = if let Some(reason) = index_preflight_refusal {
+        let (mut code_brief, mut source_previews) = if brain_has_current_preview {
+            (
+                json!({
+                    "schemaVersion": 1,
+                    "candidates": [],
+                    "incomplete": true,
+                    "unknowns": [{ "kind": "index_skipped_for_current_brain_preview" }]
+                }),
+                explicit_previews,
+            )
+        } else if let Some(reason) = index_preflight_refusal {
             (
                 json!({
                     "schemaVersion": 1,
@@ -1203,7 +1248,9 @@ impl LocalContextCoordinatorV1 {
         } else {
             ("full", serde_json::to_value(&snapshot)?, 0)
         };
-        let again_brain = if call.authorization_scope.as_str()
+        let again_brain = if brain_has_current_preview {
+            early_brain
+        } else if call.authorization_scope.as_str()
             == crate::brain::local_brain_scope_v1(&self.workspace)
         {
             let store = self
