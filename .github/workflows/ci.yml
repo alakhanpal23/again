@@ -283,6 +283,7 @@ jobs:
         run: |
           cargo +1.88.0 build --locked --features daemon
           python3 -B bench/agent_brain_single_agent_e2e.py --binary target/debug/again --output "$RUNNER_TEMP/again-brain-e2e.json"
+          python3 -B bench/package_test_brain_gate_v1.py --binary target/debug/again --output "$RUNNER_TEMP/again-package-brain-e2e.json"
       - name: Audit locked Rust dependencies
         if: runner.os == 'Linux'
         run: |

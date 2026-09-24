@@ -30,7 +30,7 @@ def brief(binary: pathlib.Path, workspace: pathlib.Path, env: dict[str, str],
           task_id: str) -> dict:
     return run_json([str(binary), "mcp", "brief", "--workspace", str(workspace),
                      "--task-id", task_id,
-                     "--task", "Fix src/ledger.ts total and run the project tests"],
+                     "--task", "Fix ledger total and run the project tests"],
                     cwd=workspace, env=env)
 
 
@@ -57,9 +57,16 @@ def main() -> int:
         fake_bin = temporary / "bin"
         fake_bin.mkdir()
         fake_codex = fake_bin / "codex"
+        read_event = {
+            "type": "item.completed",
+            "item": {"id": "observed_read", "type": "command_execution",
+                     "command": "cat src/ledger.ts", "exit_code": 0,
+                     "aggregated_output": SOURCE},
+        }
         fake_codex.write_text(
             "#!/usr/bin/env python3\n"
             "import json\n"
+            + "print(json.dumps(" + repr(read_event) + "))\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'observed_test',"
             "'type':'command_execution','command':'pnpm test','exit_code':0,"
             "'aggregated_output':'test passed'}}))\n"
@@ -70,7 +77,7 @@ def main() -> int:
         launch_env = dict(environment, PATH=str(fake_bin) + os.pathsep + environment["PATH"])
         launched = subprocess.run(
             [str(binary), "codex", "--workspace", str(workspace),
-             "--task-id", "prior-validation", "--task", "Validate src/ledger.ts with pnpm test",
+             "--task-id", "prior-validation", "--task", "Validate ledger total with pnpm test",
              "--", "--ephemeral"], cwd=workspace, env=launch_env,
             capture_output=True, text=True, timeout=45,
         )
@@ -96,6 +103,7 @@ def main() -> int:
             and hint(before) is None
             and selector(after) is not None
             and selector(after)["command"] == "pnpm test"
+            and after["relevantCode"]["unknowns"][0]["kind"] == "index_skipped_for_current_brain_preview"
             and hint(after) == "pnpm test"
             and selector(stale) is None
             and hint(stale) is None
@@ -110,6 +118,7 @@ def main() -> int:
             "beforeTestSelector": selector(before),
             "beforeTestBrainHint": hint(before),
             "afterTestSelector": selector(after),
+            "afterTestIndexStatus": after["relevantCode"]["unknowns"],
             "afterTestBrainHint": hint(after),
             "afterManifestChangeSelector": selector(stale),
             "afterManifestChangeBrainHint": hint(stale),
