@@ -23,6 +23,7 @@ import time
 import agent_gateway_editable_pair as pair
 import historical_python_quote_fixture_v1
 import historical_search_fixture_v1
+import public_historical_fixtures_v1
 from agent_gateway_authenticated_product_e2e import Client, start_daemon, structured
 from agent_gateway_codex_live_probe_v1 import sha256, source_state
 
@@ -44,6 +45,8 @@ TASK_IDS = {
     "historical-search": "historical-search-output-fix",
     "historical-search-unlocated": "historical-search-unlocated-fix",
     "historical-python-triple": "historical-python-triple-fix",
+    "packaging-empty-platforms": "packaging-empty-platforms-fix",
+    "tomlkit-array-slice": "tomlkit-array-slice-fix",
 }
 
 DEFAULT_CREATE_FIXTURE = pair.create_fixture
@@ -57,6 +60,9 @@ def configure_fixture(name: str) -> None:
     pair.validate_edit = DEFAULT_VALIDATE_EDIT
     pair.TEST_COMMAND = ("/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q")
     pair.TARGET_ORACLE_MODE = "exact"
+    if name in public_historical_fixtures_v1.CASES:
+        public_historical_fixtures_v1.configure(name)
+        return
     if name == "historical-python-triple":
         historical_python_quote_fixture_v1.configure(DEFAULT_VALIDATE_EDIT)
         return
@@ -459,6 +465,51 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
             "decoyCount": decoy_count, "mode": "search" if search else "read"}
 
 
+def run_live_prior_task(condition: str, workspace: pathlib.Path, binary: pathlib.Path,
+                        model: str, task_id: str, prompt: str,
+                        before: dict[str, str]) -> tuple[dict, bytes]:
+    """Measure a real, read-only prior agent task in both treatment conditions."""
+    codex = pathlib.Path(shutil.which("codex") or "").resolve(strict=True)
+    if condition == "product":
+        command = [str(binary), "codex", "--workspace", str(workspace),
+                   "--task-id", task_id + "-prior", "--task", prompt, "--",
+                   "--ephemeral", "--ignore-user-config", "--json", "--approve-for-me",
+                   "-m", model]
+    else:
+        command = [str(codex), "exec", "--ephemeral", "--ignore-user-config", "--json",
+                   "--approve-for-me", "-m", model, "-C", str(workspace), prompt]
+    started = time.monotonic()
+    completed = subprocess.run(command, cwd=workspace, stdin=subprocess.DEVNULL,
+                               capture_output=True, timeout=180)
+    elapsed_ms = round((time.monotonic() - started) * 1000, 3)
+    raw = completed.stdout
+    if completed.returncode != 0 or len(raw) > MAX_EVENT_BYTES or len(completed.stderr) > MAX_EVENT_BYTES:
+        raise RuntimeError("live prior agent task failed or exceeded event bounds")
+    events = [json.loads(line) for line in raw.splitlines()]
+    usages = [event["usage"] for event in events if event.get("type") == "turn.completed"]
+    commands = [event["item"] for event in events
+                if event.get("type") == "item.completed"
+                and event.get("item", {}).get("type") == "command_execution"
+                and event["item"].get("exit_code") == 0]
+    if len(usages) != 1 or not commands or not any(pair.TARGET in item.get("command", "") for item in commands):
+        raise RuntimeError("live prior task did not complete a source investigation")
+    if pair.snapshot(workspace) != before:
+        raise RuntimeError("live prior task changed repository files")
+    brain_observed = False
+    if condition == "product":
+        brain = subprocess.run([str(binary), "brain", "show", "--workspace", str(workspace)],
+                               cwd=workspace, capture_output=True, text=True, check=True,
+                               timeout=10)
+        brain_observed = pair.TARGET in {
+            item["path"] for item in json.loads(brain.stdout)["fileObservations"]
+        }
+        if not brain_observed:
+            raise RuntimeError("live prior investigation did not enter Again Brain")
+    return ({"elapsedMs": elapsed_ms, "usage": usages[0], "completedCommands": len(commands),
+             "brainObserved": brain_observed, "rawEventSha256": hashlib.sha256(raw).hexdigest(),
+             "rawEventBytes": len(raw)}, raw)
+
+
 def run_condition(
     condition: str, workspace: pathlib.Path, binary: pathlib.Path, model: str,
     task_id: str,
@@ -470,6 +521,8 @@ def run_condition(
     brain_decoys: int = 0,
     seed_brain_search: bool = False,
     required_agent_validation: tuple[str, ...] = (),
+    live_prior_prompt: str | None = None,
+    prior_trace_sink: list[bytes] | None = None,
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -481,6 +534,12 @@ def run_condition(
                 f"value = {index}\n", encoding="utf-8"
             )
     before = pair.snapshot(workspace)
+    live_prior = None
+    if live_prior_prompt is not None:
+        live_prior, prior_raw = run_live_prior_task(
+            condition, workspace, binary, model, task_id, live_prior_prompt, before)
+        if prior_trace_sink is not None:
+            prior_trace_sink.append(prior_raw)
     prior_brain = seed_prior_brain(binary, workspace, brain_decoys, seed_brain_search) if seed_brain and condition == "product" else None
     stats_before = pair.again_stats(binary, workspace)
     preparation_ms = 0.0
@@ -701,6 +760,7 @@ def run_condition(
         "agentValidationObserved": agent_validation_observed,
         "againStatsDelta": stats,
         "priorBrain": prior_brain,
+        "livePriorTask": live_prior,
         "brainRun": brain_run,
         "brainRunError": brain_run_error,
     }
