@@ -19,8 +19,13 @@ editable diagnostics use a JavaScript repair whose prompt asks for the existing
 tests without naming a command. All four patches and validations passed. Again
 made an edit and test call in each run; baseline made five to seven completed
 actions. Paired completion ratios were 0.604 and 0.446. These are unbalanced
-debug-binary synthetic trials; clean-source release evidence and a diverse
-accepted-task cohort remain open.
+debug-binary synthetic trials.
+The [clean-source release-binary repeat](../bench/results/2026-09-23-js-generic-validation-clean-df1d912/summary.json)
+again accepted all four outcomes in both treatment orders. Again made two
+actions in each task, baseline six, and the paired median completion ratio
+was 0.574. The raw event files and exact usage counters are retained beside
+the summary. This is one synthetic task in two orders; it does not establish
+the balanced product-wide speed or cost target.
 
 ## 2026-09-23 native Codex hook observation (opt-in)
 
