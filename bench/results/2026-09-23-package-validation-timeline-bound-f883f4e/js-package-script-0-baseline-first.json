@@ -1,0 +1,266 @@
+{
+  "accepted": true,
+  "againBinarySha256": "8810cc65a59027f6cb8ae7a000562a9ed81952e856f3b0c921b7960935767484",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-package-script",
+  "fixtureSha256": "c6986be1f88f9257f3e26d79d7af9f07689181c6a8fd35fcbf5e1000b68f8db9",
+  "harnessSha256": "a20734d24eaa51d254db1a6f099b1a3ee5bb7e914d53f8fa28cc41a2bd6bb291",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "codexElapsedMs": 15162.087,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'package.json' -g 'src/total.mjs' -g 'test*' -g 'tests/**' && cat src/total.mjs && cat package.json\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 15162.087,
+      "eventCount": 11,
+      "eventTimeline": [
+        {
+          "elapsedMs": 6379.376,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6379.437,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9762.559,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 9785.309,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 11790.229,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11935.605,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14428.003,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 9785.317,
+      "oracle": {
+        "after_snapshot_sha256": "592f60bc7df31a905451acf92750b909afff49666bb0627f3da565cd4d997101",
+        "changed_paths": [
+          "src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 77.208,
+        "test_output_sha256": "1d0d6096edd665d21744e54d54601a435910127518a070ef14b7393b490cece7",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 2786,
+      "rawEventFile": "js-package-script-0-baseline-first-baseline.jsonl",
+      "rawEventSha256": "ba70ab5570f696e925397f13e81939e912b0a2d2041f170914dfbb83b41d5ef1",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 66176,
+        "input_tokens": 73732,
+        "output_tokens": 348,
+        "reasoning_output_tokens": 21
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "b9e346f960daaa6f3dd84a013d7ff26117c5431fb378dc6f95f9d7702bf7aeff",
+        "cached_input_tokens": 43904,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790224808254,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48929,
+        "output_tokens": 267,
+        "session_id": "c45eb604-8938-4eba-8b8e-2376f9a5ded5",
+        "started_ms": 1790224794772,
+        "successful_tests": 1,
+        "task_id": "js-package-script-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 13703.252,
+      "completedActions": [
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 13703.252,
+      "eventCount": 9,
+      "eventTimeline": [
+        {
+          "elapsedMs": 8284.928,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8311.396,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 10465.069,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 10465.08,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12955.076,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 8284.94,
+      "oracle": {
+        "after_snapshot_sha256": "592f60bc7df31a905451acf92750b909afff49666bb0627f3da565cd4d997101",
+        "changed_paths": [
+          "src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 88.597,
+        "test_output_sha256": "314dafb784835ac42749390a663ffcfcb9d8a24bdd2ffe6a6a93b5a80ee0b49d",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1545,
+      "rawEventFile": "js-package-script-0-baseline-first-product.jsonl",
+      "rawEventSha256": "827333012c8dc2c1dd7a12a13e20245672b26380586b9c0f10d265850cabe9b3",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43904,
+        "input_tokens": 48929,
+        "output_tokens": 267,
+        "reasoning_output_tokens": 23
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "645f50cdb687f90aca647f1e23ee92b0c15479b3fe1d9df70400e6950268aa94",
+  "recordedAtUtc": "2026-09-24T04:40:08.394403+00:00",
+  "requiredAgentValidation": [
+    "npm test",
+    "node --test test/total.spec.mjs"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "f883f4eaf9557809373da49c0c3192cb4fc08fcf",
+    "dirty": false,
+    "head": "f883f4eaf9557809373da49c0c3192cb4fc08fcf"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

@@ -1,0 +1,306 @@
+{
+  "accepted": true,
+  "againBinarySha256": "8810cc65a59027f6cb8ae7a000562a9ed81952e856f3b0c921b7960935767484",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-package-script",
+  "fixtureSha256": "c6986be1f88f9257f3e26d79d7af9f07689181c6a8fd35fcbf5e1000b68f8db9",
+  "harnessSha256": "a20734d24eaa51d254db1a6f099b1a3ee5bb7e914d53f8fa28cc41a2bd6bb291",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "codexElapsedMs": 14260.636,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,160p' src/total.mjs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat package.json'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 14260.636,
+      "eventCount": 16,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5145.167,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5145.18,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5145.186,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5145.19,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5170.067,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5170.083,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8504.868,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8528.384,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 10468.943,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 10494.05,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13498.78,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 8528.393,
+      "oracle": {
+        "after_snapshot_sha256": "40689307e4aacf03e64b1c37ce91f2aec3d424e1015dbad96bead3e30e671eee",
+        "changed_paths": [
+          "src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 74.66,
+        "test_output_sha256": "6507b30eb21a748a2dd342530a254d57e2e61d22f24b70e411fdddc61af7ed13",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3359,
+      "rawEventFile": "js-package-script-1000-baseline-first-baseline.jsonl",
+      "rawEventSha256": "45f73cd5974181b7ae93dc44c408288eba04b3a369e375acd979c0509f6ae76e",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 55168,
+        "input_tokens": 64497,
+        "output_tokens": 403,
+        "reasoning_output_tokens": 25
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "be5ddaf8179d4339b11a80716d8533171ca019753ad8195a1257394d0bc0f1e1",
+        "cached_input_tokens": 43648,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790224865315,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48577,
+        "output_tokens": 280,
+        "session_id": "41cc64d0-314e-4095-8368-865d382f4dc0",
+        "started_ms": 1790224854871,
+        "successful_tests": 1,
+        "task_id": "js-package-script-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 10643.773,
+      "completedActions": [
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 10643.773,
+      "eventCount": 9,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5058.005,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 5058.025,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 7277.863,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7277.883,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9820.35,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5058.028,
+      "oracle": {
+        "after_snapshot_sha256": "40689307e4aacf03e64b1c37ce91f2aec3d424e1015dbad96bead3e30e671eee",
+        "changed_paths": [
+          "src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 73.0,
+        "test_output_sha256": "5bebfd7eeeef476fba5ca7b061f3e38c42dd250aed87dac44d67e0fcb39a7535",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1775,
+      "rawEventFile": "js-package-script-1000-baseline-first-product.jsonl",
+      "rawEventSha256": "c2fdf0b0740bba44e36342c00366ff662591af308cc7f84802be031d57feb04e",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48577,
+        "output_tokens": 280,
+        "reasoning_output_tokens": 39
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "645f50cdb687f90aca647f1e23ee92b0c15479b3fe1d9df70400e6950268aa94",
+  "recordedAtUtc": "2026-09-24T04:41:05.541298+00:00",
+  "requiredAgentValidation": [
+    "npm test",
+    "node --test test/total.spec.mjs"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "f883f4eaf9557809373da49c0c3192cb4fc08fcf",
+    "dirty": false,
+    "head": "f883f4eaf9557809373da49c0c3192cb4fc08fcf"
+  },
+  "sourceFiles": 1000,
+  "surface": "product-wrapper"
+}
