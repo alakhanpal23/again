@@ -217,6 +217,23 @@ pub fn codex_completed_events_v1(
                     authorization_scope_digest,
                 });
             }
+            if exit_code == 0 {
+                for (relative, bytes) in matching_source_search_v1(item, workspace, command) {
+                    events.push(BrainEventV1 {
+                        session_id: session_id.to_owned(),
+                        event_id: event_id.to_owned(),
+                        task_id: task_id.to_owned(),
+                        kind: "command".to_owned(),
+                        path: Some(relative),
+                        source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                        command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                        command_hint: None,
+                        exit_code: Some(exit_code),
+                        created_ms,
+                        authorization_scope_digest: Some(local_brain_scope_digest_v1(workspace)),
+                    });
+                }
+            }
             events
         }
         _ => Vec::new(),
@@ -302,6 +319,23 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
                 created_ms,
                 authorization_scope_digest,
             });
+        }
+        if exit_code.is_none() {
+            for (relative, bytes) in matching_source_search_v1(&item, workspace, command) {
+                events.push(BrainEventV1 {
+                    session_id: session_id.to_owned(),
+                    event_id: event_id.to_owned(),
+                    task_id: session_id.to_owned(),
+                    kind: "command".to_owned(),
+                    path: Some(relative),
+                    source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                    command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                    command_hint: None,
+                    exit_code: None,
+                    created_ms,
+                    authorization_scope_digest: Some(local_brain_scope_digest_v1(workspace)),
+                });
+            }
         }
     }
     Some(events)
@@ -441,7 +475,7 @@ pub fn repository_brief_v1(
                 "path": path,
                 "currentDigest": observation.source_digest,
                 "observedTaskId": observation.task_id,
-                "observation": "observed after a prior read or edit; file content rechecked now",
+                "observation": "observed after a prior read, search, or edit; file content rechecked now",
                 "currentCompletePreview": preview,
             }));
         }
@@ -754,6 +788,112 @@ fn matching_source_read_v1(
         bytes.clone()
     };
     (item["aggregated_output"].as_str()?.as_bytes() == expected).then_some((relative, bytes))
+}
+
+/// Nominate source files from a simple completed search. This verifies only
+/// each reported line against current source bytes, not search completeness.
+fn matching_source_search_v1(
+    item: &Value,
+    workspace: &Path,
+    command: &str,
+) -> Vec<(String, Vec<u8>)> {
+    let Some(output) = item["aggregated_output"]
+        .as_str()
+        .filter(|output| output.len() <= 1024 * 1024)
+    else {
+        return Vec::new();
+    };
+    let Ok(outer) = shell_words::split(command) else {
+        return Vec::new();
+    };
+    let argv = if matches!(outer.as_slice(), [shell, flag, _]
+        if shell == "/bin/zsh" && flag == "-lc")
+    {
+        let Ok(inner) = shell_words::split(&outer[2]) else {
+            return Vec::new();
+        };
+        inner
+    } else {
+        outer
+    };
+    let (pattern, operand) = match argv.as_slice() {
+        [program, line_flag, fixed_flag, pattern, operand]
+            if program == "rg" && line_flag == "-n" && fixed_flag == "-F" =>
+        {
+            (pattern.as_str(), operand.as_str())
+        }
+        [program, line_flag, pattern, operand] if program == "rg" && line_flag == "-n" => {
+            (pattern.as_str(), operand.as_str())
+        }
+        _ => return Vec::new(),
+    };
+    if !(2..=64).contains(&pattern.len())
+        || !pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || (operand != "."
+            && (operand.starts_with('-')
+                || !Path::new(operand)
+                    .components()
+                    .all(|part| matches!(part, std::path::Component::Normal(_)))))
+    {
+        return Vec::new();
+    }
+    let search_root = if operand == "." {
+        match fs::canonicalize(workspace) {
+            Ok(root) => root,
+            Err(_) => return Vec::new(),
+        }
+    } else {
+        let Some((_, root)) = workspace_file_v1(workspace, operand) else {
+            return Vec::new();
+        };
+        root
+    };
+    let mut files = Vec::new();
+    for line in output.lines().take(32) {
+        if files.len() == 4 {
+            break;
+        }
+        let Some((first, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let (path, line_number, reported) =
+            if search_root.is_file() && first.parse::<usize>().is_ok() {
+                (operand, first, rest)
+            } else {
+                let Some((line_number, reported)) = rest.split_once(':') else {
+                    continue;
+                };
+                (first, line_number, reported)
+            };
+        let Ok(line_number) = line_number.parse::<usize>() else {
+            continue;
+        };
+        if !(1..=8192).contains(&line_number) {
+            continue;
+        }
+        let Some((relative, absolute)) = workspace_file_v1(workspace, path) else {
+            continue;
+        };
+        if !absolute.starts_with(&search_root)
+            || !source_code_path_v1(&relative)
+            || files.iter().any(|(selected, _)| selected == &relative)
+            || !fs::metadata(&absolute).is_ok_and(|meta| meta.is_file() && meta.len() <= 8 * 1024)
+        {
+            continue;
+        }
+        let Ok(bytes) = fs::read(&absolute) else {
+            continue;
+        };
+        let Some(actual) = bytes.split(|byte| *byte == b'\n').nth(line_number - 1) else {
+            continue;
+        };
+        if actual == reported.as_bytes() && reported.contains(pattern) {
+            files.push((relative, bytes));
+        }
+    }
+    files
 }
 
 fn source_code_path_v1(path: &str) -> bool {
@@ -1317,6 +1457,99 @@ mod tests {
         });
         assert_eq!(
             codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn completed_literal_search_nominates_only_independently_checked_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        fs::write(
+            workspace.join("src/ledger.py"),
+            "def balance():\n    return 42\n",
+        )
+        .unwrap();
+        fs::write(workspace.join("src/wrong.py"), "def unrelated():\n").unwrap();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"search","type":"command_execution",
+                "command":"rg -n -F balance src", "exit_code":0,
+                "aggregated_output":"src/ledger.py:1:def balance():\nsrc/wrong.py:1:def balance():\n"}
+        });
+        let events = codex_completed_events_v1(&completed, &workspace, "session", "old-task");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].path.as_deref(), Some("src/ledger.py"));
+        let store = Store::open(dir.path().join("state")).unwrap();
+        for event in &events {
+            store.record_brain_event_v1(event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let brief = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[]}),
+            task_query("Fix ledger balance rounding", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(brief["recentCurrentFiles"][0]["path"], "src/ledger.py");
+        fs::write(
+            workspace.join("src/ledger.py"),
+            "def balance():\n    return 0\n",
+        )
+        .unwrap();
+        let stale = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[]}),
+            task_query("Fix ledger balance rounding", &scope),
+        )
+        .unwrap();
+        assert!(stale.is_none());
+
+        let hook = serde_json::json!({
+            "hook_event_name":"PostToolUse", "tool_name":"Bash",
+            "session_id":"interactive", "tool_use_id":"search",
+            "tool_input":{"command":"rg -n balance src"},
+            "tool_response":"src/ledger.py:1:def balance():\n"
+        });
+        let hook_events = codex_post_tool_event_v1(&hook, &workspace).unwrap();
+        assert_eq!(hook_events.len(), 2);
+        assert_eq!(hook_events[1].path.as_deref(), Some("src/ledger.py"));
+        assert_eq!(hook_events[1].exit_code, None);
+        let single_file = serde_json::json!({
+            "type":"item.completed", "item":{"id":"single_file","type":"command_execution",
+                "command":"rg -n -F balance src/ledger.py", "exit_code":0,
+                "aggregated_output":"1:def balance():\n"}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&single_file, &workspace, "session", "old-task")[1]
+                .path
+                .as_deref(),
+            Some("src/ledger.py")
+        );
+        let root_search = serde_json::json!({
+            "type":"item.completed", "item":{"id":"root_search","type":"command_execution",
+                "command":"rg -n balance .", "exit_code":0,
+                "aggregated_output":"./src/ledger.py:1:def balance():\n"}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&root_search, &workspace, "session", "old-task")[1]
+                .path
+                .as_deref(),
+            Some("src/ledger.py")
+        );
+        let unsafe_command = serde_json::json!({
+            "type":"item.completed", "item":{"id":"unsafe","type":"command_execution",
+                "command":"rg -n 'balance|secret' src", "exit_code":0,
+                "aggregated_output":"src/ledger.py:1:def balance():\n"}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&unsafe_command, &workspace, "session", "old-task").len(),
             1
         );
     }
