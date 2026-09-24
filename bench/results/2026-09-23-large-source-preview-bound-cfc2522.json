@@ -1,0 +1,19 @@
+{
+  "schema": "again.large-source-preview-gate.v1",
+  "sourceSha": "cfc25221e221436ac50527d83eccace8e7aa8608",
+  "binarySha256": "3e9fd14c727c3dc4dbd80b63febed90244b86c179d29b908fdad3d66e732297e",
+  "targetPath": "src/agent_gateway_runtime.rs",
+  "sourceBytesBefore": 50939,
+  "previewBytes": 2048,
+  "startLine": 827,
+  "endLine": 869,
+  "targetDeclarationPresent": true,
+  "complete": false,
+  "sourceDigestBefore": "33401ce467af3f19efe3e56a008728ed3748b4f1ef84697d595b6aa182dffebd",
+  "sourceDigestAfterEdit": "abbd91a29652b12e542ca9b206d07737f48e59491cf9dbc36af99e485854ac0b",
+  "sourceChangedDigest": true,
+  "newExcerptMatchesCurrentSource": true,
+  "binarySourceBindingVerified": true,
+  "buildSourceSha": "cfc25221e221436ac50527d83eccace8e7aa8608",
+  "buildSourceClean": true
+}
