@@ -1,0 +1,477 @@
+{
+  "schema": "again.diverse-real-cohort-audit.v1",
+  "sourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+  "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+  "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+  "verifiedRawTraces": 48,
+  "plannedPairs": 16,
+  "acceptedPairs": 14,
+  "qualificationPassed": false,
+  "acceptedOnlyMedianTimeRatioDiagnostic": 0.8490294053847336,
+  "acceptedOnlyMedianCostRatioDiagnostic": 0.9030763478259456,
+  "totalApiEquivalentUsdIncludingFailures": {
+    "baseline": "1.0832392",
+    "product": "1.0149720"
+  },
+  "taskSummaries": {
+    "packaging-empty-platforms": {
+      "acceptedPairs": 4,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.9019819777137229,
+      "medianCostRatioAcceptedOnly": 0.9049726726715612
+    },
+    "camelcase-number-separator": {
+      "acceptedPairs": 3,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.5838050462088015,
+      "medianCostRatioAcceptedOnly": 0.727494809448538
+    },
+    "historical-search-unlocated": {
+      "acceptedPairs": 3,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 1.217788394070015,
+      "medianCostRatioAcceptedOnly": 0.9439284354777312
+    },
+    "tomlkit-array-slice": {
+      "acceptedPairs": 4,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.965856669902461,
+      "medianCostRatioAcceptedOnly": 0.9344675448804258
+    }
+  },
+  "pairs": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 20010.996,
+          "apiEquivalentUsd": "0.039164",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        },
+        "product": {
+          "elapsedMs": 18620.789,
+          "apiEquivalentUsd": "0.0368836",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        }
+      },
+      "timeRatioDiagnostic": 0.9305278457903845,
+      "costRatioDiagnostic": 0.9417730568889797
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 17910.964,
+          "apiEquivalentUsd": "0.037604",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3
+        },
+        "baseline": {
+          "elapsedMs": 19991.273,
+          "apiEquivalentUsd": "0.0483096",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6
+        }
+      },
+      "timeRatioDiagnostic": 0.8959391430450677,
+      "costRatioDiagnostic": 0.778396012386772
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 33042.93,
+          "apiEquivalentUsd": "0.0645628",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 5
+        },
+        "product": {
+          "elapsedMs": 25215.973,
+          "apiEquivalentUsd": "0.0639308",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        }
+      },
+      "timeRatioDiagnostic": 0.763127634262458,
+      "costRatioDiagnostic": 0.9902110813037849
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 26417.362,
+          "apiEquivalentUsd": "0.0559860",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        },
+        "baseline": {
+          "elapsedMs": 29093.216,
+          "apiEquivalentUsd": "0.0644872",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8
+        }
+      },
+      "timeRatioDiagnostic": 0.9080248123823781,
+      "costRatioDiagnostic": 0.8681722884541428
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 41568.506,
+          "apiEquivalentUsd": "0.04913",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8
+        },
+        "product": {
+          "elapsedMs": 28308.762,
+          "apiEquivalentUsd": "0.0401472",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3
+        }
+      },
+      "timeRatioDiagnostic": 0.6810146604739655,
+      "costRatioDiagnostic": 0.8171626297577854
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 33304.156,
+          "apiEquivalentUsd": "0.045866",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        },
+        "baseline": {
+          "elapsedMs": 57046.708,
+          "apiEquivalentUsd": "0.1182288",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 5
+        }
+      },
+      "timeRatioDiagnostic": 0.5838050462088015,
+      "costRatioDiagnostic": 0.38794270093242933
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": false,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 33383.649,
+          "apiEquivalentUsd": "0.0550340",
+          "oraclePassed": false,
+          "agentTestObserved": false,
+          "brainRunError": null,
+          "completedActions": 5
+        },
+        "product": {
+          "elapsedMs": 41195.787,
+          "apiEquivalentUsd": "0.0787848",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        }
+      },
+      "timeRatioDiagnostic": 1.2340109075553725,
+      "costRatioDiagnostic": 1.4315659410546209
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 36187.413,
+          "apiEquivalentUsd": "0.0587260",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3
+        },
+        "baseline": {
+          "elapsedMs": 62428.378,
+          "apiEquivalentUsd": "0.0807236",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8
+        }
+      },
+      "timeRatioDiagnostic": 0.5796628738295908,
+      "costRatioDiagnostic": 0.727494809448538
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 67942.625,
+          "apiEquivalentUsd": "0.0928772",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 10
+        },
+        "product": {
+          "elapsedMs": 54227.34,
+          "apiEquivalentUsd": "0.0715108",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 11
+        }
+      },
+      "timeRatioDiagnostic": 0.7981343081754642,
+      "costRatioDiagnostic": 0.7699499984926332
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 65352.233,
+          "apiEquivalentUsd": "0.0793504",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6
+        },
+        "baseline": {
+          "elapsedMs": 53664.687,
+          "apiEquivalentUsd": "0.084064",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 7
+        }
+      },
+      "timeRatioDiagnostic": 1.217788394070015,
+      "costRatioDiagnostic": 0.9439284354777312
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 59116.888,
+          "apiEquivalentUsd": "0.1096320",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 11
+        },
+        "product": {
+          "elapsedMs": 77175.991,
+          "apiEquivalentUsd": "0.1123132",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 9
+        }
+      },
+      "timeRatioDiagnostic": 1.3054812864980307,
+      "costRatioDiagnostic": 1.0244563631056627
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": false,
+      "conditions": {
+        "product": {
+          "elapsedMs": 76972.547,
+          "apiEquivalentUsd": "0.1316468",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": "expected one current Brain run, found 0",
+          "completedActions": 6
+        },
+        "baseline": {
+          "elapsedMs": 58795.848,
+          "apiEquivalentUsd": "0.0824208",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6
+        }
+      },
+      "timeRatioDiagnostic": 1.3091493637441884,
+      "costRatioDiagnostic": 1.597252149942733
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 16237.213,
+          "apiEquivalentUsd": "0.0441084",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        },
+        "product": {
+          "elapsedMs": 21345.404,
+          "apiEquivalentUsd": "0.0406224",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        }
+      },
+      "timeRatioDiagnostic": 1.314597769949806,
+      "costRatioDiagnostic": 0.9209674347743287
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 18680.661,
+          "apiEquivalentUsd": "0.05687",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        },
+        "baseline": {
+          "elapsedMs": 16537.505,
+          "apiEquivalentUsd": "0.0361296",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4
+        }
+      },
+      "timeRatioDiagnostic": 1.1295936720805224,
+      "costRatioDiagnostic": 1.574055621983083
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 27970.516,
+          "apiEquivalentUsd": "0.0556500",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8
+        },
+        "product": {
+          "elapsedMs": 22435.701,
+          "apiEquivalentUsd": "0.0527544",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 2
+        }
+      },
+      "timeRatioDiagnostic": 0.8021196677243996,
+      "costRatioDiagnostic": 0.9479676549865229
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 20329.154,
+          "apiEquivalentUsd": "0.0519756",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 2
+        },
+        "baseline": {
+          "elapsedMs": 29324.763,
+          "apiEquivalentUsd": "0.0587172",
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8
+        }
+      },
+      "timeRatioDiagnostic": 0.6932418857059476,
+      "costRatioDiagnostic": 0.8851852608775623
+    }
+  ],
+  "interpretation": "Failed pairs disqualify the cohort; accepted-only ratios and unequal-quality cost totals are diagnostic."
+}
