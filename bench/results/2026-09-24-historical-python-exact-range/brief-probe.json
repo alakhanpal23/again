@@ -1,0 +1,24 @@
+{
+  "endLine": 540,
+  "excerptSha256": "b7c03860244d0c7094be0abbb1722b7cf4e6b10226129650a2b02c343855e00d",
+  "fixture": "historical-python-triple",
+  "matchedFixtureBytes": true,
+  "origin": "verified_prior_read_range",
+  "path": "src/code_intelligence/extract.rs",
+  "schema": "again.brain-exact-range-brief-probe.v1",
+  "seed": {
+    "decoyCount": 0,
+    "mode": "read",
+    "path": "src/code_intelligence/extract.rs",
+    "sourceSha256": "79db293143bc2780e497772dc885622f1f157a6f0642cc0a88ed821a09ff5167",
+    "taskId": "prior-python-index-investigation"
+  },
+  "source": {
+    "binarySourceBindingVerified": false,
+    "buildSourceClean": true,
+    "buildSourceSha": "065d8c2275d928570a5a16bcb8aebb243e728ccc",
+    "dirty": true,
+    "head": "065d8c2275d928570a5a16bcb8aebb243e728ccc"
+  },
+  "startLine": 466
+}
