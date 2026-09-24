@@ -49,6 +49,7 @@ const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
+const MAX_TASK_SEARCH_EXCERPT_BYTES_V1: usize = 3 * 1024;
 const MAX_TASK_SEARCH_SOURCE_BYTES_V1: u64 = 32 * 1024 * 1024;
 const MAX_TASK_SEARCH_FILES_V1: usize = 1_024;
 const MAX_TASK_SEARCH_TIME_V1: Duration = Duration::from_secs(1);
@@ -171,7 +172,7 @@ fn bounded_task_search_previews_v1(epoch: &WorkspaceExecutionEpochV1, prompt: &s
             let (preview, start_line, end_line) = if complete {
                 (text.clone(), 1, None)
             } else {
-                source_excerpt_v1(&text, prompt)
+                source_excerpt_with_budget_v1(&text, prompt, MAX_TASK_SEARCH_EXCERPT_BYTES_V1)
             };
             if crate::task_lifecycle::screen_sensitive_text_v1(&preview).is_err() {
                 return None;
@@ -2842,8 +2843,9 @@ mod validation_preview_tests {
         std::fs::create_dir_all(workspace.path().join("src/code_intelligence")).unwrap();
         std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
         let implementation = format!(
-            "{}fn sanitize_line_v1(python_triple_quote: &str) -> bool {{\n    python_triple_quote == \"triple\"\n}}\n{}",
+            "{}fn sanitize_line_v1(python_triple_quote: &str) -> bool {{\n{}    python_triple_quote == \"triple\" // implementation_end_marker\n}}\n{}",
             "// prelude\n".repeat(250),
+            "    let marker = 1;\n".repeat(110),
             "// trailing\n".repeat(100),
         );
         std::fs::write(
@@ -2870,6 +2872,12 @@ mod validation_preview_tests {
                 .as_str()
                 .unwrap()
                 .contains("fn sanitize_line_v1")
+        );
+        assert!(
+            previews[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("implementation_end_marker")
         );
         let original_digest = previews[0]["sourceDigest"].as_str().unwrap();
         std::fs::write(
