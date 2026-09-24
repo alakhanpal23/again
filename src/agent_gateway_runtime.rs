@@ -2809,7 +2809,10 @@ mod product_tests {
         let status = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.status","arguments":{}}}"#;
         let first = process(gateway.gateway(), "first", status);
         let second = process(gateway.gateway(), "second", status);
-        assert_eq!(first["result"], second["result"]);
+        assert_eq!(
+            first["result"], second["result"],
+            "first={first} second={second}"
+        );
         let stats = gateway.stats().unwrap();
         assert_eq!(stats.requested, 2);
         assert_eq!(stats.executed, 2);
