@@ -39,32 +39,8 @@ def main() -> int:
     order = ("product-cold", "product") if args.order == "cold-first" else ("product", "product-cold")
     observations = []
     output.parent.mkdir(parents=True, exist_ok=True)
-    for condition in order:
-        with tempfile.TemporaryDirectory(prefix=f"again-brain-ablation-{condition}-") as temporary:
-            result, raw = pair_harness.run_condition(
-                condition, pathlib.Path(temporary), binary, args.model,
-                f"{args.fixture}-ablation", args.source_files,
-                seed_brain=True, brain_decoys=args.prior_brain_decoys,
-                required_agent_validation=required_validation,
-            )
-        raw_path = output.with_name(output.stem + f"-{condition}.jsonl")
-        raw_path.write_bytes(raw)
-        result["rawEventFile"] = raw_path.name
-        observations.append(result)
-    by_condition = {item["condition"]: item for item in observations}
-    cold, seeded = by_condition["product-cold"], by_condition["product"]
-    accepted = all(
-        item["exitCode"] == 0 and not item["timedOut"]
-        and item["eventsCaptured"] and item["oracle"]["passed"]
-        and item["agentValidationObserved"] is True
-        and item["brainRunError"] is None
-        and item["brainRun"] is not None
-        and item["brainRun"]["successful_tests"] >= 1
-        for item in observations
-    ) and cold["priorBrain"] is None and seeded["priorBrain"] is not None
-    report = {
+    report_base = {
         "schema": "again.brain-ablation.v1",
-        "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "evidenceScope": "one local same-launcher ablation pair",
         "source": source_state(root, binary),
         "binarySha256": sha256(binary),
@@ -77,6 +53,53 @@ def main() -> int:
         "sourceFiles": args.source_files,
         "priorBrainDecoys": args.prior_brain_decoys,
         "order": list(order),
+    }
+    for condition in order:
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"again-brain-ablation-{condition}-") as temporary:
+                result, raw = pair_harness.run_condition(
+                    condition, pathlib.Path(temporary), binary, args.model,
+                    f"{args.fixture}-ablation", args.source_files,
+                    seed_brain=True, brain_decoys=args.prior_brain_decoys,
+                    required_agent_validation=required_validation,
+                )
+        except Exception as error:
+            output.write_text(json.dumps({
+                **report_base,
+                "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "accepted": False,
+                "incomplete": True,
+                "observations": observations,
+                "failure": {"condition": condition, "kind": type(error).__name__,
+                            "message": str(error)[:500]},
+            }, indent=2, sort_keys=True) + "\n")
+            raise
+        raw_path = output.with_name(output.stem + f"-{condition}.jsonl")
+        raw_path.write_bytes(raw)
+        result["rawEventFile"] = raw_path.name
+        observations.append(result)
+        output.write_text(json.dumps({
+            **report_base,
+            "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "accepted": False,
+            "incomplete": True,
+            "observations": observations,
+        }, indent=2, sort_keys=True) + "\n")
+    by_condition = {item["condition"]: item for item in observations}
+    cold, seeded = by_condition["product-cold"], by_condition["product"]
+    accepted = all(
+        item["exitCode"] == 0 and not item["timedOut"]
+        and item["eventsCaptured"] and item["oracle"]["passed"]
+        and item["agentValidationObserved"] is True
+        and item["brainRunError"] is None
+        and item["brainRun"] is not None
+        and item["brainRun"]["successful_tests"] >= 1
+        for item in observations
+    ) and cold["priorBrain"] is None and seeded["priorBrain"] is not None
+    report = {
+        **report_base,
+        "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "incomplete": False,
         "accepted": accepted,
         "seededOverColdElapsedRatio": seeded["elapsedMs"] / cold["elapsedMs"] if accepted else None,
         "observations": observations,

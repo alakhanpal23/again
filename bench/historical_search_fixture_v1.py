@@ -132,7 +132,7 @@ def create_fixture(root: pathlib.Path) -> dict[str, str]:
     )
     before = pair.snapshot(root)
     failed = subprocess.run(
-        pair.TEST_COMMAND, cwd=root, capture_output=True, text=True, timeout=120,
+        pair.TEST_COMMAND, cwd=root, capture_output=True, text=True, timeout=300,
     )
     output = failed.stdout + failed.stderr
     if failed.returncode != 101 or not all(name in output for name in (
