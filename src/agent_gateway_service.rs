@@ -2917,17 +2917,18 @@ mod tests {
             );
         };
         git(&["init", "-q"]);
+        fs::write(workspace.path().join("tracked.txt"), b"first\n").unwrap();
+        git(&["add", "tracked.txt"]);
         git(&[
             "-c",
             "user.name=Again Test",
             "-c",
             "user.email=again@example.invalid",
             "commit",
-            "--allow-empty",
             "-qm",
             "first",
         ]);
-        fs::write(workspace.path().join("pending.txt"), b"untracked\n").unwrap();
+        fs::write(workspace.path().join("tracked.txt"), b"changed\n").unwrap();
         let daemon = GatewayDaemonV1::bind(
             workspace.path(),
             AuthorizationScopeId::new("git-head-freshness-scope").unwrap(),
@@ -2945,13 +2946,13 @@ mod tests {
             .as_str()
             .unwrap_or_else(|| panic!("Git status was not admitted: {status}"))
             .to_owned();
+        git(&["add", "tracked.txt"]);
         git(&[
             "-c",
             "user.name=Again Test",
             "-c",
             "user.email=again@example.invalid",
             "commit",
-            "--allow-empty",
             "-qm",
             "second",
         ]);

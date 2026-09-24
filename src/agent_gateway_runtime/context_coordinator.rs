@@ -49,15 +49,38 @@ const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
 
 fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
-    let anchor = prompt
-        .split_whitespace()
-        .map(|word| {
-            word.trim_matches(|character: char| {
-                !character.is_ascii_alphanumeric() && character != '.' && character != '_'
-            })
+    let mut terms = Vec::new();
+    for word in prompt.split_whitespace() {
+        let word = word.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '.' && character != '_'
+        });
+        if word.contains('/') {
+            continue;
+        }
+        if let Some((_, suffix)) = word.rsplit_once('.')
+            && (4..=64).contains(&suffix.len())
+        {
+            terms.push(suffix);
+        }
+        if (4..=64).contains(&word.len()) {
+            terms.push(word);
+        }
+    }
+    let anchor = terms
+        .iter()
+        .find_map(|term| {
+            let mut offset = 0;
+            for line in text.split_inclusive('\n') {
+                if (line.contains("fn ") || line.contains("def ") || line.contains("function "))
+                    && let Some(position) = line.find(term)
+                {
+                    return Some(offset + position);
+                }
+                offset += line.len();
+            }
+            None
         })
-        .filter(|word| (4..=64).contains(&word.len()) && !word.contains('/'))
-        .find_map(|word| text.find(word))
+        .or_else(|| terms.iter().find_map(|term| text.find(term)))
         .unwrap_or(0);
     let mut start = text[..anchor].rfind('\n').map_or(0, |index| index + 1);
     for _ in 0..2 {
@@ -2516,13 +2539,13 @@ mod validation_preview_tests {
     #[test]
     fn large_named_source_excerpt_is_bounded_and_locates_task_term() {
         let source = format!(
-            "{}fn repo_search() {{\n    let marker = \"repo.search\";\n}}\n{}",
+            "{}fn repository_search_v1() {{\n    let marker = \"search\";\n}}\n{}",
             "let unrelated = 0;\n".repeat(200),
             "let later = 1;\n".repeat(200)
         );
         let (excerpt, start, end) = source_excerpt_v1(&source, "Fix repo.search truncation");
         assert!(excerpt.len() <= MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1 as usize);
-        assert!(excerpt.contains("repo.search"));
+        assert!(excerpt.contains("fn repository_search_v1()"));
         assert!(start > 100);
         assert!(end.unwrap() >= start);
     }
