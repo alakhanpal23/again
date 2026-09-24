@@ -11,12 +11,14 @@ Again helps one coding agent start with a verified repository brief, carry usefu
 - `again codex --workspace <path> --task-id <id> --task <text> -- [codex flags]` — launch Codex with bounded current source previews, relevant Brain history, and a validation suggestion. Completed tool calls and run usage are recorded locally.
 - `again brain show|clear --workspace <path>` — inspect or clear bounded activity, source observations, test hints, and Codex run summaries. Brain history is guidance; tests still run.
 - `again build-info` — show the Git revision and source-cleanliness embedded at build time for reproducible task evaluations.
-- `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Completed interactive Bash calls and successful native patches can then update Brain without hand editing Codex settings.
+- `again brain hook-setup --workspace <path>` — preview the repository-scoped Codex observer; add `--apply` to install it or `--remove` to restore an unchanged prior hook configuration. Review and trust the installed hook in Codex `/hooks` before relying on interactive capture.
 - `again brain observe-codex-hook` — the observer's stdin adapter. It emits no hook output and never changes a tool call.
 
 For interactive Codex sessions, add `--with-brain-hook` to the MCP setup
-command, or run the standalone hook setup command in that repository. Again preserves unrelated
-handlers and refuses to overwrite a hook file changed after installation.
+command, or run the standalone hook setup command in that repository. Open
+`/hooks` in Codex to review and trust the exact project hook; setup can verify
+the config file but cannot verify Codex's trust decision. Again preserves
+unrelated handlers and refuses to overwrite a hook file changed after installation.
 
 The observer does not rewrite or skip a tool call. Codex hook coverage and
 response shapes vary by tool; unrecognized responses contribute only command
@@ -57,6 +59,7 @@ Again's near-term goal is lower time and cost per correct, validated single-agen
 ```bash
 cargo install --locked --path . --features daemon
 again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
+# In an interactive Codex session, open /hooks and trust the reviewed Again observer.
 again codex --workspace "$(pwd -P)" --task-id fix-example --task "Fix the failing example and run its tests" -- --ephemeral
 again brain show --workspace "$(pwd -P)"
 ```

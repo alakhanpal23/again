@@ -70,8 +70,11 @@ def main() -> int:
                           str(workspace), "--apply"], env=env, cwd=workspace)
         if not setup["installed"]:
             raise RuntimeError("project Brain observer was not installed")
+        # This fixed synthetic fixture vets the exact installed command above.
+        # Normal interactive users review the project hook in Codex /hooks.
         command = ["codex", "exec", "--ephemeral", "--json",
-                   "--approve-for-me", "-C", str(workspace), PROMPT]
+                   "--approve-for-me", "--dangerously-bypass-hook-trust",
+                   "-C", str(workspace), PROMPT]
         try:
             codex = subprocess.run(command, cwd=workspace, env=env, capture_output=True,
                                    text=True, timeout=120)
@@ -118,6 +121,7 @@ def main() -> int:
             "source": source,
             "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             "codexVersion": codex_version,
+            "hookTrustMode": "one_off_bypass_for_fixed_fixture",
             "fixtureSha256": hashlib.sha256(SOURCE.encode()).hexdigest(),
             "codexExitCode": None if timed_out else codex.returncode,
             "timedOut": timed_out,

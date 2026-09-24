@@ -213,6 +213,7 @@ fn codex_setup_can_install_and_inspect_the_brain_hook_in_one_flow() {
     assert_eq!(applied["codexSkill"]["current"], true);
     assert_eq!(applied["codexBrainHook"]["current"], true);
     assert_eq!(applied["codexBrainHook"]["changed"], true);
+    assert_eq!(applied["codexBrainHook"]["trustStatus"], "not_verified");
     let installed: Value = serde_json::from_slice(&fs::read(&hooks).unwrap()).unwrap();
     assert_eq!(
         installed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],

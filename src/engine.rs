@@ -2168,7 +2168,9 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
                     combined["codexBrainHook"] = serde_json::json!({
                         "path": hook.path,
                         "current": args.apply || (hook.installed && !hook.changed),
-                        "changed": args.apply && hook.changed
+                        "changed": args.apply && hook.changed,
+                        "trustStatus": "not_verified",
+                        "activation": "review_and_trust_in_codex_hooks"
                     });
                 }
                 print_pretty_json_v1(&combined)?;
@@ -2195,7 +2197,7 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
             }
             if let Some(hook) = hook_outcome {
                 println!(
-                    "Codex Brain hook: path={}, current={}, changed={}",
+                    "Codex Brain hook: path={}, config_current={}, changed={}, trust=not_verified (review in Codex /hooks)",
                     hook.path.display(),
                     args.apply || (hook.installed && !hook.changed),
                     args.apply && hook.changed

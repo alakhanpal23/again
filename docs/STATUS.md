@@ -8,7 +8,7 @@ The [clean-source, release-binary returning search cohort](../bench/results/2026
 
 ## 2026-09-23 combined Codex onboarding
 
-`again mcp setup --client codex --workspace <path> --apply --with-skill --with-brain-hook` now installs the verified MCP entry, personal skill, and project Codex Brain observer in one command. The matching `--inspect` reports whether each requested part is current without changing files. Hook ownership checks run before MCP mutation, and a hook failure after MCP installation removes a newly added MCP entry and a newly installed skill. An existing skill is preserved on rollback. The standalone `again brain hook-setup --remove` still restores the unchanged prior hook file. Focused CLI integration tests cover install, inspect, repeated install, existing handlers, removal, and conflicting hooks. This is onboarding consolidation; it does not expand the observer's tool coverage or establish an end-to-end speed gain.
+`again mcp setup --client codex --workspace <path> --apply --with-skill --with-brain-hook` now installs the verified MCP entry, personal skill, and project Codex Brain observer configuration in one command. The matching `--inspect` reports whether each requested config is current without changing files. Codex hook trust is not verified by setup; an interactive user must review and trust the exact project hook in `/hooks` before interactive capture works. Hook ownership checks run before MCP mutation, and a hook failure after MCP installation removes a newly added MCP entry and a newly installed skill. An existing skill is preserved on rollback. The standalone `again brain hook-setup --remove` still restores the unchanged prior hook file. Focused CLI integration tests cover install, inspect, repeated install, existing handlers, removal, and conflicting hooks. This is onboarding consolidation; it does not expand the observer's tool coverage or establish an end-to-end speed gain.
 
 The Brain now recognizes a bounded `node --test tests/test_<name>.js|mjs|cjs` command observed with exit code zero. It suggests that command on a later task only when the test file still resolves inside the repository and a current candidate source has the matching `<name>` stem. This replaces a calculator-only command, rejects shell operators and traversal, and still requires the agent to run the test again. The test file's existence is checked; its previous passing result is never reused as validation proof.
 
@@ -103,8 +103,9 @@ and records ownership in a private snapshot. A
 [clean-source release-binary Codex run](../bench/results/2026-09-23-brain-hook-setup-release-39327e8.json)
 passed preview, apply, asynchronous read capture, preservation of an unrelated
 handler, and byte-for-byte removal. This closes the manual
-configuration step for opt-in interactive observation; the primary MCP setup
-flow remains separate.
+hook-file configuration step for opt-in interactive observation. The primary MCP
+setup flow can now install the observer config with `--with-brain-hook`; Codex
+still requires hook trust review before it runs.
 
 The `again brain observe-codex-hook` stdin adapter can now record completed
 interactive Codex Bash calls into the same repository Brain as the `again codex`
