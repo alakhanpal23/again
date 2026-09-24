@@ -1,0 +1,75 @@
+{
+  "acceptedPairs": 2,
+  "apiEquivalentCostRatio": 0.7403379113668335,
+  "coldApiEquivalentUsd": "0.1356332",
+  "coldInvestigationCommands": 7,
+  "fixture": "historical-python-triple",
+  "limitations": [
+    "one historical real-repository Python-index repair in both orders",
+    "prior read was seeded before timing; first-use economics unmeasured",
+    "the cold-first seeded agent still reread the target source; that pair did not avoid an investigation command",
+    "API-equivalent estimate, not billed Codex charges",
+    "not a frozen balanced release cohort"
+  ],
+  "pairedMedianElapsedRatio": 0.8221558695040109,
+  "pairedP95ElapsedRatio": 0.8747587890289709,
+  "pairs": [
+    {
+      "coldApiEquivalentUsd": "0.0791072",
+      "coldElapsedMs": 65296.362,
+      "coldFirstEditMs": 26724.918,
+      "coldInvestigationCommands": 2,
+      "coldSuccessfulTests": 1,
+      "order": [
+        "product-cold",
+        "product"
+      ],
+      "report": "again-python-triple-cold-first-bc4a34c.json",
+      "seededApiEquivalentUsd": "0.0442212",
+      "seededElapsedMs": 50249.008,
+      "seededFirstEditMs": 25787.956,
+      "seededInvestigationCommands": 2,
+      "seededSuccessfulTests": 1,
+      "seededToColdElapsedRatio": 0.7695529499790509,
+      "sourceSha": "bc4a34c9bcb6433a6f3708218b2a76334e15c5e2"
+    },
+    {
+      "coldApiEquivalentUsd": "0.056526",
+      "coldElapsedMs": 48203.135,
+      "coldFirstEditMs": 32672.923,
+      "coldInvestigationCommands": 5,
+      "coldSuccessfulTests": 1,
+      "order": [
+        "product",
+        "product-cold"
+      ],
+      "report": "again-python-triple-seeded-first-bc4a34c.json",
+      "seededApiEquivalentUsd": "0.0561932",
+      "seededElapsedMs": 42166.116,
+      "seededFirstEditMs": 32810.776,
+      "seededInvestigationCommands": 3,
+      "seededSuccessfulTests": 1,
+      "seededToColdElapsedRatio": 0.8747587890289709,
+      "sourceSha": "bc4a34c9bcb6433a6f3708218b2a76334e15c5e2"
+    }
+  ],
+  "rateCard": {
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "contextClass": "short, at most 272K input tokens per request",
+    "model": "gpt-6-sol",
+    "schema": "again.api-rate-card.v1",
+    "serviceTier": "standard",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "cacheWriteInput": "2.50",
+      "cachedInput": "0.20",
+      "output": "10.00",
+      "uncachedInput": "2.00"
+    }
+  },
+  "schema": "again.historical-python-brain.v1",
+  "seededApiEquivalentUsd": "0.1004144",
+  "seededInvestigationCommands": 5,
+  "sourceSha": "bc4a34c9bcb6433a6f3708218b2a76334e15c5e2",
+  "totalPairs": 2
+}
