@@ -1,8 +1,14 @@
 # Again
 
-**Give your coding agent a memory of the repository.**
+**Start with the right files. Remember the work. Pick up where you left off.**
 
 Again prepares a short, source-checked brief before a Codex task, records the work Codex completes, and brings relevant findings into the next task. Your agent keeps using its normal shell, editor, and test tools.
+
+```text
+Your task → verified file previews + test hint → Codex edits and tests
+                                                     ↓
+Next task ← current findings from the local Brain ← completed tool events
+```
 
 ## Get started
 
