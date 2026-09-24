@@ -412,6 +412,7 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
             f"target = {pair.TARGET!r}\n"
             "workspace = pathlib.Path(sys.argv[sys.argv.index('-C') + 1])\n"
             + event_script
+            + "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':2}}))\n"
             + "print(json.dumps({'type':'item.completed','item':{'id':'done','type':'agent_message','text':'Done'}}))\n"
         )
         fake_codex.chmod(0o700)
@@ -449,6 +450,7 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
                 "    item = {'id':f'decoy_{index}', 'type':'command_execution', "
                 "'command':'cat ' + path, 'aggregated_output':content, 'exit_code':0, 'status':'completed'}\n"
                 "    print(json.dumps({'type':'item.completed', 'item':item}))\n"
+                "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':2}}))\n"
             )
             fake_codex.chmod(0o700)
             environment = os.environ.copy()

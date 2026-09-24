@@ -72,6 +72,8 @@ def main() -> int:
             "'aggregated_output':'test passed'}}))\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'done',"
             "'type':'agent_message','text':'Validation completed'}}))\n"
+            "print(json.dumps({'type':'turn.completed','usage':{'input_tokens':50,"
+            "'cached_input_tokens':20,'output_tokens':5}}))\n"
         )
         fake_codex.chmod(0o700)
         launch_env = dict(environment, PATH=str(fake_bin) + os.pathsep + environment["PATH"])

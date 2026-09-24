@@ -48,6 +48,8 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str,
             "import json, os, pathlib, sys, time\n"
             "pathlib.Path(os.environ['FAKE_READY']).write_text(json.dumps(sys.argv[1:]))\n"
             "while not pathlib.Path(os.environ['FAKE_RELEASE']).exists(): time.sleep(0.025)\n"
+            "if 'exec' in sys.argv: print(json.dumps({'type':'turn.completed','usage':"
+            "{'input_tokens':1,'cached_input_tokens':0,'output_tokens':1}}), flush=True)\n"
         )
         fake_client.chmod(0o700)
         environment = os.environ.copy()

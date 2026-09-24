@@ -58,6 +58,8 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "    output = ''.join(f'multi_{index}.py:1:needle\\n' for index in range(4))\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'multi_search','type':'command_execution','command':command,'aggregated_output':output,'exit_code':0,'status':'completed'}}), flush=True)\n"
             "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':50,'cached_input_tokens':20,'output_tokens':5}}), flush=True)\n"
+            "if 'first task' not in argv[-1] and 'multi-file task' not in argv[-1]:\n"
+            "    print(json.dumps({'type':'turn.completed','usage':{'input_tokens':10,'cached_input_tokens':0,'output_tokens':2}}), flush=True)\n"
             "print(json.dumps({'type':'item.completed','item':{'id':'last','type':'agent_message','text':'Done'}}), flush=True)\n"
         )
         fake_client.chmod(0o700)

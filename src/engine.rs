@@ -1553,8 +1553,19 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
     let reader_session_id = brain_session_id.clone();
     let observation = Arc::new(Mutex::new(crate::brain::CodexRunObservationV1::default()));
     let reader_observation = Arc::clone(&observation);
+    let capture_issue = Arc::new(Mutex::new(None));
+    let reader_capture_issue = Arc::clone(&capture_issue);
     let event_reader = thread::spawn(move || -> Result<()> {
-        let brain_store = Store::open_for_workspace(&brain_workspace).ok();
+        let brain_store = match Store::open_for_workspace(&brain_workspace) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                remember_codex_capture_issue_v1(
+                    &reader_capture_issue,
+                    format!("could not open Brain for completed events: {error:#}"),
+                );
+                None
+            }
+        };
         let mut output = io::stdout().lock();
         for line in BufReader::new(stdout).lines() {
             let line = line?;
@@ -1572,24 +1583,36 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
                 writeln!(output, "{line}")?;
             }
             output.flush()?;
-            if let Ok(value) = parsed {
-                let events = crate::brain::codex_completed_events_v1(
-                    &value,
-                    &brain_workspace,
-                    &brain_session_id,
-                    &brain_task_id,
-                );
-                reader_observation
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .observe(&value, &events);
-                if let Some(store) = &brain_store {
-                    for event in events {
-                        if let Err(error) = store.record_brain_event_v1(&event) {
-                            eprintln!("Again Brain: could not record a completed event: {error:#}");
+            match parsed {
+                Ok(value) => {
+                    let events = crate::brain::codex_completed_events_v1(
+                        &value,
+                        &brain_workspace,
+                        &brain_session_id,
+                        &brain_task_id,
+                    );
+                    reader_observation
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .observe(&value, &events);
+                    if let Some(store) = &brain_store {
+                        for event in events {
+                            if let Err(error) = store.record_brain_event_v1(&event) {
+                                remember_codex_capture_issue_v1(
+                                    &reader_capture_issue,
+                                    format!("could not record a completed event: {error:#}"),
+                                );
+                            }
                         }
                     }
                 }
+                Err(error) if !line.trim().is_empty() => {
+                    remember_codex_capture_issue_v1(
+                        &reader_capture_issue,
+                        format!("Codex emitted a non-JSON event line: {error}"),
+                    );
+                }
+                Err(_) => {}
             }
         }
         Ok(())
@@ -1601,6 +1624,7 @@ fn codex_launch(args: CodexArgs) -> Result<i32> {
         Some(CodexRunReaderV1 {
             handle: event_reader,
             observation,
+            capture_issue,
             workspace: reader_workspace,
             task_id: reader_task_id,
             session_id: reader_session_id,
@@ -1651,10 +1675,19 @@ fn claude_launch(args: ClaudeArgs) -> Result<i32> {
 struct CodexRunReaderV1 {
     handle: thread::JoinHandle<Result<()>>,
     observation: Arc<Mutex<crate::brain::CodexRunObservationV1>>,
+    capture_issue: Arc<Mutex<Option<String>>>,
     workspace: PathBuf,
     task_id: String,
     session_id: String,
     started_ms: i64,
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn remember_codex_capture_issue_v1(issue: &Arc<Mutex<Option<String>>>, message: String) {
+    let mut current = issue.lock().unwrap_or_else(|poison| poison.into_inner());
+    if current.is_none() {
+        *current = Some(message);
+    }
 }
 
 #[cfg(all(feature = "daemon", unix))]
@@ -1676,6 +1709,7 @@ fn run_agent_child_v1(
     loop {
         if let Some(status) = child.try_wait()? {
             if let Some(reader) = event_reader {
+                let mut capture_issue = None;
                 // A descendant may retain stdout after the direct child exits.
                 // Do not hang the launcher indefinitely on that descriptor.
                 let deadline = Instant::now() + Duration::from_secs(2);
@@ -1686,14 +1720,21 @@ fn run_agent_child_v1(
                     match reader.handle.join() {
                         Ok(Ok(())) => {}
                         Ok(Err(error)) => {
-                            eprintln!("Again Brain: event reader stopped early: {error:#}");
+                            capture_issue = Some(format!("event reader stopped early: {error:#}"));
                         }
-                        Err(_) => eprintln!("Again Brain: event reader panicked"),
+                        Err(_) => capture_issue = Some("event reader panicked".to_owned()),
                     }
                 } else {
                     eprintln!(
                         "Again Brain: event stream remained open after {client_name} exited; retaining observed events"
                     );
+                }
+                if capture_issue.is_none() {
+                    capture_issue = reader
+                        .capture_issue
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .clone();
                 }
                 let observation = reader
                     .observation
@@ -1707,10 +1748,26 @@ fn run_agent_child_v1(
                     reader.started_ms,
                     status.code().unwrap_or(1),
                 );
+                if status.success() && (!run.turn_completed || run.input_tokens.is_none()) {
+                    capture_issue.get_or_insert_with(|| {
+                        "Codex exited successfully without a completed turn and valid token usage"
+                            .to_owned()
+                    });
+                }
                 if let Err(error) = Store::open_for_workspace(&reader.workspace)
                     .and_then(|store| store.record_brain_run_v1(&run))
                 {
-                    eprintln!("Again Brain: could not record the completed run: {error:#}");
+                    capture_issue.get_or_insert_with(|| {
+                        format!("could not record the completed run: {error:#}")
+                    });
+                }
+                if let Some(issue) = capture_issue {
+                    if status.success() {
+                        bail!(
+                            "{client_name} completed its task, but Again Brain capture is incomplete: {issue}"
+                        );
+                    }
+                    eprintln!("Again Brain capture is incomplete: {issue}");
                 }
             }
             if let Some(error) = heartbeat_failure {
