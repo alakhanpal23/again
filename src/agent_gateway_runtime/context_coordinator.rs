@@ -48,7 +48,7 @@ const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
 
-fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
+pub(crate) fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
     let mut terms = Vec::new();
     for word in prompt.split_whitespace() {
         let word = word.trim_matches(|character: char| {

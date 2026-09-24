@@ -578,15 +578,63 @@ pub fn repository_brief_for_task_v1(
         &already_previewed,
         query.authorization_scope_digest,
     )?;
+    let source_previewed: std::collections::BTreeSet<&str> = source_previews
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|preview| preview["path"].as_str())
+        .collect();
     if let Some(files) = brain["recentCurrentFiles"].as_array_mut() {
         for file in files {
-            if file["path"]
-                .as_str()
-                .is_some_and(|path| history_paths.iter().any(|prior| prior == path))
-            {
+            let Some(path) = file["path"].as_str().map(str::to_owned) else {
+                continue;
+            };
+            if history_paths.iter().any(|prior| prior == &path) {
                 file["selection"] =
                     Value::String("prior task or path overlap; source rechecked".to_owned());
             }
+            // A prior large-file read used to become only a path hint. Supply
+            // a current excerpt when task.start did not already preview it.
+            if source_previewed.contains(path.as_str())
+                || file["currentCompletePreview"].as_str().is_some()
+                || !source_code_path_v1(&path)
+            {
+                continue;
+            }
+            let Some((relative, absolute)) = workspace_file_v1(workspace, &path) else {
+                continue;
+            };
+            if relative != path
+                || !fs::metadata(&absolute)
+                    .is_ok_and(|meta| (2049..=256 * 1024).contains(&meta.len()))
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&absolute) else {
+                continue;
+            };
+            if blake3::hash(&bytes).to_hex().as_str()
+                != file["currentDigest"].as_str().unwrap_or("")
+            {
+                continue;
+            }
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let (excerpt, start_line, end_line) =
+                crate::agent_gateway_runtime::context_coordinator::source_excerpt_v1(
+                    &text,
+                    query.task_text,
+                );
+            if crate::task_lifecycle::screen_sensitive_text_v1(&excerpt).is_err() {
+                continue;
+            }
+            file["currentPartialPreview"] = serde_json::json!({
+                "text": excerpt,
+                "startLine": start_line,
+                "endLine": end_line,
+                "complete": false,
+            });
         }
     }
     if serde_json::to_vec(&brain)?.len() > MAX_BRAIN_BRIEF_BYTES_V1 {
@@ -596,6 +644,7 @@ pub fn repository_brief_for_task_v1(
                 break;
             }
             brain["recentCurrentFiles"][index]["currentCompletePreview"] = Value::Null;
+            brain["recentCurrentFiles"][index]["currentPartialPreview"] = Value::Null;
         }
         while brain["recentCurrentFiles"]
             .as_array()
@@ -1975,6 +2024,77 @@ mod tests {
         assert_eq!(
             brief["recentCurrentFiles"][0]["currentCompletePreview"],
             "value = 10\n"
+        );
+    }
+
+    #[test]
+    fn prior_large_source_gets_current_task_anchored_partial_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("src")).unwrap();
+        let source = format!(
+            "{}def balance(value):\n    return value + 1\n",
+            "# ordinary source line\n".repeat(180)
+        );
+        fs::write(workspace.join("src/ledger.py"), &source).unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let event = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"edit","type":"file_change","status":"completed",
+                    "changes":[{"path":"src/ledger.py"}]}
+        });
+        for event in codex_completed_events_v1(&event, &workspace, "session", "prior-task") {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let brief = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &Value::Array(Vec::new()),
+            &serde_json::json!({"candidates":[]}),
+            task_query("Fix ledger balance calculation", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        let file = &brief["recentCurrentFiles"][0];
+        assert_eq!(file["path"], "src/ledger.py");
+        assert!(file["currentCompletePreview"].is_null());
+        assert_eq!(file["currentPartialPreview"]["complete"], false);
+        assert!(
+            file["currentPartialPreview"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("def balance(value):")
+        );
+        assert!(serde_json::to_vec(&brief).unwrap().len() <= MAX_BRAIN_BRIEF_BYTES_V1);
+
+        let existing = serde_json::json!([{"path":"src/ledger.py","complete":false}]);
+        let duplicated = repository_brief_for_task_v1(
+            &store,
+            &workspace,
+            &existing,
+            &serde_json::json!({"candidates":[]}),
+            task_query("Fix ledger balance calculation", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(duplicated["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
+
+        fs::write(
+            workspace.join("src/ledger.py"),
+            format!("{source}# changed\n"),
+        )
+        .unwrap();
+        assert!(
+            repository_brief_for_task_v1(
+                &store,
+                &workspace,
+                &Value::Array(Vec::new()),
+                &serde_json::json!({"candidates":[]}),
+                task_query("Fix ledger balance calculation", &scope),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

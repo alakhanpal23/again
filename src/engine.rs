@@ -1943,7 +1943,7 @@ fn append_repository_brain_v1(prompt: &mut String, brief: &serde_json::Value) {
     {
         prompt.push_str("\nAGAIN_BRAIN ");
         prompt.push_str(&serialized);
-        prompt.push_str("\nComplete Brain previews were rechecked against current file bytes at launch; use them without rereading until an edit. Other history is guidance only. Run required validation.");
+        prompt.push_str("\nBrain previews were rechecked against current file bytes at launch. Use complete previews without rereading until an edit; partial previews show only their stated lines, so inspect more when the edit requires it. Other history is guidance only. Run required validation.");
     }
 }
 

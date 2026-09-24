@@ -8,7 +8,7 @@
 #[path = "agent_gateway_runtime/context_compiler.rs"]
 pub mod context_compiler;
 #[path = "agent_gateway_runtime/context_coordinator.rs"]
-mod context_coordinator;
+pub(crate) mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
 

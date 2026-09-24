@@ -2,6 +2,10 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 prior large-source Brain previews
+
+The Brain now supplies a bounded, task-anchored partial excerpt for a relevant prior source file of 2–256 KiB when task.start has not already previewed that path. It rereads the current file, verifies the stored whole-file digest, screens the excerpt, and labels its line range and incomplete status. The 4 KiB Brain brief limit still applies. A focused regression checks the anchor, deduplication against task.start, and withholding after a source edit. This is an additional opportunity to avoid a later source read; actual avoided calls and completed-task speed still need live measurement.
+
 ## 2026-09-23 large source previews
 
 Task briefs now include a bounded excerpt when a named or indexed source file is larger than the 2 KiB complete-preview limit. The excerpt carries the digest of the entire current file, its line range, and `complete: false`; the launcher labels it partial and tells the agent to inspect more before editing. Complete small-file previews keep their existing read-avoidance guidance. The [clean-source release-binary probe](../bench/results/2026-09-23-large-source-preview-bound-cfc2522.json) used the same 50 KiB historical search target as the accepted-edit cohort. It returned a 2 KiB excerpt beginning at `fn repository_search_v1`, and a subsequent source edit changed the file digest while the new excerpt matched current bytes. Focused tests and strict Clippy pass. This proves a useful current starting location on that repository; its effect on accepted-task time is not yet measured.
