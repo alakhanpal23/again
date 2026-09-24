@@ -182,16 +182,13 @@ pub fn codex_completed_events_v1(
             let command_hint = (exit_code == 0)
                 .then(|| known_test_command_v1(command))
                 .flatten();
+            let completed_test =
+                exit_code == 0 && (command_hint.is_some() || observed_cargo_test_v1(command));
             let mut events = vec![BrainEventV1 {
                 session_id: session_id.to_owned(),
                 event_id: event_id.to_owned(),
                 task_id: task_id.to_owned(),
-                kind: if command_hint.is_some() {
-                    "test"
-                } else {
-                    "command"
-                }
-                .to_owned(),
+                kind: if completed_test { "test" } else { "command" }.to_owned(),
                 path: None,
                 source_digest: None,
                 command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
@@ -705,6 +702,42 @@ fn known_test_command_v1(command: &str) -> Option<String> {
             .filter(|path| safe_node_test_path_v1(path))
             .map(|_| command.to_owned()),
     }
+}
+
+// Count a completed, successful filtered Cargo test without promoting its
+// selector into a cross-task validation hint. The filter may no longer exist
+// after source changes, so only the existing exact commands can be suggested.
+fn observed_cargo_test_v1(command: &str) -> bool {
+    let command = command.trim();
+    let command = command
+        .strip_prefix("/bin/zsh -lc '")
+        .and_then(|inner| inner.strip_suffix('\''))
+        .unwrap_or(command);
+    let Ok(parts) = shell_words::split(command) else {
+        return false;
+    };
+    let [cargo, test, flags @ ..] = parts.as_slice() else {
+        return false;
+    };
+    if cargo != "cargo" || test != "test" {
+        return false;
+    }
+    let mut selectors = 0;
+    for flag in flags {
+        if matches!(flag.as_str(), "--locked" | "--lib" | "--quiet") {
+            continue;
+        }
+        if flag.is_empty()
+            || flag.len() > 128
+            || !flag
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b':'))
+        {
+            return false;
+        }
+        selectors += 1;
+    }
+    selectors <= 1
 }
 
 fn safe_node_test_path_v1(path: &str) -> bool {
@@ -1398,6 +1431,51 @@ mod tests {
         assert_eq!(
             codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,
             None
+        );
+    }
+
+    #[test]
+    fn filtered_cargo_test_counts_as_validation_without_becoming_a_reuse_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"cargo-filter","type":"command_execution",
+                    "command":"/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+                    "exit_code":0}
+        });
+        let events = codex_completed_events_v1(&completed, dir.path(), "session", "task");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "test");
+        assert_eq!(events[0].command_hint, None);
+        let mut run = CodexRunObservationV1::default();
+        run.observe(&completed, &events);
+        assert_eq!(
+            run.into_run(
+                "session".to_owned(),
+                "task".to_owned(),
+                dir.path(),
+                current_ms_v1(),
+                0,
+            )
+            .successful_tests,
+            1
+        );
+        for command in [
+            "cargo test --locked --lib historical_search_oracle; echo done",
+            "cargo test --locked --lib ../other",
+            "cargo test --locked --lib first second",
+        ] {
+            assert!(!observed_cargo_test_v1(command));
+        }
+        let failed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"cargo-failed","type":"command_execution",
+                    "command":"cargo test --locked --lib historical_search_oracle",
+                    "exit_code":1}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&failed, dir.path(), "session", "task")[0].kind,
+            "command"
         );
     }
 
