@@ -26,6 +26,10 @@ const MAX_PATTERN_BYTES_V1: usize = 4 * 1024;
 const MAX_GLOB_BYTES_V1: usize = 512;
 const MAX_TREE_DEPTH_V1: usize = 128;
 const MAX_EXECUTION_TIME_V1: Duration = Duration::from_secs(5);
+// The first sanitized Git invocation can spend several seconds starting on a
+// loaded macOS host. Keep its bound finite without applying the repository
+// scan deadline to a separate child process.
+const MAX_GIT_EXECUTION_TIME_V1: Duration = Duration::from_secs(15);
 const MAX_GIT_STDERR_BYTES_V1: usize = 64 * 1024;
 const MANIFEST_NAMES_V1: [&str; 6] = [
     "Cargo.toml",
@@ -1169,7 +1173,7 @@ fn run_git_v1(
     let stdout_reader = thread::spawn(move || read_bounded_pipe_v1(stdout, maximum_stdout_bytes));
     let stderr_reader =
         thread::spawn(move || read_bounded_pipe_v1(stderr, MAX_GIT_STDERR_BYTES_V1));
-    let deadline = Instant::now() + MAX_EXECUTION_TIME_V1;
+    let deadline = Instant::now() + MAX_GIT_EXECUTION_TIME_V1;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
