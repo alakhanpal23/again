@@ -4,6 +4,16 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 release binary source binding
 
+The [source-bound returning cohort](../bench/results/2026-09-23-returning-cohort-bound-e3f0067/summary.json)
+accepted all four pairs, with a paired median completion ratio of 0.508 and
+p95 of 0.569. Again used two actions in each run while baseline used four to
+nine, and all three token totals were lower. Each Again condition received a
+verified prior helper read through the real launcher; baseline did not. The
+[API-equivalent estimate](../bench/results/2026-09-23-returning-cohort-bound-e3f0067/api-equivalent-cost.json)
+is $0.085131 Again versus $0.168792 baseline under the frozen rate-card
+assumptions. This demonstrates reduced duplicate investigation on one synthetic
+returning task at two repository sizes, not product-wide or billed savings.
+
 The [source-bound frozen cold cohort](../bench/results/2026-09-23-cold-cohort-bound-ffffc94/summary.json)
 accepted all 10 pairs across five synthetic tasks and both treatment orders.
 The embedded clean build SHA matched the clean source SHA before every pair.

@@ -1,0 +1,191 @@
+{
+  "accepted": true,
+  "againBinarySha256": "75c22eb985a634ccc24cb02c5eace58ac3dd49d45a5538ee8d25dc932e0cf159",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "balance-helper",
+  "fixtureSha256": "4cd4c5f773e24628861f2be424535ec0601175a378742c6e6bf0e81f20412233",
+  "harnessSha256": "4943a48146ba9ba35d905213e2ce10ec0c2c664c263542de370375a6a2d46d2d",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "25d011912f2d616bf66917694b12c8d785acda0ed1fd8ea16a8a85ccdb8a101d",
+        "cached_input_tokens": 43904,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790221995521,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48964,
+        "output_tokens": 223,
+        "session_id": "68c0b0f2-d0b5-4e42-8cf3-e8f93194887b",
+        "started_ms": 1790221985811,
+        "successful_tests": 1,
+        "task_id": "balance-helper-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 9780.621,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 9780.621,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 4677.726,
+      "oracle": {
+        "after_snapshot_sha256": "ce58b0eccf9e212a6c671b5bb58983d7886c9da6ef83d222aa05232a7a9c27af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 118.742,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": {
+        "decoyCount": 0,
+        "path": "src/util.py",
+        "sourceSha256": "59e9a06a425d16f3ed588cce0ae2cc3588531f436869541b243310bd1c6d621b",
+        "taskId": "prior-ledger-investigation"
+      },
+      "rawEventBytes": 1647,
+      "rawEventFile": "balance-helper-0-again-first-product.jsonl",
+      "rawEventSha256": "9b1757a27514732339f93ed670e21c21b47d1a11b8cea14b1e52eec51ca50949",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43904,
+        "input_tokens": 48964,
+        "output_tokens": 223,
+        "reasoning_output_tokens": 42
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 17176.6,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/**' -g 'test*' -g '*test*' -g 'pyproject.toml' -g 'setup.cfg' -g 'README*'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/ledger.py src/util.py tests/test_ledger.py README.md && git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 17176.6,
+      "eventCount": 14,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 11291.993,
+      "oracle": {
+        "after_snapshot_sha256": "ce58b0eccf9e212a6c671b5bb58983d7886c9da6ef83d222aa05232a7a9c27af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 147.213,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3856,
+      "rawEventFile": "balance-helper-0-again-first-baseline.jsonl",
+      "rawEventSha256": "a6c36b2ed899776d5efed9490c6569ff94b7ebf2a3cfc55d09331289fe8b3acd",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 70656,
+        "input_tokens": 80074,
+        "output_tokens": 431,
+        "reasoning_output_tokens": 26
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "fc8bf774397770ce4a10b61c8d9cec74cb2e0bcd39700793947039882e99a0aa",
+  "recordedAtUtc": "2026-09-24T03:53:33.113298+00:00",
+  "returningTask": true,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "e3f0067975afadd6aa5d1dfb91f688c5bf43e6d1",
+    "dirty": false,
+    "head": "e3f0067975afadd6aa5d1dfb91f688c5bf43e6d1"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}
