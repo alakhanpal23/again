@@ -1,0 +1,206 @@
+{
+  "accepted": true,
+  "againBinarySha256": "27e81ae3a516e69c5685415464c3c3db53e00317f7c422d750398580f06a911a",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "balance-helper",
+  "fixtureSha256": "4cd4c5f773e24628861f2be424535ec0601175a378742c6e6bf0e81f20412233",
+  "harnessSha256": "9af322cfbdee717d63a2ba8eb76654147d95c7edfd4b3887222a831cf40cb985",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 21596.227,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/**' -g 'tests/**' -g 'test*' -g 'pyproject.toml' -g 'setup.cfg' -g 'Makefile'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short && ls -la'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'for p in AGENTS.md src/AGENTS.md tests/AGENTS.md; do if [ -f \"$p\" ]; then printf '\"'%s\\\\n' \\\"\"'$p\"; cat \"$p\"; fi; done'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/ledger.py src/util.py tests/test_ledger.py README.md'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 21596.227,
+      "eventCount": 18,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 16060.609,
+      "oracle": {
+        "after_snapshot_sha256": "5efd3304267b732bc0261a0e01e38a02dbd0fba87037d0fdf742f67f96c439af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 125.283,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 36072,
+      "rawEventFile": "balance-helper-1000-baseline-first-baseline.jsonl",
+      "rawEventSha256": "f5d53f3fe2d6dd644a18dc992217869a81d8ff6b976ad7d45fab822e7a5a2e95",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 77824,
+        "input_tokens": 94895,
+        "output_tokens": 540,
+        "reasoning_output_tokens": 43
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "c4af4baa523b92b21ebfdcc21d15de402ea54d9c9b4d85d5903cfca731640596",
+        "cached_input_tokens": 44160,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790222922928,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 49287,
+        "output_tokens": 209,
+        "session_id": "4042d89d-9a72-47fe-a3de-50a55b2a668e",
+        "started_ms": 1790222913647,
+        "successful_tests": 1,
+        "task_id": "balance-helper-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 10391.959,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 10391.959,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5723.43,
+      "oracle": {
+        "after_snapshot_sha256": "5efd3304267b732bc0261a0e01e38a02dbd0fba87037d0fdf742f67f96c439af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 258.69,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": {
+        "decoyCount": 0,
+        "mode": "search",
+        "path": "src/util.py",
+        "sourceSha256": "59e9a06a425d16f3ed588cce0ae2cc3588531f436869541b243310bd1c6d621b",
+        "taskId": "prior-ledger-investigation"
+      },
+      "rawEventBytes": 1641,
+      "rawEventFile": "balance-helper-1000-baseline-first-product.jsonl",
+      "rawEventSha256": "b1e90e26c519c8ec97600707a6ccdb0a738fb903c7fd46c0632005b337d7dd77",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 44160,
+        "input_tokens": 49287,
+        "output_tokens": 209,
+        "reasoning_output_tokens": 29
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "fc8bf774397770ce4a10b61c8d9cec74cb2e0bcd39700793947039882e99a0aa",
+  "recordedAtUtc": "2026-09-24T04:08:43.416525+00:00",
+  "returningTask": true,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "8e982b948685090d747ad0f7f416575e50df4828",
+    "dirty": false,
+    "head": "8e982b948685090d747ad0f7f416575e50df4828"
+  },
+  "sourceFiles": 1000,
+  "surface": "product-wrapper"
+}
