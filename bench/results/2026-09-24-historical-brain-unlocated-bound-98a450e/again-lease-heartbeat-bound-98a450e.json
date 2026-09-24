@@ -1,0 +1,34 @@
+{
+  "agentExitCode": 0,
+  "binarySha256": "b0fec3267e920d909b897529b925d420219bbe094bd454e7e29b46c754e4f1a1",
+  "brainRun": {
+    "authorization_scope_digest": "41808a7f3afa29a400e17cf63bcb033c4130aca8fe1e22f8d3674967817d3b72",
+    "cached_input_tokens": 0,
+    "completed_commands": 0,
+    "completed_edits": 0,
+    "completed_mcp_calls": 0,
+    "completed_ms": 1790237101678,
+    "completed_source_reads": 0,
+    "exit_code": 0,
+    "input_tokens": 1,
+    "output_tokens": 1,
+    "session_id": "252b21f2-316d-4820-b2c8-48d898ba7067",
+    "started_ms": 1790237036347,
+    "successful_tests": 0,
+    "task_id": "long-running-agent",
+    "turn_completed": true
+  },
+  "classification": {
+    "code": "long_agent_lease_renewed",
+    "type": "pass"
+  },
+  "elapsedSeconds": 65.555,
+  "schema": "again.agent-lease-heartbeat-gate.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "98a450eb5da9e43b19df7cb2b73eacff5f276815",
+    "dirty": false,
+    "head": "98a450eb5da9e43b19df7cb2b73eacff5f276815"
+  }
+}

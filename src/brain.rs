@@ -11,7 +11,8 @@ use crate::store::{BrainEventV1, BrainRunV1, Store};
 
 const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
 const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
-const MAX_BRAIN_BRIEF_BYTES_V1: usize = 4 * 1024;
+const MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1: usize = 5 * 1024;
+const MAX_BRAIN_BRIEF_BYTES_V1: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Default)]
 pub struct CodexRunObservationV1 {
@@ -622,9 +623,10 @@ pub fn repository_brief_for_task_v1(
                 continue;
             };
             let (excerpt, start_line, end_line) =
-                crate::agent_gateway_runtime::context_coordinator::source_excerpt_v1(
+                crate::agent_gateway_runtime::context_coordinator::source_excerpt_with_budget_v1(
                     &text,
                     query.task_text,
+                    MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1,
                 );
             if crate::task_lifecycle::screen_sensitive_text_v1(&excerpt).is_err() {
                 continue;

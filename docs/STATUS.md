@@ -2,6 +2,12 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-24 long agent lease and historical returning task
+
+The historical unlocated `repo.search` repair exposed a real launcher bug: the daemon closes an idle MCP connection after 60 seconds, and the launcher previously waited 60 seconds before its first task-lease heartbeat. A successful agent-run Cargo test could therefore be followed by an exit-1 lease failure with no completed Brain run. The launcher now renews every 20 seconds, includes the renewal failure reason, and records the interrupted run even if a later heartbeat fails. The [source-bound 65-second gate](../bench/results/2026-09-24-historical-brain-unlocated-bound-98a450e/again-lease-heartbeat-bound-98a450e.json) passed with a normal exit and completed Brain run. The same release binary's seeded historical run lasted 68 seconds, passed the edit oracle and agent-run Cargo test, and retained a complete Brain run.
+
+The [source-bound historical diagnostic](../bench/results/2026-09-24-historical-brain-unlocated-bound-98a450e/again-historical-unlocated-seeded-first-98a450e.json) accepted the seeded-first pair, but seeded completion was 1.309 times cold and the agent reread the target function. A second cold-first pair was unaccepted because its cold leg exited 1 before editing; its seeded leg passed. These results establish lease reliability improvement but do not establish a speed win on this real task. The old 2 KiB Brain excerpt ended before the search function did. A larger 5 KiB Brain-only excerpt, still bounded by an 8 KiB Brain brief, now covers the relevant function in the focused regression. Task-start previews remain 2 KiB. Its completed-task effect remains to be measured.
+
 ## 2026-09-23 prior large-source Brain previews
 
 The Brain now supplies a bounded, task-anchored partial excerpt for a relevant prior source file of 2–256 KiB when task.start has not already previewed that path. It rereads the current file, verifies the stored whole-file digest, screens the excerpt, and labels its line range and incomplete status. The 4 KiB Brain brief limit still applies. A focused regression checks the anchor, deduplication against task.start, and withholding after a source edit. This is an additional opportunity to avoid a later source read; actual avoided calls and completed-task speed still need live measurement.

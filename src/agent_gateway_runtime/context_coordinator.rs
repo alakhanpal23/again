@@ -49,6 +49,18 @@ const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
 
 pub(crate) fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
+    source_excerpt_with_budget_v1(
+        text,
+        prompt,
+        MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1 as usize,
+    )
+}
+
+pub(crate) fn source_excerpt_with_budget_v1(
+    text: &str,
+    prompt: &str,
+    budget: usize,
+) -> (String, usize, Option<usize>) {
     let mut terms = Vec::new();
     for word in prompt.split_whitespace() {
         let word = word.trim_matches(|character: char| {
@@ -89,7 +101,7 @@ pub(crate) fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Opt
         }
         start = text[..start - 1].rfind('\n').map_or(0, |index| index + 1);
     }
-    let budget = MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1 as usize;
+    let budget = budget.min(text.len().saturating_sub(1)).max(1);
     if anchor.saturating_sub(start) >= budget / 2 {
         start = anchor.saturating_sub(budget / 4);
         while !text.is_char_boundary(start) {
@@ -2548,6 +2560,23 @@ mod validation_preview_tests {
         assert!(excerpt.contains("fn repository_search_v1()"));
         assert!(start > 100);
         assert!(end.unwrap() >= start);
+    }
+
+    #[test]
+    fn larger_brain_budget_can_include_a_complete_relevant_function() {
+        let source = format!(
+            "{}fn repository_search_v1() {{\n{}    let final_marker = true;\n}}\n{}",
+            "// unrelated prelude\n".repeat(70),
+            "    let intermediate = 1;\n".repeat(130),
+            "// unrelated suffix\n".repeat(200)
+        );
+        let (short, _, _) = source_excerpt_v1(&source, "Fix repository_search_v1");
+        let (long, _, _) =
+            source_excerpt_with_budget_v1(&source, "Fix repository_search_v1", 5 * 1024);
+        assert!(!short.contains("final_marker"));
+        assert!(long.contains("fn repository_search_v1()"));
+        assert!(long.contains("final_marker"));
+        assert!(long.len() <= 5 * 1024);
     }
 
     #[test]
