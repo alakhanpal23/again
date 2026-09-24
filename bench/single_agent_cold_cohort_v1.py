@@ -54,6 +54,7 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         or report.get("harnessSha256") != sha256(PAIR_HARNESS)
         or report.get("model") != model
         or report.get("surface") != "product-wrapper"
+        or report.get("requiredAgentValidation", []) != case.get("requiredAgentValidation", [])
         or report.get("returningTask") is not bool(case.get("returningTask", False))
         or report.get("source", {}).get("dirty") is not False
         or report.get("source", {}).get("binarySourceBindingVerified") is not True
@@ -62,6 +63,11 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         raise RuntimeError(f"pair result does not match frozen case {case['fixture']} {order}")
     if len(report.get("observations", [])) != 2:
         raise RuntimeError("pair omitted an observation")
+    if case.get("requiredAgentValidation") and any(
+        item.get("agentValidationObserved") is not True
+        for item in report["observations"]
+    ):
+        raise RuntimeError("agent did not run required validation")
     if case.get("returningTask"):
         observations = {item["condition"]: item for item in report["observations"]}
         if observations["product"].get("priorBrain", {}).get("path") != "src/util.py":
@@ -91,6 +97,12 @@ def usage_vector(observation: dict) -> dict[str, int] | None:
     return {"uncachedInput": total - cached, "cachedInput": cached, "output": output}
 
 
+def agent_validation_command(observation: dict, selectors: list[str]) -> str | None:
+    return next((action["command"] for action in observation["completedActions"]
+                 if action["type"] == "command_execution" and action.get("exitCode") == 0
+                 and any(selector in action["command"] for selector in selectors)), None)
+
+
 def summarize(manifest: dict, reports: list[dict], binary_hash: str,
               manifest_path: pathlib.Path = MANIFEST) -> dict:
     pairs = []
@@ -115,6 +127,8 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str,
             "againActions": len(product["completedActions"]),
             "baselineUsage": baseline_usage,
             "againUsage": product_usage,
+            "baselineAgentValidation": agent_validation_command(baseline, report.get("requiredAgentValidation", [])),
+            "againAgentValidation": agent_validation_command(product, report.get("requiredAgentValidation", [])),
         })
     median_ratio = statistics.median(ratios) if ratios else None
     p95_ratio = sorted(ratios)[math.ceil(0.95 * len(ratios)) - 1] if ratios else None
@@ -180,6 +194,8 @@ def main() -> int:
                     command.append("--seed-prior-brain-search")
                 elif case.get("returningTask"):
                     command.append("--seed-prior-brain")
+                for selector in case.get("requiredAgentValidation", []):
+                    command.extend(["--required-agent-validation", selector])
                 result = subprocess.run(command, cwd=ROOT, timeout=420, capture_output=True, text=True)
                 if not output.exists():
                     raise RuntimeError(f"pair harness failed without a report: {case['fixture']} {order}: {result.stderr[-1000:]}")

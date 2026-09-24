@@ -1,0 +1,25 @@
+{
+  "schema": "again.single-agent-cold-cohort.v1",
+  "model": "gpt-6-sol",
+  "purpose": "Diagnostic cold package-script tasks requiring an agent-run successful validation call; not the balanced release cohort",
+  "orders": ["baseline-first", "again-first"],
+  "agentSettings": ["--ephemeral", "--ignore-user-config", "--json", "--approve-for-me"],
+  "cases": [
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 0,
+      "fixtureSha256": "c6986be1f88f9257f3e26d79d7af9f07689181c6a8fd35fcbf5e1000b68f8db9",
+      "promptSha256": "645f50cdb687f90aca647f1e23ee92b0c15479b3fe1d9df70400e6950268aa94",
+      "requiredAgentValidation": ["npm test", "node --test test/total.spec.mjs"],
+      "oracle": "target-only behavior, harness Node tests, and successful agent test call"
+    },
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 1000,
+      "fixtureSha256": "c6986be1f88f9257f3e26d79d7af9f07689181c6a8fd35fcbf5e1000b68f8db9",
+      "promptSha256": "645f50cdb687f90aca647f1e23ee92b0c15479b3fe1d9df70400e6950268aa94",
+      "requiredAgentValidation": ["npm test", "node --test test/total.spec.mjs"],
+      "oracle": "target-only behavior, harness Node tests, and successful agent test call"
+    }
+  ]
+}

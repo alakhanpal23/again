@@ -33,6 +33,7 @@ TASK_IDS = {
     "rust-calculator": "rust-calculator-fix",
     "js-calculator": "js-calculator-fix",
     "js-calculator-generic-validation": "js-calculator-generic-validation-fix",
+    "js-package-script": "js-package-script-fix",
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
     "balance-helper-large": "balance-helper-large-fix",
@@ -109,6 +110,39 @@ def configure_fixture(name: str) -> None:
                 "test('large values', () => assert.equal(total([100, 200]), 300));\n"
             ),
             "README.md": "# JavaScript calculator fixture\nRun `node --test tests/test_calculator.mjs`.\n",
+        }
+        return
+    if name == "js-package-script":
+        pair.TARGET_ORACLE_MODE = "behavior"
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("js-package-script fixture requires node")
+        pair.TEST_COMMAND = (str(pathlib.Path(node).resolve()), "--test", "test/total.spec.mjs")
+        pair.TARGET = "src/total.mjs"
+        pair.TEST = "test/total.spec.mjs"
+        pair.BUGGY = (
+            "export function total(values) {\n"
+            "  return values.reduce((sum, value) => sum + value, 0) + 1;\n"
+            "}\n"
+        )
+        pair.FIXED = pair.BUGGY.replace("value, 0) + 1", "value, 0)")
+        pair.PROMPT = (
+            "Fix the off-by-one defect in src/total.mjs so total(values) returns the sum. "
+            "Preserve the exported API. Do not edit tests or other files. "
+            "Run the project's existing test script after editing, then stop."
+        )
+        pair.FIXTURE = {
+            pair.TARGET: pair.BUGGY,
+            pair.TEST: (
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "import { total } from '../src/total.mjs';\n"
+                "test('sum', () => assert.equal(total([1, 2, 3]), 6));\n"
+                "test('empty', () => assert.equal(total([]), 0));\n"
+                "test('negatives', () => assert.equal(total([-2, 5, -1]), 2));\n"
+            ),
+            "package.json": '{"name":"again-package-test-fixture","private":true,"type":"module","packageManager":"npm@11.0.0","scripts":{"test":"node --test test/total.spec.mjs"}}\n',
+            "README.md": "# Package test fixture\n",
         }
         return
     if name == "greeting-feature":
@@ -331,6 +365,7 @@ def run_condition(
     seed_brain: bool = False,
     brain_decoys: int = 0,
     seed_brain_search: bool = False,
+    required_agent_validation: tuple[str, ...] = (),
 ) -> tuple[dict[str, object], bytes]:
     pair.MAX_FIXTURE_FILES = max(pair.MAX_FIXTURE_FILES, source_files + len(pair.FIXTURE) + 8)
     pair.create_fixture(workspace)
@@ -456,6 +491,7 @@ def run_condition(
                     "resultBytes": len(json.dumps(item.get("result"), separators=(",", ":")).encode())
                     if item.get("result") is not None else None,
                     "command": str(item.get("command", ""))[:300],
+                    "exitCode": item.get("exit_code"),
                 })
             if event.get("type") == "turn.completed":
                 usage = event.get("usage")
@@ -465,6 +501,12 @@ def run_condition(
         if (workspace / pair.TARGET).is_file()
         else {"passed": False, "reason": "target_missing"}
     )
+    agent_validation_observed = any(
+        action["type"] == "command_execution"
+        and action["exitCode"] == 0
+        and any(selector in action["command"] for selector in required_agent_validation)
+        for action in completed
+    ) if required_agent_validation else None
     stats_after = pair.again_stats(binary, workspace)
     stats = {key: stats_after[key] - stats_before[key] for key in stats_before}
     brain_run = None
@@ -511,6 +553,7 @@ def run_condition(
         "completedActions": completed,
         "usage": usage,
         "oracle": oracle,
+        "agentValidationObserved": agent_validation_observed,
         "againStatsDelta": stats,
         "priorBrain": prior_brain,
         "brainRun": brain_run,
@@ -533,6 +576,8 @@ def main() -> int:
                         help="seed a verified prior source read for a balance-helper returning task")
     parser.add_argument("--seed-prior-brain-search", action="store_true",
                         help="seed verified prior source matches for a balance-helper returning task")
+    parser.add_argument("--required-agent-validation", action="append", default=[],
+                        help="require a completed zero-exit agent test call containing this fixed command text")
     parser.add_argument("--prebrief-with-mcp", action="store_true",
                         help="diagnostic: keep the normal Again MCP connection available after prebrief")
     parser.add_argument("--task-start-only-surface", action="store_true",
@@ -577,6 +622,7 @@ def main() -> int:
                 args.source_files, args.task_start_only_surface, args.compact_task_result,
                 args.prebrief_with_mcp, args.seed_prior_brain or args.seed_prior_brain_search,
                 seed_brain_search=args.seed_prior_brain_search,
+                required_agent_validation=tuple(args.required_agent_validation),
             )
         raw_path = args.output.with_name(args.output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -585,6 +631,7 @@ def main() -> int:
     accepted = all(
         result["exitCode"] == 0 and not result["timedOut"]
         and result["eventsCaptured"] and result["oracle"]["passed"]
+        and result["agentValidationObserved"] is not False
         for result in observations
     ) and next(result for result in observations if result["condition"] == "baseline")["againStatsDelta"]["requested"] == 0
     report = {
@@ -611,6 +658,7 @@ def main() -> int:
         "prebrief": args.prebrief,
         "prebriefWithMcp": args.prebrief_with_mcp,
         "returningTask": args.seed_prior_brain or args.seed_prior_brain_search,
+        "requiredAgentValidation": args.required_agent_validation,
         "observations": observations,
         "accepted": accepted,
     }
