@@ -2087,6 +2087,12 @@ fn validation_preview_v1(
         )
         .take(16)
         .collect::<Vec<_>>();
+    let explicit_javascript_paths = source_previews
+        .iter()
+        .filter(|preview| preview["origin"] == "explicit_task_path" && preview["complete"] == true)
+        .filter_map(|preview| preview["path"].as_str())
+        .filter(|path| crate::validation_hint::is_javascript_source_v1(path))
+        .collect::<Vec<_>>();
     let mut rust_source = false;
     let mut go_source = false;
     let mut javascript_source = false;
@@ -2120,7 +2126,14 @@ fn validation_preview_v1(
             "unverified Go convention; run the command to validate",
         )
     } else if javascript_source
-        && let Some(preview) = package_validation_preview_v1(workspace, &candidates)
+        && let Some(preview) = package_validation_preview_v1(
+            workspace,
+            if explicit_javascript_paths.is_empty() {
+                &candidates
+            } else {
+                &explicit_javascript_paths
+            },
+        )
     {
         return preview;
     } else {
@@ -2698,6 +2711,43 @@ mod validation_preview_tests {
                 json!([])
             );
         }
+    }
+
+    #[test]
+    fn explicit_package_with_stale_test_script_does_not_suggest_unrelated_package() {
+        let workspace = tempfile::tempdir().unwrap();
+        for package in ["alpha", "beta"] {
+            std::fs::create_dir_all(workspace.path().join(format!("packages/{package}/src")))
+                .unwrap();
+            std::fs::write(
+                workspace
+                    .path()
+                    .join(format!("packages/{package}/src/index.ts")),
+                "export const value = 1;\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            workspace.path().join("packages/alpha/package.json"),
+            r#"{"packageManager":"npm@11.0.0","scripts":{"test":"echo no test specified && exit 1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("packages/beta/package.json"),
+            r#"{"packageManager":"pnpm@9.0.0","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let explicit = json!({
+            "origin": "explicit_task_path", "complete": true,
+            "path": "packages/alpha/src/index.ts", "text": "export const value = 1;\n"
+        });
+        let indexed = json!({"candidates":[
+            {"locator":{"path":"packages/beta/src/index.ts"}}
+        ]});
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[explicit], &indexed)["selectors"],
+            json!([])
+        );
     }
 
     #[test]
