@@ -1,0 +1,91 @@
+commit 6228f8836d96b9bb14fb840f40c443fc0628ccbb
+Author:     Codex <codex@localhost>
+AuthorDate: Thu Sep 24 15:28:51 2026 -0700
+Commit:     Codex <codex@localhost>
+CommitDate: Thu Sep 24 15:28:51 2026 -0700
+
+    Improve task excerpt selection for Python class methods
+
+diff --git a/src/agent_gateway_runtime/context_coordinator.rs b/src/agent_gateway_runtime/context_coordinator.rs
+index b4b9122..1820828 100644
+--- a/src/agent_gateway_runtime/context_coordinator.rs
++++ b/src/agent_gateway_runtime/context_coordinator.rs
+@@ -129,10 +129,20 @@ fn preferred_declaration_anchor_v1(text: &str, prompt: &str) -> Option<usize> {
+         }
+     }
+     let mut best = None;
++    let mut class_name = String::new();
++    let mut contextual_best: Option<(usize, usize)> = None;
+     let mut offset = 0;
+     let mut test_attribute = false;
+-    for line in text.split_inclusive('\n') {
++    let lines = text.split_inclusive('\n').collect::<Vec<_>>();
++    for (line_index, line) in lines.iter().enumerate() {
+         let trimmed = line.trim_start();
++        if let Some(rest) = line.strip_prefix("class ") {
++            class_name = rest
++                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
++                .next()
++                .unwrap_or_default()
++                .to_ascii_lowercase();
++        }
+         let declaration = if trimmed.starts_with("fn ") {
+             Some((0, 3))
+         } else if trimmed.starts_with("def ") {
+@@ -154,6 +164,24 @@ fn preferred_declaration_anchor_v1(text: &str, prompt: &str) -> Option<usize> {
+                 .next()
+                 .unwrap_or_default();
+             if !test_attribute && !name.starts_with("test_") && !name.contains("oracle") {
++                if trimmed.starts_with("def ") && !class_name.is_empty() {
++                    let class_match = prompt_terms.iter().any(|term| term == &class_name);
++                    if class_match {
++                        let nearby = lines[line_index..lines.len().min(line_index + 12)]
++                            .join("")
++                            .to_ascii_lowercase();
++                        let body_matches = prompt_terms
++                            .iter()
++                            .filter(|term| term.len() >= 5 && nearby.contains(term.as_str()))
++                            .count();
++                        if body_matches >= 2 {
++                            let anchor = offset + line.len() - trimmed.len() + keyword_start;
++                            if contextual_best.is_none_or(|(score, _)| body_matches > score) {
++                                contextual_best = Some((body_matches, anchor));
++                            }
++                        }
++                    }
++                }
+                 let name_parts = name
+                     .split('_')
+                     .filter(|part| part.len() >= 4)
+@@ -178,7 +206,7 @@ fn preferred_declaration_anchor_v1(text: &str, prompt: &str) -> Option<usize> {
+         test_attribute = trimmed.starts_with("#[test]") || trimmed.starts_with("#[tokio::test]");
+         offset += line.len();
+     }
+-    best.map(|(_, anchor)| anchor)
++    contextual_best.or(best).map(|(_, anchor)| anchor)
+ }
+ const MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1: usize = 256;
+ const MAX_DIRECT_SEARCH_MATCH_SOURCE_BYTES_V1: u64 = 8 * 1024;
+@@ -2706,6 +2734,22 @@ mod validation_preview_tests {
+         assert!(long.len() <= 5 * 1024);
+     }
+ 
++    #[test]
++    fn python_excerpt_prefers_task_relevant_method_in_named_class() {
++        let source = format!(
++            "class Array:\n{}    def __setitem__(self, key, value):\n        if isinstance(key, slice):\n            raise ValueError('slice assignment is not supported')\n{}class Table:\n    def _render_dotted(self):\n        return 'rendered'\n",
++            "    def unrelated(self):\n        pass\n".repeat(90),
++            "    def unrelated_after(self):\n        pass\n".repeat(90),
++        );
++        let (excerpt, _, _) = source_excerpt_v1(
++            &source,
++            "Fix array slice assignment before mutating rendered output",
++        );
++        assert!(excerpt.contains("def __setitem__"));
++        assert!(excerpt.contains("slice assignment is not supported"));
++        assert!(!excerpt.contains("def _render_dotted"));
++    }
++
+     #[test]
+     fn source_excerpt_prefers_relevant_implementation_over_matching_oracle_tests() {
+         let source = format!(
