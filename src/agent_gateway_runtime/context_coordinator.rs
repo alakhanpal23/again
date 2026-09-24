@@ -1056,8 +1056,9 @@ impl LocalContextCoordinatorV1 {
         let brain_has_current_preview = early_brain.as_ref().is_some_and(|brain| {
             brain["recentCurrentFiles"].as_array().is_some_and(|files| {
                 files.iter().any(|file| {
-                    file["currentCompletePreview"].as_str().is_some()
-                        || file["currentPartialPreview"]["text"].as_str().is_some()
+                    file["fastPathEligible"] == true
+                        && (file["currentCompletePreview"].as_str().is_some()
+                            || file["currentPartialPreview"]["text"].as_str().is_some())
                 })
             })
         });

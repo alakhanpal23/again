@@ -1525,6 +1525,16 @@ mod tests {
         );
         assert_eq!(brief["sourcePreviews"], json!([]));
 
+        let weak_match = agent.tool(
+            "task.start",
+            json!({ "taskId": "weak-ledger", "task": "Repair ledger reconciliation", "includeSourcePreviews": true }),
+        );
+        let weak_brief = &weak_match["result"]["structuredContent"];
+        assert_ne!(
+            weak_brief["relevantCode"]["unknowns"][0]["kind"],
+            "index_skipped_for_current_brain_preview"
+        );
+
         fs::write(
             &source,
             b"def balance_helper(value):\n    return value + 2\n",

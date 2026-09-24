@@ -572,10 +572,13 @@ pub fn repository_brief_for_task_v1(
             let path_tokens = meaningful_task_tokens_v1(&entry.observation.path);
             let shared = task_tokens.intersection(&prior_tokens).count();
             let path_shared = task_tokens.intersection(&path_tokens).count();
+            let fast_path_eligible =
+                shared >= 2 || query.task_text.contains(&entry.observation.path);
             (path_shared > 0 || shared >= 2).then_some((
                 shared * 2 + path_shared * 3,
                 entry.observation.observed_ms,
                 entry.observation.path,
+                fast_path_eligible,
             ))
         })
         .collect::<Vec<_>>();
@@ -584,10 +587,16 @@ pub fn repository_brief_for_task_v1(
             .then_with(|| b.1.cmp(&a.1))
             .then_with(|| a.2.cmp(&b.2))
     });
+    let fast_path_eligible_paths: std::collections::BTreeSet<String> = historical
+        .iter()
+        .take(2)
+        .filter(|(_, _, _, eligible)| *eligible)
+        .map(|(_, _, path, _)| path.clone())
+        .collect();
     let history_paths: Vec<String> = historical
         .into_iter()
         .take(2)
-        .map(|(_, _, path)| path)
+        .map(|(_, _, path, _)| path)
         .collect();
     let mut selected = history_paths.clone();
     selected.extend(
@@ -617,6 +626,7 @@ pub fn repository_brief_for_task_v1(
             if history_paths.iter().any(|prior| prior == &path) {
                 file["selection"] =
                     Value::String("prior task or path overlap; source rechecked".to_owned());
+                file["fastPathEligible"] = Value::Bool(fast_path_eligible_paths.contains(&path));
             }
             // A prior large-file read used to become only a path hint. Supply
             // a current excerpt when task.start did not already preview it.
