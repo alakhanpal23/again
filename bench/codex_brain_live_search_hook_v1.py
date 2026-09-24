@@ -70,7 +70,7 @@ def main() -> int:
                           str(workspace), "--apply"], env=env, cwd=workspace)
         if not setup["installed"]:
             raise RuntimeError("project Brain observer was not installed")
-        command = ["codex", "exec", "--ephemeral", "--ignore-user-config", "--json",
+        command = ["codex", "exec", "--ephemeral", "--json",
                    "--approve-for-me", "-C", str(workspace), PROMPT]
         try:
             codex = subprocess.run(command, cwd=workspace, env=env, capture_output=True,
