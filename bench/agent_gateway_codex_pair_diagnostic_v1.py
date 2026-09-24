@@ -449,7 +449,41 @@ def run_condition(
         )
         first_edit_ms = None
         timed_out = False
+        event_timeline = []
+        event_offset = 0
+        pending_event_bytes = b""
+
+        def sample_events() -> None:
+            nonlocal event_offset, pending_event_bytes
+            while event_offset < MAX_EVENT_BYTES:
+                chunk = os.pread(stdout.fileno(), min(65536, MAX_EVENT_BYTES - event_offset), event_offset)
+                if not chunk:
+                    break
+                event_offset += len(chunk)
+                pending_event_bytes += chunk
+                lines = pending_event_bytes.split(b"\n")
+                pending_event_bytes = lines.pop()
+                for line in lines:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    kind = event.get("type")
+                    item = event.get("item") or {}
+                    if kind == "turn.completed" or (
+                        kind in ("item.started", "item.completed")
+                        and item.get("type") in ("file_change", "command_execution")
+                    ):
+                        if len(event_timeline) < 256:
+                            event_timeline.append({
+                                "elapsedMs": round((time.monotonic() - started) * 1000 + preparation_ms, 3),
+                                "event": kind,
+                                "itemId": item.get("id"),
+                                "itemType": item.get("type"),
+                            })
+
         while process.poll() is None:
+            sample_events()
             elapsed = time.monotonic() - started
             if elapsed >= TIMEOUT_SECONDS:
                 timed_out = True
@@ -460,6 +494,7 @@ def run_condition(
                 first_edit_ms = round(elapsed * 1000 + preparation_ms, 3)
             time.sleep(0.02)
         returncode = process.wait(timeout=10)
+        sample_events()
         codex_elapsed_ms = round((time.monotonic() - started) * 1000, 3)
         elapsed_ms = round(codex_elapsed_ms + preparation_ms, 3)
         if first_edit_ms is None and (workspace / pair.TARGET).is_file() and hashlib.sha256((workspace / pair.TARGET).read_bytes()).digest() != original:
@@ -545,6 +580,7 @@ def run_condition(
         "elapsedMs": elapsed_ms,
         "preparationMs": preparation_ms,
         "codexElapsedMs": codex_elapsed_ms,
+        "eventTimeline": event_timeline,
         "firstEditMs": first_edit_ms,
         "rawEventBytes": len(raw),
         "rawEventSha256": hashlib.sha256(raw).hexdigest(),
