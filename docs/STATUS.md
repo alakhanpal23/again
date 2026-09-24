@@ -6,6 +6,8 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 `again mcp setup --client codex --workspace <path> --apply --with-skill --with-brain-hook` now installs the verified MCP entry, personal skill, and project Codex Brain observer in one command. The matching `--inspect` reports whether each requested part is current without changing files. Hook ownership checks run before MCP mutation, and a hook failure after MCP installation removes a newly added MCP entry and a newly installed skill. An existing skill is preserved on rollback. The standalone `again brain hook-setup --remove` still restores the unchanged prior hook file. Focused CLI integration tests cover install, inspect, repeated install, existing handlers, removal, and conflicting hooks. This is onboarding consolidation; it does not expand the observer's tool coverage or establish an end-to-end speed gain.
 
+The Brain now recognizes a bounded `node --test tests/test_<name>.js|mjs|cjs` command observed with exit code zero. It suggests that command on a later task only when the test file still resolves inside the repository and a current candidate source has the matching `<name>` stem. This replaces a calculator-only command, rejects shell operators and traversal, and still requires the agent to run the test again. The test file's existence is checked; its previous passing result is never reused as validation proof.
+
 ## 2026-09-23 release binary source binding
 
 The [source-bound returning cohort](../bench/results/2026-09-23-returning-cohort-bound-e3f0067/summary.json)

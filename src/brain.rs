@@ -181,8 +181,7 @@ pub fn codex_completed_events_v1(
             };
             let command_hint = (exit_code == 0)
                 .then(|| known_test_command_v1(command))
-                .flatten()
-                .map(str::to_owned);
+                .flatten();
             let mut events = vec![BrainEventV1 {
                 session_id: session_id.to_owned(),
                 event_id: event_id.to_owned(),
@@ -651,21 +650,38 @@ fn workspace_file_v1(workspace: &Path, path: &str) -> Option<(String, PathBuf)> 
     Some((relative.to_owned(), canonical))
 }
 
-fn known_test_command_v1(command: &str) -> Option<&'static str> {
+fn known_test_command_v1(command: &str) -> Option<String> {
     let command = command.trim();
     let command = command
         .strip_prefix("/bin/zsh -lc '")
         .and_then(|inner| inner.strip_suffix('\''))
         .unwrap_or(command);
     match command {
-        "python3 -m unittest discover -s tests" => Some("python3 -m unittest discover -s tests"),
-        "python3 -m pytest" => Some("python3 -m pytest"),
-        "cargo test" => Some("cargo test"),
-        "cargo test --quiet" => Some("cargo test --quiet"),
-        "go test ./..." => Some("go test ./..."),
-        "node --test tests/test_calculator.mjs" => Some("node --test tests/test_calculator.mjs"),
-        _ => None,
+        "python3 -m unittest discover -s tests"
+        | "python3 -m pytest"
+        | "cargo test"
+        | "cargo test --quiet"
+        | "go test ./..." => Some(command.to_owned()),
+        _ => command
+            .strip_prefix("node --test ")
+            .filter(|path| safe_node_test_path_v1(path))
+            .map(|_| command.to_owned()),
     }
+}
+
+fn safe_node_test_path_v1(path: &str) -> bool {
+    path.starts_with("tests/test_")
+        && path.len() <= 256
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b'/'))
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+        && matches!(
+            Path::new(path).extension().and_then(|ext| ext.to_str()),
+            Some("js" | "mjs" | "cjs")
+        )
 }
 
 fn matching_source_read_v1(
@@ -750,14 +766,44 @@ fn source_code_path_v1(path: &str) -> bool {
 }
 
 fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String]) -> bool {
+    if let Some(path) = hint.strip_prefix("node --test ") {
+        if !safe_node_test_path_v1(path) {
+            return false;
+        }
+        let Ok(root) = fs::canonicalize(workspace) else {
+            return false;
+        };
+        let Ok(test_file) = fs::canonicalize(workspace.join(path)) else {
+            return false;
+        };
+        if !test_file.starts_with(&root) || !test_file.is_file() {
+            return false;
+        }
+        let Some(test_stem) = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|stem| stem.strip_prefix("test_"))
+        else {
+            return false;
+        };
+        return candidate_paths.iter().any(|candidate| {
+            candidate == path
+                || (Path::new(candidate)
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| {
+                        matches!(extension, "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx")
+                    })
+                    && Path::new(candidate)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        == Some(test_stem))
+        });
+    }
     let (extensions, manifest): (&[&str], Option<&str>) = match hint {
         "python3 -m unittest discover -s tests" | "python3 -m pytest" => (&["py", "pyi"], None),
         "cargo test" | "cargo test --quiet" => (&["rs"], Some("Cargo.toml")),
         "go test ./..." => (&["go"], Some("go.mod")),
-        "node --test tests/test_calculator.mjs" => (
-            &["js", "jsx", "mjs", "ts", "tsx"],
-            Some("tests/test_calculator.mjs"),
-        ),
         _ => return false,
     };
     candidate_paths.iter().any(|path| {
@@ -1153,6 +1199,58 @@ mod tests {
             codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,
             None
         );
+    }
+
+    #[test]
+    fn observed_node_test_is_reused_only_for_its_current_source_companion() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(workspace.join("tests")).unwrap();
+        let test_path = workspace.join("tests/test_currency.mjs");
+        fs::write(&test_path, "import 'node:test';\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"currency_test","type":"command_execution",
+                "command":"node --test tests/test_currency.mjs","exit_code":0}
+        });
+        for event in codex_completed_events_v1(&completed, &workspace, "session", "old-task") {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let relevant = repository_brief_v1(
+            &store,
+            &workspace,
+            &["src/currency.js".to_owned()],
+            &[],
+            &scope,
+        )
+        .unwrap();
+        assert_eq!(
+            relevant["previousSuccessfulTestCommand"],
+            "node --test tests/test_currency.mjs"
+        );
+        let unrelated = repository_brief_v1(
+            &store,
+            &workspace,
+            &["src/calculator.js".to_owned()],
+            &[],
+            &scope,
+        )
+        .unwrap();
+        assert!(unrelated["previousSuccessfulTestCommand"].is_null());
+        fs::remove_file(test_path).unwrap();
+        let missing = repository_brief_v1(
+            &store,
+            &workspace,
+            &["src/currency.js".to_owned()],
+            &[],
+            &scope,
+        )
+        .unwrap();
+        assert!(missing["previousSuccessfulTestCommand"].is_null());
+        assert!(known_test_command_v1("node --test tests/test_currency.mjs; rm -rf src").is_none());
+        assert!(known_test_command_v1("node --test ../test_currency.mjs").is_none());
     }
 
     #[test]
