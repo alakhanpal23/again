@@ -86,12 +86,15 @@ def main() -> int:
         if isinstance(raw, bytes):
             raw = raw.decode(errors="replace")
         events = []
+        public_trace = []
         for line in raw.splitlines():
             try:
                 value = json.loads(line)
             except json.JSONDecodeError:
                 continue
             item = value.get("item") or {}
+            if item.get("type") != "error":
+                public_trace.append(line)
             if value.get("type") == "item.completed" and item.get("type") == "command_execution":
                 events.append({"command": item.get("command"), "exitCode": item.get("exit_code"),
                                "outputMarker": "src/ledger.py:1:def balance():" in (item.get("aggregated_output") or "")})
@@ -126,6 +129,8 @@ def main() -> int:
             "codexExitCode": None if timed_out else codex.returncode,
             "timedOut": timed_out,
             "completedCommands": events,
+            "traceFilter": "error events omitted because they can include user configuration paths",
+            "traceSha256": hashlib.sha256(("\n".join(public_trace) + "\n").encode()).hexdigest(),
             "brainPaths": observed,
             "briefPathsBeforeEdit": before,
             "briefPathsAfterEdit": after,
@@ -135,7 +140,7 @@ def main() -> int:
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n")
-    args.output.with_suffix(".jsonl").write_text(raw)
+    args.output.with_suffix(".jsonl").write_text("\n".join(public_trace) + "\n")
     print(json.dumps({"accepted": accepted, "output": str(args.output)}))
     return 0 if accepted else 1
 
