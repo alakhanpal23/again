@@ -23,7 +23,7 @@ class GatewayProductE2ETest(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_exact_catalog_includes_context_repository_and_task_lifecycle(self) -> None:
-        self.assertEqual(harness.EXPECTED_DATABASE_SCHEMA, 19)
+        self.assertEqual(harness.EXPECTED_DATABASE_SCHEMA, 20)
         self.assertEqual(
             harness.EXPECTED_ADVERTISED_TOOLS,
             (

@@ -163,6 +163,8 @@ pub fn codex_completed_events_v1(
                     kind: "file_change".to_owned(),
                     path: Some(relative),
                     source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                    read_start_line: None,
+                    read_end_line: None,
                     command_digest: None,
                     command_hint: None,
                     exit_code: None,
@@ -193,6 +195,8 @@ pub fn codex_completed_events_v1(
                 kind: if completed_test { "test" } else { "command" }.to_owned(),
                 path: None,
                 source_digest: None,
+                read_start_line: None,
+                read_end_line: None,
                 command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                 command_hint,
                 exit_code: Some(exit_code),
@@ -200,15 +204,17 @@ pub fn codex_completed_events_v1(
                 authorization_scope_digest: authorization_scope_digest.clone(),
             }];
             if exit_code == 0
-                && let Some((relative, bytes)) = matching_source_read_v1(item, workspace, command)
+                && let Some(read) = matching_source_read_v1(item, workspace, command)
             {
                 events.push(BrainEventV1 {
                     session_id: session_id.to_owned(),
                     event_id: event_id.to_owned(),
                     task_id: task_id.to_owned(),
                     kind: "command".to_owned(),
-                    path: Some(relative),
-                    source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                    path: Some(read.path),
+                    source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
+                    read_start_line: read.range.map(|(start, _)| start),
+                    read_end_line: read.range.map(|(_, end)| end),
                     command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                     command_hint: None,
                     exit_code: Some(exit_code),
@@ -225,6 +231,8 @@ pub fn codex_completed_events_v1(
                         kind: "command".to_owned(),
                         path: Some(relative),
                         source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                        read_start_line: None,
+                        read_end_line: None,
                         command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                         command_hint: None,
                         exit_code: Some(exit_code),
@@ -296,6 +304,8 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
             kind: "command".to_owned(),
             path: None,
             source_digest: None,
+            read_start_line: None,
+            read_end_line: None,
             command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
             command_hint: None,
             exit_code: None,
@@ -303,15 +313,17 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
             authorization_scope_digest: authorization_scope_digest.clone(),
         });
         if exit_code.is_none()
-            && let Some((relative, bytes)) = matching_source_read_v1(&item, workspace, command)
+            && let Some(read) = matching_source_read_v1(&item, workspace, command)
         {
             events.push(BrainEventV1 {
                 session_id: session_id.to_owned(),
                 event_id: event_id.to_owned(),
                 task_id: session_id.to_owned(),
                 kind: "command".to_owned(),
-                path: Some(relative),
-                source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                path: Some(read.path),
+                source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
+                read_start_line: read.range.map(|(start, _)| start),
+                read_end_line: read.range.map(|(_, end)| end),
                 command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                 command_hint: None,
                 exit_code: None,
@@ -328,6 +340,8 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
                     kind: "command".to_owned(),
                     path: Some(relative),
                     source_digest: Some(blake3::hash(&bytes).to_hex().to_string()),
+                    read_start_line: None,
+                    read_end_line: None,
                     command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
                     command_hint: None,
                     exit_code: None,
@@ -402,6 +416,8 @@ fn codex_post_patch_events_v1(
             kind: "file_change".to_owned(),
             path: Some(path.to_owned()),
             source_digest,
+            read_start_line: None,
+            read_end_line: None,
             command_digest: None,
             command_hint: None,
             exit_code: None,
@@ -479,6 +495,8 @@ pub fn repository_brief_v1(
                 "currentDigest": observation.source_digest,
                 "observedTaskId": observation.task_id,
                 "observation": "observed after a prior read, search, or edit; file content rechecked now",
+                "observedReadRange": observation.read_start_line.zip(observation.read_end_line)
+                    .map(|(start, end)| serde_json::json!({"startLine": start, "endLine": end})),
                 "currentCompletePreview": preview,
             }));
         }
@@ -628,12 +646,30 @@ pub fn repository_brief_for_task_v1(
             let Ok(text) = String::from_utf8(bytes) else {
                 continue;
             };
-            let (excerpt, start_line, end_line) =
-                crate::agent_gateway_runtime::context_coordinator::source_excerpt_with_budget_v1(
-                    &text,
-                    query.task_text,
-                    MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1,
-                );
+            let prior_range = file["observedReadRange"]["startLine"]
+                .as_u64()
+                .zip(file["observedReadRange"]["endLine"].as_u64())
+                .and_then(|(start, end)| {
+                    prior_read_excerpt_v1(
+                        &text,
+                        start as usize,
+                        end as usize,
+                        MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1,
+                    )
+                });
+            let (excerpt, start_line, end_line, origin) = if let Some((excerpt, start, end)) =
+                prior_range
+            {
+                (excerpt, start, Some(end), "verified_prior_read_range")
+            } else {
+                let (excerpt, start, end) =
+                    crate::agent_gateway_runtime::context_coordinator::source_excerpt_with_budget_v1(
+                        &text,
+                        query.task_text,
+                        MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1,
+                    );
+                (excerpt, start, end, "task_anchored_current_excerpt")
+            };
             if crate::task_lifecycle::screen_sensitive_text_v1(&excerpt).is_err() {
                 continue;
             }
@@ -642,6 +678,7 @@ pub fn repository_brief_for_task_v1(
                 "startLine": start_line,
                 "endLine": end_line,
                 "complete": false,
+                "origin": origin,
             });
         }
     }
@@ -671,6 +708,23 @@ pub fn repository_brief_for_task_v1(
     } else {
         Ok(None)
     }
+}
+
+fn prior_read_excerpt_v1(
+    text: &str,
+    start_line: usize,
+    end_line: usize,
+    budget: usize,
+) -> Option<(String, usize, usize)> {
+    if start_line == 0 || end_line < start_line || end_line > 8192 || end_line - start_line > 512 {
+        return None;
+    }
+    let excerpt = text
+        .split_inclusive('\n')
+        .skip(start_line - 1)
+        .take(end_line - start_line + 1)
+        .collect::<String>();
+    (!excerpt.is_empty() && excerpt.len() <= budget).then_some((excerpt, start_line, end_line))
 }
 
 fn meaningful_task_tokens_v1(text: &str) -> std::collections::BTreeSet<String> {
@@ -828,11 +882,17 @@ fn safe_node_test_path_v1(path: &str) -> bool {
         )
 }
 
+struct MatchedSourceReadV1 {
+    path: String,
+    bytes: Vec<u8>,
+    range: Option<(u32, u32)>,
+}
+
 fn matching_source_read_v1(
     item: &Value,
     workspace: &Path,
     command: &str,
-) -> Option<(String, Vec<u8>)> {
+) -> Option<MatchedSourceReadV1> {
     let outer = shell_words::split(command).ok()?;
     let argv = if matches!(outer.as_slice(), [shell, flag, _]
         if shell == "/bin/zsh" && flag == "-lc")
@@ -895,7 +955,18 @@ fn matching_source_read_v1(
     } else {
         bytes.clone()
     };
-    (item["aggregated_output"].as_str()?.as_bytes() == expected).then_some((relative, bytes))
+    if item["aggregated_output"].as_str()?.as_bytes() != expected {
+        return None;
+    }
+    let range = lines.and_then(|(start, end)| {
+        let actual_end = end.min(bytes.split_inclusive(|byte| *byte == b'\n').count());
+        (start <= actual_end).then_some((start as u32, actual_end as u32))
+    });
+    Some(MatchedSourceReadV1 {
+        path: relative,
+        bytes,
+        range,
+    })
 }
 
 /// Nominate source files from a simple completed search. This verifies only
@@ -1193,6 +1264,15 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].path.as_deref(), Some("helper.py"));
         assert_eq!(events[1].exit_code, None);
+        let mut ranged = live_shape.clone();
+        ranged["tool_use_id"] = "ranged".into();
+        ranged["tool_input"]["command"] = "sed -n '1,1p' helper.py".into();
+        let events = codex_post_tool_event_v1(&ranged, dir.path()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            (events[1].read_start_line, events[1].read_end_line),
+            (Some(1), Some(1))
+        );
 
         let mut failed = read.clone();
         failed["tool_use_id"] = "failed".into();
@@ -1435,6 +1515,8 @@ mod tests {
                 kind: "command".to_owned(),
                 path: None,
                 source_digest: None,
+                read_start_line: None,
+                read_end_line: None,
                 command_digest: Some(blake3::hash(b"unrelated command").to_hex().to_string()),
                 command_hint: None,
                 exit_code: Some(0),
@@ -1819,8 +1901,38 @@ mod tests {
         let events = codex_completed_events_v1(&completed, dir.path(), "session", "task");
         assert_eq!(events.len(), 2);
         assert_eq!(events[1].path.as_deref(), Some("src/large.rs"));
+        assert_eq!(events[1].read_start_line, Some(820));
+        assert_eq!(events[1].read_end_line, Some(930));
         let digest = blake3::hash(source.as_bytes()).to_hex().to_string();
         assert_eq!(events[1].source_digest.as_deref(), Some(digest.as_str()));
+        let store = Store::open(dir.path().join("state")).unwrap();
+        for event in &events {
+            store.record_brain_event_v1(event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(dir.path());
+        let relevant = serde_json::json!({"candidates":[{"locator":{"path":"src/large.rs"}}]});
+        let brief = repository_brief_for_task_v1(
+            &store,
+            dir.path(),
+            &Value::Array(Vec::new()),
+            &relevant,
+            task_query("Fix unrelated source prelude", &scope),
+        )
+        .unwrap()
+        .unwrap();
+        let preview = &brief["recentCurrentFiles"][0]["currentPartialPreview"];
+        assert_eq!(preview["origin"], "verified_prior_read_range");
+        assert_eq!(preview["startLine"], 820);
+        assert_eq!(preview["endLine"], 930);
+        assert_eq!(preview["text"], output);
+        assert_eq!(
+            store
+                .brain_file_v1("src/large.rs", &scope)
+                .unwrap()
+                .unwrap()
+                .read_start_line,
+            Some(820)
+        );
         let mut run = CodexRunObservationV1::default();
         run.observe(&completed, &events);
         assert_eq!(run.completed_source_reads, 1);
@@ -1829,6 +1941,22 @@ mod tests {
         assert_eq!(
             codex_completed_events_v1(&wrong, dir.path(), "session", "task").len(),
             1
+        );
+        fs::write(
+            dir.path().join("src/large.rs"),
+            format!("{source}// changed\n"),
+        )
+        .unwrap();
+        assert!(
+            repository_brief_for_task_v1(
+                &store,
+                dir.path(),
+                &Value::Array(Vec::new()),
+                &relevant,
+                task_query("Fix unrelated source prelude", &scope),
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

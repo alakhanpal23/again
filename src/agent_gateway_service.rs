@@ -1484,6 +1484,8 @@ mod tests {
                         .to_hex()
                         .to_string(),
                 ),
+                read_start_line: None,
+                read_end_line: None,
                 command_digest: None,
                 command_hint: None,
                 exit_code: None,
