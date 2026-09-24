@@ -1998,6 +1998,43 @@ fn tool_result_v1(structured: Value) -> Value {
     })
 }
 
+fn package_validation_preview_v1(workspace: &Path, candidates: &[&str]) -> Option<Value> {
+    let mut suggestions = Vec::new();
+    for path in candidates
+        .iter()
+        .copied()
+        .filter(|path| crate::validation_hint::is_javascript_source_v1(path))
+    {
+        let Some(suggestion) =
+            crate::validation_hint::package_test_suggestion_for_source_v1(workspace, path)
+        else {
+            continue;
+        };
+        if suggestions
+            .iter()
+            .any(|prior: &crate::validation_hint::PackageTestSuggestionV1| {
+                prior.manifest_path() == suggestion.manifest_path()
+            })
+        {
+            continue;
+        }
+        suggestions.push(suggestion);
+        if suggestions.len() == 2 {
+            break;
+        }
+    }
+    (!suggestions.is_empty()).then(|| {
+        json!({
+            "status": "execute_required",
+            "selectors": suggestions
+                .into_iter()
+                .map(crate::validation_hint::PackageTestSuggestionV1::selector_json)
+                .collect::<Vec<_>>(),
+            "reason": "current package manifests declare test scripts; run each command in its workingDirectory to validate"
+        })
+    })
+}
+
 fn validation_preview_v1(
     workspace: &Path,
     source_previews: &[Value],
@@ -2047,11 +2084,13 @@ fn validation_preview_v1(
                 .into_iter()
                 .flatten()
                 .filter_map(|candidate| candidate["locator"]["path"].as_str()),
-        );
+        )
+        .take(16)
+        .collect::<Vec<_>>();
     let mut rust_source = false;
     let mut go_source = false;
     let mut javascript_source = false;
-    for path in candidates.take(16) {
+    for path in &candidates {
         rust_source |= path.ends_with(".rs");
         go_source |= path.ends_with(".go");
         javascript_source |= crate::validation_hint::is_javascript_source_v1(path);
@@ -2081,13 +2120,9 @@ fn validation_preview_v1(
             "unverified Go convention; run the command to validate",
         )
     } else if javascript_source
-        && let Some(suggestion) = crate::validation_hint::package_test_suggestion_v1(workspace)
+        && let Some(preview) = package_validation_preview_v1(workspace, &candidates)
     {
-        return json!({
-            "status": "execute_required",
-            "selectors": [suggestion.selector_json()],
-            "reason": "current package.json declares a test script; inspect the script and run it to validate"
-        });
+        return preview;
     } else {
         (None, "", "")
     };
@@ -2513,11 +2548,18 @@ mod validation_preview_tests {
     fn package_test_script_suggests_execution_with_current_source_evidence() {
         let workspace = tempfile::tempdir().unwrap();
         let javascript = json!({"candidates":[{"locator":{"path":"src/ledger.ts"}}]});
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("src/ledger.ts"),
+            "export const total = 1;\n",
+        )
+        .unwrap();
         let manifest = br#"{"scripts":{"test":"vitest run"}}"#;
         std::fs::write(workspace.path().join("package.json"), manifest).unwrap();
         let npm = validation_preview_v1(workspace.path(), &[], &javascript);
         assert_eq!(npm["status"], "execute_required");
         assert_eq!(npm["selectors"][0]["command"], "npm test");
+        assert_eq!(npm["selectors"][0]["workingDirectory"], ".");
         assert_eq!(npm["selectors"][0]["verified"], false);
         assert_eq!(npm["selectors"][0]["source"]["testScript"], "vitest run");
         assert_eq!(
@@ -2552,6 +2594,110 @@ mod validation_preview_tests {
             validation_preview_v1(workspace.path(), &[], &javascript)["selectors"],
             json!([])
         );
+    }
+
+    #[test]
+    fn nested_packages_get_distinct_current_test_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        for package in ["alpha", "beta"] {
+            std::fs::create_dir_all(workspace.path().join(format!("packages/{package}/src")))
+                .unwrap();
+            std::fs::write(
+                workspace
+                    .path()
+                    .join(format!("packages/{package}/src/index.ts")),
+                "export const value = 1;\n",
+            )
+            .unwrap();
+        }
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("packages/alpha/package.json"),
+            r#"{"packageManager":"pnpm@9.0.0","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("packages/beta/package.json"),
+            r#"{"packageManager":"npm@11.0.0","scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        let code = json!({"candidates":[
+            {"locator":{"path":"packages/alpha/src/index.ts"}},
+            {"locator":{"path":"packages/beta/src/index.ts"}},
+            {"locator":{"path":"packages/alpha/src/index.ts"}}
+        ]});
+        let preview = validation_preview_v1(workspace.path(), &[], &code);
+        assert_eq!(preview["status"], "execute_required");
+        assert_eq!(preview["selectors"].as_array().unwrap().len(), 2);
+        assert_eq!(preview["selectors"][0]["command"], "pnpm test");
+        assert_eq!(
+            preview["selectors"][0]["workingDirectory"],
+            "packages/alpha"
+        );
+        assert_eq!(
+            preview["selectors"][0]["source"]["path"],
+            "packages/alpha/package.json"
+        );
+        assert_eq!(preview["selectors"][1]["command"], "npm test");
+        assert_eq!(preview["selectors"][1]["workingDirectory"], "packages/beta");
+        assert_eq!(preview["selectors"][0]["verified"], false);
+    }
+
+    #[test]
+    fn nested_package_refuses_ambiguous_manager_and_symlinked_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("packages/alpha/src")).unwrap();
+        std::fs::write(
+            workspace.path().join("packages/alpha/src/index.ts"),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("packages/alpha/package.json"),
+            r#"{"scripts":{"test":"node --test"}}"#,
+        )
+        .unwrap();
+        let code = json!({"candidates":[{"locator":{"path":"packages/alpha/src/index.ts"}}]});
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &code)["selectors"],
+            json!([])
+        );
+        std::fs::write(
+            workspace.path().join("packages/alpha/pnpm-lock.yaml"),
+            "lockfileVersion: 9\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &code)["selectors"][0]["command"],
+            "pnpm test"
+        );
+        std::fs::write(
+            workspace.path().join("packages/alpha/yarn.lock"),
+            "# lock\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &code)["selectors"],
+            json!([])
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(workspace.path().join("packages/alpha/yarn.lock")).unwrap();
+            std::fs::rename(
+                workspace.path().join("packages/alpha"),
+                workspace.path().join("packages/real"),
+            )
+            .unwrap();
+            std::os::unix::fs::symlink("real", workspace.path().join("packages/alpha")).unwrap();
+            assert_eq!(
+                validation_preview_v1(workspace.path(), &[], &code)["selectors"],
+                json!([])
+            );
+        }
     }
 
     #[test]

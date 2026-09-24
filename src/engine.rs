@@ -1866,6 +1866,18 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
     }
     prompt.push_str("\nVALIDATION ");
     prompt.push_str(&serde_json::to_string(&brief["validationPreview"])?);
+    if brief["validationPreview"]["selectors"]
+        .as_array()
+        .is_some_and(|selectors| {
+            selectors.iter().any(|selector| {
+                selector["workingDirectory"]
+                    .as_str()
+                    .is_some_and(|directory| directory != ".")
+            })
+        })
+    {
+        prompt.push_str("\nRun each suggested validation command from its workingDirectory relative to the repository root. These are suggestions; execute required validation after editing.\n");
+    }
     if brief["contextFreshness"]["status"] == "current" {
         let context = &brief["context"];
         let shared = serde_json::json!({
@@ -4003,6 +4015,15 @@ mod tests {
         assert!(prompt.contains("FILE a.py DIGEST abc"));
         assert!(prompt.contains("value is one"));
         assert!(prompt.contains("check edge cases"));
+        let mut nested = brief.clone();
+        nested["validationPreview"]["selectors"] = serde_json::json!([{
+            "command": "npm test", "workingDirectory": "packages/alpha", "verified": false
+        }]);
+        let nested_prompt = agent_prebrief_prompt_v1("repair a.py", &nested).unwrap();
+        assert!(
+            nested_prompt
+                .contains("Run each suggested validation command from its workingDirectory")
+        );
         let mut leader = brief.clone();
         leader["coordination"]["status"] = serde_json::json!("leader");
         let leader_prompt = agent_prebrief_prompt_v1("repair a.py", &leader).unwrap();

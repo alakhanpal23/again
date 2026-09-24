@@ -7,18 +7,25 @@ use serde_json::{Value, json};
 
 pub(crate) struct PackageTestSuggestionV1 {
     pub command: &'static str,
+    manifest_path: String,
+    working_directory: String,
     source_digest: String,
     test_script: String,
 }
 
 impl PackageTestSuggestionV1 {
+    pub fn manifest_path(&self) -> &str {
+        &self.manifest_path
+    }
+
     pub fn selector_json(self) -> Value {
         json!({
             "command": self.command,
+            "workingDirectory": self.working_directory,
             "basis": "current_package_test_script",
             "verified": false,
             "source": {
-                "path": "package.json",
+                "path": self.manifest_path,
                 "digest": self.source_digest,
                 "testScript": self.test_script
             }
@@ -36,9 +43,59 @@ pub(crate) fn is_javascript_source_v1(path: &str) -> bool {
 }
 
 pub(crate) fn package_test_suggestion_v1(workspace: &Path) -> Option<PackageTestSuggestionV1> {
+    package_test_suggestion_at_v1(workspace, Path::new(""))
+}
+
+pub(crate) fn package_test_suggestion_for_source_v1(
+    workspace: &Path,
+    source_path: &str,
+) -> Option<PackageTestSuggestionV1> {
+    let source = Path::new(source_path);
+    if source_path.is_empty()
+        || source_path.len() > 512
+        || !source
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let root = fs::canonicalize(workspace).ok()?;
+    if !fs::symlink_metadata(root.join(source)).ok()?.is_file() {
+        return None;
+    }
+    let mut directory = source.parent()?;
+    loop {
+        if !directory.as_os_str().is_empty() {
+            let package_root = root.join(directory);
+            let metadata = fs::symlink_metadata(&package_root).ok()?;
+            if !metadata.is_dir() || fs::canonicalize(&package_root).ok()? != package_root {
+                return None;
+            }
+        }
+        let manifest = root.join(directory).join("package.json");
+        match fs::symlink_metadata(manifest) {
+            Ok(metadata) if metadata.is_file() => {
+                return package_test_suggestion_at_v1(&root, directory);
+            }
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        if directory.as_os_str().is_empty() {
+            return None;
+        }
+        directory = directory.parent()?;
+    }
+}
+
+fn package_test_suggestion_at_v1(
+    workspace: &Path,
+    directory: &Path,
+) -> Option<PackageTestSuggestionV1> {
     const MAX_MANIFEST_BYTES: u64 = 32 * 1024;
     let workspace = fs::canonicalize(workspace).ok()?;
-    let path = workspace.join("package.json");
+    let package_root = workspace.join(directory);
+    let path = package_root.join("package.json");
     let metadata = fs::symlink_metadata(&path).ok()?;
     if !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
         return None;
@@ -73,11 +130,20 @@ pub(crate) fn package_test_suggestion_v1(workspace: &Path) -> Option<PackageTest
         ("yarn", ["yarn.lock"].as_slice()),
         ("bun", ["bun.lock", "bun.lockb"].as_slice()),
     ];
+    for name in lockfiles.iter().flat_map(|(_, names)| names.iter()) {
+        match fs::symlink_metadata(package_root.join(name)) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => return None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
     let observed: Vec<&str> = lockfiles
         .iter()
         .filter(|(_, names)| {
             names.iter().any(|name| {
-                fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
+                fs::symlink_metadata(package_root.join(name))
+                    .is_ok_and(|metadata| metadata.is_file())
             })
         })
         .map(|(manager, _)| *manager)
@@ -95,7 +161,10 @@ pub(crate) fn package_test_suggestion_v1(workspace: &Path) -> Option<PackageTest
         }
         declared
     } else {
-        observed.first().copied().unwrap_or("npm")
+        observed
+            .first()
+            .copied()
+            .or_else(|| directory.as_os_str().is_empty().then_some("npm"))?
     };
     let command = match manager {
         "npm" => "npm test",
@@ -106,6 +175,15 @@ pub(crate) fn package_test_suggestion_v1(workspace: &Path) -> Option<PackageTest
     };
     Some(PackageTestSuggestionV1 {
         command,
+        manifest_path: directory
+            .join("package.json")
+            .to_string_lossy()
+            .into_owned(),
+        working_directory: if directory.as_os_str().is_empty() {
+            ".".to_owned()
+        } else {
+            directory.to_string_lossy().into_owned()
+        },
         source_digest: blake3::hash(&bytes).to_hex().to_string(),
         test_script: script.to_owned(),
     })
