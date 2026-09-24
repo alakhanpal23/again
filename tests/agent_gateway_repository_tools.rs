@@ -158,7 +158,7 @@ fn repository_refusals_are_actionable_without_echoing_sensitive_paths() {
 }
 
 #[test]
-fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable() {
+fn repository_primitives_are_product_routed_deterministic_and_fresh() {
     let workspace = TempDir::new().unwrap();
     write(
         workspace.path(),
@@ -495,11 +495,11 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     );
 
     let stats = server.stats().unwrap();
-    // Standalone repo.search now executes directly because its source proof
-    // costs more than this bounded provider scan. The Git diff retry remains
-    // exact; another Git retry may conservatively execute on hosts where Git
-    // changes an observed index/executable binding while answering it.
-    assert!((1..=2).contains(&stats.exact_hits), "{stats:?}");
+    // Standalone repository calls may execute directly when their proof costs
+    // more than a fresh provider call. This fixture checks every returned
+    // value above, including status after an index and worktree change.
+    assert_eq!(stats.requested, 25, "{stats:?}");
+    assert!(stats.exact_hits <= 2, "{stats:?}");
     assert_eq!(stats.executed + stats.exact_hits, 25, "{stats:?}");
 }
 
