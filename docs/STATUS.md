@@ -4,6 +4,15 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-23 Node test guidance for source-adjacent validation
 
+The [current frozen cold cohort](../bench/results/2026-09-23-cold-cohort-current-cb7828d/summary.json)
+accepted all 10 baseline/Again pairs across five fixtures and both orders on
+the release binary. The paired median completion ratio was 0.634, p95 was
+0.868, and aggregate uncached input, cached input, and output tokens were
+all lower with Again. Each pair recorded a clean source SHA; the harness does
+not yet cryptographically bind the binary to that SHA, so this is diagnostic
+release-binary evidence rather than final production qualification. The cohort
+is small and synthetic, and metered dollar cost remains unqualified.
+
 Task start can now fill the second complete preview with a matching
 `tests/test_<source>.js|mjs|cjs` file when a task names a JavaScript source and
 requests tests. A preview containing `node:test` yields an exact `node --test`
