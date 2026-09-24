@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--model", default="gpt-6-sol")
-    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large", "balance-helper-excerpt"), default="balance-helper")
+    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large", "balance-helper-excerpt", "historical-search-unlocated"), default="balance-helper")
     parser.add_argument("--source-files", type=int, choices=(0, 1000), required=True)
     parser.add_argument("--prior-brain-decoys", type=int, default=0)
     parser.add_argument("--order", choices=("cold-first", "seeded-first"), required=True)
@@ -33,6 +33,9 @@ def main() -> int:
     if output.is_relative_to(root):
         parser.error("write diagnostic output outside the source tree")
     pair_harness.configure_fixture(args.fixture)
+    required_validation = (("cargo test --locked --lib historical_search_oracle",)
+                           if args.fixture == "historical-search-unlocated"
+                           else ("python3 -m unittest discover -s tests",))
     order = ("product-cold", "product") if args.order == "cold-first" else ("product", "product-cold")
     observations = []
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -42,6 +45,7 @@ def main() -> int:
                 condition, pathlib.Path(temporary), binary, args.model,
                 f"{args.fixture}-ablation", args.source_files,
                 seed_brain=True, brain_decoys=args.prior_brain_decoys,
+                required_agent_validation=required_validation,
             )
         raw_path = output.with_name(output.stem + f"-{condition}.jsonl")
         raw_path.write_bytes(raw)
@@ -52,6 +56,10 @@ def main() -> int:
     accepted = all(
         item["exitCode"] == 0 and not item["timedOut"]
         and item["eventsCaptured"] and item["oracle"]["passed"]
+        and item["agentValidationObserved"] is True
+        and item["brainRunError"] is None
+        and item["brainRun"] is not None
+        and item["brainRun"]["successful_tests"] >= 1
         for item in observations
     ) and cold["priorBrain"] is None and seeded["priorBrain"] is not None
     report = {

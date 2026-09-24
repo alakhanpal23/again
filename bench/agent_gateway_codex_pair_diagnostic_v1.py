@@ -41,6 +41,7 @@ TASK_IDS = {
     "balance-helper-large": "balance-helper-large-fix",
     "balance-helper-excerpt": "balance-helper-excerpt-fix",
     "historical-search": "historical-search-output-fix",
+    "historical-search-unlocated": "historical-search-unlocated-fix",
 }
 
 DEFAULT_CREATE_FIXTURE = pair.create_fixture
@@ -54,8 +55,17 @@ def configure_fixture(name: str) -> None:
     pair.validate_edit = DEFAULT_VALIDATE_EDIT
     pair.TEST_COMMAND = ("/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q")
     pair.TARGET_ORACLE_MODE = "exact"
-    if name == "historical-search":
+    if name in ("historical-search", "historical-search-unlocated"):
         historical_search_fixture_v1.configure(DEFAULT_VALIDATE_EDIT)
+        if name == "historical-search-unlocated":
+            pair.PROMPT = (
+                "Fix repo.search: long matching lines and many matches can produce oversized "
+                "responses. Bound each returned snippet to 4 KiB and total rendered match "
+                "output to 512 KiB. Report line and result truncation accurately while "
+                "preserving existing search behavior. Edit only the implementation of "
+                "repo.search. Run cargo test --locked --lib historical_search_oracle after "
+                "editing, then stop."
+            )
         return
     if name == "calculator":
         return
@@ -348,7 +358,11 @@ def again_instruction(task_id: str) -> str:
 def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
                      decoy_count: int = 0, search: bool = False) -> dict[str, str | int]:
     """Create prior checked source observations through the real Again launcher."""
-    read_range = "1,200p" if len(pair.BUGGY) > 256 else "1,20p"
+    historical = pair.TARGET == historical_search_fixture_v1.TARGET
+    read_range = "820,930p" if historical else ("1,200p" if len(pair.BUGGY) > 256 else "1,20p")
+    prior_task_id = "prior-search-investigation" if historical else "prior-ledger-investigation"
+    prior_task = ("Investigate repo.search response size and truncation" if historical
+                  else "Investigate ledger balance helper behavior")
     if search:
         event_script = (
             "output = ''\n"
@@ -361,7 +375,11 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
         )
     else:
         event_script = (
-            "content = (workspace / target).read_text()\n"
+            (
+                "content = ''.join((workspace / target).read_text().splitlines(keepends=True)[819:930])\n"
+                if historical else "content = (workspace / target).read_text()\n"
+            )
+            +
             "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
             f"'command':\"sed -n '{read_range}' \" + target,'aggregated_output':content,'exit_code':0,'status':'completed'}}}}))\n"
         )
@@ -381,8 +399,8 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
         environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
         result = subprocess.run(
             [str(binary), "codex", "--workspace", str(workspace),
-             "--task-id", "prior-ledger-investigation",
-             "--task", "Investigate ledger balance helper behavior", "--", "--ephemeral"],
+             "--task-id", prior_task_id,
+             "--task", prior_task, "--", "--ephemeral"],
             cwd=workspace, env=environment, capture_output=True, text=True, timeout=30,
         )
         if result.returncode != 0:
@@ -423,7 +441,7 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"could not seed unrelated Brain reads: {result.stderr[-1000:]}")
-    return {"taskId": "prior-ledger-investigation", "path": pair.TARGET,
+    return {"taskId": prior_task_id, "path": pair.TARGET,
             "sourceSha256": hashlib.sha256((workspace / pair.TARGET).read_bytes()).hexdigest(),
             "decoyCount": decoy_count, "mode": "search" if search else "read"}
 
