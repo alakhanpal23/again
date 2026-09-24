@@ -21,6 +21,7 @@ import tempfile
 import time
 
 import agent_gateway_editable_pair as pair
+import historical_search_fixture_v1
 from agent_gateway_authenticated_product_e2e import Client, start_daemon, structured
 from agent_gateway_codex_live_probe_v1 import sha256, source_state
 
@@ -38,12 +39,23 @@ TASK_IDS = {
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
     "balance-helper-large": "balance-helper-large-fix",
+    "historical-search": "historical-search-output-fix",
 }
+
+DEFAULT_CREATE_FIXTURE = pair.create_fixture
+DEFAULT_RUN_TESTS = pair.run_tests
+DEFAULT_VALIDATE_EDIT = pair.validate_edit
 
 
 def configure_fixture(name: str) -> None:
+    pair.create_fixture = DEFAULT_CREATE_FIXTURE
+    pair.run_tests = DEFAULT_RUN_TESTS
+    pair.validate_edit = DEFAULT_VALIDATE_EDIT
     pair.TEST_COMMAND = ("/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q")
     pair.TARGET_ORACLE_MODE = "exact"
+    if name == "historical-search":
+        historical_search_fixture_v1.configure(DEFAULT_VALIDATE_EDIT)
+        return
     if name == "calculator":
         return
     if name == "rust-calculator":

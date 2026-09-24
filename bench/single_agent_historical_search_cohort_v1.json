@@ -1,0 +1,17 @@
+{
+  "schema": "again.single-agent-cold-cohort.v1",
+  "model": "gpt-6-sol",
+  "purpose": "Diagnostic accepted-edit task on a complete historical Again repository checkout with independently injected failing regressions; not the balanced release cohort",
+  "orders": ["baseline-first", "again-first"],
+  "agentSettings": ["--ephemeral", "--ignore-user-config", "--json", "--approve-for-me"],
+  "cases": [
+    {
+      "fixture": "historical-search",
+      "sourceFiles": 0,
+      "fixtureSha256": "f3f7370ea85f1766b4a5d45d6e040e321a87e63cb645307c5eb78c559373a191",
+      "promptSha256": "f9d3073163ad355463b69d2beb95cf75ee26fc802c32ccc1292b943a4e4e651a",
+      "requiredAgentValidation": ["cargo test --locked --lib historical_search_oracle"],
+      "oracle": "historical full-repository target-only Rust repair, preserved independent regression module, cargo test, and successful agent validation"
+    }
+  ]
+}
