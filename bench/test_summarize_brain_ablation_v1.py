@@ -26,6 +26,11 @@ EXACT_RANGE_REPORTS = (
     EXACT_RANGE_EVIDENCE / "again-python-exact-range-cold-first-065d8c2.json",
     EXACT_RANGE_EVIDENCE / "again-python-exact-range-seeded-first-065d8c2.json",
 )
+FAST_PATH_EVIDENCE = ROOT / "bench/results/2026-09-24-brain-fast-path"
+FAST_PATH_REPORTS = (
+    FAST_PATH_EVIDENCE / "cold-first.json",
+    FAST_PATH_EVIDENCE / "seeded-first.json",
+)
 
 
 class BrainAblationSummaryTest(unittest.TestCase):
@@ -76,6 +81,19 @@ class BrainAblationSummaryTest(unittest.TestCase):
             for pair in calculated["pairs"]:
                 self.assertGreater(pair["coldRequiredValidationMs"], 0)
                 self.assertGreater(pair["seededRequiredValidationMs"], 0)
+
+    def test_fast_path_pairs_recompute(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = pathlib.Path(directory) / "summary.json"
+            result = self.command(
+                output, FAST_PATH_REPORTS,
+                "cargo test --locked --lib historical_python_quote_oracle",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calculated = json.loads(output.read_text())
+            retained = json.loads((FAST_PATH_EVIDENCE / "summary.json").read_text())
+            self.assertEqual(calculated, retained)
+            self.assertEqual(calculated["acceptedPairs"], 2)
 
     def test_required_validation_timing_requires_matching_start_and_completion(self):
         with tempfile.TemporaryDirectory() as directory:
