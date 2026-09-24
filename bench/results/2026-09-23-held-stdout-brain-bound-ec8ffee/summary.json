@@ -1,0 +1,17 @@
+{
+  "schema": "again.held-stdout-brain-gate.v1",
+  "sourceSha": "ec8ffee3032d784febf4f76b8965572f321c156a",
+  "binarySha256": "f01abad1133a93caecc889a07f08a5cce9ace5f019fde2f3506bdb18e1d0c73f",
+  "binarySourceBindingVerified": true,
+  "client": "controlled Codex JSON emitter with 4-second stdout-holding descendant",
+  "launcherExitCode": 0,
+  "turnCompleted": true,
+  "completedCommands": 1,
+  "completedSourceReads": 1,
+  "recordedPath": "src/lib.rs",
+  "readerDeadlineExceeded": true,
+  "rawEventFile": "events.jsonl",
+  "rawEventSha256": "f33ab37af1d7109e232b116a99cf163c899ebc8dddea17dfa1368a98b09a19dc",
+  "stderrSha256": "643ef86e3743dadab05cfe60bdb5531b6c146fbc4e9700be45a4863d3d9ff7d2",
+  "limitation": "controlled event stream; real Codex exit-code instability is not yet explained"
+}

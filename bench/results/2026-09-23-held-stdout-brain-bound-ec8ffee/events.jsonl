@@ -1,0 +1,2 @@
+{"type": "item.completed", "item": {"id": "read", "type": "command_execution", "command": "cat src/lib.rs", "aggregated_output": "pub fn value() -> u8 { 1 }\n", "exit_code": 0, "status": "completed"}}
+{"type": "turn.completed", "usage": {"input_tokens": 50, "cached_input_tokens": 0, "output_tokens": 5}}
