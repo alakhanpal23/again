@@ -27,6 +27,8 @@ The `--` separates Again options from Codex options. Use a distinct task ID for 
 
 The normal `again codex` path does not intercept native shell calls or silently skip tests. Exact output reuse is available separately through `again run` for eligible commands with a fresh proof; cheap ordinary reads often cost less to execute directly.
 
+If Codex finishes but its completed Brain capture fails, the launcher reports the capture error and exits nonzero. The agent's edits and test output remain in the repository and terminal; inspect them before retrying the task. A failed Codex process keeps its own exit status and also reports any capture problem.
+
 ## System design
 
 ```mermaid
