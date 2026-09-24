@@ -936,15 +936,22 @@ impl LocalContextCoordinatorV1 {
             match (status, request) {
                 (Ok(_), Some(request)) => {
                     let brief = index.compile_edit_brief_v1(&request, None);
-                    let mut previews = Vec::new();
-                    let mut seen = BTreeSet::new();
+                    let mut previews = explicit_previews;
+                    let mut seen = previews
+                        .iter()
+                        .filter_map(|preview| preview["path"].as_str())
+                        .map(str::to_owned)
+                        .collect::<BTreeSet<_>>();
                     for candidate in brief
                         .candidates()
                         .iter()
                         .filter(|_| include_source_previews)
                     {
+                        if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
+                            break;
+                        }
                         if candidate.kind() != EditBriefCandidateKindV1::File
-                            || !seen.insert(candidate.locator().path())
+                            || !seen.insert(candidate.locator().path().to_owned())
                         {
                             continue;
                         }

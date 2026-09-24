@@ -70,8 +70,10 @@ def main() -> int:
         )
         subprocess.run(["git", "init", "--quiet", str(workspace)], check=True)
         environment = dict(os.environ, AGAIN_HOME=str(temporary / "state"))
-        alpha = selector(brief(binary, workspace, environment, "alpha", "alpha"))
-        beta = selector(brief(binary, workspace, environment, "beta", "beta"))
+        alpha_brief = brief(binary, workspace, environment, "alpha", "alpha")
+        beta_brief = brief(binary, workspace, environment, "beta", "beta")
+        alpha = selector(alpha_brief)
+        beta = selector(beta_brief)
         ran_test = subprocess.run(
             ["npm", "test"], cwd=workspace / "packages/alpha",
             capture_output=True, text=True, timeout=30,
@@ -79,17 +81,24 @@ def main() -> int:
         (workspace / "packages/alpha/package.json").write_text(
             '{"packageManager":"npm@9.0.0","scripts":{"test":"echo no test specified && exit 1"}}'
         )
-        stale = selector(brief(binary, workspace, environment, "alpha-stale", "alpha"))
+        stale_brief = brief(binary, workspace, environment, "alpha-stale", "alpha")
+        stale = selector(stale_brief)
+        alpha_previews = [(item.get("path"), item.get("origin"))
+                          for item in alpha_brief.get("sourcePreviews", [])]
+        beta_previews = [(item.get("path"), item.get("origin"))
+                         for item in beta_brief.get("sourcePreviews", [])]
         accepted = (
             alpha is not None
             and alpha["command"] == "npm test"
             and alpha["workingDirectory"] == "packages/alpha"
             and alpha["source"]["path"] == "packages/alpha/package.json"
             and alpha["verified"] is False
+            and alpha_previews[:1] == [("packages/alpha/src/total.mjs", "explicit_task_path")]
             and beta is not None
             and beta["command"] == "pnpm test"
             and beta["workingDirectory"] == "packages/beta"
             and beta["source"]["path"] == "packages/beta/package.json"
+            and beta_previews[:1] == [("packages/beta/src/total.mjs", "explicit_task_path")]
             and ran_test.returncode == 0
             and stale is None
         )
@@ -99,7 +108,9 @@ def main() -> int:
             "source": source,
             "binarySha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
             "alphaSelector": alpha,
+            "alphaPreviewPaths": alpha_previews,
             "betaSelector": beta,
+            "betaPreviewPaths": beta_previews,
             "alphaTestExitCode": ran_test.returncode,
             "staleSelector": stale,
             "accepted": accepted,
