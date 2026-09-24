@@ -46,6 +46,41 @@ const TASK_COORDINATION_LEASE_TTL_MS_V1: u64 = 5 * 60_000;
 const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
+const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
+
+fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
+    let anchor = prompt
+        .split_whitespace()
+        .map(|word| {
+            word.trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '.' && character != '_'
+            })
+        })
+        .filter(|word| (4..=64).contains(&word.len()) && !word.contains('/'))
+        .find_map(|word| text.find(word))
+        .unwrap_or(0);
+    let mut start = text[..anchor].rfind('\n').map_or(0, |index| index + 1);
+    for _ in 0..2 {
+        if start == 0 {
+            break;
+        }
+        start = text[..start - 1].rfind('\n').map_or(0, |index| index + 1);
+    }
+    let budget = MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1 as usize;
+    if anchor.saturating_sub(start) >= budget / 2 {
+        start = anchor.saturating_sub(budget / 4);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+    }
+    let mut end = (start + budget).min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let start_line = text[..start].bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let end_line = text[..end].bytes().filter(|byte| *byte == b'\n').count() + 1;
+    (text[start..end].to_owned(), start_line, Some(end_line))
+}
 const MAX_INLINE_PREVIEW_FAST_PATH_SOURCE_FILES_V1: usize = 256;
 const MAX_DIRECT_SEARCH_MATCH_SOURCE_BYTES_V1: u64 = 8 * 1024;
 const MAX_CONTEXT_FRESHNESS_SOURCES_V1: usize = 256;
@@ -641,7 +676,7 @@ impl LocalContextCoordinatorV1 {
             let Ok(bytes) = self
                 .observed_workspace
                 .execution_epoch
-                .read_repository_file(path, MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1)
+                .read_repository_file(path, MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1)
             else {
                 continue;
             };
@@ -653,11 +688,19 @@ impl LocalContextCoordinatorV1 {
             let Ok(text) = String::from_utf8(bytes) else {
                 continue;
             };
+            let complete = text.len() as u64 <= MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1;
+            let (preview_text, start_line, end_line) = if complete {
+                (text, 1, None)
+            } else {
+                source_excerpt_v1(&text, prompt)
+            };
             previews.push(json!({
                 "path": candidate,
                 "sourceDigest": digest,
-                "text": text,
-                "complete": true,
+                "text": preview_text,
+                "complete": complete,
+                "startLine": start_line,
+                "endLine": end_line,
                 "origin": "explicit_task_path"
             }));
             if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
@@ -960,7 +1003,7 @@ impl LocalContextCoordinatorV1 {
                         let Ok(bytes) = self
                             .observed_workspace
                             .execution_epoch
-                            .read_repository_file(path, MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1)
+                            .read_repository_file(path, MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1)
                         else {
                             continue;
                         };
@@ -976,11 +1019,19 @@ impl LocalContextCoordinatorV1 {
                         let Ok(text) = String::from_utf8(bytes) else {
                             continue;
                         };
+                        let complete = text.len() as u64 <= MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1;
+                        let (preview_text, start_line, end_line) = if complete {
+                            (text, 1, None)
+                        } else {
+                            source_excerpt_v1(&text, task.task.definition.prompt())
+                        };
                         previews.push(json!({
                             "path": locator.path(),
                             "sourceDigest": locator.source_digest(),
-                            "text": text,
-                            "complete": true,
+                            "text": preview_text,
+                            "complete": complete,
+                            "startLine": start_line,
+                            "endLine": end_line,
                             "origin": "indexed_candidate"
                         }));
                         if previews.len() == MAX_TASK_START_SOURCE_PREVIEWS_V1 {
@@ -1728,7 +1779,7 @@ impl ToolDiscovery for LocalContextProviderV1 {
                 (
                     "start",
                     "Start immutable task with shared context",
-                    "Start a coding task with a stable task ID and exact task text. Converge exact duplicate intent, enforce dependency readiness, and return a bounded edit brief, shared findings, and coordination status. Set includeSourcePreviews=true to receive up to two digest-checked complete source previews when useful. Use complete previews before redundant reads. After editing, reread only when current bytes are needed and the edit result did not show them.",
+                    "Start a coding task with a stable task ID and exact task text. Converge exact duplicate intent, enforce dependency readiness, and return a bounded edit brief, shared findings, and coordination status. Set includeSourcePreviews=true to receive up to two digest-checked source previews: complete for small files or line-numbered partial excerpts for larger files. Use complete previews before redundant reads; inspect more of a partial file when the edit requires it. After editing, reread only when current bytes are needed and the edit result did not show them.",
                     json!({
                         "type": "object",
                         "properties": {
@@ -2461,6 +2512,20 @@ fn now_ms_v1() -> i64 {
 #[cfg(test)]
 mod validation_preview_tests {
     use super::*;
+
+    #[test]
+    fn large_named_source_excerpt_is_bounded_and_locates_task_term() {
+        let source = format!(
+            "{}fn repo_search() {{\n    let marker = \"repo.search\";\n}}\n{}",
+            "let unrelated = 0;\n".repeat(200),
+            "let later = 1;\n".repeat(200)
+        );
+        let (excerpt, start, end) = source_excerpt_v1(&source, "Fix repo.search truncation");
+        assert!(excerpt.len() <= MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1 as usize);
+        assert!(excerpt.contains("repo.search"));
+        assert!(start > 100);
+        assert!(end.unwrap() >= start);
+    }
 
     #[test]
     fn complete_unittest_companion_suggests_execution_without_claiming_proof() {
