@@ -1,0 +1,25 @@
+{
+  "schema": "again.brain-single-agent-e2e.v1",
+  "recordedAtUtc": "2026-09-24T19:13:26.775594+00:00",
+  "binarySha256": "082515731759222384c99883397c8eb83cfe246d8a7064a6a52887b888429e5e",
+  "classification": {
+    "type": "pass",
+    "code": "brain_event_handoff_passed"
+  },
+  "capturedCompletedEvents": 5,
+  "capturedRunOutcomeAndUsage": true,
+  "nextTaskReceivedCurrentEdit": true,
+  "nextTaskReceivedUnverifiedTestHint": true,
+  "staleEditWithheld": true,
+  "compoundSourceReadsObservedAndStaleWithheld": true,
+  "interactiveTaskStartReceivedBrain": true,
+  "priorTaskOverlapSelectedFile": true,
+  "clearRemovedEvents": true,
+  "source": {
+    "head": "514dff4406e0a0535cfc4c03f8c1643eca1af2ff",
+    "dirty": false,
+    "buildSourceSha": "514dff4406e0a0535cfc4c03f8c1643eca1af2ff",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  }
+}

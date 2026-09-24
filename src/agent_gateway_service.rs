@@ -1461,10 +1461,15 @@ mod tests {
     fn current_brain_preview_skips_index_and_stale_observation_does_not() {
         let workspace = tempfile::tempdir().unwrap();
         fs::create_dir(workspace.path().join("src")).unwrap();
-        let source = workspace.path().join("src/ledger.py");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            b"[package]\nname = \"ledger\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let source = workspace.path().join("src/ledger.rs");
         fs::write(
             &source,
-            b"def balance_helper(value):\n    return value + 1\n",
+            b"fn balance_helper(value: i32) -> i32 { value + 1 }\n",
         )
         .unwrap();
         let root = fs::canonicalize(workspace.path()).unwrap();
@@ -1486,7 +1491,7 @@ mod tests {
                 event_id: "prior-ledger-read".to_owned(),
                 task_id: prior_task_id.to_owned(),
                 kind: "command".to_owned(),
-                path: Some("src/ledger.py".to_owned()),
+                path: Some("src/ledger.rs".to_owned()),
                 source_digest: Some(
                     blake3::hash(&fs::read(&source).unwrap())
                         .to_hex()
@@ -1515,7 +1520,7 @@ mod tests {
         );
         assert_eq!(
             brief["againBrain"]["recentCurrentFiles"][0]["path"],
-            "src/ledger.py"
+            "src/ledger.rs"
         );
         assert!(
             brief["againBrain"]["recentCurrentFiles"][0]["currentCompletePreview"]
@@ -1524,6 +1529,14 @@ mod tests {
                 .contains("balance_helper")
         );
         assert_eq!(brief["sourcePreviews"], json!([]));
+        assert_eq!(
+            brief["validationPreview"]["selectors"][0]["command"],
+            "cargo test"
+        );
+        assert_eq!(
+            brief["validationPreview"]["selectors"][0]["verified"],
+            false
+        );
 
         let weak_match = agent.tool(
             "task.start",
@@ -1537,7 +1550,7 @@ mod tests {
 
         fs::write(
             &source,
-            b"def balance_helper(value):\n    return value + 2\n",
+            b"fn balance_helper(value: i32) -> i32 { value + 2 }\n",
         )
         .unwrap();
         let changed = agent.tool(

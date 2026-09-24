@@ -1053,15 +1053,19 @@ impl LocalContextCoordinatorV1 {
         } else {
             None
         };
-        let brain_has_current_preview = early_brain.as_ref().is_some_and(|brain| {
-            brain["recentCurrentFiles"].as_array().is_some_and(|files| {
-                files.iter().any(|file| {
-                    file["fastPathEligible"] == true
-                        && (file["currentCompletePreview"].as_str().is_some()
-                            || file["currentPartialPreview"]["text"].as_str().is_some())
-                })
+        let brain_fast_path_paths = early_brain
+            .as_ref()
+            .and_then(|brain| brain["recentCurrentFiles"].as_array())
+            .into_iter()
+            .flatten()
+            .filter(|file| {
+                file["fastPathEligible"] == true
+                    && (file["currentCompletePreview"].as_str().is_some()
+                        || file["currentPartialPreview"]["text"].as_str().is_some())
             })
-        });
+            .filter_map(|file| file["path"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        let brain_has_current_preview = !brain_fast_path_paths.is_empty();
         let large_enough_for_preview_fast_path = !explicit_previews.is_empty()
             && index_preflight_refusal.is_none()
             && index_preflight_refusal_v1(
@@ -1275,6 +1279,17 @@ impl LocalContextCoordinatorV1 {
         } else {
             None
         };
+        let validation_code = if brain_has_current_preview {
+            let candidates = brain_fast_path_paths
+                .iter()
+                .map(|path| json!({ "locator": { "path": path } }))
+                .collect::<Vec<_>>();
+            json!({ "candidates": candidates })
+        } else {
+            code_brief.clone()
+        };
+        let validation_preview =
+            validation_preview_v1(&self.workspace, &source_previews, &validation_code);
         let structured = json!({
             "schemaVersion": 1,
             "operation": "task.start",
@@ -1302,7 +1317,7 @@ impl LocalContextCoordinatorV1 {
             "relevantCode": code_brief,
             "sourcePreviews": source_previews,
             "againBrain": again_brain,
-            "validationPreview": validation_preview_v1(&self.workspace, &source_previews, &code_brief),
+            "validationPreview": validation_preview,
             "compulsoryPlan": false
         });
         if freshness_issue.is_some() {
