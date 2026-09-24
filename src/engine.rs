@@ -1938,12 +1938,35 @@ fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<Str
 
 #[cfg(all(feature = "daemon", unix))]
 fn append_repository_brain_v1(prompt: &mut String, brief: &serde_json::Value) {
-    if let Some(brain) = brief.get("againBrain").filter(|brain| !brain.is_null())
-        && let Ok(serialized) = serde_json::to_string(brain)
-    {
+    if let Some(brain) = brief.get("againBrain").filter(|brain| !brain.is_null()) {
+        let mut metadata = brain.clone();
+        let mut partial_previews = Vec::new();
+        if let Some(files) = metadata["recentCurrentFiles"].as_array_mut() {
+            for file in files {
+                let preview = &file["currentPartialPreview"];
+                if let (Some(path), Some(digest), Some(start), Some(end), Some(text)) = (
+                    file["path"].as_str(),
+                    file["currentDigest"].as_str(),
+                    preview["startLine"].as_u64(),
+                    preview["endLine"].as_u64(),
+                    preview["text"].as_str(),
+                ) {
+                    partial_previews.push(format!(
+                        "\nBRAIN_PARTIAL FILE {path} LINES {start}-{end} DIGEST {digest}\n{text}\n"
+                    ));
+                    file["currentPartialPreview"] = serde_json::Value::Null;
+                }
+            }
+        }
+        let Ok(serialized) = serde_json::to_string(&metadata) else {
+            return;
+        };
         prompt.push_str("\nAGAIN_BRAIN ");
         prompt.push_str(&serialized);
-        prompt.push_str("\nBrain previews were rechecked against current file bytes at launch. Use complete previews without rereading until an edit; partial previews show only their stated lines, so inspect more when the edit requires it. Other history is guidance only. Run required validation.");
+        for preview in partial_previews {
+            prompt.push_str(&preview);
+        }
+        prompt.push_str("\nBrain previews were rechecked against current file bytes at launch. Use complete previews without rereading until an edit. A partial preview covers only its stated lines: if it fully shows the code needed for a local edit, edit directly; inspect omitted lines when they matter. Other history is guidance only. Run required validation.");
     }
 }
 
@@ -4017,6 +4040,41 @@ mod tests {
     use crate::executable::ExecutableProvenance;
     use std::io::{Cursor, repeat};
     use tempfile::TempDir;
+
+    #[cfg(all(feature = "daemon", unix))]
+    #[test]
+    fn brain_partial_preview_is_readable_without_duplicating_escaped_source() {
+        let brief = serde_json::json!({
+            "againBrain": {
+                "recentCurrentFiles": [{
+                    "path": "src/util.py",
+                    "currentDigest": "current-digest",
+                    "currentCompletePreview": null,
+                    "currentPartialPreview": {
+                        "text": "def adjust_total(value):\n    return value + 1\n",
+                        "startLine": 1,
+                        "endLine": 2,
+                        "complete": false
+                    }
+                }],
+                "previousSuccessfulTestCommand": null
+            }
+        });
+        let mut prompt = String::new();
+        append_repository_brain_v1(&mut prompt, &brief);
+        let metadata = prompt
+            .split_once("AGAIN_BRAIN ")
+            .unwrap()
+            .1
+            .split_once('\n')
+            .unwrap()
+            .0;
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        assert_eq!(metadata["recentCurrentFiles"][0]["path"], "src/util.py");
+        assert!(metadata["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
+        assert!(prompt.contains("BRAIN_PARTIAL FILE src/util.py LINES 1-2 DIGEST current-digest\ndef adjust_total(value):\n    return value + 1\n"));
+        assert!(!prompt.contains("def adjust_total(value):\\n"));
+    }
 
     #[cfg(all(feature = "daemon", unix))]
     #[test]
