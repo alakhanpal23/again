@@ -46,6 +46,7 @@ class Client:
             bufsize=0,
         )
         self.next_id = 0
+        self.request_sent = threading.Event()
         self.request("initialize", {
             "protocolVersion": PROTOCOL,
             "capabilities": {},
@@ -59,6 +60,7 @@ class Client:
         frame = json.dumps({"jsonrpc": "2.0", "id": identifier, "method": method, "params": params}, separators=(",", ":"))
         self.process.stdin.write(frame.encode() + b"\n")
         self.process.stdin.flush()
+        self.request_sent.set()
         ready, _, _ = select.select([self.process.stdout], [], [], 15)
         require(bool(ready), f"{method} timed out")
         line = self.process.stdout.readline()
@@ -488,10 +490,13 @@ def run(binary: pathlib.Path, source_root: pathlib.Path, source_sha: str) -> dic
             leader_worker.start()
             inflight_binding = reader.wait_for_binding(inflight_start, 5)
             reader.wait_for_event(inflight_binding, inflight_start, "executed", 5)
+            follower_request_id = cancel_follower.next_id + 1
+            cancel_follower.request_sent.clear()
             follower_worker = threading.Thread(target=inflight_search, args=(cancel_follower, follower_outcome))
             follower_worker.start()
+            require(cancel_follower.request_sent.wait(5), "follower request was not sent")
+            cancel_follower.cancel(follower_request_id)
             reader.wait_for_event(inflight_binding, inflight_start, "inflight_candidate", 5)
-            cancel_follower.cancel(cancel_follower.next_id)
             follower_worker.join(timeout=15)
             leader_worker.join(timeout=15)
             require(not follower_worker.is_alive() and not leader_worker.is_alive(),
