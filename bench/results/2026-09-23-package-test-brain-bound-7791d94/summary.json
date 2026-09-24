@@ -1,0 +1,40 @@
+{
+  "accepted": true,
+  "afterManifestChangeBrainHint": null,
+  "afterManifestChangeSelector": null,
+  "afterTestBrainHint": "pnpm test",
+  "afterTestSelector": {
+    "basis": "current_package_test_script",
+    "command": "pnpm test",
+    "source": {
+      "digest": "aa0ff1ec938f951cdba314518013193241c0af59d30c25f1517a491da1daabd1",
+      "path": "package.json",
+      "testScript": "vitest run"
+    },
+    "verified": false
+  },
+  "beforeTestBrainHint": null,
+  "beforeTestSelector": {
+    "basis": "current_package_test_script",
+    "command": "pnpm test",
+    "source": {
+      "digest": "aa0ff1ec938f951cdba314518013193241c0af59d30c25f1517a491da1daabd1",
+      "path": "package.json",
+      "testScript": "vitest run"
+    },
+    "verified": false
+  },
+  "binarySha256": "d1eb554b76f226f1d1b9451d59efc8f13286cf65699e105e6d98435999b7f177",
+  "evidenceScope": "fixed fake-Codex completed test event; no test execution or reuse claim",
+  "fixtureSha256": "0b99ff29c1339c59f004f5f38cf242443aaea2cc4d4c482f76a42ffe3e4cb0c1",
+  "launcherExitCode": 0,
+  "recordedAtUtc": "2026-09-24T04:31:05.250698+00:00",
+  "schema": "again.package-test-brain-gate.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "7791d94993315ca3b5b1cf75e437274753739e5b",
+    "dirty": false,
+    "head": "7791d94993315ca3b5b1cf75e437274753739e5b"
+  }
+}
