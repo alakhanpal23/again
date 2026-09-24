@@ -58,7 +58,7 @@ def main() -> int:
         "schema": "again.brain-ablation.v1",
         "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "evidenceScope": "one local same-launcher ablation pair",
-        "source": source_state(root),
+        "source": source_state(root, binary),
         "binarySha256": sha256(binary),
         "harnessSha256": sha256(pathlib.Path(__file__)),
         "pairHarnessSha256": sha256(pathlib.Path(pair_harness.__file__)),
