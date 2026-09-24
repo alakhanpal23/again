@@ -8,6 +8,43 @@ on the first task in a repository and improve as it learns the repository.
 Parallel coordination and cross-machine sharing are later extensions of the
 same knowledge model, not requirements for this release.
 
+## Default product decision (2026-09-24)
+
+The supported user path should be `again codex` followed by ordinary Codex
+shell and editor tools. The launcher supplies a small verified brief and
+automatically observes completed work; Brain supplies source-current context
+to a later task. The installed skill should not make every cheap read or search
+an Again gateway call. Warm proof and lookup have been slower than direct
+execution on several measured repository calls, and native shell is the
+agent's normal workflow. Keep `again run`, `repo.*`, and `git.*` available for
+explicit, measured cases with useful exact-result or shared-context value.
+
+The next product gate should use a **frozen real-task cohort**, not another
+single showcase repair. Before running it, pin at least three repositories,
+their pre-fix commits, independent edit and test oracles, model/client version,
+approval settings, task text, prior-Brain seeding, and a rate card. Include bug
+fixes and feature edits, small and large repositories, cold and returning
+tasks, and both treatment orders. Count prebrief and prior-observation setup
+time in the corresponding user journey; report returning-task benefit
+separately if that setup is amortized. Retain exact source/build binding,
+raw event digests, accepted patches, agent-run required tests, elapsed time,
+first edit, post-edit time, command executions, tokens, and cost. An incomplete
+or failed task stays in the denominator. The release decision requires the
+full cohort to meet the existing 20% median completion-time and cost targets,
+with no accepted-outcome or required-validation regression and no material
+cold-task or p95 regression.
+
+The current two historical repair fixtures are diagnostic seeds for that
+cohort, not sufficient repository diversity. Codex account usage blocked a
+source-bound repeat on 2026-09-24; offline fixtures and scorecard checks can
+be prepared while live runs are unavailable. The Linux pytest reuse profile
+is not qualified on the stock hosted runner. Keep validation execute-required
+and pursue reuse only after a positive provisioned-host input/effect proof and
+a measured task-level benefit. If the frozen cohort misses a gate, rank time
+and token cost by phase, change one default-path bottleneck, and rerun the
+same frozen cohort. Remove a default feature that consistently raises total
+completion time despite earlier first edits.
+
 The first customer-visible loop is:
 
 ```text

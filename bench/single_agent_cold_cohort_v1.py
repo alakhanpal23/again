@@ -136,6 +136,9 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str,
                       for key in ("uncachedInput", "cachedInput", "output")}
     again_usage = {key: sum(pair["againUsage"][key] for pair in pairs if pair["againUsage"])
                    for key in ("uncachedInput", "cachedInput", "output")}
+    expected_pairs = len(manifest["cases"]) * len(manifest["orders"])
+    all_pairs_accepted = len(pairs) == expected_pairs and all(pair["accepted"] for pair in pairs)
+    all_usage_complete = all(pair["baselineUsage"] and pair["againUsage"] for pair in pairs)
     return {
         "schema": manifest["schema"].replace("cohort.v1", "cohort-result.v1"),
         "recordedAtUtc": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -145,12 +148,15 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str,
         "evidenceScope": manifest["purpose"],
         "acceptedPairs": sum(pair["accepted"] for pair in pairs),
         "totalPairs": len(pairs),
+        "expectedPairs": expected_pairs,
+        "allPairsAccepted": all_pairs_accepted,
         "pairedMedianElapsedRatio": median_ratio,
         "pairedP95ElapsedRatio": p95_ratio,
-        "pairedMedianElapsedTargetMet": median_ratio is not None and median_ratio <= 0.8,
+        "pairedMedianElapsedTargetMet": all_pairs_accepted and all_usage_complete
+        and median_ratio is not None and median_ratio <= 0.8,
         "baselineUsageTotals": baseline_usage,
         "againUsageTotals": again_usage,
-        "allUsageVectorsComplete": all(pair["baselineUsage"] and pair["againUsage"] for pair in pairs),
+        "allUsageVectorsComplete": all_usage_complete,
         "pairs": pairs,
     }
 

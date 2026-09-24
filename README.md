@@ -1,6 +1,6 @@
 # Again
 
-Again helps one coding agent start with a verified repository brief, carry useful source knowledge into later tasks, and avoid repeated investigation. Its local Again Brain records completed Codex activity and rechecks source bytes before presenting prior reads or edits as current.
+Again helps one coding agent start with a verified repository brief, carry useful source knowledge into later tasks, and avoid repeated investigation. Its local Again Brain records completed Codex activity and rechecks source bytes before presenting prior reads, searches, or edits as current. The default coding path uses Codex's normal tools; Again adds the brief and observes completed work.
 
 ![Again system design: a command is classified, its scoped observation and stored proof are verified, then the result is reused or executed](docs/system-design.svg)
 
@@ -23,7 +23,7 @@ unrelated handlers and refuses to overwrite a hook file changed after installati
 The observer does not rewrite or skip a tool call. Codex hook coverage and
 response shapes vary by tool; unrecognized responses contribute only command
 metadata. [Hook contract](https://learn.chatgpt.com/docs/hooks).
-- `again run -- <argv...>` — run a command through the conservative local engine; cache hits return stored stdout, stderr, and status without rerunning the requested command.
+- `again run -- <argv...>` — optional exact-result reuse for eligible repeated local read-only commands when proof is cheaper than execution. The default agent workflow uses native tools.
 - `again reference -- <argv...>` — verify an existing hit and emit compact content-addressed JSON; a miss never executes the command.
 - `again mcp connect --workspace <path>` — start or join the authenticated per-workspace daemon and proxy MCP over stdio. The daemon drains active sessions and retires after ten idle minutes.
 - `again mcp setup --client codex|claude --workspace <path>` — print an exact dry-run plan. Add `--apply`, `--inspect`, or `--remove`; MCP changes use only the official client CLI and are verified afterward. For Codex, add `--with-skill` and `--with-brain-hook` to `--apply` or `--inspect` to manage the personal skill and project Brain observer in the same flow.
@@ -58,11 +58,12 @@ Again's near-term goal is lower time and cost per correct, validated single-agen
 
 ```bash
 cargo install --locked --path . --features daemon
-again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
-# In an interactive Codex session, open /hooks and trust the reviewed Again observer.
+# Run the next commands from the repository you want Codex to edit.
 again codex --workspace "$(pwd -P)" --task-id fix-example --task "Fix the failing example and run its tests" -- --ephemeral
 again brain show --workspace "$(pwd -P)"
 ```
+
+For interactive Codex sessions, install the MCP entry and observer separately with `again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook`, then review and trust the observer in Codex `/hooks`. The launcher captures its event stream without that hook.
 
 ## License
 

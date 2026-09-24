@@ -39,6 +39,16 @@ fn dry_run_renders_the_skill_without_touching_disk() {
     assert!(change.rendered.contains("`context.publish`"));
     assert!(change.rendered.contains("`context.retrieve`"));
     assert!(change.rendered.contains("authenticated local daemon"));
+    assert!(
+        change
+            .rendered
+            .contains("Use ordinary shell and editor tools")
+    );
+    assert!(
+        change
+            .rendered
+            .contains("lookup and proof can cost more than the call itself")
+    );
     assert!(change.rendered.contains("again run --"));
     assert!(change.rendered.contains("again reference --"));
     assert!(change.rendered.contains("Never invoke Again's hidden"));
