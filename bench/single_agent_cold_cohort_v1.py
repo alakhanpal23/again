@@ -68,6 +68,12 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         for item in report["observations"]
     ):
         raise RuntimeError("agent did not run required validation")
+    required_directory = case.get("requiredValidationWorkingDirectory")
+    if required_directory and any(
+        agent_validation_command(item, case["requiredAgentValidation"], required_directory) is None
+        for item in report["observations"]
+    ):
+        raise RuntimeError("agent did not validate from the required package directory")
     if case.get("returningTask"):
         observations = {item["condition"]: item for item in report["observations"]}
         if observations["product"].get("priorBrain", {}).get("path") != "src/util.py":
@@ -97,10 +103,12 @@ def usage_vector(observation: dict) -> dict[str, int] | None:
     return {"uncachedInput": total - cached, "cachedInput": cached, "output": output}
 
 
-def agent_validation_command(observation: dict, selectors: list[str]) -> str | None:
+def agent_validation_command(observation: dict, selectors: list[str],
+                             working_directory: str | None = None) -> str | None:
     return next((action["command"] for action in observation["completedActions"]
                  if action["type"] == "command_execution" and action.get("exitCode") == 0
-                 and any(selector in action["command"] for selector in selectors)), None)
+                 and any(selector in action["command"] for selector in selectors)
+                 and (working_directory is None or working_directory in action["command"])), None)
 
 
 def summarize(manifest: dict, reports: list[dict], binary_hash: str,
@@ -108,6 +116,10 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str,
     pairs = []
     ratios = []
     for report in reports:
+        case = next(case for case in manifest["cases"]
+                    if case["fixture"] == report["fixture"]
+                    and case["sourceFiles"] == report["sourceFiles"])
+        required_directory = case.get("requiredValidationWorkingDirectory")
         observations = {item["condition"]: item for item in report["observations"]}
         baseline, product = observations["baseline"], observations["product"]
         baseline_usage, product_usage = usage_vector(baseline), usage_vector(product)
@@ -127,8 +139,14 @@ def summarize(manifest: dict, reports: list[dict], binary_hash: str,
             "againActions": len(product["completedActions"]),
             "baselineUsage": baseline_usage,
             "againUsage": product_usage,
-            "baselineAgentValidation": agent_validation_command(baseline, report.get("requiredAgentValidation", [])),
-            "againAgentValidation": agent_validation_command(product, report.get("requiredAgentValidation", [])),
+            "baselineAgentValidation": agent_validation_command(
+                baseline, report.get("requiredAgentValidation", []),
+                required_directory,
+            ),
+            "againAgentValidation": agent_validation_command(
+                product, report.get("requiredAgentValidation", []),
+                required_directory,
+            ),
         })
     median_ratio = statistics.median(ratios) if ratios else None
     p95_ratio = sorted(ratios)[math.ceil(0.95 * len(ratios)) - 1] if ratios else None

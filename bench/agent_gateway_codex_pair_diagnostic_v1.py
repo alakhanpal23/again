@@ -34,6 +34,7 @@ TASK_IDS = {
     "js-calculator": "js-calculator-fix",
     "js-calculator-generic-validation": "js-calculator-generic-validation-fix",
     "js-package-script": "js-package-script-fix",
+    "js-nested-package-script": "js-nested-package-script-fix",
     "greeting-feature": "greeting-feature",
     "balance-helper": "balance-helper-fix",
     "balance-helper-large": "balance-helper-large-fix",
@@ -143,6 +144,59 @@ def configure_fixture(name: str) -> None:
             ),
             "package.json": '{"name":"again-package-test-fixture","private":true,"type":"module","packageManager":"npm@11.0.0","scripts":{"test":"node --test test/total.spec.mjs"}}\n',
             "README.md": "# Package test fixture\n",
+        }
+        return
+    if name == "js-nested-package-script":
+        pair.TARGET_ORACLE_MODE = "behavior"
+        node = shutil.which("node")
+        if not node:
+            raise RuntimeError("js-nested-package-script fixture requires node")
+        pair.TEST_COMMAND = (
+            str(pathlib.Path(node).resolve()), "--test", "packages/alpha/test/total.spec.mjs"
+        )
+        pair.TARGET = "packages/alpha/src/total.mjs"
+        pair.TEST = "packages/alpha/test/total.spec.mjs"
+        pair.BUGGY = (
+            "export function total(values) {\n"
+            "  return values.reduce((sum, value) => sum + value, 0) + 1;\n"
+            "}\n"
+        )
+        pair.FIXED = pair.BUGGY.replace("value, 0) + 1", "value, 0)")
+        pair.PROMPT = (
+            "Fix the off-by-one defect in packages/alpha/src/total.mjs so total(values) "
+            "returns the sum. Preserve the exported API. Do not edit tests or other files. "
+            "Run the existing test script for packages/alpha after editing, then stop."
+        )
+        pair.FIXTURE = {
+            pair.TARGET: pair.BUGGY,
+            pair.TEST: (
+                "import test from 'node:test';\n"
+                "import assert from 'node:assert/strict';\n"
+                "import { total } from '../src/total.mjs';\n"
+                "test('sum', () => assert.equal(total([1, 2, 3]), 6));\n"
+                "test('empty', () => assert.equal(total([]), 0));\n"
+                "test('negatives', () => assert.equal(total([-2, 5, -1]), 2));\n"
+            ),
+            "packages/alpha/package.json": (
+                '{"name":"alpha","private":true,"type":"module",'
+                '"packageManager":"npm@11.0.0",'
+                '"scripts":{"test":"node --test test/total.spec.mjs"}}\n'
+            ),
+            "packages/beta/src/total.mjs": "export const unrelated = 1;\n",
+            "packages/beta/package.json": (
+                '{"name":"beta","private":true,"type":"module",'
+                '"packageManager":"pnpm@9.0.0",'
+                '"scripts":{"test":"node --test"}}\n'
+            ),
+            "package.json": (
+                '{"name":"monorepo","private":true,'
+                '"scripts":{"test":"node --test tests/root.spec.mjs"}}\n'
+            ),
+            "tests/root.spec.mjs": (
+                "import test from 'node:test';\n"
+                "test('root package is unrelated', () => {});\n"
+            ),
+            "README.md": "# Package workspace fixture\nPackages alpha and beta are independent.\n",
         }
         return
     if name == "greeting-feature":

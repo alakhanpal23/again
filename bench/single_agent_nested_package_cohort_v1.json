@@ -1,0 +1,18 @@
+{
+  "schema": "again.single-agent-cold-cohort.v1",
+  "model": "gpt-6-sol",
+  "purpose": "Diagnostic nested-package task requiring an agent-run successful validation from the target package; not the balanced release cohort",
+  "orders": ["baseline-first", "again-first"],
+  "agentSettings": ["--ephemeral", "--ignore-user-config", "--json", "--approve-for-me"],
+  "cases": [
+    {
+      "fixture": "js-nested-package-script",
+      "sourceFiles": 0,
+      "fixtureSha256": "01c38841a642a2d736839a4025f692992e3d34ac2c8d0841e1357e9e45459da5",
+      "promptSha256": "3ae5e5719b333bd8c0c068a4c2589299bc8778a4fb4a63ec34f876257968ccb3",
+      "requiredAgentValidation": ["npm test", "node --test"],
+      "requiredValidationWorkingDirectory": "packages/alpha",
+      "oracle": "target-only behavior, harness Node tests, and successful agent validation from packages/alpha"
+    }
+  ]
+}
