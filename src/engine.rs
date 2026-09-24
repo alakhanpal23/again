@@ -1664,11 +1664,15 @@ fn run_agent_child_v1(
     client_name: &str,
     event_reader: Option<CodexRunReaderV1>,
 ) -> Result<i32> {
+    // The daemon closes an MCP connection after 60 seconds without a request.
+    // Renew well before then so a long edit or test cannot lose its lease.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
     let lease_id = session.brief["coordination"]["leaseId"]
         .as_str()
         .filter(|_| session.brief["coordination"]["status"] == "leader")
         .map(str::to_owned);
-    let mut next_heartbeat = Instant::now() + Duration::from_secs(60);
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+    let mut heartbeat_failure = None;
     loop {
         if let Some(status) = child.try_wait()? {
             if let Some(reader) = event_reader {
@@ -1709,6 +1713,9 @@ fn run_agent_child_v1(
                     eprintln!("Again Brain: could not record the completed run: {error:#}");
                 }
             }
+            if let Some(error) = heartbeat_failure {
+                return Err(error);
+            }
             return Ok(status.code().unwrap_or(1));
         }
         if Instant::now() >= next_heartbeat {
@@ -1723,18 +1730,24 @@ fn run_agent_child_v1(
                         "ttlMs": 300_000
                     }),
                 );
-                if !heartbeat
-                    .as_ref()
-                    .is_ok_and(|response| response["outcome"]["status"] == "renewed")
-                {
-                    child.kill()?;
+                let failure = match heartbeat {
+                    Ok(response) if response["outcome"]["status"] == "renewed" => None,
+                    Ok(response) => Some(anyhow!(
+                        "lease renewal returned status {}",
+                        response["outcome"]["status"]
+                    )),
+                    Err(error) => Some(error.context("lease renewal request failed")),
+                };
+                if let Some(error) = failure {
+                    let _ = child.kill();
                     let _ = child.wait();
-                    bail!(
+                    heartbeat_failure = Some(error.context(format!(
                         "task lease heartbeat failed; stopped {client_name} before uncoordinated work"
-                    );
+                    )));
+                    continue;
                 }
             }
-            next_heartbeat = Instant::now() + Duration::from_secs(60);
+            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         }
         thread::sleep(Duration::from_millis(100));
     }
