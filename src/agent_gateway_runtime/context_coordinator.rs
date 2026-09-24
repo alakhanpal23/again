@@ -49,7 +49,7 @@ const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
-const MAX_TASK_SEARCH_EXCERPT_BYTES_V1: usize = 3 * 1024;
+const MAX_TASK_SEARCH_EXCERPT_BYTES_V1: usize = 768;
 const MAX_TASK_SEARCH_SOURCE_BYTES_V1: u64 = 32 * 1024 * 1024;
 const MAX_TASK_SEARCH_FILES_V1: usize = 1_024;
 const MAX_TASK_SEARCH_TIME_V1: Duration = Duration::from_secs(1);
@@ -2873,12 +2873,7 @@ mod validation_preview_tests {
                 .unwrap()
                 .contains("fn sanitize_line_v1")
         );
-        assert!(
-            previews[0]["text"]
-                .as_str()
-                .unwrap()
-                .contains("implementation_end_marker")
-        );
+        assert!(previews[0]["text"].as_str().unwrap().len() <= 768);
         let original_digest = previews[0]["sourceDigest"].as_str().unwrap();
         std::fs::write(
             workspace.path().join("src/code_intelligence/extract.rs"),
