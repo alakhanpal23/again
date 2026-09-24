@@ -1,0 +1,325 @@
+{
+  "accepted": true,
+  "againBinarySha256": "619a090e217e4e8d853ea754f07870ac17e025e7624f3eb1748feae1e9257982",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-nested-package-script",
+  "fixtureSha256": "cc71fd7eba7d39e8768958f43073e4e1d4304050d4093624f906a33df2200fae",
+  "harnessSha256": "e26866c4bbd69ac2be4becdae12c35b0a4872eea6c72380ecc32c115f8004294",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "codexElapsedMs": 14353.175,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'cat packages/alpha/src/total.mjs'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg --files -g 'AGENTS.md' -g '\"'!node_modules'\"'\"",
+          "exitCode": 1,
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat packages/alpha/package.json'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 14353.175,
+      "eventCount": 17,
+      "eventTimeline": [
+        {
+          "elapsedMs": 6076.46,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6076.482,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6076.485,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6076.488,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6076.491,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6076.495,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6099.182,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6099.192,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8842.859,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8866.746,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 10839.52,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 10975.848,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13624.453,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 8866.755,
+      "oracle": {
+        "after_snapshot_sha256": "fbad4303667384c79a240055995831b09558795950f1a8fcf946df96d3296872",
+        "changed_paths": [
+          "packages/alpha/src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 82.291,
+        "test_output_sha256": "a51faa301d3768ddd1c4049ecfa3f749fb273fddb4aaf268ccf8d5735f6bc1c2",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3734,
+      "rawEventFile": "js-nested-package-script-0-baseline-first-baseline.jsonl",
+      "rawEventSha256": "93d7d7cf6a22d26e0c23c463f2f8b1267f11dd758765317d5be58b64af1ca8f5",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 55168,
+        "input_tokens": 64648,
+        "output_tokens": 407,
+        "reasoning_output_tokens": 25
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "933d59335230e0132a42d183d4861fecf46528045e9fc8da1ed0970b43ad3189",
+        "cached_input_tokens": 39680,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790225914279,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48990,
+        "output_tokens": 337,
+        "session_id": "1892572e-be67-4817-ac9c-69ba826fffbc",
+        "started_ms": 1790225902558,
+        "successful_tests": 1,
+        "task_id": "js-nested-package-script-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 12020.924,
+      "completedActions": [
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'npm test'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 12020.924,
+      "eventCount": 9,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5443.799,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 5443.815,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8578.623,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8578.643,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11106.847,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5443.818,
+      "oracle": {
+        "after_snapshot_sha256": "fbad4303667384c79a240055995831b09558795950f1a8fcf946df96d3296872",
+        "changed_paths": [
+          "packages/alpha/src/total.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 80.524,
+        "test_output_sha256": "0e2473a288635dd703b47b3458082e6aab8bef02b3f7c041693c2a0ed4b1099e",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1845,
+      "rawEventFile": "js-nested-package-script-0-baseline-first-product.jsonl",
+      "rawEventSha256": "49f8667587f8fb0f636c52f6434a0d26414a24a4da6d23e44381176a731740c3",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 39680,
+        "input_tokens": 48990,
+        "output_tokens": 337,
+        "reasoning_output_tokens": 30
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "3ae5e5719b333bd8c0c068a4c2589299bc8778a4fb4a63ec34f876257968ccb3",
+  "recordedAtUtc": "2026-09-24T04:58:34.430162+00:00",
+  "requiredAgentValidation": [
+    "npm test"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "e92921450855702f99e76677f86460bf89be2e9c",
+    "dirty": false,
+    "head": "e92921450855702f99e76677f86460bf89be2e9c"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

@@ -1,0 +1,85 @@
+{
+  "schema": "again.single-agent-cold-cohort-result.v1",
+  "recordedAtUtc": "2026-09-24T04:59:03.289638+00:00",
+  "manifestSha256": "3e84a4972ca0cb06b1c94c9a2f7102953ff22cfc1889702a807436ecc117d41f",
+  "binarySha256": "619a090e217e4e8d853ea754f07870ac17e025e7624f3eb1748feae1e9257982",
+  "model": "gpt-6-sol",
+  "evidenceScope": "Diagnostic nested-package task requiring an agent-run successful validation from the target package; not the balanced release cohort",
+  "acceptedPairs": 2,
+  "totalPairs": 2,
+  "pairedMedianElapsedRatio": 0.9239545574940677,
+  "pairedP95ElapsedRatio": 1.0103993654031131,
+  "pairedMedianElapsedTargetMet": false,
+  "baselineUsageTotals": {
+    "uncachedInput": 14480,
+    "cachedInput": 114304,
+    "output": 814
+  },
+  "againUsageTotals": {
+    "uncachedInput": 14573,
+    "cachedInput": 83584,
+    "output": 655
+  },
+  "allUsageVectorsComplete": true,
+  "pairs": [
+    {
+      "fixture": "js-nested-package-script",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 14353.175,
+      "againMs": 12020.924,
+      "elapsedRatio": 0.8375097495850222,
+      "baselineActions": 6,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9480,
+        "cachedInput": 55168,
+        "output": 407
+      },
+      "againUsage": {
+        "uncachedInput": 9310,
+        "cachedInput": 39680,
+        "output": 337
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    },
+    {
+      "fixture": "js-nested-package-script",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 14053.646,
+      "againMs": 14199.795,
+      "elapsedRatio": 1.0103993654031131,
+      "baselineActions": 5,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 5000,
+        "cachedInput": 59136,
+        "output": 407
+      },
+      "againUsage": {
+        "uncachedInput": 5263,
+        "cachedInput": 43904,
+        "output": 318
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    }
+  ],
+  "source": {
+    "head": "e92921450855702f99e76677f86460bf89be2e9c",
+    "dirty": false,
+    "buildSourceSha": "e92921450855702f99e76677f86460bf89be2e9c",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  }
+}
