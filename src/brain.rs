@@ -771,15 +771,12 @@ fn matching_source_read_v1(
     let (path, lines) = match argv.as_slice() {
         [program, path] if program == "cat" => (path.as_str(), None),
         [program, flag, range, path] if program == "sed" && flag == "-n" => {
-            let end = range
-                .strip_prefix("1,")?
-                .strip_suffix('p')?
-                .parse::<usize>()
-                .ok()?;
-            if !(1..=200).contains(&end) {
+            let (start, end) = range.strip_suffix('p')?.split_once(',')?;
+            let (start, end) = (start.parse::<usize>().ok()?, end.parse::<usize>().ok()?);
+            if start == 0 || end < start || end > 8192 || end - start > 512 {
                 return None;
             }
-            (path.as_str(), Some(end))
+            (path.as_str(), Some((start, end)))
         }
         _ => return None,
     };
@@ -809,15 +806,16 @@ fn matching_source_read_v1(
     }
     let (relative, absolute) = workspace_file_v1(workspace, path)?;
     if !source_code_path_v1(&relative)
-        || !fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= 8 * 1024)
+        || !fs::metadata(&absolute).is_ok_and(|meta| meta.len() <= MAX_OBSERVED_FILE_BYTES_V1)
     {
         return None;
     }
     let bytes = fs::read(&absolute).ok()?;
-    let expected = if let Some(end) = lines {
+    let expected = if let Some((start, end)) = lines {
         bytes
             .split_inclusive(|byte| *byte == b'\n')
-            .take(end)
+            .skip(start - 1)
+            .take(end - start + 1)
             .flatten()
             .copied()
             .collect::<Vec<_>>()
@@ -1641,6 +1639,43 @@ mod tests {
         });
         assert_eq!(
             codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn bounded_sed_range_on_large_source_records_only_verified_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        let source = (1..=1200)
+            .map(|line| format!("// source line {line}\n"))
+            .collect::<String>();
+        fs::write(dir.path().join("src/large.rs"), &source).unwrap();
+        assert!(source.len() > 8 * 1024);
+        let output = source
+            .lines()
+            .skip(819)
+            .take(111)
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"large-range","type":"command_execution",
+                    "command":"/bin/zsh -lc \"sed -n '820,930p' src/large.rs\"",
+                    "aggregated_output":output,"exit_code":0}
+        });
+        let events = codex_completed_events_v1(&completed, dir.path(), "session", "task");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].path.as_deref(), Some("src/large.rs"));
+        let digest = blake3::hash(source.as_bytes()).to_hex().to_string();
+        assert_eq!(events[1].source_digest.as_deref(), Some(digest.as_str()));
+        let mut run = CodexRunObservationV1::default();
+        run.observe(&completed, &events);
+        assert_eq!(run.completed_source_reads, 1);
+        let mut wrong = completed;
+        wrong["item"]["aggregated_output"] = "unverified".into();
+        assert_eq!(
+            codex_completed_events_v1(&wrong, dir.path(), "session", "task").len(),
             1
         );
     }
