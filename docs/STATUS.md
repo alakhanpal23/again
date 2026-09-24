@@ -4,7 +4,7 @@ This file distinguishes code that exists from roadmap intent. Implementation sta
 
 ## 2026-09-24 bounded search pipeline observation
 
-Brain now recognizes a completed `rg -n` search followed by an exact trailing `| head -N` with `N` from 1 to 1000. It independently verifies each reported source line and records only positive file and hit-line observations; truncation never proves search completeness or absence. Other pipelines and shell composition remain command metadata only. The focused regression and launcher handoff gate cover a regex search with `head`, a later source-anchored brief, and edit invalidation. Task-level call avoidance and speed from this added coverage remain unmeasured.
+Brain now recognizes a completed `rg -n` search followed by an exact trailing `| head -N` with `N` from 1 to 1000. It independently verifies each reported source line and records only positive file and hit-line observations; truncation never proves search completeness or absence. Other pipelines and shell composition remain command metadata only. The focused regression and [clean release launcher gate](../bench/results/2026-09-24-brain-bounded-search-head-e2e-5ea693b.json) cover a regex search with `head`, a later source-anchored brief, and edit invalidation. Task-level call avoidance and speed from this added coverage remain unmeasured.
 
 ## 2026-09-24 single-agent default path
 
