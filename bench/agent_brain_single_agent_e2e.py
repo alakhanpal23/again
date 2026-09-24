@@ -134,14 +134,14 @@ def run(binary: pathlib.Path) -> dict[str, object]:
 
             launch("fourth", "Improve ledger balance rendering fourth task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
-            if "helper.py" not in brain_files_in_prompt(calls[3][-1]):
+            if "ledger.py" not in brain_files_in_prompt(calls[3][-1]):
                 raise RuntimeError("current read observation was not in the next task")
-            if "FILE helper.py DIGEST" in calls[3][-1]:
+            if "FILE ledger.py DIGEST" in calls[3][-1]:
                 raise RuntimeError("history-selected file was already in the initial source preview")
-            (workspace / "helper.py").write_text("def helper():\n    return 0\n")
+            (workspace / "ledger.py").write_text("def ledger_balance():\n    return 0\n")
             launch("fifth", "Improve ledger balance rendering fifth task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
-            if "helper.py" in brain_files_in_prompt(calls[4][-1]):
+            if "ledger.py" in brain_files_in_prompt(calls[4][-1]):
                 raise RuntimeError("stale read observation remained current")
 
             subprocess.run(
