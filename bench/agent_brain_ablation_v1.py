@@ -19,7 +19,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", required=True, type=pathlib.Path)
     parser.add_argument("--model", default="gpt-6-sol")
-    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large", "balance-helper-excerpt", "historical-search-unlocated"), default="balance-helper")
+    parser.add_argument("--fixture", choices=("balance-helper", "balance-helper-large", "balance-helper-excerpt", "historical-search-unlocated", "historical-python-triple"), default="balance-helper")
     parser.add_argument("--source-files", type=int, choices=(0, 1000), required=True)
     parser.add_argument("--prior-brain-decoys", type=int, default=0)
     parser.add_argument("--order", choices=("cold-first", "seeded-first"), required=True)
@@ -33,9 +33,13 @@ def main() -> int:
     if output.is_relative_to(root):
         parser.error("write diagnostic output outside the source tree")
     pair_harness.configure_fixture(args.fixture)
-    required_validation = (("cargo test --locked --lib historical_search_oracle",)
-                           if args.fixture == "historical-search-unlocated"
-                           else ("python3 -m unittest discover -s tests",))
+    required_validation = (
+        ("cargo test --locked --lib historical_search_oracle",)
+        if args.fixture == "historical-search-unlocated" else
+        ("cargo test --locked --lib historical_python_quote_oracle",)
+        if args.fixture == "historical-python-triple" else
+        ("python3 -m unittest discover -s tests",)
+    )
     order = ("product-cold", "product") if args.order == "cold-first" else ("product", "product-cold")
     observations = []
     output.parent.mkdir(parents=True, exist_ok=True)

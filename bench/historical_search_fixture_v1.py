@@ -4,17 +4,12 @@
 from __future__ import annotations
 
 import hashlib
-import io
-import os
 import pathlib
 import shutil
-import signal
 import subprocess
-import tarfile
-import tempfile
-import time
 
 import agent_gateway_editable_pair as pair
+import historical_repo_fixture_core_v1 as core
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -86,93 +81,22 @@ def configure(original_validate_edit) -> None:
         "oracleSha256": hashlib.sha256(ORACLE.encode()).hexdigest(),
     }
     pair.create_fixture = create_fixture
-    pair.run_tests = run_tests
+    pair.run_tests = core.run_tests
     pair.validate_edit = lambda root, before, timeout: validate_edit(
         original_validate_edit, root, before, timeout
     )
 
 
 def create_fixture(root: pathlib.Path) -> dict[str, str]:
-    archive = subprocess.run(
-        ["git", "-C", str(ROOT), "archive", PARENT_SHA],
-        capture_output=True, check=True, timeout=30,
-    ).stdout
-    if hashlib.sha256(archive).hexdigest() != ARCHIVE_SHA256:
-        raise RuntimeError("historical repository archive changed")
-    count = 0
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
-        for member in tar:
-            relative = pathlib.PurePosixPath(member.name)
-            if (relative.is_absolute() or not relative.parts
-                    or any(part in (".", "..") for part in relative.parts)):
-                raise RuntimeError("historical archive has an invalid path")
-            path = root.joinpath(*relative.parts)
-            if member.isdir():
-                path.mkdir(parents=True, exist_ok=True)
-            elif member.isfile() and member.size <= pair.MAX_FIXTURE_FILE_BYTES:
-                count += 1
-                if count > pair.MAX_FIXTURE_FILES:
-                    raise RuntimeError("historical archive has too many files")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                source = tar.extractfile(member)
-                if source is None:
-                    raise RuntimeError("historical archive file unavailable")
-                path.write_bytes(source.read())
-                path.chmod(0o755 if member.mode & 0o111 else 0o644)
-            else:
-                raise RuntimeError("historical archive has an unsupported entry")
-    target = root / TARGET
-    target.write_text(target.read_text() + ORACLE)
-    subprocess.run(["git", "init", "--quiet", str(root)], check=True, timeout=15)
-    subprocess.run(["git", "add", "-A"], cwd=root, check=True, timeout=30)
-    subprocess.run(
-        ["git", "-c", "user.name=Again Benchmark", "-c", "user.email=benchmark@localhost",
-         "commit", "--quiet", "-m", "Historical pre-fix fixture"],
-        cwd=root, check=True, timeout=30,
+    return core.create_fixture(
+        root, parent_sha=PARENT_SHA, archive_sha256=ARCHIVE_SHA256,
+        target=TARGET, oracle=ORACLE,
+        expected_failures=("long_matching_line_is_bounded", "total_rendered_matches_are_bounded"),
     )
-    before = pair.snapshot(root)
-    failed = subprocess.run(
-        pair.TEST_COMMAND, cwd=root, capture_output=True, text=True, timeout=300,
-    )
-    output = failed.stdout + failed.stderr
-    if failed.returncode != 101 or not all(name in output for name in (
-        "long_matching_line_is_bounded", "total_rendered_matches_are_bounded"
-    )):
-        raise RuntimeError("historical pre-fix regressions did not fail as expected")
-    if pair.snapshot(root) != before:
-        raise RuntimeError("historical prewarm changed tracked fixture files")
-    return before
-
-
-def run_tests(root: pathlib.Path, timeout: float) -> tuple[bool, float, str]:
-    """Run the fixed Rust oracle without limiting compiler artifact file size."""
-    started = time.monotonic()
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        process = subprocess.Popen(
-            pair.TEST_COMMAND, cwd=root, stdin=subprocess.DEVNULL,
-            stdout=stdout, stderr=stderr, start_new_session=True,
-        )
-        timed_out = False
-        try:
-            returncode = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            os.killpg(process.pid, signal.SIGKILL)
-            returncode = process.wait(timeout=10)
-        oversized = any(os.fstat(stream.fileno()).st_size > pair.MAX_CAPTURE_BYTES
-                        for stream in (stdout, stderr))
-        digest = hashlib.sha256()
-        for stream in (stdout, stderr):
-            stream.seek(0)
-            for block in iter(lambda: stream.read(64 * 1024), b""):
-                digest.update(block)
-    return returncode == 0 and not timed_out and not oversized, (time.monotonic() - started) * 1000, digest.hexdigest()
 
 
 def validate_edit(original_validate_edit, root: pathlib.Path,
                   before: dict[str, str], timeout: float) -> dict:
-    result = original_validate_edit(root, before, timeout)
-    oracle_preserved = (root / TARGET).read_text().endswith(ORACLE)
-    result["oracle_preserved"] = oracle_preserved
-    result["passed"] = bool(result["passed"] and oracle_preserved)
-    return result
+    return core.validate_edit(
+        original_validate_edit, root, before, timeout, target=TARGET, oracle=ORACLE,
+    )

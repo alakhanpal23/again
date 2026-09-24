@@ -21,6 +21,7 @@ import tempfile
 import time
 
 import agent_gateway_editable_pair as pair
+import historical_python_quote_fixture_v1
 import historical_search_fixture_v1
 from agent_gateway_authenticated_product_e2e import Client, start_daemon, structured
 from agent_gateway_codex_live_probe_v1 import sha256, source_state
@@ -42,6 +43,7 @@ TASK_IDS = {
     "balance-helper-excerpt": "balance-helper-excerpt-fix",
     "historical-search": "historical-search-output-fix",
     "historical-search-unlocated": "historical-search-unlocated-fix",
+    "historical-python-triple": "historical-python-triple-fix",
 }
 
 DEFAULT_CREATE_FIXTURE = pair.create_fixture
@@ -55,6 +57,9 @@ def configure_fixture(name: str) -> None:
     pair.validate_edit = DEFAULT_VALIDATE_EDIT
     pair.TEST_COMMAND = ("/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q")
     pair.TARGET_ORACLE_MODE = "exact"
+    if name == "historical-python-triple":
+        historical_python_quote_fixture_v1.configure(DEFAULT_VALIDATE_EDIT)
+        return
     if name in ("historical-search", "historical-search-unlocated"):
         historical_search_fixture_v1.configure(DEFAULT_VALIDATE_EDIT)
         if name == "historical-search-unlocated":
@@ -358,11 +363,17 @@ def again_instruction(task_id: str) -> str:
 def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
                      decoy_count: int = 0, search: bool = False) -> dict[str, str | int]:
     """Create prior checked source observations through the real Again launcher."""
-    historical = pair.TARGET == historical_search_fixture_v1.TARGET
-    read_range = "820,930p" if historical else ("1,200p" if len(pair.BUGGY) > 256 else "1,20p")
-    prior_task_id = "prior-search-investigation" if historical else "prior-ledger-investigation"
-    prior_task = ("Investigate repo.search response size and truncation" if historical
-                  else "Investigate ledger balance helper behavior")
+    historical_search = pair.TARGET == historical_search_fixture_v1.TARGET
+    historical_python = pair.TARGET == historical_python_quote_fixture_v1.TARGET
+    read_range = ("820,930p" if historical_search else
+                  "466,540p" if historical_python else
+                  "1,200p" if len(pair.BUGGY) > 256 else "1,20p")
+    prior_task_id = ("prior-search-investigation" if historical_search else
+                     "prior-python-index-investigation" if historical_python else
+                     "prior-ledger-investigation")
+    prior_task = ("Investigate repo.search response size and truncation" if historical_search else
+                  "Investigate Python triple-quote handling in the code index" if historical_python else
+                  "Investigate ledger balance helper behavior")
     if search:
         event_script = (
             "output = ''\n"
@@ -377,7 +388,9 @@ def seed_prior_brain(binary: pathlib.Path, workspace: pathlib.Path,
         event_script = (
             (
                 "content = ''.join((workspace / target).read_text().splitlines(keepends=True)[819:930])\n"
-                if historical else "content = (workspace / target).read_text()\n"
+                if historical_search else
+                "content = ''.join((workspace / target).read_text().splitlines(keepends=True)[465:540])\n"
+                if historical_python else "content = (workspace / target).read_text()\n"
             )
             +
             "print(json.dumps({'type':'item.completed','item':{'id':'prior_read','type':'command_execution',"
