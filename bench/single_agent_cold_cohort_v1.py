@@ -15,6 +15,7 @@ import sys
 
 import agent_gateway_codex_pair_diagnostic_v1 as pair_harness
 import agent_gateway_editable_pair as fixture
+from agent_gateway_codex_live_probe_v1 import source_state
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -55,6 +56,7 @@ def validate_report(report: dict, case: dict, order: str, binary_hash: str, mode
         or report.get("surface") != "product-wrapper"
         or report.get("returningTask") is not bool(case.get("returningTask", False))
         or report.get("source", {}).get("dirty") is not False
+        or report.get("source", {}).get("binarySourceBindingVerified") is not True
         or report.get("order") != (["baseline", "product"] if order == "baseline-first" else ["product", "baseline"])
     ):
         raise RuntimeError(f"pair result does not match frozen case {case['fixture']} {order}")
@@ -159,6 +161,9 @@ def main() -> int:
         raise RuntimeError("cohort requires a clean source tree and an output directory outside it")
     if args.output_dir.resolve().is_relative_to(ROOT):
         raise RuntimeError("cohort output directory must be outside the source tree")
+    build_source = source_state(ROOT, binary)
+    if build_source["binarySourceBindingVerified"] is not True:
+        raise RuntimeError(f"cohort binary is not bound to this clean source: {build_source}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     reports = []
     for case in manifest["cases"]:
@@ -180,6 +185,7 @@ def main() -> int:
             print(json.dumps({"fixture": case["fixture"], "order": order,
                               "accepted": report["accepted"], "report": str(output)}), flush=True)
     summary = summarize(manifest, reports, binary_hash, manifest_path)
+    summary["source"] = build_source
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     print(json.dumps({"acceptedPairs": summary["acceptedPairs"], "totalPairs": summary["totalPairs"],
                       "pairedMedianElapsedRatio": summary["pairedMedianElapsedRatio"]}))

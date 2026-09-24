@@ -541,7 +541,7 @@ def main() -> int:
     if connector.returncode != 0:
         parser.error("--binary must be built with the daemon feature (cargo build --features daemon)")
     root = pathlib.Path(__file__).resolve().parents[1]
-    source_before_run = source_state(root)
+    source_before_run = source_state(root, binary)
     codex = pathlib.Path(subprocess.run(
         ["which", "codex"], capture_output=True, text=True, check=True
     ).stdout.strip()).resolve(strict=True)

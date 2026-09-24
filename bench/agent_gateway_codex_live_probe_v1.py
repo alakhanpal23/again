@@ -36,7 +36,7 @@ def sha256(path: pathlib.Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def source_state(root: pathlib.Path) -> dict[str, object]:
+def source_state(root: pathlib.Path, binary: pathlib.Path | None = None) -> dict[str, object]:
     head = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=True
     ).stdout.strip()
@@ -45,7 +45,29 @@ def source_state(root: pathlib.Path) -> dict[str, object]:
             ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True, check=True
         ).stdout
     )
-    return {"head": head, "dirty": dirty, "binarySourceBindingVerified": False}
+    build_info = None
+    if binary is not None:
+        result = subprocess.run(
+            [str(binary), "build-info"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            try:
+                build_info = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                pass
+    bound = bool(
+        build_info is not None
+        and not dirty
+        and build_info.get("sourceCleanAtBuild") is True
+        and build_info.get("sourceSha") == head
+    )
+    return {
+        "head": head,
+        "dirty": dirty,
+        "buildSourceSha": build_info.get("sourceSha") if build_info else None,
+        "buildSourceClean": build_info.get("sourceCleanAtBuild") if build_info else None,
+        "binarySourceBindingVerified": bound,
+    }
 
 
 def main() -> int:

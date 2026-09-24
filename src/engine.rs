@@ -55,6 +55,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandName {
+    /// Report the source revision embedded when this binary was built.
+    BuildInfo,
     /// Install, inspect, or remove agent integrations.
     Setup(SetupArgs),
     /// Execute a strictly admitted command through the local engine.
@@ -766,6 +768,13 @@ struct FixedFilesystemReadyProbeResult {
 pub fn run_cli() -> Result<i32> {
     let cli = Cli::parse_from(normalized_args());
     match cli.command {
+        CommandName::BuildInfo => {
+            print_pretty_json_v1(&serde_json::json!({
+                "sourceSha": env!("AGAIN_BUILD_SOURCE_SHA"),
+                "sourceCleanAtBuild": env!("AGAIN_BUILD_SOURCE_CLEAN") == "true",
+            }))?;
+            Ok(0)
+        }
         CommandName::Setup(args) => setup(args),
         CommandName::Run(args) => direct_run(args.command),
         CommandName::Reference(args) => direct_reference(args.command),

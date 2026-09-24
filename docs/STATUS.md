@@ -2,6 +2,16 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 release binary source binding
+
+Again now embeds the Git source SHA and whether its source checkout was clean
+at build time. `again build-info` reports both. The paired Codex harness
+captures that identity before writing trace files and marks binary/source
+binding verified only when both the build and starting checkout are clean and
+the SHAs match. This strengthens provenance for future release-binary cohorts;
+the already retained cold cohort below has no embedded binding and remains
+diagnostic evidence.
+
 ## 2026-09-23 Node test guidance for source-adjacent validation
 
 The [current frozen cold cohort](../bench/results/2026-09-23-cold-cohort-current-cb7828d/summary.json)
