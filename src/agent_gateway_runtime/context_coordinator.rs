@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -35,7 +35,9 @@ use crate::task_lifecycle::{
     MAX_TASK_DEPENDENCIES_V1, MAX_TASK_LIST_ITEMS_V1, TaskClaimOutcomeV1, TaskDefinitionV1,
     TaskStateV1,
 };
-use crate::workspace_authority::{RepositoryObservationPlanV1, StateDigestV1};
+use crate::workspace_authority::{
+    RepositoryObservationPlanV1, StateDigestV1, WorkspaceExecutionEpochV1,
+};
 
 const INTERNAL_COMPLETION_FIELD_V1: &str = "__again_context_completion_v1";
 const MAX_CONTEXT_DELTA_ITEMS_V1: usize = 64;
@@ -47,6 +49,150 @@ const TASK_COORDINATION_DEADLINE_MS_V1: i64 = 24 * 60 * 60 * 1_000;
 const MAX_TASK_START_SOURCE_PREVIEWS_V1: usize = 2;
 const MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1: u64 = 2 * 1024;
 const MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1: u64 = 256 * 1024;
+const MAX_TASK_SEARCH_SOURCE_BYTES_V1: u64 = 32 * 1024 * 1024;
+const MAX_TASK_SEARCH_FILES_V1: usize = 1_024;
+const MAX_TASK_SEARCH_TIME_V1: Duration = Duration::from_secs(1);
+
+/// Find a few current source previews when the full code index could not
+/// finish. This bounded scan supplies orientation, never a claim that all
+/// relevant files were found.
+fn bounded_task_search_previews_v1(epoch: &WorkspaceExecutionEpochV1, prompt: &str) -> Vec<Value> {
+    let ignored = [
+        "after",
+        "before",
+        "behavior",
+        "cargo",
+        "edit",
+        "existing",
+        "file",
+        "files",
+        "following",
+        "from",
+        "historical",
+        "implementation",
+        "locked",
+        "oracle",
+        "only",
+        "preserve",
+        "public",
+        "source",
+        "test",
+        "tests",
+        "that",
+        "this",
+        "with",
+    ];
+    let terms = prompt
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| (4..=32).contains(&word.len()))
+        .map(str::to_ascii_lowercase)
+        .filter(|word| !ignored.contains(&word.as_str()))
+        .take(24)
+        .collect::<BTreeSet<_>>();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let editing_tests = prompt.to_ascii_lowercase().contains("edit tests");
+    let Ok(mut files) = epoch.list_source_files(
+        Path::new(""),
+        &crate::agent_gateway_runtime::gateway_workspace_limits_v1(),
+    ) else {
+        return Vec::new();
+    };
+    files.sort_by(|left, right| {
+        let left_path = left.relative_path();
+        let right_path = right.relative_path();
+        (!left_path.starts_with("src"), left_path)
+            .cmp(&(!right_path.starts_with("src"), right_path))
+    });
+    let started = Instant::now();
+    let mut scanned_bytes = 0u64;
+    let mut candidates = Vec::new();
+    for file in files.into_iter().take(MAX_TASK_SEARCH_FILES_V1) {
+        if started.elapsed() >= MAX_TASK_SEARCH_TIME_V1 {
+            break;
+        }
+        let path = file.relative_path();
+        if file.bytes() > MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1
+            || !matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("rs" | "py" | "pyi" | "go" | "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs")
+            )
+        {
+            continue;
+        }
+        let Some(next_bytes) = scanned_bytes.checked_add(file.bytes()) else {
+            break;
+        };
+        if next_bytes > MAX_TASK_SEARCH_SOURCE_BYTES_V1 {
+            break;
+        }
+        scanned_bytes = next_bytes;
+        let Ok(bytes) = epoch.read_repository_file(path, MAX_TASK_START_EXCERPT_SOURCE_BYTES_V1)
+        else {
+            continue;
+        };
+        let Ok(text) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let lowered = text.to_ascii_lowercase();
+        let path_text = path.to_string_lossy().to_ascii_lowercase();
+        let mut score = 0u32;
+        let mut content_matches = 0u32;
+        for term in &terms {
+            let stem = term
+                .strip_suffix("er")
+                .filter(|stem| stem.len() >= 5)
+                .unwrap_or(term);
+            if path_text.contains(term) {
+                score += 4;
+            }
+            if lowered.contains(stem) {
+                score += 1;
+                content_matches += 1;
+            }
+        }
+        if content_matches < 2 {
+            continue;
+        }
+        if !editing_tests
+            && path.components().any(|part| matches!(part, std::path::Component::Normal(name) if name == "tests" || name == "test" || name == "bench"))
+        {
+            score = score.saturating_sub(8);
+        }
+        candidates.push((score, path.to_path_buf(), text));
+    }
+    candidates.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    candidates
+        .into_iter()
+        .take(MAX_TASK_START_SOURCE_PREVIEWS_V1)
+        .filter_map(|(_, path, text)| {
+            let complete = text.len() as u64 <= MAX_TASK_START_SOURCE_PREVIEW_BYTES_V1;
+            let (preview, start_line, end_line) = if complete {
+                (text.clone(), 1, None)
+            } else {
+                source_excerpt_v1(&text, prompt)
+            };
+            if crate::task_lifecycle::screen_sensitive_text_v1(&preview).is_err() {
+                return None;
+            }
+            let digest = StateDigestV1::from_domain_and_bytes(
+                b"again.code-intelligence.source-bytes.v1",
+                text.as_bytes(),
+            )
+            .to_hex();
+            Some(json!({
+                "path": path.to_string_lossy(),
+                "sourceDigest": digest,
+                "text": preview,
+                "complete": complete,
+                "startLine": start_line,
+                "endLine": end_line,
+                "origin": "bounded_task_search_candidate"
+            }))
+        })
+        .collect()
+}
 
 pub(crate) fn source_excerpt_v1(text: &str, prompt: &str) -> (String, usize, Option<usize>) {
     source_excerpt_with_budget_v1(
@@ -1150,6 +1296,16 @@ impl LocalContextCoordinatorV1 {
                 ),
             }
         };
+        if include_source_previews
+            && source_previews.is_empty()
+            && code_brief["incomplete"] == true
+            && freshness_issue.is_none()
+        {
+            source_previews = bounded_task_search_previews_v1(
+                &self.observed_workspace.execution_epoch,
+                task.task.definition.prompt(),
+            );
+        }
         if freshness_issue.is_some() {
             code_brief = json!({
                 "schemaVersion": 1,
@@ -1227,6 +1383,24 @@ impl LocalContextCoordinatorV1 {
         } else {
             None
         };
+        if let Some(brain) = again_brain.as_ref() {
+            let brain_preview_paths = brain["recentCurrentFiles"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|file| {
+                    file["currentCompletePreview"].as_str().is_some()
+                        || file["currentPartialPreview"]["text"].as_str().is_some()
+                })
+                .filter_map(|file| file["path"].as_str())
+                .collect::<BTreeSet<_>>();
+            source_previews.retain(|preview| {
+                preview["origin"] != "bounded_task_search_candidate"
+                    || !preview["path"]
+                        .as_str()
+                        .is_some_and(|path| brain_preview_paths.contains(path))
+            });
+        }
         let structured = json!({
             "schemaVersion": 1,
             "operation": "task.start",
@@ -2660,6 +2834,55 @@ mod validation_preview_tests {
         assert!(excerpt.contains("let implementation = true"));
         assert!(!excerpt.contains("fn closing_triple_quote_at_line_end"));
         assert!(start > 100);
+    }
+
+    #[test]
+    fn bounded_task_search_previews_current_implementation_before_test_decoy() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("src/code_intelligence")).unwrap();
+        std::fs::create_dir_all(workspace.path().join("tests")).unwrap();
+        let implementation = format!(
+            "{}fn sanitize_line_v1(python_triple_quote: &str) -> bool {{\n    python_triple_quote == \"triple\"\n}}\n{}",
+            "// prelude\n".repeat(250),
+            "// trailing\n".repeat(100),
+        );
+        std::fs::write(
+            workspace.path().join("src/code_intelligence/extract.rs"),
+            &implementation,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("tests/triple_quote.py"),
+            "def test_python_triple_quote_sanitizer(): pass\n",
+        )
+        .unwrap();
+        let root = std::fs::canonicalize(workspace.path()).unwrap();
+        let observed = SharedObservedWorkspaceV1::begin(&root).unwrap();
+        let previews = bounded_task_search_previews_v1(
+            &observed.execution_epoch,
+            "Fix the Python code index sanitizer for triple quote boundaries; run tests",
+        );
+        assert_eq!(previews[0]["path"], "src/code_intelligence/extract.rs");
+        assert_eq!(previews[0]["origin"], "bounded_task_search_candidate");
+        assert_eq!(previews[0]["complete"], false);
+        assert!(
+            previews[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("fn sanitize_line_v1")
+        );
+        let original_digest = previews[0]["sourceDigest"].as_str().unwrap();
+        std::fs::write(
+            workspace.path().join("src/code_intelligence/extract.rs"),
+            implementation.replace("== \"triple\"", "!= \"triple\""),
+        )
+        .unwrap();
+        let changed = SharedObservedWorkspaceV1::begin(&root).unwrap();
+        let later = bounded_task_search_previews_v1(
+            &changed.execution_epoch,
+            "Fix the Python code index sanitizer for triple quote boundaries; run tests",
+        );
+        assert_ne!(later[0]["sourceDigest"], original_digest);
     }
 
     #[test]
