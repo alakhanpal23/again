@@ -203,24 +203,24 @@ pub fn codex_completed_events_v1(
                 created_ms,
                 authorization_scope_digest: authorization_scope_digest.clone(),
             }];
-            if exit_code == 0
-                && let Some(read) = matching_source_read_v1(item, workspace, command)
-            {
-                events.push(BrainEventV1 {
-                    session_id: session_id.to_owned(),
-                    event_id: event_id.to_owned(),
-                    task_id: task_id.to_owned(),
-                    kind: "command".to_owned(),
-                    path: Some(read.path),
-                    source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
-                    read_start_line: read.range.map(|(start, _)| start),
-                    read_end_line: read.range.map(|(_, end)| end),
-                    command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
-                    command_hint: None,
-                    exit_code: Some(exit_code),
-                    created_ms,
-                    authorization_scope_digest,
-                });
+            if exit_code == 0 {
+                for read in matching_source_reads_v1(item, workspace, command) {
+                    events.push(BrainEventV1 {
+                        session_id: session_id.to_owned(),
+                        event_id: event_id.to_owned(),
+                        task_id: task_id.to_owned(),
+                        kind: "command".to_owned(),
+                        path: Some(read.path),
+                        source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
+                        read_start_line: read.range.map(|(start, _)| start),
+                        read_end_line: read.range.map(|(_, end)| end),
+                        command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                        command_hint: None,
+                        exit_code: Some(exit_code),
+                        created_ms,
+                        authorization_scope_digest: authorization_scope_digest.clone(),
+                    });
+                }
             }
             if exit_code == 0 {
                 for (relative, bytes) in matching_source_search_v1(item, workspace, command) {
@@ -312,24 +312,24 @@ pub fn codex_post_tool_event_v1(value: &Value, workspace: &Path) -> Option<Vec<B
             created_ms,
             authorization_scope_digest: authorization_scope_digest.clone(),
         });
-        if exit_code.is_none()
-            && let Some(read) = matching_source_read_v1(&item, workspace, command)
-        {
-            events.push(BrainEventV1 {
-                session_id: session_id.to_owned(),
-                event_id: event_id.to_owned(),
-                task_id: session_id.to_owned(),
-                kind: "command".to_owned(),
-                path: Some(read.path),
-                source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
-                read_start_line: read.range.map(|(start, _)| start),
-                read_end_line: read.range.map(|(_, end)| end),
-                command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
-                command_hint: None,
-                exit_code: None,
-                created_ms,
-                authorization_scope_digest,
-            });
+        if exit_code.is_none() {
+            for read in matching_source_reads_v1(&item, workspace, command) {
+                events.push(BrainEventV1 {
+                    session_id: session_id.to_owned(),
+                    event_id: event_id.to_owned(),
+                    task_id: session_id.to_owned(),
+                    kind: "command".to_owned(),
+                    path: Some(read.path),
+                    source_digest: Some(blake3::hash(&read.bytes).to_hex().to_string()),
+                    read_start_line: read.range.map(|(start, _)| start),
+                    read_end_line: read.range.map(|(_, end)| end),
+                    command_digest: Some(blake3::hash(command.as_bytes()).to_hex().to_string()),
+                    command_hint: None,
+                    exit_code: None,
+                    created_ms,
+                    authorization_scope_digest: authorization_scope_digest.clone(),
+                });
+            }
         }
         if exit_code.is_none() {
             for (relative, bytes) in matching_source_search_v1(&item, workspace, command) {
@@ -888,20 +888,78 @@ struct MatchedSourceReadV1 {
     range: Option<(u32, u32)>,
 }
 
-fn matching_source_read_v1(
+fn matching_source_reads_v1(
     item: &Value,
     workspace: &Path,
     command: &str,
-) -> Option<MatchedSourceReadV1> {
-    let outer = shell_words::split(command).ok()?;
-    let argv = if matches!(outer.as_slice(), [shell, flag, _]
+) -> Vec<MatchedSourceReadV1> {
+    let Some(output) = item["aggregated_output"]
+        .as_str()
+        .filter(|s| s.len() <= 1024 * 1024)
+    else {
+        return Vec::new();
+    };
+    let Ok(outer) = shell_words::split(command) else {
+        return Vec::new();
+    };
+    let script = if matches!(outer.as_slice(), [shell, flag, _]
         if shell == "/bin/zsh" && flag == "-lc")
     {
-        shell_words::split(&outer[2]).ok()?
+        outer[2].as_str()
     } else {
-        outer
+        command
     };
-    let (path, lines) = match argv.as_slice() {
+    // Recognize only a short conjunction of read commands, optionally followed
+    // by `git status --short`. Other shell syntax may change bytes or reorder
+    // output, so it never creates a source observation.
+    if script.bytes().any(|byte| {
+        matches!(
+            byte,
+            b';' | b'|' | b'<' | b'>' | b'$' | b'`' | b'\n' | b'\r'
+        )
+    }) {
+        return Vec::new();
+    }
+    let parts = script.split(" && ").collect::<Vec<_>>();
+    if parts.is_empty() || parts.len() > 4 {
+        return Vec::new();
+    }
+    let mut reads: Vec<MatchedSourceReadV1> = Vec::new();
+    let mut expected_output = Vec::new();
+    let mut has_status_suffix = false;
+    for (index, part) in parts.iter().enumerate() {
+        let Ok(argv) = shell_words::split(part) else {
+            return Vec::new();
+        };
+        if argv.as_slice() == ["git", "status", "--short"] && index == parts.len() - 1 {
+            has_status_suffix = true;
+            continue;
+        }
+        let Some((read, printed)) = matched_source_read_argv_v1(workspace, &argv) else {
+            return Vec::new();
+        };
+        expected_output.extend_from_slice(&printed);
+        if let Some(existing) = reads.iter_mut().find(|existing| existing.path == read.path) {
+            *existing = read;
+        } else {
+            reads.push(read);
+        }
+    }
+    if reads.is_empty()
+        || expected_output.is_empty()
+        || (has_status_suffix && !output.as_bytes().starts_with(&expected_output))
+        || (!has_status_suffix && output.as_bytes() != expected_output)
+    {
+        return Vec::new();
+    }
+    reads
+}
+
+fn matched_source_read_argv_v1(
+    workspace: &Path,
+    argv: &[String],
+) -> Option<(MatchedSourceReadV1, Vec<u8>)> {
+    let (path, lines) = match argv {
         [program, path] if program == "cat" => (path.as_str(), None),
         [program, flag, range, path] if program == "sed" && flag == "-n" => {
             let (start, end) = range.strip_suffix('p')?.split_once(',')?;
@@ -955,18 +1013,18 @@ fn matching_source_read_v1(
     } else {
         bytes.clone()
     };
-    if item["aggregated_output"].as_str()?.as_bytes() != expected {
-        return None;
-    }
     let range = lines.and_then(|(start, end)| {
         let actual_end = end.min(bytes.split_inclusive(|byte| *byte == b'\n').count());
         (start <= actual_end).then_some((start as u32, actual_end as u32))
     });
-    Some(MatchedSourceReadV1 {
-        path: relative,
-        bytes,
-        range,
-    })
+    Some((
+        MatchedSourceReadV1 {
+            path: relative,
+            bytes,
+            range,
+        },
+        expected,
+    ))
 }
 
 /// Nominate source files from a simple completed search. This verifies only
@@ -1873,6 +1931,58 @@ mod tests {
         });
         assert_eq!(
             codex_completed_events_v1(&composed, &workspace, "session", "old-task").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn compound_source_reads_require_exact_printed_prefix_and_safe_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/helper.rs"), "one\ntwo\nthree\n").unwrap();
+        let mut completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"compound-read","type":"command_execution",
+                    "command":"/bin/zsh -lc \"sed -n '1,1p' src/helper.rs && sed -n '3,3p' src/helper.rs && git status --short\"",
+                    "aggregated_output":"one\nthree\n M src/helper.rs\n", "exit_code":0}
+        });
+        let events = codex_completed_events_v1(&completed, dir.path(), "session", "task");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].path.as_deref(), Some("src/helper.rs"));
+        assert_eq!(
+            (events[1].read_start_line, events[1].read_end_line),
+            (Some(3), Some(3))
+        );
+        let store = Store::open(dir.path().join("state")).unwrap();
+        for event in &events {
+            store.record_brain_event_v1(event).unwrap();
+        }
+        fs::write(dir.path().join("src/other.rs"), "other\n").unwrap();
+        completed["item"]["command"] =
+            "/bin/zsh -lc \"cat src/helper.rs && cat src/other.rs\"".into();
+        completed["item"]["aggregated_output"] = "one\ntwo\nthree\nother\n".into();
+        let two_files = codex_completed_events_v1(&completed, dir.path(), "session", "task");
+        assert_eq!(two_files.len(), 3);
+        assert_eq!(two_files[1].path.as_deref(), Some("src/helper.rs"));
+        assert_eq!(two_files[2].path.as_deref(), Some("src/other.rs"));
+        completed["item"]["command"] = "/bin/zsh -lc \"sed -n '1,1p' src/helper.rs && sed -n '3,3p' src/helper.rs && git status --short\"".into();
+        completed["item"]["aggregated_output"] = "one\nWRONG\n M src/helper.rs\n".into();
+        assert_eq!(
+            codex_completed_events_v1(&completed, dir.path(), "session", "task").len(),
+            1
+        );
+        completed["item"]["aggregated_output"] = "one\nthree\n M src/helper.rs\n".into();
+        completed["item"]["command"] =
+            "/bin/zsh -lc \"sed -n '1,1p' src/helper.rs && touch changed && git status --short\""
+                .into();
+        assert_eq!(
+            codex_completed_events_v1(&completed, dir.path(), "session", "task").len(),
+            1
+        );
+        fs::write(dir.path().join("src/helper.rs"), "one\ntwo\nchanged\n").unwrap();
+        completed["item"]["command"] = "/bin/zsh -lc \"sed -n '1,1p' src/helper.rs && sed -n '3,3p' src/helper.rs && git status --short\"".into();
+        assert_eq!(
+            codex_completed_events_v1(&completed, dir.path(), "session", "task").len(),
             1
         );
     }
