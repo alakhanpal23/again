@@ -816,39 +816,88 @@ fn matching_source_search_v1(
     } else {
         outer
     };
-    let (pattern, operand) = match argv.as_slice() {
-        [program, line_flag, fixed_flag, pattern, operand]
-            if program == "rg" && line_flag == "-n" && fixed_flag == "-F" =>
-        {
-            (pattern.as_str(), operand.as_str())
-        }
-        [program, line_flag, pattern, operand] if program == "rg" && line_flag == "-n" => {
-            (pattern.as_str(), operand.as_str())
-        }
-        _ => return Vec::new(),
-    };
-    if !(2..=64).contains(&pattern.len())
-        || !pattern
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        || (operand != "."
-            && (operand.starts_with('-')
-                || !Path::new(operand)
-                    .components()
-                    .all(|part| matches!(part, std::path::Component::Normal(_)))))
+    if argv.first().is_none_or(|program| program != "rg")
+        || argv.get(1).is_none_or(|flag| flag != "-n")
     {
         return Vec::new();
     }
-    let search_root = if operand == "." {
-        match fs::canonicalize(workspace) {
-            Ok(root) => root,
-            Err(_) => return Vec::new(),
-        }
+    let fixed = argv.get(2).is_some_and(|flag| flag == "-F");
+    let pattern_index = if fixed { 3 } else { 2 };
+    let Some(pattern) = argv.get(pattern_index) else {
+        return Vec::new();
+    };
+    if !(2..=128).contains(&pattern.len()) {
+        return Vec::new();
+    }
+    let terms = if fixed {
+        vec![pattern.as_str()]
     } else {
-        let Some((_, root)) = workspace_file_v1(workspace, operand) else {
+        pattern.split('|').collect::<Vec<_>>()
+    };
+    if terms.is_empty()
+        || terms.len() > 8
+        || terms.iter().any(|term| {
+            !(2..=64).contains(&term.len())
+                || !term
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return Vec::new();
+    }
+    let mut operands = Vec::new();
+    let mut position = pattern_index + 1;
+    while position < argv.len() {
+        let operand = argv[position].as_str();
+        if matches!(operand, "--glob" | "-g") {
+            let Some(glob) = argv.get(position + 1) else {
+                return Vec::new();
+            };
+            if glob.is_empty()
+                || glob.len() > 128
+                || !glob.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(byte, b'_' | b'-' | b'.' | b'/' | b'*' | b'!' | b'?')
+                })
+            {
+                return Vec::new();
+            }
+            position += 2;
+            continue;
+        }
+        if operand == "2>/dev/null" && position + 1 == argv.len() {
+            break;
+        }
+        if operands.len() == 4
+            || (operand != "."
+                && (operand.starts_with('-')
+                    || !Path::new(operand)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))))
+        {
             return Vec::new();
+        }
+        let root = if operand == "." {
+            match fs::canonicalize(workspace) {
+                Ok(root) => root,
+                Err(_) => return Vec::new(),
+            }
+        } else {
+            let Some((_, root)) = workspace_file_v1(workspace, operand) else {
+                return Vec::new();
+            };
+            root
         };
-        root
+        operands.push((operand, root));
+        position += 1;
+    }
+    if operands.is_empty() {
+        return Vec::new();
+    }
+    let single_file = if operands.len() == 1 && operands[0].1.is_file() {
+        Some(operands[0].0)
+    } else {
+        None
     };
     let mut files = Vec::new();
     for line in output.lines().take(32) {
@@ -859,8 +908,8 @@ fn matching_source_search_v1(
             continue;
         };
         let (path, line_number, reported) =
-            if search_root.is_file() && first.parse::<usize>().is_ok() {
-                (operand, first, rest)
+            if let Some(single_file) = single_file.filter(|_| first.parse::<usize>().is_ok()) {
+                (single_file, first, rest)
             } else {
                 let Some((line_number, reported)) = rest.split_once(':') else {
                     continue;
@@ -876,7 +925,7 @@ fn matching_source_search_v1(
         let Some((relative, absolute)) = workspace_file_v1(workspace, path) else {
             continue;
         };
-        if !absolute.starts_with(&search_root)
+        if !operands.iter().any(|(_, root)| absolute.starts_with(root))
             || !source_code_path_v1(&relative)
             || files.iter().any(|(selected, _)| selected == &relative)
             || !fs::metadata(&absolute).is_ok_and(|meta| meta.is_file() && meta.len() <= 8 * 1024)
@@ -889,7 +938,7 @@ fn matching_source_search_v1(
         let Some(actual) = bytes.split(|byte| *byte == b'\n').nth(line_number - 1) else {
             continue;
         };
-        if actual == reported.as_bytes() && reported.contains(pattern) {
+        if actual == reported.as_bytes() && terms.iter().any(|term| reported.contains(term)) {
             files.push((relative, bytes));
         }
     }
@@ -1543,9 +1592,37 @@ mod tests {
                 .as_deref(),
             Some("src/ledger.py")
         );
+        fs::create_dir(workspace.join("tests")).unwrap();
+        fs::write(
+            workspace.join("tests/test_ledger.py"),
+            "def test_balance():\n    pass\n",
+        )
+        .unwrap();
+        let multi_root = serde_json::json!({
+            "type":"item.completed", "item":{"id":"multi_root","type":"command_execution",
+                "command":"/bin/zsh -lc 'rg -n \"balance|value\" src tests 2>/dev/null'", "exit_code":0,
+                "aggregated_output":"src/ledger.py:1:def balance():\ntests/test_ledger.py:1:def test_balance():\n"}
+        });
+        let multi_root_events =
+            codex_completed_events_v1(&multi_root, &workspace, "session", "old-task");
+        assert_eq!(multi_root_events.len(), 3);
+        assert_eq!(multi_root_events[1].path.as_deref(), Some("src/ledger.py"));
+        assert_eq!(
+            multi_root_events[2].path.as_deref(),
+            Some("tests/test_ledger.py")
+        );
+        let globbed = serde_json::json!({
+            "type":"item.completed", "item":{"id":"globbed","type":"command_execution",
+                "command":"rg -n balance src --glob '!background/**'", "exit_code":0,
+                "aggregated_output":"src/ledger.py:1:def balance():\n"}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&globbed, &workspace, "session", "old-task").len(),
+            2
+        );
         let unsafe_command = serde_json::json!({
             "type":"item.completed", "item":{"id":"unsafe","type":"command_execution",
-                "command":"rg -n 'balance|secret' src", "exit_code":0,
+                "command":"rg -n 'balance.*secret' src", "exit_code":0,
                 "aggregated_output":"src/ledger.py:1:def balance():\n"}
         });
         assert_eq!(

@@ -269,7 +269,7 @@ broader task evidence.
 
 ## 2026-09-23 source-matched native reads
 
-The Brain also nominates up to four source files from a completed `rg -n` literal-identifier search over an explicit workspace file, directory, or root. It accepts a cited match only when the reported line number and line bytes match an independently read current file, the file is within the searched subtree, and the source is at most 8 KiB. Both launcher events with a successful exit and interactive Bash hook responses without an exit code can yield these source observations. The later task still checks the file digest before showing it. This proves cited source lines, not search completeness, absence, or the command's exit status; unsupported searches remain command metadata only.
+The Brain also nominates up to four source files from a completed `rg -n` search using one literal identifier or a bounded alternation of identifiers, across up to four explicit workspace files, directories, or the root. A bounded `--glob` and trailing `2>/dev/null` are accepted. It accepts a cited match only when the reported line number and line bytes match an independently read current file, the file is within a searched subtree, and the source is at most 8 KiB. Both launcher events with a successful exit and interactive Bash hook responses without an exit code can yield these source observations. The later task still checks the file digest before showing it. This proves cited source lines, not search completeness, absence, or the command's exit status; unsupported searches remain command metadata only.
 
 The Brain now recognizes single-file `cat` and bounded `sed -n 1,Np` reads,
 including relative paths, only when completed client output exactly matches
