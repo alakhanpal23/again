@@ -1,0 +1,396 @@
+[
+  {
+    "condition": "product",
+    "exitCode": 0,
+    "timedOut": false,
+    "eventsCaptured": true,
+    "elapsedMs": 52200.052,
+    "preparationMs": 0.0,
+    "codexElapsedMs": 52200.052,
+    "eventTimeline": [
+      {
+        "elapsedMs": 6271.235,
+        "event": "item.started",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6271.251,
+        "event": "item.completed",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6292.471,
+        "event": "item.started",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6292.506,
+        "event": "item.completed",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 9039.172,
+        "event": "item.started",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 9039.197,
+        "event": "item.completed",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 40359.669,
+        "event": "item.started",
+        "itemId": "item_5",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 40383.301,
+        "event": "item.completed",
+        "itemId": "item_5",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 43831.485,
+        "event": "item.started",
+        "itemId": "item_6",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 48133.444,
+        "event": "item.completed",
+        "itemId": "item_6",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 51260.801,
+        "event": "turn.completed",
+        "itemId": null,
+        "itemType": null
+      }
+    ],
+    "firstEditMs": 40383.31,
+    "rawEventBytes": 10725,
+    "rawEventSha256": "207c9ef6d033cb33e4249155316cb54148a69225313f5a6830ab902bfcf10cb9",
+    "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+    "eventCount": 16,
+    "completedActions": [
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"rg -n 'repository_search_v1|repo.search' src/agent_gateway_runtime.rs\"",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"rg -n 'historical_search_oracle|MAX_SEARCH_RESULTS_V1|lineTruncated|resultTruncated|truncated' src tests 2>/dev/null\"",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"sed -n '1320,1370p' src/agent_gateway_runtime.rs; sed -n '45,70p' src/agent_gateway_runtime.rs; rg -n 'fn path_text_v1|fn collect_regular_files_v1' src/agent_gateway_runtime.rs\"",
+        "exitCode": 0
+      },
+      {
+        "type": "file_change",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "",
+        "exitCode": null
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+        "exitCode": 0
+      }
+    ],
+    "usage": {
+      "input_tokens": 96323,
+      "cached_input_tokens": 81536,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 2219,
+      "reasoning_output_tokens": 1048
+    },
+    "oracle": {
+      "passed": true,
+      "target_oracle_mode": "behavior",
+      "target_oracle_passed": true,
+      "exact_target": false,
+      "collateral_safe": true,
+      "changed_paths": [
+        "src/agent_gateway_runtime.rs"
+      ],
+      "tests_passed": true,
+      "test_elapsed_ms": 133.638,
+      "test_output_sha256": "16df7569220c6e36d9feab38e6bd136b4247e203efa3f59e04734970ca023eef",
+      "after_snapshot_sha256": "3efc9b5655f846956189bb30f8100ce8a02ea2c827cfbaf916936cca1460f4e0",
+      "oracle_preserved": true
+    },
+    "agentValidationObserved": true,
+    "againStatsDelta": {
+      "requested": 0,
+      "executed": 0,
+      "exact_hits": 0,
+      "inflight_joins": 0,
+      "context_events": 1
+    },
+    "priorBrain": null,
+    "livePriorTask": {
+      "elapsedMs": 11145.349,
+      "usage": {
+        "input_tokens": 33980,
+        "cached_input_tokens": 28544,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 211,
+        "reasoning_output_tokens": 32
+      },
+      "completedCommands": 1,
+      "brainObserved": true,
+      "rawEventSha256": "e6aba1cfb59630cd3a4ae87cbd4aa34f8555e8d7d3e5e04dd7f271c5b0ada754",
+      "rawEventBytes": 1376
+    },
+    "brainRun": {
+      "authorization_scope_digest": "9058f2f39ccce237ff6821ec243278ab15a14ca5546374ea8324b4305917cc82",
+      "cached_input_tokens": 81536,
+      "completed_commands": 4,
+      "completed_edits": 1,
+      "completed_mcp_calls": 0,
+      "completed_ms": 1790290076580,
+      "completed_source_reads": 5,
+      "exit_code": 0,
+      "input_tokens": 96323,
+      "output_tokens": 2219,
+      "session_id": "13bf7773-11ad-40b1-bbf1-440507f8e3ee",
+      "started_ms": 1790290024411,
+      "successful_tests": 1,
+      "task_id": "historical-search-unlocated-fix",
+      "turn_completed": true
+    },
+    "brainRunError": null
+  },
+  {
+    "condition": "product",
+    "exitCode": 0,
+    "timedOut": false,
+    "eventsCaptured": true,
+    "elapsedMs": 56553.284,
+    "preparationMs": 0.0,
+    "codexElapsedMs": 56553.284,
+    "eventTimeline": [
+      {
+        "elapsedMs": 6269.275,
+        "event": "item.started",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6269.293,
+        "event": "item.started",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6269.309,
+        "event": "item.completed",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6269.333,
+        "event": "item.completed",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 10245.464,
+        "event": "item.started",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 10245.5,
+        "event": "item.completed",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 10245.505,
+        "event": "item.started",
+        "itemId": "item_4",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 10245.512,
+        "event": "item.completed",
+        "itemId": "item_4",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 45541.467,
+        "event": "item.started",
+        "itemId": "item_6",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 45566.186,
+        "event": "item.completed",
+        "itemId": "item_6",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 47946.177,
+        "event": "item.started",
+        "itemId": "item_7",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 52783.339,
+        "event": "item.completed",
+        "itemId": "item_7",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 55819.361,
+        "event": "turn.completed",
+        "itemId": null,
+        "itemType": null
+      }
+    ],
+    "firstEditMs": 45566.194,
+    "rawEventBytes": 12543,
+    "rawEventSha256": "66d868873006b19d27659b297ce7335e1900c2875ee9a79d3914574669a8f35c",
+    "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+    "eventCount": 18,
+    "completedActions": [
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"rg -n 'repository_search_v1|repo.search' src/agent_gateway_runtime.rs tests src | head -100\"",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"rg -n 'MAX_SEARCH_RESULTS_V1|historical_search_oracle|lineTruncated|resultTruncated|truncated' src/agent_gateway_runtime.rs tests src | head -100\"",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"sed -n '45,68p;1320,1365p' src/agent_gateway_runtime.rs\"",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"rg -n 'lineTruncated|resultTruncated|repo.search|\\\"truncated\\\"' . --glob '\"'!target/**'\"' | head -100\"",
+        "exitCode": 0
+      },
+      {
+        "type": "file_change",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "",
+        "exitCode": null
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+        "exitCode": 0
+      }
+    ],
+    "usage": {
+      "input_tokens": 98793,
+      "cached_input_tokens": 87936,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 2406,
+      "reasoning_output_tokens": 1181
+    },
+    "oracle": {
+      "passed": true,
+      "target_oracle_mode": "behavior",
+      "target_oracle_passed": true,
+      "exact_target": false,
+      "collateral_safe": true,
+      "changed_paths": [
+        "src/agent_gateway_runtime.rs"
+      ],
+      "tests_passed": true,
+      "test_elapsed_ms": 128.644,
+      "test_output_sha256": "16df7569220c6e36d9feab38e6bd136b4247e203efa3f59e04734970ca023eef",
+      "after_snapshot_sha256": "4e4c391398ac5a9cd36243d3d5b74f119d41831ab2b8db2d38f9ce87eb36bbae",
+      "oracle_preserved": true
+    },
+    "agentValidationObserved": true,
+    "againStatsDelta": {
+      "requested": 0,
+      "executed": 0,
+      "exact_hits": 0,
+      "inflight_joins": 0,
+      "context_events": 1
+    },
+    "priorBrain": null,
+    "livePriorTask": {
+      "elapsedMs": 13251.959,
+      "usage": {
+        "input_tokens": 34102,
+        "cached_input_tokens": 28544,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 143,
+        "reasoning_output_tokens": 29
+      },
+      "completedCommands": 1,
+      "brainObserved": true,
+      "rawEventSha256": "6b099a8141c75c0b907d4851bc489fc173dfbd53352bbfa6760f17500a8bfcba",
+      "rawEventBytes": 1187
+    },
+    "brainRun": {
+      "authorization_scope_digest": "980d7cea78c2fc9f495e49ecc25db6773fec3d56ecb29d317cf5d3731d61abb8",
+      "cached_input_tokens": 87936,
+      "completed_commands": 5,
+      "completed_edits": 1,
+      "completed_mcp_calls": 0,
+      "completed_ms": 1790290165943,
+      "completed_source_reads": 6,
+      "exit_code": 0,
+      "input_tokens": 98793,
+      "output_tokens": 2406,
+      "session_id": "0865adf5-999a-4378-8b21-a170b4701b44",
+      "started_ms": 1790290109427,
+      "successful_tests": 1,
+      "task_id": "historical-search-unlocated-fix",
+      "turn_completed": true
+    },
+    "brainRunError": null
+  }
+]

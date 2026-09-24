@@ -1,0 +1,390 @@
+{
+  "schema": "again.brain-excerpt-guidance-evaluation.v1",
+  "sources": {
+    "predecessor": {
+      "commit": "d8fc30a",
+      "binaryArchive": "again-d8fc30a-macos-arm64.gz",
+      "binarySha256": "9c736cbbadd6ba27736b4c0134a6eb78ee89d02cd3fd64b4bce7ed51b8613e1d"
+    },
+    "promptTrial": {
+      "commit": "6498d77",
+      "binaryArchive": "again-6498d77-macos-arm64.gz",
+      "binarySha256": "f6b75675e7c4e887fae62375e5e43693f959f4e362e68a14e4a789bf88c4ba93"
+    },
+    "locatorTrial": {
+      "commit": "6228f88",
+      "binaryArchive": "rejected-locator/again-6228f88-macos-arm64.gz",
+      "binarySha256": "52f57c7c69e1c3ecb61b62587f340d1b3568dcef962f54bb2cd4750359da8f18"
+    }
+  },
+  "rawTraceHashesVerified": true,
+  "exactPredecessor": {
+    "before": [
+      {
+        "correct": true,
+        "requiredTestObserved": true,
+        "brainRunCaptured": true,
+        "preparationMs": 0.0,
+        "firstEditMs": 40383.31,
+        "postEditMs": 11816.742,
+        "repairMs": 52200.052,
+        "priorMs": 11145.349,
+        "lifecycleMs": 63345.401,
+        "toolActions": 5,
+        "commandExecutions": 4,
+        "inputTokens": 96323,
+        "cachedInputTokens": 81536,
+        "outputTokens": 2219,
+        "lifecycleInputTokens": 130303,
+        "lifecycleOutputTokens": 2430
+      },
+      {
+        "correct": true,
+        "requiredTestObserved": true,
+        "brainRunCaptured": true,
+        "preparationMs": 0.0,
+        "firstEditMs": 45566.194,
+        "postEditMs": 10987.09,
+        "repairMs": 56553.284,
+        "priorMs": 13251.959,
+        "lifecycleMs": 69805.243,
+        "toolActions": 6,
+        "commandExecutions": 5,
+        "inputTokens": 98793,
+        "cachedInputTokens": 87936,
+        "outputTokens": 2406,
+        "lifecycleInputTokens": 132895,
+        "lifecycleOutputTokens": 2549
+      }
+    ],
+    "after": [
+      {
+        "correct": true,
+        "requiredTestObserved": true,
+        "brainRunCaptured": true,
+        "preparationMs": 0.0,
+        "firstEditMs": 34393.751,
+        "postEditMs": 10159.136,
+        "repairMs": 44552.887,
+        "priorMs": 9151.741,
+        "lifecycleMs": 53704.628,
+        "toolActions": 5,
+        "commandExecutions": 4,
+        "inputTokens": 141496,
+        "cachedInputTokens": 119808,
+        "outputTokens": 1762,
+        "lifecycleInputTokens": 175464,
+        "lifecycleOutputTokens": 1905
+      },
+      {
+        "correct": true,
+        "requiredTestObserved": true,
+        "brainRunCaptured": true,
+        "preparationMs": 0.0,
+        "firstEditMs": 43910.041,
+        "postEditMs": 10879.353,
+        "repairMs": 54789.394,
+        "priorMs": 11366.049,
+        "lifecycleMs": 66155.443,
+        "toolActions": 6,
+        "commandExecutions": 5,
+        "inputTokens": 114874,
+        "cachedInputTokens": 104960,
+        "outputTokens": 2086,
+        "lifecycleInputTokens": 148890,
+        "lifecycleOutputTokens": 2316
+      }
+    ],
+    "medianBefore": {
+      "firstEditMs": 42974.752,
+      "postEditMs": 11401.916,
+      "repairMs": 54376.668,
+      "lifecycleMs": 66575.322,
+      "toolActions": 5.5,
+      "commandExecutions": 4.5,
+      "inputTokens": 97558.0,
+      "cachedInputTokens": 84736.0,
+      "outputTokens": 2312.5,
+      "lifecycleInputTokens": 131599.0,
+      "lifecycleOutputTokens": 2489.5
+    },
+    "medianAfter": {
+      "firstEditMs": 39151.896,
+      "postEditMs": 10519.245,
+      "repairMs": 49671.141,
+      "lifecycleMs": 59930.035,
+      "toolActions": 5.5,
+      "commandExecutions": 4.5,
+      "inputTokens": 128185.0,
+      "cachedInputTokens": 112384.0,
+      "outputTokens": 1924.0,
+      "lifecycleInputTokens": 162177.0,
+      "lifecycleOutputTokens": 2110.5
+    },
+    "decision": "reverted: token regression and no tool-action reduction"
+  },
+  "historicalRustProduct": [
+    {
+      "correct": true,
+      "requiredTestObserved": true,
+      "brainRunCaptured": true,
+      "preparationMs": 0.0,
+      "firstEditMs": 54463.718,
+      "postEditMs": 11558.838,
+      "repairMs": 66022.556,
+      "priorMs": 11153.435,
+      "lifecycleMs": 77175.991,
+      "toolActions": 9,
+      "commandExecutions": 8,
+      "inputTokens": 177532,
+      "cachedInputTokens": 163584,
+      "outputTokens": 2490,
+      "lifecycleInputTokens": 211474,
+      "lifecycleOutputTokens": 2621
+    },
+    {
+      "correct": true,
+      "requiredTestObserved": true,
+      "brainRunCaptured": false,
+      "preparationMs": 0.0,
+      "firstEditMs": 51022.788,
+      "postEditMs": 13307.435,
+      "repairMs": 64330.223,
+      "priorMs": 12642.324,
+      "lifecycleMs": 76972.547,
+      "toolActions": 6,
+      "commandExecutions": 5,
+      "inputTokens": 158040,
+      "cachedInputTokens": 131072,
+      "outputTokens": 2355,
+      "lifecycleInputTokens": 192030,
+      "lifecycleOutputTokens": 2591
+    }
+  ],
+  "tomlkitReturningGuard": [
+    {
+      "correct": true,
+      "requiredTestObserved": true,
+      "brainRunCaptured": false,
+      "preparationMs": 0.0,
+      "firstEditMs": 14265.625,
+      "postEditMs": 7010.622,
+      "repairMs": 21276.247,
+      "priorMs": 7825.693,
+      "lifecycleMs": 29101.94,
+      "toolActions": 5,
+      "commandExecutions": 4,
+      "inputTokens": 89363,
+      "cachedInputTokens": 77312,
+      "outputTokens": 766,
+      "lifecycleInputTokens": 120787,
+      "lifecycleOutputTokens": 969
+    },
+    {
+      "correct": true,
+      "requiredTestObserved": true,
+      "brainRunCaptured": true,
+      "preparationMs": 0.0,
+      "firstEditMs": 7575.521,
+      "postEditMs": 6319.061,
+      "repairMs": 13894.582,
+      "priorMs": 8729.809,
+      "lifecycleMs": 22624.391,
+      "toolActions": 2,
+      "commandExecutions": 1,
+      "inputTokens": 51979,
+      "cachedInputTokens": 40448,
+      "outputTokens": 414,
+      "lifecycleInputTokens": 86055,
+      "lifecycleOutputTokens": 637
+    }
+  ],
+  "rejectedLocatorTrial": [
+    {
+      "order": "baseline-first",
+      "observations": {
+        "baseline": {
+          "correct": true,
+          "requiredTestObserved": true,
+          "brainRunCaptured": false,
+          "preparationMs": 0.0,
+          "firstEditMs": 14005.773,
+          "postEditMs": 6105.302,
+          "repairMs": 20111.075,
+          "priorMs": 0,
+          "lifecycleMs": 20111.075,
+          "toolActions": 5,
+          "commandExecutions": 4,
+          "inputTokens": 88480,
+          "cachedInputTokens": 80512,
+          "outputTokens": 610,
+          "lifecycleInputTokens": 88480,
+          "lifecycleOutputTokens": 610
+        },
+        "product": {
+          "correct": true,
+          "requiredTestObserved": true,
+          "brainRunCaptured": true,
+          "preparationMs": 0.0,
+          "firstEditMs": 14115.725,
+          "postEditMs": 7111.973,
+          "repairMs": 21227.698,
+          "priorMs": 0,
+          "lifecycleMs": 21227.698,
+          "toolActions": 5,
+          "commandExecutions": 4,
+          "inputTokens": 93203,
+          "cachedInputTokens": 84480,
+          "outputTokens": 583,
+          "lifecycleInputTokens": 93203,
+          "lifecycleOutputTokens": 583
+        }
+      }
+    },
+    {
+      "order": "again-first",
+      "observations": {
+        "product": {
+          "correct": true,
+          "requiredTestObserved": true,
+          "brainRunCaptured": true,
+          "preparationMs": 0.0,
+          "firstEditMs": 12172.587,
+          "postEditMs": 6425.116,
+          "repairMs": 18597.703,
+          "priorMs": 0,
+          "lifecycleMs": 18597.703,
+          "toolActions": 4,
+          "commandExecutions": 3,
+          "inputTokens": 94328,
+          "cachedInputTokens": 85248,
+          "outputTokens": 519,
+          "lifecycleInputTokens": 94328,
+          "lifecycleOutputTokens": 519
+        },
+        "baseline": {
+          "correct": true,
+          "requiredTestObserved": true,
+          "brainRunCaptured": false,
+          "preparationMs": 0.0,
+          "firstEditMs": 15360.54,
+          "postEditMs": 6720.305,
+          "repairMs": 22080.845,
+          "priorMs": 0,
+          "lifecycleMs": 22080.845,
+          "toolActions": 7,
+          "commandExecutions": 6,
+          "inputTokens": 94552,
+          "cachedInputTokens": 84608,
+          "outputTokens": 623,
+          "lifecycleInputTokens": 94552,
+          "lifecycleOutputTokens": 623
+        }
+      }
+    }
+  ],
+  "preparationProxy": {
+    "historical-search-unlocated": {
+      "before": {
+        "samples": [
+          {
+            "ms": 4780.051,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          },
+          {
+            "ms": 3086.816,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          },
+          {
+            "ms": 3342.479,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          }
+        ],
+        "medianMs": 3342.479
+      },
+      "after": {
+        "samples": [
+          {
+            "ms": 2716.799,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          },
+          {
+            "ms": 2400.996,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          },
+          {
+            "ms": 2400.022,
+            "previews": 0,
+            "brain": false,
+            "bytes": 20073
+          }
+        ],
+        "medianMs": 2400.996
+      }
+    },
+    "tomlkit-array-slice": {
+      "before": {
+        "samples": [
+          {
+            "ms": 335.032,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46054
+          },
+          {
+            "ms": 340.273,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46055
+          },
+          {
+            "ms": 330.931,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46068
+          }
+        ],
+        "medianMs": 335.032
+      },
+      "after": {
+        "samples": [
+          {
+            "ms": 342.164,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46064
+          },
+          {
+            "ms": 333.324,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46068
+          },
+          {
+            "ms": 342.544,
+            "previews": 2,
+            "brain": false,
+            "bytes": 46060
+          }
+        ],
+        "medianMs": 342.164
+      }
+    }
+  },
+  "measurementLimits": [
+    "Live product wrapper preparationMs is a harness placeholder of zero; launcher preparation is included in firstEditMs.",
+    "The mcp brief timing is a separate cold daemon/brief proxy, not launch preparation.",
+    "The opposite-order Rust pair had an incorrect baseline and is excluded from valid paired claims.",
+    "Two product trials are insufficient for a general speed claim."
+  ]
+}

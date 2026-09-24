@@ -111,7 +111,12 @@ def audit(cohort: pathlib.Path, card_path: pathlib.Path) -> dict:
                     totals[condition]['tools'].update(repair_trace['tools'])
                     totals[condition]['tools'].update(prior_tools)
                     totals[condition]['tokens'].update(tokens)
+                    first_edit = item['firstEditMs']
+                    post_edit = (round(item['elapsedMs'] - first_edit, 3)
+                                 if first_edit is not None else None)
                     observed[condition] = {'elapsedMs': float(elapsed), 'apiEquivalentUsd': str(amount),
+                                           'reportedPreparationMs': item['preparationMs'],
+                                           'firstEditMs': first_edit, 'postEditMs': post_edit,
                                            'oraclePassed': item['oracle']['passed'],
                                            'agentTestObserved': item['agentValidationObserved'],
                                            'brainRunError': item['brainRunError'],
@@ -169,6 +174,9 @@ def audit(cohort: pathlib.Path, card_path: pathlib.Path) -> dict:
                         'apiEquivalentUsd': str(total_cost[condition])}
             for condition, value in totals.items()},
         'taskSummaries': task_summaries, 'pairs': pairs,
+        'phaseMeasurement': ('The live product wrapper does not separately instrument preparation; '
+                             'its reported zero is a harness placeholder and launcher preparation '
+                             'is included in firstEditMs. PostEditMs is repair elapsed minus firstEditMs.'),
         'interpretation': 'Failed pairs disqualify the cohort; accepted-only ratios and unequal-quality cost totals are diagnostic.',
     }
 

@@ -146,6 +146,9 @@
         "baseline": {
           "elapsedMs": 20010.996,
           "apiEquivalentUsd": "0.039164",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 12782.722,
+          "postEditMs": 7228.274,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -165,6 +168,9 @@
         "product": {
           "elapsedMs": 18620.789,
           "apiEquivalentUsd": "0.0368836",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 11610.274,
+          "postEditMs": 7010.515,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -195,6 +201,9 @@
         "product": {
           "elapsedMs": 17910.964,
           "apiEquivalentUsd": "0.037604",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10974.862,
+          "postEditMs": 6936.102,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -214,6 +223,9 @@
         "baseline": {
           "elapsedMs": 19991.273,
           "apiEquivalentUsd": "0.0483096",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14254.157,
+          "postEditMs": 5737.116,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -244,6 +256,9 @@
         "baseline": {
           "elapsedMs": 33042.93,
           "apiEquivalentUsd": "0.0645628",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13452.054,
+          "postEditMs": 7255.226,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -263,6 +278,9 @@
         "product": {
           "elapsedMs": 25215.973,
           "apiEquivalentUsd": "0.0639308",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10471.959,
+          "postEditMs": 6400.026,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -293,6 +311,9 @@
         "product": {
           "elapsedMs": 26417.362,
           "apiEquivalentUsd": "0.0559860",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10626.034,
+          "postEditMs": 6951.725,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -312,6 +333,9 @@
         "baseline": {
           "elapsedMs": 29093.216,
           "apiEquivalentUsd": "0.0644872",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13573.667,
+          "postEditMs": 6487.417,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -342,6 +366,9 @@
         "baseline": {
           "elapsedMs": 41568.506,
           "apiEquivalentUsd": "0.04913",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 33165.428,
+          "postEditMs": 8403.078,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -361,6 +388,9 @@
         "product": {
           "elapsedMs": 28308.762,
           "apiEquivalentUsd": "0.0401472",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 22241.052,
+          "postEditMs": 6067.71,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -391,6 +421,9 @@
         "product": {
           "elapsedMs": 33304.156,
           "apiEquivalentUsd": "0.045866",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 26113.748,
+          "postEditMs": 7190.408,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -410,6 +443,9 @@
         "baseline": {
           "elapsedMs": 57046.708,
           "apiEquivalentUsd": "0.1182288",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 50648.544,
+          "postEditMs": 6398.164,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -440,6 +476,9 @@
         "baseline": {
           "elapsedMs": 33383.649,
           "apiEquivalentUsd": "0.0550340",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 16123.423,
+          "postEditMs": 8275.586,
           "oraclePassed": false,
           "agentTestObserved": false,
           "brainRunError": null,
@@ -459,6 +498,9 @@
         "product": {
           "elapsedMs": 41195.787,
           "apiEquivalentUsd": "0.0787848",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 24401.815,
+          "postEditMs": 7675.511,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -489,6 +531,9 @@
         "product": {
           "elapsedMs": 36187.413,
           "apiEquivalentUsd": "0.0587260",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 21381.371,
+          "postEditMs": 6108.619,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -508,6 +553,9 @@
         "baseline": {
           "elapsedMs": 62428.378,
           "apiEquivalentUsd": "0.0807236",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 43577.934,
+          "postEditMs": 7885.831,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -538,6 +586,9 @@
         "baseline": {
           "elapsedMs": 67942.625,
           "apiEquivalentUsd": "0.0928772",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 54598.049,
+          "postEditMs": 13344.576,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -557,6 +608,9 @@
         "product": {
           "elapsedMs": 54227.34,
           "apiEquivalentUsd": "0.0715108",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 44637.465,
+          "postEditMs": 9589.875,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -587,6 +641,9 @@
         "product": {
           "elapsedMs": 65352.233,
           "apiEquivalentUsd": "0.0793504",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 52272.913,
+          "postEditMs": 13079.32,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -606,6 +663,9 @@
         "baseline": {
           "elapsedMs": 53664.687,
           "apiEquivalentUsd": "0.084064",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 40736.187,
+          "postEditMs": 12928.5,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -636,6 +696,9 @@
         "baseline": {
           "elapsedMs": 59116.888,
           "apiEquivalentUsd": "0.1096320",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 37415.629,
+          "postEditMs": 10061.657,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -655,6 +718,9 @@
         "product": {
           "elapsedMs": 77175.991,
           "apiEquivalentUsd": "0.1123132",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 54463.718,
+          "postEditMs": 11558.838,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -685,6 +751,9 @@
         "product": {
           "elapsedMs": 76972.547,
           "apiEquivalentUsd": "0.1316468",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 51022.788,
+          "postEditMs": 13307.435,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": "expected one current Brain run, found 0",
@@ -704,6 +773,9 @@
         "baseline": {
           "elapsedMs": 58795.848,
           "apiEquivalentUsd": "0.0824208",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 39957.179,
+          "postEditMs": 11449.994,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -734,6 +806,9 @@
         "baseline": {
           "elapsedMs": 16237.213,
           "apiEquivalentUsd": "0.0441084",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 9902.044,
+          "postEditMs": 6335.169,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -753,6 +828,9 @@
         "product": {
           "elapsedMs": 21345.404,
           "apiEquivalentUsd": "0.0406224",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13953.645,
+          "postEditMs": 7391.759,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -783,6 +861,9 @@
         "product": {
           "elapsedMs": 18680.661,
           "apiEquivalentUsd": "0.05687",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 11616.137,
+          "postEditMs": 7064.524,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -802,6 +883,9 @@
         "baseline": {
           "elapsedMs": 16537.505,
           "apiEquivalentUsd": "0.0361296",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10953.625,
+          "postEditMs": 5583.88,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -832,6 +916,9 @@
         "baseline": {
           "elapsedMs": 27970.516,
           "apiEquivalentUsd": "0.0556500",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14439.932,
+          "postEditMs": 6799.569,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -851,6 +938,9 @@
         "product": {
           "elapsedMs": 22435.701,
           "apiEquivalentUsd": "0.0527544",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 6723.518,
+          "postEditMs": 7810.247,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -881,6 +971,9 @@
         "product": {
           "elapsedMs": 20329.154,
           "apiEquivalentUsd": "0.0519756",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 6081.352,
+          "postEditMs": 6147.025,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -900,6 +993,9 @@
         "baseline": {
           "elapsedMs": 29324.763,
           "apiEquivalentUsd": "0.0587172",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14522.85,
+          "postEditMs": 7194.983,
           "oraclePassed": true,
           "agentTestObserved": true,
           "brainRunError": null,
@@ -921,5 +1017,6 @@
       "costRatioDiagnostic": 0.8851852608775623
     }
   ],
+  "phaseMeasurement": "The live product wrapper does not separately instrument preparation; its reported zero is a harness placeholder and launcher preparation is included in firstEditMs. PostEditMs is repair elapsed minus firstEditMs.",
   "interpretation": "Failed pairs disqualify the cohort; accepted-only ratios and unequal-quality cost totals are diagnostic."
 }
