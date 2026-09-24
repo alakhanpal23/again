@@ -45,7 +45,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "    command = 'cat helper.py && cat ledger.py && git status --short'\n"
             "    read = subprocess.run(['/bin/sh', '-c', command], cwd=workspace, capture_output=True, text=True, check=True)\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'read_1','type':'command_execution','command':command,'aggregated_output':read.stdout,'exit_code':read.returncode,'status':'completed'}}), flush=True)\n"
-            "    print(json.dumps({'type':'item.completed','item':{'id':'search_1','type':'command_execution','command':\"rg -n 'sanitize.*line|unrelated' src\",'aggregated_output':'src/search.rs:1501:fn sanitize_line_v1() {}\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'search_1','type':'command_execution','command':\"rg -n 'sanitize.*line|unrelated' src | head -80\",'aggregated_output':'src/search.rs:1501:fn sanitize_line_v1() {}\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
             "    path = workspace / 'a.py'\n"
             "    path.write_text('value = 2\\n')\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
@@ -203,6 +203,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "compoundSourceReadsObservedAndStaleWithheld": True,
                 "largeRegexSearchObservedAndStaleWithheld": True,
                 "largeRegexSearchHitAnchoredPreview": True,
+                "boundedSearchPipelineObserved": True,
                 "interactiveTaskStartReceivedBrain": True,
                 "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,

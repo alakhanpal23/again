@@ -1110,6 +1110,22 @@ fn simple_search_shell_v1(script: &str) -> bool {
     quote.is_none() && !escaped
 }
 
+/// A trailing `head` only bounds reported matches; it does not establish
+/// completeness. The remaining search must still pass the shell syntax check.
+fn search_without_bounded_head_v1(script: &str) -> Option<&str> {
+    let Some((search, count)) = script.rsplit_once(" | head -") else {
+        return Some(script);
+    };
+    if count.is_empty()
+        || count.len() > 4
+        || !count.bytes().all(|byte| byte.is_ascii_digit())
+        || !(1..=1000).contains(&count.parse::<u16>().ok()?)
+    {
+        return None;
+    }
+    Some(search)
+}
+
 fn matching_source_search_v1(
     item: &Value,
     workspace: &Path,
@@ -1130,6 +1146,9 @@ fn matching_source_search_v1(
         outer[2].as_str()
     } else {
         command
+    };
+    let Some(script) = search_without_bounded_head_v1(script) else {
+        return Vec::new();
     };
     if !simple_search_shell_v1(script) {
         return Vec::new();
@@ -2293,6 +2312,26 @@ mod tests {
         assert_eq!(regex_events[1].path.as_deref(), Some("src/large.rs"));
         assert_eq!(regex_events[1].read_start_line, Some(1501));
         assert_eq!(regex_events[1].read_end_line, None);
+        let mut bounded_search = regex_search.clone();
+        bounded_search["item"]["id"] = "bounded_search".into();
+        bounded_search["item"]["command"] =
+            "/bin/zsh -lc \"rg -n 'sanitize.*line|unrelated' src | head -80\"".into();
+        let bounded_events =
+            codex_completed_events_v1(&bounded_search, &workspace, "session", "old-task");
+        assert_eq!(bounded_events.len(), 2);
+        assert_eq!(bounded_events[1].read_start_line, Some(1501));
+        bounded_search["item"]["command"] =
+            "/bin/zsh -lc \"rg -n 'sanitize.*line|unrelated' src 2>/dev/null | head -80\"".into();
+        assert_eq!(
+            codex_completed_events_v1(&bounded_search, &workspace, "session", "old-task").len(),
+            2
+        );
+        bounded_search["item"]["command"] =
+            "/bin/zsh -lc \"rg -n 'sanitize.*line|unrelated' src | sed -n 1,80p\"".into();
+        assert_eq!(
+            codex_completed_events_v1(&bounded_search, &workspace, "session", "old-task").len(),
+            1
+        );
         for event in &regex_events {
             store.record_brain_event_v1(event).unwrap();
         }

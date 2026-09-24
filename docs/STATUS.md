@@ -2,6 +2,10 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-24 bounded search pipeline observation
+
+Brain now recognizes a completed `rg -n` search followed by an exact trailing `| head -N` with `N` from 1 to 1000. It independently verifies each reported source line and records only positive file and hit-line observations; truncation never proves search completeness or absence. Other pipelines and shell composition remain command metadata only. The focused regression and launcher handoff gate cover a regex search with `head`, a later source-anchored brief, and edit invalidation. Task-level call avoidance and speed from this added coverage remain unmeasured.
+
 ## 2026-09-24 single-agent default path
 
 The installed Codex skill now recommends native shell and editor tools for ordinary investigation while the `again codex` launcher supplies the verified brief and observes completed work. It no longer directs every supported repository read through the gateway: earlier measured warm lookup and proof often cost more than direct cheap reads. The exact `again run` and repository MCP paths remain available for explicit measured cases. This changes guidance, not the hook's execution authority or a measured completed-task outcome. The frozen cold-cohort scorecard also withholds its diagnostic time-target flag if any pair is unaccepted or has missing token usage, preventing a fast survivor subset from appearing to pass. A diverse real-task, source-bound release cohort remains open.
