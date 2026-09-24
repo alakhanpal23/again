@@ -186,7 +186,7 @@ def configure_fixture(name: str) -> None:
             "packages/beta/package.json": (
                 '{"name":"beta","private":true,"type":"module",'
                 '"packageManager":"pnpm@9.0.0",'
-                '"scripts":{"test":"node --test"}}\n'
+                '"scripts":{"test":"node --test test/missing.spec.mjs"}}\n'
             ),
             "package.json": (
                 '{"name":"monorepo","private":true,'
@@ -194,7 +194,9 @@ def configure_fixture(name: str) -> None:
             ),
             "tests/root.spec.mjs": (
                 "import test from 'node:test';\n"
-                "test('root package is unrelated', () => {});\n"
+                "test('root package cannot validate alpha', () => {\n"
+                "  throw new Error('wrong package');\n"
+                "});\n"
             ),
             "README.md": "# Package workspace fixture\nPackages alpha and beta are independent.\n",
         }

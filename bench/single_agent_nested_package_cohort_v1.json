@@ -8,11 +8,10 @@
     {
       "fixture": "js-nested-package-script",
       "sourceFiles": 0,
-      "fixtureSha256": "01c38841a642a2d736839a4025f692992e3d34ac2c8d0841e1357e9e45459da5",
+      "fixtureSha256": "cc71fd7eba7d39e8768958f43073e4e1d4304050d4093624f906a33df2200fae",
       "promptSha256": "3ae5e5719b333bd8c0c068a4c2589299bc8778a4fb4a63ec34f876257968ccb3",
-      "requiredAgentValidation": ["npm test", "node --test"],
-      "requiredValidationWorkingDirectory": "packages/alpha",
-      "oracle": "target-only behavior, harness Node tests, and successful agent validation from packages/alpha"
+      "requiredAgentValidation": ["npm test"],
+      "oracle": "target-only behavior, harness Node tests, and successful agent npm test; root and beta scripts fail after the fix"
     }
   ]
 }
