@@ -2031,6 +2031,9 @@ fn append_repository_brain_v1(prompt: &mut String, brief: &serde_json::Value) {
         let Ok(serialized) = serde_json::to_string(&metadata) else {
             return;
         };
+        if !partial_previews.is_empty() {
+            prompt.push_str("\nThe Brain excerpts below were rechecked against current file bytes. Start at those locations. Read adjacent source when needed for the edit; repeat a locating search only if the excerpt does not identify the relevant code.\n");
+        }
         prompt.push_str("\nAGAIN_BRAIN ");
         prompt.push_str(&serialized);
         for preview in partial_previews {
@@ -4143,6 +4146,7 @@ mod tests {
         assert_eq!(metadata["recentCurrentFiles"][0]["path"], "src/util.py");
         assert!(metadata["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
         assert!(prompt.contains("BRAIN_PARTIAL FILE src/util.py LINES 1-2 DIGEST current-digest\ndef adjust_total(value):\n    return value + 1\n"));
+        assert!(prompt.contains("Start at those locations"));
         assert!(!prompt.contains("def adjust_total(value):\\n"));
     }
 
