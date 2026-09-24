@@ -10,6 +10,19 @@ Your task → verified file previews + test hint → Codex edits and tests
 Next task ← current findings from the local Brain ← completed tool events
 ```
 
+## Speed in live coding tasks
+
+In a frozen eight-pair Codex benchmark across two repositories, every repair passed validation. Again's median paired completion-time ratio was **0.801** (about **19.9% less time**) and its median API-equivalent cost ratio was **0.884** (about **11.6% less estimated cost**), including the preparation for returning tasks.
+
+| Benchmark | Accepted pairs | Median paired time | Median paired estimated cost |
+| --- | ---: | ---: | ---: |
+| [Two repositories, cold and returning tasks](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/bench/results/2026-09-24-real-repository-cohort-38c8bc7/summary.json) | 8/8 | 19.9% lower | 11.6% lower |
+| [Four repositories, expanded task mix](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/bench/results/2026-09-24-diverse-real-cohort-bb44f50/summary.json) | 14/16 | 15.1% lower* | 9.7% lower* |
+
+\*The expanded percentages cover accepted pairs only. One baseline repair failed validation; one Again repair passed its test but failed to retain its Brain run under an earlier capture bug. The capture bug was fixed after that frozen run. Neither cohort passed its predeclared acceptance, speed, and cost gate. These small benchmarks show where Again is promising, not a general speed guarantee. [Methods and raw-trace audit](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/bench/results/2026-09-24-diverse-real-cohort-bb44f50/audit.json). API-equivalent cost uses observed tokens and a fixed rate card, not a Codex bill.
+
+In a separate [source-bound returning-task diagnostic](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/STATUS.md#2026-09-24-long-agent-lease-and-historical-returning-task), a strongly matched Brain brief took **12 ms** to prepare versus roughly **2.4–2.6 seconds** in earlier index-building runs. This measures the brief, not the completed coding task.
+
 ## Get started
 
 Install Rust 1.88 or newer and the [Codex CLI](https://developers.openai.com/codex/cli), then sign in to Codex. Build Again from the current development branch on macOS or Linux:
