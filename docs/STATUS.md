@@ -2,6 +2,10 @@
 
 This file distinguishes code that exists from roadmap intent. Implementation status comes from reproducible tests; performance claims require retained benchmark evidence. Immutable CI retention for new test-only claims remains a release gate.
 
+## 2026-09-23 package test guidance
+
+For a JavaScript or TypeScript source candidate without a more specific previewed test, task start now reads a bounded current root `package.json` and suggests its declared test command through the matching npm, pnpm, yarn, or bun manager. The validation preview carries the manifest digest and a screened script preview, marks the selector unverified, and requires execution. Conflicting lockfiles, a conflicting `packageManager` field, placeholder scripts, oversized manifests, and symlinked manifests produce no guessed selector. An authenticated `mcp brief` probe returned `pnpm test` with the current manifest digest for a TypeScript source. Brain also recognizes an observed successful package test and can suggest it on a later matching task only while the current manifest still supports that command. A past pass never authorizes skipping validation. Focused unit tests cover the selection, ambiguity, failed-test, and stale-manifest paths; broad task-outcome impact remains unmeasured.
+
 ## 2026-09-23 live multi-root search observation
 
 The [clean-source live alternation gate](../bench/results/2026-09-23-live-search-multiroot-bound-ee60b2f/alternation-summary.json) passed with Codex 0.156.1 and a release binary bound to `ee60b2f`. Codex executed `rg -n 'balance|value' src tests 2>/dev/null`. Again checked the cited lines against current files, stored observations for a source and test file, surfaced them in a later brief, and withheld the edited source observation after its bytes changed. The [literal-search regression gate](../bench/results/2026-09-23-live-search-multiroot-bound-ee60b2f/literal-summary.json) also passed. Filtered Codex event traces are retained beside both reports. These gates show live capture of two common shell-search shapes, not search completeness, automatic command avoidance, or a task-speed improvement.

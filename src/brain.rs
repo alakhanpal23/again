@@ -695,7 +695,11 @@ fn known_test_command_v1(command: &str) -> Option<String> {
         | "python3 -m pytest"
         | "cargo test"
         | "cargo test --quiet"
-        | "go test ./..." => Some(command.to_owned()),
+        | "go test ./..."
+        | "npm test"
+        | "pnpm test"
+        | "yarn test"
+        | "bun test" => Some(command.to_owned()),
         _ => command
             .strip_prefix("node --test ")
             .filter(|path| safe_node_test_path_v1(path))
@@ -955,6 +959,13 @@ fn source_code_path_v1(path: &str) -> bool {
 }
 
 fn test_hint_relevant_v1(hint: &str, workspace: &Path, candidate_paths: &[String]) -> bool {
+    if matches!(hint, "npm test" | "pnpm test" | "yarn test" | "bun test") {
+        return candidate_paths
+            .iter()
+            .any(|path| crate::validation_hint::is_javascript_source_v1(path))
+            && crate::validation_hint::package_test_suggestion_v1(workspace)
+                .is_some_and(|suggestion| suggestion.command == hint);
+    }
     if let Some(path) = hint.strip_prefix("node --test ") {
         if !safe_node_test_path_v1(path) {
             return false;
@@ -1383,6 +1394,52 @@ mod tests {
             "type":"item.completed",
             "item":{"id":"failed","type":"command_execution",
                     "command":"cargo test","exit_code":1}
+        });
+        assert_eq!(
+            codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,
+            None
+        );
+    }
+
+    #[test]
+    fn repository_brain_keeps_successful_package_test_as_execute_required_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(
+            workspace.join("package.json"),
+            r#"{"packageManager":"pnpm@9.0.0","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        fs::write(workspace.join("pnpm-lock.yaml"), "lockfileVersion: 9\n").unwrap();
+        let store = Store::open(dir.path().join("state")).unwrap();
+        let completed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"package_test","type":"command_execution",
+                "command":"pnpm test","exit_code":0}
+        });
+        for event in codex_completed_events_v1(&completed, &workspace, "session", "old-task") {
+            store.record_brain_event_v1(&event).unwrap();
+        }
+        let scope = local_brain_scope_digest_v1(&workspace);
+        let candidate = ["src/ledger.ts".to_owned()];
+        let brief = repository_brief_v1(&store, &workspace, &candidate, &[], &scope).unwrap();
+        assert_eq!(brief["previousSuccessfulTestCommand"], "pnpm test");
+        assert_eq!(
+            brief["testCommandAuthority"],
+            "unverified suggestion; run required validation"
+        );
+        fs::write(
+            workspace.join("package.json"),
+            r#"{"packageManager":"npm@10.0.0","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        let stale = repository_brief_v1(&store, &workspace, &candidate, &[], &scope).unwrap();
+        assert!(stale["previousSuccessfulTestCommand"].is_null());
+        let failed = serde_json::json!({
+            "type":"item.completed",
+            "item":{"id":"failed_package_test","type":"command_execution",
+                "command":"pnpm test","exit_code":1}
         });
         assert_eq!(
             codex_completed_events_v1(&failed, &workspace, "session", "old-task")[0].command_hint,

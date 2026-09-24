@@ -59,6 +59,7 @@ pub mod team_pull;
 pub mod team_request_key;
 #[cfg(feature = "team-alpha")]
 pub mod trust_bundle;
+pub(crate) mod validation_hint;
 pub mod workspace_authority;
 
 pub use engine::run_cli;

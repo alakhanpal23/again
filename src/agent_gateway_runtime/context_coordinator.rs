@@ -2050,9 +2050,11 @@ fn validation_preview_v1(
         );
     let mut rust_source = false;
     let mut go_source = false;
+    let mut javascript_source = false;
     for path in candidates.take(16) {
         rust_source |= path.ends_with(".rs");
         go_source |= path.ends_with(".go");
+        javascript_source |= crate::validation_hint::is_javascript_source_v1(path);
     }
     let (command, basis, reason) = if unittest_candidate {
         (
@@ -2078,6 +2080,14 @@ fn validation_preview_v1(
             "current_manifest_and_source_candidate",
             "unverified Go convention; run the command to validate",
         )
+    } else if javascript_source
+        && let Some(suggestion) = crate::validation_hint::package_test_suggestion_v1(workspace)
+    {
+        return json!({
+            "status": "execute_required",
+            "selectors": [suggestion.selector_json()],
+            "reason": "current package.json declares a test script; inspect the script and run it to validate"
+        });
     } else {
         (None, "", "")
     };
@@ -2497,5 +2507,89 @@ mod validation_preview_tests {
             validation_preview_v1(workspace.path(), &[], &go)["selectors"][0]["command"],
             "go test ./..."
         );
+    }
+
+    #[test]
+    fn package_test_script_suggests_execution_with_current_source_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let javascript = json!({"candidates":[{"locator":{"path":"src/ledger.ts"}}]});
+        let manifest = br#"{"scripts":{"test":"vitest run"}}"#;
+        std::fs::write(workspace.path().join("package.json"), manifest).unwrap();
+        let npm = validation_preview_v1(workspace.path(), &[], &javascript);
+        assert_eq!(npm["status"], "execute_required");
+        assert_eq!(npm["selectors"][0]["command"], "npm test");
+        assert_eq!(npm["selectors"][0]["verified"], false);
+        assert_eq!(npm["selectors"][0]["source"]["testScript"], "vitest run");
+        assert_eq!(
+            npm["selectors"][0]["source"]["digest"],
+            blake3::hash(manifest).to_hex().to_string()
+        );
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &json!({}))["selectors"],
+            json!([])
+        );
+
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"packageManager":"pnpm@9.0.0","scripts":{"test":"vitest run"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: 9\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &javascript)["selectors"][0]["command"],
+            "pnpm test"
+        );
+        std::fs::write(
+            workspace.path().join("yarn.lock"),
+            "# conflicting manager\n",
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &javascript)["selectors"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn package_test_script_refuses_placeholder_or_untrusted_manifest_shape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let javascript = json!({"candidates":[{"locator":{"path":"src/ledger.js"}}]});
+        let path = workspace.path().join("package.json");
+        std::fs::write(
+            &path,
+            r#"{"scripts":{"test":"echo no test specified && exit 1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &javascript)["selectors"],
+            json!([])
+        );
+        std::fs::write(
+            &path,
+            r#"{"scripts":{"test":"node --test"},"packageManager":"unknown@1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            validation_preview_v1(workspace.path(), &[], &javascript)["selectors"],
+            json!([])
+        );
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(
+                workspace.path().join("outside.json"),
+                r#"{"scripts":{"test":"node --test"}}"#,
+            )
+            .unwrap();
+            std::os::unix::fs::symlink(workspace.path().join("outside.json"), &path).unwrap();
+            assert_eq!(
+                validation_preview_v1(workspace.path(), &[], &javascript)["selectors"],
+                json!([])
+            );
+        }
     }
 }
