@@ -27,6 +27,10 @@ def run(binary: pathlib.Path) -> dict[str, object]:
         (workspace / "helper.py").write_text("def helper():\n    return 42\n")
         (workspace / "ledger.py").write_text("def ledger_balance():\n    return 10\n")
         (workspace / "balance.py").write_text("def render_balance():\n    return '10'\n")
+        (workspace / "src").mkdir()
+        (workspace / "src/search.rs").write_text(
+            "// preceding source\n" * 1500 + "fn sanitize_line_v1() {}\n"
+        )
         subprocess.run(["git", "init", "-q", str(workspace)], check=True)
         fake_bin = root / "bin"
         fake_bin.mkdir()
@@ -41,6 +45,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             "    command = 'cat helper.py && cat ledger.py && git status --short'\n"
             "    read = subprocess.run(['/bin/sh', '-c', command], cwd=workspace, capture_output=True, text=True, check=True)\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'read_1','type':'command_execution','command':command,'aggregated_output':read.stdout,'exit_code':read.returncode,'status':'completed'}}), flush=True)\n"
+            "    print(json.dumps({'type':'item.completed','item':{'id':'search_1','type':'command_execution','command':\"rg -n 'sanitize.*line|unrelated' src\",'aggregated_output':'src/search.rs:1501:fn sanitize_line_v1() {}\\n','exit_code':0,'status':'completed'}}), flush=True)\n"
             "    path = workspace / 'a.py'\n"
             "    path.write_text('value = 2\\n')\n"
             "    print(json.dumps({'type':'item.completed','item':{'id':'edit_1','type':'file_change','status':'completed','changes':[{'path':str(path)}]}}), flush=True)\n"
@@ -88,19 +93,19 @@ def run(binary: pathlib.Path) -> dict[str, object]:
             return {item["path"] for item in json.loads(payload)["recentCurrentFiles"]}
 
         try:
-            launch("first", "Repair ledger balance formatting in a.py first task")
+            launch("first", "Repair ledger balance formatting and inspect search sanitizer in a.py first task")
             snapshot = brain()
             observed = snapshot["recentEvents"]
-            if len(observed) != 5 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
-                raise RuntimeError("completed compound reads, edit, and test were not retained")
-            if {item["path"] for item in snapshot["fileObservations"]} != {"a.py", "helper.py", "ledger.py"}:
+            if len(observed) != 7 or {row["kind"] for row in observed} != {"file_change", "test", "command"}:
+                raise RuntimeError("completed compound reads, regex search, edit, and test were not retained")
+            if {item["path"] for item in snapshot["fileObservations"]} != {"a.py", "helper.py", "ledger.py", "src/search.rs"}:
                 raise RuntimeError("latest file observations were not materialized")
             if "aggregated_output" in json.dumps(observed):
                 raise RuntimeError("raw tool output entered the brain store")
             runs = snapshot["recentRuns"]
             if len(runs) != 1 or any(runs[0].get(key) != value for key, value in {
-                "exit_code": 0, "turn_completed": True, "completed_commands": 2,
-                "completed_source_reads": 2, "completed_edits": 1,
+                "exit_code": 0, "turn_completed": True, "completed_commands": 3,
+                "completed_source_reads": 3, "completed_edits": 1,
                 "completed_mcp_calls": 0, "successful_tests": 1,
                 "input_tokens": 100, "cached_input_tokens": 40, "output_tokens": 12,
             }.items()):
@@ -116,6 +121,30 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 item["path"] for item in interactive_brain["recentCurrentFiles"]
             }:
                 raise RuntimeError("interactive task brief did not receive current Brain history")
+            search_brief = subprocess.run(
+                [str(binary), "mcp", "brief", "--workspace", str(workspace),
+                 "--task-id", "search-current", "--task", "Fix search sanitizer"],
+                cwd=workspace, env=environment, capture_output=True,
+                text=True, timeout=20, check=True,
+            )
+            search_brain = json.loads(search_brief.stdout).get("againBrain") or {}
+            if "src/search.rs" not in {
+                item["path"] for item in search_brain.get("recentCurrentFiles", [])
+            }:
+                raise RuntimeError("large regex search source was not in the next task brief")
+            with (workspace / "src/search.rs").open("a") as source:
+                source.write("// changed after search\n")
+            stale_search_brief = subprocess.run(
+                [str(binary), "mcp", "brief", "--workspace", str(workspace),
+                 "--task-id", "search-stale", "--task", "Fix search sanitizer"],
+                cwd=workspace, env=environment, capture_output=True,
+                text=True, timeout=20, check=True,
+            )
+            stale_search_brain = json.loads(stale_search_brief.stdout).get("againBrain") or {}
+            if "src/search.rs" in {
+                item["path"] for item in stale_search_brain.get("recentCurrentFiles", [])
+            }:
+                raise RuntimeError("stale regex search observation remained current")
 
             launch("second", "Improve a.py second task")
             calls = [json.loads(line) for line in (root / "calls.jsonl").read_text().splitlines()]
@@ -163,6 +192,7 @@ def run(binary: pathlib.Path) -> dict[str, object]:
                 "nextTaskReceivedUnverifiedTestHint": True,
                 "staleEditWithheld": True,
                 "compoundSourceReadsObservedAndStaleWithheld": True,
+                "largeRegexSearchObservedAndStaleWithheld": True,
                 "interactiveTaskStartReceivedBrain": True,
                 "priorTaskOverlapSelectedFile": True,
                 "clearRemovedEvents": True,

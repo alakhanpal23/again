@@ -10,6 +10,7 @@ use serde_json::Value;
 use crate::store::{BrainEventV1, BrainRunV1, Store};
 
 const MAX_OBSERVED_FILE_BYTES_V1: u64 = 1024 * 1024;
+const MAX_SEARCH_OBSERVED_FILE_BYTES_V1: u64 = 256 * 1024;
 const MAX_BRAIN_PREVIEW_BYTES_V1: usize = 2 * 1024;
 const MAX_BRAIN_PARTIAL_PREVIEW_BYTES_V1: usize = 5 * 1024;
 const MAX_BRAIN_BRIEF_BYTES_V1: usize = 8 * 1024;
@@ -1039,6 +1040,39 @@ fn matched_source_read_argv_v1(
 
 /// Nominate source files from a simple completed search. This verifies only
 /// each reported line against current source bytes, not search completeness.
+fn simple_search_shell_v1(script: &str) -> bool {
+    let script = script.strip_suffix(" 2>/dev/null").unwrap_or(script);
+    let mut quote = None;
+    let mut escaped = false;
+    for character in script.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some('\'') => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some('"') => match character {
+                '"' => quote = None,
+                '\\' => escaped = true,
+                '$' | '`' => return false,
+                _ => {}
+            },
+            None => match character {
+                '\'' | '"' => quote = Some(character),
+                '\\' => escaped = true,
+                ';' | '|' | '&' | '<' | '>' | '$' | '`' | '\n' | '\r' => return false,
+                _ => {}
+            },
+            _ => return false,
+        }
+    }
+    quote.is_none() && !escaped
+}
+
 fn matching_source_search_v1(
     item: &Value,
     workspace: &Path,
@@ -1053,15 +1087,18 @@ fn matching_source_search_v1(
     let Ok(outer) = shell_words::split(command) else {
         return Vec::new();
     };
-    let argv = if matches!(outer.as_slice(), [shell, flag, _]
+    let script = if matches!(outer.as_slice(), [shell, flag, _]
         if shell == "/bin/zsh" && flag == "-lc")
     {
-        let Ok(inner) = shell_words::split(&outer[2]) else {
-            return Vec::new();
-        };
-        inner
+        outer[2].as_str()
     } else {
-        outer
+        command
+    };
+    if !simple_search_shell_v1(script) {
+        return Vec::new();
+    }
+    let Ok(argv) = shell_words::split(script) else {
+        return Vec::new();
     };
     if argv.first().is_none_or(|program| program != "rg")
         || argv.get(1).is_none_or(|flag| flag != "-n")
@@ -1076,22 +1113,18 @@ fn matching_source_search_v1(
     if !(2..=128).contains(&pattern.len()) {
         return Vec::new();
     }
-    let terms = if fixed {
-        vec![pattern.as_str()]
+    let expression = if fixed {
+        None
     } else {
-        pattern.split('|').collect::<Vec<_>>()
+        let Ok(expression) = regex::RegexBuilder::new(pattern)
+            .size_limit(1024 * 1024)
+            .dfa_size_limit(1024 * 1024)
+            .build()
+        else {
+            return Vec::new();
+        };
+        Some(expression)
     };
-    if terms.is_empty()
-        || terms.len() > 8
-        || terms.iter().any(|term| {
-            !(2..=64).contains(&term.len())
-                || !term
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        })
-    {
-        return Vec::new();
-    }
     let mut operands = Vec::new();
     let mut position = pattern_index + 1;
     while position < argv.len() {
@@ -1175,7 +1208,8 @@ fn matching_source_search_v1(
         if !operands.iter().any(|(_, root)| absolute.starts_with(root))
             || !source_code_path_v1(&relative)
             || files.iter().any(|(selected, _)| selected == &relative)
-            || !fs::metadata(&absolute).is_ok_and(|meta| meta.is_file() && meta.len() <= 8 * 1024)
+            || !fs::metadata(&absolute)
+                .is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_SEARCH_OBSERVED_FILE_BYTES_V1)
         {
             continue;
         }
@@ -1185,7 +1219,12 @@ fn matching_source_search_v1(
         let Some(actual) = bytes.split(|byte| *byte == b'\n').nth(line_number - 1) else {
             continue;
         };
-        if actual == reported.as_bytes() && terms.iter().any(|term| reported.contains(term)) {
+        if actual == reported.as_bytes()
+            && expression.as_ref().map_or_else(
+                || reported.contains(pattern),
+                |expression| expression.is_match(reported),
+            )
+        {
             files.push((relative, bytes));
         }
     }
@@ -2197,6 +2236,29 @@ mod tests {
         });
         assert_eq!(
             codex_completed_events_v1(&unsafe_command, &workspace, "session", "old-task").len(),
+            1
+        );
+
+        let large_source = format!(
+            "{}fn sanitize_line_v1() {{}}\n",
+            "// preceding source\n".repeat(1500)
+        );
+        assert!(large_source.len() > 8 * 1024);
+        fs::write(workspace.join("src/large.rs"), &large_source).unwrap();
+        let regex_search = serde_json::json!({
+            "type":"item.completed", "item":{"id":"regex_search","type":"command_execution",
+                "command":"/bin/zsh -lc \"rg -n 'sanitize.*line|unrelated' src\"", "exit_code":0,
+                "aggregated_output":"src/large.rs:1501:fn sanitize_line_v1() {}\n"}
+        });
+        let regex_events =
+            codex_completed_events_v1(&regex_search, &workspace, "session", "old-task");
+        assert_eq!(regex_events.len(), 2);
+        assert_eq!(regex_events[1].path.as_deref(), Some("src/large.rs"));
+        let mut composed_search = regex_search;
+        composed_search["item"]["command"] =
+            "rg -n 'sanitize.*line|unrelated' src && touch src/large.rs".into();
+        assert_eq!(
+            codex_completed_events_v1(&composed_search, &workspace, "session", "old-task").len(),
             1
         );
     }
