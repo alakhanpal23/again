@@ -1,0 +1,198 @@
+{
+  "accepted": true,
+  "againBinarySha256": "29530d5a843f32a095acd67fb3542b1cc53134d58324663253c52a157a052a65",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "greeting-feature",
+  "fixtureSha256": "56ae0dc9be81ab387c3ed66b8ab213fa6aef0108790bd1108b143fcbcd58094b",
+  "harnessSha256": "e381228abbe18cc7955df39279c839d1daf257cc56f1c6ec282eab222fd05a3e",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 18795.214,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/greeting.py' -g 'test*' -g 'pyproject.toml' -g 'setup.cfg' -g 'Makefile'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,160p' src/greeting.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,200p' tests/test_greeting.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,160p' README.md\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 18795.214,
+      "eventCount": 17,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 12639.889,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 139.864,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 4603,
+      "rawEventFile": "greeting-feature-0-baseline-first-baseline.jsonl",
+      "rawEventSha256": "52f1d85e0e2078765f0d1980d854c080a2b2782b1a0e8ced295c1f3b71b55ba2",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 75776,
+        "input_tokens": 81515,
+        "output_tokens": 570,
+        "reasoning_output_tokens": 84
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "5f823d4fe4e5c1b6fd783e05d495a11417e0e3c3e23124b6cfd1531064a53c60",
+        "cached_input_tokens": 43904,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790221102165,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48929,
+        "output_tokens": 238,
+        "session_id": "9f7b0050-11c5-4ce2-a654-b96b2b57255c",
+        "started_ms": 1790221091403,
+        "successful_tests": 1,
+        "task_id": "greeting-feature",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 11013.088,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 11013.088,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5780.695,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 132.237,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1698,
+      "rawEventFile": "greeting-feature-0-baseline-first-product.jsonl",
+      "rawEventSha256": "676786a17ecc4aaae87fc01b5820cfa31b78adc4f5a9d028f460c9028dffc553",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43904,
+        "input_tokens": 48929,
+        "output_tokens": 238,
+        "reasoning_output_tokens": 27
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "0d4ba13d9402d8a7785ff4755e8c7e30c81c5e1ee3adbc00969ad8122eaed426",
+  "recordedAtUtc": "2026-09-24T03:38:22.363183+00:00",
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "cb7828d0b0bfa9d9d05b40c8497d2a9517bbdebe"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

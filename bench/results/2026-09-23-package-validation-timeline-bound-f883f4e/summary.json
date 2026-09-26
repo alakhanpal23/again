@@ -1,0 +1,137 @@
+{
+  "schema": "again.single-agent-cold-cohort-result.v1",
+  "recordedAtUtc": "2026-09-24T04:41:32.776659+00:00",
+  "manifestSha256": "01fc3f936501a115aacbf9462a0d00162a3d3030d21260c9fb7d6137819dcd19",
+  "binarySha256": "8810cc65a59027f6cb8ae7a000562a9ed81952e856f3b0c921b7960935767484",
+  "model": "gpt-6-sol",
+  "evidenceScope": "Diagnostic cold package-script tasks requiring an agent-run successful validation call; not the balanced release cohort",
+  "acceptedPairs": 4,
+  "totalPairs": 4,
+  "pairedMedianElapsedRatio": 0.7164035244791799,
+  "pairedP95ElapsedRatio": 0.9037840239275767,
+  "pairedMedianElapsedTargetMet": true,
+  "baselineUsageTotals": {
+    "uncachedInput": 36139,
+    "cachedInput": 245632,
+    "output": 1696
+  },
+  "againUsageTotals": {
+    "uncachedInput": 23998,
+    "cachedInput": 170880,
+    "output": 1144
+  },
+  "allUsageVectorsComplete": true,
+  "pairs": [
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 15162.087,
+      "againMs": 13703.252,
+      "elapsedRatio": 0.9037840239275767,
+      "baselineActions": 3,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 7556,
+        "cachedInput": 66176,
+        "output": 348
+      },
+      "againUsage": {
+        "uncachedInput": 5025,
+        "cachedInput": 43904,
+        "output": 267
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    },
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 18472.717,
+      "againMs": 12337.044,
+      "elapsedRatio": 0.667852162732748,
+      "baselineActions": 4,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9953,
+        "cachedInput": 69248,
+        "output": 591
+      },
+      "againUsage": {
+        "uncachedInput": 5100,
+        "cachedInput": 43904,
+        "output": 319
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    },
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 1000,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 14260.636,
+      "againMs": 10643.773,
+      "elapsedRatio": 0.7463743552531598,
+      "baselineActions": 5,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9329,
+        "cachedInput": 55168,
+        "output": 403
+      },
+      "againUsage": {
+        "uncachedInput": 4929,
+        "cachedInput": 43648,
+        "output": 280
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    },
+    {
+      "fixture": "js-package-script",
+      "sourceFiles": 1000,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 15549.66,
+      "againMs": 10673.795,
+      "elapsedRatio": 0.6864326937052,
+      "baselineActions": 4,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9301,
+        "cachedInput": 55040,
+        "output": 354
+      },
+      "againUsage": {
+        "uncachedInput": 8944,
+        "cachedInput": 39424,
+        "output": 278
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'npm test'",
+      "againAgentValidation": "/bin/zsh -lc 'npm test'"
+    }
+  ],
+  "source": {
+    "head": "f883f4eaf9557809373da49c0c3192cb4fc08fcf",
+    "dirty": false,
+    "buildSourceSha": "f883f4eaf9557809373da49c0c3192cb4fc08fcf",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "schema": "again.real-repository-cohort-summary.v1",
+  "completedPairs": 8,
+  "plannedPairs": 8,
+  "acceptedPairs": 8,
+  "allAccepted": true,
+  "medianTimeRatioAcceptedOnly": 0.8011770129608045,
+  "medianApiEquivalentCostRatioAcceptedOnly": 0.8839776464648955,
+  "qualifiedAgainstFrozenGate": false,
+  "warning": "Accepted-only ratios are diagnostic until every planned pair is accepted.",
+  "pairs": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true
+    }
+  ]
+}

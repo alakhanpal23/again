@@ -1,0 +1,150 @@
+{
+  "accepted": true,
+  "againBinarySha256": "45ac0671d1825574230a8f7cc6d3b04cef940c729ff17799e74fba250535abcf",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "delayFollowerUntilLeaderExits": false,
+  "evidenceScope": "local_live_diagnostic_not_qualification",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc 'git diff -- src/calculator.py'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1-again-first.jsonl",
+          "rawEventSha256": "0f8e36efe41283f694c225f699d51397c86ea1b4ab8044f8f4df2d0b202f27be",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 43648,
+            "input_tokens": 48711,
+            "output_tokens": 320,
+            "reasoning_output_tokens": 87
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+            "/bin/zsh -lc 'git status --short'",
+            "/bin/zsh -lc 'git diff -- src/calculator.py'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1-again-second.jsonl",
+          "rawEventSha256": "92e2ed0b92af85be341d4f3bf93e901364d608a20994c0abe75db8d24836b68e",
+          "stderrSha256": "7bb4f1ceeffd8a3d3b957fc13df5b9fef63a115a9cd97df80bdf8fdf58bc245a",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 43904,
+            "input_tokens": 49160,
+            "output_tokens": 542,
+            "reasoning_output_tokens": 142
+          }
+        }
+      },
+      "condition": "again",
+      "elapsedMs": 31945.6,
+      "firstEditMs": 5869.698,
+      "followerDelayedUntilLeaderExit": false,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 151.077,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": true,
+      "secondLaunchGapMs": 189.025,
+      "timedOut": false
+    },
+    {
+      "agents": {
+        "first": {
+          "commands": [
+            "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini'\"",
+            "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/calculator.py\"",
+            "/bin/zsh -lc \"sed -n '1,200p' tests/test_calculator.py\"",
+            "/bin/zsh -lc \"ls -la && rg --files -g 'AGENTS.md' -g '\"'!tests/**'\"'\"",
+            "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 1,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1-baseline-first.jsonl",
+          "rawEventSha256": "290720b14f1104ed1d0fb8f7e0021332b335e5dbb19367b8b28b4c8bd5489eff",
+          "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 92672,
+            "input_tokens": 98582,
+            "output_tokens": 608,
+            "reasoning_output_tokens": 74
+          }
+        },
+        "second": {
+          "commands": [
+            "/bin/zsh -lc \"pwd; rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini'\"",
+            "/bin/zsh -lc 'git status --short; cat src/calculator.py'",
+            "/bin/zsh -lc 'cat tests/test_calculator.py'",
+            "/bin/zsh -lc \"rg --files -g '\"'!src/calculator.py'\"' -g '\"'!tests/test_calculator.py'\"'\"",
+            "/bin/zsh -lc 'cat src/calculator.py; git status --short; git diff -- src/calculator.py'",
+            "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+            "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'"
+          ],
+          "eventsCaptured": true,
+          "exitCode": 0,
+          "fileChanges": 0,
+          "mcpTools": [],
+          "rawEventFile": "2026-09-23-codex-parallel-pair-wrapper-wait-again-first-v1-baseline-second.jsonl",
+          "rawEventSha256": "0daf0cf4e4e9a41f0936810233cf250f7af504c6ef6df9bd120bd0aed382e7a5",
+          "stderrSha256": "4d008b90a0ac056ffb5a4383978623d1f1139f9fe6ca45e563cb38edd7ca171f",
+          "usage": {
+            "cache_write_input_tokens": 0,
+            "cached_input_tokens": 127360,
+            "input_tokens": 143572,
+            "output_tokens": 956,
+            "reasoning_output_tokens": 115
+          }
+        }
+      },
+      "condition": "baseline",
+      "elapsedMs": 32427.839,
+      "firstEditMs": 12545.229,
+      "followerDelayedUntilLeaderExit": false,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 152.09,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "peerObservedBeforeSecondLaunch": false,
+      "secondLaunchGapMs": 1.986,
+      "timedOut": false
+    }
+  ],
+  "order": "again-first",
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "schema": "again.codex-parallel-pair-diagnostic.v1",
+  "sourceFiles": 1000
+}

@@ -1,0 +1,389 @@
+{
+  "accepted": true,
+  "againBinarySha256": "52f57c7c69e1c3ecb61b62587f340d1b3568dcef962f54bb2cd4750359da8f18",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "tomlkit-array-slice",
+  "fixtureSha256": "214de42803845701c4838e872143dae1221faccd8fe4cd9dedc31f10e1383102",
+  "harnessSha256": "6514b77deb564b34c596ed77b60c93f3a8ef85ad5fb225f74b70e0a99ef06d57",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "337e670f024cbee58fc50ead41358bd798272a1f4db7ab62c97560dc443026d4",
+        "cached_input_tokens": 85248,
+        "completed_commands": 3,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790289065576,
+        "completed_source_reads": 2,
+        "exit_code": 0,
+        "input_tokens": 94328,
+        "output_tokens": 519,
+        "session_id": "88ccb90f-3a0c-480c-8699-3803bcdd250c",
+        "started_ms": 1790289047322,
+        "successful_tests": 0,
+        "task_id": "tomlkit-array-slice-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null,
+      "codexElapsedMs": 18597.703,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"rg -n 'class Array|def __setitem__|slice' tomlkit/items.py\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1377,1680p' tomlkit/items.py\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 18597.703,
+      "eventCount": 14,
+      "eventTimeline": [
+        {
+          "elapsedMs": 6120.93,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 6120.969,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8283.191,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8283.242,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12125.567,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 12172.579,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 15067.208,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 15067.222,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17779.29,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 12172.587,
+      "livePriorTask": null,
+      "oracle": {
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340",
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 70.81,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 15413,
+      "rawEventFile": "again-locator-tomlkit-again-first-product.jsonl",
+      "rawEventSha256": "e6368397ff7010c8a3fddde33a76671c91ac6f41a83d783d6f6004de70a66eb0",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 85248,
+        "input_tokens": 94328,
+        "output_tokens": 519,
+        "reasoning_output_tokens": 51
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "brainRunError": null,
+      "codexElapsedMs": 22080.845,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'rg -n \"class Array|def __setitem__|slice\" tomlkit/items.py'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"git status --short && rg --files -g 'AGENTS.md' -g 'test_again_oracle.py'\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat tests/test_again_oracle.py'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1370,1690p' tomlkit/items.py\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'find .. -name AGENTS.md -print'",
+          "exitCode": 1,
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 22080.845,
+      "eventCount": 20,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5292.504,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5292.528,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5292.532,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5292.535,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8688.244,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8688.255,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8688.266,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8688.316,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8811.246,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 10609.999,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 15336.761,
+          "event": "item.started",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 15360.532,
+          "event": "item.completed",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 18074.651,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 18074.662,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 21309.789,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 15360.54,
+      "livePriorTask": null,
+      "oracle": {
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340",
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 76.524,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 20201,
+      "rawEventFile": "again-locator-tomlkit-again-first-baseline.jsonl",
+      "rawEventSha256": "9f1f166affb713a3846d29b225d64532063a4236eee5fd6a4490ed402a6ad4e1",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 84608,
+        "input_tokens": 94552,
+        "output_tokens": 623,
+        "reasoning_output_tokens": 36
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "f5577df62b3685d780aa2c19b1070fdf04bd8ce34593e4a7d3e60f06fbcb79ab",
+  "recordedAtUtc": "2026-09-24T22:31:28.266807+00:00",
+  "requiredAgentValidation": [
+    "python3 -m unittest discover -s tests -p test_again_oracle.py"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "6228f8836d96b9bb14fb840f40c443fc0628ccbb",
+    "dirty": false,
+    "head": "6228f8836d96b9bb14fb840f40c443fc0628ccbb"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

@@ -6,6 +6,7 @@ pub mod agent_gateway_service;
 #[path = "agent_gateway_service_unsupported.rs"]
 pub mod agent_gateway_service;
 pub mod agent_gateway_setup;
+pub mod brain;
 pub mod code_intelligence;
 pub mod effect;
 pub mod engine;
@@ -15,6 +16,7 @@ pub mod fingerprint;
 #[cfg(feature = "hook")]
 pub mod hook;
 pub mod mcp_gateway;
+pub mod observer_setup;
 // Keep the disabled Linux pytest profile crate-private while its implementations
 // are built behind the frozen interfaces.
 #[cfg(feature = "linux-pytest")]
@@ -57,6 +59,7 @@ pub mod team_pull;
 pub mod team_request_key;
 #[cfg(feature = "team-alpha")]
 pub mod trust_bundle;
+pub(crate) mod validation_hint;
 pub mod workspace_authority;
 
 pub use engine::run_cli;

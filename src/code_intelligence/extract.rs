@@ -473,10 +473,10 @@ fn sanitize_line_v1(
     let mut result = vec![b' '; bytes.len()];
     let mut index = 0usize;
     let mut quote: Option<u8> = None;
-    while index < bytes.len() {
+    'line: while index < bytes.len() {
         if language == CodeLanguageV1::Python {
             for marker in [b"\"\"\"".as_slice(), b"'''".as_slice()] {
-                if bytes[index..].starts_with(marker) {
+                if quote.is_none() && bytes[index..].starts_with(marker) {
                     let marker_text = if marker[0] == b'\"' { "\"\"\"" } else { "'''" };
                     if python_triple_quote.is_none() {
                         *python_triple_quote = Some(marker_text);
@@ -484,7 +484,7 @@ fn sanitize_line_v1(
                         *python_triple_quote = None;
                     }
                     index += 3;
-                    continue;
+                    continue 'line;
                 }
             }
             if python_triple_quote.is_some() {
@@ -825,5 +825,56 @@ fn locator_v1(
         end_column_byte,
         source_digest: source_digest.to_owned(),
         observation_digest: observation_digest.to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_triple_quote_at_line_end_does_not_escape_the_line() {
+        let mut block = false;
+        let mut triple = None;
+        assert_eq!(
+            sanitize_line_v1(
+                "value = \"\"\"",
+                CodeLanguageV1::Python,
+                &mut block,
+                &mut triple
+            ),
+            "value =    "
+        );
+        assert_eq!(triple, Some("\"\"\""));
+        assert_eq!(
+            sanitize_line_v1("\"\"\"", CodeLanguageV1::Python, &mut block, &mut triple),
+            "   "
+        );
+        assert_eq!(triple, None);
+        assert_eq!(
+            sanitize_line_v1("'''", CodeLanguageV1::Python, &mut block, &mut triple),
+            "   "
+        );
+        assert_eq!(triple, Some("'''"));
+        assert_eq!(
+            sanitize_line_v1("'''", CodeLanguageV1::Python, &mut block, &mut triple),
+            "   "
+        );
+        assert_eq!(triple, None);
+    }
+
+    #[test]
+    fn python_quote_marker_inside_regular_string_stays_regular_string() {
+        let mut block = false;
+        let mut triple = None;
+        let sanitized = sanitize_line_v1(
+            "value = '\"\"\"' # comment",
+            CodeLanguageV1::Python,
+            &mut block,
+            &mut triple,
+        );
+        assert!(sanitized.starts_with("value = "));
+        assert_eq!(triple, None);
+        assert_eq!(sanitized.len(), "value = '\"\"\"' # comment".len());
     }
 }

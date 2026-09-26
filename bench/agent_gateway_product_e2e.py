@@ -37,7 +37,7 @@ from typing import Any, BinaryIO
 
 REPORT_SCHEMA = "again.agent-gateway-product-e2e.v1"
 HARNESS_VERSION = "1.0.0"
-EXPECTED_DATABASE_SCHEMA = 13
+EXPECTED_DATABASE_SCHEMA = 20
 MCP_PROTOCOL_VERSION = "2025-06-18"
 SOURCE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 RESULT_ID_RE = re.compile(r"^[0-9a-f]{64}$")

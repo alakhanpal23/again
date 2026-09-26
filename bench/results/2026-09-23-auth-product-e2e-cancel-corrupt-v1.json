@@ -1,0 +1,47 @@
+{
+  "binary_sha256": "0ce20ca5ed63e77e5f6b5e088702b717aec1d03da133d73bcb45a384f94d6324",
+  "cancelled_result_id": "36274065dc4aa3e94988ffcd34ffb09045144bd7f6c6c2feb44f6319dc6f22d0",
+  "classification": {
+    "code": "task_source_lifecycle_passed",
+    "type": "pass"
+  },
+  "corrupted_result_id": "944e2fd2537a185ace017b787d8f073e567f01f29f2bb8f16a4944652ceaa5b2",
+  "corruption": {
+    "bytes": 130,
+    "relative_path": "blobs/e5/303b456c215c869303fd94f187893829c7257d89565afc2a076b314580cd7d",
+    "sha256_after": "8e62705b4ea2b3899202650cb47441d2f07d34a08665ffbbc0c86b1603acf4e8",
+    "sha256_before": "d5c735295b0775d585cc39262fb5d4ac0500038e8881910da17cf8bc6b514d56"
+  },
+  "duplicate_read_events": {
+    "completed": 1,
+    "executed": 1,
+    "inflight_candidate": 1,
+    "inflight_join": 1,
+    "requested": 2
+  },
+  "large_index_source_files": 4097,
+  "large_ledger_sources": 257,
+  "mid_index_source_files": 1000,
+  "new_result_id": "99b135999d5f42f0a66d4e87c6c5da0134ef6abb6424e4b619f67ed5f8a3ae45",
+  "old_result_id": "d447bad791e197b7bc6af7e654b80f8fe5b0741df3e08800c134f625ffd55dde",
+  "scenarios": [
+    "standalone_direct",
+    "duplicate_read_avoided",
+    "peer_fact",
+    "peer_retrieval",
+    "unrelated_edit",
+    "unobserved_relevant_edit",
+    "large_ledger_incomplete",
+    "mid_index_explicit_preview",
+    "large_index_explicit_preview",
+    "recipient_cancel_scoped",
+    "corrupt_result_refused"
+  ],
+  "schema": "again.authenticated-product-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "f014ca752c529a0a2a63b82dcbea88e5ce921390",
+    "git_sha256": "b2257da69dd905bd07aca44979f0586bc83f85f4dedf585b16816797b10d49d0",
+    "root": "/Users/arjun/.superset/projects/again"
+  }
+}

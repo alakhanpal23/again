@@ -1,0 +1,166 @@
+{
+  "accepted": true,
+  "binarySha256": "178edebdaf6e2b41cd7a41992d60c963ba6bc878d46518b67fd34ad6ee490214",
+  "evidenceScope": "one local same-launcher ablation pair",
+  "fixture": "balance-helper",
+  "fixtureSha256": "4cd4c5f773e24628861f2be424535ec0601175a378742c6e6bf0e81f20412233",
+  "harnessSha256": "095235d6966bcdb4fc42e1b45546c94d8fd6231075203bdfb8299175d30dac7f",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 16236.636,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'rg --files src'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/util.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product-cold",
+      "elapsedMs": 16236.636,
+      "eventCount": 14,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 10394.743,
+      "oracle": {
+        "after_snapshot_sha256": "5efd3304267b732bc0261a0e01e38a02dbd0fba87037d0fdf742f67f96c439af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 124.516,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 33736,
+      "rawEventFile": "again-aged-brain-ablation-37fdc86-cold-first-product-cold.jsonl",
+      "rawEventSha256": "bf1efd56e51d6af20ab4a3a5c2242cf963e26cd561726fe9ce60be9da6f2c6fe",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 82304,
+        "input_tokens": 89896,
+        "output_tokens": 370,
+        "reasoning_output_tokens": 45
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 12206.955,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 12206.955,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 6318.533,
+      "oracle": {
+        "after_snapshot_sha256": "5efd3304267b732bc0261a0e01e38a02dbd0fba87037d0fdf742f67f96c439af",
+        "changed_paths": [
+          "src/util.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 119.521,
+        "test_output_sha256": "aece0b59f94004ff6484ed589e910c70269686c7290ca5a65d6577c9d53ceda1",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": {
+        "decoyCount": 100,
+        "path": "src/util.py",
+        "sourceSha256": "59e9a06a425d16f3ed588cce0ae2cc3588531f436869541b243310bd1c6d621b",
+        "taskId": "prior-ledger-investigation"
+      },
+      "rawEventBytes": 1754,
+      "rawEventFile": "again-aged-brain-ablation-37fdc86-cold-first-product.jsonl",
+      "rawEventSha256": "23f5684ecc52ccf77526d2735faef872ccbd42aa32952768637696aeb16cada1",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 44160,
+        "input_tokens": 49254,
+        "output_tokens": 269,
+        "reasoning_output_tokens": 50
+      }
+    }
+  ],
+  "order": [
+    "product-cold",
+    "product"
+  ],
+  "pairHarnessSha256": "52285a55622ab92354018b2c08ba3b2c8437b635feaa3a931447aab4378624b0",
+  "priorBrainDecoys": 100,
+  "promptSha256": "fc8bf774397770ce4a10b61c8d9cec74cb2e0bcd39700793947039882e99a0aa",
+  "recordedAtUtc": "2026-09-23T23:02:44.022362+00:00",
+  "schema": "again.brain-ablation.v1",
+  "seededOverColdElapsedRatio": 0.75181552385605,
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "37fdc865ed0535721dbd6beb4353a5f89f0f605d"
+  },
+  "sourceFiles": 1000
+}

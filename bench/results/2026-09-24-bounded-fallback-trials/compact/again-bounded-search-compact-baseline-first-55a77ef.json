@@ -1,0 +1,409 @@
+{
+  "accepted": true,
+  "againBinarySha256": "7a5edd02d5e216694e0707967f11cf54570444666f055798205becf4e4b6355d",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "historical-python-triple",
+  "fixtureSha256": "2d8d454b5397b0fe5d83e7bff23973b47e8e1f4f08f6833ff8f77e546f827f9b",
+  "harnessSha256": "2f41f5951d37cc777618390441897045f06b0f405cf2cdd6d271096d9f41b863",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "brainRunError": null,
+      "codexElapsedMs": 39424.77,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'rg -n \"historical_python_quote_oracle|Python.*sanitiz|python.*sanitiz|triple.?quote\" .'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,240p' src/code_intelligence/extract.rs; sed -n '430,555p' src/code_intelligence/extract.rs; sed -n '810,910p' src/code_intelligence/extract.rs; rg -n 'AGENTS.md' -g AGENTS.md .\"",
+          "exitCode": 1,
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'git diff -- src/code_intelligence/extract.rs'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test --locked --lib historical_python_quote_oracle'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 39424.77,
+      "eventCount": 16,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4736.407,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4736.43,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7493.518,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7493.589,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 27442.676,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 27467.747,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 29790.0,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 29790.049,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 32567.81,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 35983.874,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 38769.899,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 27467.768,
+      "oracle": {
+        "after_snapshot_sha256": "33415c3040c162f3abcf49f69637a28ca1ce492914b962c598e9acb6be391289",
+        "changed_paths": [
+          "src/code_intelligence/extract.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "oracle_preserved": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 2217.042,
+        "test_output_sha256": "f4c7b2e0d56e6019c7f7ca8f3ad2cfaf4d631212341e99338d527d45541e7884",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 22109,
+      "rawEventFile": "again-bounded-search-compact-baseline-first-55a77ef-baseline.jsonl",
+      "rawEventSha256": "42503bc22e651d77ca71a595a7a11f8239a450470c4426626f4fca9033f08063",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 102912,
+        "input_tokens": 113063,
+        "output_tokens": 1314,
+        "reasoning_output_tokens": 388
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "e33ff22cad9fba7cd0f493793846649c7f80acbd523032499ffd10b547e30a8d",
+        "cached_input_tokens": 88704,
+        "completed_commands": 6,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790274028694,
+        "completed_source_reads": 3,
+        "exit_code": 0,
+        "input_tokens": 115161,
+        "output_tokens": 1327,
+        "session_id": "daf1b8a0-fd85-418c-bf20-f5ab816b78d7",
+        "started_ms": 1790273993577,
+        "successful_tests": 1,
+        "task_id": "historical-python-triple-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null,
+      "codexElapsedMs": 38023.817,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"sed -n '430,550p' src/code_intelligence/extract.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg -n 'historical_python_quote_oracle|sanitize_line_v1|python_triple_quote' src\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '820,865p' src/code_intelligence/extract.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '75,120p' src/code_intelligence/extract.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test --locked --lib historical_python_quote_oracle'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 38023.817,
+      "eventCount": 20,
+      "eventTimeline": [
+        {
+          "elapsedMs": 8228.323,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8228.728,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8252.217,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8252.273,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8252.298,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8252.307,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11361.346,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11361.38,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11361.532,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11361.552,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 27211.959,
+          "event": "item.started",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 27236.278,
+          "event": "item.completed",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 29469.411,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 33058.84,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 37182.493,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 27236.287,
+      "oracle": {
+        "after_snapshot_sha256": "33415c3040c162f3abcf49f69637a28ca1ce492914b962c598e9acb6be391289",
+        "changed_paths": [
+          "src/code_intelligence/extract.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "oracle_preserved": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 2853.159,
+        "test_output_sha256": "f4c7b2e0d56e6019c7f7ca8f3ad2cfaf4d631212341e99338d527d45541e7884",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 14532,
+      "rawEventFile": "again-bounded-search-compact-baseline-first-55a77ef-product.jsonl",
+      "rawEventSha256": "43f2e5a0686c2208467fe8dc13ad194cab1dbafe4b5ca74237cc9ef90fff0a2f",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 88704,
+        "input_tokens": 115161,
+        "output_tokens": 1327,
+        "reasoning_output_tokens": 330
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "6fee1c3ecaf95aa078ab172f8082cefde34fc153a790cc79416f5cb74108a1f4",
+  "recordedAtUtc": "2026-09-24T18:20:32.199897+00:00",
+  "requiredAgentValidation": [
+    "cargo test --locked --lib historical_python_quote_oracle"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "55a77efcfc2ae5f1210c47e3f9dac6c970b44cd8",
+    "dirty": false,
+    "head": "55a77efcfc2ae5f1210c47e3f9dac6c970b44cd8"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

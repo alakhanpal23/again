@@ -1,0 +1,409 @@
+{
+  "accepted": true,
+  "againBinarySha256": "a45a8d855892a76666549426903ba63f740a8ad1d4a6a5c4ddd9f095c0c28579",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "historical-search",
+  "fixtureSha256": "f3f7370ea85f1766b4a5d45d6e040e321a87e63cb645307c5eb78c559373a191",
+  "harnessSha256": "49e08fd04cbb1af16bf5ed0936ea6071761c14ab1ded2d35c11b0c4e96632273",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": {
+        "authorization_scope_digest": "a43c0f438e5f62e05d835ed63a3c96934277e6a3a1d1368a6312b87604769904",
+        "cached_input_tokens": 108672,
+        "completed_commands": 6,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790229149273,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 119326,
+        "output_tokens": 1721,
+        "session_id": "5842854b-3d84-4583-875b-236a9386de99",
+        "started_ms": 1790229097905,
+        "successful_tests": 1,
+        "task_id": "historical-search-output-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null,
+      "codexElapsedMs": 53729.473,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"rg -n 'historical_search_oracle|repository_search_v1|MAX_SEARCH_RESULTS_V1|lineTruncated|resultsTruncated|repo.search' src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '825,930p' src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '45,70p;1310,1385p' src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg -n 'truncated|lineTruncated|resultTruncated|MAX_.*SEARCH|512 \\\\* 1024|4096' src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 53729.473,
+      "eventCount": 20,
+      "eventTimeline": [
+        {
+          "elapsedMs": 9604.853,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9604.872,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9604.876,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9604.896,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9634.88,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9634.89,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14059.9,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14059.927,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14088.151,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14088.164,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 39741.087,
+          "event": "item.started",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 39771.391,
+          "event": "item.completed",
+          "itemId": "item_7",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 42511.89,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 46425.169,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 52772.342,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 39771.4,
+      "oracle": {
+        "after_snapshot_sha256": "8c39addf95291e81cd961a340522f54750d0988ae7c149f7a1ba39feef75aaf1",
+        "changed_paths": [
+          "src/agent_gateway_runtime.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "oracle_preserved": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 137.938,
+        "test_output_sha256": "16df7569220c6e36d9feab38e6bd136b4247e203efa3f59e04734970ca023eef",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 13588,
+      "rawEventFile": "historical-search-0-again-first-product.jsonl",
+      "rawEventSha256": "a009fe906c7a40807d4bd4469ee5277d130478391968b78dbe0777103a782d4b",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 108672,
+        "input_tokens": 119326,
+        "output_tokens": 1721,
+        "reasoning_output_tokens": 480
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "agentValidationObserved": true,
+      "brainRun": null,
+      "brainRunError": null,
+      "codexElapsedMs": 59745.164,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"rg -n \\\"repo\\\\.search|historical_search_oracle|search\\\" src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '760,960p' src/agent_gateway_runtime.rs && sed -n '1300,1380p' src/agent_gateway_runtime.rs && rg -n 'truncat|MAX_|maxResults|lineNumber' src/agent_gateway_runtime.rs\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '40,70p' src/agent_gateway_runtime.rs && sed -n '1,35p' src/agent_gateway_runtime.rs && rg -n '\\\"lineTruncated\\\"|\\\"truncated\\\"|repo.search' src tests 2>/dev/null\"",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "exitCode": null,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+          "exitCode": 0,
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 59745.164,
+      "eventCount": 16,
+      "eventTimeline": [
+        {
+          "elapsedMs": 7644.806,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7644.833,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13870.748,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13870.803,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 30092.69,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 30092.709,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 45521.093,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 45546.584,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 49981.324,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 53831.241,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 59020.687,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 45546.592,
+      "oracle": {
+        "after_snapshot_sha256": "77d17631222510a4975ca90d376707a4b0e82c682805bee143175532f3376e7c",
+        "changed_paths": [
+          "src/agent_gateway_runtime.rs"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "oracle_preserved": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 143.936,
+        "test_output_sha256": "16df7569220c6e36d9feab38e6bd136b4247e203efa3f59e04734970ca023eef",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 21088,
+      "rawEventFile": "historical-search-0-again-first-baseline.jsonl",
+      "rawEventSha256": "8fa3d4e4df4fff6263ecfc5b9654727c165a73b8f906932799038393892430c9",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 124032,
+        "input_tokens": 134792,
+        "output_tokens": 1770,
+        "reasoning_output_tokens": 494
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "f9d3073163ad355463b69d2beb95cf75ee26fc802c32ccc1292b943a4e4e651a",
+  "recordedAtUtc": "2026-09-24T05:53:48.080577+00:00",
+  "requiredAgentValidation": [
+    "cargo test --locked --lib historical_search_oracle"
+  ],
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "316f06ac2115678fd28f07206bbcb4b469057988",
+    "dirty": false,
+    "head": "316f06ac2115678fd28f07206bbcb4b469057988"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

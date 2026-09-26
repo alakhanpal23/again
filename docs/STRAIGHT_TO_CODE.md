@@ -84,7 +84,7 @@ Again reduces pre-edit work in layers:
 6. **Bypass negative-value reuse.** If fresh validation costs as much as or more
    than the work, execute the ordinary tool and avoid polluting the brief.
 
-## Current implementation gap
+## Current implementation boundary
 
 The repository already contains most data-model foundations:
 
@@ -98,11 +98,13 @@ The repository already contains most data-model foundations:
 - metrics for facts reused, investigations/provider calls avoided, context
   bytes, invalidations, and delivery-confirmed omitted bytes/tokens.
 
-The current compiler is an internal general reasoning brief with a maximum of
-64 items and 64 KiB. It is not task-ranked, has no public task-start MCP route,
-does not admit facts automatically from shipping repository-tool results, and
-cannot authenticate a production stdio recipient. Those are product gaps, not
-current acceleration claims.
+The same-user daemon now exposes `task.start`, a bounded deterministic code
+edit brief, verified facts admitted from built-in repository observations,
+task-scoped context deltas, and full-before-compact recipient delivery. The
+ordinary stdio route cannot mint that recipient authority. Pinned live-agent
+editable cohorts, task-level acceleration evidence, production or cross-user
+recipient issuance, and qualified changed-only validation remain open. The
+implementation checklist and gates are in [PRODUCT_FINISH_PLAN.md](PRODUCT_FINISH_PLAN.md).
 
 ## Required implementation slices
 

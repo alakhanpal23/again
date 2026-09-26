@@ -1,0 +1,85 @@
+{
+  "schema": "again.single-agent-cold-cohort-result.v1",
+  "recordedAtUtc": "2026-09-24T05:19:49.457240+00:00",
+  "manifestSha256": "88eaa34638cdf2b954904abc2895d7ddfb31193dbe02a4761f30f0ce176e46b3",
+  "binarySha256": "e6621d52126316c122467c5807bcb92050771502baab4c46a96866e473bcefb9",
+  "model": "gpt-6-sol",
+  "evidenceScope": "Diagnostic accepted-edit task on a complete historical Again repository checkout with independently injected failing regressions; not the balanced release cohort",
+  "acceptedPairs": 2,
+  "totalPairs": 2,
+  "pairedMedianElapsedRatio": 0.9168511599656454,
+  "pairedP95ElapsedRatio": 0.9505724347818844,
+  "pairedMedianElapsedTargetMet": false,
+  "baselineUsageTotals": {
+    "uncachedInput": 41568,
+    "cachedInput": 267008,
+    "output": 4360
+  },
+  "againUsageTotals": {
+    "uncachedInput": 30553,
+    "cachedInput": 233984,
+    "output": 3643
+  },
+  "allUsageVectorsComplete": true,
+  "pairs": [
+    {
+      "fixture": "historical-search",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 59099.651,
+      "againMs": 52192.668,
+      "elapsedRatio": 0.8831298851494064,
+      "baselineActions": 6,
+      "againActions": 5,
+      "baselineUsage": {
+        "uncachedInput": 18684,
+        "cachedInput": 140160,
+        "output": 2334
+      },
+      "againUsage": {
+        "uncachedInput": 21158,
+        "cachedInput": 132736,
+        "output": 1938
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+      "againAgentValidation": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'"
+    },
+    {
+      "fixture": "historical-search",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 55706.608,
+      "againMs": 52953.166,
+      "elapsedRatio": 0.9505724347818844,
+      "baselineActions": 6,
+      "againActions": 5,
+      "baselineUsage": {
+        "uncachedInput": 22884,
+        "cachedInput": 126848,
+        "output": 2026
+      },
+      "againUsage": {
+        "uncachedInput": 9395,
+        "cachedInput": 101248,
+        "output": 1705
+      },
+      "baselineAgentValidation": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'",
+      "againAgentValidation": "/bin/zsh -lc 'cargo test --locked --lib historical_search_oracle'"
+    }
+  ],
+  "source": {
+    "head": "146af520fa9350ba4c0af6956519c21e4afa32eb",
+    "dirty": false,
+    "buildSourceSha": "146af520fa9350ba4c0af6956519c21e4afa32eb",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  }
+}

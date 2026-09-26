@@ -1,0 +1,25 @@
+{
+  "schema": "again.codex-run-capture-gate.v1",
+  "source": {
+    "head": "d8fc30a48be725da0b86fcdc6ad9f506b8e4e1fe",
+    "dirty": false,
+    "buildSourceSha": "d8fc30a48be725da0b86fcdc6ad9f506b8e4e1fe",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  },
+  "binarySha256": "08344d516c3281c2bbd3630959375ced1324d8d8f63a97be9c6d51060ff10bee",
+  "replayedRustTraceSha256": "03a58dbaa521ef7c8d396925cfd18812edb5f3822e280a67f7530cf67c096f84",
+  "replayedCompletedCommands": 5,
+  "replayedVerifiedSourceFiles": 6,
+  "replayedUsage": {
+    "input_tokens": 158040,
+    "cached_input_tokens": 131072,
+    "output_tokens": 2355
+  },
+  "malformedStreamVisible": true,
+  "missingTurnVisible": true,
+  "eventStorageFailureVisible": true,
+  "heldStdoutRetainedCompletedRun": true,
+  "multiTurnUsageMatchesRawEvents": true,
+  "runStorageFailureVisible": true
+}

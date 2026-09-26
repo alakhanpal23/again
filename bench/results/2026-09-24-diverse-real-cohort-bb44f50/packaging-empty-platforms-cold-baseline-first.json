@@ -1,0 +1,313 @@
+{
+  "schema": "again.diverse-real-pair.v2",
+  "identity": {
+    "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+    "source": {
+      "head": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "dirty": false,
+      "buildSourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "packaging-empty-platforms",
+  "mode": "cold",
+  "order": "baseline-first",
+  "observations": [
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 20010.996,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 20010.996,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4973.734,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4973.763,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8057.293,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8057.347,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 12736.402,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 12782.715,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 16091.02,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 16091.032,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 18967.571,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 12782.722,
+      "rawEventBytes": 16074,
+      "rawEventSha256": "1294c9a32b92de49cd5ddc397001e2606107dc9b1591d68c1a6e8d57a41e98db",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 14,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"platforms|def .*tags\" src/packaging/tags.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '390,645p' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 89459,
+        "cached_input_tokens": 81280,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 655,
+        "reasoning_output_tokens": 53
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "src/packaging/tags.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 78.44,
+        "test_output_sha256": "33060fd73862c5e1af97335504d5b45211fce6d229657f556d8deceeadc52ce4",
+        "after_snapshot_sha256": "214c18ac2b26266527c6f909aef09e5bcbe57c09d9f4ef3142f63cd02d7f236e"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": null,
+      "brainRunError": null
+    },
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 18620.789,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 18620.789,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5360.757,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5360.776,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7402.426,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7402.48,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11589.432,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 11610.266,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 14652.396,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14652.413,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17752.454,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 11610.274,
+      "rawEventBytes": 11514,
+      "rawEventSha256": "e7c06417e235ccabe09d8841a34cc9fc17472fd2626ea01973bc77db64bf5ea1",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 14,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg -n 'def (cpython_tags|generic_tags|compatible_tags)|platforms =|platforms or' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '398,475p;523,645p' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 88398,
+        "cached_input_tokens": 80768,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 547,
+        "reasoning_output_tokens": 70
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "src/packaging/tags.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 78.608,
+        "test_output_sha256": "921b60a7fd52e978fbb551cacd29df2d6708879400278e1fcc70fceeb0c6f8e0",
+        "after_snapshot_sha256": "214c18ac2b26266527c6f909aef09e5bcbe57c09d9f4ef3142f63cd02d7f236e"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": {
+        "authorization_scope_digest": "85393616b463e690ee7c84747e6c41b4ad43b90f3dca6aceba59c61c31ff305b",
+        "cached_input_tokens": 80768,
+        "completed_commands": 3,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790286876839,
+        "completed_source_reads": 1,
+        "exit_code": 0,
+        "input_tokens": 88398,
+        "output_tokens": 547,
+        "session_id": "e943177e-a201-4518-9f38-09909a795291",
+        "started_ms": 1790286858821,
+        "successful_tests": 0,
+        "task_id": "packaging-empty-platforms-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T21:54:37.016848+00:00"
+}

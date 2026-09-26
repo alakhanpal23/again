@@ -1,0 +1,379 @@
+{
+  "schema": "again.real-repository-pair.v1",
+  "identity": {
+    "manifestSha256": "ed16ffdd86ef5ec5abc258752e5be5033a9b8c2a938d1fa4e73ea28304d92647",
+    "source": {
+      "head": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+      "dirty": false,
+      "buildSourceSha": "38c8bc7b50e74c997e8c35199a2962a27fba75a7",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "0d3ce3972d892dba8a983a522f4d4e9427544f6ea9aadaf3387876377a2460fb",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "packaging-empty-platforms",
+  "mode": "returning",
+  "order": "baseline-first",
+  "observations": [
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 19060.402,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 19060.402,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5461.578,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5461.617,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5461.624,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5461.656,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5486.402,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5486.413,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8025.522,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8025.578,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 13306.49,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 13327.717,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 15632.374,
+          "event": "item.started",
+          "itemId": "item_7",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 15632.398,
+          "event": "item.completed",
+          "itemId": "item_7",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 18283.464,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 13327.724,
+      "rawEventBytes": 25544,
+      "rawEventSha256": "5f0267fa3c82ae02ee79bc5967c972b3d541c85f08f2792e2626b80d32033ed0",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 18,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg -n 'platforms|def .*tags' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1,260p' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '390,650p' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 99196,
+        "cached_input_tokens": 88576,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 605,
+        "reasoning_output_tokens": 72
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "src/packaging/tags.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 73.323,
+        "test_output_sha256": "921b60a7fd52e978fbb551cacd29df2d6708879400278e1fcc70fceeb0c6f8e0",
+        "after_snapshot_sha256": "214c18ac2b26266527c6f909aef09e5bcbe57c09d9f4ef3142f63cd02d7f236e"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 7629.44,
+        "usage": {
+          "input_tokens": 31532,
+          "cached_input_tokens": 27264,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 185,
+          "reasoning_output_tokens": 10
+        },
+        "completedCommands": 1,
+        "brainObserved": false,
+        "rawEventSha256": "d26274a7d9562f964055cd4e9fe4b6db411767782c173f212818e7d54d4ec0c7",
+        "rawEventBytes": 1320
+      },
+      "brainRun": null,
+      "brainRunError": null
+    },
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 19083.688,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 19083.688,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4903.666,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4903.678,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7466.153,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 7466.216,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11811.065,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 11854.268,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 14996.857,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14996.876,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 18231.735,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 11854.275,
+      "rawEventBytes": 7118,
+      "rawEventSha256": "000ce37204a9d1753bf942c318cabef15a56c9f73b4d1458d49afb6256f929f5",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 14,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg -n 'platforms\\\\s*=|platform_tags\\\\(\\\\)' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '530,575p;595,645p' src/packaging/tags.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 89516,
+        "cached_input_tokens": 82048,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 540,
+        "reasoning_output_tokens": 70
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "src/packaging/tags.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 78.327,
+        "test_output_sha256": "921b60a7fd52e978fbb551cacd29df2d6708879400278e1fcc70fceeb0c6f8e0",
+        "after_snapshot_sha256": "214c18ac2b26266527c6f909aef09e5bcbe57c09d9f4ef3142f63cd02d7f236e"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 9795.804,
+        "usage": {
+          "input_tokens": 33117,
+          "cached_input_tokens": 28032,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 280,
+          "reasoning_output_tokens": 73
+        },
+        "completedCommands": 1,
+        "brainObserved": true,
+        "rawEventSha256": "b501a372f5bf2f673f8c7f4f547ddd025ed77db400f1823a5f41d8f2d50b8520",
+        "rawEventBytes": 1404
+      },
+      "brainRun": {
+        "authorization_scope_digest": "2ae73bc144a0c0160114e2de58abb2ea6a29e5c0eaa353bb8b82953300f62e4c",
+        "cached_input_tokens": 82048,
+        "completed_commands": 3,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790285664610,
+        "completed_source_reads": 1,
+        "exit_code": 0,
+        "input_tokens": 89516,
+        "output_tokens": 540,
+        "session_id": "84a1e8dd-bff4-4bb9-8d06-eb0f5bb7e96a",
+        "started_ms": 1790285645549,
+        "successful_tests": 0,
+        "task_id": "packaging-empty-platforms-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T21:34:24.803533+00:00"
+}

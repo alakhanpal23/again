@@ -1,0 +1,280 @@
+{
+  "againBinarySha256": "865ad36a63d8b5a29c05d573aab120d5733182ab326a2a3f5bb027c523bbe0ae",
+  "evidenceScope": "local stdio diagnostic; not a live-agent task-speed result",
+  "harnessSha256": "048a33c419fd5a1a03baec860081a9ed87423e594dc8a1899d4e7e04190d01c0",
+  "host": {
+    "machine": "arm64",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "largeFixtureSha256": "05eb80c970509ee6769f59741a9b6a3d235f7e9510cdb7a2db113a24ee2dd98d",
+  "observations": [
+    {
+      "case": "stat-small",
+      "coldMicros": 518.417,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 40,
+      "warmMeanMicros": 291.872,
+      "warmP50Micros": 289.542,
+      "warmP95Micros": 338.916
+    },
+    {
+      "case": "stat-small",
+      "coldMicros": 416.959,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 40,
+      "warmMeanMicros": 293.737,
+      "warmP50Micros": 287.625,
+      "warmP95Micros": 318.625
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 414.125,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 40,
+      "warmMeanMicros": 262.736,
+      "warmP50Micros": 258.541,
+      "warmP95Micros": 292.0
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 373.833,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 40,
+      "warmMeanMicros": 261.39,
+      "warmP50Micros": 255.458,
+      "warmP95Micros": 288.125
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 5235.917,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 40,
+      "warmMeanMicros": 5143.9,
+      "warmP50Micros": 5133.875,
+      "warmP95Micros": 5238.583
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 5247.083,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 40,
+      "warmMeanMicros": 4993.712,
+      "warmP50Micros": 4985.25,
+      "warmP95Micros": 5190.334
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 68974.209,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 40,
+      "warmMeanMicros": 63588.635,
+      "warmP50Micros": 64491.375,
+      "warmP95Micros": 66097.417
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 65670.833,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 40,
+      "warmMeanMicros": 63480.579,
+      "warmP50Micros": 63643.166,
+      "warmP95Micros": 67130.25
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 31715.709,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 40,
+      "warmMeanMicros": 30018.453,
+      "warmP50Micros": 30155.458,
+      "warmP95Micros": 30741.542
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 32582.416,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 40,
+      "warmMeanMicros": 29657.508,
+      "warmP50Micros": 29106.833,
+      "warmP95Micros": 31468.625
+    },
+    {
+      "case": "list-1000",
+      "coldMicros": 31924.791,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "be0e689258703f5cc41c3425b7da09b23189921ac77cb3a1943fae66125fb037",
+      "samples": 40,
+      "warmMeanMicros": 30442.196,
+      "warmP50Micros": 30132.792,
+      "warmP95Micros": 32856.042
+    },
+    {
+      "case": "list-1000",
+      "coldMicros": 32038.083,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "be0e689258703f5cc41c3425b7da09b23189921ac77cb3a1943fae66125fb037",
+      "samples": 40,
+      "warmMeanMicros": 29389.925,
+      "warmP50Micros": 29144.125,
+      "warmP95Micros": 30579.583
+    },
+    {
+      "case": "glob-1000",
+      "coldMicros": 45980.667,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "935b4a0ced33c7d0db6a2aca1b3bcbd3f19b722d732ff7873f9ea8450580de56",
+      "samples": 40,
+      "warmMeanMicros": 46789.617,
+      "warmP50Micros": 46958.084,
+      "warmP95Micros": 48918.333
+    },
+    {
+      "case": "glob-1000",
+      "coldMicros": 46332.167,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "935b4a0ced33c7d0db6a2aca1b3bcbd3f19b722d732ff7873f9ea8450580de56",
+      "samples": 40,
+      "warmMeanMicros": 45360.251,
+      "warmP50Micros": 44568.708,
+      "warmP95Micros": 49795.708
+    },
+    {
+      "case": "manifest-root",
+      "coldMicros": 358.917,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "execute-only",
+      "requested": 41,
+      "resultSha256": "2db066d5dcd7047befc781a7f03a82b952560ac98f0eef147c339acec5554e88",
+      "samples": 40,
+      "warmMeanMicros": 195.77,
+      "warmP50Micros": 185.041,
+      "warmP95Micros": 258.916
+    },
+    {
+      "case": "manifest-root",
+      "coldMicros": 359.209,
+      "exactHits": 0,
+      "executed": 41,
+      "mode": "automatic",
+      "requested": 41,
+      "resultSha256": "2db066d5dcd7047befc781a7f03a82b952560ac98f0eef147c339acec5554e88",
+      "samples": 40,
+      "warmMeanMicros": 226.552,
+      "warmP50Micros": 219.416,
+      "warmP95Micros": 285.041
+    }
+  ],
+  "pairs": [
+    {
+      "automaticWarmP50Micros": 287.625,
+      "case": "stat-small",
+      "directWarmP50Micros": 289.542,
+      "warmP50DeltaMicros": 1.917
+    },
+    {
+      "automaticWarmP50Micros": 255.458,
+      "case": "read-small",
+      "directWarmP50Micros": 258.541,
+      "warmP50DeltaMicros": 3.083
+    },
+    {
+      "automaticWarmP50Micros": 4985.25,
+      "case": "read-large",
+      "directWarmP50Micros": 5133.875,
+      "warmP50DeltaMicros": 148.625
+    },
+    {
+      "automaticWarmP50Micros": 63643.166,
+      "case": "search-1000",
+      "directWarmP50Micros": 64491.375,
+      "warmP50DeltaMicros": 848.209
+    },
+    {
+      "automaticWarmP50Micros": 29106.833,
+      "case": "tree-1000",
+      "directWarmP50Micros": 30155.458,
+      "warmP50DeltaMicros": 1048.625
+    },
+    {
+      "automaticWarmP50Micros": 29144.125,
+      "case": "list-1000",
+      "directWarmP50Micros": 30132.792,
+      "warmP50DeltaMicros": 988.667
+    },
+    {
+      "automaticWarmP50Micros": 44568.708,
+      "case": "glob-1000",
+      "directWarmP50Micros": 46958.084,
+      "warmP50DeltaMicros": 2389.376
+    },
+    {
+      "automaticWarmP50Micros": 219.416,
+      "case": "manifest-root",
+      "directWarmP50Micros": 185.041,
+      "warmP50DeltaMicros": -34.375
+    }
+  ],
+  "recordedAtUtc": "2026-09-23T08:03:01.628531+00:00",
+  "schema": "again.gateway-reuse-value-probe.v1",
+  "smallFixtureSha256": "2e66e42b3e0b8334c261015ea9ecb5cb937485406bca0e9028d43797761aafbe",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "992528afc2c2e62bf3eaa9625118f64b91b8ebd7"
+  },
+  "sourceFiles": 1000
+}

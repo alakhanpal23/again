@@ -2,19 +2,21 @@
 
 ## Exact promise
 
-> Again is a repository-aware execution memory and tool-call control plane for coding agents. It skips only work proven redundant, executes uncertain work, and returns the smallest useful verified observation.
+> Again gives one coding agent a current repository brief and remembers verified work across tasks so it can reach a correct, tested change with less repeated investigation.
 
-This sentence is both the product pitch and the reuse boundary. The explicit path makes a narrow, policy-admitted set of local read-only commands fast while returning exact full streams. The default MCP path controls 13 built-in repository/Git intelligence tools and includes a crate-internal bounded transport for real upstream stdio providers. “Proven” means that the request and its declared repository, task, provider, schema, environment, authorization scope, executable, and dependency observations satisfy a versioned deterministic policy; matching text, provider annotations, or semantic similarity is never sufficient.
+This is the single-agent product promise being qualified. The primary path is the `again codex` launcher with native agent tools and an automatically updated local Brain. Exact-result reuse remains an explicit narrow path: a hit requires a versioned deterministic proof of the request, environment, executable, and relevant source state. Matching text or semantic similarity does not authorize a replay. Cheap native reads remain native because lookup and proof can cost more than execution.
 
 ## Product outcome
 
 > Again helps coding agents start with verified repository understanding, avoid
-> repeating work, run only the validation that changed, and share exact
-> execution knowledge across agents.
+> repeating work, run the validation that matters, and carry current execution
+> knowledge into the next task.
 
 The product is optimized for lower time and lower total cost per successful
-coding task, not for cache-hit percentage. The complete end-state user loop,
-current implementation map, scorecard, and delivery order are frozen in
+coding task, not for cache-hit percentage. The current implementation priority
+is the [single-agent product plan](SINGLE_AGENT_PRODUCT_PLAN.md), including a
+durable repository knowledge base. The broader end-state user loop,
+implementation map, scorecard, and delivery order are in
 [the agent acceleration product](AGENT_ACCELERATION.md). That direction does
 not upgrade an experimental subsystem or broaden any shipping claim below. The
 profile-by-profile inventory of reads, code intelligence, validation, builds,
@@ -24,26 +26,73 @@ The latency-critical task experience and its proof gate are defined by the
 
 ## Initial customer and job
 
-The first customer is a technical individual using Codex or Claude locally on a repository where agents repeatedly search or inspect the same material. The initial job is to remove redundant repository-tool latency and repeated context without asking the developer to declare a build graph. The gateway gives agents a shared exact execution memory; the explicit CLI remains the conservative local path.
+The first customer is a technical individual using one Codex or Claude agent
+locally on a repository where tasks repeatedly search or inspect the same
+material. The initial job is to speed a correct, validated coding task through
+better orientation, durable repository knowledge, and less repeated work
+without asking the developer to declare a build graph. The gateway provides
+exact execution memory where proof is economical; the explicit CLI remains
+the conservative local path.
 
 The first economic buyer is the same developer. The later buyer is an engineering-platform leader paying to remove redundant agent/CI computation across a team while retaining provenance and policy control.
 
 ## Onboarding contract
 
-The packaged target is:
+The packaged command below is a future target; no Homebrew package or GitHub release has been published. The current user path is the [source install](../README.md#install-and-run): `cargo install --locked --path . --features daemon` from a cloned checkout. The target workflow is:
 
 ```bash
 brew install again
-again setup --codex
+again mcp setup --client codex --workspace "$(pwd -P)" --apply --with-skill --with-brain-hook
 # Start a new Codex session; it can now invoke:
+# Call the Again task.start MCP tool for a bounded shared edit brief.
+# Or prepare verified source previews before a noninteractive Codex run:
+again codex --workspace "$(pwd -P)" --task-id fix-calculator --task "Fix calculator addition" -- --ephemeral
+# Claude Code print mode uses the same authenticated launch preparation:
+again claude --workspace "$(pwd -P)" --task-id fix-calculator --task "Fix calculator addition" -- --output-format json
 again run -- rg --no-ignore --sort=path needle src
 # only if those exact complete bytes remain visible in this active context:
 again reference -- rg --no-ignore --sort=path needle src
 ```
 
-`again setup --codex` installs an instruction-only skill at `$HOME/.agents/skills/again` by default. `again setup --codex --project` instead installs `<repo>/.agents/skills/again`; scoped `--remove` reverses an unchanged owned install. The skill tells Codex when to use explicit `again run --`, when an explicit `again reference --` is context-safe, and to rerun an ineligible command unchanged outside Again. It does not install hooks. `again doctor` reports both skill scopes and duplicate installation.
+`again codex` is the primary launch path; it needs no installed project hook to observe its own event stream. `--apply --with-skill --with-brain-hook` configures interactive Codex separately: it verifies the MCP entry, installs the instruction-only personal skill, and installs the project Brain observer. Interactive capture starts after the user reviews and trusts that observer in `/hooks`; setup cannot verify trust. The skill now directs ordinary investigation through native tools and reserves Again's repository tools and explicit reuse path for cases where their verified result is useful. `again doctor` reports installation state.
 
-Personal-scope local use requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry.
+`again codex` starts or joins the authenticated workspace daemon, registers the exact durable task, and supplies up to two source-checked previews and bounded current shared findings before calling `codex exec`. Small files are shown completely; larger files receive line-numbered partial excerpts that guide a later read before editing. It preserves Codex's normal user configuration and approval policy, pins the Again MCP connection for this invocation, and forwards explicit Codex flags after `--`. An elected launcher holds and renews the leader lease for the process lifetime. A follower waits up to 30 seconds by default; if the leader exits, it claims the task and refreshes source and context before launching Codex. Use `--peer-wait-seconds 0` to launch a collaborating follower immediately, or set a bounded wait up to 300 seconds. A still-active peer is reported in the follower brief. Blocked dependencies and terminal tasks stop the launch. `again mcp brief --workspace <path> --task-id <id> --task <text>` prints a preview without claiming a lease for other launchers. Keep task text free of secrets. These commands require a daemon-enabled Unix build and an installed Codex CLI; this launch path has local diagnostic evidence but is not yet a qualified default workflow.
+
+The launcher now consumes Codex `--json` events, rendering text for normal
+invocations and preserving raw JSONL when `--json` is explicitly passed. A
+local Again Brain records completed command metadata, file edit digests,
+independently matched `cat` and bounded `sed` source reads, and one compact
+outcome and token-usage row per completed Codex launcher session. Matching
+prior files and an unverified successful-test hint can appear in later task
+briefs. Current complete Brain previews are capped at 2 KiB per file and the
+whole Brain field at 4 KiB. The same
+bounded `againBrain` field is included in authenticated `task.start` for the
+canonical local-workspace scope, giving interactive agents this history as
+well. It can select a prior file from a related task even when that file is
+outside the current code index candidates; it rechecks source bytes before
+presenting the file as current. Older unscoped observations are withheld from
+the brief after the scope-binding migration. The launcher consumes the
+task-start field without a second Brain lookup. When a task requests tests,
+task start can preview a complete matching Python unittest or JavaScript Node
+test file and suggest an execution-required command. Rust and Go source
+candidates can also receive manifest-backed, unverified test suggestions.
+An optional repository-scoped
+`again brain hook-setup --workspace <path> --apply` installs an observation-only
+Codex `PostToolUse` Bash and `apply_patch` hook for interactive sessions. It preserves unrelated
+hook handlers and an ownership snapshot permits restoring an unchanged prior
+configuration with `--remove`. The hook records bounded command metadata and
+source reads whose plain output exactly matches current file bytes. Completed
+patch responses record current edited-file digests or retire an older file
+observation when the source is gone; a response
+without exit status does not establish successful validation.
+`again brain show --workspace <path>` inspects the metadata and run summaries,
+and `again brain clear --workspace <path>` removes it. This does not intercept
+or cache native shell calls, and a prior test hint never permits skipping a
+new validation run.
+
+`again claude` uses the same brief, peer wait, and lease lifecycle for Claude Code's noninteractive print mode. It passes a workspace-bound Again MCP server through Claude Code's documented [`--mcp-config`](https://code.claude.com/docs/en/cli-reference) flag and forwards explicit Claude flags after `--`. The local release gate checks the generated arguments with a fake Claude executable; no Claude Code binary is installed on this host, so a live Claude task and token result remain unverified.
+
+The explicit `again run` path requires no Again account, sign-in, API key, daemon, Docker, privileged helper, repository file, Codex hook installation, or telemetry. MCP context and prebrief use the authenticated local daemon.
 
 The MCP onboarding path is explicit and workspace-bound:
 
@@ -52,15 +101,17 @@ again mcp setup --client codex --workspace /canonical/repository
 again mcp setup --client claude --workspace /canonical/repository
 ```
 
-Both commands are dry runs unless `--install-owned-config ABSOLUTE_PATH` is supplied. The generated server argv contains the exact canonical repository path. Installation can create only a wholly Again-owned absent config plus its ownership record, or verify the exact owned pair; an unowned or conflicting file is never overwritten. The gateway uses bounded concurrent stdio, serializes complete responses, propagates cancellation to the matching physical attempt, and fails closed on malformed or oversized JSON-RPC.
+Both commands are dry runs unless `--apply` is supplied. Apply uses the official client CLI, verifies the exact installed entry, and refuses a conflicting entry. The generated server argv contains the exact canonical repository path. The gateway uses bounded concurrent stdio, serializes complete responses, propagates cancellation to the matching physical attempt, and fails closed on malformed or oversized JSON-RPC.
 
-Current gateway limits are part of the product truth: there is no CLI configuration path for arbitrary upstream MCP servers, authenticated result-ID retrieval, automatic compact cross-agent delivery, semantic reuse, task-quality qualification, or production Linux command backend. Unknown or incomplete state executes normally when doing so preserves the closed provider semantics; configuration that could make a nominally read-only Git query execute a filter or external diff command is instead refused before Git starts. External Git includes/ignore/attribute files and nested worktree/submodule state never authorize reuse. Mutating, freshness-bound, network, credential, communication, deployment, payment, and unknown tools are not reused; sensitive or unknown classes bypass storage entirely.
+Current gateway limits are part of the product truth: same-user daemon sessions have authenticated task-scoped full retrieval and write/flush-confirmed compact context delivery, but production or cross-user recipient issuance is absent. There is no CLI configuration path for arbitrary upstream MCP servers, semantic reuse, live task-quality qualification, or production Linux command backend. Unknown or incomplete state executes normally when doing so preserves the closed provider semantics; configuration that could make a nominally read-only Git query execute a filter or external diff command is instead refused before Git starts. External Git includes/ignore/attribute files and nested worktree/submodule state never authorize reuse. Mutating, freshness-bound, network, credential, communication, deployment, payment, and unknown tools are not reused; sensitive or unknown classes bypass storage entirely.
 
-The current retained product checkpoint is [`2026-08-27-agent-gateway-product-e2e-release-v3.json`](../bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json), bound to source `850e7c4398adc25ef1210ee4260e27b29aaeb753`, release-binary SHA-256 `e52e7540c3754038db3fbc87bc0039df1b6e983b124497d4f3559708c5a536f0`, and report-file SHA-256 `9b818771f830395d2b123e83437b290ea470b284bcef0f52ce1576edbd82ce08`. All eight exact scenarios passed through four actual Again MCP processes with 12 provider executions and zero false hits. Their exact event windows contain two exact reuse hits and one joined in-flight call, for three avoided provider executions. The canceled follower remains only a cancellation candidate.
+The retained [exact gateway checkpoint](../bench/results/2026-08-27-agent-gateway-product-e2e-release-v3.json) at `850e7c4398adc25ef1210ee4260e27b29aaeb753` passed eight scenarios through four actual Again MCP processes with 12 provider executions and zero false hits. Its exact event windows contain two exact reuse hits and one joined in-flight call, for three avoided provider executions. The newer [authenticated product lifecycle gate](../bench/results/2026-09-23-auth-product-e2e-indexed-validation-hint-v1.json) passed at `eb12c17fa027556e88ce6f56cf6c9a7cf1dbf2ba`, including two-client task/source sharing, invalidation, cancellation, corruption refusal, and lease recovery. These gates cover different scenario sets; neither proves a product-wide task-speed gain.
+
+The [four-platform native beta matrix](../bench/results/2026-09-23-native-beta-matrix-56d9d3e-summary.json) passed at `56d9d3e4e2e1f0b349ab126d422a617b04dd1658`. Each daemon-enabled archive was installed, started, exercised through authenticated MCP, checked for its tool catalog and client setup plans, and removed. The archives are retained in [GitHub Actions run 35919913635](https://github.com/alakhanpal23/again/actions/runs/35919913635); no release has been published.
 
 The same release bytes passed the retained [onboarding smoke](../bench/results/2026-08-27-agent-gateway-onboarding-smoke-v2.json) and [quick chaos run](../bench/results/2026-08-27-agent-gateway-chaos-soak-v3.json). Onboarding exercised isolated Codex/Claude installation, owned reinstall/removal, unowned and symlink refusal, exact workspace binding, real MCP startup, both built-ins, mutation invalidation, and descendant cleanup without reading real user credentials or configuration. Chaos reconciled all eight product scenarios, 16 extra exact calls over two sessions, zero false hits, six absent owned process groups, unchanged open-descriptor count, and absent temporary state. These are local release-binary facts, not hostile-binary network-sandbox or general performance evidence.
 
-The earlier [real-repository report](../bench/results/2026-08-27-agent-gateway-real-repository-partial-v2.json) correctly remained a typed `non_pass` when no Go repository was supplied. The current [four-language report](../bench/results/2026-08-28-agent-gateway-real-repository-four-language-private-release-v1.json) passes explicit clean Rust, Python, Go, and TypeScript repositories with zero false hits; the harness still never clones, downloads, or executes source-repository code. The alpha-trial recorder freezes ten scenarios and can aggregate exactly five independent users and 50 attempts, but no outside-user report exists; local simulation is explicitly non-evidence. The [real-agent report](../bench/results/2026-08-27-agent-gateway-real-agent-dry-run-v2.json) validates explicit read-only Codex 0.150.1 and Claude 2.1.220 command templates, exact inspected runtime pins, isolated configuration roots, credential-by-environment handling, fixed paired tasks, output redaction, resumable journal rules, and evidence bounds. It is an offline plan: no agent, network, or paid model call ran. All 16 live paired runs remain manual and unexecuted, so no model-quality, end-to-end agent-latency, direct token-count, or task-outcome claim follows. Production has no authenticated MCP recipient issuer: schema-v10 receipts and grants are dormant, full results remain the only MCP presentation, and delivery-confirmed bytes/tokens saved are zero.
+The earlier [real-repository report](../bench/results/2026-08-27-agent-gateway-real-repository-partial-v2.json) correctly remained a typed `non_pass` when no Go repository was supplied. The [four-language report](../bench/results/2026-08-28-agent-gateway-real-repository-four-language-private-release-v1.json) passes explicit clean Rust, Python, Go, and TypeScript repositories with zero false hits; the harness never clones, downloads, or executes source-repository code. Local live Codex edits now have retained paired events and usage on [calculator](../bench/results/2026-09-23-codex-pair-product-wrapper-guided-baseline-first-v1.json) and [running balance](../bench/results/2026-09-23-codex-running-balance-wrapper-baseline-first-v1.json), plus [two-agent runs in both orders](../bench/results/2026-09-23-codex-parallel-running-balance-baseline-first-v1.json). Those tasks passed their exact patch oracles and often reduced first-edit time, calls, and input tokens; parallel completion time was mixed. The original 16-run read-only real-agent harness remains unexecuted, and no representative editable cohort or metered total-cost qualification exists. A live Claude Code task remains unverified on this host. Production and cross-user MCP recipient issuance remain absent. The local daemon supports recipient-scoped retrieval and delivery-confirmed compact context, while the live input-token differences cannot yet be attributed specifically to compact delivery.
 
 On Unix, disposable local state defaults to `${TMPDIR}/again-<euid>/workspaces/<BLAKE3(canonical-workspace-path)>`, with private app-owned directory levels, so the first run never mutates the observed repository. `AGAIN_HOME` selects one exact persistent root; it must be absolute and outside the active workspace, and an existing root must already satisfy the owned-real-`0700` policy. Every canonical ancestor must be a real directory owned by the current uid or root, with sticky protection if group/world writable. Path checks and creation are still raceable by the same user or root.
 

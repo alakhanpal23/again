@@ -1,0 +1,324 @@
+{
+  "againBinarySha256": "34399fcfea3c00c7102c3463f47fbd9fbb4ab266c7c13b98dd543751767b5d38",
+  "evidenceScope": "local authenticated daemon task diagnostic; not a live-agent speed result",
+  "harnessSha256": "0e3e5076fe44e23e3fbc7d868c968fe005924bae0e01325573b66980ae252422",
+  "host": {
+    "machine": "arm64",
+    "release": "25.6.0",
+    "system": "Darwin"
+  },
+  "includeSourcePreviews": false,
+  "observations": [
+    {
+      "case": "read-small",
+      "coldMicros": 618.917,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2139586.042,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 206.861,
+      "warmP50Micros": 204.208,
+      "warmP95Micros": 232.917
+    },
+    {
+      "case": "read-small",
+      "coldMicros": 10149.542,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "dc5773ed518efed749ffe2bc0abf02fab58e7b492518aab2fad4fee223582356",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2241522.291,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 296.638,
+      "warmP50Micros": 306.833,
+      "warmP95Micros": 339.291
+    },
+    {
+      "case": "stat-small",
+      "coldMicros": 312.333,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2224180.25,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 179.333,
+      "warmP50Micros": 177.5,
+      "warmP95Micros": 202.25
+    },
+    {
+      "case": "stat-small",
+      "coldMicros": 12467.458,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "03e69d322cfb917816e871694c0f4aa933cc5e5794f1f370255543f04ea24038",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2250632.417,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 348.555,
+      "warmP50Micros": 369.875,
+      "warmP95Micros": 392.708
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 1232.75,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2160162.833,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 595.236,
+      "warmP50Micros": 602.292,
+      "warmP95Micros": 693.958
+    },
+    {
+      "case": "read-large",
+      "coldMicros": 149374.667,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "450d1a9afb8137b243f3ed5157cd4847d96b9939005cf5acfe561dc0f4685602",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2183931.5,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 563.542,
+      "warmP50Micros": 556.25,
+      "warmP95Micros": 590.5
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 107502.334,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2473341.0,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 128296.403,
+      "warmP50Micros": 126720.084,
+      "warmP95Micros": 137119.75
+    },
+    {
+      "case": "search-1000",
+      "coldMicros": 543219.708,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "2667158d06bb7e8cadac5edae98543d67aa76c4655b9fb2a2bcba75938f3c0e5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2247827.458,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 93772.569,
+      "warmP50Micros": 94375.208,
+      "warmP95Micros": 95176.042
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 30266.834,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2308208.417,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 29226.43,
+      "warmP50Micros": 29104.042,
+      "warmP95Micros": 29938.291
+    },
+    {
+      "case": "tree-1000",
+      "coldMicros": 307156.458,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "0a304183b4222b4a05580ac75b7deda425c4cf6bda51713473ceb96d9f3738d5",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2216297.958,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 28318.875,
+      "warmP50Micros": 28305.334,
+      "warmP95Micros": 28346.541
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 42777.625,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "execute-only",
+      "requested": 4,
+      "resultSha256": "088cf522785d775db0c18721345ddbfac405579e841f72045e3e00696c612408",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2210398.292,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 32542.972,
+      "warmP50Micros": 32762.292,
+      "warmP95Micros": 35744.917
+    },
+    {
+      "case": "git-status",
+      "coldMicros": 441188.708,
+      "editBriefCandidateCount": 24,
+      "editBriefIncomplete": true,
+      "editBriefUnknownKinds": [
+        "parse_time_exceeded",
+        "candidate_limit_exceeded"
+      ],
+      "exactHits": 0,
+      "executed": 4,
+      "mode": "automatic",
+      "requested": 4,
+      "resultSha256": "088cf522785d775db0c18721345ddbfac405579e841f72045e3e00696c612408",
+      "samples": 3,
+      "sourcePreviewCount": 0,
+      "taskStartMicros": 2202541.917,
+      "taskStartPresentation": "full",
+      "warmMeanMicros": 28965.931,
+      "warmP50Micros": 29861.917,
+      "warmP95Micros": 30251.084
+    }
+  ],
+  "pairs": [
+    {
+      "automaticWarmP50Micros": 306.833,
+      "case": "read-small",
+      "directWarmP50Micros": 204.208,
+      "warmP50DeltaMicros": -102.625
+    },
+    {
+      "automaticWarmP50Micros": 369.875,
+      "case": "stat-small",
+      "directWarmP50Micros": 177.5,
+      "warmP50DeltaMicros": -192.375
+    },
+    {
+      "automaticWarmP50Micros": 556.25,
+      "case": "read-large",
+      "directWarmP50Micros": 602.292,
+      "warmP50DeltaMicros": 46.042
+    },
+    {
+      "automaticWarmP50Micros": 94375.208,
+      "case": "search-1000",
+      "directWarmP50Micros": 126720.084,
+      "warmP50DeltaMicros": 32344.876
+    },
+    {
+      "automaticWarmP50Micros": 28305.334,
+      "case": "tree-1000",
+      "directWarmP50Micros": 29104.042,
+      "warmP50DeltaMicros": 798.708
+    },
+    {
+      "automaticWarmP50Micros": 29861.917,
+      "case": "git-status",
+      "directWarmP50Micros": 32762.292,
+      "warmP50DeltaMicros": 2900.375
+    }
+  ],
+  "recordedAtUtc": "2026-09-23T18:12:54.263472+00:00",
+  "schema": "again.gateway-task-reuse-value-probe.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "5a99f35bcd24adeb4de46e5949bdbf38f2c2bb71"
+  },
+  "sourceFiles": 1000,
+  "taskText": "Inspect this fixture"
+}

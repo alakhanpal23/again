@@ -1,0 +1,30 @@
+{
+  "sourceSha": "df1d912981f6d95be5deb8a56c61e8462683149a",
+  "releaseBinarySha256": "29530d5a843f32a095acd67fb3542b1cc53134d58324663253c52a157a052a65",
+  "evidenceScope": "two-order synthetic JavaScript repair diagnostic; not balanced release qualification",
+  "pairedMedianElapsedRatio": 0.5741443955722121,
+  "orders": [
+    {
+      "order": "baseline-first",
+      "baselineElapsedMs": 22603.367,
+      "againElapsedMs": 11323.249,
+      "pairedElapsedRatio": 0.5009540835221584,
+      "baselineActions": 6,
+      "againActions": 2,
+      "baselineInputTokens": 82158,
+      "againInputTokens": 48638,
+      "accepted": true
+    },
+    {
+      "order": "again-first",
+      "baselineElapsedMs": 19452.969,
+      "againElapsedMs": 12592.582,
+      "pairedElapsedRatio": 0.6473347076222657,
+      "baselineActions": 6,
+      "againActions": 2,
+      "baselineInputTokens": 81817,
+      "againInputTokens": 48642,
+      "accepted": true
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 //! Local SQLite index and content-addressed output store.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -37,7 +38,10 @@ use crate::task_lifecycle::{
     validate_task_selector_v1,
 };
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 20;
+const MAX_BRAIN_EVENTS_V1: i64 = 10_000;
+const MAX_BRAIN_EVENT_AGE_MS_V1: i64 = 90 * 24 * 60 * 60 * 1_000;
+const MAX_CONTEXT_SOURCE_PLAN_BYTES_V1: usize = 64 * 1024;
 const MAX_CONTEXT_TASKS_PER_WORKSPACE_V1: u64 = 4096;
 const MAX_CONTEXT_TASK_ALIASES_PER_WORKSPACE_V1: u64 = 16_384;
 const MAX_TASK_CONTEXT_LOGICAL_BYTES_V1: u64 = 256 * 1024 * 1024;
@@ -68,6 +72,85 @@ pub struct CleanupReport {
     pub events: u64,
     pub gateway_events: u64,
     pub artifacts: u64,
+}
+
+/// Bounded metadata observed from a coding client's completed tool event.
+/// Native client output is never authority for a cache hit or verified fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainEventV1 {
+    pub session_id: String,
+    pub event_id: String,
+    pub task_id: String,
+    pub kind: String,
+    pub path: Option<String>,
+    pub source_digest: Option<String>,
+    /// A paired range is a verified read; a start without an end is a verified search hit.
+    pub read_start_line: Option<u32>,
+    pub read_end_line: Option<u32>,
+    pub command_digest: Option<String>,
+    pub command_hint: Option<String>,
+    pub exit_code: Option<i32>,
+    pub created_ms: i64,
+    pub authorization_scope_digest: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainFileV1 {
+    pub path: String,
+    pub source_digest: String,
+    /// Paired lines represent a read; a lone start line represents a search hit.
+    pub read_start_line: Option<u32>,
+    pub read_end_line: Option<u32>,
+    pub task_id: String,
+    pub observed_ms: i64,
+    pub authorization_scope_digest: Option<String>,
+}
+
+/// Outcome metadata from one Codex launcher session. Counts and usage come
+/// from the client's event stream; they do not prove task acceptance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrainRunV1 {
+    pub session_id: String,
+    pub task_id: String,
+    pub authorization_scope_digest: String,
+    pub started_ms: i64,
+    pub completed_ms: i64,
+    pub exit_code: i32,
+    pub turn_completed: bool,
+    pub completed_commands: u32,
+    pub completed_source_reads: u32,
+    pub completed_edits: u32,
+    pub completed_mcp_calls: u32,
+    pub successful_tests: u32,
+    pub input_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub output_tokens: Option<i64>,
+}
+
+fn brain_run_from_row_v1(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrainRunV1> {
+    Ok(BrainRunV1 {
+        session_id: row.get(0)?,
+        task_id: row.get(1)?,
+        authorization_scope_digest: row.get(2)?,
+        started_ms: row.get(3)?,
+        completed_ms: row.get(4)?,
+        exit_code: row.get(5)?,
+        turn_completed: row.get(6)?,
+        completed_commands: row.get(7)?,
+        completed_source_reads: row.get(8)?,
+        completed_edits: row.get(9)?,
+        completed_mcp_calls: row.get(10)?,
+        successful_tests: row.get(11)?,
+        input_tokens: row.get(12)?,
+        cached_input_tokens: row.get(13)?,
+        output_tokens: row.get(14)?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BrainTaskFileV1 {
+    pub observation: BrainFileV1,
+    pub task_prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -133,6 +216,7 @@ pub struct StoreStats {
     pub estimated_execution_ms_saved: u64,
     pub requested: u64,
     pub executed: u64,
+    pub direct_observations_published: u64,
     pub exact_hits: u64,
     pub coverage_hits: u64,
     pub inflight_joins: u64,
@@ -743,6 +827,7 @@ impl GatewayAgentContext {
 pub struct GatewayStats {
     pub requested: u64,
     pub executed: u64,
+    pub direct_observations_published: u64,
     pub exact_hits: u64,
     pub coverage_hits: u64,
     pub inflight_joins: u64,
@@ -962,6 +1047,7 @@ pub struct Store {
     blobs: PathBuf,
     conn: Connection,
     file_digest_writes_since_prune: u16,
+    brain_writes_since_prune: Cell<u16>,
 }
 
 impl Store {
@@ -1026,6 +1112,7 @@ impl Store {
             blobs,
             conn,
             file_digest_writes_since_prune: FILE_DIGEST_PRUNE_INTERVAL - 1,
+            brain_writes_since_prune: Cell::new(0),
         };
         store.migrate()?;
         store.verify_gateway_schema_current()?;
@@ -1881,6 +1968,162 @@ impl Store {
             transaction.pragma_update(None, "user_version", 13)?;
             transaction.commit()?;
         }
+        if version < 14 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE gateway_context_source_recipes_v1 (
+                    result_id TEXT PRIMARY KEY CHECK(length(result_id) = 64),
+                    repository_id TEXT NOT NULL CHECK(length(repository_id) BETWEEN 1 AND 128),
+                    workspace_id TEXT NOT NULL CHECK(length(workspace_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    repository_digest TEXT NOT NULL CHECK(length(repository_digest) = 64),
+                    plan_json TEXT NOT NULL CHECK(json_valid(plan_json)
+                        AND length(CAST(plan_json AS BLOB)) BETWEEN 1 AND 65536),
+                    plan_digest TEXT NOT NULL CHECK(length(plan_digest) = 64),
+                    created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+                    FOREIGN KEY(result_id) REFERENCES gateway_results(gateway_result_id) ON DELETE CASCADE
+                ) WITHOUT ROWID;
+                PRAGMA user_version = 14;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 15 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE gateway_results ADD COLUMN origin TEXT NOT NULL DEFAULT 'leased'
+                    CHECK(origin IN ('leased', 'direct_observation'));
+                DROP INDEX gateway_results_ready_idx;
+                CREATE UNIQUE INDEX gateway_results_ready_idx
+                    ON gateway_results(binding_digest)
+                    WHERE status = 'ready' AND origin = 'leased';
+                CREATE UNIQUE INDEX gateway_results_direct_idx
+                    ON gateway_results(binding_digest)
+                    WHERE status = 'ready' AND origin = 'direct_observation';
+                PRAGMA user_version = 15;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 16 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_events_v1 (
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    kind TEXT NOT NULL CHECK(kind IN ('file_change', 'command', 'test')),
+                    path TEXT NOT NULL CHECK(length(path) <= 512),
+                    source_digest TEXT CHECK(source_digest IS NULL OR length(source_digest) = 64),
+                    command_digest TEXT CHECK(command_digest IS NULL OR length(command_digest) = 64),
+                    command_hint TEXT CHECK(command_hint IS NULL OR length(command_hint) BETWEEN 1 AND 256),
+                    exit_code INTEGER,
+                    created_ms INTEGER NOT NULL CHECK(created_ms >= 0),
+                    PRIMARY KEY(session_id, event_id, kind, path)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_events_recent_idx ON brain_events_v1(created_ms DESC);
+                CREATE INDEX IF NOT EXISTS brain_events_task_idx ON brain_events_v1(task_id, created_ms DESC);
+                PRAGMA user_version = 16;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 17 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_files_v1 (
+                    path TEXT PRIMARY KEY CHECK(length(path) BETWEEN 1 AND 512),
+                    source_digest TEXT NOT NULL CHECK(length(source_digest) = 64),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    session_id TEXT NOT NULL CHECK(length(session_id) BETWEEN 1 AND 128),
+                    event_id TEXT NOT NULL CHECK(length(event_id) BETWEEN 1 AND 128),
+                    observed_ms INTEGER NOT NULL CHECK(observed_ms >= 0)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_files_recent_idx
+                    ON brain_files_v1(observed_ms DESC);
+                CREATE TABLE IF NOT EXISTS brain_test_commands_v1 (
+                    command_hint TEXT PRIMARY KEY CHECK(length(command_hint) BETWEEN 1 AND 256),
+                    command_digest TEXT NOT NULL CHECK(length(command_digest) = 64),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    observed_ms INTEGER NOT NULL CHECK(observed_ms >= 0)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_test_commands_recent_idx
+                    ON brain_test_commands_v1(observed_ms DESC);
+                PRAGMA user_version = 17;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 18 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE brain_events_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                ALTER TABLE brain_files_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                ALTER TABLE brain_test_commands_v1 ADD COLUMN authorization_scope_digest TEXT
+                    CHECK(authorization_scope_digest IS NULL OR length(authorization_scope_digest) = 64);
+                CREATE INDEX brain_files_scope_recent_idx
+                    ON brain_files_v1(authorization_scope_digest, observed_ms DESC);
+                CREATE INDEX brain_test_commands_scope_recent_idx
+                    ON brain_test_commands_v1(authorization_scope_digest, observed_ms DESC);
+                PRAGMA user_version = 18;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 19 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                CREATE TABLE IF NOT EXISTS brain_runs_v1 (
+                    session_id TEXT PRIMARY KEY CHECK(length(session_id) BETWEEN 1 AND 128),
+                    task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 128),
+                    authorization_scope_digest TEXT NOT NULL CHECK(length(authorization_scope_digest) = 64),
+                    started_ms INTEGER NOT NULL CHECK(started_ms >= 0),
+                    completed_ms INTEGER NOT NULL CHECK(completed_ms >= started_ms),
+                    exit_code INTEGER NOT NULL,
+                    turn_completed INTEGER NOT NULL CHECK(turn_completed IN (0, 1)),
+                    completed_commands INTEGER NOT NULL CHECK(completed_commands >= 0),
+                    completed_source_reads INTEGER NOT NULL CHECK(completed_source_reads >= 0),
+                    completed_edits INTEGER NOT NULL CHECK(completed_edits >= 0),
+                    completed_mcp_calls INTEGER NOT NULL CHECK(completed_mcp_calls >= 0),
+                    successful_tests INTEGER NOT NULL CHECK(successful_tests >= 0),
+                    input_tokens INTEGER CHECK(input_tokens IS NULL OR input_tokens >= 0),
+                    cached_input_tokens INTEGER CHECK(cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+                    output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+                    CHECK(cached_input_tokens IS NULL OR input_tokens IS NOT NULL),
+                    CHECK(cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens)
+                ) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS brain_runs_scope_recent_idx
+                    ON brain_runs_v1(authorization_scope_digest, completed_ms DESC);
+                PRAGMA user_version = 19;
+                COMMIT;
+                "#,
+            )?;
+        }
+        if version < 20 {
+            self.conn.execute_batch(
+                r#"
+                BEGIN IMMEDIATE;
+                ALTER TABLE brain_events_v1 ADD COLUMN read_start_line INTEGER
+                    CHECK(read_start_line IS NULL OR read_start_line BETWEEN 1 AND 8192);
+                ALTER TABLE brain_events_v1 ADD COLUMN read_end_line INTEGER
+                    CHECK(read_end_line IS NULL OR read_end_line BETWEEN 1 AND 8192);
+                ALTER TABLE brain_files_v1 ADD COLUMN read_start_line INTEGER
+                    CHECK(read_start_line IS NULL OR read_start_line BETWEEN 1 AND 8192);
+                ALTER TABLE brain_files_v1 ADD COLUMN read_end_line INTEGER
+                    CHECK(read_end_line IS NULL OR read_end_line BETWEEN 1 AND 8192);
+                PRAGMA user_version = 20;
+                COMMIT;
+                "#,
+            )?;
+        }
         Ok(())
     }
 
@@ -2208,16 +2451,19 @@ impl Store {
         if dependencies != binding.input.dependencies {
             return Ok(None);
         }
-        let lease_id = transaction
+        let (lease_id, origin) = transaction
             .query_row(
-                "SELECT lease_id FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
+                "SELECT lease_id, origin FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
                 [gateway_result_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
-            .optional()?;
-        let Some(lease_id) = lease_id else {
+            ?;
+        if origin == "direct_observation" {
+            return Ok((lease_id == "direct_observation").then_some(result));
+        }
+        if origin != "leased" {
             return Ok(None);
-        };
+        }
         let Some(lease) = gateway_lease_row_v1(transaction, &lease_id)? else {
             return Ok(None);
         };
@@ -2258,7 +2504,7 @@ impl Store {
 
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| row.get::<_, String>(0),
             )
@@ -2573,7 +2819,7 @@ impl Store {
         }
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| row.get::<_, String>(0),
             )
@@ -3365,6 +3611,36 @@ impl Store {
         Ok(tasks)
     }
 
+    /// Advisory lease observation for a preview-only launch. This grants no
+    /// ownership; a later task claim must still perform its authenticated CAS.
+    pub fn preview_task_leader_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+    ) -> Result<Option<(String, i64)>> {
+        validate_context_identity_v1(identity)?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let leader = transaction
+            .query_row(
+                "SELECT leader_agent_id, expires_ms FROM context_ledger_leases_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
+                   AND authorization_scope_digest = ?4 AND status = 'active'
+                   AND expires_ms > ?5
+                 LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    now_ms()
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        transaction.commit()?;
+        Ok(leader)
+    }
+
     pub fn claim_task_v1(
         &self,
         identity: &ContextLedgerIdentityV1,
@@ -4100,6 +4376,335 @@ impl Store {
         })
     }
 
+    /// Retain the exact bounded repository observation plan that authorized a
+    /// source-backed result. It is private metadata, never model supplied.
+    pub fn admit_context_source_recipe_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        binding: &ValidatedGatewayReadV1,
+        gateway_result_id: &str,
+        repository_digest: &str,
+        plan_json: &[u8],
+    ) -> Result<()> {
+        validate_digest(gateway_result_id, "context source recipe result")?;
+        validate_digest(repository_digest, "context source repository digest")?;
+        if plan_json.is_empty() || plan_json.len() > MAX_CONTEXT_SOURCE_PLAN_BYTES_V1 {
+            bail!("context source observation plan exceeds its bound");
+        }
+        let _: serde_json::Value = serde_json::from_slice(plan_json)
+            .context("context source observation plan is not JSON")?;
+        let plan_text = std::str::from_utf8(plan_json)?;
+        let plan_digest = blake3::hash(plan_json).to_hex().to_string();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let ready: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_results
+                           WHERE gateway_result_id = ?1 AND binding_digest = ?2
+                             AND status = 'ready' AND quarantine_reason IS NULL)",
+            params![gateway_result_id, binding.binding_digest()],
+            |row| row.get(0),
+        )?;
+        if !ready {
+            bail!(GatewayRefusalReason::ResultNotFound.as_str());
+        }
+        let exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_context_source_recipes_v1 WHERE result_id = ?1)",
+            [gateway_result_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            reserve_task_context_bytes_v1(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                0,
+            )?;
+            let additional = (plan_json.len() as u64).saturating_add(256);
+            let task_bytes: u64 = transaction.query_row(
+                "SELECT task_context_bytes FROM context_workspace_quota_v1
+                 WHERE repository_id = ?1 AND workspace_id = ?2",
+                params![identity.repository_id(), identity.workspace_id()],
+                |row| row.get(0),
+            )?;
+            let total = task_bytes
+                .checked_add(stored_result_logical_bytes_v1(&transaction)?)
+                .and_then(|bytes| bytes.checked_add(additional))
+                .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))?;
+            if total > MAX_WORKSPACE_STATE_LOGICAL_BYTES_V1 {
+                bail!("workspace_state_quota_exceeded");
+            }
+            transaction.execute(
+                "INSERT INTO gateway_context_source_recipes_v1 (
+                result_id, repository_id, workspace_id, authorization_scope_digest,
+                repository_digest, plan_json, plan_digest, created_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    gateway_result_id,
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest(),
+                    repository_digest,
+                    plan_text,
+                    plan_digest,
+                    now_ms()
+                ],
+            )?;
+            reconcile_task_quota_scope_v1_tx(
+                &transaction,
+                identity.repository_id(),
+                identity.workspace_id(),
+                now_ms(),
+            )?;
+        }
+        let current: (String, String, String, String, String, String) = transaction.query_row(
+            "SELECT repository_id, workspace_id, authorization_scope_digest,
+                    repository_digest, plan_json, plan_digest
+             FROM gateway_context_source_recipes_v1 WHERE result_id = ?1",
+            [gateway_result_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+        if current
+            != (
+                identity.repository_id().to_owned(),
+                identity.workspace_id().to_owned(),
+                identity.authorization_scope_digest().to_owned(),
+                repository_digest.to_owned(),
+                plan_text.to_owned(),
+                plan_digest,
+            )
+        {
+            bail!("context source recipe conflicts with prior admission");
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn context_source_recipe_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<Option<(String, Vec<u8>)>> {
+        validate_digest(gateway_result_id, "context source recipe selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let recipe: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT repository_digest, plan_json, plan_digest
+                 FROM gateway_context_source_recipes_v1
+                 WHERE result_id = ?1 AND repository_id = ?2 AND workspace_id = ?3
+                   AND authorization_scope_digest = ?4",
+                params![
+                    gateway_result_id,
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        transaction.commit()?;
+        let Some((repository_digest, plan_json, plan_digest)) = recipe else {
+            return Ok(None);
+        };
+        if blake3::hash(plan_json.as_bytes()).to_hex().as_str() != plan_digest {
+            bail!("context source recipe digest mismatch");
+        }
+        Ok(Some((repository_digest, plan_json.into_bytes())))
+    }
+
+    pub fn current_context_source_ids_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 || limit > MAX_CONTEXT_LEDGER_EVENTS_PER_TASK_V1 {
+            bail!(ReasoningContextRefusalV1::ItemBound.code());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let mut statement = transaction.prepare(
+            "SELECT DISTINCT source.result_id
+             FROM context_ledger_event_sources_v1 AS source
+             JOIN context_ledger_events_v1 AS event ON event.sequence = source.event_sequence
+             WHERE event.repository_id = ?1 AND event.workspace_id = ?2
+               AND event.task_id = ?3 AND event.authorization_scope_digest = ?4
+               AND (EXISTS(SELECT 1 FROM context_ledger_fact_versions_v1 AS fact
+                           WHERE fact.admission_event_sequence = event.sequence
+                             AND fact.retired_event_sequence IS NULL)
+                    OR EXISTS(SELECT 1 FROM context_ledger_result_references_v1 AS reference
+                              WHERE reference.admission_event_sequence = event.sequence
+                                AND reference.retired_event_sequence IS NULL))
+             ORDER BY source.result_id LIMIT ?5",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    identity.authorization_scope_digest(),
+                    limit + 1
+                ],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        transaction.commit()?;
+        if ids.len() > limit {
+            bail!("context_freshness_capacity_exceeded");
+        }
+        Ok(ids)
+    }
+
+    /// Select the current task reference version, or the next version after
+    /// an explicit retirement. A restored source must create a new ledger
+    /// admission even when its exact gateway result bytes match an older one.
+    pub fn context_result_admission_version_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<u64> {
+        validate_digest(gateway_result_id, "context result admission selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let (maximum, current): (Option<u64>, Option<u64>) = transaction.query_row(
+            "SELECT MAX(reference_version),
+                    MAX(CASE WHEN retired_event_sequence IS NULL THEN reference_version END)
+             FROM context_ledger_result_references_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3 AND result_id = ?4",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                gateway_result_id
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.commit()?;
+        let version = match current {
+            Some(current) => current,
+            None => maximum
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("context reference version overflow"))?,
+        };
+        if version == 0 || version > i64::MAX as u64 {
+            bail!("context reference version exhausted");
+        }
+        Ok(version)
+    }
+
+    /// Determine whether a direct observation already backs the current task
+    /// fact, and allocate the next version after retirement or source change.
+    /// The caller still admits under the ledger's uniqueness checks and must
+    /// retry if a separate store handle wins the race.
+    pub fn context_direct_fact_admission_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        fact_id: &str,
+        source_result_id: &str,
+    ) -> Result<Option<u64>> {
+        validate_digest(source_result_id, "direct context source")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let current: Option<(u64, u64)> = transaction
+            .query_row(
+                "SELECT fact.fact_version, fact.admission_event_sequence
+             FROM context_ledger_fact_versions_v1 AS fact
+             WHERE fact.repository_id = ?1 AND fact.workspace_id = ?2
+               AND fact.task_id = ?3 AND fact.fact_id = ?4
+               AND fact.retired_event_sequence IS NULL
+             ORDER BY fact.fact_version DESC LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    fact_id
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((_, event)) = current {
+            let same_source: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM context_ledger_event_sources_v1
+                 WHERE event_sequence = ?1 AND result_id = ?2)",
+                params![event, source_result_id],
+                |row| row.get(0),
+            )?;
+            if same_source && context_event_provenance_current_v1(&transaction, identity, event)? {
+                transaction.commit()?;
+                return Ok(None);
+            }
+        }
+        let maximum: Option<u64> = transaction.query_row(
+            "SELECT MAX(fact_version) FROM context_ledger_fact_versions_v1
+             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3 AND fact_id = ?4",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                fact_id
+            ],
+            |row| row.get(0),
+        )?;
+        transaction.commit()?;
+        let next = maximum
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("direct context fact version overflow"))?;
+        if next > i64::MAX as u64 {
+            bail!("direct context fact version exhausted");
+        }
+        Ok(Some(next))
+    }
+
+    /// A warm direct read may bypass context admission only while its own
+    /// task still holds a current, provenance-checked result reference.
+    pub fn context_result_reference_current_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        gateway_result_id: &str,
+    ) -> Result<bool> {
+        validate_digest(gateway_result_id, "context result reference selector")?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        let event: Option<u64> = transaction
+            .query_row(
+                "SELECT reference.admission_event_sequence
+                 FROM context_ledger_result_references_v1 AS reference
+                 JOIN gateway_results AS result
+                   ON result.gateway_result_id = reference.result_id
+                  AND result.status = 'ready' AND result.origin = 'leased'
+                 WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
+                   AND reference.task_id = ?3 AND reference.result_id = ?4
+                   AND reference.retired_event_sequence IS NULL
+                 ORDER BY reference_version DESC LIMIT 1",
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.task_id(),
+                    gateway_result_id
+                ],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let current = match event {
+            Some(event) => context_event_provenance_current_v1(&transaction, identity, event)?,
+            None => false,
+        };
+        transaction.commit()?;
+        Ok(current)
+    }
+
     /// Narrow typed adapter for exact built-in observations. Callers choose
     /// only an identifier and scope; the statement/topic/value are derived by
     /// deterministic code, never copied from agent or model prose.
@@ -4259,6 +4864,23 @@ impl Store {
         }
         enforce_context_quota_v1(&transaction, identity)?;
         let dependencies = verify_context_sources_v1(&transaction, identity, sources, now)?;
+        if matches!(
+            input,
+            ContextLedgerEventInputV1::CompletedObservation { .. }
+                | ContextLedgerEventInputV1::ResultReference { .. }
+        ) {
+            for source in sources {
+                let leased: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM gateway_results
+                     WHERE gateway_result_id = ?1 AND status = 'ready' AND origin = 'leased')",
+                    [source.source().result_id()],
+                    |row| row.get(0),
+                )?;
+                if !leased {
+                    bail!("direct context observation cannot grant retrieval authority");
+                }
+            }
+        }
         let sequence = insert_context_event_v1(
             &transaction,
             identity,
@@ -4430,6 +5052,199 @@ impl Store {
         })
     }
 
+    /// Conservatively retire current task facts and retrieval references from
+    /// one previously verified result when its built-in provider can no longer
+    /// reproduce that observation. This asserts no replacement dependency
+    /// value: an unavailable read is uncertainty, not a fabricated digest.
+    pub fn invalidate_context_source_observation_v1(
+        &self,
+        identity: &ContextLedgerIdentityV1,
+        envelope_digest: &str,
+        gateway_result_id: &str,
+    ) -> Result<ContextInvalidationReportV1> {
+        validate_digest(envelope_digest, "context source invalidation envelope")?;
+        validate_digest(gateway_result_id, "context source result")?;
+        let serialized = serde_json::to_vec(&("source_changed_or_unavailable", gateway_result_id))?;
+        let fields = ContextEventFieldsV1 {
+            kind: ContextLedgerEventKindV1::Invalidation,
+            subject_id: gateway_result_id,
+            subject_version: 1,
+            summary: "verified source observation changed or became unavailable",
+            value_digest: Some(gateway_result_id),
+            result_id: None,
+            result_digest: None,
+            total_bytes: None,
+            duration_ms: None,
+        };
+        let canonical_digest =
+            context_event_canonical_digest_v1(identity, &fields, &serialized, &[]);
+        let now = now_ms();
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        ensure_current_context_recipient_v1(&transaction, identity)?;
+        if let Some(outcome) =
+            duplicate_context_envelope_v1(&transaction, envelope_digest, &canonical_digest)?
+        {
+            let sequence = outcome.sequence();
+            let (facts, references) = context_invalidation_counts_v1(&transaction, sequence)?;
+            transaction.commit()?;
+            return Ok(ContextInvalidationReportV1 {
+                sequence,
+                retired_facts: facts,
+                retired_result_references: references,
+            });
+        }
+        let current: bool = transaction.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                WHERE source.result_id = ?4
+                  AND source.repository_id = ?1 AND source.workspace_id = ?2
+                  AND source.authorization_scope_digest = ?5
+                  AND (
+                    EXISTS(SELECT 1 FROM context_ledger_fact_versions_v1 AS fact
+                           WHERE fact.admission_event_sequence = source.event_sequence
+                             AND fact.repository_id = ?1 AND fact.workspace_id = ?2
+                             AND fact.task_id = ?3 AND fact.retired_event_sequence IS NULL)
+                    OR EXISTS(SELECT 1 FROM context_ledger_result_references_v1 AS reference
+                              WHERE reference.admission_event_sequence = source.event_sequence
+                                AND reference.repository_id = ?1 AND reference.workspace_id = ?2
+                                AND reference.task_id = ?3 AND reference.retired_event_sequence IS NULL)
+                  )
+            )",
+            params![
+                identity.repository_id(),
+                identity.workspace_id(),
+                identity.task_id(),
+                gateway_result_id,
+                identity.authorization_scope_digest()
+            ],
+            |row| row.get(0),
+        )?;
+        if !current {
+            transaction.commit()?;
+            return Ok(ContextInvalidationReportV1::default());
+        }
+        enforce_context_quota_v1(&transaction, identity)?;
+        let sequence = insert_context_event_v1(
+            &transaction,
+            identity,
+            envelope_digest,
+            &canonical_digest,
+            &fields,
+            now,
+        )?;
+        let mut retired_facts =
+            retire_context_source_facts_v1(&transaction, identity, sequence, gateway_result_id)?;
+        let mut retired_result_references =
+            retire_context_source_results_v1(&transaction, identity, sequence, gateway_result_id)?;
+        // Another task can admit the same source under a different result ID.
+        // Match its admitted dependency key and old value, within the same
+        // repository and authorization scope. A task that has already admitted
+        // a newer value remains current.
+        let affected_tasks = {
+            let mut statement = transaction.prepare(
+                "SELECT event.task_id, event.agent_id, event.session_id, event.turn_id,
+                        event.connection_generation, event.compaction_generation,
+                        event.lifecycle_generation
+                 FROM context_ledger_events_v1 AS event
+                 WHERE event.repository_id = ?1 AND event.workspace_id = ?2
+                   AND event.authorization_scope_digest = ?3 AND event.task_id != ?4
+                   AND (EXISTS(SELECT 1 FROM context_ledger_fact_versions_v1 AS fact
+                               WHERE fact.admission_event_sequence = event.sequence
+                                 AND fact.retired_event_sequence IS NULL)
+                        OR EXISTS(SELECT 1 FROM context_ledger_result_references_v1 AS reference
+                                  WHERE reference.admission_event_sequence = event.sequence
+                                    AND reference.retired_event_sequence IS NULL))
+                   AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                               WHERE source.event_sequence = event.sequence
+                                 AND source.result_id = ?5)
+                        OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                  JOIN result_dependencies AS changed
+                                    ON changed.gateway_result_id = ?5
+                                   AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                   AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                  WHERE dependency.event_sequence = event.sequence))
+                 ORDER BY event.task_id, event.sequence",
+            )?;
+            let rows = statement.query_map(
+                params![
+                    identity.repository_id(),
+                    identity.workspace_id(),
+                    identity.authorization_scope_digest(),
+                    identity.task_id(),
+                    gateway_result_id
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, u64>(6)?,
+                    ))
+                },
+            )?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut last_task = None::<String>;
+        for (task_id, agent_id, session_id, turn_id, connection, compaction, lifecycle) in
+            affected_tasks
+        {
+            if last_task.as_deref() == Some(&task_id) {
+                continue;
+            }
+            last_task = Some(task_id.clone());
+            let target = ContextLedgerIdentityV1::new(
+                identity.repository_id(),
+                identity.workspace_id(),
+                &task_id,
+                identity.authorization_scope_digest(),
+                &agent_id,
+                &session_id,
+                &turn_id,
+                &connection,
+                compaction,
+                lifecycle,
+            )
+            .map_err(|refusal| anyhow!(refusal.code()))?;
+            enforce_context_quota_v1(&transaction, &target)?;
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"again.context.cross-task-source-invalidation.v1\0");
+            hash_field(&mut hasher, envelope_digest.as_bytes());
+            hash_field(&mut hasher, task_id.as_bytes());
+            let target_envelope = hasher.finalize().to_hex().to_string();
+            let target_digest =
+                context_event_canonical_digest_v1(&target, &fields, &serialized, &[]);
+            let target_sequence = insert_context_event_v1(
+                &transaction,
+                &target,
+                &target_envelope,
+                &target_digest,
+                &fields,
+                now,
+            )?;
+            retired_facts += retire_context_source_facts_v1(
+                &transaction,
+                &target,
+                target_sequence,
+                gateway_result_id,
+            )?;
+            retired_result_references += retire_context_source_results_v1(
+                &transaction,
+                &target,
+                target_sequence,
+                gateway_result_id,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(ContextInvalidationReportV1 {
+            sequence,
+            retired_facts,
+            retired_result_references,
+        })
+    }
+
     /// Compile a bounded current task projection. Every fact and result
     /// reference is rechecked against its exact ready source observations.
     pub fn context_task_snapshot_v1(
@@ -4453,6 +5268,522 @@ impl Store {
             result_references,
             inflight_work,
         ))
+    }
+
+    pub fn record_brain_event_v1(&self, event: &BrainEventV1) -> Result<()> {
+        let valid_read_range = match (event.read_start_line, event.read_end_line) {
+            (None, None) => true,
+            (Some(hit), None) => {
+                event.kind == "command"
+                    && event.path.is_some()
+                    && event.source_digest.is_some()
+                    && matches!(event.exit_code, None | Some(0))
+                    && (1..=8192).contains(&hit)
+            }
+            (Some(start), Some(end)) => {
+                event.kind == "command"
+                    && event.path.is_some()
+                    && event.source_digest.is_some()
+                    && matches!(event.exit_code, None | Some(0))
+                    && start >= 1
+                    && end >= start
+                    && end <= 8192
+                    && end - start <= 512
+            }
+            _ => false,
+        };
+        for value in [&event.session_id, &event.event_id, &event.task_id] {
+            if value.is_empty() || value.len() > 128 {
+                bail!("brain_event_invalid_identity");
+            }
+        }
+        if !valid_read_range
+            || !matches!(event.kind.as_str(), "file_change" | "command" | "test")
+            || event.created_ms < 0
+            || event.path.as_ref().is_some_and(|path| {
+                path.is_empty()
+                    || path.len() > 512
+                    || !Path::new(path)
+                        .components()
+                        .all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+            || [event.source_digest.as_ref(), event.command_digest.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || event
+                .authorization_scope_digest
+                .as_ref()
+                .is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            || event.command_hint.as_ref().is_some_and(|hint| {
+                hint.is_empty() || hint.len() > 256 || screen_sensitive_text_v1(hint).is_err()
+            })
+        {
+            bail!("brain_event_invalid_metadata");
+        }
+        let path = event.path.as_deref().unwrap_or("");
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO brain_events_v1 (
+                session_id, event_id, task_id, kind, path, source_digest,
+                command_digest, command_hint, exit_code, created_ms,
+                authorization_scope_digest, read_start_line, read_end_line
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                event.session_id,
+                event.event_id,
+                event.task_id,
+                event.kind,
+                path,
+                event.source_digest,
+                event.command_digest,
+                event.command_hint,
+                event.exit_code,
+                event.created_ms,
+                event.authorization_scope_digest,
+                event.read_start_line,
+                event.read_end_line,
+            ],
+        )?;
+        let stored: BrainEventV1 = transaction.query_row(
+            "SELECT session_id, event_id, task_id, kind, path, source_digest,
+                    command_digest, command_hint, exit_code, created_ms,
+                    authorization_scope_digest, read_start_line, read_end_line
+             FROM brain_events_v1
+             WHERE session_id = ?1 AND event_id = ?2 AND kind = ?3 AND path = ?4",
+            params![event.session_id, event.event_id, event.kind, path],
+            |row| {
+                let path: String = row.get(4)?;
+                Ok(BrainEventV1 {
+                    session_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    path: (!path.is_empty()).then_some(path),
+                    source_digest: row.get(5)?,
+                    command_digest: row.get(6)?,
+                    command_hint: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    created_ms: row.get(9)?,
+                    authorization_scope_digest: row.get(10)?,
+                    read_start_line: row.get(11)?,
+                    read_end_line: row.get(12)?,
+                })
+            },
+        )?;
+        if &stored != event {
+            bail!("brain_event_id_collision");
+        }
+        if inserted == 1 {
+            if (event.kind == "file_change"
+                || (event.kind == "command" && matches!(event.exit_code, None | Some(0))))
+                && let (Some(path), Some(digest)) = (&event.path, &event.source_digest)
+            {
+                transaction.execute(
+                    "INSERT INTO brain_files_v1 (
+                        path, source_digest, task_id, session_id, event_id, observed_ms,
+                        authorization_scope_digest, read_start_line, read_end_line
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(path) DO UPDATE SET
+                        source_digest = excluded.source_digest,
+                        task_id = excluded.task_id,
+                        session_id = excluded.session_id,
+                        event_id = excluded.event_id,
+                        observed_ms = excluded.observed_ms,
+                        authorization_scope_digest = excluded.authorization_scope_digest,
+                        read_start_line = CASE
+                            WHEN excluded.source_digest = brain_files_v1.source_digest
+                                 AND excluded.read_start_line IS NULL
+                            THEN brain_files_v1.read_start_line
+                            ELSE excluded.read_start_line END,
+                        read_end_line = CASE
+                            WHEN excluded.source_digest = brain_files_v1.source_digest
+                                 AND excluded.read_start_line IS NULL
+                            THEN brain_files_v1.read_end_line
+                            ELSE excluded.read_end_line END
+                     WHERE excluded.observed_ms >= brain_files_v1.observed_ms",
+                    params![
+                        path,
+                        digest,
+                        event.task_id,
+                        event.session_id,
+                        event.event_id,
+                        event.created_ms,
+                        event.authorization_scope_digest,
+                        event.read_start_line,
+                        event.read_end_line,
+                    ],
+                )?;
+            }
+            if event.kind == "file_change"
+                && event.source_digest.is_none()
+                && let Some(path) = &event.path
+            {
+                transaction.execute(
+                    "DELETE FROM brain_files_v1
+                     WHERE path = ?1 AND authorization_scope_digest = ?2
+                       AND observed_ms <= ?3",
+                    params![path, event.authorization_scope_digest, event.created_ms],
+                )?;
+            }
+            if event.kind == "test"
+                && event.exit_code == Some(0)
+                && let (Some(hint), Some(digest)) = (&event.command_hint, &event.command_digest)
+            {
+                transaction.execute(
+                    "INSERT INTO brain_test_commands_v1 (
+                        command_hint, command_digest, task_id, observed_ms,
+                        authorization_scope_digest
+                     ) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(command_hint) DO UPDATE SET
+                        command_digest = excluded.command_digest,
+                        task_id = excluded.task_id,
+                        observed_ms = excluded.observed_ms,
+                        authorization_scope_digest = excluded.authorization_scope_digest
+                     WHERE excluded.observed_ms >= brain_test_commands_v1.observed_ms",
+                    params![
+                        hint,
+                        digest,
+                        event.task_id,
+                        event.created_ms,
+                        event.authorization_scope_digest
+                    ],
+                )?;
+            }
+        }
+        let prune = self.brain_writes_since_prune.get() >= 127;
+        if prune {
+            let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+            transaction.execute(
+                "DELETE FROM brain_events_v1 WHERE created_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_events_v1 WHERE (session_id, event_id, kind, path) IN (
+                    SELECT session_id, event_id, kind, path FROM brain_events_v1
+                    ORDER BY created_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_files_v1 WHERE observed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_test_commands_v1 WHERE observed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_files_v1 WHERE path IN (
+                    SELECT path FROM brain_files_v1
+                    ORDER BY observed_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+        }
+        transaction.commit()?;
+        self.brain_writes_since_prune.set(if prune {
+            0
+        } else {
+            self.brain_writes_since_prune.get() + 1
+        });
+        Ok(())
+    }
+
+    pub fn recent_brain_events_v1(&self, limit: usize) -> Result<Vec<BrainEventV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_event_limit_invalid");
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, event_id, task_id, kind, path, source_digest,
+                    command_digest, command_hint, exit_code, created_ms,
+                    authorization_scope_digest, read_start_line, read_end_line
+             FROM brain_events_v1 ORDER BY created_ms DESC LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit as i64], |row| {
+            let path: String = row.get(4)?;
+            Ok(BrainEventV1 {
+                session_id: row.get(0)?,
+                event_id: row.get(1)?,
+                task_id: row.get(2)?,
+                kind: row.get(3)?,
+                path: (!path.is_empty()).then_some(path),
+                source_digest: row.get(5)?,
+                command_digest: row.get(6)?,
+                command_hint: row.get(7)?,
+                exit_code: row.get(8)?,
+                created_ms: row.get(9)?,
+                authorization_scope_digest: row.get(10)?,
+                read_start_line: row.get(11)?,
+                read_end_line: row.get(12)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn brain_file_v1(
+        &self,
+        path: &str,
+        authorization_scope_digest: &str,
+    ) -> Result<Option<BrainFileV1>> {
+        if path.is_empty()
+            || path.len() > 512
+            || !Path::new(path)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
+            bail!("brain_file_invalid_path");
+        }
+        validate_digest(authorization_scope_digest, "brain file authorization scope")?;
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        self.conn
+            .query_row(
+                "SELECT path, source_digest, task_id, observed_ms, authorization_scope_digest,
+                        read_start_line, read_end_line
+                 FROM brain_files_v1 WHERE path = ?1 AND observed_ms >= ?2
+                   AND authorization_scope_digest = ?3",
+                params![path, cutoff, authorization_scope_digest],
+                |row| {
+                    Ok(BrainFileV1 {
+                        path: row.get(0)?,
+                        source_digest: row.get(1)?,
+                        task_id: row.get(2)?,
+                        observed_ms: row.get(3)?,
+                        authorization_scope_digest: row.get(4)?,
+                        read_start_line: row.get(5)?,
+                        read_end_line: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn brain_test_hints_v1(
+        &self,
+        authorization_scope_digest: &str,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        if limit == 0 || limit > 32 {
+            bail!("brain_test_hint_limit_invalid");
+        }
+        validate_digest(authorization_scope_digest, "brain test authorization scope")?;
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT command_hint FROM brain_test_commands_v1
+             WHERE observed_ms >= ?1 AND authorization_scope_digest = ?2
+             ORDER BY observed_ms DESC LIMIT ?3",
+        )?;
+        let rows = statement.query_map(
+            params![cutoff, authorization_scope_digest, limit as i64],
+            |row| row.get(0),
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn brain_test_hint_v1(&self) -> Result<Option<String>> {
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        self.conn
+            .query_row(
+                "SELECT command_hint FROM brain_test_commands_v1
+             WHERE observed_ms >= ?1 ORDER BY observed_ms DESC LIMIT 1",
+                [cutoff],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Retained repository observations with an optional attributed prompt.
+    /// Interactive hooks have no lifecycle task, so their prompt is empty.
+    /// The caller may use prompt or path similarity to nominate a path, but must
+    /// independently recheck the source before presenting it as current.
+    pub(crate) fn brain_files_with_task_prompts_v1(
+        &self,
+        repository_id: &str,
+        workspace_id: &str,
+        authorization_scope_digest: &str,
+    ) -> Result<Vec<BrainTaskFileV1>> {
+        validate_task_selector_v1(repository_id)?;
+        validate_task_selector_v1(workspace_id)?;
+        validate_digest(authorization_scope_digest, "brain task authorization scope")?;
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT file.path, file.source_digest, file.task_id, file.observed_ms,
+                    file.authorization_scope_digest,
+                    COALESCE(substr(task.prompt_text, 1, 1024), ''),
+                    file.read_start_line, file.read_end_line
+             FROM brain_files_v1 AS file
+             LEFT JOIN context_tasks_v1 AS task
+               ON task.canonical_task_id = file.task_id
+              AND task.repository_id = ?1 AND task.workspace_id = ?2
+              AND task.authorization_scope_digest = ?3
+             WHERE file.authorization_scope_digest = ?3
+               AND file.observed_ms >= ?4
+             ORDER BY file.observed_ms DESC LIMIT ?5",
+        )?;
+        let rows = statement.query_map(
+            params![
+                repository_id,
+                workspace_id,
+                authorization_scope_digest,
+                cutoff,
+                MAX_BRAIN_EVENTS_V1
+            ],
+            |row| {
+                Ok(BrainTaskFileV1 {
+                    observation: BrainFileV1 {
+                        path: row.get(0)?,
+                        source_digest: row.get(1)?,
+                        task_id: row.get(2)?,
+                        observed_ms: row.get(3)?,
+                        authorization_scope_digest: row.get(4)?,
+                        read_start_line: row.get(6)?,
+                        read_end_line: row.get(7)?,
+                    },
+                    task_prompt: row.get(5)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn recent_brain_files_v1(&self, limit: usize) -> Result<Vec<BrainFileV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_file_limit_invalid");
+        }
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT path, source_digest, task_id, observed_ms, authorization_scope_digest,
+                    read_start_line, read_end_line
+             FROM brain_files_v1 WHERE observed_ms >= ?1
+             ORDER BY observed_ms DESC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![cutoff, limit as i64], |row| {
+            Ok(BrainFileV1 {
+                path: row.get(0)?,
+                source_digest: row.get(1)?,
+                task_id: row.get(2)?,
+                observed_ms: row.get(3)?,
+                authorization_scope_digest: row.get(4)?,
+                read_start_line: row.get(5)?,
+                read_end_line: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn record_brain_run_v1(&self, run: &BrainRunV1) -> Result<()> {
+        if run.session_id.is_empty()
+            || run.session_id.len() > 128
+            || run.task_id.is_empty()
+            || run.task_id.len() > 128
+            || run.started_ms < 0
+            || run.completed_ms < run.started_ms
+            // One completed shell search can independently verify up to four
+            // source files. Count those file observations without discarding
+            // the whole run summary when more than one came from a command.
+            || run.completed_source_reads > run.completed_commands.saturating_mul(4)
+            || run.successful_tests > run.completed_commands
+            || run.input_tokens.is_some() != run.cached_input_tokens.is_some()
+            || run.input_tokens.is_some() != run.output_tokens.is_some()
+            || run.input_tokens.is_some_and(|tokens| tokens < 0)
+            || run
+                .cached_input_tokens
+                .is_some_and(|tokens| tokens < 0 || Some(tokens) > run.input_tokens)
+            || run.output_tokens.is_some_and(|tokens| tokens < 0)
+        {
+            bail!("brain_run_invalid_metadata");
+        }
+        validate_digest(
+            &run.authorization_scope_digest,
+            "brain run authorization scope",
+        )?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO brain_runs_v1 (
+                session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                exit_code, turn_completed, completed_commands, completed_source_reads,
+                completed_edits, completed_mcp_calls, successful_tests,
+                input_tokens, cached_input_tokens, output_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                run.session_id,
+                run.task_id,
+                run.authorization_scope_digest,
+                run.started_ms,
+                run.completed_ms,
+                run.exit_code,
+                run.turn_completed,
+                run.completed_commands,
+                run.completed_source_reads,
+                run.completed_edits,
+                run.completed_mcp_calls,
+                run.successful_tests,
+                run.input_tokens,
+                run.cached_input_tokens,
+                run.output_tokens
+            ],
+        )?;
+        let stored = transaction.query_row(
+            "SELECT session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                    exit_code, turn_completed, completed_commands, completed_source_reads,
+                    completed_edits, completed_mcp_calls, successful_tests,
+                    input_tokens, cached_input_tokens, output_tokens
+             FROM brain_runs_v1 WHERE session_id = ?1",
+            [&run.session_id],
+            brain_run_from_row_v1,
+        )?;
+        if &stored != run {
+            bail!("brain_run_session_collision");
+        }
+        if inserted == 1 {
+            let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+            transaction.execute(
+                "DELETE FROM brain_runs_v1 WHERE completed_ms < ?1",
+                [cutoff],
+            )?;
+            transaction.execute(
+                "DELETE FROM brain_runs_v1 WHERE session_id IN (
+                    SELECT session_id FROM brain_runs_v1
+                    ORDER BY completed_ms DESC LIMIT -1 OFFSET ?1
+                )",
+                [MAX_BRAIN_EVENTS_V1],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn recent_brain_runs_v1(&self, limit: usize) -> Result<Vec<BrainRunV1>> {
+        if limit == 0 || limit > 128 {
+            bail!("brain_run_limit_invalid");
+        }
+        let cutoff = now_ms().saturating_sub(MAX_BRAIN_EVENT_AGE_MS_V1);
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, task_id, authorization_scope_digest, started_ms, completed_ms,
+                    exit_code, turn_completed, completed_commands, completed_source_reads,
+                    completed_edits, completed_mcp_calls, successful_tests,
+                    input_tokens, cached_input_tokens, output_tokens
+             FROM brain_runs_v1 WHERE completed_ms >= ?1
+             ORDER BY completed_ms DESC, session_id ASC LIMIT ?2",
+        )?;
+        let rows = statement.query_map(params![cutoff, limit as i64], brain_run_from_row_v1)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn clear_brain_events_v1(&self) -> Result<u64> {
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let runs = transaction.execute("DELETE FROM brain_runs_v1", [])? as u64;
+        let files = transaction.execute("DELETE FROM brain_files_v1", [])? as u64;
+        let tests = transaction.execute("DELETE FROM brain_test_commands_v1", [])? as u64;
+        let events = transaction.execute("DELETE FROM brain_events_v1", [])? as u64;
+        transaction.commit()?;
+        Ok(runs + files + tests + events)
     }
 
     pub fn context_delta_after_v1(
@@ -4532,12 +5863,26 @@ impl Store {
         if observed_total != total_bytes {
             bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
-        let stdout = self.get_blob(&result.stdout_digest)?;
-        let stderr = self.get_blob(&result.stderr_digest)?;
-        if stdout.len() as u64 != result.stdout_bytes || stderr.len() as u64 != result.stderr_bytes
-        {
+        let stdout = self.get_blob(&result.stdout_digest);
+        let stderr = self.get_blob(&result.stderr_digest);
+        let valid = matches!((&stdout, &stderr), (Ok(stdout), Ok(stderr))
+            if stdout.len() as u64 == result.stdout_bytes
+                && stderr.len() as u64 == result.stderr_bytes);
+        if !valid {
+            transaction.rollback()?;
+            let quarantine =
+                Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+            quarantine_invalid_gateway_result_v1_tx(
+                &quarantine,
+                None,
+                gateway_result_id,
+                now_ms(),
+            )?;
+            quarantine.commit()?;
             bail!(DeliveryAuthorityRefusalV1::InvalidBinding.code());
         }
+        let stdout = stdout?;
+        let stderr = stderr?;
         transaction.commit()?;
         Ok(GatewayFullResultV1 {
             gateway_result_id: gateway_result_id.to_owned(),
@@ -5150,7 +6495,7 @@ impl Store {
         }
         let ready = transaction
             .query_row(
-                "SELECT gateway_result_id, lease_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready'",
+                "SELECT gateway_result_id, lease_id FROM gateway_results WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'leased'",
                 [binding.binding_digest()],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -5617,9 +6962,101 @@ impl Store {
         }))
     }
 
-    /// Record a provider execution that bypassed coordinator authority. This
-    /// counter is emitted immediately before the provider invocation and does
-    /// not imply that the call succeeded or produced reusable evidence.
+    /// Publish one freshly executed built-in read as context evidence without
+    /// acquiring a cache lease. A direct observation can back a task fact, but
+    /// its origin is never eligible for an exact hit or an in-flight join.
+    pub fn publish_gateway_direct_observation_v1(
+        &self,
+        binding: &ValidatedGatewayReadV1,
+        result_id: &str,
+    ) -> Result<String> {
+        let now = now_ms();
+        if !freshness_is_current(binding, now) {
+            bail!(GatewayRefusalReason::FreshnessExpired.as_str());
+        }
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let result = load_visible_result_tx(&transaction, result_id)?
+            .ok_or_else(|| anyhow!(GatewayRefusalReason::ResultNotFound.as_str()))?;
+        if result.request_key != direct_observation_request_key_v1(binding)
+            || gateway_policy_digest(&result.policy_version) != binding.policy_digest()
+            || !source_result_blobs_valid_v1(self, &result)
+        {
+            bail!(GatewayRefusalReason::BindingMismatch.as_str());
+        }
+        let dependencies = binding.dependencies();
+        let gateway_result_id = direct_observation_content_digest_v1(binding, &result);
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT gateway_result_id FROM gateway_results
+                 WHERE binding_digest = ?1 AND status = 'ready' AND origin = 'direct_observation'",
+                [binding.binding_digest()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            if existing != gateway_result_id {
+                bail!("direct context observation conflicts with prior publication");
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let proof_digest = blake3::hash(result.proof_json.as_bytes())
+            .to_hex()
+            .to_string();
+        transaction.execute(
+            "INSERT INTO gateway_results (gateway_result_id, request_digest, state_digest,
+             policy_digest, binding_digest, result_id, stdout_digest, stderr_digest,
+             stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version,
+             proof_digest, lease_id, status, created_ms, updated_ms, origin)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                     'direct_observation', 'ready', ?15, ?15, 'direct_observation')",
+            params![
+                gateway_result_id,
+                binding.request_digest(),
+                binding.state_digest(),
+                binding.policy_digest(),
+                binding.binding_digest(),
+                result.id,
+                result.stdout_digest,
+                result.stderr_digest,
+                result.stdout_bytes,
+                result.stderr_bytes,
+                result.exit_code,
+                result.duration_ms,
+                result.policy_version,
+                proof_digest,
+                now,
+            ],
+        )?;
+        for (ordinal, dependency) in dependencies.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO result_dependencies (gateway_result_id, ordinal,
+                 dependency_key_digest, dependency_value_digest) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    gateway_result_id,
+                    i64::try_from(ordinal)?,
+                    dependency.key_digest,
+                    dependency.value_digest,
+                ],
+            )?;
+        }
+        record_gateway_event_v1_tx(
+            &transaction,
+            None,
+            None,
+            Some(&gateway_result_id),
+            "direct_observation_published",
+            None,
+            0,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(gateway_result_id)
+    }
+
+    /// Record a provider execution that bypassed coordinator authority. A
+    /// caller may emit this before dispatch or after a fresh direct response;
+    /// it does not imply success or reusable evidence.
     pub fn record_gateway_direct_execution(&self, record_request: bool) -> Result<()> {
         let now = now_ms();
         let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -6140,6 +7577,7 @@ impl Store {
             match event_type.as_str() {
                 "requested" => stats.requested += count,
                 "executed" => stats.executed += count,
+                "direct_observation_published" => stats.direct_observations_published += count,
                 "exact_hit" => stats.exact_hits += count,
                 "coverage_hit" => stats.coverage_hits += count,
                 "inflight_join" => stats.inflight_joins += count,
@@ -6547,6 +7985,7 @@ impl Store {
         let gateway = self.gateway_stats()?;
         stats.requested = gateway.requested;
         stats.executed = gateway.executed;
+        stats.direct_observations_published = gateway.direct_observations_published;
         stats.exact_hits = gateway.exact_hits;
         stats.coverage_hits = gateway.coverage_hits;
         stats.inflight_joins = gateway.inflight_joins;
@@ -7296,13 +8735,32 @@ fn stored_result_logical_bytes_v1(transaction: &Transaction<'_>) -> Result<u64> 
     if complete_columns != 2 {
         return Ok(0);
     }
-    transaction
+    let result_bytes: u64 = transaction
         .query_row(
             "SELECT COALESCE(SUM(stdout_bytes + stderr_bytes), 0) FROM results",
             [],
             |row| row.get(0),
         )
-        .context("count logical result bytes")
+        .context("count logical result bytes")?;
+    let recipes_exist: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema
+                       WHERE type = 'table' AND name = 'gateway_context_source_recipes_v1')",
+        [],
+        |row| row.get(0),
+    )?;
+    let recipe_bytes: u64 = if recipes_exist {
+        transaction.query_row(
+            "SELECT COALESCE(SUM(length(CAST(plan_json AS BLOB)) + 256), 0)
+             FROM gateway_context_source_recipes_v1",
+            [],
+            |row| row.get(0),
+        )?
+    } else {
+        0
+    };
+    result_bytes
+        .checked_add(recipe_bytes)
+        .ok_or_else(|| anyhow!("workspace_state_quota_exceeded"))
 }
 
 fn enforce_workspace_result_capacity_v1(
@@ -8141,6 +9599,76 @@ fn context_invalidation_counts_v1(
         .context("read context invalidation counts")
 }
 
+fn retire_context_source_facts_v1(
+    transaction: &Transaction<'_>,
+    identity: &ContextLedgerIdentityV1,
+    sequence: u64,
+    source_result_id: &str,
+) -> Result<u64> {
+    let count = transaction.execute(
+        "UPDATE context_ledger_fact_versions_v1 AS fact
+         SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
+         WHERE fact.repository_id = ?2 AND fact.workspace_id = ?3 AND fact.task_id = ?4
+           AND fact.retired_event_sequence IS NULL
+           AND EXISTS(SELECT 1 FROM context_ledger_events_v1 AS event
+                      WHERE event.sequence = fact.admission_event_sequence
+                        AND event.authorization_scope_digest = ?5
+                        AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                                    WHERE source.event_sequence = event.sequence
+                                      AND source.result_id = ?6)
+                             OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                       JOIN result_dependencies AS changed
+                                         ON changed.gateway_result_id = ?6
+                                        AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                        AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                       WHERE dependency.event_sequence = event.sequence)))",
+        params![
+            sequence,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.task_id(),
+            identity.authorization_scope_digest(),
+            source_result_id
+        ],
+    )?;
+    Ok(count as u64)
+}
+
+fn retire_context_source_results_v1(
+    transaction: &Transaction<'_>,
+    identity: &ContextLedgerIdentityV1,
+    sequence: u64,
+    source_result_id: &str,
+) -> Result<u64> {
+    let count = transaction.execute(
+        "UPDATE context_ledger_result_references_v1 AS reference
+         SET retired_event_sequence = ?1, retirement_reason = 'source_observation_unavailable'
+         WHERE reference.repository_id = ?2 AND reference.workspace_id = ?3
+           AND reference.task_id = ?4 AND reference.retired_event_sequence IS NULL
+           AND EXISTS(SELECT 1 FROM context_ledger_events_v1 AS event
+                      WHERE event.sequence = reference.admission_event_sequence
+                        AND event.authorization_scope_digest = ?5
+                        AND (EXISTS(SELECT 1 FROM context_ledger_event_sources_v1 AS source
+                                    WHERE source.event_sequence = event.sequence
+                                      AND source.result_id = ?6)
+                             OR EXISTS(SELECT 1 FROM context_ledger_event_dependencies_v1 AS dependency
+                                       JOIN result_dependencies AS changed
+                                         ON changed.gateway_result_id = ?6
+                                        AND changed.dependency_key_digest = dependency.dependency_key_digest
+                                        AND changed.dependency_value_digest = dependency.dependency_value_digest
+                                       WHERE dependency.event_sequence = event.sequence)))",
+        params![
+            sequence,
+            identity.repository_id(),
+            identity.workspace_id(),
+            identity.task_id(),
+            identity.authorization_scope_digest(),
+            source_result_id
+        ],
+    )?;
+    Ok(count as u64)
+}
+
 fn context_event_provenance_current_v1(
     transaction: &Transaction<'_>,
     identity: &ContextLedgerIdentityV1,
@@ -8364,11 +9892,15 @@ fn load_current_context_results_v1(
 ) -> Result<Vec<ReasoningRetrievalIdentityV1>> {
     let rows = {
         let mut statement = transaction.prepare(
-            "SELECT admission_event_sequence, result_id, result_digest, total_bytes
-             FROM context_ledger_result_references_v1
-             WHERE repository_id = ?1 AND workspace_id = ?2 AND task_id = ?3
-               AND retired_event_sequence IS NULL
-             ORDER BY result_id, reference_version DESC LIMIT ?4",
+            "SELECT reference.admission_event_sequence, reference.result_id,
+                    reference.result_digest, reference.total_bytes
+             FROM context_ledger_result_references_v1 AS reference
+                 JOIN gateway_results AS result
+                   ON result.gateway_result_id = reference.result_id
+                  AND result.status = 'ready' AND result.origin = 'leased'
+             WHERE reference.repository_id = ?1 AND reference.workspace_id = ?2
+               AND reference.task_id = ?3 AND reference.retired_event_sequence IS NULL
+             ORDER BY reference.result_id, reference.reference_version DESC LIMIT ?4",
         )?;
         statement
             .query_map(
@@ -9056,6 +10588,43 @@ fn gateway_result_content_digest(
     hasher.finalize().to_hex().to_string()
 }
 
+fn direct_observation_content_digest_v1(
+    binding: &ValidatedGatewayReadV1,
+    result: &StoredResult,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.direct-observation.v1\0");
+    for value in [
+        binding.binding_digest(),
+        binding.request_digest(),
+        binding.state_digest(),
+        binding.policy_digest(),
+        result.stdout_digest.as_str(),
+        result.stderr_digest.as_str(),
+    ] {
+        hash_field(&mut hasher, value.as_bytes());
+    }
+    hasher.update(&result.stdout_bytes.to_le_bytes());
+    hasher.update(&result.stderr_bytes.to_le_bytes());
+    hasher.update(&result.exit_code.to_le_bytes());
+    hasher.update(&result.duration_ms.to_le_bytes());
+    hash_field(&mut hasher, result.policy_version.as_bytes());
+    hash_field(&mut hasher, result.proof_json.as_bytes());
+    hasher.update(&(binding.dependencies().len() as u64).to_le_bytes());
+    for dependency in binding.dependencies() {
+        hash_field(&mut hasher, dependency.key_digest.as_bytes());
+        hash_field(&mut hasher, dependency.value_digest.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+pub(crate) fn direct_observation_request_key_v1(binding: &ValidatedGatewayReadV1) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"again.gateway.direct-observation-request.v1\0");
+    hash_field(&mut hasher, binding.binding_digest().as_bytes());
+    hasher.finalize().to_hex().to_string()
+}
+
 fn delivery_token_digest_v2(token: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"again.gateway.retrieval-token.v2\0");
@@ -9258,7 +10827,7 @@ fn load_gateway_result_snapshot_v1(
 ) -> Result<Option<StoredResult>> {
     let snapshot = transaction
         .query_row(
-            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
+            "SELECT result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, request_digest, state_digest, policy_digest, binding_digest, origin FROM gateway_results WHERE gateway_result_id = ?1 AND status = 'ready'",
             [gateway_result_id],
             |row| {
                 Ok((
@@ -9275,6 +10844,7 @@ fn load_gateway_result_snapshot_v1(
                     row.get::<_, String>(10)?,
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
+                    row.get::<_, String>(13)?,
                 ))
             },
         )
@@ -9293,6 +10863,7 @@ fn load_gateway_result_snapshot_v1(
         state_digest,
         policy_digest,
         binding_digest,
+        origin,
     )) = snapshot
     else {
         return Ok(None);
@@ -9307,7 +10878,12 @@ fn load_gateway_result_snapshot_v1(
     let Some(result) = load_visible_result_tx(transaction, &result_id)? else {
         bail!("gateway result source is missing or quarantined");
     };
-    if result.request_key != request_digest
+    if result.request_key
+        != if origin == "direct_observation" {
+            direct_observation_request_key_v1(binding)
+        } else {
+            request_digest.clone()
+        }
         || result.stdout_digest != stdout_digest
         || result.stderr_digest != stderr_digest
         || result.stdout_bytes != stdout_bytes
@@ -9320,6 +10896,15 @@ fn load_gateway_result_snapshot_v1(
         bail!("gateway result source metadata drifted after publication");
     }
     let dependencies = load_result_dependencies_v1(transaction, gateway_result_id)?;
+    if origin == "direct_observation" {
+        if direct_observation_content_digest_v1(binding, &result) != gateway_result_id {
+            bail!("direct context observation content address mismatch");
+        }
+        return Ok(Some(result));
+    }
+    if origin != "leased" {
+        bail!("gateway result origin is invalid");
+    }
     let synthetic_lease = GatewayLeaseRowV1 {
         lease_id: String::new(),
         call_id: String::new(),
@@ -9517,6 +11102,19 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
             | "workspace_state_bytes"
             | "maintenance_mode"
             | "reconciled_ms"
+            | "observed_ms"
+            | "read_start_line"
+            | "read_end_line"
+            | "started_ms"
+            | "turn_completed"
+            | "completed_commands"
+            | "completed_source_reads"
+            | "completed_edits"
+            | "completed_mcp_calls"
+            | "successful_tests"
+            | "input_tokens"
+            | "cached_input_tokens"
+            | "output_tokens"
     ) || (table == "gateway_events" && column == "id");
     let nullable = matches!(
         (table, column),
@@ -9559,6 +11157,25 @@ fn expected_gateway_column_shape(table: &str, column: &str) -> (&'static str, bo
                 "retired_event_sequence" | "retirement_reason"
             )
             | ("context_ledger_leases_v1", "lease_id" | "completed_ms")
+            | (
+                "brain_events_v1",
+                "source_digest"
+                    | "read_start_line"
+                    | "read_end_line"
+                    | "command_digest"
+                    | "command_hint"
+                    | "exit_code"
+                    | "authorization_scope_digest"
+            )
+            | (
+                "brain_files_v1",
+                "authorization_scope_digest" | "read_start_line" | "read_end_line"
+            )
+            | ("brain_test_commands_v1", "authorization_scope_digest")
+            | (
+                "brain_runs_v1",
+                "input_tokens" | "cached_input_tokens" | "output_tokens"
+            )
             | ("context_tasks_v1", "definition_digest")
             | (
                 "context_task_transitions_v1",
@@ -9629,6 +11246,7 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "quarantine_reason",
                 "created_ms",
                 "updated_ms",
+                "origin",
             ],
         ),
         (
@@ -9638,6 +11256,19 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "ordinal",
                 "dependency_key_digest",
                 "dependency_value_digest",
+            ],
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            &[
+                "result_id",
+                "repository_id",
+                "workspace_id",
+                "authorization_scope_digest",
+                "repository_digest",
+                "plan_json",
+                "plan_digest",
+                "created_ms",
             ],
         ),
         (
@@ -9995,6 +11626,68 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
                 "recorded_ms",
             ],
         ),
+        (
+            "brain_events_v1",
+            &[
+                "session_id",
+                "event_id",
+                "task_id",
+                "kind",
+                "path",
+                "source_digest",
+                "command_digest",
+                "command_hint",
+                "exit_code",
+                "created_ms",
+                "authorization_scope_digest",
+                "read_start_line",
+                "read_end_line",
+            ],
+        ),
+        (
+            "brain_files_v1",
+            &[
+                "path",
+                "source_digest",
+                "task_id",
+                "session_id",
+                "event_id",
+                "observed_ms",
+                "authorization_scope_digest",
+                "read_start_line",
+                "read_end_line",
+            ],
+        ),
+        (
+            "brain_test_commands_v1",
+            &[
+                "command_hint",
+                "command_digest",
+                "task_id",
+                "observed_ms",
+                "authorization_scope_digest",
+            ],
+        ),
+        (
+            "brain_runs_v1",
+            &[
+                "session_id",
+                "task_id",
+                "authorization_scope_digest",
+                "started_ms",
+                "completed_ms",
+                "exit_code",
+                "turn_completed",
+                "completed_commands",
+                "completed_source_reads",
+                "completed_edits",
+                "completed_mcp_calls",
+                "successful_tests",
+                "input_tokens",
+                "cached_input_tokens",
+                "output_tokens",
+            ],
+        ),
     ];
     let mut table_info_statement = connection
         .prepare("SELECT name, type, \"notnull\" FROM pragma_table_info(?1) ORDER BY cid")?;
@@ -10031,6 +11724,13 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         (
             "gateway_results",
             "gateway_results_ready_idx",
+            &["binding_digest"],
+            true,
+            true,
+        ),
+        (
+            "gateway_results",
+            "gateway_results_direct_idx",
             &["binding_digest"],
             true,
             true,
@@ -10267,6 +11967,55 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             false,
             false,
         ),
+        (
+            "brain_events_v1",
+            "brain_events_recent_idx",
+            &["created_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_events_v1",
+            "brain_events_task_idx",
+            &["task_id", "created_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_files_v1",
+            "brain_files_recent_idx",
+            &["observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_files_v1",
+            "brain_files_scope_recent_idx",
+            &["authorization_scope_digest", "observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_test_commands_v1",
+            "brain_test_commands_recent_idx",
+            &["observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_test_commands_v1",
+            "brain_test_commands_scope_recent_idx",
+            &["authorization_scope_digest", "observed_ms"],
+            false,
+            false,
+        ),
+        (
+            "brain_runs_v1",
+            "brain_runs_scope_recent_idx",
+            &["authorization_scope_digest", "completed_ms"],
+            false,
+            false,
+        ),
     ];
     let mut index_signature_statement = connection.prepare(
         "SELECT \"unique\", partial FROM pragma_index_list(?1) WHERE name = ?2 AND origin = 'c'",
@@ -10294,7 +12043,44 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
             bail!("Again gateway schema index {index} has an unexpected key shape");
         }
     }
+    for (index, predicate) in [
+        (
+            "gateway_results_ready_idx",
+            "WHERE status = 'ready' AND origin = 'leased'",
+        ),
+        (
+            "gateway_results_direct_idx",
+            "WHERE status = 'ready' AND origin = 'direct_observation'",
+        ),
+    ] {
+        let sql: String = connection.query_row(
+            "SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = ?1",
+            [index],
+            |row| row.get(0),
+        )?;
+        if !sql.contains(predicate) {
+            bail!("Again gateway schema index {index} has an unexpected admission predicate");
+        }
+    }
     let required_checks = [
+        ("brain_runs_v1", "CHECK(completed_ms >= started_ms)"),
+        ("brain_runs_v1", "CHECK(turn_completed IN (0, 1))"),
+        (
+            "brain_runs_v1",
+            "CHECK(cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens)",
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            "CHECK(json_valid(plan_json)",
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            "length(CAST(plan_json AS BLOB)) BETWEEN 1 AND 65536",
+        ),
+        (
+            "gateway_context_source_recipes_v1",
+            "CHECK(length(plan_digest) = 64)",
+        ),
         ("gateway_requests", "CHECK(length(request_digest) = 64)"),
         ("gateway_requests", "CHECK(length(state_digest) = 64)"),
         ("gateway_requests", "CHECK(length(policy_digest) = 64)"),
@@ -10316,6 +12102,10 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         ("gateway_results", "CHECK(stdout_bytes >= 0)"),
         ("gateway_results", "CHECK(stderr_bytes >= 0)"),
         ("gateway_results", "CHECK(duration_ms >= 0)"),
+        (
+            "gateway_results",
+            "CHECK(origin IN ('leased', 'direct_observation'))",
+        ),
         (
             "gateway_results",
             "CHECK(status IN ('ready', 'quarantined'))",
@@ -10626,6 +12416,15 @@ fn verify_gateway_schema_current(connection: &Connection) -> Result<()> {
         }
     }
     let expected_foreign_keys: &[ExpectedTableForeignKeysV1] = &[
+        (
+            "gateway_context_source_recipes_v1",
+            &[(
+                "gateway_results",
+                "result_id",
+                "gateway_result_id",
+                "CASCADE",
+            )],
+        ),
         (
             "context_task_aliases_v1",
             &[
@@ -11884,6 +13683,19 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    fn restore_pre_v15_gateway_result_shape(store: &Store) {
+        store
+            .conn
+            .execute_batch(
+                "DROP INDEX gateway_results_direct_idx;
+             DROP INDEX gateway_results_ready_idx;
+             ALTER TABLE gateway_results DROP COLUMN origin;
+             CREATE UNIQUE INDEX gateway_results_ready_idx
+               ON gateway_results(binding_digest) WHERE status = 'ready';",
+            )
+            .unwrap();
+    }
+
     fn context_test_identity(
         agent: &str,
         authorization: char,
@@ -11961,6 +13773,112 @@ mod tests {
         (binding, gateway_result_id)
     }
 
+    #[test]
+    fn direct_observation_backs_context_but_never_becomes_a_cache_candidate() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let identity = context_test_identity("agent-a", 'a', '1', 1);
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let state_digest = blake3::hash(b"direct-state").to_hex().to_string();
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: blake3::hash(b"direct-request").to_hex().to_string(),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest("context-ledger-test-v1"),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now_ms(),
+                valid_until_ms: now_ms() + 60_000,
+            },
+            dependencies: vec![GatewayDependencyV1 {
+                key_digest: "b".repeat(64),
+                value_digest: "c".repeat(64),
+            }],
+        })
+        .unwrap();
+        let result = store
+            .insert_result(
+                &direct_observation_request_key_v1(&binding),
+                b"direct bytes",
+                b"",
+                0,
+                1,
+                "context-ledger-test-v1",
+                "{}",
+            )
+            .unwrap();
+        let direct_id = store
+            .publish_gateway_direct_observation_v1(&binding, &result.id)
+            .unwrap();
+        assert_eq!(
+            store
+                .publish_gateway_direct_observation_v1(&binding, &result.id)
+                .unwrap(),
+            direct_id,
+        );
+        let stats = store.gateway_stats().unwrap();
+        assert_eq!(stats.direct_observations_published, 1);
+        assert_eq!(stats.provider_calls_avoided, 0);
+        assert_eq!(stats.exact_hits, 0);
+        assert_eq!(store.stats().unwrap().direct_observations_published, 1);
+        let source = store
+            .context_verified_observation_v1(&identity, &binding, &direct_id, "repo.read:input.txt")
+            .unwrap();
+        let fact = context_test_fact(&store, &identity, "fact:direct", &source);
+        store
+            .admit_context_fact_v1(
+                &identity,
+                &"d".repeat(64),
+                1,
+                &fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        let forged_reference =
+            ReasoningRetrievalIdentityV1::new(&direct_id, &direct_id, b"direct bytes".len() as u64)
+                .unwrap();
+        assert!(
+            store
+                .append_context_event_v1(
+                    &identity,
+                    &"e".repeat(64),
+                    &ContextLedgerEventInputV1::ResultReference {
+                        reference: forged_reference,
+                        reference_version: 1,
+                        verified_sources: vec![source.clone()],
+                    },
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .context_task_snapshot_v1(&identity)
+                .unwrap()
+                .current_facts()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_gateway_result(&binding, &direct_id)
+                .unwrap()
+                .unwrap()
+                .stdout,
+            b"direct bytes"
+        );
+        assert!(matches!(
+            store
+                .acquire_gateway_call(&binding, "direct-test-owner")
+                .unwrap(),
+            GatewayCallAcquisition::Leader { .. }
+        ));
+        store.conn.execute(
+            "UPDATE gateway_results SET stdout_bytes = stdout_bytes + 1 WHERE gateway_result_id = ?1",
+            [&direct_id],
+        ).unwrap();
+        assert!(store.get_gateway_result(&binding, &direct_id).is_err());
+    }
+
     fn context_test_fact(
         store: &Store,
         identity: &ContextLedgerIdentityV1,
@@ -11975,6 +13893,332 @@ mod tests {
                 std::slice::from_ref(source),
             )
             .unwrap()
+    }
+
+    fn context_test_admit_result(
+        store: &Store,
+        identity: &ContextLedgerIdentityV1,
+        binding: &ValidatedGatewayReadV1,
+        result_id: &str,
+        label: &str,
+    ) {
+        let source = store
+            .context_verified_observation_v1(identity, binding, result_id, "repo.read:input.txt")
+            .unwrap();
+        let fact = context_test_fact(store, identity, &format!("fact:{label}"), &source);
+        let fact_envelope = blake3::hash(format!("fact:{label}").as_bytes())
+            .to_hex()
+            .to_string();
+        store
+            .admit_context_fact_v1(
+                identity,
+                &fact_envelope,
+                1,
+                &fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        let full = store
+            .get_gateway_result(binding, result_id)
+            .unwrap()
+            .unwrap();
+        let retrieval = ReasoningRetrievalIdentityV1::new(
+            result_id,
+            result_id,
+            full.result.stdout_bytes + full.result.stderr_bytes,
+        )
+        .unwrap();
+        let reference_envelope = blake3::hash(format!("reference:{label}").as_bytes())
+            .to_hex()
+            .to_string();
+        store
+            .append_context_event_v1(
+                identity,
+                &reference_envelope,
+                &ContextLedgerEventInputV1::ResultReference {
+                    reference: retrieval,
+                    reference_version: 1,
+                    verified_sources: vec![source],
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn source_recipe_is_scope_bound_idempotent_and_counted_once() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let identity = context_test_identity("agent-a", 'a', '1', 1);
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let (binding, result_id) = context_test_gateway_result(
+            &mut store,
+            "source-recipe",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let before = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        let plan = br#"{"content_paths":["input.txt"],"recursive_trees":[],"source_trees":[],"directory_listings":[],"negative_dependencies":[]}"#;
+        store
+            .admit_context_source_recipe_v1(&identity, &binding, &result_id, &"d".repeat(64), plan)
+            .unwrap();
+        let after_first = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        store
+            .admit_context_source_recipe_v1(&identity, &binding, &result_id, &"d".repeat(64), plan)
+            .unwrap();
+        let after = store
+            .task_quota_status_v1(identity.repository_id(), identity.workspace_id())
+            .unwrap();
+        assert_eq!(
+            after.workspace_state_bytes,
+            after_first.workspace_state_bytes
+        );
+        let result = store
+            .get_gateway_result(&binding, &result_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.workspace_state_bytes,
+            before.workspace_state_bytes
+                + result.result.stdout_bytes
+                + result.result.stderr_bytes
+                + plan.len() as u64
+                + 256
+        );
+        assert_eq!(
+            store
+                .context_source_recipe_v1(&identity, &result_id)
+                .unwrap(),
+            Some(("d".repeat(64), plan.to_vec()))
+        );
+        let other_scope = context_test_identity("agent-b", 'e', '2', 1);
+        store.activate_context_recipient_v1(&other_scope).unwrap();
+        assert!(
+            store
+                .context_source_recipe_v1(&other_scope, &result_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unavailable_source_retires_matching_dependencies_across_tasks_only() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let first = context_test_identity("agent-a", 'a', '1', 1);
+        let second = ContextLedgerIdentityV1::new(
+            "repository",
+            "workspace",
+            "second-task",
+            &"a".repeat(64),
+            "agent-b",
+            "session-b",
+            "turn",
+            &"2".repeat(64),
+            0,
+            1,
+        )
+        .unwrap();
+        let unrelated = ContextLedgerIdentityV1::new(
+            "repository",
+            "workspace",
+            "unrelated-task",
+            &"a".repeat(64),
+            "agent-c",
+            "session-c",
+            "turn",
+            &"3".repeat(64),
+            0,
+            1,
+        )
+        .unwrap();
+        let other_scope = context_test_identity("agent-d", 'd', '4', 1);
+        for identity in [&first, &second, &unrelated, &other_scope] {
+            store.activate_context_recipient_v1(identity).unwrap();
+        }
+        let (first_binding, first_id) = context_test_gateway_result(
+            &mut store,
+            "source-first",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let (second_binding, second_id) = context_test_gateway_result(
+            &mut store,
+            "source-second",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let (unrelated_binding, unrelated_id) = context_test_gateway_result(
+            &mut store,
+            "source-unrelated",
+            &"e".repeat(64),
+            &"f".repeat(64),
+        );
+        let (scope_binding, scope_id) = context_test_gateway_result(
+            &mut store,
+            "source-other-scope",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        context_test_admit_result(&store, &first, &first_binding, &first_id, "first");
+        context_test_admit_result(&store, &second, &second_binding, &second_id, "second");
+        context_test_admit_result(
+            &store,
+            &unrelated,
+            &unrelated_binding,
+            &unrelated_id,
+            "unrelated",
+        );
+        context_test_admit_result(
+            &store,
+            &other_scope,
+            &scope_binding,
+            &scope_id,
+            "other-scope",
+        );
+        let cursor = store.context_task_snapshot_v1(&second).unwrap().cursor();
+        let retired = store
+            .invalidate_context_source_observation_v1(&first, &"9".repeat(64), &first_id)
+            .unwrap();
+        assert_eq!(retired.retired_facts, 2);
+        assert_eq!(retired.retired_result_references, 2);
+        assert!(store.retrieve_context_result_v1(&first, &first_id).is_err());
+        assert!(
+            store
+                .retrieve_context_result_v1(&second, &second_id)
+                .is_err()
+        );
+        assert!(
+            store
+                .retrieve_context_result_v1(&unrelated, &unrelated_id)
+                .is_ok()
+        );
+        assert!(
+            store
+                .retrieve_context_result_v1(&other_scope, &scope_id)
+                .is_ok()
+        );
+        let delta = store.context_delta_after_v1(&second, cursor, 64).unwrap();
+        assert!(
+            delta
+                .events()
+                .iter()
+                .any(|event| event.kind() == ContextLedgerEventKindV1::Invalidation)
+        );
+    }
+
+    #[test]
+    fn unavailable_source_retirement_is_atomic_and_same_result_can_be_readmitted() {
+        let temp = TempDir::new().unwrap();
+        let mut store = Store::open(temp.path().join("state")).unwrap();
+        let identity = context_test_identity("agent-a", 'a', '1', 1);
+        store.activate_context_recipient_v1(&identity).unwrap();
+        let (binding, result_id) = context_test_gateway_result(
+            &mut store,
+            "recoverable",
+            &"b".repeat(64),
+            &"c".repeat(64),
+        );
+        let source = store
+            .context_verified_observation_v1(&identity, &binding, &result_id, "repo.read:input.txt")
+            .unwrap();
+        let full = store
+            .get_gateway_result(&binding, &result_id)
+            .unwrap()
+            .unwrap();
+        let retrieval = ReasoningRetrievalIdentityV1::new(
+            &result_id,
+            &result_id,
+            full.result.stdout_bytes + full.result.stderr_bytes,
+        )
+        .unwrap();
+        let fact = context_test_fact(&store, &identity, "fact:recoverable", &source);
+        store
+            .admit_context_fact_v1(
+                &identity,
+                &"d".repeat(64),
+                1,
+                &fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        store
+            .append_context_event_v1(
+                &identity,
+                &"e".repeat(64),
+                &ContextLedgerEventInputV1::ResultReference {
+                    reference: retrieval.clone(),
+                    reference_version: 1,
+                    verified_sources: vec![source.clone()],
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .context_result_admission_version_v1(&identity, &result_id)
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
+        );
+        let retired = store
+            .invalidate_context_source_observation_v1(&identity, &"f".repeat(64), &result_id)
+            .unwrap();
+        assert_eq!(retired.retired_facts, 1);
+        assert_eq!(retired.retired_result_references, 1);
+        assert!(
+            store
+                .retrieve_context_result_v1(&identity, &result_id)
+                .is_err()
+        );
+        assert!(
+            !store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .context_result_admission_version_v1(&identity, &result_id)
+                .unwrap(),
+            2
+        );
+        let restored_fact = context_test_fact(&store, &identity, "fact:recoverable:2", &source);
+        store
+            .admit_context_fact_v1(
+                &identity,
+                &"1".repeat(64),
+                1,
+                &restored_fact,
+                std::slice::from_ref(&source),
+            )
+            .unwrap();
+        store
+            .append_context_event_v1(
+                &identity,
+                &"2".repeat(64),
+                &ContextLedgerEventInputV1::ResultReference {
+                    reference: retrieval,
+                    reference_version: 2,
+                    verified_sources: vec![source],
+                },
+            )
+            .unwrap();
+        assert!(
+            store
+                .retrieve_context_result_v1(&identity, &result_id)
+                .is_ok()
+        );
+        assert!(
+            store
+                .context_result_reference_current_v1(&identity, &result_id)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -12581,7 +14825,11 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
+                    "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
+                     DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
                      DROP TABLE context_task_aliases_v1;
@@ -12620,6 +14868,238 @@ mod tests {
         let stats = reopened.stats().unwrap();
         assert_eq!(stats.full_replays, 1);
         assert_eq!(stats.estimated_execution_ms_saved, 0);
+    }
+
+    #[test]
+    fn version_seventeen_brain_history_migrates_without_granting_unknown_scope() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let scope = "a".repeat(64);
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .record_brain_event_v1(&BrainEventV1 {
+                    session_id: "session".to_owned(),
+                    event_id: "old".to_owned(),
+                    task_id: "task".to_owned(),
+                    kind: "file_change".to_owned(),
+                    path: Some("src/file.py".to_owned()),
+                    source_digest: Some("b".repeat(64)),
+                    read_start_line: None,
+                    read_end_line: None,
+                    command_digest: None,
+                    command_hint: None,
+                    exit_code: None,
+                    created_ms: now_ms(),
+                    authorization_scope_digest: Some(scope.clone()),
+                })
+                .unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP INDEX brain_files_scope_recent_idx;
+                 DROP INDEX brain_test_commands_scope_recent_idx;
+                 ALTER TABLE brain_events_v1 DROP COLUMN read_start_line;
+                 ALTER TABLE brain_events_v1 DROP COLUMN read_end_line;
+                 ALTER TABLE brain_files_v1 DROP COLUMN read_start_line;
+                 ALTER TABLE brain_files_v1 DROP COLUMN read_end_line;
+                 ALTER TABLE brain_events_v1 DROP COLUMN authorization_scope_digest;
+                 ALTER TABLE brain_files_v1 DROP COLUMN authorization_scope_digest;
+                 ALTER TABLE brain_test_commands_v1 DROP COLUMN authorization_scope_digest;
+                 PRAGMA user_version = 17;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        assert_eq!(store.recent_brain_files_v1(8).unwrap().len(), 1);
+        assert!(
+            store
+                .brain_file_v1("src/file.py", &scope)
+                .unwrap()
+                .is_none()
+        );
+        store
+            .record_brain_event_v1(&BrainEventV1 {
+                session_id: "session".to_owned(),
+                event_id: "new".to_owned(),
+                task_id: "task".to_owned(),
+                kind: "file_change".to_owned(),
+                path: Some("src/file.py".to_owned()),
+                source_digest: Some("c".repeat(64)),
+                read_start_line: None,
+                read_end_line: None,
+                command_digest: None,
+                command_hint: None,
+                exit_code: None,
+                created_ms: now_ms() + 1,
+                authorization_scope_digest: Some(scope.clone()),
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .brain_file_v1("src/file.py", &scope)
+                .unwrap()
+                .unwrap()
+                .source_digest,
+            "c".repeat(64)
+        );
+    }
+
+    #[test]
+    fn brain_run_summary_is_idempotent_bounded_and_clearable() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let store = Store::open(temp.path()).unwrap();
+        let run = BrainRunV1 {
+            session_id: "session".to_owned(),
+            task_id: "task".to_owned(),
+            authorization_scope_digest: "a".repeat(64),
+            started_ms: now_ms() - 100,
+            completed_ms: now_ms(),
+            exit_code: 0,
+            turn_completed: true,
+            completed_commands: 2,
+            completed_source_reads: 1,
+            completed_edits: 1,
+            completed_mcp_calls: 0,
+            successful_tests: 1,
+            input_tokens: Some(100),
+            cached_input_tokens: Some(40),
+            output_tokens: Some(12),
+        };
+        store.record_brain_run_v1(&run).unwrap();
+        store.record_brain_run_v1(&run).unwrap();
+        assert_eq!(store.recent_brain_runs_v1(8).unwrap(), vec![run.clone()]);
+        let mut collision = run.clone();
+        collision.output_tokens = Some(13);
+        assert!(store.record_brain_run_v1(&collision).is_err());
+        let mut invalid = run.clone();
+        invalid.cached_input_tokens = Some(101);
+        assert!(store.record_brain_run_v1(&invalid).is_err());
+        let mut multi_file_search = run.clone();
+        multi_file_search.session_id = "multi-file-search".to_owned();
+        multi_file_search.completed_commands = 1;
+        multi_file_search.completed_source_reads = 4;
+        multi_file_search.successful_tests = 0;
+        store.record_brain_run_v1(&multi_file_search).unwrap();
+        let mut impossible = multi_file_search.clone();
+        impossible.session_id = "too-many-source-files".to_owned();
+        impossible.completed_source_reads = 5;
+        assert!(store.record_brain_run_v1(&impossible).is_err());
+        assert_eq!(store.clear_brain_events_v1().unwrap(), 2);
+        assert!(store.recent_brain_runs_v1(8).unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_eighteen_brain_store_migrates_to_run_summaries() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE brain_runs_v1;
+                     ALTER TABLE brain_events_v1 DROP COLUMN read_start_line;
+                     ALTER TABLE brain_events_v1 DROP COLUMN read_end_line;
+                     ALTER TABLE brain_files_v1 DROP COLUMN read_start_line;
+                     ALTER TABLE brain_files_v1 DROP COLUMN read_end_line;
+                     PRAGMA user_version = 18;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        assert!(store.recent_brain_runs_v1(8).unwrap().is_empty());
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn version_nineteen_brain_history_gains_bounded_read_ranges_without_stale_reuse() {
+        let temp = TempDir::new().unwrap();
+        set_private_dir(temp.path()).unwrap();
+        let scope = "a".repeat(64);
+        let mut event = BrainEventV1 {
+            session_id: "session".to_owned(),
+            event_id: "old-read".to_owned(),
+            task_id: "task".to_owned(),
+            kind: "command".to_owned(),
+            path: Some("src/file.rs".to_owned()),
+            source_digest: Some("b".repeat(64)),
+            read_start_line: Some(10),
+            read_end_line: Some(20),
+            command_digest: Some("c".repeat(64)),
+            command_hint: None,
+            exit_code: Some(0),
+            created_ms: now_ms(),
+            authorization_scope_digest: Some(scope.clone()),
+        };
+        {
+            let store = Store::open(temp.path()).unwrap();
+            store.record_brain_event_v1(&event).unwrap();
+            store
+                .conn
+                .execute_batch(
+                    "ALTER TABLE brain_events_v1 DROP COLUMN read_start_line;
+                 ALTER TABLE brain_events_v1 DROP COLUMN read_end_line;
+                 ALTER TABLE brain_files_v1 DROP COLUMN read_start_line;
+                 ALTER TABLE brain_files_v1 DROP COLUMN read_end_line;
+                 PRAGMA user_version = 19;",
+                )
+                .unwrap();
+        }
+        let store = Store::open(temp.path()).unwrap();
+        let old = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!((old.read_start_line, old.read_end_line), (None, None));
+        event.event_id = "new-read".to_owned();
+        event.created_ms += 1;
+        event.read_start_line = Some(30);
+        event.read_end_line = Some(40);
+        store.record_brain_event_v1(&event).unwrap();
+        drop(store);
+        let store = Store::open(temp.path()).unwrap();
+        let current = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!(
+            (current.read_start_line, current.read_end_line),
+            (Some(30), Some(40))
+        );
+        let mut invalid = event.clone();
+        invalid.event_id = "invalid".to_owned();
+        invalid.read_end_line = Some(29);
+        assert!(store.record_brain_event_v1(&invalid).is_err());
+        event.event_id = "search".to_owned();
+        event.created_ms += 1;
+        event.read_start_line = Some(50);
+        event.read_end_line = None;
+        store.record_brain_event_v1(&event).unwrap();
+        let searched = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!(
+            (searched.read_start_line, searched.read_end_line),
+            (Some(50), None)
+        );
+        event.event_id = "metadata-only".to_owned();
+        event.created_ms += 1;
+        event.read_start_line = None;
+        store.record_brain_event_v1(&event).unwrap();
+        let retained = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!(
+            (retained.read_start_line, retained.read_end_line),
+            (Some(50), None)
+        );
+        event.event_id = "edit".to_owned();
+        event.created_ms += 1;
+        event.kind = "file_change".to_owned();
+        event.source_digest = Some("d".repeat(64));
+        event.command_digest = None;
+        event.exit_code = None;
+        store.record_brain_event_v1(&event).unwrap();
+        let edited = store.brain_file_v1("src/file.rs", &scope).unwrap().unwrap();
+        assert_eq!((edited.read_start_line, edited.read_end_line), (None, None));
     }
 
     #[test]
@@ -12727,11 +15207,41 @@ mod tests {
     }
 
     #[test]
+    fn source_recipe_schema_migrates_from_thirteen_and_is_required_at_fourteen() {
+        let temp = TempDir::new().unwrap();
+        let store = Store::open(temp.path().join("state")).unwrap();
+        restore_pre_v15_gateway_result_shape(&store);
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE gateway_context_source_recipes_v1;
+                 DROP TABLE brain_test_commands_v1;
+                 DROP TABLE brain_files_v1;
+                 DROP TABLE brain_events_v1;
+                 PRAGMA user_version = 13;",
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::open(temp.path().join("state")).unwrap();
+        let version: i64 = reopened
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        reopened
+            .conn
+            .execute_batch("DROP TABLE gateway_context_source_recipes_v1;")
+            .unwrap();
+        assert!(verify_gateway_schema_current(&reopened.conn).is_err());
+    }
+
+    #[test]
     fn version_eight_compact_savings_are_neutralized_without_a_receipt() {
         let temp = TempDir::new().unwrap();
         set_private_dir(temp.path()).unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
+            restore_pre_v15_gateway_result_shape(&store);
             store
                 .conn
                 .execute(
@@ -12742,7 +15252,11 @@ mod tests {
             store
                 .conn
                 .execute_batch(
-                    "DROP TABLE context_workspace_quota_v1;
+                    "DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
+                     DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;
                      DROP TABLE context_task_aliases_v1;
@@ -12790,10 +15304,15 @@ mod tests {
         set_private_dir(temp.path()).unwrap();
         {
             let store = Store::open(temp.path()).unwrap();
+            restore_pre_v15_gateway_result_shape(&store);
             store
                 .conn
                 .execute_batch(
                     "PRAGMA foreign_keys = OFF;
+                     DROP TABLE gateway_context_source_recipes_v1;
+                     DROP TABLE brain_test_commands_v1;
+                     DROP TABLE brain_files_v1;
+                     DROP TABLE brain_events_v1;
                      DROP TABLE context_workspace_quota_v1;
                      DROP TABLE context_task_transitions_v1;
                      DROP TABLE context_task_relations_v1;

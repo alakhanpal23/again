@@ -17,6 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use blake3::Hasher;
+use serde::{Deserialize, Serialize};
 
 pub const WORKSPACE_AUTHORITY_SCHEMA_VERSION_V1: u16 = 1;
 
@@ -250,7 +251,8 @@ fn incomplete_plan(
     )
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryObservationPlanV1 {
     /// Exact regular files whose metadata and content are relevant.
     content_paths: Vec<PathBuf>,
@@ -1680,6 +1682,22 @@ impl WorkspaceExecutionEpochV1 {
 
 #[allow(dead_code)]
 impl ObservedManifestV1 {
+    /// Budget optional index observations before they can exhaust and poison
+    /// the shared manifest used by ordinary repository tools.
+    pub(crate) fn remaining_observation_slots_v1(&self) -> usize {
+        self.limits
+            .max_plan_entries
+            .saturating_sub(self.observations.len())
+    }
+
+    pub(crate) fn has_content_observation_v1(&self, path: &Path) -> bool {
+        self.observations
+            .contains_key(&ManifestObservationKeyV1::new(
+                RepositoryObservationKindV1::ContentPath,
+                path,
+            ))
+    }
+
     /// Bind a result, fact, validation, or artifact identity to every complete
     /// witness in an already-observed plan. This is an invalidation index only:
     /// the dependent identity cannot be used to retrieve or serve anything.
@@ -1790,11 +1808,10 @@ impl ObservedManifestV1 {
 
         for key in &keys {
             if let Some(cached) = self.observations.get(key) {
-                validate_manifest_witnesses_v1(
-                    &self.execution_epoch,
-                    &cached.witnesses,
-                    &self.limits,
-                )?;
+                // advance_for_stale_dependencies validated every cached
+                // witness before this loop. The final fence below checks the
+                // requested witnesses again after observation and catches a
+                // mutation during this call.
                 self.accounting.reuse_hits =
                     self.accounting.reuse_hits.checked_add(1).ok_or_else(|| {
                         incomplete_limit(

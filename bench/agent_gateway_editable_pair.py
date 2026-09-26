@@ -38,6 +38,7 @@ MAX_CAPTURE_BYTES = 8 * 1024 * 1024
 MAX_FIXTURE_FILES = 128
 MAX_FIXTURE_FILE_BYTES = 1024 * 1024
 MAX_BINARY_BYTES = 512 * 1024 * 1024
+IGNORED_OUTPUT_DIRS = {".git", "target", "node_modules", "__pycache__"}
 PLACEHOLDERS = {"{workspace}", "{prompt}", "{model}"}
 TARGET = "src/calculator.py"
 TEST = "tests/test_calculator.py"
@@ -48,6 +49,8 @@ PROMPT = (
     "the total(values) API. Do not edit tests or any other file. Run the existing "
     "test suite, then stop."
 )
+TEST_COMMAND = ("/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q")
+TARGET_ORACLE_MODE = "exact"
 FIXTURE = {
     TARGET: BUGGY,
     TEST: (
@@ -96,7 +99,7 @@ def sha256_file(path: pathlib.Path) -> str:
 def snapshot(root: pathlib.Path) -> dict[str, str]:
     observed: dict[str, str] = {}
     for path in sorted(root.rglob("*")):
-        if path.is_dir() or ".git" in path.parts:
+        if path.is_dir() or any(part in IGNORED_OUTPUT_DIRS for part in path.relative_to(root).parts):
             continue
         if path.is_symlink() or not path.is_file():
             raise Refusal("unsafe_fixture_entry", str(path))
@@ -152,7 +155,7 @@ def render(template: Sequence[str], workspace: pathlib.Path, model: str) -> list
 def run_tests(root: pathlib.Path, timeout: float) -> tuple[bool, float, str]:
     started = time.perf_counter()
     returncode, output_sha, timed_out, output_limited, _ = run_captured(
-        ["/usr/bin/python3", "-I", "-m", "unittest", "discover", "-s", "tests", "-q"],
+        TEST_COMMAND,
         root,
         timeout,
     )
@@ -236,14 +239,19 @@ def again_stats(binary: pathlib.Path, root: pathlib.Path) -> dict[str, int]:
 
 
 def validate_edit(root: pathlib.Path, before: Mapping[str, str], timeout: float) -> dict[str, Any]:
+    if TARGET_ORACLE_MODE not in {"exact", "behavior"}:
+        raise Refusal("target_oracle_mode_invalid", TARGET_ORACLE_MODE)
     after = snapshot(root)
     changed = sorted(set(before) | set(after))
     changed = [path for path in changed if before.get(path) != after.get(path)]
     exact_target = (root / TARGET).read_text(encoding="utf-8") == FIXED
     collateral_safe = changed == [TARGET]
     tests_passed, test_ms, output_sha = run_tests(root, timeout)
+    target_oracle_passed = exact_target if TARGET_ORACLE_MODE == "exact" else TARGET in changed
     return {
-        "passed": exact_target and collateral_safe and tests_passed,
+        "passed": target_oracle_passed and collateral_safe and tests_passed,
+        "target_oracle_mode": TARGET_ORACLE_MODE,
+        "target_oracle_passed": target_oracle_passed,
         "exact_target": exact_target,
         "collateral_safe": collateral_safe,
         "changed_paths": changed,

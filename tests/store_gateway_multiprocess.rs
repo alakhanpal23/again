@@ -923,7 +923,18 @@ fn malformed_duplicate_and_broken_relationships_refuse_open_or_reuse() {
         .unwrap();
     connection
         .execute(
-            "INSERT INTO gateway_results SELECT ?1, request_digest, state_digest, policy_digest, binding_digest, result_id, stdout_digest, stderr_digest, stdout_bytes, stderr_bytes, exit_code, duration_ms, result_policy_version, proof_digest, lease_id, status, quarantine_reason, created_ms, updated_ms FROM gateway_results WHERE gateway_result_id = ?2",
+            "INSERT INTO gateway_results (
+                 gateway_result_id, request_digest, state_digest, policy_digest,
+                 binding_digest, result_id, stdout_digest, stderr_digest,
+                 stdout_bytes, stderr_bytes, exit_code, duration_ms,
+                 result_policy_version, proof_digest, lease_id, status,
+                 quarantine_reason, created_ms, updated_ms, origin
+             ) SELECT ?1, request_digest, state_digest, policy_digest,
+                      binding_digest, result_id, stdout_digest, stderr_digest,
+                      stdout_bytes, stderr_bytes, exit_code, duration_ms,
+                      result_policy_version, proof_digest, lease_id, status,
+                      quarantine_reason, created_ms, updated_ms, origin
+               FROM gateway_results WHERE gateway_result_id = ?2",
             params!["f".repeat(64), fixture.gateway_result_id],
         )
         .unwrap();

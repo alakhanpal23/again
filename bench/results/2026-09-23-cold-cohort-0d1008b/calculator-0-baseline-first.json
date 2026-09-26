@@ -1,0 +1,198 @@
+{
+  "accepted": true,
+  "againBinarySha256": "8f8f2cace6932f9271a4e4fce952a05d2a9a1c753c90468eeff8ca830d10010c",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "calculator",
+  "fixtureSha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+  "harnessSha256": "2afec65c4165b72b6c7c85c11fca51d93950805e9dd228ea0793195234531f4c",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 23263.76,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini' -g 'tests/**'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat tests/test_calculator.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/calculator.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"cat README.md && rg --files -g '\"'!src/calculator.py'\"' -g '\"'!tests/test_calculator.py'\"'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 23263.76,
+      "eventCount": 22,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 15376.634,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 136.51,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 5391,
+      "rawEventFile": "calculator-0-baseline-first-baseline.jsonl",
+      "rawEventSha256": "824c1b350151b1ea42e0a74328e12b9bfeadf7592d6cbfb489dfb04aef8e2685",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 103808,
+        "input_tokens": 114696,
+        "output_tokens": 708,
+        "reasoning_output_tokens": 48
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 12365.802,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/calculator.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 12365.802,
+      "eventCount": 11,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5258.336,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "exact",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 129.358,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 2164,
+      "rawEventFile": "calculator-0-baseline-first-product.jsonl",
+      "rawEventSha256": "ccf7c941152ccd657ffbf6d331f0b146e0bced415ecf2a9ea42f5e99465e650e",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48523,
+        "output_tokens": 324,
+        "reasoning_output_tokens": 41
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "recordedAtUtc": "2026-09-23T22:23:43.446082+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "0d1008bb290da57782e767ada9113fe9b481db09"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

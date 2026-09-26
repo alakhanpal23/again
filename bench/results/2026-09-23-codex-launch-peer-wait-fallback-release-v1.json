@@ -1,0 +1,23 @@
+{
+  "againBinarySha256": "45ac0671d1825574230a8f7cc6d3b04cef940c729ff17799e74fba250535abcf",
+  "boundedWaitFallbackReportedPeer": true,
+  "classification": {
+    "code": "launcher_lease_handoff_passed",
+    "type": "pass"
+  },
+  "followerClaimedAfterLeader": true,
+  "followerPromptSha256": "19136e6f24e0ae710ac4e8cde9b21add0f6c0d4aba3d316335f7a2084139c28a",
+  "followerReceivedFreshEditedSource": true,
+  "followerWaitedForLeader": true,
+  "leaderPromptSha256": "9df60ddbec4ec7b30e7647251bab5034ee696e4f62430a6d26d62acf4eb1c66f",
+  "leaderRetiredAfterExit": true,
+  "leaderVisibleDuringRun": true,
+  "recordedAtUtc": "2026-09-23T19:24:27.678794+00:00",
+  "schema": "again.codex-launch-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "b207f2a5e1436699ab76ea0e4bf679791678f0d8",
+    "git_sha256": "9485e54100f78dc4cbd37ba6c488ca0118544bd6377f372b36459d0b95beaf74",
+    "root": "/Users/arjun/.superset/projects/again"
+  }
+}

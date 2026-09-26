@@ -1,0 +1,37 @@
+{
+  "binary_sha256": "76ead6260a813a3fbdf97e76b18cf1f8f80b32cfa9c0418643ae4fad3ec733bc",
+  "classification": {
+    "code": "task_source_lifecycle_passed",
+    "type": "pass"
+  },
+  "duplicate_read_events": {
+    "completed": 1,
+    "executed": 1,
+    "inflight_candidate": 1,
+    "inflight_join": 1,
+    "requested": 2
+  },
+  "large_index_source_files": 4097,
+  "large_ledger_sources": 257,
+  "mid_index_source_files": 1000,
+  "new_result_id": "dbaf07125b49e9e12208bdff35e4b9355bdec096e599873d2f763d88c17ae054",
+  "old_result_id": "ab7f40713f8973f5426b7b83335327eefe55d61c66cb74c53fbce6102211597b",
+  "scenarios": [
+    "standalone_direct",
+    "duplicate_read_avoided",
+    "peer_fact",
+    "peer_retrieval",
+    "unrelated_edit",
+    "unobserved_relevant_edit",
+    "large_ledger_incomplete",
+    "mid_index_explicit_preview",
+    "large_index_explicit_preview"
+  ],
+  "schema": "again.authenticated-product-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "7a608ad1d22dada754d9aee117a444e2ce89a743",
+    "git_sha256": "a0aa831702f76c2ce08e57b2707a4fc659ff0d2907199e30989de0296ac31c01",
+    "root": "/Users/arjun/.superset/projects/again"
+  }
+}

@@ -6,6 +6,11 @@ gates. [STATUS.md](STATUS.md) remains the source of implementation truth and
 [EVIDENCE.md](EVIDENCE.md) remains the source of measured claims. A roadmap
 item is intent until those documents contain its passing evidence.
 
+The current execution priority is the [single-agent product plan](SINGLE_AGENT_PRODUCT_PLAN.md).
+Its release gate is one correct, validated coding task completed faster and at
+lower total cost with a persistent repository knowledge base. The parallel
+and team capabilities below remain architectural options after that gate.
+
 Historical Gate 0–6 names are retained below so release procedures, Linux
 evidence, and older technical documents keep their original meaning.
 
@@ -22,9 +27,9 @@ deterministic proof may turn it into a shortcut.
 
 The target user outcome is:
 
-> Again helps coding agents start with verified repository understanding, avoid
-> repeating work, run only the validation that changed, and share exact
-> execution knowledge across agents.
+> Again helps one coding agent start with verified repository understanding,
+> avoid repeated work, run the validation that matters, and carry current
+> execution knowledge into the next task.
 
 ## Target user experience
 
@@ -362,8 +367,8 @@ Current priority order after the local paired gate:
    supported agent clients, with a clean upgrade/recovery path.
 2. Run and retain pinned live-agent editable cohorts so the task-quality and
    acceleration claims are based on real Codex/Claude outcomes.
-3. Add explicit task revision, parent/child, dependency, and completion records
-   without silently merging semantically similar prompts.
+3. Qualify the landed task revision, parent/child, dependency, and completion
+   records in real agent sessions without merging semantically similar prompts.
 4. Finish the qualified Linux pytest execution path, then admit changed-only
    reuse through the existing candidate/shadow/promotion contract.
 5. Extend qualified validation to Rust, TypeScript, Go, and Python before

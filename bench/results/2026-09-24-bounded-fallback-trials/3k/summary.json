@@ -1,0 +1,65 @@
+{
+  "acceptedPairs": 2,
+  "apiEquivalentCostRatio": 0.9573809400959703,
+  "baselineApiEquivalentUsd": "0.1162860",
+  "baselineCommands": 14,
+  "fixture": "historical-python-triple",
+  "limitations": [
+    "one historical repair fixture; not a diverse release cohort",
+    "API-equivalent estimate, not billed Codex charges"
+  ],
+  "model": "gpt-6-sol",
+  "pairedMedianElapsedRatio": 1.0675641969380967,
+  "pairs": [
+    {
+      "baselineApiEquivalentUsd": "0.0621524",
+      "baselineCommands": 7,
+      "baselineElapsedMs": 43219.709,
+      "baselineFirstEditMs": 32979.67,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "productApiEquivalentUsd": "0.053974",
+      "productCommands": 4,
+      "productElapsedMs": 45782.165,
+      "productFirstEditMs": 30656.097,
+      "productToBaselineElapsedRatio": 1.0592890618490745,
+      "report": "again-bounded-search-3k-baseline-first-ef8dfe1.json"
+    },
+    {
+      "baselineApiEquivalentUsd": "0.0541336",
+      "baselineCommands": 7,
+      "baselineElapsedMs": 37792.672,
+      "baselineFirstEditMs": 29177.525,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "productApiEquivalentUsd": "0.057356",
+      "productCommands": 5,
+      "productElapsedMs": 40658.843,
+      "productFirstEditMs": 31341.944,
+      "productToBaselineElapsedRatio": 1.075839332027119,
+      "report": "again-bounded-search-3k-again-first-ef8dfe1.json"
+    }
+  ],
+  "productApiEquivalentUsd": "0.111330",
+  "productCommands": 9,
+  "rateCard": {
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "contextClass": "short, at most 272K input tokens per request",
+    "model": "gpt-6-sol",
+    "schema": "again.api-rate-card.v1",
+    "serviceTier": "standard",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "cacheWriteInput": "2.50",
+      "cachedInput": "0.20",
+      "output": "10.00",
+      "uncachedInput": "2.00"
+    }
+  },
+  "schema": "again.product-pair-summary.v1",
+  "sourceSha": "ef8dfe16e4c17cef87b9a6c732c0f263a0f5c1a4"
+}

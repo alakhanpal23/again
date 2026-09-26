@@ -1,0 +1,191 @@
+{
+  "accepted": true,
+  "againBinarySha256": "29530d5a843f32a095acd67fb3542b1cc53134d58324663253c52a157a052a65",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-calculator",
+  "fixtureSha256": "3fa31097163d233f39092b75f0ee8c8a794ee30f743da985c3d7c853a971de36",
+  "harnessSha256": "e381228abbe18cc7955df39279c839d1daf257cc56f1c6ec282eab222fd05a3e",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 15341.465,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc 'cat src/calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg --files -g AGENTS.md -g '\"'!node_modules'\"'\"",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 15341.465,
+      "eventCount": 15,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 9194.155,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 151.509,
+        "test_output_sha256": "076cdaf39adac9fbefe06a7c8c6cb89c59a7c895d4371f6b33eeb0ed7ff1a64b",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3144,
+      "rawEventFile": "js-calculator-1000-baseline-first-baseline.jsonl",
+      "rawEventSha256": "6fe54ea2c1195503c1594bbcb66165e0f0aae2c24b6f95cca9f9ecfb4c23b9c6",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 54784,
+        "input_tokens": 63996,
+        "output_tokens": 368,
+        "reasoning_output_tokens": 16
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "8211806bb0f01badd93b9011aa83957762a942985f3f421c627d44838076a276",
+        "cached_input_tokens": 43648,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790221043395,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48619,
+        "output_tokens": 313,
+        "session_id": "2073ae82-d4ac-4a78-a131-126b8b382bc7",
+        "started_ms": 1790221031709,
+        "successful_tests": 1,
+        "task_id": "js-calculator-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 12081.496,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 12081.496,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5513.936,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 79.586,
+        "test_output_sha256": "0b04ac3917fd03de624fa7dabfc861e914d0702e90633cc8eb4c4f33f50977dc",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1866,
+      "rawEventFile": "js-calculator-1000-baseline-first-product.jsonl",
+      "rawEventSha256": "b276445964cf9536faf4a2d27199cff8bb86eebd254dcce924aee38c0e3a18e2",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48619,
+        "output_tokens": 313,
+        "reasoning_output_tokens": 16
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "7a02429cdec105fe7f0f6f42495a17a710679e417d361fc09e3648459da10720",
+  "recordedAtUtc": "2026-09-24T03:37:23.612208+00:00",
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "cb7828d0b0bfa9d9d05b40c8497d2a9517bbdebe"
+  },
+  "sourceFiles": 1000,
+  "surface": "product-wrapper"
+}

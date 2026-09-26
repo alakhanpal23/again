@@ -1,0 +1,18 @@
+{
+  "again_sha256": "d705e614ab3e195f08ca69de8b55906daff50ec822668f6aeceee51bbe20461e",
+  "applied": true,
+  "client": "codex",
+  "client_sha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "client_version": "codex-cli 0.156.0",
+  "inspected": true,
+  "model_calls": 0,
+  "removed": true,
+  "repeated_apply_idempotent": true,
+  "schema": "again.client-setup-probe.v1",
+  "skill_verified": true,
+  "source_to_binary_binding": "unverified",
+  "workspace_git": {
+    "dirty": true,
+    "head": "6a8f88a4eec4bc63dde0bce7ab55404459a188c2"
+  }
+}

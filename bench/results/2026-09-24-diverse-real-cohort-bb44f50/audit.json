@@ -1,0 +1,1022 @@
+{
+  "schema": "again.diverse-real-cohort-audit.v1",
+  "sourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+  "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+  "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+  "verifiedRawTraces": 48,
+  "retainedBinaryArchive": "again-bb44f50-macos-arm64.gz",
+  "retainedBinaryArchiveSha256": "0d47f5aab6a1e6b11cf6e5a7ca600985d550dff42e20898a5d20126c2804d448",
+  "plannedPairs": 16,
+  "acceptedPairs": 14,
+  "qualificationPassed": false,
+  "acceptedOnlyMedianTimeRatioDiagnostic": 0.8490294053847336,
+  "acceptedOnlyMedianCostRatioDiagnostic": 0.9030763478259456,
+  "totalApiEquivalentUsdIncludingFailures": {
+    "baseline": "1.0832392",
+    "product": "1.0149720"
+  },
+  "totalsIncludingFailures": {
+    "baseline": {
+      "elapsedMs": 626155.701,
+      "executedTools": {
+        "command_execution": 100,
+        "file_change": 16
+      },
+      "tokens": {
+        "input_tokens": 1991827,
+        "cached_input_tokens": 1729536,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 21275,
+        "reasoning_output_tokens": 7452
+      },
+      "apiEquivalentUsd": "1.0832392"
+    },
+    "product": {
+      "elapsedMs": 583680.237,
+      "executedTools": {
+        "command_execution": 65,
+        "file_change": 16
+      },
+      "tokens": {
+        "input_tokens": 1883519,
+        "cached_input_tokens": 1637120,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 19475,
+        "reasoning_output_tokens": 7293
+      },
+      "apiEquivalentUsd": "1.0149720"
+    }
+  },
+  "taskSummaries": {
+    "packaging-empty-platforms": {
+      "acceptedPairs": 4,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.9019819777137229,
+      "medianCostRatioAcceptedOnly": 0.9049726726715612,
+      "timeRatiosAllPairs": [
+        0.9305278457903845,
+        0.8959391430450677,
+        0.763127634262458,
+        0.9080248123823781
+      ],
+      "costRatiosAllPairs": [
+        0.9417730568889797,
+        0.778396012386772,
+        0.9902110813037849,
+        0.8681722884541428
+      ],
+      "failedPairs": []
+    },
+    "camelcase-number-separator": {
+      "acceptedPairs": 3,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.5838050462088015,
+      "medianCostRatioAcceptedOnly": 0.727494809448538,
+      "timeRatiosAllPairs": [
+        0.6810146604739655,
+        0.5838050462088015,
+        1.2340109075553725,
+        0.5796628738295908
+      ],
+      "costRatiosAllPairs": [
+        0.8171626297577854,
+        0.38794270093242933,
+        1.4315659410546209,
+        0.727494809448538
+      ],
+      "failedPairs": [
+        {
+          "mode": "returning",
+          "order": "baseline-first"
+        }
+      ]
+    },
+    "historical-search-unlocated": {
+      "acceptedPairs": 3,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 1.217788394070015,
+      "medianCostRatioAcceptedOnly": 0.9439284354777312,
+      "timeRatiosAllPairs": [
+        0.7981343081754642,
+        1.217788394070015,
+        1.3054812864980307,
+        1.3091493637441884
+      ],
+      "costRatiosAllPairs": [
+        0.7699499984926332,
+        0.9439284354777312,
+        1.0244563631056627,
+        1.597252149942733
+      ],
+      "failedPairs": [
+        {
+          "mode": "returning",
+          "order": "again-first"
+        }
+      ]
+    },
+    "tomlkit-array-slice": {
+      "acceptedPairs": 4,
+      "plannedPairs": 4,
+      "medianTimeRatioAcceptedOnly": 0.965856669902461,
+      "medianCostRatioAcceptedOnly": 0.9344675448804258,
+      "timeRatiosAllPairs": [
+        1.314597769949806,
+        1.1295936720805224,
+        0.8021196677243996,
+        0.6932418857059476
+      ],
+      "costRatiosAllPairs": [
+        0.9209674347743287,
+        1.574055621983083,
+        0.9479676549865229,
+        0.8851852608775623
+      ],
+      "failedPairs": []
+    }
+  },
+  "pairs": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 20010.996,
+          "apiEquivalentUsd": "0.039164",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 12782.722,
+          "postEditMs": 7228.274,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 89459,
+            "cached_input_tokens": 81280,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 655,
+            "reasoning_output_tokens": 53
+          }
+        },
+        "product": {
+          "elapsedMs": 18620.789,
+          "apiEquivalentUsd": "0.0368836",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 11610.274,
+          "postEditMs": 7010.515,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 88398,
+            "cached_input_tokens": 80768,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 547,
+            "reasoning_output_tokens": 70
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.9305278457903845,
+      "costRatioDiagnostic": 0.9417730568889797
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 17910.964,
+          "apiEquivalentUsd": "0.037604",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10974.862,
+          "postEditMs": 6936.102,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 2,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 80598,
+            "cached_input_tokens": 71040,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 428,
+            "reasoning_output_tokens": 44
+          }
+        },
+        "baseline": {
+          "elapsedMs": 19991.273,
+          "apiEquivalentUsd": "0.0483096",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14254.157,
+          "postEditMs": 5737.116,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 104339,
+            "cached_input_tokens": 92288,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 575,
+            "reasoning_output_tokens": 59
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.8959391430450677,
+      "costRatioDiagnostic": 0.778396012386772
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 33042.93,
+          "apiEquivalentUsd": "0.0645628",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13452.054,
+          "postEditMs": 7255.226,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 122981,
+            "cached_input_tokens": 105344,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 822,
+            "reasoning_output_tokens": 62
+          }
+        },
+        "product": {
+          "elapsedMs": 25215.973,
+          "apiEquivalentUsd": "0.0639308",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10471.959,
+          "postEditMs": 6400.026,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 123265,
+            "cached_input_tokens": 105344,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 702,
+            "reasoning_output_tokens": 78
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.763127634262458,
+      "costRatioDiagnostic": 0.9902110813037849
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 26417.362,
+          "apiEquivalentUsd": "0.0559860",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10626.034,
+          "postEditMs": 6951.725,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 124467,
+            "cached_input_tokens": 111360,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 750,
+            "reasoning_output_tokens": 71
+          }
+        },
+        "baseline": {
+          "elapsedMs": 29093.216,
+          "apiEquivalentUsd": "0.0644872",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13573.667,
+          "postEditMs": 6487.417,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 122838,
+            "cached_input_tokens": 105216,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 820,
+            "reasoning_output_tokens": 57
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.9080248123823781,
+      "costRatioDiagnostic": 0.8681722884541428
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 41568.506,
+          "apiEquivalentUsd": "0.04913",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 33165.428,
+          "postEditMs": 8403.078,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 7,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 90368,
+            "cached_input_tokens": 81920,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1585,
+            "reasoning_output_tokens": 952
+          }
+        },
+        "product": {
+          "elapsedMs": 28308.762,
+          "apiEquivalentUsd": "0.0401472",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 22241.052,
+          "postEditMs": 6067.71,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 2,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 72705,
+            "cached_input_tokens": 64896,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1155,
+            "reasoning_output_tokens": 720
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.6810146604739655,
+      "costRatioDiagnostic": 0.8171626297577854
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 33304.156,
+          "apiEquivalentUsd": "0.045866",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 26113.748,
+          "postEditMs": 7190.408,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 93080,
+            "cached_input_tokens": 84480,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1177,
+            "reasoning_output_tokens": 694
+          }
+        },
+        "baseline": {
+          "elapsedMs": 57046.708,
+          "apiEquivalentUsd": "0.1182288",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 50648.544,
+          "postEditMs": 6398.164,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 106911,
+            "cached_input_tokens": 65024,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2145,
+            "reasoning_output_tokens": 1506
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.5838050462088015,
+      "costRatioDiagnostic": 0.38794270093242933
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": false,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 33383.649,
+          "apiEquivalentUsd": "0.0550340",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 16123.423,
+          "postEditMs": 8275.586,
+          "oraclePassed": false,
+          "agentTestObserved": false,
+          "brainRunError": null,
+          "completedActions": 5,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 101957,
+            "cached_input_tokens": 89600,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1240,
+            "reasoning_output_tokens": 604
+          }
+        },
+        "product": {
+          "elapsedMs": 41195.787,
+          "apiEquivalentUsd": "0.0787848",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 24401.815,
+          "postEditMs": 7675.511,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 4,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 128885,
+            "cached_input_tokens": 107264,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1409,
+            "reasoning_output_tokens": 761
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.2340109075553725,
+      "costRatioDiagnostic": 1.4315659410546209
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 36187.413,
+          "apiEquivalentUsd": "0.0587260",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 21381.371,
+          "postEditMs": 6108.619,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 3,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 108677,
+            "cached_input_tokens": 95360,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 1302,
+            "reasoning_output_tokens": 674
+          }
+        },
+        "baseline": {
+          "elapsedMs": 62428.378,
+          "apiEquivalentUsd": "0.0807236",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 43577.934,
+          "postEditMs": 7885.831,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 137505,
+            "cached_input_tokens": 120448,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2252,
+            "reasoning_output_tokens": 925
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.5796628738295908,
+      "costRatioDiagnostic": 0.727494809448538
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 67942.625,
+          "apiEquivalentUsd": "0.0928772",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 54598.049,
+          "postEditMs": 13344.576,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 10,
+          "executedToolsIncludingPrior": {
+            "command_execution": 9,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 161463,
+            "cached_input_tokens": 140416,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2270,
+            "reasoning_output_tokens": 935
+          }
+        },
+        "product": {
+          "elapsedMs": 54227.34,
+          "apiEquivalentUsd": "0.0715108",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 44637.465,
+          "postEditMs": 9589.875,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 11,
+          "executedToolsIncludingPrior": {
+            "command_execution": 10,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 140160,
+            "cached_input_tokens": 127744,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2113,
+            "reasoning_output_tokens": 747
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.7981343081754642,
+      "costRatioDiagnostic": 0.7699499984926332
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 65352.233,
+          "apiEquivalentUsd": "0.0793504",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 52272.913,
+          "postEditMs": 13079.32,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 5,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 157507,
+            "cached_input_tokens": 145152,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2561,
+            "reasoning_output_tokens": 950
+          }
+        },
+        "baseline": {
+          "elapsedMs": 53664.687,
+          "apiEquivalentUsd": "0.084064",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 40736.187,
+          "postEditMs": 12928.5,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 7,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 185244,
+            "cached_input_tokens": 170880,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2116,
+            "reasoning_output_tokens": 769
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.217788394070015,
+      "costRatioDiagnostic": 0.9439284354777312
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 59116.888,
+          "apiEquivalentUsd": "0.1096320",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 37415.629,
+          "postEditMs": 10061.657,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 11,
+          "executedToolsIncludingPrior": {
+            "command_execution": 12,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 164235,
+            "cached_input_tokens": 133760,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2193,
+            "reasoning_output_tokens": 663
+          }
+        },
+        "product": {
+          "elapsedMs": 77175.991,
+          "apiEquivalentUsd": "0.1123132",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 54463.718,
+          "postEditMs": 11558.838,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 9,
+          "executedToolsIncludingPrior": {
+            "command_execution": 9,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 211474,
+            "cached_input_tokens": 187136,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2621,
+            "reasoning_output_tokens": 1212
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.3054812864980307,
+      "costRatioDiagnostic": 1.0244563631056627
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": false,
+      "conditions": {
+        "product": {
+          "elapsedMs": 76972.547,
+          "apiEquivalentUsd": "0.1316468",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 51022.788,
+          "postEditMs": 13307.435,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": "expected one current Brain run, found 0",
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 192030,
+            "cached_input_tokens": 154624,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2591,
+            "reasoning_output_tokens": 1056
+          }
+        },
+        "baseline": {
+          "elapsedMs": 58795.848,
+          "apiEquivalentUsd": "0.0824208",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 39957.179,
+          "postEditMs": 11449.994,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 6,
+          "executedToolsIncludingPrior": {
+            "command_execution": 6,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 180019,
+            "cached_input_tokens": 165504,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 2029,
+            "reasoning_output_tokens": 686
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.3091493637441884,
+      "costRatioDiagnostic": 1.597252149942733
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 16237.213,
+          "apiEquivalentUsd": "0.0441084",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 9902.044,
+          "postEditMs": 6335.169,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 87973,
+            "cached_input_tokens": 76032,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 502,
+            "reasoning_output_tokens": 37
+          }
+        },
+        "product": {
+          "elapsedMs": 21345.404,
+          "apiEquivalentUsd": "0.0406224",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 13953.645,
+          "postEditMs": 7391.759,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 94224,
+            "cached_input_tokens": 84992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 516,
+            "reasoning_output_tokens": 39
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.314597769949806,
+      "costRatioDiagnostic": 0.9209674347743287
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 18680.661,
+          "apiEquivalentUsd": "0.05687",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 11616.137,
+          "postEditMs": 7064.524,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 96653,
+            "cached_input_tokens": 78720,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 526,
+            "reasoning_output_tokens": 60
+          }
+        },
+        "baseline": {
+          "elapsedMs": 16537.505,
+          "apiEquivalentUsd": "0.0361296",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 10953.625,
+          "postEditMs": 5583.88,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 4,
+          "executedToolsIncludingPrior": {
+            "command_execution": 3,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 87970,
+            "cached_input_tokens": 80128,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 442,
+            "reasoning_output_tokens": 35
+          }
+        }
+      },
+      "timeRatioDiagnostic": 1.1295936720805224,
+      "costRatioDiagnostic": 1.574055621983083
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true,
+      "conditions": {
+        "baseline": {
+          "elapsedMs": 27970.516,
+          "apiEquivalentUsd": "0.0556500",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14439.932,
+          "postEditMs": 6799.569,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 123082,
+            "cached_input_tokens": 110080,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 763,
+            "reasoning_output_tokens": 54
+          }
+        },
+        "product": {
+          "elapsedMs": 22435.701,
+          "apiEquivalentUsd": "0.0527544",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 6723.518,
+          "postEditMs": 7810.247,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 2,
+          "executedToolsIncludingPrior": {
+            "file_change": 1,
+            "command_execution": 2
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 85745,
+            "cached_input_tokens": 68992,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 545,
+            "reasoning_output_tokens": 69
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.8021196677243996,
+      "costRatioDiagnostic": 0.9479676549865229
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true,
+      "conditions": {
+        "product": {
+          "elapsedMs": 20329.154,
+          "apiEquivalentUsd": "0.0519756",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 6081.352,
+          "postEditMs": 6147.025,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 2,
+          "executedToolsIncludingPrior": {
+            "file_change": 1,
+            "command_execution": 2
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 85651,
+            "cached_input_tokens": 69248,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 532,
+            "reasoning_output_tokens": 48
+          }
+        },
+        "baseline": {
+          "elapsedMs": 29324.763,
+          "apiEquivalentUsd": "0.0587172",
+          "reportedPreparationMs": 0.0,
+          "firstEditMs": 14522.85,
+          "postEditMs": 7194.983,
+          "oraclePassed": true,
+          "agentTestObserved": true,
+          "brainRunError": null,
+          "completedActions": 8,
+          "executedToolsIncludingPrior": {
+            "command_execution": 8,
+            "file_change": 1
+          },
+          "tokensIncludingPrior": {
+            "input_tokens": 125483,
+            "cached_input_tokens": 111616,
+            "cache_write_input_tokens": 0,
+            "output_tokens": 866,
+            "reasoning_output_tokens": 55
+          }
+        }
+      },
+      "timeRatioDiagnostic": 0.6932418857059476,
+      "costRatioDiagnostic": 0.8851852608775623
+    }
+  ],
+  "phaseMeasurement": "The live product wrapper does not separately instrument preparation; its reported zero is a harness placeholder and launcher preparation is included in firstEditMs. PostEditMs is repair elapsed minus firstEditMs.",
+  "interpretation": "Failed pairs disqualify the cohort; accepted-only ratios and unequal-quality cost totals are diagnostic."
+}

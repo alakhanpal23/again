@@ -1,0 +1,184 @@
+{
+  "accepted": true,
+  "againBinarySha256": "29530d5a843f32a095acd67fb3542b1cc53134d58324663253c52a157a052a65",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "js-calculator-generic-validation",
+  "fixtureSha256": "3fa31097163d233f39092b75f0ee8c8a794ee30f743da985c3d7c853a971de36",
+  "harnessSha256": "b7144c7d70626586f46ce7f213455ddb221a6f02cb9e15ab5a532cea95d3d867",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": {
+        "authorization_scope_digest": "b21a585587d423210caca3f496c4470e899e928bfd0fac788ee0d139e418818e",
+        "cached_input_tokens": 43648,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790207399346,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 48651,
+        "output_tokens": 265,
+        "session_id": "730b9fd8-8e73-4b19-80fb-3059af2162b8",
+        "started_ms": 1790207388550,
+        "successful_tests": 1,
+        "task_id": "js-calculator-generic-validation-fix",
+        "turn_completed": true
+      },
+      "codexElapsedMs": 11008.714,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 11008.714,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 4800.0,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 67.906,
+        "test_output_sha256": "38ec3567ad20f44c917ef79dea7b074eb66a59ada69cdd9971622f66056ed30d",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 1847,
+      "rawEventFile": "2026-09-23-js-generic-validation-release-3457307-again-first-product.jsonl",
+      "rawEventSha256": "0914eb0ebb2f766bd890ca013af254b8c50fce36da66bfc858c6c851458ecc32",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48651,
+        "output_tokens": 265,
+        "reasoning_output_tokens": 23
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "brainRun": null,
+      "codexElapsedMs": 15604.554,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'package.json' -g 'src/calculator.mjs' -g '*test*'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,160p' src/calculator.mjs\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'node --test tests/test_calculator.mjs'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 15604.554,
+      "eventCount": 14,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 9260.833,
+      "oracle": {
+        "after_snapshot_sha256": "4ba4741c2e4a0e3e20b9febaed3c0ed2ca4eaa0fee02305db7b1830339d165b7",
+        "changed_paths": [
+          "src/calculator.mjs"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 70.694,
+        "test_output_sha256": "3133621b342705e30d6799d053af9f2c8026ba8d18e65e44669ee51fb76a720e",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "priorBrain": null,
+      "rawEventBytes": 3270,
+      "rawEventFile": "2026-09-23-js-generic-validation-release-3457307-again-first-baseline.jsonl",
+      "rawEventSha256": "e0fca942e392c862efc1169d64437bcb3ae269b3ad4aad2a51e8c4d5e929a15b",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 59136,
+        "input_tokens": 64161,
+        "output_tokens": 444,
+        "reasoning_output_tokens": 49
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "4f18180bd05b0bca9e0798ee214e6557f651770b8af1fa6b9904f39ab4ea97a7",
+  "recordedAtUtc": "2026-09-23T23:50:15.545529+00:00",
+  "returningTask": false,
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "3457307c7d102e3f203b7db3e76bb70f4a2a64ea"
+  },
+  "sourceFiles": 1000,
+  "surface": "product-wrapper"
+}

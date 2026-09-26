@@ -1,0 +1,82 @@
+{
+  "acceptedPairs": 2,
+  "apiEquivalentCostRatio": 0.8767957814073206,
+  "coldApiEquivalentUsd": "0.1021004",
+  "coldInvestigationCommands": 6,
+  "fixture": "historical-python-triple",
+  "limitations": [
+    "one fixture in the supplied run orders; not a frozen balanced release cohort",
+    "prior read seeded before timing; first-use economics unmeasured",
+    "API-equivalent estimate, not billed Codex charges"
+  ],
+  "model": "gpt-6-sol",
+  "pairedMedianElapsedRatio": 0.9769505007393088,
+  "pairedP95ElapsedRatio": 1.0304730316039301,
+  "pairs": [
+    {
+      "coldApiEquivalentUsd": "0.050696",
+      "coldElapsedMs": 37248.401,
+      "coldFirstEditMs": 27590.056,
+      "coldInvestigationCommands": 2,
+      "coldNonValidationMs": 34711.61,
+      "coldRequiredValidationMs": 2536.791,
+      "coldSuccessfulTests": 1,
+      "order": [
+        "product-cold",
+        "product"
+      ],
+      "report": "cold-first.json",
+      "seededApiEquivalentUsd": "0.0510652",
+      "seededElapsedMs": 38604.987,
+      "seededFirstEditMs": 28572.555,
+      "seededInvestigationCommands": 2,
+      "seededNonValidationMs": 36379.083,
+      "seededRequiredValidationMs": 2225.904,
+      "seededSuccessfulTests": 1,
+      "seededToColdElapsedRatio": 1.0364199794777769,
+      "sourceSha": "b6268995a1d4de04b1f8656a2a4ffe31bf35e512"
+    },
+    {
+      "coldApiEquivalentUsd": "0.0514044",
+      "coldElapsedMs": 41104.702,
+      "coldFirstEditMs": 29653.956,
+      "coldInvestigationCommands": 4,
+      "coldNonValidationMs": 37926.498,
+      "coldRequiredValidationMs": 3178.204,
+      "coldSuccessfulTests": 1,
+      "order": [
+        "product",
+        "product-cold"
+      ],
+      "report": "seeded-first.json",
+      "seededApiEquivalentUsd": "0.038456",
+      "seededElapsedMs": 37712.784,
+      "seededFirstEditMs": 24389.534,
+      "seededInvestigationCommands": 0,
+      "seededNonValidationMs": 35752.191,
+      "seededRequiredValidationMs": 1960.593,
+      "seededSuccessfulTests": 1,
+      "seededToColdElapsedRatio": 0.9174810220008407,
+      "sourceSha": "b6268995a1d4de04b1f8656a2a4ffe31bf35e512"
+    }
+  ],
+  "rateCard": {
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "contextClass": "short, at most 272K input tokens per request",
+    "model": "gpt-6-sol",
+    "schema": "again.api-rate-card.v1",
+    "serviceTier": "standard",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "cacheWriteInput": "2.50",
+      "cachedInput": "0.20",
+      "output": "10.00",
+      "uncachedInput": "2.00"
+    }
+  },
+  "schema": "again.brain-ablation-summary.v1",
+  "seededApiEquivalentUsd": "0.0895212",
+  "seededInvestigationCommands": 2,
+  "testCommand": "cargo test --locked --lib historical_python_quote_oracle",
+  "totalPairs": 2
+}

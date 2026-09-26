@@ -1,0 +1,30 @@
+{
+  "schema": "again.api-equivalent-cohort-cost.v1",
+  "model": "gpt-6-sol",
+  "sourceSha": "316f06ac2115678fd28f07206bbcb4b469057988",
+  "binarySha256": "a45a8d855892a76666549426903ba63f740a8ad1d4a6a5c4ddd9f095c0c28579",
+  "acceptedTasksPerCondition": 2,
+  "rateCard": {
+    "schema": "again.api-rate-card.v1",
+    "model": "gpt-6-sol",
+    "serviceTier": "standard",
+    "contextClass": "short, at most 272K input tokens per request",
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "uncachedInput": "2.00",
+      "cachedInput": "0.20",
+      "cacheWriteInput": "2.50",
+      "output": "10.00"
+    }
+  },
+  "estimatedBaselineUsd": "0.132656",
+  "estimatedAgainUsd": "0.123656",
+  "againToBaselineRatio": 0.9321583644916174,
+  "pairedMedianCostRatio": 0.9324567458856883,
+  "limitations": [
+    "API-equivalent estimate, not measured Codex charges or subscription economics",
+    "assumes Standard short-context text pricing for every model request",
+    "excludes tool fees, regional premiums, tax, and developer time"
+  ]
+}

@@ -1,0 +1,65 @@
+{
+  "acceptedPairs": 2,
+  "apiEquivalentCostRatio": 1.234061616469995,
+  "baselineApiEquivalentUsd": "0.1205392",
+  "baselineCommands": 11,
+  "fixture": "historical-python-triple",
+  "limitations": [
+    "one historical repair fixture; not a diverse release cohort",
+    "API-equivalent estimate, not billed Codex charges"
+  ],
+  "model": "gpt-6-sol",
+  "pairedMedianElapsedRatio": 0.9999005390968856,
+  "pairs": [
+    {
+      "baselineApiEquivalentUsd": "0.0540244",
+      "baselineCommands": 4,
+      "baselineElapsedMs": 39424.77,
+      "baselineFirstEditMs": 27467.768,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "productApiEquivalentUsd": "0.0839248",
+      "productCommands": 6,
+      "productElapsedMs": 38023.817,
+      "productFirstEditMs": 27236.287,
+      "productToBaselineElapsedRatio": 0.9644651573110004,
+      "report": "again-bounded-search-compact-baseline-first-55a77ef.json"
+    },
+    {
+      "baselineApiEquivalentUsd": "0.0665148",
+      "baselineCommands": 7,
+      "baselineElapsedMs": 42341.22,
+      "baselineFirstEditMs": 30113.592,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "productApiEquivalentUsd": "0.064828",
+      "productCommands": 4,
+      "productElapsedMs": 43837.386,
+      "productFirstEditMs": 32043.72,
+      "productToBaselineElapsedRatio": 1.0353359208827708,
+      "report": "again-bounded-search-compact-again-first-55a77ef.json"
+    }
+  ],
+  "productApiEquivalentUsd": "0.1487528",
+  "productCommands": 10,
+  "rateCard": {
+    "capturedAtUtc": "2026-09-24T03:50:00Z",
+    "contextClass": "short, at most 272K input tokens per request",
+    "model": "gpt-6-sol",
+    "schema": "again.api-rate-card.v1",
+    "serviceTier": "standard",
+    "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+    "usdPerMillionTokens": {
+      "cacheWriteInput": "2.50",
+      "cachedInput": "0.20",
+      "output": "10.00",
+      "uncachedInput": "2.00"
+    }
+  },
+  "schema": "again.product-pair-summary.v1",
+  "sourceSha": "55a77efcfc2ae5f1210c47e3f9dac6c970b44cd8"
+}

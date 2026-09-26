@@ -1,6 +1,6 @@
 # Local beta product gate
 
-The local beta is releasable only when one candidate commit has all five kinds
+The local beta is releasable only when one candidate commit has all six kinds
 of retained evidence below. Unit tests, dry runs, synthetic agents, and a local
 unsigned binary are useful qualification inputs, but none can substitute for a
 missing release input.
@@ -8,9 +8,10 @@ missing release input.
 | Evidence | Required scope |
 |---|---|
 | Product scenario | The ordered 12-step install-to-uninstall lifecycle |
+| Authenticated task lifecycle | Shared source, duplicate-read avoidance, recipient and in-flight follower cancellation, corrupt-result quarantine, and lease-owner crash recovery through the production daemon |
 | Chaos/soak | `beta` mode, 100 concurrent `mcp connect` clients, one automatic daemon, zero false hits or resource leaks |
 | Native package smoke | Exactly one result for each macOS/Linux arm64/x86_64 target |
-| Real-agent review | Outside-user paired Codex and Claude runs, direct metrics, independent patch review, zero incorrect hits and no quality regression |
+| Real-agent review | Balanced existing-user or controlled-agent Codex and Claude pairs, direct metrics, independent patch review, zero incorrect hits, no quality regression, and measured acceleration |
 | Release verification | Immutable exact tag, authenticated publisher, seven signed subjects plus seven Sigstore bundles |
 
 [`bench/local_beta_gate.py`](../bench/local_beta_gate.py) is the final
@@ -141,16 +142,19 @@ Each matrix job retains its archive and `again.local-beta-native-smoke.v1`
 report for thirty days. This is qualification evidence; signed exact-tag release
 evidence remains a separate human-authorized gate.
 
-The outside-user report uses `again.local-beta-real-agent-review.v1`. Codex and
+The real-client report uses `again.local-beta-real-agent-review.v2`. Codex and
 Claude together need at least fifty accepted paired baseline/Again observations
-from at least five outside users across at least five repositories. The report
+from existing users or controlled agents across at least five repositories. The report
 must retain balanced order, pinned models and settings, identical worktrees,
 fixed acceptance tests, and provider usage. Each client records first correct edit,
 duplicate reads and investigations, tool calls, response bytes, input/output
 tokens, cost, validated completion time, and patch quality. The report must
-state that it is outside-user evidence rather than a deterministic-harness-only
-result. Incorrect hits, stale or incorrect facts, and quality regressions must
-all be zero, and patches must be independently reviewed.
+identify the cohort source and must use real clients rather than a
+deterministic-harness-only result. Incorrect hits, stale or incorrect facts,
+and quality regressions must all be zero, and patches must be independently
+reviewed. For each client, duplicate reads and investigations and time to
+first correct edit must each improve by at least 30%; validated completion
+time and metered cost must each improve by at least 20%.
 
 ## Final aggregation
 
@@ -159,6 +163,7 @@ After the final candidate has all retained inputs:
 ```bash
 python3 -B bench/local_beta_gate.py \
   --scenario-evidence /absolute/path/to/product-scenario.json \
+  --authenticated-evidence /absolute/path/to/authenticated-task-e2e.json \
   --chaos-evidence /absolute/path/to/chaos-beta.json \
   --real-agent-evidence /absolute/path/to/real-agent-review.json \
   --release-evidence /absolute/path/to/release-verification.json \
@@ -180,5 +185,5 @@ Terminal D owns the scenario and gate contracts. After A+B+C are linearized,
 D must connect the black-box scenario producer to the accepted public CLI/MCP
 wire shapes and generate fresh evidence from the packaged candidate. Failures
 in daemon, lifecycle/storage, or packaging behavior go back to the original
-owner and are rebased forward. Until all five retained evidence classes pass,
+owner and are rebased forward. Until all six retained evidence classes pass,
 the local beta release status remains **not qualified**.

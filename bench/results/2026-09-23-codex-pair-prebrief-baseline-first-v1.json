@@ -1,0 +1,164 @@
+{
+  "accepted": true,
+  "againBinarySha256": "b2ead55b48ee2ce9fc24c84bae56e1306d24f91ab88e1502ec0598a8906a6fc1",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "codexVersion": "codex-cli 0.156.0",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixtureSha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+  "harnessSha256": "8148df8263aa7d8333a00a40567f8a7cd9371510254cc6a64a3292a229a2b815",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 19040.486,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd; rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g '*test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'requirements*.txt'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'cat src/calculator.py tests/test_calculator.py; ls -la'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 19040.486,
+      "eventCount": 15,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 10303.686,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 201.974,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 4319,
+      "rawEventFile": "2026-09-23-codex-pair-prebrief-baseline-first-v1-baseline.jsonl",
+      "rawEventSha256": "941692ac6277d0c60c0f4856db12f76eebcf62b0d0cc50450616f9a40a9caa35",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 82560,
+        "input_tokens": 96778,
+        "output_tokens": 447,
+        "reasoning_output_tokens": 30
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 10257.787,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "prebrief",
+      "elapsedMs": 10428.915,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5137.028,
+      "oracle": {
+        "after_snapshot_sha256": "f6bc12dc689e50e2575a60d862830ee8dc63aaa430e8809f15112e2b3b21626a",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 125.316,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 171.128,
+      "rawEventBytes": 1707,
+      "rawEventFile": "2026-09-23-codex-pair-prebrief-baseline-first-v1-prebrief.jsonl",
+      "rawEventSha256": "b05da5bec008d19d1b09811deb389474b60592fa1e8f4e5a44a11c315891cdae",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43392,
+        "input_tokens": 48191,
+        "output_tokens": 240,
+        "reasoning_output_tokens": 29
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "prebrief"
+  ],
+  "prebrief": true,
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "recordedAtUtc": "2026-09-23T18:34:48.967113+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "6fe4631c849b3581a7620cfe2378b9dd409a90fc"
+  },
+  "sourceFiles": 1000,
+  "surface": "prebrief-no-mcp"
+}

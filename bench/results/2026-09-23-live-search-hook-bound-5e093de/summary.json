@@ -1,0 +1,36 @@
+{
+  "accepted": true,
+  "binarySha256": "6df6aecd1a77cc8b9c4310120cc6158fac0327b8e345fc08a8bc153697e093f1",
+  "brainPaths": [
+    "src/ledger.py"
+  ],
+  "briefPathsAfterEdit": [],
+  "briefPathsBeforeEdit": [
+    "src/ledger.py"
+  ],
+  "codexExitCode": 0,
+  "codexVersion": "codex-cli 0.156.1",
+  "completedCommands": [
+    {
+      "command": "/bin/zsh -lc 'rg -n -F balance src'",
+      "exitCode": 0,
+      "outputMarker": true
+    }
+  ],
+  "evidenceScope": "one live Codex search in an isolated repository; no speed claim",
+  "fixtureSha256": "ce5d272161e9a92ffbc12462bd1face3232e40ca172523faea080996e6187a17",
+  "hookRemoved": true,
+  "hookTrustMode": "one_off_bypass_for_fixed_fixture",
+  "recordedAtUtc": "2026-09-24T04:19:45.157586+00:00",
+  "schema": "again.codex-brain-live-search-hook.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "5e093de293216648de6913d7a2d4fe3c1b3649ad",
+    "dirty": false,
+    "head": "5e093de293216648de6913d7a2d4fe3c1b3649ad"
+  },
+  "timedOut": false,
+  "traceFilter": "error events omitted because they can include user configuration paths",
+  "traceSha256": "ec60e7f12e650f75e438abad6ced8ec287341eb34b248d3512c24d34912fbe49"
+}

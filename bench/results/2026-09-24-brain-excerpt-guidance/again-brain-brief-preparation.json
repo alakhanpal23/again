@@ -1,0 +1,98 @@
+{
+  "historical-search-unlocated": {
+    "before": {
+      "samples": [
+        {
+          "ms": 4780.051,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        },
+        {
+          "ms": 3086.816,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        },
+        {
+          "ms": 3342.479,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        }
+      ],
+      "medianMs": 3342.479
+    },
+    "after": {
+      "samples": [
+        {
+          "ms": 2716.799,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        },
+        {
+          "ms": 2400.996,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        },
+        {
+          "ms": 2400.022,
+          "previews": 0,
+          "brain": false,
+          "bytes": 20073
+        }
+      ],
+      "medianMs": 2400.996
+    }
+  },
+  "tomlkit-array-slice": {
+    "before": {
+      "samples": [
+        {
+          "ms": 335.032,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46054
+        },
+        {
+          "ms": 340.273,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46055
+        },
+        {
+          "ms": 330.931,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46068
+        }
+      ],
+      "medianMs": 335.032
+    },
+    "after": {
+      "samples": [
+        {
+          "ms": 342.164,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46064
+        },
+        {
+          "ms": 333.324,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46068
+        },
+        {
+          "ms": 342.544,
+          "previews": 2,
+          "brain": false,
+          "bytes": 46060
+        }
+      ],
+      "medianMs": 342.164
+    }
+  }
+}

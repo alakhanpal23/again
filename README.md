@@ -81,7 +81,7 @@ flowchart LR
 
 The launcher uses a workspace daemon to bind each task to its repository. It builds the brief from current source files and stored observations. Completed Codex JSON events are checked before bounded results are written to SQLite and content-addressed storage. BLAKE3 source digests let Again withhold old file observations when the repository changes. If a successful Codex run cannot be captured, the launcher reports the capture failure.
 
-The CLI and daemon are written in Rust 2024 with `clap`, `tokio`, `rusqlite`, and BLAKE3. The optional MCP gateway supplies workspace-bound context and narrowly proven repository-tool reuse. See the [architecture](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/ARCHITECTURE.md) for the complete authority model.
+The CLI and daemon are written in Rust 2024 with `clap`, `tokio`, `rusqlite`, and BLAKE3. The optional MCP gateway supplies workspace-bound context and narrowly proven repository-tool reuse. See the [architecture](docs/ARCHITECTURE.md) for the complete authority model.
 
 ## Interactive Codex
 
@@ -105,7 +105,7 @@ again doctor                               # check the integration
 
 To update Again, pull the checkout and rerun `cargo install --locked --path . --features daemon`. To run the project tests, use `cargo test --locked --features daemon`.
 
-The [roadmap](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/ROADMAP.md) covers planned work. [Status](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/STATUS.md) and [evidence](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/EVIDENCE.md) record implementation and benchmark details.
+The [roadmap](docs/ROADMAP.md) covers planned work. [Status](docs/STATUS.md), [evidence](docs/EVIDENCE.md), and the [product update](docs/PRODUCT_UPDATE.md) record implementation and benchmark details.
 
 For contributor setup and commit attribution, see [Contributing](CONTRIBUTING.md).
 

@@ -1,0 +1,29 @@
+{
+  "accepted": false,
+  "binarySha256": "3ba6b4cb3e6b3fc35535be730f574d454d2bd2a59ddd50aeeb4de7d0c1dd3188",
+  "brainPaths": [],
+  "briefPathsAfterEdit": [],
+  "briefPathsBeforeEdit": [],
+  "codexExitCode": 0,
+  "codexVersion": "codex-cli 0.156.1",
+  "completedCommands": [
+    {
+      "command": "/bin/zsh -lc 'rg -n -F balance src'",
+      "exitCode": 0,
+      "outputMarker": true
+    }
+  ],
+  "evidenceScope": "one live Codex search in an isolated repository; no speed claim",
+  "fixtureSha256": "ce5d272161e9a92ffbc12462bd1face3232e40ca172523faea080996e6187a17",
+  "hookRemoved": true,
+  "recordedAtUtc": "2026-09-24T04:15:30.272050+00:00",
+  "schema": "again.codex-brain-live-search-hook.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "ad8cf8c8011ee217b1ce6d398fad50ff2ad40224",
+    "dirty": false,
+    "head": "ad8cf8c8011ee217b1ce6d398fad50ff2ad40224"
+  },
+  "timedOut": false
+}

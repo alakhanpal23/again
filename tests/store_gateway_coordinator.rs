@@ -520,10 +520,10 @@ fn completion_refuses_request_and_policy_mismatch() {
 fn freshness_bounds_lease_and_stale_leader_cannot_complete() {
     let temp = TempDir::new().unwrap();
     let root = temp.path().join("state");
-    let first = binding_with_deadline("takeover", "state", now_ms() + 500);
     let first_store = Store::open(&root).unwrap();
+    let first = binding_with_deadline("takeover", "state", now_ms() + 2_000);
     let (_, stale_lease) = leader(first_store.acquire_gateway_call(&first, "owner-a").unwrap());
-    thread::sleep(Duration::from_millis(600));
+    thread::sleep(Duration::from_millis(2_100));
     let current = binding("takeover", "state");
     let current_store = Store::open(&root).unwrap();
     let (_, current_lease) = leader(

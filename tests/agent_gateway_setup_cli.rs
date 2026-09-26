@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "daemon"))]
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -20,6 +20,14 @@ case "$2" in
     if [ "${3:-}" = --help ]; then printf 'Usage: codex mcp add NAME -- COMMAND\n'; exit 0; fi
     if [ "${FAKE_FAIL_ADD:-0}" = 1 ]; then printf 'ghp_setup_output_must_not_leak\n' >&2; exit 70; fi
     printf 'exact\n' > "$state_file"
+    if [ "${FAKE_INJECT_SKILL_CONFLICT:-0}" = 1 ]; then
+      mkdir -p "$HOME/.agents/skills/again"
+      printf 'user instructions\n' > "$HOME/.agents/skills/again/SKILL.md"
+    fi
+    if [ "${FAKE_INJECT_HOOK_CONFLICT:-0}" = 1 ]; then
+      mkdir -p "$EXPECTED_WORKSPACE/.codex"
+      printf 'invalid json\n' > "$EXPECTED_WORKSPACE/.codex/hooks.json"
+    fi
     ;;
   get)
     if [ "${3:-}" = --help ]; then
@@ -37,6 +45,36 @@ case "$2" in
     ;;
   remove)
     if [ "${3:-}" = --help ]; then printf 'Usage: codex mcp remove NAME\n'; exit 0; fi
+    printf 'absent\n' > "$state_file"
+    ;;
+  *) exit 64 ;;
+esac
+"#;
+
+const FAKE_CLAUDE: &str = r#"#!/bin/sh
+set -eu
+state_file="$FAKE_MCP_STATE"
+state=absent
+if [ -f "$state_file" ]; then state=$(sed -n '1p' "$state_file"); fi
+printf '%s\n' "$*" >> "$FAKE_MCP_LOG"
+if [ "$1" != mcp ]; then exit 64; fi
+case "$2" in
+  add)
+    if [ "${3:-}" = --help ]; then printf 'Usage: claude mcp add --transport stdio --scope user NAME -- COMMAND\n'; exit 0; fi
+    printf 'exact\n' > "$state_file"
+    ;;
+  get)
+    if [ "${3:-}" = --help ]; then printf 'Usage: claude mcp get NAME\n'; exit 0; fi
+    if [ "$state" = absent ]; then exit 1; fi
+    if [ "$state" = conflict ]; then command=/other/binary; else command=$EXPECTED_AGAIN; fi
+    printf 'Command: %s\nArgs: mcp connect --workspace %s\n' "$command" "$EXPECTED_WORKSPACE"
+    ;;
+  list)
+    if [ "${3:-}" = --help ]; then printf 'Usage: claude mcp list\n'; exit 0; fi
+    if [ "$state" = absent ]; then printf 'No servers\n'; else printf 'again: configured\n'; fi
+    ;;
+  remove)
+    if [ "${3:-}" = --help ]; then printf 'Usage: claude mcp remove NAME --scope user\n'; exit 0; fi
     printf 'absent\n' > "$state_file"
     ;;
   *) exit 64 ;;
@@ -64,6 +102,9 @@ impl Fixture {
         let codex = bin.join("codex");
         fs::write(&codex, FAKE_CODEX).unwrap();
         fs::set_permissions(&codex, fs::Permissions::from_mode(0o700)).unwrap();
+        let claude = bin.join("claude");
+        fs::write(&claude, FAKE_CLAUDE).unwrap();
+        fs::set_permissions(&claude, fs::Permissions::from_mode(0o700)).unwrap();
         Self {
             temporary,
             workspace: fs::canonicalize(workspace).unwrap(),
@@ -94,11 +135,15 @@ impl Fixture {
     }
 
     fn setup_args(&self, operation: &str) -> Vec<String> {
+        self.setup_args_for("codex", operation)
+    }
+
+    fn setup_args_for(&self, client: &str, operation: &str) -> Vec<String> {
         vec![
             "mcp".to_owned(),
             "setup".to_owned(),
             "--client".to_owned(),
-            "codex".to_owned(),
+            client.to_owned(),
             "--workspace".to_owned(),
             self.workspace.to_string_lossy().into_owned(),
             operation.to_owned(),
@@ -109,6 +154,254 @@ impl Fixture {
 
 fn string_args(arguments: &[String]) -> Vec<&str> {
     arguments.iter().map(String::as_str).collect()
+}
+
+#[test]
+fn codex_apply_and_inspect_can_manage_mcp_and_personal_skill_together() {
+    let fixture = Fixture::new();
+    let skill = fixture
+        .temporary
+        .path()
+        .join("home/.agents/skills/again/SKILL.md");
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-skill".to_owned());
+    let applied = fixture.run(&string_args(&arguments), &[]);
+    assert!(applied.status.success(), "{:?}", applied.stderr);
+    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["mcp"]["after"], "exact");
+    assert_eq!(applied["codexSkill"]["current"], true);
+    assert_eq!(applied["codexSkill"]["changed"], true);
+    assert!(fs::read_to_string(&skill).unwrap().contains("`task.start`"));
+
+    let mut arguments = fixture.setup_args("--inspect");
+    arguments.push("--with-skill".to_owned());
+    let inspected = fixture.run(&string_args(&arguments), &[]);
+    assert!(inspected.status.success(), "{:?}", inspected.stderr);
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["mcp"]["after"], "exact");
+    assert_eq!(inspected["codexSkill"]["current"], true);
+
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-skill".to_owned());
+    let repeated = fixture.run(&string_args(&arguments), &[]);
+    assert!(repeated.status.success(), "{:?}", repeated.stderr);
+    let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(repeated["mcp"]["changed"], false);
+    assert_eq!(repeated["codexSkill"]["changed"], false);
+}
+
+#[test]
+fn codex_setup_can_install_and_inspect_the_brain_hook_in_one_flow() {
+    let fixture = Fixture::new();
+    let hooks = fixture.workspace.join(".codex/hooks.json");
+    fs::create_dir(hooks.parent().unwrap()).unwrap();
+    let original = "{\"hooks\":{\"PostToolUse\":[{\"matcher\":\"^Bash$\",\"hooks\":[{\"type\":\"command\",\"command\":\"other\"}]}]}}\n";
+    fs::write(&hooks, original).unwrap();
+    let mut arguments = fixture.setup_args("--inspect");
+    arguments.push("--with-brain-hook".to_owned());
+    let preview = fixture.run(&string_args(&arguments), &[]);
+    assert!(preview.status.success(), "{:?}", preview.stderr);
+    let preview: Value = serde_json::from_slice(&preview.stdout).unwrap();
+    assert_eq!(preview["codexBrainHook"]["current"], false);
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), original);
+
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.extend(["--with-skill".to_owned(), "--with-brain-hook".to_owned()]);
+    let applied = fixture.run(&string_args(&arguments), &[]);
+    assert!(applied.status.success(), "{:?}", applied.stderr);
+    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["codexSkill"]["current"], true);
+    assert_eq!(applied["codexBrainHook"]["current"], true);
+    assert_eq!(applied["codexBrainHook"]["changed"], true);
+    assert_eq!(applied["codexBrainHook"]["trustStatus"], "not_verified");
+    let installed: Value = serde_json::from_slice(&fs::read(&hooks).unwrap()).unwrap();
+    assert_eq!(
+        installed["hooks"]["PostToolUse"][0]["hooks"][0]["command"],
+        "other"
+    );
+    assert!(
+        installed["hooks"]["PostToolUse"][1]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("brain observe-codex-hook")
+    );
+
+    let mut arguments = fixture.setup_args("--inspect");
+    arguments.push("--with-brain-hook".to_owned());
+    let inspected = fixture.run(&string_args(&arguments), &[]);
+    assert!(inspected.status.success(), "{:?}", inspected.stderr);
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["codexBrainHook"]["current"], true);
+    assert_eq!(inspected["codexBrainHook"]["changed"], false);
+
+    let removed = fixture.run(
+        &[
+            "brain",
+            "hook-setup",
+            "--workspace",
+            fixture.workspace.to_str().unwrap(),
+            "--remove",
+        ],
+        &[],
+    );
+    assert!(removed.status.success(), "{:?}", removed.stderr);
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), original);
+}
+
+#[test]
+fn conflicting_brain_hook_refuses_before_mcp_mutation() {
+    let fixture = Fixture::new();
+    let hooks = fixture.workspace.join(".codex/hooks.json");
+    fs::create_dir(hooks.parent().unwrap()).unwrap();
+    fs::write(&hooks, "invalid json").unwrap();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-brain-hook".to_owned());
+    let refused = fixture.run(&string_args(&arguments), &[]);
+    assert!(!refused.status.success());
+    assert!(!fixture.state.exists());
+    assert_eq!(fs::read_to_string(&hooks).unwrap(), "invalid json");
+}
+
+#[test]
+fn hook_conflict_after_mcp_add_rolls_back_new_skill_and_entry() {
+    let fixture = Fixture::new();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.extend(["--with-skill".to_owned(), "--with-brain-hook".to_owned()]);
+    let refused = fixture.run(
+        &string_args(&arguments),
+        &[("FAKE_INJECT_HOOK_CONFLICT", "1")],
+    );
+    assert!(!refused.status.success());
+    assert_eq!(
+        fs::read_to_string(&fixture.state).unwrap_or_default(),
+        "absent\n",
+        "stderr: {}; log: {}",
+        String::from_utf8_lossy(&refused.stderr),
+        fs::read_to_string(&fixture.log).unwrap_or_default()
+    );
+    assert!(
+        !fixture
+            .temporary
+            .path()
+            .join("home/.agents/skills/again/SKILL.md")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.join(".codex/hooks.json")).unwrap(),
+        "invalid json\n"
+    );
+}
+
+#[test]
+fn unowned_codex_skill_refuses_before_mcp_apply() {
+    let fixture = Fixture::new();
+    let skill = fixture.temporary.path().join("home/.agents/skills/again");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(skill.join("SKILL.md"), "user instructions\n").unwrap();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-skill".to_owned());
+    let refused = fixture.run(&string_args(&arguments), &[]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not owned by Again"));
+    assert!(!fixture.state.exists());
+    assert_eq!(
+        fs::read_to_string(skill.join("SKILL.md")).unwrap(),
+        "user instructions\n"
+    );
+}
+
+#[test]
+fn failed_mcp_apply_does_not_install_the_codex_skill() {
+    let fixture = Fixture::new();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-skill".to_owned());
+    let failed = fixture.run(&string_args(&arguments), &[("FAKE_FAIL_ADD", "1")]);
+    assert!(!failed.status.success());
+    assert!(
+        !fixture
+            .temporary
+            .path()
+            .join("home/.agents/skills/again")
+            .exists()
+    );
+}
+
+#[test]
+fn skill_conflict_after_mcp_add_rolls_back_only_the_new_entry() {
+    let fixture = Fixture::new();
+    let mut arguments = fixture.setup_args("--apply");
+    arguments.push("--with-skill".to_owned());
+    let failed = fixture.run(
+        &string_args(&arguments),
+        &[("FAKE_INJECT_SKILL_CONFLICT", "1")],
+    );
+    assert!(!failed.status.success());
+    assert_eq!(fs::read_to_string(&fixture.state).unwrap(), "absent\n");
+    let skill = fixture
+        .temporary
+        .path()
+        .join("home/.agents/skills/again/SKILL.md");
+    assert_eq!(fs::read_to_string(skill).unwrap(), "user instructions\n");
+}
+
+#[test]
+fn claude_apply_inspect_and_remove_use_the_official_cli() {
+    let fixture = Fixture::new();
+    let applied = fixture.run(
+        &string_args(&fixture.setup_args_for("claude", "--apply")),
+        &[],
+    );
+    assert!(applied.status.success(), "{:?}", applied.stderr);
+    let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
+    assert_eq!(applied["after"], "exact");
+
+    let inspected = fixture.run(
+        &string_args(&fixture.setup_args_for("claude", "--inspect")),
+        &[],
+    );
+    assert!(inspected.status.success(), "{:?}", inspected.stderr);
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["after"], "exact");
+
+    let removed = fixture.run(
+        &string_args(&fixture.setup_args_for("claude", "--remove")),
+        &[],
+    );
+    assert!(removed.status.success(), "{:?}", removed.stderr);
+    let removed: Value = serde_json::from_slice(&removed.stdout).unwrap();
+    assert_eq!(removed["after"], "absent");
+    let log = fs::read_to_string(&fixture.log).unwrap();
+    assert!(log.contains("mcp add --transport stdio --scope user again --"));
+    assert!(log.contains("mcp remove again --scope user"));
+}
+
+#[test]
+fn claude_skill_flag_refuses_before_cli_mutation() {
+    let fixture = Fixture::new();
+    let mut arguments = fixture.setup_args_for("claude", "--apply");
+    arguments.push("--with-skill".to_owned());
+    let refused = fixture.run(&string_args(&arguments), &[]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("only for Codex"));
+    assert!(!fixture.state.exists());
+}
+
+#[test]
+fn codex_skill_flag_requires_apply_or_inspect() {
+    let fixture = Fixture::new();
+    let arguments = [
+        "mcp",
+        "setup",
+        "--client",
+        "codex",
+        "--workspace",
+        fixture.workspace.to_str().unwrap(),
+        "--with-skill",
+    ];
+    let refused = fixture.run(&arguments, &[]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("requires --apply or --inspect"));
+    assert!(!fixture.state.exists());
 }
 
 #[test]

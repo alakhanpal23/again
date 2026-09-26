@@ -1,0 +1,18 @@
+{
+  "schema": "again.large-sed-brain-gate.v1",
+  "sourceSha": "a55eb929971dd6eaa8b1ae78519719f17fc1bda1",
+  "binarySha256": "c4bcc85d7db6ee9ee27606a29df241b0d73e8b544b98246cad609818d2b9df9e",
+  "binarySourceBindingVerified": true,
+  "client": "controlled Codex JSON event emitter through again codex",
+  "completedCommands": 1,
+  "completedSourceReads": 1,
+  "recordedPath": "src/large.rs",
+  "currentBriefHadObservation": true,
+  "editedBriefWithheldObservation": true,
+  "rawEventSha256": "0bdb3ba4ba1e411488ae46b6795597c5d1e69fc705986f4a60d4ed3f4cb3cdcb",
+  "rawEventFile": "events.jsonl",
+  "limitations": [
+    "controlled event emitter, not a live Codex model",
+    "no completed-task speed or command-avoidance measurement"
+  ]
+}

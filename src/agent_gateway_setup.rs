@@ -27,7 +27,7 @@ const SERVER_NAME: &str = "again";
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_CONFIG_BYTES: usize = 64 * 1_024;
 const OWNERSHIP_SUFFIX: &str = ".again-owner-v2";
-const CLIENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CLIENT_OUTPUT_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]

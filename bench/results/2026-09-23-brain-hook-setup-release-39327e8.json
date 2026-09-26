@@ -1,0 +1,17 @@
+{
+  "sourceSha": "39327e81b38f597e83213ba77c1d1673f78821f1",
+  "releaseBinarySha256": "6fde900d913af902fed9b11b157601fc90081699014dfb535de7b7cb0dbc7ba6",
+  "previewChanged": true,
+  "previewPreservedOriginal": true,
+  "applyInstalled": true,
+  "preservedUnrelatedHandler": true,
+  "installedAsyncObserver": true,
+  "codexExitCode": 0,
+  "brainEventCount": 2,
+  "observedPaths": [
+    "helper.py"
+  ],
+  "removeChanged": true,
+  "restoredOriginalBytes": true,
+  "passed": true
+}

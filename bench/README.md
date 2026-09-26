@@ -1,13 +1,127 @@
 # Benchmarks
 
+## Gateway reuse value probe
+
+`python3 bench/gateway_reuse_value_probe_v1.py --source-files 1000 --output
+bench/results/<date>-gateway-reuse-value.json` compares a live stdio MCP
+session with the hidden diagnostic `mcp serve --execute-only` mode. Both modes
+run the same provider and return identical content; the diagnostic mode skips
+candidate lookup and storage. Each case records 40 warm calls, cold latency,
+p50/p95, and physical executions. The
+[pre-bypass 1,000-file run](results/2026-09-23-gateway-reuse-value-probe-v3.json)
+found direct execution faster for read, stat, tree, and a simple search. The
+[post-bypass run](results/2026-09-23-gateway-reuse-value-probe-v7.json) confirms
+that the default gateway executes all eight built-in `repo.*` tools directly
+when no shared task is active, bringing their latency close to the
+execute-only path. Task-bound calls still retain proof and shared context.
+These are local dirty-source diagnostics, not a universal value model or an
+agent-level speed result.
+
+The later [one-file](results/2026-09-23-gateway-reuse-value-probe-small-v8.json)
+and [250-file](results/2026-09-23-gateway-reuse-value-probe-250-v8.json)
+standalone runs include `git.status`. An index below 16 KiB retains reuse;
+the 250-file index exceeds that threshold and the default executes directly.
+The gate only removes reuse authority and makes no new claim about Git output.
+
+`python3 bench/gateway_task_reuse_value_probe_v1.py --source-files 1000
+--output bench/results/<date>-gateway-task-reuse-value.json` runs the same
+comparison through the authenticated daemon after `task.start`. Its hidden
+`mcp daemon serve --execute-only` control retains the task setup and provider
+path but skips reuse lookup and storage. The [one-file](results/2026-09-23-gateway-task-reuse-value-probe-small-v2.json),
+[250-file](results/2026-09-23-gateway-task-reuse-value-probe-250-v1.json),
+and [1,000-file](results/2026-09-23-gateway-task-reuse-value-probe-v2.json)
+reports show that the earlier warm task-bound `repo.*` cache hits were slower
+than direct execution on these fixtures, despite avoiding physical executions
+and supplying verified shared context. The newer [one-file](results/2026-09-23-gateway-task-reuse-value-probe-fast-small-v9.json)
+and [1,000-file](results/2026-09-23-gateway-task-reuse-value-probe-fast-v9.json)
+runs exercise the current policy: the first call stores a source-backed result;
+subsequent same-task calls with an identical fresh provider result execute
+directly and return no cache-result ID. A changed result falls back to full
+proof and publishes a new verified result. Large-index `git.status` uses the
+same path; small-index Git status keeps reuse. These probes measure per-call
+latency, not the downstream value of context to another agent.
+
+## Installed client setup probe
+
+[`agent_gateway_client_setup_v1.py`](agent_gateway_client_setup_v1.py) exercises
+the current `again mcp setup` flow against an installed Codex or Claude CLI in
+a disposable private client home. It checks apply, inspect, idempotent apply,
+and removal without making model calls or changing the user's normal client
+configuration. For Codex, it also verifies the personal skill and task-start
+guidance. Run it with a daemon-enabled binary:
+
+```bash
+cargo build --locked --features daemon
+python3 bench/agent_gateway_client_setup_v1.py \
+  --again-bin target/debug/again --client codex \
+  --workspace "$(pwd -P)" --json-out /tmp/again-codex-setup-probe.json
+```
+
+The report binds the client and Again binary bytes, but it does not prove that
+the binary came from the recorded Git revision. A dirty-worktree run is a local
+diagnostic, not release qualification. The current
+[`local Codex probe`](results/2026-09-22-codex-setup-local-probe-v1.json) used
+Codex CLI 0.156.0, passed all four setup operations, and made zero model calls.
+Claude still needs a run with an installed client binary.
+
+## Local Codex live MCP probe
+
+`python3 bench/agent_gateway_codex_live_probe_v1.py --output
+bench/results/<date>-codex-live-probe-v1.json` runs one authenticated Codex
+session in a disposable repository with the current user's existing login. It
+loads only the explicit Again MCP configuration, calls `task.start` and
+`repo.read`, and verifies the fixture is unchanged. Noninteractive Codex needs
+`--approve-for-me` to allow MCP calls; its default `never` approval mode
+refused both tools in the diagnostic run. This probe confirms tool discovery
+and use, but does not measure task quality, repeated-call savings, or source
+binding while the checkout is dirty. The current
+[`local run`](results/2026-09-23-codex-live-probe-v1.json) passed.
+
+The same harness with `--repeat-read` asks Codex for two identical `repo.read`
+calls and checks the durable gateway counters. The
+[`local repeat probe`](results/2026-09-23-codex-repeat-probe-v1.json) recorded two
+requests, one physical execution, one exact hit, one avoided provider call,
+and zero false-hit quarantines. This verifies one narrow repeated call shape;
+it does not establish a general speed or cost improvement.
+
+`python3 bench/agent_gateway_codex_context_probe_v1.py --output
+bench/results/<date>-codex-context-probe-v1.json` runs two separate Codex
+sessions in the same disposable repository. The first reads and publishes an
+unverified suggestion; the second joins the exact task and reads it through
+`context.delta`. The [local run](results/2026-09-23-codex-context-probe-v1.json)
+passed. It is a cross-session integration diagnostic, not a concurrent editing
+or acceleration result.
+
+## Codex editable pair diagnostic
+
+`python3 bench/agent_gateway_codex_pair_diagnostic_v1.py --output
+bench/results/<date>-codex-editable-pair-diagnostic.json` runs one baseline
+Codex edit and one Again-enabled edit on the same fixed calculator fixture. It
+retains the complete synthetic-fixture Codex JSONL events beside a summary with
+provider-reported usage, first edit timing, the strict one-file oracle, and
+Again's durable counters. The runs use the current authenticated Codex CLI,
+`--approve-for-me`, a pinned model argument, and disposable repositories.
+
+The [v1](results/2026-09-23-codex-editable-pair-diagnostic-v1.json) through
+[v5](results/2026-09-23-codex-editable-pair-diagnostic-v5.json) local diagnostics
+all produced the accepted patch and passing tests. Bounded source previews
+let Codex edit without a separate pre-edit `repo.read` in v2 through v5. In v4,
+baseline and Again first edits took 17.1 and 16.8 seconds, while validated
+completion took 23.4 and 28.7 seconds. In v5 the corresponding times were
+19.7 and 17.9 seconds for first edit, and 31.1 and 26.9 seconds for completion.
+These are single unbalanced pairs on dirty source and differing binary
+revisions; their mixed results do not establish acceleration or a causal
+before/after effect. The v5 recorded harness hash matches the current script.
+
 ## Local beta release gate
 
 [`local_beta_gate.py`](local_beta_gate.py) is the fail-closed final aggregator
 for the daemon/task-lifecycle local beta. It requires the ordered 12-step
 release-binary product scenario, a 100-client automatic-daemon chaos run,
 exactly four native package smokes, authenticated 14-asset release evidence,
-and outside-user paired Codex/Claude evidence. All inputs must bind to one
-source commit, and product/chaos/agent observations must bind to one binary.
+the authenticated task lifecycle gate, and balanced existing-user or
+controlled-agent Codex/Claude evidence. All inputs must bind to one source
+commit, and product/task/chaos/agent observations must bind to one binary.
 The output contains only compact digests and release decisions.
 
 The complete evidence schemas, beta chaos command, aggregation command, privacy

@@ -1,0 +1,177 @@
+{
+  "accepted": true,
+  "againBinarySha256": "f1b149d2cca2166a7ae76c085fca40d9064a9964d36b130dcb1168d6c809ecc2",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "greeting-feature",
+  "fixtureSha256": "56ae0dc9be81ab387c3ed66b8ab213fa6aef0108790bd1108b143fcbcd58094b",
+  "harnessSha256": "2afec65c4165b72b6c7c85c11fca51d93950805e9dd228ea0793195234531f4c",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 18437.738,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,160p' src/greeting.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"rg --files | rg '(\"'^|/)(test[''^/]*|[''^/]*test[''^/]*|AGENTS'\"\\\\.md)\"'$|''^src/greeting'\"\\\\.py\"'$'\"'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 18437.738,
+      "eventCount": 18,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 8804.342,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 149.012,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 3829,
+      "rawEventFile": "greeting-feature-0-baseline-first-baseline.jsonl",
+      "rawEventSha256": "f340f8649f6c3d7c29c4d273e4b640a8ed1e0b0de31c4d13d665bf5559bf7bb3",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 71040,
+        "input_tokens": 80604,
+        "output_tokens": 579,
+        "reasoning_output_tokens": 105
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 10941.026,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 10941.026,
+      "eventCount": 9,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5155.039,
+      "oracle": {
+        "after_snapshot_sha256": "4ae0d77eacc97f555ea570624f67be352cfd8eda09e0b0ae335f1216519b01d0",
+        "changed_paths": [
+          "src/greeting.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": false,
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "test_elapsed_ms": 127.188,
+        "test_output_sha256": "3afcae530163ea01d2693365fa8e3558acd6e5c7062b03f8d0594d49c2163e96",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 1776,
+      "rawEventFile": "greeting-feature-0-baseline-first-product.jsonl",
+      "rawEventSha256": "344ad660727920371545e3ee8aaba868bb510a6c118c0bfcf3d841d2781456b5",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43776,
+        "input_tokens": 48721,
+        "output_tokens": 275,
+        "reasoning_output_tokens": 21
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "0d4ba13d9402d8a7785ff4755e8c7e30c81c5e1ee3adbc00969ad8122eaed426",
+  "recordedAtUtc": "2026-09-23T22:36:52.114189+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": false,
+    "head": "1a91d3d86a36afd5c37b5fd18e59154dc362813a"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

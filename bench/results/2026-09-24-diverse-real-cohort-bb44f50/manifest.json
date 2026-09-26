@@ -1,0 +1,67 @@
+{
+  "schema": "again.diverse-real-cohort-manifest.v2",
+  "model": "gpt-6-sol",
+  "rateCard": "rate_card_gpt6sol_standard_short_2026-09-23.json",
+  "cases": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "language": "Python",
+      "repository": "https://github.com/pypa/packaging.git",
+      "parent": "b097450461523502ada842f98274449ad74ff1ff",
+      "fix": "4e79787a31c99348649bb0dafee2a5078d3595be",
+      "fixtureSha256": "0fead1a8702c291a98f9f31088317b5335fffbd4157f654307f3397e7a4b8bf9",
+      "promptSha256": "c013f20b192a2f2b628757ad1f1378b5998bcea715e33e5aeb6a4b096b682283",
+      "priorPromptSha256": "f67212f1960b3315abc265b88ad7a1731d235b7bd363a10be9fec9e9e4d8a071",
+      "validationSelector": "python3 -m unittest discover -s tests -p test_again_oracle.py"
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "language": "JavaScript",
+      "repository": "https://github.com/sindresorhus/camelcase.git",
+      "parent": "c9fa59df2e32611c5c71d0f219f661fa8e1dfdf8",
+      "fix": "e7dccc901ce645138a52dd5945e245773b4684c5",
+      "fixtureSha256": "8cc2ba6e2f457a77cefd5d11a7e9276b981d7b9125435ce9756fd5ff3585ec28",
+      "promptSha256": "b05ad43e41b92d3e57f51ece4d2637fa2ba9af448896ca65fcf977f6b9aad066",
+      "priorPromptSha256": "6ca413ab920c81553a92040b02b9cc700ad0bb050642cfac6cc68ec0030a35c7",
+      "validationSelector": "node --test tests/test_again_oracle.mjs"
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "language": "Rust",
+      "repository": "https://github.com/alakhanpal23/again.git",
+      "parent": "337af76ab8c88d8d75802130fd5fa66c6b6e397d",
+      "fix": "c747f8bb312ca21a95750055e5ecf898262f49cd",
+      "fixtureSha256": "f3f7370ea85f1766b4a5d45d6e040e321a87e63cb645307c5eb78c559373a191",
+      "promptSha256": "829fc1d70e1adf270243c7cb9f5c6c4ec6a88347daa673717584aaf4de12bc62",
+      "priorPromptSha256": "5c3085c1f1f3f21acea1038ac67d6f0f0f5a5cdbc27390d296b84b7ae284a21b",
+      "validationSelector": "cargo test --locked --lib historical_search_oracle"
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "language": "Python",
+      "repository": "https://github.com/sdispater/tomlkit.git",
+      "parent": "7ab7469addd60e03ca3bfbb1287642e8d771e1c0",
+      "fix": "4b38becd75405e0f38ef3e47e9839eb407591c8a",
+      "fixtureSha256": "214de42803845701c4838e872143dae1221faccd8fe4cd9dedc31f10e1383102",
+      "promptSha256": "f5577df62b3685d780aa2c19b1070fdf04bd8ce34593e4a7d3e60f06fbcb79ab",
+      "priorPromptSha256": "86d82bc7f37a6779a49bd69558da1786375e38556248ef59f3b9d9ac18467619",
+      "validationSelector": "python3 -m unittest discover -s tests -p test_again_oracle.py"
+    }
+  ],
+  "modes": [
+    "cold",
+    "returning"
+  ],
+  "orders": [
+    "baseline-first",
+    "again-first"
+  ],
+  "qualification": {
+    "requireEveryPairedTaskAccepted": true,
+    "requireAgentTestExecution": true,
+    "requireProductBrainRun": true,
+    "includePriorTaskTimeAndTokens": true,
+    "maximumMedianTimeRatio": 0.8,
+    "maximumMedianApiEquivalentCostRatio": 0.8
+  }
+}

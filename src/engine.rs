@@ -3,12 +3,16 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(all(feature = "daemon", unix))]
+use std::io::{BufRead, BufReader};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 #[cfg(all(feature = "daemon", unix))]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(all(feature = "daemon", unix))]
+use std::sync::{Arc, Mutex};
 use std::thread;
 #[cfg(feature = "daemon")]
 use std::time::Duration;
@@ -53,6 +57,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum CommandName {
+    /// Report the source revision embedded when this binary was built.
+    BuildInfo,
     /// Install, inspect, or remove agent integrations.
     Setup(SetupArgs),
     /// Execute a strictly admitted command through the local engine.
@@ -64,8 +70,17 @@ enum CommandName {
     Team(TeamArgs),
     /// Run or configure the repository-aware MCP gateway.
     Mcp(McpArgs),
+    #[cfg(feature = "daemon")]
+    /// Launch Codex with an authenticated, verified task brief.
+    Codex(CodexArgs),
+    #[cfg(feature = "daemon")]
+    /// Launch Claude Code with an authenticated, verified task brief.
+    Claude(ClaudeArgs),
     /// Inspect, export, delete, or prune durable local tasks.
     Task(TaskArgs),
+    #[cfg(feature = "daemon")]
+    /// Inspect or clear the local Again Brain's observed agent activity.
+    Brain(BrainArgs),
     #[cfg(feature = "hook")]
     #[command(hide = true)]
     Hook(HookArgs),
@@ -116,6 +131,9 @@ enum McpCommand {
     #[cfg(feature = "daemon")]
     /// Start or join the workspace daemon and proxy MCP over stdio.
     Connect(McpConnectArgs),
+    #[cfg(feature = "daemon")]
+    /// Print a verified task brief without claiming a coordination lease.
+    Brief(McpBriefArgs),
 }
 
 #[derive(Debug, Args)]
@@ -126,6 +144,9 @@ struct McpServeArgs {
     /// Stable, non-secret local authorization-scope identifier.
     #[arg(long)]
     authorization_scope: Option<String>,
+    /// Diagnostic: execute every eligible tool without reuse or candidate storage.
+    #[arg(long, hide = true)]
+    execute_only: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -155,6 +176,9 @@ struct McpDaemonServeArgs {
     /// Stable, non-secret local authorization-scope identifier.
     #[arg(long)]
     authorization_scope: Option<String>,
+    /// Diagnostic: execute eligible tools without reuse or candidate storage.
+    #[arg(long, hide = true)]
+    execute_only: bool,
 }
 
 #[cfg(feature = "daemon")]
@@ -171,6 +195,82 @@ struct McpConnectArgs {
     /// Repository root; defaults to the repository containing the current directory.
     #[arg(long)]
     workspace: Option<PathBuf>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct McpBriefArgs {
+    /// Repository root; defaults to the repository containing the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Stable task ID shared by cooperating agents.
+    #[arg(long)]
+    task_id: String,
+    /// Exact task text, without secrets.
+    #[arg(long)]
+    task: String,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct CodexArgs {
+    #[command(flatten)]
+    brief: McpBriefArgs,
+    /// Wait this many seconds for an exact-task leader before launching a follower.
+    #[arg(long, default_value_t = 30)]
+    peer_wait_seconds: u64,
+    /// Additional codex exec flags after `--`.
+    #[arg(last = true, num_args = 0..)]
+    codex_args: Vec<OsString>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct ClaudeArgs {
+    #[command(flatten)]
+    brief: McpBriefArgs,
+    /// Wait this many seconds for an exact-task leader before launching a follower.
+    #[arg(long, default_value_t = 30)]
+    peer_wait_seconds: u64,
+    /// Additional Claude Code print-mode flags after `--`.
+    #[arg(last = true, num_args = 0..)]
+    claude_args: Vec<OsString>,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Args)]
+struct BrainArgs {
+    #[command(subcommand)]
+    command: BrainCommand,
+}
+
+#[cfg(feature = "daemon")]
+#[derive(Debug, Subcommand)]
+enum BrainCommand {
+    /// Show bounded completed activity metadata from this repository.
+    Show {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u8).range(1..=128))]
+        limit: u8,
+    },
+    /// Clear retained activity metadata for this repository.
+    Clear {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+    /// Ingest one completed Codex PostToolUse event from stdin.
+    #[command(hide = true)]
+    ObserveCodexHook,
+    /// Configure repository-scoped observation of completed Codex Bash calls.
+    HookSetup {
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+        #[arg(long, conflicts_with = "remove")]
+        apply: bool,
+        #[arg(long, conflicts_with = "apply")]
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -198,6 +298,12 @@ struct McpSetupArgs {
     /// Remove an exact Again-owned entry through the official client CLI.
     #[arg(long, conflicts_with_all = ["apply", "inspect"])]
     remove: bool,
+    /// Install or inspect the personal Codex skill alongside the MCP entry.
+    #[arg(long, conflicts_with = "remove")]
+    with_skill: bool,
+    /// Install or inspect the project Codex Brain observer alongside the MCP entry.
+    #[arg(long, conflicts_with = "remove")]
+    with_brain_hook: bool,
 }
 
 #[derive(Debug, Args)]
@@ -667,6 +773,13 @@ struct FixedFilesystemReadyProbeResult {
 pub fn run_cli() -> Result<i32> {
     let cli = Cli::parse_from(normalized_args());
     match cli.command {
+        CommandName::BuildInfo => {
+            print_pretty_json_v1(&serde_json::json!({
+                "sourceSha": env!("AGAIN_BUILD_SOURCE_SHA"),
+                "sourceCleanAtBuild": env!("AGAIN_BUILD_SOURCE_CLEAN") == "true",
+            }))?;
+            Ok(0)
+        }
         CommandName::Setup(args) => setup(args),
         CommandName::Run(args) => direct_run(args.command),
         CommandName::Reference(args) => direct_reference(args.command),
@@ -684,8 +797,16 @@ pub fn run_cli() -> Result<i32> {
             McpCommand::Daemon(args) => mcp_daemon(args),
             #[cfg(feature = "daemon")]
             McpCommand::Connect(args) => mcp_connect(args),
+            #[cfg(feature = "daemon")]
+            McpCommand::Brief(args) => mcp_brief(args),
         },
+        #[cfg(feature = "daemon")]
+        CommandName::Codex(args) => codex_launch(args),
+        #[cfg(feature = "daemon")]
+        CommandName::Claude(args) => claude_launch(args),
         CommandName::Task(args) => task_cli(args),
+        #[cfg(feature = "daemon")]
+        CommandName::Brain(args) => brain_cli(args),
         #[cfg(feature = "hook")]
         CommandName::Hook(args) => handle_hook(args.experimental_unsafe_rewrite),
         #[cfg(feature = "hook")]
@@ -1017,7 +1138,11 @@ fn mcp_serve(args: McpServeArgs) -> Result<i32> {
     eprintln!(
         "Again MCP gateway is experimental; only bounded built-in repository reads are reuse-eligible."
     );
-    let gateway = ExperimentalMcpGatewayV1::build(&workspace)?;
+    let gateway = if args.execute_only {
+        ExperimentalMcpGatewayV1::build_execute_only_v1(&workspace)?
+    } else {
+        ExperimentalMcpGatewayV1::build(&workspace)?
+    };
     gateway.serve_stdio(&authorization_scope)?;
     Ok(0)
 }
@@ -1038,14 +1163,9 @@ fn local_mcp_authorization_scope_v1(
     if let Some(scope) = explicit {
         return Ok(crate::mcp_gateway::AuthorizationScopeId::new(scope)?);
     }
-    let mut hasher = Hasher::new();
-    hasher.update(b"again.local-mcp-authorization-scope.v1\0");
-    hasher.update(workspace.as_os_str().as_encoded_bytes());
-    let digest = hasher.finalize().to_hex();
-    Ok(crate::mcp_gateway::AuthorizationScopeId::new(format!(
-        "local-workspace:{}",
-        &digest[..24]
-    ))?)
+    Ok(crate::mcp_gateway::AuthorizationScopeId::new(
+        crate::brain::local_brain_scope_v1(workspace),
+    )?)
 }
 
 #[cfg(feature = "daemon")]
@@ -1057,10 +1177,15 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
 
     match args.command {
         McpDaemonCommand::Serve(args) => {
+            close_inherited_daemon_fds_v1()?;
             let workspace = resolve_mcp_workspace(args.workspace)?;
             let authorization_scope =
                 local_mcp_authorization_scope_v1(&workspace, args.authorization_scope)?;
-            let daemon = GatewayDaemonV1::bind(&workspace, authorization_scope)?;
+            let daemon = if args.execute_only {
+                GatewayDaemonV1::bind_execute_only_v1(&workspace, authorization_scope)?
+            } else {
+                GatewayDaemonV1::bind(&workspace, authorization_scope)?
+            };
             install_termination_handler_v1()?;
             eprintln!(
                 "Again MCP daemon is experimental; socket peers are restricted to the current uid."
@@ -1082,6 +1207,32 @@ fn mcp_daemon(args: McpDaemonArgs) -> Result<i32> {
     }
 }
 
+#[cfg(all(feature = "daemon", target_os = "macos"))]
+fn close_inherited_daemon_fds_v1() -> Result<()> {
+    // Concurrent client launches can pass unrelated pipe descriptors to the
+    // elected daemon. Keeping a writer open prevents a client's output() from
+    // observing EOF after that client has exited.
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid writable rlimit value.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    for fd in 3..limit.rlim_cur.min(i32::MAX as u64) as i32 {
+        // SAFETY: closing an inherited descriptor in this freshly exec'd
+        // daemon is safe; EBADF means that descriptor was not open.
+        unsafe { libc::close(fd) };
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "daemon", unix, not(target_os = "macos")))]
+fn close_inherited_daemon_fds_v1() -> Result<()> {
+    Ok(())
+}
+
 #[cfg(feature = "daemon")]
 #[cfg(not(unix))]
 fn mcp_daemon(_args: McpDaemonArgs) -> Result<i32> {
@@ -1095,6 +1246,813 @@ fn mcp_connect(args: McpConnectArgs) -> Result<i32> {
     let stream = connect_or_start_daemon_v1(&workspace)?;
     crate::agent_gateway_service::proxy_current_stdio_v1(stream)?;
     Ok(0)
+}
+
+#[cfg(all(feature = "daemon", unix))]
+const MAX_TASK_BRIEF_FRAME_BYTES_V1: u64 = 1024 * 1024;
+
+#[cfg(all(feature = "daemon", unix))]
+fn daemon_request_v1(
+    stream: &mut std::os::unix::net::UnixStream,
+    reader: &mut BufReader<std::os::unix::net::UnixStream>,
+    id: u64,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value> {
+    let request = serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": method, "params": params
+    });
+    serde_json::to_writer(&mut *stream, &request)?;
+    stream.write_all(b"\n")?;
+    stream.flush()?;
+    let mut frame = Vec::new();
+    reader
+        .take(MAX_TASK_BRIEF_FRAME_BYTES_V1 + 1)
+        .read_until(b'\n', &mut frame)?;
+    if frame.is_empty()
+        || frame.len() as u64 > MAX_TASK_BRIEF_FRAME_BYTES_V1
+        || !frame.ends_with(b"\n")
+    {
+        bail!("authenticated task brief response was missing or too large");
+    }
+    let response: serde_json::Value =
+        serde_json::from_slice(&frame).context("parse authenticated task brief response")?;
+    if response["id"] != id {
+        bail!("authenticated task brief response ID mismatch");
+    }
+    if !response["error"].is_null() {
+        bail!(
+            "authenticated task brief request failed: {}",
+            response["error"]
+        );
+    }
+    Ok(response["result"].clone())
+}
+
+#[cfg(all(feature = "daemon", unix))]
+struct TaskBriefSessionV1 {
+    workspace: PathBuf,
+    brief: serde_json::Value,
+    stream: std::os::unix::net::UnixStream,
+    reader: BufReader<std::os::unix::net::UnixStream>,
+    next_request_id: u64,
+}
+
+#[cfg(all(feature = "daemon", unix))]
+impl TaskBriefSessionV1 {
+    fn tool(&mut self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value> {
+        let result = daemon_request_v1(
+            &mut self.stream,
+            &mut self.reader,
+            self.next_request_id,
+            "tools/call",
+            serde_json::json!({ "name": name, "arguments": arguments }),
+        )?;
+        self.next_request_id = self
+            .next_request_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("task brief request ID overflow"))?;
+        if result["isError"] == true {
+            bail!(
+                "authenticated {name} request was refused: {}",
+                result["content"]
+            );
+        }
+        let structured = result["structuredContent"]
+            .as_object()
+            .ok_or_else(|| anyhow!("authenticated {name} response lacked structured content"))?;
+        Ok(serde_json::Value::Object(structured.clone()))
+    }
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn verified_task_brief_v1(
+    args: &McpBriefArgs,
+    claim_for_launch: bool,
+) -> Result<TaskBriefSessionV1> {
+    use crate::mcp_gateway::MCP_PROTOCOL_VERSION;
+
+    let workspace = resolve_mcp_workspace(args.workspace.clone())?;
+    let mut stream = connect_or_start_daemon_v1(&workspace)?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let initialized = daemon_request_v1(
+        &mut stream,
+        &mut reader,
+        1,
+        "initialize",
+        serde_json::json!({
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "again-prebrief", "version": env!("CARGO_PKG_VERSION") }
+        }),
+    )?;
+    if initialized["protocolVersion"] != MCP_PROTOCOL_VERSION {
+        bail!("authenticated task brief protocol mismatch");
+    }
+    let result = daemon_request_v1(
+        &mut stream,
+        &mut reader,
+        2,
+        "tools/call",
+        serde_json::json!({
+            "name": "task.start",
+            "arguments": {
+                "taskId": args.task_id,
+                "task": args.task,
+                "includeSourcePreviews": true,
+                "previewOnly": !claim_for_launch
+            }
+        }),
+    )?;
+    if result["isError"] == true {
+        bail!(
+            "authenticated task brief was refused: {}",
+            result["content"]
+        );
+    }
+    let brief = result["structuredContent"]
+        .as_object()
+        .ok_or_else(|| anyhow!("authenticated task brief lacked structured content"))?;
+    let coordination = brief
+        .get("coordination")
+        .and_then(|value| value.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let expected_coordination = if claim_for_launch {
+        matches!(
+            coordination,
+            Some("leader" | "join" | "waiting" | "terminal")
+        )
+    } else {
+        coordination == Some("preview")
+    };
+    if brief.get("operation").and_then(serde_json::Value::as_str) != Some("task.start")
+        || !expected_coordination
+    {
+        bail!("authenticated task brief had an unexpected operation or coordination status");
+    }
+    Ok(TaskBriefSessionV1 {
+        workspace,
+        brief: serde_json::Value::Object(brief.clone()),
+        stream,
+        reader,
+        next_request_id: 3,
+    })
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn mcp_brief(args: McpBriefArgs) -> Result<i32> {
+    let session = verified_task_brief_v1(&args, false)?;
+    println!("{}", serde_json::to_string(&session.brief)?);
+    Ok(0)
+}
+
+#[cfg(feature = "daemon")]
+fn brain_cli(args: BrainArgs) -> Result<i32> {
+    match args.command {
+        BrainCommand::HookSetup {
+            workspace,
+            apply,
+            remove,
+        } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let executable = fs::canonicalize(std::env::current_exe()?)?;
+            let change = crate::observer_setup::configure_codex_brain_hook_v1(
+                &workspace,
+                &executable,
+                apply,
+                remove,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&change)?);
+            return Ok(0);
+        }
+        BrainCommand::ObserveCodexHook => {
+            let mut input = Vec::new();
+            io::stdin().take(1024 * 1024 + 1).read_to_end(&mut input)?;
+            if input.len() > 1024 * 1024 {
+                return Ok(0);
+            }
+            let Ok(value) = serde_json::from_slice::<serde_json::Value>(&input) else {
+                return Ok(0);
+            };
+            let Some(cwd) = value["cwd"].as_str() else {
+                return Ok(0);
+            };
+            let Ok(cwd) = fs::canonicalize(cwd) else {
+                return Ok(0);
+            };
+            let Ok(workspace) = discover_workspace(&cwd) else {
+                return Ok(0);
+            };
+            if let Some(events) = crate::brain::codex_post_tool_event_v1(&value, &workspace) {
+                if let Ok(store) = Store::open_for_workspace(&workspace) {
+                    for event in events {
+                        let _ = store.record_brain_event_v1(&event);
+                    }
+                }
+            }
+            return Ok(0);
+        }
+        BrainCommand::Show { workspace, limit } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let store = Store::open_for_workspace(&workspace)?;
+            let events = store.recent_brain_events_v1(limit as usize)?;
+            let files = store.recent_brain_files_v1(limit as usize)?;
+            let runs = store.recent_brain_runs_v1(limit as usize)?;
+            let test_hint = store.brain_test_hint_v1()?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "recentEvents": events,
+                    "recentRuns": runs,
+                    "runAuthority": "client-observed activity and usage; task acceptance not verified",
+                    "fileObservations": files,
+                    "fileObservationsFreshness": "historical; not rechecked by this command",
+                    "previousSuccessfulTestCommand": test_hint,
+                    "testCommandAuthority": "unverified suggestion; run required validation"
+                }))?
+            );
+        }
+        BrainCommand::Clear { workspace } => {
+            let workspace = resolve_mcp_workspace(workspace)?;
+            let store = Store::open_for_workspace(&workspace)?;
+            let removed = store.clear_brain_events_v1()?;
+            println!(
+                "Cleared {removed} Again Brain records for {}",
+                workspace.display()
+            );
+        }
+    }
+    Ok(0)
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn codex_launch(args: CodexArgs) -> Result<i32> {
+    let mut session = verified_task_brief_v1(&args.brief, true)?;
+    if args.peer_wait_seconds > 300 {
+        bail!("--peer-wait-seconds must be between 0 and 300");
+    }
+    validate_agent_launch_task_v1(&session.brief)?;
+    wait_for_peer_v1(
+        &mut session,
+        &args.brief,
+        Duration::from_secs(args.peer_wait_seconds),
+    )?;
+    validate_agent_launch_task_v1(&session.brief)?;
+    let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    let workspace = &session.workspace;
+    append_repository_brain_v1(&mut prompt, &session.brief);
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let bridge_args = [
+        "mcp",
+        "connect",
+        "--workspace",
+        workspace
+            .to_str()
+            .ok_or_else(|| anyhow!("workspace path is not UTF-8"))?,
+    ];
+    let raw_json = args.codex_args.iter().any(|arg| arg == "--json");
+    let mut command = Command::new("codex");
+    command.arg("exec");
+    if !raw_json {
+        command.arg("--json");
+    }
+    let mut child = command
+        .args(&args.codex_args)
+        .arg("-C")
+        .arg(workspace)
+        .arg("-c")
+        .arg(format!(
+            "mcp_servers.again.command={}",
+            serde_json::to_string(&executable.to_string_lossy())?
+        ))
+        .arg("-c")
+        .arg(format!(
+            "mcp_servers.again.args={}",
+            serde_json::to_string(&bridge_args)?
+        ))
+        .arg(prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("launch Codex with authenticated task brief")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Codex event stream was unavailable"))?;
+    let brain_workspace = session.workspace.clone();
+    let brain_task_id = session.brief["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("task brief omitted task ID"))?
+        .to_owned();
+    let brain_session_id = uuid::Uuid::new_v4().to_string();
+    let brain_started_ms = crate::brain::current_ms_v1();
+    let reader_workspace = brain_workspace.clone();
+    let reader_task_id = brain_task_id.clone();
+    let reader_session_id = brain_session_id.clone();
+    let observation = Arc::new(Mutex::new(crate::brain::CodexRunObservationV1::default()));
+    let reader_observation = Arc::clone(&observation);
+    let capture_issue = Arc::new(Mutex::new(None));
+    let reader_capture_issue = Arc::clone(&capture_issue);
+    let event_reader = thread::spawn(move || -> Result<()> {
+        let brain_store = match Store::open_for_workspace(&brain_workspace) {
+            Ok(store) => Some(store),
+            Err(error) => {
+                remember_codex_capture_issue_v1(
+                    &reader_capture_issue,
+                    format!("could not open Brain for completed events: {error:#}"),
+                );
+                None
+            }
+        };
+        let mut output = io::stdout().lock();
+        for line in BufReader::new(stdout).lines() {
+            let line = line?;
+            let parsed = serde_json::from_str::<serde_json::Value>(&line);
+            if raw_json {
+                writeln!(output, "{line}")?;
+            } else if let Ok(ref value) = parsed {
+                if let Some(display) = crate::brain::codex_display_text_v1(value) {
+                    write!(output, "{display}")?;
+                    if !display.ends_with('\n') {
+                        writeln!(output)?;
+                    }
+                }
+            } else {
+                writeln!(output, "{line}")?;
+            }
+            output.flush()?;
+            match parsed {
+                Ok(value) => {
+                    let events = crate::brain::codex_completed_events_v1(
+                        &value,
+                        &brain_workspace,
+                        &brain_session_id,
+                        &brain_task_id,
+                    );
+                    reader_observation
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .observe(&value, &events);
+                    if let Some(store) = &brain_store {
+                        for event in events {
+                            if let Err(error) = store.record_brain_event_v1(&event) {
+                                remember_codex_capture_issue_v1(
+                                    &reader_capture_issue,
+                                    format!("could not record a completed event: {error:#}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(error) if !line.trim().is_empty() => {
+                    remember_codex_capture_issue_v1(
+                        &reader_capture_issue,
+                        format!("Codex emitted a non-JSON event line: {error}"),
+                    );
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(())
+    });
+    run_agent_child_v1(
+        session,
+        child,
+        "Codex",
+        Some(CodexRunReaderV1 {
+            handle: event_reader,
+            observation,
+            capture_issue,
+            workspace: reader_workspace,
+            task_id: reader_task_id,
+            session_id: reader_session_id,
+            started_ms: brain_started_ms,
+        }),
+    )
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn claude_launch(args: ClaudeArgs) -> Result<i32> {
+    let mut session = verified_task_brief_v1(&args.brief, true)?;
+    if args.peer_wait_seconds > 300 {
+        bail!("--peer-wait-seconds must be between 0 and 300");
+    }
+    validate_agent_launch_task_v1(&session.brief)?;
+    wait_for_peer_v1(
+        &mut session,
+        &args.brief,
+        Duration::from_secs(args.peer_wait_seconds),
+    )?;
+    validate_agent_launch_task_v1(&session.brief)?;
+    let mut prompt = agent_prebrief_prompt_v1(&args.brief.task, &session.brief)?;
+    let executable = fs::canonicalize(std::env::current_exe()?)?;
+    let workspace = &session.workspace;
+    append_repository_brain_v1(&mut prompt, &session.brief);
+    let mcp_config = serde_json::json!({
+        "mcpServers": {
+            "again": {
+                "command": executable,
+                "args": ["mcp", "connect", "--workspace", workspace]
+            }
+        }
+    });
+    let child = Command::new("claude")
+        .arg("-p")
+        .args(&args.claude_args)
+        .arg("--mcp-config")
+        .arg(serde_json::to_string(&mcp_config)?)
+        .arg(prompt)
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .spawn()
+        .context("launch Claude Code with authenticated task brief")?;
+    run_agent_child_v1(session, child, "Claude Code", None)
+}
+
+#[cfg(all(feature = "daemon", unix))]
+struct CodexRunReaderV1 {
+    handle: thread::JoinHandle<Result<()>>,
+    observation: Arc<Mutex<crate::brain::CodexRunObservationV1>>,
+    capture_issue: Arc<Mutex<Option<String>>>,
+    workspace: PathBuf,
+    task_id: String,
+    session_id: String,
+    started_ms: i64,
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn remember_codex_capture_issue_v1(issue: &Arc<Mutex<Option<String>>>, message: String) {
+    let mut current = issue.lock().unwrap_or_else(|poison| poison.into_inner());
+    if current.is_none() {
+        *current = Some(message);
+    }
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn run_agent_child_v1(
+    mut session: TaskBriefSessionV1,
+    mut child: std::process::Child,
+    client_name: &str,
+    event_reader: Option<CodexRunReaderV1>,
+) -> Result<i32> {
+    // The daemon closes an MCP connection after 60 seconds without a request.
+    // Renew well before then so a long edit or test cannot lose its lease.
+    const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+    let lease_id = session.brief["coordination"]["leaseId"]
+        .as_str()
+        .filter(|_| session.brief["coordination"]["status"] == "leader")
+        .map(str::to_owned);
+    let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+    let mut heartbeat_failure = None;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if let Some(reader) = event_reader {
+                let mut capture_issue = None;
+                // A descendant may retain stdout after the direct child exits.
+                // Do not hang the launcher indefinitely on that descriptor.
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !reader.handle.is_finished() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                if reader.handle.is_finished() {
+                    match reader.handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            capture_issue = Some(format!("event reader stopped early: {error:#}"));
+                        }
+                        Err(_) => capture_issue = Some("event reader panicked".to_owned()),
+                    }
+                } else {
+                    eprintln!(
+                        "Again Brain: event stream remained open after {client_name} exited; retaining observed events"
+                    );
+                }
+                if capture_issue.is_none() {
+                    capture_issue = reader
+                        .capture_issue
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .clone();
+                }
+                let observation = reader
+                    .observation
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .clone();
+                let run = observation.into_run(
+                    reader.session_id,
+                    reader.task_id,
+                    &reader.workspace,
+                    reader.started_ms,
+                    status.code().unwrap_or(1),
+                );
+                if status.success() && (!run.turn_completed || run.input_tokens.is_none()) {
+                    capture_issue.get_or_insert_with(|| {
+                        "Codex exited successfully without a completed turn and valid token usage"
+                            .to_owned()
+                    });
+                }
+                if let Err(error) = Store::open_for_workspace(&reader.workspace)
+                    .and_then(|store| store.record_brain_run_v1(&run))
+                {
+                    capture_issue.get_or_insert_with(|| {
+                        format!("could not record the completed run: {error:#}")
+                    });
+                }
+                if let Some(issue) = capture_issue {
+                    if status.success() {
+                        bail!(
+                            "{client_name} completed its task, but Again Brain capture is incomplete: {issue}"
+                        );
+                    }
+                    eprintln!("Again Brain capture is incomplete: {issue}");
+                }
+            }
+            if let Some(error) = heartbeat_failure {
+                return Err(error);
+            }
+            return Ok(status.code().unwrap_or(1));
+        }
+        if Instant::now() >= next_heartbeat {
+            if let Some(ref lease_id) = lease_id {
+                let task_id = session.brief["taskId"].clone();
+                let heartbeat = session.tool(
+                    "context.publish",
+                    serde_json::json!({
+                        "taskId": task_id,
+                        "kind": "work_heartbeat",
+                        "leaseId": lease_id,
+                        "ttlMs": 300_000
+                    }),
+                );
+                let failure = match heartbeat {
+                    Ok(response) if response["outcome"]["status"] == "renewed" => None,
+                    Ok(response) => Some(anyhow!(
+                        "lease renewal returned status {}",
+                        response["outcome"]["status"]
+                    )),
+                    Err(error) => Some(error.context("lease renewal request failed")),
+                };
+                if let Some(error) = failure {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    heartbeat_failure = Some(error.context(format!(
+                        "task lease heartbeat failed; stopped {client_name} before uncoordinated work"
+                    )));
+                    continue;
+                }
+            }
+            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn wait_for_peer_v1(
+    session: &mut TaskBriefSessionV1,
+    args: &McpBriefArgs,
+    max_wait: Duration,
+) -> Result<()> {
+    if session.brief["coordination"]["status"] != "join" || max_wait.is_zero() {
+        return Ok(());
+    }
+    eprintln!(
+        "Again: another agent leads this exact task; waiting up to {} seconds before launching the coding agent.",
+        max_wait.as_secs()
+    );
+    let task_id = session.brief["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("task brief omitted canonical task ID"))?
+        .to_owned();
+    let state_generation = session.brief["taskIntent"]["stateGeneration"]
+        .as_u64()
+        .ok_or_else(|| anyhow!("task brief omitted state generation"))?;
+    let deadline = Instant::now() + max_wait;
+    let mut poll_delay = Duration::from_millis(250);
+    loop {
+        let claim = session.tool(
+            "task.claim",
+            serde_json::json!({
+                "taskId": task_id,
+                "expectedStateGeneration": state_generation,
+                "ttlMs": 300_000
+            }),
+        )?;
+        match claim["outcome"]["status"].as_str() {
+            Some("leader") => {
+                let lease_id = claim["outcome"]["lease_id"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("task claim omitted leader lease ID"))?;
+                let mut refreshed = session.tool(
+                    "task.start",
+                    serde_json::json!({
+                        "taskId": args.task_id,
+                        "task": args.task,
+                        "includeSourcePreviews": true,
+                        "previewOnly": true
+                    }),
+                )?;
+                if refreshed["operation"] != "task.start"
+                    || refreshed["coordination"]["status"] != "preview"
+                {
+                    bail!("refreshed task brief had an unexpected operation");
+                }
+                refreshed["coordination"] = serde_json::json!({
+                    "status": "leader",
+                    "leaseId": lease_id,
+                    "stateGeneration": claim["outcome"]["state_generation"],
+                    "expiresAtMs": claim["outcome"]["expires_at_ms"]
+                });
+                session.brief = refreshed;
+                eprintln!(
+                    "Again: peer lease ended; launching the coding agent with a fresh brief."
+                );
+                return Ok(());
+            }
+            Some("join") => {
+                if Instant::now() >= deadline {
+                    let refreshed = session.tool(
+                        "task.start",
+                        serde_json::json!({
+                            "taskId": args.task_id,
+                            "task": args.task,
+                            "includeSourcePreviews": true,
+                            "previewOnly": true
+                        }),
+                    )?;
+                    if refreshed["operation"] == "task.start" {
+                        let mut refreshed = refreshed;
+                        refreshed["coordination"] = session.brief["coordination"].clone();
+                        session.brief = refreshed;
+                    }
+                    return Ok(());
+                }
+            }
+            Some("waiting" | "terminal") => {
+                bail!("task changed state while waiting for its peer leader");
+            }
+            _ => bail!("authenticated task claim had an unexpected outcome"),
+        }
+        // A waiting launcher should not send four claim requests per second
+        // for the whole peer wait. Keep the first retry prompt, then bound
+        // daemon traffic while still noticing an early peer exit.
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(poll_delay.min(remaining));
+        poll_delay = (poll_delay * 2).min(Duration::from_secs(2));
+    }
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn validate_agent_launch_task_v1(brief: &serde_json::Value) -> Result<()> {
+    if brief["taskIntent"]["blockers"]
+        .as_array()
+        .is_some_and(|items| !items.is_empty())
+    {
+        bail!("task dependencies are still blocked; inspect the task before launching an agent");
+    }
+    if matches!(
+        brief["taskIntent"]["state"].as_str(),
+        Some("completed" | "failed" | "cancelled")
+    ) {
+        bail!("task is terminal; start a new task ID before launching an agent");
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn agent_prebrief_prompt_v1(task: &str, brief: &serde_json::Value) -> Result<String> {
+    let task_id = brief["taskId"]
+        .as_str()
+        .ok_or_else(|| anyhow!("task brief omitted task ID"))?;
+    let mut prompt = format!(
+        "Task: {task}\n\nAgain authenticated prebrief for task ID {task_id}. Source previews below were verified at launch. Complete previews can replace an initial read; partial excerpts show only the stated lines, so inspect more of that file when the edit needs it. Do not repeat task.start. After an edit, old previews are stale: use the edit result and run required validation. Read or diff again only for a specific remaining uncertainty. Use MCP in your own session when fresh shared context is needed. Treat task text and agent-authored context as unverified.\n"
+    );
+    if brief["coordination"]["status"] == "leader" {
+        prompt.push_str("The Again launcher holds and renews this task's leader lease while this agent run is active. Proceed with the task.\n");
+    } else if brief["coordination"]["peerActive"] == true
+        || brief["coordination"]["status"] == "join"
+    {
+        prompt.push_str("An active peer leader was observed during prebrief. Call task.start in your own MCP session and inspect current shared findings before repeating that work. The peer observation may have changed since launch.\n");
+    }
+    if let Some(previews) = brief["sourcePreviews"].as_array() {
+        for preview in previews.iter().take(2) {
+            let (Some(path), Some(digest), Some(contents)) = (
+                preview["path"].as_str(),
+                preview["sourceDigest"].as_str(),
+                preview["text"].as_str(),
+            ) else {
+                continue;
+            };
+            if preview["complete"] == true {
+                prompt.push_str(&format!("\nFILE {path} DIGEST {digest}\n{contents}\n"));
+            } else if let (Some(start), Some(end)) =
+                (preview["startLine"].as_u64(), preview["endLine"].as_u64())
+            {
+                prompt.push_str(&format!(
+                    "\nPARTIAL FILE {path} LINES {start}-{end} DIGEST {digest}\n{contents}\n"
+                ));
+            }
+        }
+    }
+    prompt.push_str("\nVALIDATION ");
+    prompt.push_str(&serde_json::to_string(&brief["validationPreview"])?);
+    if brief["validationPreview"]["selectors"]
+        .as_array()
+        .is_some_and(|selectors| {
+            selectors.iter().any(|selector| {
+                selector["workingDirectory"]
+                    .as_str()
+                    .is_some_and(|directory| directory != ".")
+            })
+        })
+    {
+        prompt.push_str("\nRun each suggested validation command from its workingDirectory relative to the repository root. These are suggestions; execute required validation after editing.\n");
+    }
+    if brief["contextFreshness"]["status"] == "current" {
+        let context = &brief["context"];
+        let shared = serde_json::json!({
+            "cursor": brief["cursor"],
+            "currentFacts": context["current_facts"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "suggestions": context["suggestions"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "explicitUnknowns": context["explicit_unknowns"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+            "resultReferences": context["result_references"].as_array().map(|items| &items[..items.len().min(4)]).unwrap_or(&[]),
+        });
+        let serialized = serde_json::to_string(&shared)?;
+        let has_shared_items = [
+            "currentFacts",
+            "suggestions",
+            "explicitUnknowns",
+            "resultReferences",
+        ]
+        .iter()
+        .any(|key| {
+            shared[*key]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        });
+        if has_shared_items && serialized.len() <= 4096 {
+            prompt.push_str("\nSHARED_CONTEXT ");
+            prompt.push_str(&serialized);
+            prompt.push_str("\nShared facts were source checked at launch; recheck after relevant edits. Suggestions are unverified agent statements. Explicit unknowns still need investigation. Retrieve referenced results through MCP in your own session if needed.");
+        } else if has_shared_items {
+            prompt.push_str("\nSHARED_CONTEXT omitted due to size; call task.start in your own MCP session if needed.");
+        }
+    } else {
+        prompt.push_str("\nSHARED_CONTEXT freshness incomplete; call task.start in your own MCP session before relying on earlier findings.");
+    }
+    Ok(prompt)
+}
+
+#[cfg(all(feature = "daemon", unix))]
+fn append_repository_brain_v1(prompt: &mut String, brief: &serde_json::Value) {
+    if let Some(brain) = brief.get("againBrain").filter(|brain| !brain.is_null()) {
+        let mut metadata = brain.clone();
+        let mut partial_previews = Vec::new();
+        if let Some(files) = metadata["recentCurrentFiles"].as_array_mut() {
+            for file in files {
+                let preview = &file["currentPartialPreview"];
+                if let (Some(path), Some(digest), Some(start), Some(end), Some(text)) = (
+                    file["path"].as_str(),
+                    file["currentDigest"].as_str(),
+                    preview["startLine"].as_u64(),
+                    preview["endLine"].as_u64(),
+                    preview["text"].as_str(),
+                ) {
+                    partial_previews.push(format!(
+                        "\nBRAIN_PARTIAL FILE {path} LINES {start}-{end} DIGEST {digest}\n{text}\n"
+                    ));
+                    file["currentPartialPreview"] = serde_json::Value::Null;
+                }
+            }
+        }
+        let Ok(serialized) = serde_json::to_string(&metadata) else {
+            return;
+        };
+        prompt.push_str("\nAGAIN_BRAIN ");
+        prompt.push_str(&serialized);
+        for preview in partial_previews {
+            prompt.push_str(&preview);
+        }
+        prompt.push_str("\nBrain previews were rechecked against current file bytes at launch. Use complete previews without rereading until an edit. A partial preview covers only its stated lines: if it fully shows the code needed for a local edit, edit directly; inspect omitted lines when they matter. Other history is guidance only. Run required validation.");
+    }
+}
+
+#[cfg(all(feature = "daemon", not(unix)))]
+fn mcp_brief(_args: McpBriefArgs) -> Result<i32> {
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
+}
+
+#[cfg(all(feature = "daemon", not(unix)))]
+fn codex_launch(_args: CodexArgs) -> Result<i32> {
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
+}
+
+#[cfg(all(feature = "daemon", not(unix)))]
+fn claude_launch(_args: ClaudeArgs) -> Result<i32> {
+    Err(crate::agent_gateway_service::GatewayServiceError::UnsupportedPlatform.into())
 }
 
 #[cfg(feature = "daemon")]
@@ -1211,6 +2169,9 @@ fn mcp_connect(_args: McpConnectArgs) -> Result<i32> {
 }
 
 fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
+    if (args.apply || args.inspect) && !cfg!(all(feature = "daemon", unix)) {
+        bail!("MCP client setup requires an Again binary built with --features daemon on Unix");
+    }
     let client = match args.client {
         McpClientArg::Codex => AgentGatewayClientV1::Codex,
         McpClientArg::Claude => AgentGatewayClientV1::Claude,
@@ -1226,6 +2187,40 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
         AgentGatewayClientV1::Claude => home.join(".claude.json"),
     };
     let plan = AgentGatewaySetupPlanV1::dry_run(client, &config_path, &args.workspace)?;
+    if args.with_skill && client != AgentGatewayClientV1::Codex {
+        bail!("--with-skill is currently supported only for Codex");
+    }
+    if args.with_skill && !args.apply && !args.inspect {
+        bail!("--with-skill requires --apply or --inspect");
+    }
+    if args.with_brain_hook && client != AgentGatewayClientV1::Codex {
+        bail!("--with-brain-hook is currently supported only for Codex");
+    }
+    if args.with_brain_hook && !args.apply && !args.inspect {
+        bail!("--with-brain-hook requires --apply or --inspect");
+    }
+    let skill_dir = args
+        .with_skill
+        .then(|| codex_skill_dir(SetupScope::Global, None))
+        .transpose()?;
+    // Preflight ownership before the official client CLI can be changed.
+    let skill_plan = skill_dir
+        .as_deref()
+        .map(|directory| install_codex_skill(directory, true))
+        .transpose()?;
+    let skill_was_absent = skill_dir
+        .as_ref()
+        .is_some_and(|directory| !directory.join("SKILL.md").exists());
+    let hook_plan = if args.with_brain_hook {
+        Some(crate::observer_setup::configure_codex_brain_hook_v1(
+            &plan.workspace,
+            &plan.stdio.command,
+            false,
+            false,
+        )?)
+    } else {
+        None
+    };
     let action = if args.apply {
         Some(ClientSetupActionV1::Apply)
     } else if args.inspect {
@@ -1237,8 +2232,79 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
     };
     if let Some(action) = action {
         let outcome = execute_client_setup_v1(&plan, action)?;
+        let skill_outcome = if args.apply {
+            if let Some(directory) = skill_dir.as_deref() {
+                match install_codex_skill(directory, false) {
+                    Ok(change) => Some(change),
+                    Err(error) => {
+                        if outcome.changed {
+                            execute_client_setup_v1(&plan, ClientSetupActionV1::Remove).context(
+                                "roll back newly added MCP entry after skill install failed",
+                            )?;
+                        }
+                        return Err(error).context("install Codex skill after MCP setup");
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            skill_plan
+        };
+        let hook_outcome = if args.apply {
+            if args.with_brain_hook {
+                match crate::observer_setup::configure_codex_brain_hook_v1(
+                    &plan.workspace,
+                    &plan.stdio.command,
+                    true,
+                    false,
+                ) {
+                    Ok(change) => Some(change),
+                    Err(error) => {
+                        if skill_was_absent
+                            && skill_outcome.as_ref().is_some_and(|skill| skill.changed)
+                        {
+                            if let Some(directory) = skill_dir.as_deref() {
+                                remove_codex_skill(directory, false)
+                                    .context("roll back newly installed Codex skill")?;
+                            }
+                        }
+                        if outcome.changed {
+                            execute_client_setup_v1(&plan, ClientSetupActionV1::Remove)
+                                .context("roll back newly added MCP entry")?;
+                        }
+                        return Err(error).context("install Codex Brain observer after MCP setup");
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            hook_plan
+        };
         if args.json {
-            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            if skill_outcome.is_some() || hook_outcome.is_some() {
+                let mut combined = serde_json::json!({"mcp": outcome});
+                if let Some(skill) = skill_outcome {
+                    combined["codexSkill"] = serde_json::json!({
+                        "path": skill.path,
+                        "current": args.apply || !skill.changed,
+                        "changed": args.apply && skill.changed
+                    });
+                }
+                if let Some(hook) = hook_outcome {
+                    combined["codexBrainHook"] = serde_json::json!({
+                        "path": hook.path,
+                        "current": args.apply || (hook.installed && !hook.changed),
+                        "changed": args.apply && hook.changed,
+                        "trustStatus": "not_verified",
+                        "activation": "review_and_trust_in_codex_hooks"
+                    });
+                }
+                print_pretty_json_v1(&combined)?;
+            } else {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+            }
         } else {
             println!(
                 "{} MCP setup: action={}, before={:?}, after={:?}, changed={}, verified={}",
@@ -1249,6 +2315,22 @@ fn mcp_setup(args: McpSetupArgs) -> Result<i32> {
                 outcome.changed,
                 outcome.verified
             );
+            if let Some(skill) = skill_outcome {
+                println!(
+                    "Codex skill: path={}, current={}, changed={}",
+                    skill.path.display(),
+                    args.apply || !skill.changed,
+                    args.apply && skill.changed
+                );
+            }
+            if let Some(hook) = hook_outcome {
+                println!(
+                    "Codex Brain hook: path={}, config_current={}, changed={}, trust=not_verified (review in Codex /hooks)",
+                    hook.path.display(),
+                    args.apply || (hook.installed && !hook.changed),
+                    args.apply && hook.changed
+                );
+            }
         }
     } else if args.json {
         println!("{}", plan.machine_readable_json()?);
@@ -3028,6 +4110,110 @@ mod tests {
     use crate::executable::ExecutableProvenance;
     use std::io::{Cursor, repeat};
     use tempfile::TempDir;
+
+    #[cfg(all(feature = "daemon", unix))]
+    #[test]
+    fn brain_partial_preview_is_readable_without_duplicating_escaped_source() {
+        let brief = serde_json::json!({
+            "againBrain": {
+                "recentCurrentFiles": [{
+                    "path": "src/util.py",
+                    "currentDigest": "current-digest",
+                    "currentCompletePreview": null,
+                    "currentPartialPreview": {
+                        "text": "def adjust_total(value):\n    return value + 1\n",
+                        "startLine": 1,
+                        "endLine": 2,
+                        "complete": false
+                    }
+                }],
+                "previousSuccessfulTestCommand": null
+            }
+        });
+        let mut prompt = String::new();
+        append_repository_brain_v1(&mut prompt, &brief);
+        let metadata = prompt
+            .split_once("AGAIN_BRAIN ")
+            .unwrap()
+            .1
+            .split_once('\n')
+            .unwrap()
+            .0;
+        let metadata: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        assert_eq!(metadata["recentCurrentFiles"][0]["path"], "src/util.py");
+        assert!(metadata["recentCurrentFiles"][0]["currentPartialPreview"].is_null());
+        assert!(prompt.contains("BRAIN_PARTIAL FILE src/util.py LINES 1-2 DIGEST current-digest\ndef adjust_total(value):\n    return value + 1\n"));
+        assert!(!prompt.contains("def adjust_total(value):\\n"));
+    }
+
+    #[cfg(all(feature = "daemon", unix))]
+    #[test]
+    fn codex_prebrief_carries_bounded_current_shared_context() {
+        let brief = serde_json::json!({
+            "taskId": "repair",
+            "sourcePreviews": [{"path":"a.py", "sourceDigest":"abc", "text":"value=1\n", "complete":true}],
+            "validationPreview": {"status":"execute_required"},
+            "cursor": 7,
+            "contextFreshness": {"status":"current"},
+            "context": {
+                "current_facts": [{"topic":"a.py", "statement":"value is one"}],
+                "explicit_unknowns": [{"subject":"test", "explanation":"check edge cases"}],
+                "result_references": []
+            }
+        });
+        let prompt = agent_prebrief_prompt_v1("repair a.py", &brief).unwrap();
+        assert!(prompt.contains("Do not repeat task.start"));
+        assert!(prompt.contains("FILE a.py DIGEST abc"));
+        assert!(prompt.contains("value is one"));
+        assert!(prompt.contains("check edge cases"));
+        let mut excerpt = brief.clone();
+        excerpt["sourcePreviews"] = serde_json::json!([{
+            "path":"large.rs", "sourceDigest":"current", "text":"fn target() {}\n",
+            "complete":false, "startLine":80, "endLine":80
+        }]);
+        let excerpt_prompt = agent_prebrief_prompt_v1("repair large.rs", &excerpt).unwrap();
+        assert!(excerpt_prompt.contains("PARTIAL FILE large.rs LINES 80-80 DIGEST current"));
+        assert!(excerpt_prompt.contains("inspect more of that file"));
+        let mut nested = brief.clone();
+        nested["validationPreview"]["selectors"] = serde_json::json!([{
+            "command": "npm test", "workingDirectory": "packages/alpha", "verified": false
+        }]);
+        let nested_prompt = agent_prebrief_prompt_v1("repair a.py", &nested).unwrap();
+        assert!(
+            nested_prompt
+                .contains("Run each suggested validation command from its workingDirectory")
+        );
+        let mut leader = brief.clone();
+        leader["coordination"]["status"] = serde_json::json!("leader");
+        let leader_prompt = agent_prebrief_prompt_v1("repair a.py", &leader).unwrap();
+        assert!(leader_prompt.contains("while this agent run is active"));
+        assert!(!leader_prompt.contains("Codex run"));
+        let mut stale = brief;
+        stale["coordination"]["peerActive"] = serde_json::json!(true);
+        let peer_prompt = agent_prebrief_prompt_v1("repair a.py", &stale).unwrap();
+        assert!(peer_prompt.contains("active peer leader"));
+        stale["contextFreshness"]["status"] = serde_json::json!("incomplete");
+        let prompt = agent_prebrief_prompt_v1("repair a.py", &stale).unwrap();
+        assert!(!prompt.contains("value is one"));
+        assert!(prompt.contains("freshness incomplete"));
+    }
+
+    #[cfg(all(feature = "daemon", unix))]
+    #[test]
+    fn codex_launch_refuses_blocked_and_terminal_tasks() {
+        let ready = serde_json::json!({
+            "taskIntent": {"state": "waiting", "blockers": []}
+        });
+        assert!(validate_agent_launch_task_v1(&ready).is_ok());
+        let blocked = serde_json::json!({
+            "taskIntent": {"state": "waiting", "blockers": ["prerequisite"]}
+        });
+        assert!(validate_agent_launch_task_v1(&blocked).is_err());
+        let terminal = serde_json::json!({
+            "taskIntent": {"state": "completed", "blockers": []}
+        });
+        assert!(validate_agent_launch_task_v1(&terminal).is_err());
+    }
 
     struct BrokenPipeWriter;
 

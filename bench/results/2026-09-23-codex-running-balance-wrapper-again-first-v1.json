@@ -1,0 +1,208 @@
+{
+  "accepted": true,
+  "againBinarySha256": "3d1c9bba1861001b04d23e64d018c0ea1c4b5449144b8cbdb824a844511a4ccf",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "6b42db4d33fd53516162bd76a0e2d07e0567287c44e036d4e4c06cb555a432f9",
+  "codexVersion": "codex-cli 0.156.0",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "running-balance",
+  "fixtureSha256": "e2e46ad5abe9a94ae43e1494a5887f5c534e8ba5af76934145d945e19e210565",
+  "harnessSha256": "cc6c926bd68cf32b409b3098d9cb7154c8344d4dc9e48b417a5dc85d9a25b701",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 18747.372,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git diff -- src/running_balance.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,30p' src/running_balance.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'git status --short'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 18747.372,
+      "eventCount": 18,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5654.536,
+      "oracle": {
+        "after_snapshot_sha256": "e0cadd9810a1e88fc2860a9b33dd5ce263222124226dc7d53056d34470776245",
+        "changed_paths": [
+          "src/running_balance.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 140.928,
+        "test_output_sha256": "2a50b4749107e50e3993c9a59df48e8d8cebd81e26a286e83bb83d7fe81b2d90",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 3647,
+      "rawEventFile": "2026-09-23-codex-running-balance-wrapper-again-first-v1-product.jsonl",
+      "rawEventSha256": "fad291f7a44d52091c8589f225809aab4a555ba0bf49a7625909b2591d222097",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 55424,
+        "input_tokens": 65594,
+        "output_tokens": 532,
+        "reasoning_output_tokens": 136
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 26386.679,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini' -g 'Makefile' -g 'src/running_balance.py' -g 'tests/**'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/running_balance.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,200p' tests/test_running_balance.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,160p' README.md && ls -la\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "failed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 26386.679,
+      "eventCount": 20,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 18193.152,
+      "oracle": {
+        "after_snapshot_sha256": "e0cadd9810a1e88fc2860a9b33dd5ce263222124226dc7d53056d34470776245",
+        "changed_paths": [
+          "src/running_balance.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 150.54,
+        "test_output_sha256": "2a50b4749107e50e3993c9a59df48e8d8cebd81e26a286e83bb83d7fe81b2d90",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 5815,
+      "rawEventFile": "2026-09-23-codex-running-balance-wrapper-again-first-v1-baseline.jsonl",
+      "rawEventSha256": "2d2eba42670a5a4ce7c55839ac7a1398b7068ed10b5c9eefa18f87c4af3dfab3",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 104064,
+        "input_tokens": 115688,
+        "output_tokens": 746,
+        "reasoning_output_tokens": 55
+      }
+    }
+  ],
+  "order": [
+    "product",
+    "baseline"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "68640edd816dc58830feecc035d0aad882c3d0a8877713fbe787d9c1b4bbf5f4",
+  "recordedAtUtc": "2026-09-23T20:48:02.379758+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "0a1112e5ceac9767278d3c4218e7d31ff895f3b0"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

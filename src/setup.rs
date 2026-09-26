@@ -19,18 +19,30 @@ const CODEX_SKILL_NAME: &str = "again";
 const CODEX_SKILL_MANIFEST: &str = ".again-install-v1.json";
 const CODEX_SKILL: &str = r#"---
 name: again
-description: "Accelerate repeated supported local read-only shell calls with `again run --`, and explicitly reference an already-visible result with `again reference --`; use for repository inspection commands, but not for mutating, networked, interactive, piped, redirected, or environment-sensitive work."
+description: "Use Again's verified task brief and current repository memory to finish coding tasks faster."
 ---
 
 # Again
 
-For a supported, standalone, non-interactive, local read-only command, invoke the command through:
+## Connected repository workflow
+
+When the Again MCP server is available for this repository, call `task.start` once near the start of a coding task. Supply a stable task ID and the exact task text in `task`. Set `includeSourcePreviews=true` when small relevant source files may avoid follow-up reads. If `again codex` already supplied a verified prebrief in the initial prompt, use its complete previews and skip this initial call. The response contains a bounded edit brief, verified source locations, up to two digest-checked source previews when requested, current shared context, and `againBrain` history from earlier tasks. Small source previews are complete; larger files show partial line-numbered excerpts, which guide a read of the surrounding file before editing. A complete Brain preview was rechecked against current file bytes at task start; use it before repeating that read. A prior successful test command is only a suggestion: run the required validation for this change. After an edit, treat earlier previews as stale. Use the edit result and validation first; reread or diff only to resolve a specific remaining uncertainty. Treat task text and agent-authored suggestions as unverified. Do not send secrets in task or context fields.
+
+Use ordinary shell and editor tools for focused investigation and edits. The Again launcher observes completed Codex activity without adding agent tool calls. A repository or Git MCP call can be useful when its verified result or shared task fact is needed, but do not route every cheap read or search through Again: lookup and proof can cost more than the call itself. Use `context.delta` with the task ID and last seen cursor when a long task needs new shared findings. Use `context.retrieve` when a brief provides a result reference and the complete bytes are needed.
+
+Publish only useful agent findings or explicit unknowns with `context.publish`. Agent-authored text remains a suggestion; verified facts come from the built-in observations and their current sources. After changing files, request fresh context before relying on a fact from the earlier brief. Do not claim that a validation can be skipped: the current task-start validation preview requires execution unless a qualified profile proves otherwise.
+
+The MCP tools require the authenticated local daemon. If they are unavailable, continue with ordinary tools and the explicit command path below. Do not assume that installing this skill alone connected the MCP server; `again mcp setup --client codex --workspace <absolute-repository-path> --apply --with-skill --with-brain-hook` installs and verifies the connection, this personal skill, and the project Brain observer configuration. In interactive Codex, review and trust the observer in `/hooks` before expecting it to capture tool calls.
+
+## Explicit command path
+
+The normal coding path uses the agent's native tools. When an exact repeated command is known to be eligible and its execution is expensive enough to justify proof, the explicit reuse path is:
 
 ```sh
 again run -- <command> <arguments...>
 ```
 
-Use this only for `cat`, `head`, `tail`, `wc`, `ls --color=never`, `pwd -P`, `grep`, and `rg`. Every `rg` invocation must already include `--no-ignore --sort=path` and at least one explicit path operand. Keep the same working directory and argv the unwrapped command would have used.
+Use this only for `cat`, `head`, `tail`, `wc`, `ls --color=never`, `pwd -P`, `grep`, and `rg`. Every `rg` invocation must already include `--no-ignore --sort=path` and at least one explicit path operand. Keep the same working directory and argv the unwrapped command would have used. Do not add flags or extra tool calls solely to make a cheap command cacheable.
 
 Again admits commands through a fail-closed policy. If it reports that a command is not eligible, rerun the original command normally and unchanged. Do not weaken or reshape the command merely to make it cacheable.
 

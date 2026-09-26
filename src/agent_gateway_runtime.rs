@@ -8,15 +8,15 @@
 #[path = "agent_gateway_runtime/context_compiler.rs"]
 pub mod context_compiler;
 #[path = "agent_gateway_runtime/context_coordinator.rs"]
-mod context_coordinator;
+pub(crate) mod context_coordinator;
 #[path = "agent_gateway_runtime/repository_tools.rs"]
 mod repository_tools;
 
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::io::{self, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,7 @@ use crate::agent_gateway_runtime::context_compiler::{
 use crate::agent_gateway_runtime::context_coordinator::{
     ContextProviderKindV1, LocalContextCoordinatorV1, LocalContextProviderV1,
 };
+use crate::code_intelligence::{CodeIntelligenceLimitsV1, index_preflight_refusal_v1};
 use crate::mcp_gateway::{
     AuthorizationScopeId, CapturedToolResult, ConfirmedDeliveryV1, DeliveryConfirmationSink,
     EffectClass, EphemeralSecrets, Freshness, FreshnessMetadata, GatewayLimits, McpError,
@@ -89,6 +90,11 @@ const FOLLOWER_PROOF_WAIT_V1: Duration = Duration::from_secs(2);
 const LEADER_HEARTBEAT_INTERVAL_V1: Duration = Duration::from_secs(5);
 const MAX_PENDING_REASONING_CONTEXTS_V1: usize = 128;
 const MAX_RECENT_GATEWAY_CANDIDATES_V1: usize = 64;
+const MAX_PENDING_GATEWAY_CANCELLATIONS_V1: usize = 256;
+// Below this size, exact admission costs more than simply reading the file.
+// Larger reads retain the lease path so concurrent callers can avoid work.
+const DIRECT_CONTEXT_READ_BYTES_V1: u64 = 8 * 1024;
+const MAX_DIRECT_SEARCH_MATCH_FACTS_V1: usize = 2;
 const INTERNAL_REASONING_CONTEXT_TOKEN_V1: &str = "__again_internal_reasoning_context_v1";
 
 struct RuntimeReasoningContextV1 {
@@ -201,6 +207,24 @@ enum RepositoryOperationV1 {
     GitBlame,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GatewayReuseModeV1 {
+    Automatic,
+    #[cfg(test)]
+    ForceReuse,
+    ExecuteOnly,
+}
+
+// A 250-file authenticated probe measured git.status warm reuse at 53.65 ms
+// versus 14.89 ms direct. The index crossed 16 KiB at that scale. A standalone
+// probe confirmed that the default bypass is near direct latency, while the
+// one-file index retains a measured reuse win. This check can only disable
+// reuse, never authorize a cache hit.
+const STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1: u64 = 16 * 1024;
+// Bound retained provider values by serialized size (64 entries, 16 MiB total
+// serialized budget); larger results use digest comparison.
+const MAX_RECENT_PROVIDER_VALUE_BYTES_V1: u64 = 256 * 1024;
+
 impl RepositoryOperationV1 {
     fn from_call(call: &ProviderCall) -> Option<Self> {
         if call.provider_identity.is_empty()
@@ -249,13 +273,13 @@ struct ResolvedRequestV1 {
     core_call: GatewayToolCallV1,
     binding: ValidatedGatewayReadV1,
     observation_plan: RepositoryObservationPlanV1,
+    repository_digest: String,
 }
 
 #[derive(Clone)]
 enum ActiveCoordinatorV1 {
     Leader {
         lease_id: String,
-        owner: String,
         cancelled: Arc<AtomicBool>,
     },
     Follower {
@@ -283,8 +307,10 @@ pub(crate) struct GatewayControlledProviderV1 {
     store: Arc<Mutex<Store>>,
     context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
     active: Mutex<BTreeMap<(String, u64), ActiveCoordinatorV1>>,
+    pending_cancellations: Mutex<VecDeque<(String, u64)>>,
     pending_reasoning: Mutex<BTreeMap<String, ReasoningBriefInputV1>>,
     recent_candidates: Mutex<BTreeMap<String, RecentGatewayCandidateV1>>,
+    reuse_mode: GatewayReuseModeV1,
 }
 
 #[derive(Clone)]
@@ -308,12 +334,36 @@ impl SharedObservedWorkspaceV1 {
             manifest: Arc::new(Mutex::new(manifest)),
         })
     }
+
+    fn fork_manifest(&self) -> Result<Self> {
+        let manifest = self
+            .execution_epoch
+            .begin_observed_manifest(&gateway_workspace_limits_v1())
+            .map_err(|_| anyhow!("sealed observed manifest issuance failed"))?;
+        Ok(Self {
+            execution_epoch: Arc::clone(&self.execution_epoch),
+            manifest: Arc::new(Mutex::new(manifest)),
+        })
+    }
 }
 
 #[derive(Clone)]
 struct RecentGatewayCandidateV1 {
     binding: ValidatedGatewayReadV1,
     gateway_result_id: String,
+    task_id: Option<String>,
+    stdout_digest: String,
+    provider_value: Option<Arc<Value>>,
+}
+
+impl RecentGatewayCandidateV1 {
+    fn matches_fresh_provider_result(&self, value: &Value) -> bool {
+        if let Some(prior) = self.provider_value.as_deref() {
+            return prior == value;
+        }
+        let bytes = serde_json::to_vec(value).expect("JSON values are serializable");
+        blake3::hash(&bytes).to_hex().as_str() == self.stdout_digest
+    }
 }
 
 struct LoadedGatewayResultV1 {
@@ -350,6 +400,7 @@ impl GatewayControlledProviderV1 {
             observed_workspace,
             store,
             None,
+            GatewayReuseModeV1::ForceReuse,
         ))
     }
 
@@ -359,6 +410,7 @@ impl GatewayControlledProviderV1 {
         observed_workspace: SharedObservedWorkspaceV1,
         store: Arc<Mutex<Store>>,
         context_coordinator: Option<Arc<LocalContextCoordinatorV1>>,
+        reuse_mode: GatewayReuseModeV1,
     ) -> Self {
         Self {
             inner,
@@ -367,8 +419,10 @@ impl GatewayControlledProviderV1 {
             store,
             context_coordinator,
             active: Mutex::new(BTreeMap::new()),
+            pending_cancellations: Mutex::new(VecDeque::new()),
             pending_reasoning: Mutex::new(BTreeMap::new()),
             recent_candidates: Mutex::new(BTreeMap::new()),
+            reuse_mode,
         }
     }
 
@@ -385,6 +439,365 @@ impl GatewayControlledProviderV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .record_gateway_direct_execution(record_request);
         self.inner.execute_with_epoch(epoch, call, secrets)
+    }
+
+    fn execute_direct_with_context(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: ProviderCall,
+        secrets: EphemeralSecrets<'_>,
+    ) -> Result<Value, ProviderError> {
+        let started = Instant::now();
+        let observed = self.execute_direct(epoch, call.clone(), secrets, true);
+        let Ok(value) = observed else {
+            return observed;
+        };
+        let verification =
+            self.inner
+                .execute_with_epoch(epoch, call.clone(), EphemeralSecrets::empty());
+        if !matches!(&verification, Ok(confirmed) if confirmed == &value) {
+            return Ok(value);
+        }
+        let bytes = canonical_json_bytes_v1(&value);
+        if RepositoryOperationV1::from_call(&call) == Some(RepositoryOperationV1::Read)
+            && bytes.len() > (DIRECT_CONTEXT_READ_BYTES_V1 as usize + 4096)
+        {
+            return Ok(value);
+        }
+        let Some(binding) = self.direct_repository_binding(&call, &bytes) else {
+            return Ok(value);
+        };
+        let Some(coordinator) = self.context_coordinator.as_ref() else {
+            return Ok(value);
+        };
+        if coordinator.observe_dependencies(&call, &binding).is_err() {
+            return Ok(value);
+        }
+        let output_digest = blake3::hash(&bytes).to_hex().to_string();
+        let recipe = json!({
+            "schema": "again.context.direct-repository-recipe.v1",
+            "tool": call.translation.namespaced_tool_name(),
+            "arguments": call.arguments,
+            "outputDigest": output_digest,
+        });
+        let duration_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
+        let proof = json!({
+            "schema": "again.gateway-direct-observation-proof.v1",
+            "requestDigest": binding.request_digest(),
+            "stateDigest": binding.state_digest(),
+            "policyDigest": binding.policy_digest(),
+            "authority": {"semantic": false, "mutationReplay": false,
+                          "externalWriteReplay": false, "cacheHit": false}
+        });
+        let observation_id = (|| {
+            let mut store = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let stored = store.insert_result(
+                &crate::store::direct_observation_request_key_v1(&binding),
+                &bytes,
+                b"",
+                0,
+                duration_ms,
+                POLICY_VERSION_V1,
+                &serde_json::to_string(&proof)?,
+            )?;
+            store.publish_gateway_direct_observation_v1(&binding, &stored.id)
+        })();
+        if let Ok(observation_id) = observation_id {
+            if coordinator
+                .admit_direct_observation(
+                    &call,
+                    &binding,
+                    &serde_json::to_vec(&recipe).expect("direct recipe serializes"),
+                    &output_digest,
+                    &observation_id,
+                )
+                .is_ok()
+            {
+                self.remember_candidate(&call, &binding, &observation_id);
+            }
+        }
+        Ok(value)
+    }
+
+    fn direct_repository_operation(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: &ProviderCall,
+    ) -> Option<RepositoryOperationV1> {
+        let operation = RepositoryOperationV1::from_call(call)?;
+        if operation == RepositoryOperationV1::Stat {
+            return Some(operation);
+        }
+        if operation != RepositoryOperationV1::Read {
+            return None;
+        }
+        let relative = Path::new(call.arguments.get("path")?.as_str()?);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+        {
+            return None;
+        }
+        if epoch.classify_relative(relative).ok()?
+            != crate::workspace_authority::RepositoryNodeKindV1::Regular
+        {
+            return None;
+        }
+        let size = fs::symlink_metadata(self.workspace.join(relative))
+            .ok()?
+            .len();
+        (size <= DIRECT_CONTEXT_READ_BYTES_V1).then_some(operation)
+    }
+
+    fn direct_repository_binding(
+        &self,
+        call: &ProviderCall,
+        provider_bytes: &[u8],
+    ) -> Option<ValidatedGatewayReadV1> {
+        let operation = RepositoryOperationV1::from_call(call)?;
+        if !matches!(
+            operation,
+            RepositoryOperationV1::Stat | RepositoryOperationV1::Read
+        ) {
+            return None;
+        }
+        let descriptor = self.inner.descriptor();
+        if descriptor.id != REPOSITORY_PROVIDER_ID_V1
+            || descriptor.implementation != REPOSITORY_PROVIDER_IMPLEMENTATION_V1
+        {
+            return None;
+        }
+        let mut request_hasher = blake3::Hasher::new();
+        request_hasher.update(b"again.context.direct-repository-request.v1\0");
+        request_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+        request_hasher.update(call.translation.namespaced_tool_name().as_bytes());
+        request_hasher.update(call.translation.canonical_digest());
+        request_hasher.update(descriptor.version.as_bytes());
+        let request_digest = request_hasher.finalize().to_hex().to_string();
+        let output_digest = blake3::hash(provider_bytes).to_hex().to_string();
+        let mut state_hasher = blake3::Hasher::new();
+        state_hasher.update(b"again.context.direct-repository-state.v1\0");
+        state_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+        state_hasher.update(output_digest.as_bytes());
+        let state_digest = state_hasher.finalize().to_hex().to_string();
+        let mut key_hasher = blake3::Hasher::new();
+        key_hasher.update(b"again.context.direct-repository-dependency.v1\0");
+        key_hasher.update(request_digest.as_bytes());
+        let now = now_millis_i64_v1();
+        ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest,
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now,
+                valid_until_ms: now.saturating_add(60_000),
+            },
+            dependencies: vec![GatewayDependencyV1 {
+                key_digest: key_hasher.finalize().to_hex().to_string(),
+                value_digest: output_digest,
+            }],
+        })
+        .ok()
+    }
+
+    fn admit_bounded_search_matches(
+        &self,
+        epoch: &WorkspaceExecutionEpochV1,
+        call: &ProviderCall,
+        value: &Value,
+    ) {
+        let Some(coordinator) = self.context_coordinator.as_ref() else {
+            return;
+        };
+        let descriptor = self.inner.descriptor();
+        if descriptor.id != REPOSITORY_PROVIDER_ID_V1
+            || descriptor.implementation != REPOSITORY_PROVIDER_IMPLEMENTATION_V1
+        {
+            return;
+        }
+        let (Some(pattern), Some(matches)) = (
+            call.arguments.get("pattern").and_then(Value::as_str),
+            value["structuredContent"]["matches"].as_array(),
+        ) else {
+            return;
+        };
+        let mut seen_paths = std::collections::BTreeSet::new();
+        for found in matches {
+            if seen_paths.len() >= MAX_DIRECT_SEARCH_MATCH_FACTS_V1 {
+                break;
+            }
+            let (Some(path), Some(line), Some(snippet), Some(truncated)) = (
+                found["path"].as_str(),
+                found["line"].as_u64(),
+                found["text"].as_str(),
+                found["lineTruncated"].as_bool(),
+            ) else {
+                continue;
+            };
+            let relative = Path::new(path);
+            if path.is_empty()
+                || path.len() > 480
+                || line == 0
+                || !relative
+                    .components()
+                    .all(|part| matches!(part, Component::Normal(_)))
+                || !seen_paths.insert(path)
+            {
+                continue;
+            }
+            let Ok(bytes) = epoch.read_repository_file(relative, DIRECT_CONTEXT_READ_BYTES_V1)
+            else {
+                continue;
+            };
+            let Ok(content) = std::str::from_utf8(&bytes) else {
+                continue;
+            };
+            let Some(actual) = usize::try_from(line - 1)
+                .ok()
+                .and_then(|index| content.lines().nth(index))
+            else {
+                continue;
+            };
+            if !actual.contains(pattern)
+                || if truncated {
+                    !actual.starts_with(snippet) || actual.len() <= snippet.len()
+                } else {
+                    actual != snippet
+                }
+            {
+                continue;
+            }
+            if epoch
+                .read_repository_file(relative, DIRECT_CONTEXT_READ_BYTES_V1)
+                .ok()
+                .as_deref()
+                != Some(bytes.as_slice())
+            {
+                continue;
+            }
+            let content_digest = blake3::hash(&bytes).to_hex().to_string();
+            let mut request_hasher = blake3::Hasher::new();
+            request_hasher.update(b"again.context.direct-search-match-request.v1\0");
+            request_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+            request_hasher.update(call.translation.canonical_digest());
+            request_hasher.update(path.as_bytes());
+            request_hasher.update(&line.to_le_bytes());
+            let request_digest = request_hasher.finalize().to_hex().to_string();
+            let mut state_hasher = blake3::Hasher::new();
+            state_hasher.update(b"again.context.direct-search-match-state.v1\0");
+            state_hasher.update(request_digest.as_bytes());
+            state_hasher.update(content_digest.as_bytes());
+            let state_digest = state_hasher.finalize().to_hex().to_string();
+            let mut key_hasher = blake3::Hasher::new();
+            key_hasher.update(b"again.context.direct-search-match-dependency.v1\0");
+            key_hasher.update(self.workspace.as_os_str().as_encoded_bytes());
+            key_hasher.update(path.as_bytes());
+            let now = now_millis_i64_v1();
+            let Ok(binding) = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+                request_digest,
+                state_digest: state_digest.clone(),
+                policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+                operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+                freshness: GatewayFreshnessEvidenceV1 {
+                    snapshot_digest: state_digest,
+                    observed_at_ms: now,
+                    valid_until_ms: now.saturating_add(60_000),
+                },
+                dependencies: vec![GatewayDependencyV1 {
+                    key_digest: key_hasher.finalize().to_hex().to_string(),
+                    value_digest: content_digest.clone(),
+                }],
+            }) else {
+                continue;
+            };
+            let recipe = json!({
+                "schema": "again.context.direct-search-match-recipe.v1",
+                "path": path,
+                "pattern": pattern,
+                "line": line,
+                "text": snippet,
+                "lineTruncated": truncated,
+            });
+            let proof = json!({
+                "schema": "again.gateway-direct-observation-proof.v1",
+                "requestDigest": binding.request_digest(),
+                "stateDigest": binding.state_digest(),
+                "policyDigest": binding.policy_digest(),
+                "authority": {"semantic": false, "mutationReplay": false,
+                              "externalWriteReplay": false, "cacheHit": false}
+            });
+            if coordinator.observe_dependencies(call, &binding).is_err() {
+                continue;
+            }
+            let observation_id = (|| {
+                let mut store = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let stored = store.insert_result(
+                    &crate::store::direct_observation_request_key_v1(&binding),
+                    &canonical_json_bytes_v1(found),
+                    b"",
+                    0,
+                    0,
+                    POLICY_VERSION_V1,
+                    &serde_json::to_string(&proof)?,
+                )?;
+                store.publish_gateway_direct_observation_v1(&binding, &stored.id)
+            })();
+            if let Ok(observation_id) = observation_id {
+                let locator = format!("repo.search:{path}:{line}");
+                let _ = coordinator.admit_direct_observation_with_locator(
+                    call,
+                    &binding,
+                    &serde_json::to_vec(&recipe).expect("search match recipe serializes"),
+                    &content_digest,
+                    &observation_id,
+                    &locator,
+                );
+            }
+        }
+    }
+
+    fn large_git_status_index(&self) -> bool {
+        fs::symlink_metadata(self.workspace.join(".git/index"))
+            .ok()
+            .is_some_and(|metadata| {
+                metadata.is_file() && metadata.len() >= STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1
+            })
+    }
+
+    fn broad_input_overflow(&self, call: &ProviderCall) -> bool {
+        let Some(path) = call.arguments.get("path").and_then(Value::as_str) else {
+            return true;
+        };
+        if path.is_empty() || path == "." {
+            return true;
+        }
+        let relative = Path::new(path);
+        if !relative
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
+            || self
+                .observed_workspace
+                .execution_epoch
+                .classify_relative(relative)
+                .ok()
+                != Some(crate::workspace_authority::RepositoryNodeKindV1::Directory)
+        {
+            return false;
+        }
+        index_preflight_refusal_v1(
+            &self.workspace.join(relative),
+            &CodeIntelligenceLimitsV1::default(),
+            Duration::from_millis(50),
+        ) == Some("index_preflight_file_budget_exceeded")
     }
 
     fn resolve(&self, call: &ProviderCall) -> Option<ResolvedRequestV1> {
@@ -446,6 +859,25 @@ impl GatewayControlledProviderV1 {
         gateway_result_id: &str,
     ) {
         let key = Self::recent_candidate_key(call);
+        {
+            let recent = self
+                .recent_candidates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if recent.get(&key).is_some_and(|candidate| {
+                candidate.binding.binding_digest() == binding.binding_digest()
+                    && candidate.gateway_result_id == gateway_result_id
+            }) {
+                return;
+            }
+        }
+        let Some(loaded) = self
+            .load_stored_exact(binding, gateway_result_id)
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
         let mut recent = self
             .recent_candidates
             .lock()
@@ -456,11 +888,21 @@ impl GatewayControlledProviderV1 {
         {
             recent.remove(&oldest_key);
         }
+        let provider_value = (loaded.full.result.stdout_bytes
+            <= MAX_RECENT_PROVIDER_VALUE_BYTES_V1)
+            .then(|| Arc::new(loaded.value));
         recent.insert(
             key,
             RecentGatewayCandidateV1 {
                 binding: binding.clone(),
                 gateway_result_id: gateway_result_id.to_owned(),
+                task_id: self
+                    .context_coordinator
+                    .as_ref()
+                    .and_then(|coordinator| coordinator.active_identity_for_call(call))
+                    .map(|identity| identity.task_id().to_owned()),
+                stdout_digest: loaded.full.result.stdout_digest,
+                provider_value,
             },
         );
     }
@@ -492,13 +934,53 @@ impl GatewayControlledProviderV1 {
         active: ActiveCoordinatorV1,
     ) -> ActiveRegistrationV1<'_> {
         let key = (logical_call_id.to_owned(), physical_attempt_id);
-        self.active
+        let mut registered = self
+            .active
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .insert(key.clone(), active);
+            .unwrap_or_else(|poison| poison.into_inner());
+        let mut pending = self
+            .pending_cancellations
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let was_cancelled = if let Some(index) = pending.iter().position(|item| item == &key) {
+            pending.remove(index);
+            true
+        } else {
+            false
+        };
+        registered.insert(key.clone(), active.clone());
+        drop(pending);
+        drop(registered);
+        if was_cancelled {
+            self.cancel_active_coordinator(&active);
+        }
         ActiveRegistrationV1 {
             provider: self,
             key,
+        }
+    }
+
+    fn cancel_active_coordinator(&self, active: &ActiveCoordinatorV1) {
+        match active {
+            ActiveCoordinatorV1::Leader {
+                lease_id,
+                cancelled,
+            } => {
+                cancelled.store(true, Ordering::Release);
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .fail_gateway_call(lease_id, GatewayFailureReason::Cancelled);
+            }
+            ActiveCoordinatorV1::Follower { call_id, cancelled } => {
+                cancelled.store(true, Ordering::Release);
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .cancel_gateway_follower(call_id);
+            }
         }
     }
 
@@ -537,6 +1019,8 @@ impl GatewayControlledProviderV1 {
             let _ = coordinator.admit_verified_result(
                 call,
                 &resolved.binding,
+                &resolved.observation_plan,
+                &resolved.repository_digest,
                 &loaded.full.gateway_result_id,
                 loaded.full.result.duration_ms,
             );
@@ -589,10 +1073,12 @@ impl GatewayControlledProviderV1 {
             physical_attempt_id,
             ActiveCoordinatorV1::Leader {
                 lease_id: lease_id.clone(),
-                owner: owner.clone(),
                 cancelled: Arc::clone(&cancelled),
             },
         );
+        if cancelled.load(Ordering::Acquire) {
+            return Err(cancelled_provider_error_v1());
+        }
         let verification_call = call.clone();
         let started = Instant::now();
         let heartbeat_failed = Arc::new(AtomicBool::new(false));
@@ -723,6 +1209,8 @@ impl GatewayControlledProviderV1 {
                                 let _ = coordinator.admit_verified_result(
                                     &verification_call,
                                     &resolved.binding,
+                                    &resolved.observation_plan,
+                                    &resolved.repository_digest,
                                     &gateway_result_id,
                                     stored.duration_ms,
                                 );
@@ -891,39 +1379,30 @@ impl StructuredResultCapture for GatewayControlledProviderV1 {
 
 impl ToolCancellation for GatewayControlledProviderV1 {
     fn cancel(&self, cancellation: ProviderCancellation) -> Result<(), ProviderError> {
-        let active = self
+        let key = (
+            cancellation.logical_call_id.as_str().to_owned(),
+            cancellation.physical_attempt_id.get(),
+        );
+        let registered = self
             .active
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .get(&(
-                cancellation.logical_call_id.as_str().to_owned(),
-                cancellation.physical_attempt_id.get(),
-            ))
-            .cloned();
-        if let Some(active) = active {
-            match active {
-                ActiveCoordinatorV1::Leader {
-                    lease_id,
-                    owner,
-                    cancelled,
-                } => {
-                    cancelled.store(true, Ordering::Release);
-                    let _ = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .fail_gateway_call(&lease_id, GatewayFailureReason::Cancelled);
-                    let _ = owner;
+            .unwrap_or_else(|poison| poison.into_inner());
+        let active = registered.get(&key).cloned();
+        if active.is_none() {
+            let mut pending = self
+                .pending_cancellations
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            if !pending.contains(&key) {
+                if pending.len() >= MAX_PENDING_GATEWAY_CANCELLATIONS_V1 {
+                    pending.pop_front();
                 }
-                ActiveCoordinatorV1::Follower { call_id, cancelled } => {
-                    cancelled.store(true, Ordering::Release);
-                    let _ = self
-                        .store
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .cancel_gateway_follower(&call_id);
-                }
+                pending.push_back(key);
             }
+        }
+        drop(registered);
+        if let Some(active) = active.as_ref() {
+            self.cancel_active_coordinator(active);
         }
         self.inner.cancel(cancellation)
     }
@@ -936,21 +1415,225 @@ impl ToolExecution for GatewayControlledProviderV1 {
         secrets: EphemeralSecrets<'_>,
     ) -> Result<Value, ProviderError> {
         let epoch = Arc::clone(&self.observed_workspace.execution_epoch);
-        if call.effect != EffectClass::ReadOnly {
+        if call.effect != EffectClass::ReadOnly
+            || self.reuse_mode == GatewayReuseModeV1::ExecuteOnly
+        {
             return self.execute_direct(&epoch, call, secrets, true);
         }
-        // Preload only a previously verified candidate. Reuse authority still
-        // comes later from a fresh descriptor-bound observation and the exact
-        // current coordinator proof. Loading first lets that observation be
-        // the final filesystem check instead of repeating the whole tree.
-        let preloaded = self
-            .recent_candidate(&Self::recent_candidate_key(&call))
-            .and_then(|candidate| {
-                self.load_stored_exact(&candidate.binding, &candidate.gateway_result_id)
-                    .ok()
-                    .flatten()
-                    .map(|loaded| (candidate, loaded))
-            });
+        // Exact proof for built-in repository tools inspects the same source
+        // or listing state as the provider. With no active task to receive a
+        // durable fact or result reference, lookup and storage add work. The
+        // task-bound path still stores proof and source-backed shared context.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && self
+                .context_coordinator
+                .as_ref()
+                .and_then(|coordinator| coordinator.active_identity_for_call(&call))
+                .is_none()
+        {
+            match RepositoryOperationV1::from_call(&call) {
+                Some(operation) if !operation.is_git() => {
+                    return self.execute_direct(&epoch, call, secrets, true);
+                }
+                Some(RepositoryOperationV1::GitStatus) if self.large_git_status_index() => {
+                    return self.execute_direct(&epoch, call, secrets, true);
+                }
+                _ => {}
+            }
+        }
+        // When the source inventory exceeds the bounded task index, broad
+        // repository proofs traverse far more input than the provider call.
+        // Return a fresh result without a full-result reference. A search may
+        // separately admit at most two file-backed match facts; no fact claims
+        // the complete search result or the absence of other matches.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && self
+                .context_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| {
+                    coordinator.source_inventory_overflow()
+                        && coordinator.active_identity_for_call(&call).is_some()
+                })
+            && RepositoryOperationV1::from_call(&call).is_some_and(|operation| {
+                operation == RepositoryOperationV1::GitStatus
+                    || (matches!(
+                        operation,
+                        RepositoryOperationV1::Search
+                            | RepositoryOperationV1::List
+                            | RepositoryOperationV1::Tree
+                            | RepositoryOperationV1::Glob
+                            | RepositoryOperationV1::References
+                            | RepositoryOperationV1::Manifest
+                    ) && self.broad_input_overflow(&call))
+            })
+        {
+            let observed = self.execute_direct(&epoch, call.clone(), secrets, true);
+            if call.translation.namespaced_tool_name() == "repo.search"
+                && let Ok(value) = &observed
+            {
+                self.admit_bounded_search_matches(&epoch, &call, value);
+            }
+            return observed;
+        }
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && self.direct_repository_operation(&epoch, &call).is_some()
+            && self
+                .context_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| coordinator.active_identity_for_call(&call).is_some())
+        {
+            let key = Self::recent_candidate_key(&call);
+            if let Some(candidate) = self.recent_candidate(&key)
+                && let Some(coordinator) = self.context_coordinator.as_ref()
+                && coordinator
+                    .active_identity_for_call(&call)
+                    .is_some_and(|identity| {
+                        candidate.task_id.as_deref() == Some(identity.task_id())
+                    })
+            {
+                match coordinator.direct_observation_current(
+                    &call,
+                    &candidate.binding,
+                    &candidate.gateway_result_id,
+                ) {
+                    Ok(true) => {
+                        let fresh = self.inner.execute_with_epoch(&epoch, call.clone(), secrets);
+                        if matches!(&fresh, Ok(value) if candidate.matches_fresh_provider_result(value))
+                        {
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_direct_execution(true);
+                            return fresh;
+                        }
+                        if coordinator
+                            .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                            .is_err()
+                        {
+                            return Err(context_authority_failed_v1());
+                        }
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                        if let Err(error) = fresh {
+                            let _ = self
+                                .store
+                                .lock()
+                                .unwrap_or_else(|poison| poison.into_inner())
+                                .record_gateway_direct_execution(true);
+                            return Err(error);
+                        }
+                    }
+                    Ok(false) => {
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                    }
+                    Err(_) => {
+                        if coordinator
+                            .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                            .is_err()
+                        {
+                            return Err(context_authority_failed_v1());
+                        }
+                        self.recent_candidates
+                            .lock()
+                            .unwrap_or_else(|poison| poison.into_inner())
+                            .remove(&key);
+                    }
+                }
+            }
+            return self.execute_direct_with_context(&epoch, call, secrets);
+        }
+        let candidate_key = Self::recent_candidate_key(&call);
+        let mut candidate = self.recent_candidate(&candidate_key);
+        let active_task_id = self
+            .context_coordinator
+            .as_ref()
+            .and_then(|coordinator| coordinator.active_identity_for_call(&call))
+            .map(|identity| identity.task_id().to_owned());
+        if let Some(remembered) = candidate.as_ref()
+            && remembered.task_id == active_task_id
+            && remembered.task_id.is_some()
+            && let Some(coordinator) = self.context_coordinator.as_ref()
+        {
+            match coordinator.result_reference_current(&call, &remembered.gateway_result_id) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.recent_candidates
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner())
+                        .remove(&candidate_key);
+                    candidate = None;
+                }
+                Err(_) => return Err(context_authority_failed_v1()),
+            }
+        }
+        // After a task has received one source-backed built-in result, a
+        // repeated repository call or large-index Git status can execute
+        // through the trusted provider directly.
+        // Returning its freshly executed value is cheaper than proving a
+        // cache hit, and an identical result leaves the admitted fact truthful.
+        // Divergence falls back to the full proof path to retire the old fact
+        // and publish the changed result. This path never serves cached bytes.
+        if self.reuse_mode == GatewayReuseModeV1::Automatic
+            && RepositoryOperationV1::from_call(&call).is_some_and(|operation| {
+                !operation.is_git()
+                    || (operation == RepositoryOperationV1::GitStatus
+                        && self.large_git_status_index())
+            })
+            && let Some(candidate) = candidate.as_ref()
+            && candidate.task_id == active_task_id
+            && candidate.task_id.is_some()
+        {
+            let observed = self.inner.execute_with_epoch(&epoch, call.clone(), secrets);
+            // A bounded in-memory value makes the common comparison cheap.
+            // Larger values use the stored blob digest; neither branch serves
+            // cached bytes as a hit.
+            if matches!(&observed, Ok(value) if candidate.matches_fresh_provider_result(value)) {
+                let _ = self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .record_gateway_direct_execution(true);
+                return observed;
+            }
+            if let Some(coordinator) = self.context_coordinator.as_ref() {
+                if coordinator
+                    .invalidate_source_observation(&call, &candidate.gateway_result_id)
+                    .is_err()
+                {
+                    return Err(context_authority_failed_v1());
+                }
+            }
+            // A source change can retire references in other tasks too. Their
+            // in-memory shortcuts must re-enter admission on the next call.
+            self.recent_candidates
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clear();
+            let _ = self
+                .store
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .record_gateway_direct_execution(observed.is_err());
+            if let Err(error) = observed {
+                let _ = self.resolve(&call);
+                return Err(error);
+            }
+        }
+        // Preload only a previously verified candidate for the actual cache
+        // route. The direct path above compares a fresh provider result with
+        // an in-memory digest and never serves cached bytes.
+        let preloaded = self.recent_candidate(&candidate_key).and_then(|candidate| {
+            self.load_stored_exact(&candidate.binding, &candidate.gateway_result_id)
+                .ok()
+                .flatten()
+                .map(|loaded| (candidate, loaded))
+        });
         let Some(resolved) = self.resolve(&call) else {
             return self.execute_direct(&epoch, call, secrets, true);
         };
@@ -1380,23 +2063,60 @@ impl ExperimentalMcpGatewayV1 {
     pub fn build(workspace: &Path) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
-        Self::build_with_shared_store_v1(&workspace, store)
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::Automatic)
+    }
+
+    /// Diagnostic control for measuring the exact same MCP and provider path
+    /// with cache lookup and storage bypassed. Stdio has no authenticated task
+    /// recipient, so this mode cannot silently weaken shared-context claims.
+    pub(crate) fn build_execute_only_v1(workspace: &Path) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
+        let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::ExecuteOnly)
+    }
+
+    #[cfg(test)]
+    fn build_force_reuse_v1(workspace: &Path) -> Result<Self> {
+        let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
+        let store = Arc::new(Mutex::new(Store::open_for_workspace(&workspace)?));
+        Self::build_with_shared_store_mode_v1(&workspace, store, GatewayReuseModeV1::ForceReuse)
     }
 
     /// Construct isolated MCP protocol state over one daemon-owned durable
     /// store. Each connection still receives its own gateway and lifecycle,
     /// while cold connection storms avoid concurrently reopening/migrating the
     /// same SQLite authority.
+    #[cfg(feature = "daemon")]
     pub(crate) fn build_with_shared_store_v1(
         workspace: &Path,
         store: Arc<Mutex<Store>>,
     ) -> Result<Self> {
+        Self::build_with_shared_store_mode_v1(workspace, store, GatewayReuseModeV1::Automatic)
+    }
+
+    #[cfg(feature = "daemon")]
+    pub(crate) fn build_with_shared_store_execute_only_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+    ) -> Result<Self> {
+        Self::build_with_shared_store_mode_v1(workspace, store, GatewayReuseModeV1::ExecuteOnly)
+    }
+
+    fn build_with_shared_store_mode_v1(
+        workspace: &Path,
+        store: Arc<Mutex<Store>>,
+        reuse_mode: GatewayReuseModeV1,
+    ) -> Result<Self> {
         let workspace = fs::canonicalize(workspace).context("resolve experimental workspace")?;
         let observed_workspace = SharedObservedWorkspaceV1::begin(&workspace)?;
+        // Code-index observations can cover thousands of files. Keep their
+        // witness set out of the hot exact-result manifest while both planes
+        // retain the same workspace epoch and durable task ledger.
+        let context_workspace = observed_workspace.fork_manifest()?;
         let context_coordinator = Arc::new(LocalContextCoordinatorV1::new(
             &workspace,
             Arc::clone(&store),
-            observed_workspace.clone(),
+            context_workspace,
         ));
         let repository = Arc::new(RepositoryProviderV1::new(&workspace)?);
         let repository_controlled: Arc<dyn UpstreamProvider> =
@@ -1406,6 +2126,7 @@ impl ExperimentalMcpGatewayV1 {
                 observed_workspace.clone(),
                 Arc::clone(&store),
                 Some(Arc::clone(&context_coordinator)),
+                reuse_mode,
             ));
         let git = Arc::new(GitProviderV1::new(&workspace)?);
         let git_controlled: Arc<dyn UpstreamProvider> =
@@ -1415,6 +2136,7 @@ impl ExperimentalMcpGatewayV1 {
                 observed_workspace.clone(),
                 Arc::clone(&store),
                 Some(Arc::clone(&context_coordinator)),
+                reuse_mode,
             ));
         let task_context: Arc<dyn UpstreamProvider> = Arc::new(LocalContextProviderV1::new(
             ContextProviderKindV1::Task,
@@ -1639,7 +2361,7 @@ fn resolve_repository_request_v1(
         state: RepositoryEnvironmentStateV1::Known {
             reference: StateDigestReferenceV1 {
                 schema_version: 1,
-                repository: DigestReferenceV1::new("blake3", repository_digest)?,
+                repository: DigestReferenceV1::new("blake3", repository_digest.clone())?,
                 environment: DigestReferenceV1::new("blake3", environment_digest)?,
             },
         },
@@ -1687,6 +2409,7 @@ fn resolve_repository_request_v1(
         core_call,
         binding,
         observation_plan,
+        repository_digest,
     })
 }
 
@@ -1868,6 +2591,19 @@ fn provider_io_v1(error: impl std::fmt::Display) -> ProviderError {
     )
 }
 
+fn context_authority_failed_v1() -> ProviderError {
+    ProviderError::gateway_authored(
+        McpError::typed(
+            McpErrorCode::InternalError,
+            "verified context authority check failed",
+        )
+        .with_data(json!({
+            "reason": "context_authority_failed",
+            "retryable": true
+        })),
+    )
+}
+
 fn cancelled_provider_error_v1() -> ProviderError {
     ProviderError::gateway_authored(
         McpError::typed(McpErrorCode::RequestCancelled, "gateway call cancelled")
@@ -1877,6 +2613,7 @@ fn cancelled_provider_error_v1() -> ProviderError {
 
 #[cfg(test)]
 mod product_tests {
+    use std::process::Command;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1986,6 +2723,103 @@ mod product_tests {
     }
 
     #[test]
+    fn diagnostic_execute_only_mode_preserves_results_without_reuse() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same\n").unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build_execute_only_v1(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        let initialized = process(gateway.gateway(), "init", initialize);
+        assert_eq!(initialized["result"]["protocolVersion"], "2025-06-18");
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        let first = process(gateway.gateway(), "first", read);
+        let second = process(gateway.gateway(), "second", read);
+        assert_eq!(first["result"]["content"][0]["text"], "same\n");
+        assert_eq!(first["result"], second["result"]);
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.executed, 2);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
+    fn automatic_mode_executes_repository_reads_without_a_shared_task() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"same\n").unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(gateway.gateway(), "init", initialize);
+        let read = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"repo.read","arguments":{"path":"input.txt"}}}"#;
+        let first = process(gateway.gateway(), "first", read);
+        let second = process(gateway.gateway(), "second", read);
+        assert_eq!(first["result"], second["result"]);
+        assert_eq!(first["result"]["content"][0]["text"], "same\n");
+        let search = br#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"repo.search","arguments":{"path":".","pattern":"same"}}}"#;
+        let first_search = process(gateway.gateway(), "first-search", search);
+        let second_search = process(gateway.gateway(), "second-search", search);
+        assert_eq!(first_search["result"], second_search["result"]);
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 4);
+        assert_eq!(stats.executed, 4);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
+    fn automatic_mode_executes_large_standalone_git_status_directly() {
+        let workspace = TempDir::new().unwrap();
+        let git = |arguments: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(workspace.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        git(&["init", "--quiet"]);
+        for index in 0..250 {
+            fs::write(
+                workspace.path().join(format!("file_{index:04}.txt")),
+                b"x\n",
+            )
+            .unwrap();
+        }
+        git(&["add", "."]);
+        assert!(
+            fs::metadata(workspace.path().join(".git/index"))
+                .unwrap()
+                .len()
+                >= STANDALONE_GIT_STATUS_DIRECT_INDEX_BYTES_V1
+        );
+        git(&[
+            "-c",
+            "user.name=Again Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
+        process(gateway.gateway(), "init", initialize);
+        let status = br#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.status","arguments":{}}}"#;
+        let first = process(gateway.gateway(), "first", status);
+        let second = process(gateway.gateway(), "second", status);
+        assert_eq!(
+            first["result"], second["result"],
+            "first={first} second={second}"
+        );
+        let stats = gateway.stats().unwrap();
+        assert_eq!(stats.requested, 2);
+        assert_eq!(stats.executed, 2);
+        assert_eq!(stats.exact_hits, 0);
+    }
+
+    #[test]
     fn concurrent_sessions_execute_once_and_join_exact_inflight_call() {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.txt"), b"same").unwrap();
@@ -2051,7 +2885,7 @@ mod product_tests {
         let workspace = TempDir::new().unwrap();
         fs::write(workspace.path().join("input.txt"), b"first").unwrap();
         fs::write(workspace.path().join("other.txt"), b"unrelated").unwrap();
-        let gateway = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+        let gateway = ExperimentalMcpGatewayV1::build_force_reuse_v1(workspace.path()).unwrap();
         let initialize = br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}"#;
         process(gateway.gateway(), "init", initialize);
         let call = |id: u8| {
@@ -2076,6 +2910,49 @@ mod product_tests {
         assert_ne!(first["result"], relevant["result"]);
         assert_eq!(relevant["result"]["content"][0]["text"], "second");
         assert_eq!(gateway.stats().unwrap().executed, 2);
+    }
+
+    #[test]
+    fn code_index_manifest_does_not_add_tool_proof_witnesses() {
+        let workspace = TempDir::new().unwrap();
+        fs::write(workspace.path().join("input.txt"), b"content").unwrap();
+        let gateway_observed =
+            SharedObservedWorkspaceV1::begin(&fs::canonicalize(workspace.path()).unwrap()).unwrap();
+        let index_observed = gateway_observed.fork_manifest().unwrap();
+        assert!(Arc::ptr_eq(
+            &gateway_observed.execution_epoch,
+            &index_observed.execution_epoch
+        ));
+        let plan = RepositoryObservationPlanV1::new(
+            vec![PathBuf::from("input.txt")],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        index_observed
+            .manifest
+            .lock()
+            .unwrap()
+            .observe_repository(&plan)
+            .unwrap();
+        assert_eq!(
+            gateway_observed
+                .manifest
+                .lock()
+                .unwrap()
+                .accounting()
+                .observed_entries(),
+            0
+        );
+        assert!(
+            index_observed
+                .manifest
+                .lock()
+                .unwrap()
+                .accounting()
+                .observed_entries()
+                > 0
+        );
     }
 
     #[test]
@@ -2274,5 +3151,95 @@ mod product_tests {
             .unwrap();
         assert_eq!(stats.executed, 2);
         assert_eq!(stats.inflight_joins, 0);
+    }
+
+    #[test]
+    fn cancellation_before_follower_registration_retires_only_the_follower() {
+        let workspace = TempDir::new().unwrap();
+        let state = TempDir::new().unwrap();
+        let store = Arc::new(Mutex::new(Store::open(state.path().join("store")).unwrap()));
+        let controlled = GatewayControlledProviderV1::new(
+            Arc::new(SlowRepositoryProviderV1 {
+                executions: AtomicUsize::new(0),
+            }),
+            fs::canonicalize(workspace.path()).unwrap(),
+            Arc::clone(&store),
+        )
+        .unwrap();
+        let state_digest = blake3::hash(b"pending-follower-state").to_hex().to_string();
+        let binding = ValidatedGatewayReadV1::validate(GatewayCoordinatorInputV1 {
+            request_digest: blake3::hash(b"pending-follower-request")
+                .to_hex()
+                .to_string(),
+            state_digest: state_digest.clone(),
+            policy_digest: gateway_policy_digest(POLICY_VERSION_V1),
+            operation: GatewayOperationDispositionV1::ReplayEligibleRead,
+            freshness: GatewayFreshnessEvidenceV1 {
+                snapshot_digest: state_digest,
+                observed_at_ms: now_millis_i64_v1(),
+                valid_until_ms: now_millis_i64_v1() + 60_000,
+            },
+            dependencies: Vec::new(),
+        })
+        .unwrap();
+        let leader_lease = match store
+            .lock()
+            .unwrap()
+            .acquire_gateway_call(&binding, "pending-leader")
+            .unwrap()
+        {
+            GatewayCallAcquisition::Leader { lease_id, .. } => lease_id,
+            other => panic!("expected leader: {other:?}"),
+        };
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .start_gateway_execution(&leader_lease, "pending-leader")
+                .unwrap(),
+            GatewayExecutionStart::Started
+        );
+        let follower_call = match store
+            .lock()
+            .unwrap()
+            .acquire_gateway_call(&binding, "pending-follower")
+            .unwrap()
+        {
+            GatewayCallAcquisition::Follower { call_id, .. } => call_id,
+            other => panic!("expected follower: {other:?}"),
+        };
+        let key = ("pending-follower".to_owned(), 1);
+        controlled
+            .pending_cancellations
+            .lock()
+            .unwrap()
+            .push_back(key.clone());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _registration = controlled.remember_active(
+            &key.0,
+            key.1,
+            ActiveCoordinatorV1::Follower {
+                call_id: follower_call.clone(),
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(controlled.pending_cancellations.lock().unwrap().is_empty());
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .cancel_gateway_follower(&follower_call)
+                .unwrap(),
+            crate::store::GatewayFollowerCancellation::AlreadyCancelled
+        );
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .observe_gateway_call(&binding)
+                .unwrap(),
+            GatewayCallObservation::Inflight { .. }
+        ));
     }
 }

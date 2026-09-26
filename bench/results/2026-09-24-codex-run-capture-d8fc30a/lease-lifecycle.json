@@ -1,0 +1,24 @@
+{
+  "againBinarySha256": "08344d516c3281c2bbd3630959375ced1324d8d8f63a97be9c6d51060ff10bee",
+  "boundedWaitFallbackReportedPeer": true,
+  "classification": {
+    "code": "launcher_lease_handoff_passed",
+    "type": "pass"
+  },
+  "client": "codex",
+  "followerClaimedAfterLeader": true,
+  "followerPromptSha256": "ae0ef97841369f053261e03105635762cf630dd5e8667ba0b4384ad27f6a3f72",
+  "followerReceivedFreshEditedSource": true,
+  "followerWaitedForLeader": true,
+  "leaderPromptSha256": "66417fc863798428f36be67f91636d358f2395e79828adcc3d261e4a5d941cfe",
+  "leaderRetiredAfterExit": true,
+  "leaderVisibleDuringRun": true,
+  "recordedAtUtc": "2026-09-24T22:33:51.442754+00:00",
+  "schema": "again.agent-launch-e2e.v1",
+  "source": {
+    "clean": true,
+    "git_sha": "d8fc30a48be725da0b86fcdc6ad9f506b8e4e1fe",
+    "git_sha256": "64b69aaf549e7a329c8a094b06592f72a41c004f006f1f695c8c0fef85df26ef",
+    "root": "/private/tmp/again-brain-capture-worktree"
+  }
+}

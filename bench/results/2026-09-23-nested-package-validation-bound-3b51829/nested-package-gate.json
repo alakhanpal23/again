@@ -1,0 +1,58 @@
+{
+  "accepted": true,
+  "alphaPreviewPaths": [
+    [
+      "packages/alpha/src/total.mjs",
+      "explicit_task_path"
+    ],
+    [
+      "packages/alpha/test/total.spec.mjs",
+      "indexed_candidate"
+    ]
+  ],
+  "alphaSelector": {
+    "basis": "current_package_test_script",
+    "command": "npm test",
+    "source": {
+      "digest": "9e31c48beeee1b70e80dd4a56c34fd5f887dc5b351bf190b3912b89ecc32f3fc",
+      "path": "packages/alpha/package.json",
+      "testScript": "node --test test/total.spec.mjs"
+    },
+    "verified": false,
+    "workingDirectory": "packages/alpha"
+  },
+  "alphaTestExitCode": 0,
+  "betaPreviewPaths": [
+    [
+      "packages/beta/src/total.mjs",
+      "explicit_task_path"
+    ],
+    [
+      "packages/alpha/src/total.mjs",
+      "indexed_candidate"
+    ]
+  ],
+  "betaSelector": {
+    "basis": "current_package_test_script",
+    "command": "pnpm test",
+    "source": {
+      "digest": "b2b928f5fdd025e6e6d38156d9f4971a97aba4caa82c1f61b539bcbdb213cd24",
+      "path": "packages/beta/package.json",
+      "testScript": "node --test test/total.spec.mjs"
+    },
+    "verified": false,
+    "workingDirectory": "packages/beta"
+  },
+  "binarySha256": "28977dadd795e4749e90268128bcce4973ea77c7f3b8945a6fcb7177f17bd27e",
+  "evidenceScope": "source-backed nested package test guidance; the separate npm test is not an agent-run validation",
+  "recordedAtUtc": "2026-09-24T04:53:02.859295+00:00",
+  "schema": "again.nested-package-validation-gate.v1",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "3b5182941b6ebd39094eb085f281ba89a49834b1",
+    "dirty": false,
+    "head": "3b5182941b6ebd39094eb085f281ba89a49834b1"
+  },
+  "staleSelector": null
+}

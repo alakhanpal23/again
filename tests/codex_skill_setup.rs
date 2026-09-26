@@ -34,6 +34,21 @@ fn dry_run_renders_the_skill_without_touching_disk() {
     assert!(change.changed);
     assert_eq!(change.path, directory.join("SKILL.md"));
     assert!(change.rendered.starts_with("---\nname: again\n"));
+    assert!(change.rendered.contains("call `task.start` once"));
+    assert!(change.rendered.contains("`context.delta`"));
+    assert!(change.rendered.contains("`context.publish`"));
+    assert!(change.rendered.contains("`context.retrieve`"));
+    assert!(change.rendered.contains("authenticated local daemon"));
+    assert!(
+        change
+            .rendered
+            .contains("Use ordinary shell and editor tools")
+    );
+    assert!(
+        change
+            .rendered
+            .contains("lookup and proof can cost more than the call itself")
+    );
     assert!(change.rendered.contains("again run --"));
     assert!(change.rendered.contains("again reference --"));
     assert!(change.rendered.contains("Never invoke Again's hidden"));

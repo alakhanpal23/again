@@ -1,0 +1,109 @@
+{
+  "schema": "again.diverse-real-cohort-summary.v2",
+  "completedPairs": 16,
+  "plannedPairs": 16,
+  "acceptedPairs": 14,
+  "allAccepted": false,
+  "medianTimeRatioAcceptedOnly": 0.8490294053847336,
+  "medianApiEquivalentCostRatioAcceptedOnly": 0.9030763478259456,
+  "qualifiedAgainstFrozenGate": false,
+  "warning": "Accepted-only ratios are diagnostic until every planned pair is accepted.",
+  "pairs": [
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "packaging-empty-platforms",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": false
+    },
+    {
+      "fixture": "camelcase-number-separator",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "historical-search-unlocated",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": false
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "cold",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "cold",
+      "order": "again-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "returning",
+      "order": "baseline-first",
+      "accepted": true
+    },
+    {
+      "fixture": "tomlkit-array-slice",
+      "mode": "returning",
+      "order": "again-first",
+      "accepted": true
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "accepted": true,
+  "binarySha256": "d23d7bc241c389e398a13a86b42d5787a93a3a29ec8f305ec61d386c9cdad957",
+  "brainPaths": [
+    "src/ledger.py",
+    "src/unrelated.py",
+    "tests/test_ledger.py"
+  ],
+  "briefPathsAfterEdit": [
+    "tests/test_ledger.py",
+    "src/unrelated.py"
+  ],
+  "briefPathsBeforeEdit": [
+    "tests/test_ledger.py",
+    "src/ledger.py"
+  ],
+  "codexExitCode": 0,
+  "codexVersion": "codex-cli 0.156.1",
+  "completedCommands": [
+    {
+      "command": "/bin/zsh -lc \"rg -n 'balance|value' src tests 2>/dev/null\"",
+      "exitCode": 0,
+      "outputMarker": true
+    }
+  ],
+  "evidenceScope": "one live Codex search in an isolated repository; no speed claim",
+  "fixtureSha256": "ce5d272161e9a92ffbc12462bd1face3232e40ca172523faea080996e6187a17",
+  "hookRemoved": true,
+  "hookTrustMode": "one_off_bypass_for_fixed_fixture",
+  "recordedAtUtc": "2026-09-24T04:23:54.920385+00:00",
+  "schema": "again.codex-brain-live-search-hook.v1",
+  "searchCommand": "rg -n 'balance|value' src tests 2>/dev/null",
+  "searchShape": "alternation",
+  "source": {
+    "binarySourceBindingVerified": true,
+    "buildSourceClean": true,
+    "buildSourceSha": "ee60b2f906105a452507398c20a66a581653c092",
+    "dirty": false,
+    "head": "ee60b2f906105a452507398c20a66a581653c092"
+  },
+  "timedOut": false,
+  "traceFilter": "error events omitted because they can include user configuration paths",
+  "traceSha256": "f81baee46e975436b0af04963c0346755e612d9d4fe0661047d2fbce2ae25669"
+}

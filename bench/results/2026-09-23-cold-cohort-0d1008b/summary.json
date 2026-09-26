@@ -1,0 +1,266 @@
+{
+  "schema": "again.single-agent-cold-cohort-result.v1",
+  "recordedAtUtc": "2026-09-23T22:30:43.770764+00:00",
+  "manifestSha256": "d54ebb608af6ec4b8dc37a4c12c937bfd364e865a7f708a50fdb0c3a6a8edd6b",
+  "binarySha256": "8f8f2cace6932f9271a4e4fce952a05d2a9a1c753c90468eeff8ca830d10010c",
+  "model": "gpt-6-sol",
+  "evidenceScope": "cold local tasks only; returning tasks and cost qualification remain open",
+  "acceptedPairs": 10,
+  "totalPairs": 10,
+  "pairedMedianElapsedRatio": 0.870270800298756,
+  "pairedP95ElapsedRatio": 1.0387248908968612,
+  "pairedMedianElapsedTargetMet": false,
+  "baselineUsageTotals": {
+    "uncachedInput": 68693,
+    "cachedInput": 772224,
+    "output": 5462
+  },
+  "againUsageTotals": {
+    "uncachedInput": 56906,
+    "cachedInput": 562176,
+    "output": 4342
+  },
+  "allUsageVectorsComplete": true,
+  "pairs": [
+    {
+      "fixture": "calculator",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 23263.76,
+      "againMs": 12365.802,
+      "elapsedRatio": 0.5315478667248975,
+      "baselineActions": 8,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 10888,
+        "cachedInput": 103808,
+        "output": 708
+      },
+      "againUsage": {
+        "uncachedInput": 4875,
+        "cachedInput": 43648,
+        "output": 324
+      }
+    },
+    {
+      "fixture": "calculator",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 20907.615,
+      "againMs": 16113.166,
+      "elapsedRatio": 0.7706840785044109,
+      "baselineActions": 8,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 5785,
+        "cachedInput": 92288,
+        "output": 562
+      },
+      "againUsage": {
+        "uncachedInput": 4973,
+        "cachedInput": 43648,
+        "output": 376
+      }
+    },
+    {
+      "fixture": "running-balance",
+      "sourceFiles": 1000,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 26068.399,
+      "againMs": 16292.561,
+      "elapsedRatio": 0.624992773817832,
+      "baselineActions": 6,
+      "againActions": 4,
+      "baselineUsage": {
+        "uncachedInput": 9393,
+        "cachedInput": 98560,
+        "output": 822
+      },
+      "againUsage": {
+        "uncachedInput": 5513,
+        "cachedInput": 60032,
+        "output": 481
+      }
+    },
+    {
+      "fixture": "running-balance",
+      "sourceFiles": 1000,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 20749.454,
+      "againMs": 13966.651,
+      "elapsedRatio": 0.6731093261538351,
+      "baselineActions": 8,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 6010,
+        "cachedInput": 92928,
+        "output": 604
+      },
+      "againUsage": {
+        "uncachedInput": 5096,
+        "cachedInput": 43776,
+        "output": 431
+      }
+    },
+    {
+      "fixture": "rust-calculator",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 19243.457,
+      "againMs": 18765.513,
+      "elapsedRatio": 0.9751632983616197,
+      "baselineActions": 4,
+      "againActions": 5,
+      "baselineUsage": {
+        "uncachedInput": 5016,
+        "cachedInput": 58880,
+        "output": 322
+      },
+      "againUsage": {
+        "uncachedInput": 9679,
+        "cachedInput": 71936,
+        "output": 482
+      }
+    },
+    {
+      "fixture": "rust-calculator",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 15903.575,
+      "againMs": 15470.119,
+      "elapsedRatio": 0.9727447444992714,
+      "baselineActions": 5,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 5229,
+        "cachedInput": 59008,
+        "output": 382
+      },
+      "againUsage": {
+        "uncachedInput": 5357,
+        "cachedInput": 43520,
+        "output": 479
+      }
+    },
+    {
+      "fixture": "js-calculator",
+      "sourceFiles": 1000,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 16257.706,
+      "againMs": 15229.016,
+      "elapsedRatio": 0.9367260055016372,
+      "baselineActions": 5,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 5211,
+        "cachedInput": 59136,
+        "output": 383
+      },
+      "againUsage": {
+        "uncachedInput": 5196,
+        "cachedInput": 59776,
+        "output": 364
+      }
+    },
+    {
+      "fixture": "js-calculator",
+      "sourceFiles": 1000,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 15325.152,
+      "againMs": 15605.297,
+      "elapsedRatio": 1.0182800797016565,
+      "baselineActions": 3,
+      "againActions": 4,
+      "baselineUsage": {
+        "uncachedInput": 5161,
+        "cachedInput": 58880,
+        "output": 465
+      },
+      "againUsage": {
+        "uncachedInput": 5392,
+        "cachedInput": 75904,
+        "output": 410
+      }
+    },
+    {
+      "fixture": "greeting-feature",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 21584.851,
+      "againMs": 22420.722,
+      "elapsedRatio": 1.0387248908968612,
+      "baselineActions": 7,
+      "againActions": 4,
+      "baselineUsage": {
+        "uncachedInput": 10658,
+        "cachedInput": 73472,
+        "output": 671
+      },
+      "againUsage": {
+        "uncachedInput": 5680,
+        "cachedInput": 76288,
+        "output": 503
+      }
+    },
+    {
+      "fixture": "greeting-feature",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 20868.881,
+      "againMs": 16774.732,
+      "elapsedRatio": 0.803815595095875,
+      "baselineActions": 5,
+      "againActions": 3,
+      "baselineUsage": {
+        "uncachedInput": 5342,
+        "cachedInput": 75264,
+        "output": 543
+      },
+      "againUsage": {
+        "uncachedInput": 5145,
+        "cachedInput": 43648,
+        "output": 492
+      }
+    }
+  ]
+}

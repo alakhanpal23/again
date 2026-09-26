@@ -1,0 +1,298 @@
+[
+  {
+    "condition": "baseline",
+    "exitCode": 0,
+    "timedOut": false,
+    "eventsCaptured": true,
+    "elapsedMs": 21276.247,
+    "preparationMs": 0.0,
+    "codexElapsedMs": 21276.247,
+    "eventTimeline": [
+      {
+        "elapsedMs": 6409.447,
+        "event": "item.started",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6409.47,
+        "event": "item.completed",
+        "itemId": "item_1",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6409.474,
+        "event": "item.started",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 6409.477,
+        "event": "item.completed",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 9417.126,
+        "event": "item.started",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 9417.169,
+        "event": "item.completed",
+        "itemId": "item_3",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 14240.291,
+        "event": "item.started",
+        "itemId": "item_4",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 14265.617,
+        "event": "item.completed",
+        "itemId": "item_4",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 17876.062,
+        "event": "item.started",
+        "itemId": "item_6",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 17876.077,
+        "event": "item.completed",
+        "itemId": "item_6",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 20493.012,
+        "event": "turn.completed",
+        "itemId": null,
+        "itemType": null
+      }
+    ],
+    "firstEditMs": 14265.625,
+    "rawEventBytes": 15719,
+    "rawEventSha256": "15893a9ee8f8d62234be66599821ccfffbd65b96cfa40533e9a54e848a1ac1a8",
+    "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+    "eventCount": 16,
+    "completedActions": [
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'rg -n \"def __setitem__|class Array|slice\" tomlkit/items.py'",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'git status --short'",
+        "exitCode": 0
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc \"sed -n '1377,1680p' tomlkit/items.py\"",
+        "exitCode": 0
+      },
+      {
+        "type": "file_change",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "",
+        "exitCode": null
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+        "exitCode": 0
+      }
+    ],
+    "usage": {
+      "input_tokens": 89363,
+      "cached_input_tokens": 77312,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 766,
+      "reasoning_output_tokens": 42
+    },
+    "oracle": {
+      "passed": true,
+      "target_oracle_mode": "behavior",
+      "target_oracle_passed": true,
+      "exact_target": true,
+      "collateral_safe": true,
+      "changed_paths": [
+        "tomlkit/items.py"
+      ],
+      "tests_passed": true,
+      "test_elapsed_ms": 75.075,
+      "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+      "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+    },
+    "agentValidationObserved": true,
+    "againStatsDelta": {
+      "requested": 0,
+      "executed": 0,
+      "exact_hits": 0,
+      "inflight_joins": 0,
+      "context_events": 0
+    },
+    "priorBrain": null,
+    "livePriorTask": {
+      "elapsedMs": 7825.693,
+      "usage": {
+        "input_tokens": 31424,
+        "cached_input_tokens": 27264,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 203,
+        "reasoning_output_tokens": 9
+      },
+      "completedCommands": 1,
+      "brainObserved": false,
+      "rawEventSha256": "80b91e83a476bd863a442b74ccd07075efb275c432639c919a362690fe20c12e",
+      "rawEventBytes": 1233
+    },
+    "brainRun": null,
+    "brainRunError": null
+  },
+  {
+    "condition": "product",
+    "exitCode": 0,
+    "timedOut": false,
+    "eventsCaptured": true,
+    "elapsedMs": 13894.582,
+    "preparationMs": 0.0,
+    "codexElapsedMs": 13894.582,
+    "eventTimeline": [
+      {
+        "elapsedMs": 7555.069,
+        "event": "item.started",
+        "itemId": "item_1",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 7575.514,
+        "event": "item.completed",
+        "itemId": "item_1",
+        "itemType": "file_change"
+      },
+      {
+        "elapsedMs": 10150.914,
+        "event": "item.started",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 10150.928,
+        "event": "item.completed",
+        "itemId": "item_2",
+        "itemType": "command_execution"
+      },
+      {
+        "elapsedMs": 12967.534,
+        "event": "turn.completed",
+        "itemId": null,
+        "itemType": null
+      }
+    ],
+    "firstEditMs": 7575.521,
+    "rawEventBytes": 1847,
+    "rawEventSha256": "a78fecd980e330c58edad59e8000ba24e918e921d39da166207dbe4875773641",
+    "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+    "eventCount": 9,
+    "completedActions": [
+      {
+        "type": "file_change",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "",
+        "exitCode": null
+      },
+      {
+        "type": "command_execution",
+        "tool": null,
+        "status": "completed",
+        "resultBytes": null,
+        "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+        "exitCode": 0
+      }
+    ],
+    "usage": {
+      "input_tokens": 51979,
+      "cached_input_tokens": 40448,
+      "cache_write_input_tokens": 0,
+      "output_tokens": 414,
+      "reasoning_output_tokens": 88
+    },
+    "oracle": {
+      "passed": true,
+      "target_oracle_mode": "behavior",
+      "target_oracle_passed": true,
+      "exact_target": true,
+      "collateral_safe": true,
+      "changed_paths": [
+        "tomlkit/items.py"
+      ],
+      "tests_passed": true,
+      "test_elapsed_ms": 78.966,
+      "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+      "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+    },
+    "agentValidationObserved": true,
+    "againStatsDelta": {
+      "requested": 0,
+      "executed": 0,
+      "exact_hits": 0,
+      "inflight_joins": 0,
+      "context_events": 1
+    },
+    "priorBrain": null,
+    "livePriorTask": {
+      "elapsedMs": 8729.809,
+      "usage": {
+        "input_tokens": 34076,
+        "cached_input_tokens": 28544,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 223,
+        "reasoning_output_tokens": 21
+      },
+      "completedCommands": 1,
+      "brainObserved": true,
+      "rawEventSha256": "2320624dec41185902dd0772734adcc366c0e658d6e21773629bf2007e563308",
+      "rawEventBytes": 1264
+    },
+    "brainRun": {
+      "authorization_scope_digest": "04513f7d3f4974a03a174b617b8c93c5e095413775225f369644379e5653132f",
+      "cached_input_tokens": 40448,
+      "completed_commands": 1,
+      "completed_edits": 1,
+      "completed_mcp_calls": 0,
+      "completed_ms": 1790289630234,
+      "completed_source_reads": 0,
+      "exit_code": 0,
+      "input_tokens": 51979,
+      "output_tokens": 414,
+      "session_id": "197e4cdb-c0da-4d22-9a44-d9f617189966",
+      "started_ms": 1790289616375,
+      "successful_tests": 0,
+      "task_id": "tomlkit-array-slice-fix",
+      "turn_completed": true
+    },
+    "brainRunError": null
+  }
+]

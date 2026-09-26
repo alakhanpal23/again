@@ -1,0 +1,373 @@
+{
+  "schema": "again.diverse-real-pair.v2",
+  "identity": {
+    "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+    "source": {
+      "head": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "dirty": false,
+      "buildSourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "camelcase-number-separator",
+  "mode": "cold",
+  "order": "baseline-first",
+  "observations": [
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 41568.506,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 41568.506,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5440.367,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5440.388,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5440.391,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5440.428,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5440.432,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5440.434,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.17,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.18,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.188,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.207,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.21,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11947.215,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 33145.148,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 33165.421,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 37794.412,
+          "event": "item.started",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 37794.436,
+          "event": "item.completed",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 40764.408,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 33165.428,
+      "rawEventBytes": 11282,
+      "rawEventSha256": "594a41825caf8719aa6f3aed7aefe7c4b9d133350e5fc287e72d5046c71c474a",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 22,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"camel|pascal|underscore|hyphen\" index.js'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1,240p' index.js\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1,240p' tests/test_again_oracle.mjs\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat package.json'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"b2b|numeric|number|digit|pascal|123|1a|2b\" tests package.json'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 90368,
+        "cached_input_tokens": 81920,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1585,
+        "reasoning_output_tokens": 952
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 80.364,
+        "test_output_sha256": "8726bd8ed8ccbe2e98b882232a8050a379dc32f136926cadb7a62e1ff67addc0",
+        "after_snapshot_sha256": "fe1a4af26d5cc0144ccdee77176979c55388e6c392f5d5acbd5efbbc1dfabc5b"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": null,
+      "brainRunError": null
+    },
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 28308.762,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 28308.762,
+      "eventTimeline": [
+        {
+          "elapsedMs": 4568.538,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 4568.588,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 22215.886,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 22241.045,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 24416.088,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 24416.111,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 27596.829,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 22241.052,
+      "rawEventBytes": 6372,
+      "rawEventSha256": "47c0401f3826f8fc153565aa047b7467df822dce50173b50294c54e5de31bb72",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 12,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'cat index.js'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'node --test tests/test_again_oracle.mjs'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 72705,
+        "cached_input_tokens": 64896,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 1155,
+        "reasoning_output_tokens": 720
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": false,
+        "collateral_safe": true,
+        "changed_paths": [
+          "index.js"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 79.898,
+        "test_output_sha256": "95a021c8afeb2b95abbb189a02e8158ae998137d9f8eba13560ef61ef07815b3",
+        "after_snapshot_sha256": "f15a4f77d43f36d0cd342f0462b3d8bccf3533685fc5d0cd6ce4f3c0a4432109"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": null,
+      "brainRun": {
+        "authorization_scope_digest": "ca2b0376bb2be71afe9920af57084683970b765e6371926868c400a19f020726",
+        "cached_input_tokens": 64896,
+        "completed_commands": 2,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790287103085,
+        "completed_source_reads": 1,
+        "exit_code": 0,
+        "input_tokens": 72705,
+        "output_tokens": 1155,
+        "session_id": "995401ef-f3c7-4a0e-9cda-7432e4d85c35",
+        "started_ms": 1790287075008,
+        "successful_tests": 1,
+        "task_id": "camelcase-number-separator-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T21:58:23.237963+00:00"
+}

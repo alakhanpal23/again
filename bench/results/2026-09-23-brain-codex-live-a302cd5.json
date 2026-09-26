@@ -1,0 +1,180 @@
+{
+  "accepted": true,
+  "againBinarySha256": "0ae4c4a86c5b6d49d96e19a552d9315dc22153e81fed3ca1568bf695cacefd31",
+  "approvalMode": "approve-for-me",
+  "codexBinarySha256": "0196e89fe5a7598f816ee54232c3d7c26d75e502ab5cfe2c9240e81d90f7255a",
+  "codexVersion": "codex-cli 0.156.1",
+  "compactTaskResult": false,
+  "evidenceScope": "one unbalanced local pair, not acceleration qualification",
+  "fixture": "calculator",
+  "fixtureSha256": "40894a569557708809bce2160bb8c86dffb5ad8dbe8e77a3a58630eefabf4fe3",
+  "harnessSha256": "cc6c926bd68cf32b409b3098d9cb7154c8344d4dc9e48b417a5dc85d9a25b701",
+  "model": "gpt-6-sol",
+  "observations": [
+    {
+      "againStatsDelta": {
+        "context_events": 0,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 23611.297,
+      "completedActions": [
+        {
+          "command": "/bin/zsh -lc \"git status --short && sed -n '1,200p' src/calculator.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"pwd && rg --files -g 'AGENTS.md' -g 'src/calculator.py' -g 'test*' -g 'pyproject.toml' -g 'pytest.ini' -g 'setup.cfg' -g 'tox.ini'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,200p' tests/test_calculator.py\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc \"sed -n '1,120p' README.md && rg --files -g '\"'!README.md'\"'\"",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -v'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "baseline",
+      "elapsedMs": 23611.297,
+      "eventCount": 18,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 16856.381,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 122.791,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 4606,
+      "rawEventFile": "again-brain-codex-live-a302cd5-baseline.jsonl",
+      "rawEventSha256": "65bb4125d9dfd2e287f5f4934dd5ed58d7603e577ed136ad5614dd019fcaf464",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 71936,
+        "input_tokens": 81817,
+        "output_tokens": 772,
+        "reasoning_output_tokens": 51
+      }
+    },
+    {
+      "againStatsDelta": {
+        "context_events": 1,
+        "exact_hits": 0,
+        "executed": 0,
+        "inflight_joins": 0,
+        "requested": 0
+      },
+      "codexElapsedMs": 14667.401,
+      "completedActions": [
+        {
+          "command": "",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "file_change"
+        },
+        {
+          "command": "/bin/zsh -lc 'git diff -- src/calculator.py'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        },
+        {
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests'",
+          "resultBytes": null,
+          "status": "completed",
+          "tool": null,
+          "type": "command_execution"
+        }
+      ],
+      "condition": "product",
+      "elapsedMs": 14667.401,
+      "eventCount": 11,
+      "eventsCaptured": true,
+      "exitCode": 0,
+      "firstEditMs": 5189.595,
+      "oracle": {
+        "after_snapshot_sha256": "ea2387cc9c603abeaa9ea4e5cee3179121640d79e82eebbb50e664df3854857b",
+        "changed_paths": [
+          "src/calculator.py"
+        ],
+        "collateral_safe": true,
+        "exact_target": true,
+        "passed": true,
+        "test_elapsed_ms": 125.124,
+        "test_output_sha256": "445221b98f22d14309aaea4fee1a9f41c9659ced4c922d71fbc0dcbbde571045",
+        "tests_passed": true
+      },
+      "preparationMs": 0.0,
+      "rawEventBytes": 2112,
+      "rawEventFile": "again-brain-codex-live-a302cd5-product.jsonl",
+      "rawEventSha256": "1b4f054b42f32ffc38110b258466703cd3b56173dc7d03d58085a221a54df5e0",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "timedOut": false,
+      "usage": {
+        "cache_write_input_tokens": 0,
+        "cached_input_tokens": 43648,
+        "input_tokens": 48519,
+        "output_tokens": 421,
+        "reasoning_output_tokens": 140
+      }
+    }
+  ],
+  "order": [
+    "baseline",
+    "product"
+  ],
+  "prebrief": false,
+  "prebriefWithMcp": false,
+  "promptSha256": "39f1e553db10066f132f448bf32bc1765343e068af576bd8e0a148ea42497c38",
+  "recordedAtUtc": "2026-09-23T21:41:29.285402+00:00",
+  "schema": "again.codex-editable-pair-diagnostic.v1",
+  "source": {
+    "binarySourceBindingVerified": false,
+    "dirty": true,
+    "head": "a302cd5aee5fed4bce87a24b315c5507a1c6d2e5"
+  },
+  "sourceFiles": 0,
+  "surface": "product-wrapper"
+}

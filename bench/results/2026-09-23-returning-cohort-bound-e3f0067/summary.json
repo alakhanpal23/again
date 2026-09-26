@@ -1,0 +1,129 @@
+{
+  "schema": "again.single-agent-returning-cohort-result.v1",
+  "recordedAtUtc": "2026-09-24T03:54:49.478259+00:00",
+  "manifestSha256": "0ab2f67216d4cd163c6172b12a1b9574ebea58f0f04bfc4fd15de455448da169",
+  "binarySha256": "75c22eb985a634ccc24cb02c5eace58ac3dd49d45a5538ee8d25dc932e0cf159",
+  "model": "gpt-6-sol",
+  "evidenceScope": "Diagnostic returning-task pairs with a verified prior helper read; not the full release cohort",
+  "acceptedPairs": 4,
+  "totalPairs": 4,
+  "pairedMedianElapsedRatio": 0.50796204099802,
+  "pairedP95ElapsedRatio": 0.5694154256372042,
+  "pairedMedianElapsedTargetMet": true,
+  "baselineUsageTotals": {
+    "uncachedInput": 36443,
+    "cachedInput": 359680,
+    "output": 2397
+  },
+  "againUsageTotals": {
+    "uncachedInput": 20374,
+    "cachedInput": 175616,
+    "output": 926
+  },
+  "allUsageVectorsComplete": true,
+  "pairs": [
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 0,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 26274.812,
+      "againMs": 12764.959,
+      "elapsedRatio": 0.48582494139253973,
+      "baselineActions": 9,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 10420,
+        "cachedInput": 87680,
+        "output": 554
+      },
+      "againUsage": {
+        "uncachedInput": 5148,
+        "cachedInput": 43904,
+        "output": 321
+      }
+    },
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 0,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 17176.6,
+      "againMs": 9780.621,
+      "elapsedRatio": 0.5694154256372042,
+      "baselineActions": 4,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9418,
+        "cachedInput": 70656,
+        "output": 431
+      },
+      "againUsage": {
+        "uncachedInput": 5060,
+        "cachedInput": 43904,
+        "output": 223
+      }
+    },
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 1000,
+      "order": [
+        "baseline",
+        "product"
+      ],
+      "accepted": true,
+      "baselineMs": 20381.861,
+      "againMs": 10804.407,
+      "elapsedRatio": 0.5300991406035003,
+      "baselineActions": 6,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 9059,
+        "cachedInput": 86528,
+        "output": 645
+      },
+      "againUsage": {
+        "uncachedInput": 5059,
+        "cachedInput": 43904,
+        "output": 189
+      }
+    },
+    {
+      "fixture": "balance-helper",
+      "sourceFiles": 1000,
+      "order": [
+        "product",
+        "baseline"
+      ],
+      "accepted": true,
+      "baselineMs": 25298.699,
+      "againMs": 11131.462,
+      "elapsedRatio": 0.4400013613348259,
+      "baselineActions": 8,
+      "againActions": 2,
+      "baselineUsage": {
+        "uncachedInput": 7546,
+        "cachedInput": 114816,
+        "output": 767
+      },
+      "againUsage": {
+        "uncachedInput": 5107,
+        "cachedInput": 43904,
+        "output": 193
+      }
+    }
+  ],
+  "source": {
+    "head": "e3f0067975afadd6aa5d1dfb91f688c5bf43e6d1",
+    "dirty": false,
+    "buildSourceSha": "e3f0067975afadd6aa5d1dfb91f688c5bf43e6d1",
+    "buildSourceClean": true,
+    "binarySourceBindingVerified": true
+  }
+}

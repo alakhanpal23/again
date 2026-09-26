@@ -1,0 +1,379 @@
+{
+  "schema": "again.diverse-real-pair.v2",
+  "identity": {
+    "manifestSha256": "1053428ea1ecbb5b3319c23357ba6ac6eb01f9cc0fe164c13aa81b9ccf351989",
+    "source": {
+      "head": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "dirty": false,
+      "buildSourceSha": "bb44f50a188c0c2c2a539a97af95bd90944d1277",
+      "buildSourceClean": true,
+      "binarySourceBindingVerified": true
+    },
+    "binarySha256": "3e7e27b8cfebd8198cb01c331404c8483f481bae3c7cb50f2bd6aa407e330dc1",
+    "model": "gpt-6-sol",
+    "rateCardSha256": "bcec778d16c238f652e1eec36df3a0095e5894d0c5c46442b1c58d6ba27b6c98"
+  },
+  "fixture": "tomlkit-array-slice",
+  "mode": "returning",
+  "order": "again-first",
+  "observations": [
+    {
+      "condition": "product",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 12228.377,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 12228.377,
+      "eventTimeline": [
+        {
+          "elapsedMs": 6081.339,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 6106.603,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 8402.454,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 8402.475,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 11220.852,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 6081.352,
+      "rawEventBytes": 1872,
+      "rawEventSha256": "c42e82347f309b0e107d34ff970bf5f55e41ff730a82d292a09a757da4234705",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 9,
+      "completedActions": [
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 51686,
+        "cached_input_tokens": 45696,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 368,
+        "reasoning_output_tokens": 37
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 75.713,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 1
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 8100.777,
+        "usage": {
+          "input_tokens": 33965,
+          "cached_input_tokens": 23552,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 164,
+          "reasoning_output_tokens": 11
+        },
+        "completedCommands": 1,
+        "brainObserved": true,
+        "rawEventSha256": "769c287be59ac3e0e020f9649dbeef64865f1eb707ab22a5040b1c29ba6d272f",
+        "rawEventBytes": 1246
+      },
+      "brainRun": {
+        "authorization_scope_digest": "f2c39ebf1babba0952f447b9ef1af5aa05bf52d2d96d0f64c271657810996961",
+        "cached_input_tokens": 45696,
+        "completed_commands": 1,
+        "completed_edits": 1,
+        "completed_mcp_calls": 0,
+        "completed_ms": 1790288194535,
+        "completed_source_reads": 0,
+        "exit_code": 0,
+        "input_tokens": 51686,
+        "output_tokens": 368,
+        "session_id": "75b90ee6-cba7-4284-a0c5-d666956288cf",
+        "started_ms": 1790288182346,
+        "successful_tests": 0,
+        "task_id": "tomlkit-array-slice-fix",
+        "turn_completed": true
+      },
+      "brainRunError": null
+    },
+    {
+      "condition": "baseline",
+      "exitCode": 0,
+      "timedOut": false,
+      "eventsCaptured": true,
+      "elapsedMs": 21717.833,
+      "preparationMs": 0.0,
+      "codexElapsedMs": 21717.833,
+      "eventTimeline": [
+        {
+          "elapsedMs": 5706.487,
+          "event": "item.started",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5706.513,
+          "event": "item.completed",
+          "itemId": "item_1",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5731.433,
+          "event": "item.started",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5731.441,
+          "event": "item.completed",
+          "itemId": "item_2",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5731.444,
+          "event": "item.started",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 5731.451,
+          "event": "item.completed",
+          "itemId": "item_3",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.112,
+          "event": "item.started",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.125,
+          "event": "item.started",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.134,
+          "event": "item.started",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.146,
+          "event": "item.completed",
+          "itemId": "item_4",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.195,
+          "event": "item.completed",
+          "itemId": "item_5",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 9723.209,
+          "event": "item.completed",
+          "itemId": "item_6",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 14497.714,
+          "event": "item.started",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 14522.843,
+          "event": "item.completed",
+          "itemId": "item_8",
+          "itemType": "file_change"
+        },
+        {
+          "elapsedMs": 17084.436,
+          "event": "item.started",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 17084.459,
+          "event": "item.completed",
+          "itemId": "item_9",
+          "itemType": "command_execution"
+        },
+        {
+          "elapsedMs": 20306.431,
+          "event": "turn.completed",
+          "itemId": null,
+          "itemType": null
+        }
+      ],
+      "firstEditMs": 14522.85,
+      "rawEventBytes": 21194,
+      "rawEventSha256": "477c1cf75a28e7af06e8cc4ffa86eda5bbb2188921ad63808e506f0ace44df61",
+      "stderrSha256": "1aa26269eb1cc57f86b235a03cda53c004edb5b1e9fc99d4da4f00843293d721",
+      "eventCount": 22,
+      "completedActions": [
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"class Array|def __setitem__|slice\" tomlkit/items.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"rg --files -g 'AGENTS.md' -g 'test_again_oracle.py'\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'git status --short'",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1,240p' tests/test_again_oracle.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc \"sed -n '1377,1690p' tomlkit/items.py\"",
+          "exitCode": 0
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'rg -n \"def _getstate|def _value|class _CustomList|_group|_index_map\" tomlkit/items.py'",
+          "exitCode": 0
+        },
+        {
+          "type": "file_change",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "",
+          "exitCode": null
+        },
+        {
+          "type": "command_execution",
+          "tool": null,
+          "status": "completed",
+          "resultBytes": null,
+          "command": "/bin/zsh -lc 'python3 -m unittest discover -s tests -p test_again_oracle.py'",
+          "exitCode": 0
+        }
+      ],
+      "usage": {
+        "input_tokens": 94118,
+        "cached_input_tokens": 84352,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 670,
+        "reasoning_output_tokens": 45
+      },
+      "oracle": {
+        "passed": true,
+        "target_oracle_mode": "behavior",
+        "target_oracle_passed": true,
+        "exact_target": true,
+        "collateral_safe": true,
+        "changed_paths": [
+          "tomlkit/items.py"
+        ],
+        "tests_passed": true,
+        "test_elapsed_ms": 77.192,
+        "test_output_sha256": "d10ffbd9f0faa72cd6837063279524e199b59fbc3d035051302a1e8dbc4b36ad",
+        "after_snapshot_sha256": "61f2522ff3e7866e9f8234020f70c478e9ff14f0382e5ac682183b597a68e340"
+      },
+      "agentValidationObserved": true,
+      "againStatsDelta": {
+        "requested": 0,
+        "executed": 0,
+        "exact_hits": 0,
+        "inflight_joins": 0,
+        "context_events": 0
+      },
+      "priorBrain": null,
+      "livePriorTask": {
+        "elapsedMs": 7606.93,
+        "usage": {
+          "input_tokens": 31365,
+          "cached_input_tokens": 27264,
+          "cache_write_input_tokens": 0,
+          "output_tokens": 196,
+          "reasoning_output_tokens": 10
+        },
+        "completedCommands": 1,
+        "brainObserved": false,
+        "rawEventSha256": "ab99a4f3295558bb8e5cf73725e80f4eb62718d1cb19a1b8a8b244de3a13f466",
+        "rawEventBytes": 1234
+      },
+      "brainRun": null,
+      "brainRunError": null
+    }
+  ],
+  "accepted": true,
+  "capturedAtUtc": "2026-09-24T22:17:04.567461+00:00"
+}

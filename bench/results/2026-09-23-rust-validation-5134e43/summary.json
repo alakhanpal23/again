@@ -1,0 +1,12 @@
+{
+  "acceptedPairs": 2,
+  "medianPairedElapsedRatio": 0.36379161579048713,
+  "pairedElapsedRatios": [
+    0.2403147958814231,
+    0.4872684356995512
+  ],
+  "schema": "again.rust-validation-diagnostic.v1",
+  "scope": "Two treatment orders for one Rust fixture; not release qualification",
+  "sourceCommit": "5134e43",
+  "totalPairs": 2
+}

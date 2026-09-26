@@ -82,6 +82,53 @@ fn git(root: &Path, arguments: &[&str]) -> String {
 }
 
 #[test]
+fn root_paths_and_overflowing_git_status_remain_usable_and_fresh() {
+    let workspace = TempDir::new().unwrap();
+    write(workspace.path(), "tracked.txt", "tracked\n");
+    git(workspace.path(), &["init", "-q"]);
+    git(workspace.path(), &["add", "tracked.txt"]);
+    for index in 0..230 {
+        write(
+            workspace.path(),
+            &format!("bulk/file-{index:03}.txt"),
+            "untracked\n",
+        );
+    }
+    write(workspace.path(), "focus/one.txt", "untracked\n");
+    let server = ExperimentalMcpGatewayV1::build(workspace.path()).unwrap();
+    initialize(server.gateway());
+
+    let listed = call(server.gateway(), 2, "repo.list", json!({ "path": "" }));
+    assert_eq!(
+        listed["result"]["structuredContent"]["path"], ".",
+        "{listed}"
+    );
+    let status = call(server.gateway(), 3, "git.status", json!({}));
+    let content = &status["result"]["structuredContent"];
+    assert_eq!(content["entries"].as_array().unwrap().len(), 200);
+    assert_eq!(content["totalEntries"], 232);
+    assert_eq!(content["truncated"], true);
+    assert!(
+        status["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("truncated")
+    );
+    let narrow = call(
+        server.gateway(),
+        4,
+        "git.status",
+        json!({ "path": "focus", "maxResults": 200 }),
+    );
+    assert_eq!(narrow["result"]["structuredContent"]["totalEntries"], 1);
+    assert_eq!(narrow["result"]["structuredContent"]["truncated"], false);
+
+    write(workspace.path(), "bulk/file-999.txt", "new\n");
+    let changed = call(server.gateway(), 5, "git.status", json!({ "path": "" }));
+    assert_eq!(changed["result"]["structuredContent"]["totalEntries"], 233);
+}
+
+#[test]
 fn repository_refusals_are_actionable_without_echoing_sensitive_paths() {
     let workspace = TempDir::new().unwrap();
     write(workspace.path(), "visible.txt", "public\n");
@@ -111,7 +158,7 @@ fn repository_refusals_are_actionable_without_echoing_sensitive_paths() {
 }
 
 #[test]
-fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable() {
+fn repository_primitives_are_product_routed_deterministic_and_fresh() {
     let workspace = TempDir::new().unwrap();
     write(
         workspace.path(),
@@ -448,11 +495,11 @@ fn repository_primitives_are_product_routed_deterministic_and_exactly_reusable()
     );
 
     let stats = server.stats().unwrap();
-    // The two in-process repository retries must be exact hits. The external
-    // Git retry may conservatively execute on hosts where Git changes an
-    // observed index/executable binding while answering the first request;
-    // that is a safe miss, and its exact response equality is asserted above.
-    assert!((2..=3).contains(&stats.exact_hits), "{stats:?}");
+    // Standalone repository calls may execute directly when their proof costs
+    // more than a fresh provider call. This fixture checks every returned
+    // value above, including status after an index and worktree change.
+    assert_eq!(stats.requested, 25, "{stats:?}");
+    assert!(stats.exact_hits <= 2, "{stats:?}");
     assert_eq!(stats.executed + stats.exact_hits, 25, "{stats:?}");
 }
 

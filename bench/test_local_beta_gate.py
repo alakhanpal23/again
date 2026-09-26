@@ -225,13 +225,20 @@ def metrics(score: int) -> dict[str, int]:
 
 
 def real_agent_report() -> dict[str, object]:
+    enabled = metrics(90)
+    enabled.update({
+        "cost_usd_micros": 80_000,
+        "duplicate_investigations": 0,
+        "duplicate_reads": 1,
+        "first_correct_edit_ms": 700,
+        "validated_completion_ms": 1_600,
+    })
     return {
         "schema": gate.REAL_AGENT_SCHEMA,
-        "classification": {"type": "pass", "code": "outside_user_pairs_passed"},
+        "classification": {"type": "pass", "code": "real_client_pairs_passed"},
         "source_git_sha": SOURCE,
         "binary_sha256": UPGRADED,
-        "outside_user": True,
-        "outside_user_count": 5,
+        "cohort_source": "controlled_agents",
         "accepted_attempts": 50,
         "repository_count": 5,
         "deterministic_harness_only": False,
@@ -253,7 +260,7 @@ def real_agent_report() -> dict[str, object]:
             client: {
                 "paired_runs": 25,
                 "baseline": metrics(90),
-                "again_enabled": metrics(90),
+                "again_enabled": dict(enabled),
             }
             for client in ("claude", "codex")
         },
@@ -327,6 +334,24 @@ def native_reports() -> list[dict[str, object]]:
     ]
 
 
+def authenticated_report() -> dict[str, object]:
+    return {
+        "schema": gate.AUTHENTICATED_SCHEMA,
+        "classification": {"type": "pass", "code": "task_source_lifecycle_passed"},
+        "source": {"clean": True, "git_sha": SOURCE, "git_sha256": "e" * 64},
+        "binary_sha256": UPGRADED,
+        "scenarios": sorted(gate.AUTHENTICATED_SCENARIOS),
+        "duplicate_read_events": {"requested": 2, "executed": 1, "completed": 1, "inflight_join": 1},
+        "corruption_events": [{"event_type": "binding_quarantined", "reason": "result_corrupt"}],
+        "inflight_cancellation_events": {"requested": 2, "executed": 1,
+                                         "inflight_candidate": 1, "follower_cancelled": 1,
+                                         "completed": 1},
+        "old_lease": {"status": "active", "lifecycle_generation": 1},
+        "new_lease": {"status": "completed", "lifecycle_generation": 2},
+        "lease_recovery_events": {"lease_expired": 1, "requested": 1, "executed": 1, "completed": 1},
+    }
+
+
 class LocalBetaGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory(prefix="again-local-beta-gate-test-")
@@ -338,6 +363,7 @@ class LocalBetaGateTests(unittest.TestCase):
     def build(self) -> dict[str, object]:
         return gate.build_gate(
             scenario=scenario_report(),
+            authenticated=authenticated_report(),
             chaos=chaos_report(),
             real_agent=real_agent_report(),
             release=release_report(),
@@ -420,12 +446,26 @@ class LocalBetaGateTests(unittest.TestCase):
                 gate.validate_chaos(report)
             self.assertEqual(refused.exception.code, "chaos_scope")
 
-    def test_real_agent_gate_requires_outside_user_and_no_quality_regression(self) -> None:
+    def test_authenticated_gate_rejects_missing_avoidance_and_recovery(self) -> None:
+        for field, value in (
+            ("duplicate_read_events", {"requested": 2, "executed": 2, "completed": 2}),
+            ("duplicate_read_events", {"requested": 2, "executed": 1, "completed": 1, "inflight_join": "one"}),
+            ("corruption_events", []),
+            ("inflight_cancellation_events", {"requested": 2, "executed": 2}),
+            ("lease_recovery_events", {"requested": 1, "executed": 1, "completed": 1}),
+            ("scenarios", [{}]),
+        ):
+            report = authenticated_report()
+            report[field] = value
+            with self.subTest(field=field), self.assertRaises(gate.GateRefusal):
+                gate.validate_authenticated(report)
+
+    def test_real_agent_gate_requires_real_cohort_and_no_quality_regression(self) -> None:
         report = real_agent_report()
-        report["outside_user"] = False
-        with self.assertRaises(gate.GateRefusal) as outside:
+        report["cohort_source"] = "synthetic_fixture"
+        with self.assertRaises(gate.GateRefusal) as cohort:
             gate.validate_real_agent(report)
-        self.assertEqual(outside.exception.code, "outside_user")
+        self.assertEqual(cohort.exception.code, "agent_cohort")
 
         report = real_agent_report()
         report["clients"]["codex"]["again_enabled"]["patch_quality_score"] = 89  # type: ignore[index]
@@ -445,12 +485,19 @@ class LocalBetaGateTests(unittest.TestCase):
             gate.validate_real_agent(report)
         self.assertEqual(methodology.exception.code, "agent_methodology")
 
+        report = real_agent_report()
+        report["clients"]["codex"]["again_enabled"]["validated_completion_ms"] = 1_900  # type: ignore[index]
+        with self.assertRaises(gate.GateRefusal) as slow:
+            gate.validate_real_agent(report)
+        self.assertEqual(slow.exception.code, "agent_acceleration")
+
     def test_exact_native_target_matrix_and_source_binding_are_required(self) -> None:
         duplicate = native_reports()
         duplicate[-1]["target"] = duplicate[0]["target"]
         with self.assertRaises(gate.GateRefusal) as matrix:
             gate.build_gate(
                 scenario=scenario_report(),
+                authenticated=authenticated_report(),
                 chaos=chaos_report(),
                 real_agent=real_agent_report(),
                 release=release_report(),
@@ -463,6 +510,7 @@ class LocalBetaGateTests(unittest.TestCase):
         with self.assertRaises(gate.GateRefusal) as source:
             gate.build_gate(
                 scenario=scenario_report(),
+                authenticated=authenticated_report(),
                 chaos=chaos_report(),
                 real_agent=real_agent_report(),
                 release=release_report(),
@@ -495,6 +543,8 @@ class LocalBetaGateTests(unittest.TestCase):
         argv = [
             "--scenario-evidence",
             str(link),
+            "--authenticated-evidence",
+            str(target),
             "--chaos-evidence",
             str(target),
             "--real-agent-evidence",
@@ -527,6 +577,7 @@ class LocalBetaGateTests(unittest.TestCase):
     def test_cli_aggregates_retained_files_without_overwrite(self) -> None:
         inputs = {
             "scenario": scenario_report(),
+            "authenticated": authenticated_report(),
             "chaos": chaos_report(),
             "agent": real_agent_report(),
             "release": release_report(),
@@ -545,6 +596,8 @@ class LocalBetaGateTests(unittest.TestCase):
         argv = [
             "--scenario-evidence",
             str(paths["scenario"]),
+            "--authenticated-evidence",
+            str(paths["authenticated"]),
             "--chaos-evidence",
             str(paths["chaos"]),
             "--real-agent-evidence",
