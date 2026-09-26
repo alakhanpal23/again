@@ -107,4 +107,6 @@ To update Again, pull the checkout and rerun `cargo install --locked --path . --
 
 The [roadmap](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/ROADMAP.md) covers planned work. [Status](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/STATUS.md) and [evidence](https://github.com/alakhanpal23/again/blob/productize/beta-task-lifecycle/docs/EVIDENCE.md) record implementation and benchmark details.
 
+For contributor setup and commit attribution, see [Contributing](CONTRIBUTING.md).
+
 Apache-2.0 licensed.
